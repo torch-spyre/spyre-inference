@@ -7,6 +7,8 @@ dtype conversion.
 
 from typing import Any
 
+import torch
+
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -47,6 +49,22 @@ def _fake_impl(*args, **kwargs) -> None:
     return
 
 
+# Library object for registering PrivateUse1 (Spyre) dispatch keys.
+# vLLM's direct_register_custom_op only registers the platform dispatch_key
+# (CPU). When tensors flow on Spyre, PyTorch dispatches to PrivateUse1 —
+# so we must register the same kernels there too.
+_spyre_dispatch_lib = torch.library.Library("vllm", "IMPL")
+
+
+def register_spyre_dispatch(op_name: str, op_func) -> None:
+    """Register an op implementation for the PrivateUse1 (Spyre) dispatch key.
+
+    Call this after direct_register_custom_op to ensure the op can be
+    dispatched when any argument is a Spyre tensor.
+    """
+    _spyre_dispatch_lib.impl(op_name, op_func, dispatch_key="PrivateUse1")
+
+
 def convert(tensor, device=None, dtype=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 
@@ -58,8 +76,8 @@ def convert(tensor, device=None, dtype=None):
     Returns:
         Converted tensor, or None if input is None.
     """
-    if tensor is None:
-        return None
+    if tensor is None or not isinstance(tensor, torch.Tensor):
+        return tensor
     if tensor.device.type == "spyre":
         # In case the tensor is on spyre, we first need to move it to cpu and then change the dtype.
         if device is not None:

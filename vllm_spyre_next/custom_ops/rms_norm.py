@@ -43,9 +43,6 @@ from .utils import convert, register_layer, get_layer, _fake_impl
 
 logger = init_logger(__name__)
 
-# Minimum batch size required by Spyre hardware.
-_SPYRE_MIN_BATCH_SIZE = 64
-
 
 @RMSNorm.register_oot(name="RMSNorm")
 class SpyreRMSNorm(RMSNorm):
@@ -89,12 +86,13 @@ class SpyreRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """OOT forward pass using custom op to bypass torch.compile.
+        """OOT forward pass.
 
-        Delegates to torch.ops.vllm.spyre_rmsnorm which retrieves this layer
-        from the layer registry and calls _forward_spyre_impl outside
-        the compilation graph. This prevents torch.compile from inlining the
-        Spyre-specific operations.
+        When input is on Spyre, calls _forward_spyre_impl directly to avoid
+        the custom op boundary (Spyre does not support in-device copy_).
+        When input is on CPU, delegates to torch.ops.vllm.spyre_rmsnorm
+        which retrieves this layer from the layer registry and calls
+        _forward_spyre_impl outside the compilation graph.
 
         Args:
             x: Input tensor [batch_size, hidden_size]
@@ -103,6 +101,9 @@ class SpyreRMSNorm(RMSNorm):
         Returns:
             Normalized output, or (output, residual) tuple if residual provided
         """
+        if x.device.type == "spyre":
+            return self._forward_spyre_impl(x, residual)
+
         output = torch.empty_like(x)
         residual_out = torch.empty_like(residual) if residual is not None else None
 
@@ -169,7 +170,7 @@ class SpyreRMSNorm(RMSNorm):
             - variance_size_override not implemented (raises NotImplementedError)
 
         Args:
-            x: Input tensor [batch_size, hidden_size] on CPU
+            x: Input tensor [batch_size, hidden_size]
             residual: Optional residual
 
         Returns:
@@ -181,16 +182,6 @@ class SpyreRMSNorm(RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        orig_batch_size = x.shape[0]
-
-        # Pad to minimum batch size of 64 (Spyre constraint)
-        # Pad at END so original data stays at indices [0:orig_batch_size]
-        if x.shape[0] < _SPYRE_MIN_BATCH_SIZE:
-            pad_amount = _SPYRE_MIN_BATCH_SIZE - x.shape[0]
-            x = torch.nn.functional.pad(x, (0, 0, 0, pad_amount))
-            if residual is not None:
-                residual = torch.nn.functional.pad(residual, (0, 0, 0, pad_amount))
-
         # Execute compiled kernel on Spyre device
         outs = self.maybe_compiled_forward_spyre(
             convert(x, self._target_device, self._target_dtype),
@@ -199,12 +190,14 @@ class SpyreRMSNorm(RMSNorm):
             convert(self.weight.data, self._target_device, self._target_dtype)
             if self.has_weight
             else None,
-            convert(residual, self._target_device, self._target_dtype),
+            convert(residual, self._target_device, self._target_dtype)
+            if residual is not None
+            else None,
         )
 
-        # Transfer back to CPU and restore original shape
+        # Transfer back to original device/dtype
         return pytree.tree_map(
-            lambda el: convert(el, dtype=x_dtype, device=x_device)[:orig_batch_size, :],
+            lambda el: convert(el, dtype=x_dtype, device=x_device),
             outs,
         )
 

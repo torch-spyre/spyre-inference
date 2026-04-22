@@ -1,3 +1,4 @@
+import torch
 import sys
 from typing import TYPE_CHECKING
 from string import Template
@@ -36,6 +37,13 @@ class TorchSpyrePlatform(CpuPlatform):
     # "spyre" device_name no longer worked due to https://github.com/vllm-project/vllm/pull/16464
     device_name: str = "cpu"
     device_type: str = "cpu"
+
+    # Primary dispatch key for direct_register_custom_op. Kept as CPU
+    # because some custom ops receive CPU-only tensors (e.g. rotary_embedding).
+    # All ops are ALSO registered for PrivateUse1 (Spyre) via
+    # register_spyre_dispatch() in each module's register() function,
+    # so dispatch works regardless of tensor device.
+    dispatch_key: str = "CPU"
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend
     register_backend(
@@ -82,6 +90,20 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info(message, version, model_name)
 
     @classmethod
+    def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Set Spyre-specific config defaults before vLLM's defaulting logic."""
+        from vllm.config import CompilationMode
+
+        vllm_config.compilation_config.mode = CompilationMode.NONE
+
+        # Force eager execution. torch.compile with the Spyre inductor
+        # backend requires ALL graph tensors on Spyre, but our CPU fallback
+        # ops (embedding, linear, rotary, attention) create intermediate
+        # CPU tensors that the Spyre backend cannot codegen. Once all layers
+        # run natively on Spyre, this can be removed to enable compilation.
+        vllm_config.model_config.enforce_eager = True
+
+    @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
         if selected_backend == AttentionBackendEnum.CUSTOM:
             return AttentionBackendEnum.CUSTOM.get_path()
@@ -92,6 +114,14 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
+        # Check if the model dtype is different from float16,
+        # which is only currently supported in torch-spyre
+        if vllm_config.model_config.dtype != torch.float16:
+            raise ValueError(
+                f"The model dtype needs to be torch.float16 for spyre, "
+                f"but was specified to be {vllm_config.model_config.dtype}"
+            )
+
         # ---- worker ----
         parallel_config = vllm_config.parallel_config
         if parallel_config.worker_cls == "auto":
@@ -100,12 +130,6 @@ class TorchSpyrePlatform(CpuPlatform):
             worker_class = "vllm_spyre_next.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
-
-        # ---- model runner ----
-        # A custom model runner has to be added to a potential TorchSpyreWorker class:
-        # TorchSpyreWorker.model_runner = TorchSpyreModelRunner (see SpyreWorker for reference)
-        # The default vllm.v1.worker.cpu_worker.CPUWorker uses
-        # vllm.v1.worker.cpu_model_runner.CPUModelRunner
 
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config

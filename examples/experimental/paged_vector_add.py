@@ -14,12 +14,12 @@
 
 import torch
 import os
-import debugpy
 
 # debug = True
 debug = False
 
 if debug:
+    import debugpy
     host_addr = os.environ.get("TORCH_SPYRE_DEBUG_ADDR", "0.0.0.0")
     pdb_port = int(os.environ.get("TORCH_SPYRE_DEBUG_PORT", "5679"))
     debugpy.listen((host_addr, pdb_port))
@@ -55,14 +55,19 @@ out_pages = create_paged_memory(PAGE_SIZE, 256)
 a_pages[42].fill_(40.0)
 b_pages[312].fill_(31.0)
 
+# 0 page as padding index
+a_pages[0].fill_(0.0)
+b_pages[0].fill_(0.0)
 
 print("prepare computation...")
 # create page table 
 page_table = [13, 312, 42, 14, 15]
 
-def paged_vector_add(a_pages, b_pages, page_table, out_pages):
+
+def paged_vector_add(a_pages, b_pages, page_table, max_page_table_length, out_pages):
     # output pages are starting from 0, in this case
-    for i, page_index in enumerate(page_table):
+    for i in range(max_page_table_length):
+        page_index = page_table[i]
         a_page = a_pages[page_index]
         b_page = b_pages[page_index]
         out_page = out_pages[i]
@@ -70,23 +75,29 @@ def paged_vector_add(a_pages, b_pages, page_table, out_pages):
         out_page.copy_(sum)
 
 
-def create_compilable_paged_vector_add(page_table):
-    def paged_vector_add_with_fixed_table(a_pages, b_pages, out_pages):
-        return paged_vector_add(a_pages, b_pages, page_table, out_pages)
-    return paged_vector_add_with_fixed_table
+def create_compilable_paged_vector_add(page_table_length):
+    def paged_vector_add_with_fixed_length(a_pages, b_pages, page_table, out_pages):
+        assert len(page_table) == page_table_length
+        return paged_vector_add(
+            a_pages, b_pages, page_table, page_table_length, out_pages
+        )
+    return paged_vector_add_with_fixed_length
 
 
 list_of_compiled_functions_per_request_length = {}
 
-list_of_compiled_functions_per_request_length[5] = torch.compile(
-    create_compilable_paged_vector_add(page_table)
+page_table_length = len(page_table)
+list_of_compiled_functions_per_request_length[page_table_length] = torch.compile(
+    create_compilable_paged_vector_add(page_table_length)
 )
 
 
-# do the computation 
+# do the computation
 print("computing paged vector add...")
 
-list_of_compiled_functions_per_request_length[5](a_pages, b_pages, out_pages)
+list_of_compiled_functions_per_request_length[page_table_length](
+    a_pages, b_pages, page_table, out_pages
+)
 
 print("result...")
 
@@ -106,3 +117,23 @@ for i in range(len(page_table)):
     # )
 
 
+print("\n repeat now with updated pages...")
+
+page_table_2 = [500, 501, 312, 0, 0]
+
+list_of_compiled_functions_per_request_length[len(page_table_2)](
+    a_pages, b_pages, page_table_2, out_pages
+)
+
+# print result, exptected this time
+#  0: 3.0
+#  1: 3.0
+#  2: 32.0
+#  3: 0.0
+#  4: 0.0
+
+print("results of 2nd run:")
+# copy back again
+out_pages_cpu = [p.cpu() for p in out_pages]
+for i in range(len(page_table)):
+    print(f"out page {i}: {out_pages_cpu[i].tolist()}")

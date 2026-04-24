@@ -12,8 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
 import os
+os.environ["SPYRE_INDUCTOR_LOG"] = "1"
+os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
+os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
+# os.environ["DT_DEEPRT_VERBOSE"] = "1"
+# os.environ["DTLOG_LEVEL"] = "debug"
+
+import torch
+from torch.profiler import profile, ProfilerActivity
+
+import torch._logging
+
+# Enable graph code printing
+torch._logging.set_logs(graph_code=True)
 
 # debug = True
 debug = False

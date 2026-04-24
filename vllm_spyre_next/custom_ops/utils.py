@@ -49,22 +49,6 @@ def _fake_impl(*args, **kwargs) -> None:
     return
 
 
-# Library object for registering PrivateUse1 (Spyre) dispatch keys.
-# vLLM's direct_register_custom_op only registers the platform dispatch_key
-# (CPU). When tensors flow on Spyre, PyTorch dispatches to PrivateUse1 —
-# so we must register the same kernels there too.
-_spyre_dispatch_lib = torch.library.Library("vllm", "IMPL")
-
-
-def register_spyre_dispatch(op_name: str, op_func) -> None:
-    """Register an op implementation for the PrivateUse1 (Spyre) dispatch key.
-
-    Call this after direct_register_custom_op to ensure the op can be
-    dispatched when any argument is a Spyre tensor.
-    """
-    _spyre_dispatch_lib.impl(op_name, op_func, dispatch_key="PrivateUse1")
-
-
 def convert(tensor, device=None, dtype=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 

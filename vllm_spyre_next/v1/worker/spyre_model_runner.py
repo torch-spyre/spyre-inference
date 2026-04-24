@@ -34,7 +34,7 @@ import numpy as np
 
 from vllm.config import VllmConfig, CompilationMode
 from vllm.logger import init_logger
-from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -197,12 +197,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Load model and compile for Spyre."""
         logger.info("Loading model %s...", self.model_config.model)
 
+        if load_dummy_weights:
+            self.load_config.load_format = "dummy"
+        model_loader = get_model_loader(self.load_config)
+        
         # Load model on CPU
-        self.model = get_model(vllm_config=self.vllm_config)
+        self.model = model_loader.load_model(
+            vllm_config=self.vllm_config, model_config=self.model_config
+        )
         self.model_memory_usage = 0  # No GPU memory profiling for Spyre
 
+        # Cases appearing in GPUModelRunner.
+        # When needed, they can be implemented for Spyre.
         if self.lora_config:
-            self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+            raise NotImplementedError('LoRA adapters are not yet implemented and tested for Spyre.')
+        
+        if hasattr(self, "drafter"):
+            raise NotImplementedError('Models with a drafter model are not yet implemented and tested for Spyre.')
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Attention is nn.Module (not PluggableLayer) so OOT registration is

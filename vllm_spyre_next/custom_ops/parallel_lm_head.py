@@ -26,7 +26,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         """
         return self
 
-
+@lru_cache(maxsize=1)
 def register():
     # OOT class registration happens at import time via the decorator.
     pass

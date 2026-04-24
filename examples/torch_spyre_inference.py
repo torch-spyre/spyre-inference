@@ -25,6 +25,9 @@ def parse_args():
     parser.add_argument("--max_model_len", "--max-model-len", type=int, default=2048)
     parser.add_argument("--max_num_seqs", "--max-num-seqs", type=int, default=2)
     parser.add_argument("--max_num_batched_tokens", "--max-num-batched-tokens", type=int, default=2)
+    parser.add_argument(
+        "--num_gpu_blocks_override", "--num-gpu-blocks-override", type=int, default=None
+    )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--num-prompts", "-n", type=int, default=3)
     parser.add_argument(
@@ -135,6 +138,7 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         dtype="float16",
         enforce_eager=args.enforce_eager,
+        num_gpu_blocks_override=args.num_gpu_blocks_override,
         compilation_config=CompilationConfig(custom_ops=args.custom_ops),
         attention_config=AttentionConfig(backend=AttentionBackendEnum[args.attention_backend])
         if args.attention_backend is not None

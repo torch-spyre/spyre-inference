@@ -13,9 +13,9 @@
 # limitations under the License.
 
 import os
-os.environ["SPYRE_INDUCTOR_LOG"] = "1"
+# os.environ["SPYRE_INDUCTOR_LOG"] = "1"
 os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
-os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
+# os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
 # os.environ["DT_DEEPRT_VERBOSE"] = "1"
 # os.environ["DTLOG_LEVEL"] = "debug"
 
@@ -25,7 +25,7 @@ from torch.profiler import profile, ProfilerActivity
 import torch._logging
 
 # Enable graph code printing
-torch._logging.set_logs(graph_code=True)
+# torch._logging.set_logs(graph_code=True)
 
 # debug = True
 debug = False
@@ -40,6 +40,40 @@ if debug:
     print("[debugpy] connected")
 
 DEVICE = torch.device("spyre")
+
+def profile_and_print(func, name, num_runs=10):
+    """Helper to profile a function and extract CPU total time"""
+    # # Warmup
+    # for _ in range(3):
+    #     func()
+    
+    # Profile
+    print(f"\nProfiling {name}...")
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        record_shapes=True,
+    ) as prof:
+        # for _ in range(num_runs):
+        #     func()
+        func()
+    
+    table_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=10)
+    table_cpu_display = table_cpu.replace("CUDA", "Spyre")
+    
+    table_spyre = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+    table_spyre_display = table_spyre.replace("CUDA", "Spyre")
+    
+    print(f"\n{name} - Sorted by CPU time:")
+    print(table_cpu_display)
+    
+    print(f"\n{name} - Sorted by SPYRE time:")
+    print(table_spyre_display)
+    
+    # Extract total CPU time from the profiler
+    total_cpu_time = sum(evt.cpu_time_total for evt in prof.key_averages())
+    return total_cpu_time / num_runs  # Average per run
+
+
 
 def create_paged_memory(
     page_size: int, number_of_pages: int, fill_value: float = 0.0, dtype=torch.float16
@@ -149,3 +183,13 @@ print("results of 2nd run:")
 out_pages_cpu = [p.cpu() for p in out_pages]
 for i in range(len(page_table)):
     print(f"out page {i}: {out_pages_cpu[i].tolist()}")
+
+
+print("profiling 2nd run...")
+avg_per_run = profile_and_print(
+    lambda: list_of_compiled_functions_per_request_length[len(page_table_2)](
+        a_pages, b_pages, page_table_2, out_pages
+    ),
+    "2nd run, list on CPU"
+)
+

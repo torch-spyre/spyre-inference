@@ -126,18 +126,18 @@ class SpyreSiluAndMul(SiluAndMul):
 
         The Spyre device does not currently support strided tensor views (slicing),
         so the input is split into its two halves on the CPU before being
-        transferred to the device.  Once tensor slicing is supported this method
-        should revert to the simpler single-tensor path (see commented-out block).
+        transferred to the device.  When the input is already on Spyre it is
+        first moved to CPU for slicing.
 
         Execution steps:
-            1. Slice on CPU: split x into x1 = x[..., :d] and x2 = x[..., d:]
-            2. Device transfer: convert x1 and x2 independently to Spyre (float16)
-               via convert_for_spyre
-            3. Kernel execution: call compiled maybe_compiled_forward_spyre(x1_spyre, x2_spyre)
-            4. Result transfer: Spyre -> original device, restore original dtype
+            1. If on Spyre, move to CPU (strided views are unsupported on Spyre)
+            2. Slice on CPU: split x into x1 = x[..., :d] and x2 = x[..., d:]
+            3. Device transfer: convert x1 and x2 independently to Spyre (float16)
+            4. Kernel execution: call compiled maybe_compiled_forward_spyre(x1_spyre, x2_spyre)
+            5. Result transfer: Spyre -> original device, restore original dtype
 
         Args:
-            x: Input tensor of shape [..., 2*d] on CPU with arbitrary float dtype.
+            x: Input tensor of shape [..., 2*d] on CPU or Spyre.
 
         Returns:
             Activated output tensor of shape [..., d] on the original device with
@@ -146,7 +146,10 @@ class SpyreSiluAndMul(SiluAndMul):
         x_dtype = x.dtype
         x_device = x.device
 
-        # Note: Workaround with tensor slicing on CPU
+        # Spyre does not support strided tensor views — must slice on CPU
+        if x.device.type == "spyre":
+            x = x.to(device="cpu")
+
         d = x.shape[-1] // 2
         x1 = x[..., :d]
         x2 = x[..., d:]

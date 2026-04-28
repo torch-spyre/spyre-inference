@@ -1,0 +1,18 @@
+FROM 
+
+USER root
+
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_SPYRE_NEXT=0.1.0
+
+RUN cd /root && \
+    git clone --depth 1 https://github.com/torch-spyre/spyre-inference.git && \
+    source /root/torch-spyre/.venv/bin/activate && \
+    uv pip install vllm torchvision && \
+    cd spyre-inference && \
+    uv pip install -e . --no-deps && \
+    echo "source /root/torch-spyre/.venv/bin/activate" >> /root/.bashrc
+
+USER senuser
+WORKDIR /root/spyre-inference
+
+CMD ["bash"]

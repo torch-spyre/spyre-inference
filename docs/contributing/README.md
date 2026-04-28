@@ -31,20 +31,17 @@ The test suite uses pytest markers to categorize tests:
 --8<-- "spyre_inference/pyproject.toml:test-markers-definition"
 ```
 
-By default, `pytest` runs tests marked `spyre` or `upstream_passing`. Some useful overrides:
+Some useful overrides:
 
 ```bash
 # Run only local tests
 pytest -m spyre
 
-# Run only passing upstream tests
-pytest -m upstream_passing
-
-# Run all upstream tests, including non-passing
+# Run all upstream tests
 pytest -m upstream
 
-# Run upstream tests not yet marked as passing
-pytest -m "upstream and not upstream_passing"
+# Run attention tests from upstream only (see spyre_inference/testing/upstream_tests.yaml for markers on upstream tests)
+pytest -m "attention"
 ```
 
 ### Upstream Test Integration
@@ -67,8 +64,6 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
 **VLLM_REPO_URL**: Override the vLLM repository URL. Defaults to `https://github.com/vllm-project/vllm`.
 
 **UPSTREAM_TESTS_PATHS**: Comma-separated paths to include, relative to `tests/`. Defaults to `models/language/generation`.
-
-**UPSTREAM_PASSING_PATTERNS**: Comma-separated regex patterns used to identify tests marked `upstream_passing`. Defaults to `facebook` (matches Meta/Facebook model tests).
 
 !!! tip
     Environment variables can be passed directly to the `pytest` command, e.g. `VLLM_COMMIT=abc123def456 pytest`.

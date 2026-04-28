@@ -35,7 +35,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Commands
 
 ```bash
-# Install dependencies (requires sendnn availability for torch-spyre compilation)
+# Install dependencies (requires the Spyre Runtime stack for torch-spyre compilation)
 uv sync --frozen
 
 # Development install with test dependencies

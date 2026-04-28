@@ -194,7 +194,6 @@ filterwarnings = [
 markers = [
     "spyre: Tests that require a Spyre device",
     "upstream: Tests coming from upstream vLLM",
-    "upstream_passing: Tests known to pass from upstream vLLM",
 ]
 # --8<-- [end:test-markers-definition]
 

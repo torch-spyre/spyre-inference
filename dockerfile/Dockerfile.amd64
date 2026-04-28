@@ -1,0 +1,28 @@
+# dockerfile/Dockerfile.amd64
+
+FROM icr.io/ai_sw_accel/mayurtorch-spyre:latest
+
+USER root
+
+# Install uv (required)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Version override (ok)
+ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_SPYRE_NEXT=0.1.0
+
+WORKDIR /workspace
+
+# Clone + install
+RUN git clone --depth 1 https://github.com/torch-spyre/spyre-inference.git && \
+    cd spyre-inference && \
+    uv pip install vllm torchvision && \
+    uv pip install -e . --no-deps
+
+# Fix permissions before switching user
+RUN chown -R senuser:senuser /workspace
+
+USER senuser
+WORKDIR /workspace/spyre-inference
+
+CMD ["bash"]

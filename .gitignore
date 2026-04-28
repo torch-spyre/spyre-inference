@@ -38,8 +38,3 @@ htmlcov/
 # probable secrets
 .env
 
-# uv
-uv.lock
-
-# CLAUDE.md (AI-generated, not source)
-CLAUDE.md

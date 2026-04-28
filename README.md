@@ -26,11 +26,12 @@ cd spyre-inference
 uv sync --frozen
 ```
 
-**Note:** `torch-spyre` compilation requires `sendnn` to be available on your system. See internal development documentation for environment setup.
+**Note:** `torch-spyre` compilation requires access to IBM Spyre hardware with the Spyre Runtime stack. See internal development documentation for environment setup.
 
 ## Usage
 
-The plugin automatically registers with vLLM when installed. Use it by setting the appropriate platform configuration:
+The plugin automatically registers with vLLM when installed.
+Use it by setting `VLLM_PLUGINS=spyre_inference"
 
 ```python
 from vllm import LLM

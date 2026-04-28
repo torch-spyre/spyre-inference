@@ -651,6 +651,45 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
+    # Patch the KV cache layout handling to include CUSTOM backend
+    # The spyre backend uses [num_blocks, 2, block_size, num_kv_heads, head_size] layout,
+    # same as TRITON_ATTN, but the test creates KV cache as [2, num_blocks, ...] by default
+    orig_run_attention_backend = test_module.run_attention_backend
+
+    def patched_run_attention_backend(
+        backend,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        common_attn_metadata,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_type=None,
+        sliding_window=None,
+    ):
+        # Transpose KV cache for CUSTOM backend to match expected layout
+        if backend == AttentionBackendEnum.CUSTOM:
+            kv_cache = kv_cache.transpose(0, 1).contiguous()
+        return orig_run_attention_backend(
+            backend,
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            common_attn_metadata,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_type,
+            sliding_window,
+        )
+
+    monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
+
     yield
 
 

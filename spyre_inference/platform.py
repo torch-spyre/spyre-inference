@@ -126,8 +126,7 @@ class TorchSpyrePlatform(CpuPlatform):
         cls.log_server_boot(vllm_config)
 
         # ---- compilation / custom ops ----
-        compilation_config = vllm_config.compilation_config
-        compilation_config.ir_enable_torch_wrap = True
+        # compilation_config = vllm_config.compilation_config
 
         # Check if the model dtype is different from float16,
         # which is only currently supported in torch-spyre

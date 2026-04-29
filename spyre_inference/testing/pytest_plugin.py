@@ -638,7 +638,7 @@ def patch_backend_list(request, monkeypatch):
     test_module = request.node.module
     monkeypatch.setattr(test_module, "BACKENDS_TO_TEST", our_backend_list)
 
-    # _test_backend_correctness may be called with a hardcoded AttentionBackendEnum.FLASH_ATTN,
+    # _test_backend_correctness may be called with a hardcoded AttentionBackendEnum.FLEX_ATTENTION,
     # which we want to ignore
     orig_tbc = test_module._test_backend_correctness
 

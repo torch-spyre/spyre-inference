@@ -1,10 +1,15 @@
 """A Torch Spyre worker class."""
 
+import os
+import sys
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
+from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+from vllm.utils.torch_utils import set_random_seed
+from vllm.platforms import CpuArchEnum, current_platform
 
 from spyre_inference.custom_ops import register_all
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
@@ -41,8 +46,46 @@ class TorchSpyreWorker(CPUWorker):
         register_all()
 
     def init_device(self) -> None:
-        # Call the upstream init_device function for the environment setup
-        super().init_device()
+        # Call the relevant parts from the CPUWorker upstream, but don't create the CPUModelRunner
+        
+        # Check whether critical libraries are loaded
+        def check_preloaded_libs(name: str):
+            ld_preload_list = os.environ.get("LD_PRELOAD", "")
+            if name not in ld_preload_list:
+                logger.warning(
+                    "%s is not found in LD_PRELOAD. "
+                    "For best performance, please follow the section "
+                    "`set LD_PRELOAD` in "
+                    "https://docs.vllm.ai/en/latest/getting_started/installation/cpu/ "
+                    "to setup required pre-loaded libraries.",
+                    name,
+                )
+
+        if sys.platform.startswith("linux"):
+            check_preloaded_libs("libtcmalloc")
+            if current_platform.get_cpu_architecture() == CpuArchEnum.X86:
+                check_preloaded_libs("libiomp")
+
+        def skip_set_num_threads(x: int):
+            logger.warning(
+                "CPU backend doesn't allow to use "
+                "`torch.set_num_threads` after the thread binding, skip it."
+            )
+
+        torch.set_num_threads = skip_set_num_threads
+
+        # Note: unique identifier for creating allreduce shared memory
+        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
+        # Initialize the distributed environment.
+        init_worker_distributed_environment(
+            self.vllm_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+            current_platform.dist_backend,
+        )
+        # Set random seed.
+        set_random_seed(self.model_config.seed)
 
         # Construct Spyre model runner with torch.device("spyre")
         self.model_runner = TorchSpyreModelRunner(

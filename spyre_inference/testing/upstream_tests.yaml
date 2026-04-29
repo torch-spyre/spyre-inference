@@ -1,4 +1,4 @@
-# Upstream test filter configuration for vllm-spyre-next.
+# Upstream test filter configuration for spyre-inference.
 #
 # Only tests listed here will run from upstream vLLM. All other upstream
 # tests are skipped by default (opt-in / whitelist model).

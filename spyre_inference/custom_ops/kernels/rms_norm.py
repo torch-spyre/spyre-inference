@@ -10,8 +10,6 @@ import torch
 
 from vllm import ir
 
-from ..utils import convert
-
 
 def _supports_spyre(x, weight, epsilon, variance_size=None):
     """Accept tensors when variance_size is not used.
@@ -31,18 +29,20 @@ def spyre_rms_norm(
     """Spyre IR provider for rms_norm.
 
     Spyre-specific implementation details:
-    - Epsilon as tensor: scalar broadcast limited on Spyre, expanded via
-      torch.full().
     - No dtype promotion: torch-spyre limitation, stays in input dtype.
     - variance_size: not supported; _supports_spyre rejects it so dispatch
       falls back to native.
     """
-    # Compute (no float32 upcast, epsilon as tensor)
-    eps_tensor = torch.full(x.shape, epsilon, dtype=x.dtype, device=x.device)
+    # Implementation adopted from vllm/ir/ops/layernorm.py
+    orig_dtype = x.dtype
+    
+    # Additional components in upstream vLLM
+    # x = x.to(torch.float32)
+    # x_var = x if variance_size is None else x[..., :variance_size]
+    
     variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x = x * torch.rsqrt(variance + eps_tensor)
-
+    x = x * torch.rsqrt(variance + epsilon)
+    x = x.to(orig_dtype)
     if weight is not None:
         x = x * weight
-        
     return x

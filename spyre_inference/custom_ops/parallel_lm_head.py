@@ -6,7 +6,11 @@ Follows the same architecture as SpyreRMSNorm:
     - OOT Registration replaces upstream layer
     - forward_oot uses torch.ops custom-op boundary
     - _op_func executes outside torch.compile
-    - _forward_spyre_impl contains actual execution (CPU/Spyre)
+    - _forward_spyre_impl contains actual execution (CPU fallback / Spyre-ready)
+
+NOTE:
+    No functional change to existing CPU behavior.
+    This only introduces wrapping for torch-spyre compatibility.
 """
 
 import torch
@@ -38,14 +42,14 @@ class SpyreParallelLMHead(ParallelLMHead):
         self._target_device = torch.device("spyre")
         self._target_dtype = torch.float16
 
-        # Compile Spyre kernel (future use)
+        # Compile Spyre kernel (future path only)
         self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)
 
-        # Register layer for custom op lookup
+        # Register for custom-op lookup
         self._layer_name = register_layer(self, "spyre_parallel_lm_head")
 
     def _apply(self, fn, recurse=True):
-        """Keep LMHead weights on CPU."""
+        """Keep LMHead weights on CPU (preserve existing behavior)."""
         return self
 
     def forward_oot(
@@ -54,18 +58,16 @@ class SpyreParallelLMHead(ParallelLMHead):
         embedding_bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        """OOT forward pass using custom-op boundary."""
+        """OOT forward using custom-op boundary.
 
-        logger.debug(
-            f"LMHead forward: shape={hidden_states.shape}, "
-            f"dtype={hidden_states.dtype}, device={hidden_states.device}"
-        )
+        Existing behavior: CPU fallback unchanged.
+        """
 
-        # Direct execution if already on Spyre
+        # If already on Spyre → direct execution
         if hidden_states.device.type == "spyre":
             return self._forward_spyre_impl(hidden_states, embedding_bias)
 
-        # Support both [B, H] and [B, S, H]
+        # Handle both [B, H] and [B, S, H]
         output_shape = hidden_states.shape[:-1] + (self.weight.shape[0],)
 
         output = torch.empty(
@@ -74,7 +76,7 @@ class SpyreParallelLMHead(ParallelLMHead):
             device=hidden_states.device,
         )
 
-        # Custom op call (outside torch.compile graph)
+        # Custom op boundary (torch.compile safe)
         torch.ops.vllm.spyre_parallel_lm_head(
             hidden_states,
             output,
@@ -90,7 +92,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         weight: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Spyre-compiled LMHead kernel."""
+        """Spyre execution kernel (same math as CPU)."""
         return F.linear(hidden_states, weight, embedding_bias)
 
     def _forward_spyre_impl(
@@ -98,9 +100,14 @@ class SpyreParallelLMHead(ParallelLMHead):
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Execution path (CPU fallback / Spyre-ready)."""
+        """Execution path.
 
-        # Optional safety check
+        IMPORTANT:
+        - Keeps same logical computation
+        - Adds device/dtype conversion for Spyre
+        """
+
+        # Safety check (same expectation as upstream)
         if hidden_states.shape[-1] != self.weight.shape[1]:
             raise ValueError(
                 f"Hidden size mismatch: got {hidden_states.shape[-1]}, "
@@ -117,6 +124,7 @@ class SpyreParallelLMHead(ParallelLMHead):
             if embedding_bias is not None else None,
         )
 
+        # Convert back → preserves original behavior
         return pytree.tree_map(
             lambda x: convert(x, dtype=hs_dtype, device=hs_device),
             logits,
@@ -139,7 +147,7 @@ def _op_func(
 
 @lru_cache(maxsize=1)
 def register():
-    """Register custom op."""
+    """Register custom op for Spyre LMHead."""
     direct_register_custom_op(
         op_name="spyre_parallel_lm_head",
         op_func=_op_func,

@@ -47,7 +47,7 @@ import torch
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 import yaml
 
-from spyre_inference.testing.models import (
+from spyre_testing_plugin.models import (
     AllowEntry,
     BlockEntry,
     FileConfig,
@@ -177,10 +177,16 @@ def _extract_vllm_commit_from_pyproject() -> str:
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
-    if not pyproject_path.exists():
+    # Look for pyproject.toml in parent directories (supports nested package structure)
+    current = Path(__file__).parent.parent.parent.parent
+    for _ in range(5):  # Walk up to 5 levels
+        pyproject_path = current / "pyproject.toml"
+        if pyproject_path.exists():
+            break
+        current = current.parent
+    else:
         raise FileNotFoundError(
-            f"pyproject.toml not found in {Path(__file__).parent.parent.parent}"
+            f"pyproject.toml not found in parent directories of {Path(__file__).parent}"
         )
 
     content = pyproject_path.read_text()

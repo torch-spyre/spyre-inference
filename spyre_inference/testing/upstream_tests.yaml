@@ -40,7 +40,6 @@ tests:
     #           hidden_size: [64]
     #   block_list:
     #     - test: "test_fused_rms_norm_quant"
-    # Currently the tests fail because upstream rtol and atol are 0
     - rel_path: tests/kernels/core/test_activation.py
       allow_list:
         - test: "test_act_and_mul"

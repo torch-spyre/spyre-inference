@@ -1,7 +1,7 @@
 # Upstream test filter configuration for spyre-inference.
 #
 # Only tests listed here will run from upstream vLLM. All other upstream
-# tests are skipped by default (opt-in / whitelist model).
+# tests are skipped by default (opt-in / allowlist model).
 #
 # block_list entries take precedence over allow_list entries.
 #
@@ -18,6 +18,9 @@
 #                     Optional tolerance config for torch.testing.assert_close:
 #                       atol: float (absolute tolerance)
 #                       rtol: float (relative tolerance)
+#   allow_list[].fixture_names Fixture names to inject for this test.
+#                              These fixtures are automatically added to the test's
+#                              fixturenames during collection.
 #   block_list[].test fnmatch glob matched against test function name
 
 tests:
@@ -68,4 +71,29 @@ tests:
               - facebook/opt-125m
       block_list:
         - test: "test_fused_rms_norm_quant"
+
+    # Model tests are now failing too :(
+    # - rel_path: tests/models/language/generation/test_common.py
+    #   allow_list:
+    #     - test: "test_models"
+    #       mode: mandatory_pass
+    #       # uses_subprocess marker is added to make these tests run first.
+    #       # This must be added for any sets of tests that use `vllm.LLM`
+    #       tags: [facebook, upstream, uses_subprocess]
+    #       params:
+    #         allow:  # skip every model except facebook/opt-125m
+    #           model:
+    #           - facebook/opt-125m
+
+    - rel_path: tests/v1/attention/test_attention_backends.py
+      allow_list:
+        - test: "test_causal_backend_correctness"
+          mode: mandatory_pass
+          tags: [attention, upstream]
+          params:
+            allow:  # skip TP cases that we don't support
+              tensor_parallel_size:
+              - 1
+          fixture_names:
+          - "patch_backend_list"
 

@@ -60,6 +60,8 @@ class AllowEntry:
                          only these parameter values will run.
         param_overrides: Parameter values to replace upstream defaults with.
         tolerances:      Optional tolerance config for torch.testing.assert_close.
+        fixture_names:   Fixture names to inject for this test (e.g. "foo" for a
+                         custom fixture that prints "hello world").
     """
 
     test: str
@@ -69,6 +71,7 @@ class AllowEntry:
     param_allows: tuple[ParamAllow, ...] = ()
     param_overrides: tuple[ParamOverride, ...] = ()
     tolerances: Tolerances | None = None
+    fixture_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

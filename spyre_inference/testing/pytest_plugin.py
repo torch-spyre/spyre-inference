@@ -45,6 +45,8 @@ import torch.testing
 from pathlib import Path
 
 import pytest
+import torch
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 import yaml
 
 from spyre_inference.testing.models import (
@@ -130,6 +132,7 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                     param_allows=tuple(param_allows),
                     param_overrides=tuple(param_overrides),
                     tolerances=tolerances,
+                    fixture_names=tuple(allow.get("fixture_names", ())),
                 )
             )
         block_list = [BlockEntry(test=b["test"]) for b in file_entry.get("block_list", [])]
@@ -337,6 +340,26 @@ def _prepare_upstream_tests_dir() -> Path:
     return tests_dir
 
 
+def _temp_upstream_code_edits(upstream_tests_dir: Path):
+    """Apply small code edits to the upstream tests directory before importing.
+
+    These should be _temporary_ edits to source code for vllm tests while we work to make them more
+    portable. This should only be used where mocking is not possible or too cumbersome.
+    """
+
+    # Mocking out torch.device seems impossible to do (at least multiple rounds of Bob and Claude
+    # were unsuccessful). So we patch the source code to change the hardcoded
+    # `torch.device("cuda:0")` to `torch.device("cpu")`.
+    hardcoded_cuda_test_path = (
+        upstream_tests_dir / "v1" / "attention" / "test_attention_backends.py"
+    )
+    with open(hardcoded_cuda_test_path) as f:
+        content = f.read()
+    content = content.replace('torch.device("cuda:0")', 'torch.device("cpu")')
+    with open(hardcoded_cuda_test_path, "w") as f:
+        f.write(content)
+
+
 # ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
@@ -377,6 +400,7 @@ def pytest_configure(config):
         try:
             # Clone vLLM to cache
             upstream_tests_base = _prepare_upstream_tests_dir()
+            _temp_upstream_code_edits(upstream_tests_base)
             config._upstream_tests_base = upstream_tests_base
 
             # Determine which test paths to inject
@@ -513,6 +537,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         # Store tolerances on item for fixture access
         if allow_entry.tolerances:
             item._spyre_tolerances = allow_entry.tolerances
+        # Inject fixtures for tests that have fixture_names defined
+        for fixture_name in allow_entry.fixture_names:
+            item.fixturenames.append(fixture_name)
 
     # Reorder tests so that tests with "uses_subprocess" marker run first
     _reorder_tests_by_name(items)
@@ -603,7 +630,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 def _spyre_default_vllm_config(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.platforms import PlatformEnum, current_platform
     from vllm.forward_context import set_forward_context
@@ -618,6 +645,7 @@ def _spyre_default_vllm_config(monkeypatch):
     config = VllmConfig(
         device_config=DeviceConfig(device="cpu"),
         compilation_config=CompilationConfig(custom_ops=["all"]),
+        model_config=ModelConfig(dtype=torch.float16),
     )
     with set_current_vllm_config(config), set_forward_context(None, config):
         # Set forward context so custom ops can access the vllm config
@@ -658,6 +686,70 @@ def relax_torch_tolerances(request, monkeypatch):
         return _original(*args, **kwargs)
 
     monkeypatch.setattr(torch.testing, "assert_close", relaxed_assert_close)
+@pytest.fixture()
+def patch_backend_list(request, monkeypatch):
+    """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
+
+    # The BACKENDS_TO_TEST list has to be patched with only our backend
+    our_backend_list = [
+        AttentionBackendEnum.CUSTOM,
+    ]
+    test_module = request.node.module
+    monkeypatch.setattr(test_module, "BACKENDS_TO_TEST", our_backend_list)
+
+    # _test_backend_correctness may be called with a hardcoded AttentionBackendEnum.FLEX_ATTENTION,
+    # which we want to ignore
+    orig_tbc = test_module._test_backend_correctness
+
+    def tbc_wrapper(
+        batch_spec, model, backend_to_test: list[AttentionBackendEnum | str], *args, **kwargs
+    ):
+        if "AttentionBackendEnum.FLEX_ATTENTION" in str(backend_to_test):
+            return
+        return orig_tbc(batch_spec, model, backend_to_test, *args, **kwargs)
+
+    monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
+
+    # Patch the KV cache layout handling to include CUSTOM backend
+    # The spyre backend uses [num_blocks, 2, block_size, num_kv_heads, head_size] layout,
+    # same as TRITON_ATTN, but the test creates KV cache as [2, num_blocks, ...] by default
+    orig_run_attention_backend = test_module.run_attention_backend
+
+    def patched_run_attention_backend(
+        backend,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        common_attn_metadata,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_type=None,
+        sliding_window=None,
+    ):
+        # Transpose KV cache for CUSTOM backend to match expected layout
+        if backend == AttentionBackendEnum.CUSTOM:
+            kv_cache = kv_cache.transpose(0, 1).contiguous()
+        return orig_run_attention_backend(
+            backend,
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            common_attn_metadata,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_type,
+            sliding_window,
+        )
+
+    monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
+
+    yield
 
 
 @pytest.hookimpl(tryfirst=True)

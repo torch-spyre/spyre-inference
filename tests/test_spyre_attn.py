@@ -10,21 +10,16 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
 )
 
-
-def is_spyre_available():
+@pytest.fixture(autouse=True)
+def requires_spyre():
+    """Lazy check that spyre devices are available.
+    This must be done lazily to avoid accessing a device at import time.
+    """
     try:
         test_tensor = torch.randn(1, device=torch.device("spyre"))
         del test_tensor
-        return True
     except Exception:
-        return False
-
-
-SPYRE_AVAILABLE = is_spyre_available()
-
-pytestmark = pytest.mark.skipif(
-    not SPYRE_AVAILABLE, reason="Spyre device not available - these tests require Spyre hardware"
-)
+        pytest.skip("Spyre device not available - these tests require Spyre hardware")
 
 NUM_HEADS = [(4, 4), (8, 2)]  # (num_query_heads, num_kv_heads)
 HEAD_SIZES = [128, 256]

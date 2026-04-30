@@ -103,6 +103,11 @@ class TorchSpyrePlatform(CpuPlatform):
         # run natively on Spyre, this can be removed to enable compilation.
         vllm_config.model_config.enforce_eager = True
 
+        # In check_and_update_config we assert this must be flaot16 for spyre.
+        # This must be set here as the default, otherwise all usage (including test fixtures) would
+        # require setting the dtype.
+        vllm_config.model_config.dtype = torch.float16
+
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
         if selected_backend == AttentionBackendEnum.CUSTOM:

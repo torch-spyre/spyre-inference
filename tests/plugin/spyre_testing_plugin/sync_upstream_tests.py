@@ -16,6 +16,7 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+from spyre_testing_plugin import pytest_plugin
 
 # Plugin package root - syncs the plugin's pyproject.toml
 PLUGIN_ROOT = Path(__file__).parent.parent
@@ -135,7 +136,7 @@ def main():
         print(f"Found vLLM commit: {vllm_commit}")
 
         # Create cache directory for downloaded files
-        cache_dir = PLUGIN_ROOT / ".cache"
+        cache_dir = pytest_plugin._cache_root() / ".cache"
         cache_dir.mkdir(exist_ok=True)
 
         # Download test.in from the vLLM repository

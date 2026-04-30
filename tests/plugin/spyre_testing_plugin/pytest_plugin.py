@@ -177,16 +177,12 @@ def _extract_vllm_commit_from_pyproject() -> str:
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    # Look for pyproject.toml in parent directories (supports nested package structure)
-    current = Path(__file__).parent.parent.parent.parent
-    for _ in range(5):  # Walk up to 5 levels
-        pyproject_path = current / "pyproject.toml"
-        if pyproject_path.exists():
-            break
-        current = current.parent
-    else:
+    # Look for pyproject.toml at repo root
+    repo_root_dir = Path(__file__).parent.parent.parent.parent
+    pyproject_path = repo_root_dir / "pyproject.toml"
+    if not pyproject_path.exists():
         raise FileNotFoundError(
-            f"pyproject.toml not found in parent directories of {Path(__file__).parent}"
+            f"pyproject.toml not found in {repo_root_dir}"
         )
 
     content = pyproject_path.read_text()

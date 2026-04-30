@@ -22,6 +22,9 @@ from spyre_testing_plugin import pytest_plugin
 PLUGIN_ROOT = Path(__file__).parent.parent
 PYPROJECT_PATH = PLUGIN_ROOT / "pyproject.toml"
 
+# Libraries to exclude from upstream test dependencies
+FILTERED_LIBRARIES = {"terratorch"}
+
 
 def extract_vllm_commit(pyproject_path: Path) -> str:
     """
@@ -83,6 +86,37 @@ def download_test_requirements(commit: str, cache_dir: Path) -> Path:
         ) from e
 
 
+def filter_requirements(test_in: Path, filtered_libs: set[str]) -> Path:
+    """
+    Filter out specified libraries from the requirements file.
+
+    Returns path to the filtered requirements file.
+    """
+    with open(test_in) as f:
+        lines = f.readlines()
+
+    filtered_lines = []
+    for line in lines:
+        # Skip empty lines and comments
+        if not line.strip() or line.strip().startswith("#"):
+            filtered_lines.append(line)
+            continue
+
+        # Extract package name (handle various formats: pkg, pkg==ver, pkg>=ver, etc.)
+        pkg_name = re.split(r"[=<>!~\[]", line.strip())[0].strip()
+
+        # Keep line if package is not in filtered list
+        if pkg_name.lower() not in {lib.lower() for lib in filtered_libs}:
+            filtered_lines.append(line)
+
+    # Write filtered content to new file
+    filtered_path = test_in.parent / f"{test_in.stem}-filtered{test_in.suffix}"
+    with open(filtered_path, "w") as f:
+        f.writelines(filtered_lines)
+
+    return filtered_path
+
+
 def clear_dependencies(pyproject_path: Path) -> None:
     """
     Clear the [project].dependencies section, keeping only pytest and pyyaml.
@@ -142,7 +176,12 @@ def main():
         # Download test.in from the vLLM repository
         test_in = download_test_requirements(vllm_commit, cache_dir)
 
-        # Clear existing dependencies (keep pytest, pyyaml)
+        # Filter out excluded libraries
+        if FILTERED_LIBRARIES:
+            print(f"Filtering out libraries: {', '.join(FILTERED_LIBRARIES)}")
+            test_in = filter_requirements(test_in, FILTERED_LIBRARIES)
+
+        # Clear existing upstream-tests section
         print("Clearing existing dependencies...")
         clear_dependencies(PYPROJECT_PATH)
 
@@ -156,7 +195,10 @@ def main():
         )
 
         if result.returncode != 0:
-            print(f"Error: uv command failed with exit code {result.returncode}", file=sys.stderr)
+            print(
+                f"Error: uv command failed with exit code {result.returncode}",
+                file=sys.stderr,
+            )
             if result.stderr:
                 print(result.stderr, file=sys.stderr)
             return 1

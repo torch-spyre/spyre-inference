@@ -13,17 +13,11 @@ Architecture:
     - CPU slicing workaround: Slice on CPU, transfer to Spyre separately to avoid
       memory corruption from slicing Spyre tensors directly
 
-Spyre Device Constraints:
-    - Computations performed in torch.float16:
-      Input (dtype defined by model / user) converted to torch.float16 for
-      operations on spyre and then converted back to original dtype for cpu.
-
 Output Shape Note:
     input shape: [..., 2*d] -> output shape: [..., d]
 
 References:
     - Upstream SiluAndMul: vllm/model_executor/layers/activation.py
-    - Pattern reference:   spyre_inference/custom_ops/linear.py
 """
 
 import torch
@@ -46,68 +40,43 @@ class SpyreSiluAndMul(SiluAndMul):
 
     Computes: x -> silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2
 
-    Fully transparent to the outer torch.compile graph — no opaque custom-op
-    boundary. Slices input on CPU before transferring to Spyre to avoid memory
-    corruption from slicing Spyre tensors directly.
+    Preserves input dtype and device. Slices on CPU to avoid Spyre slicing bugs.
     """
 
     def __init__(self, *args, **kwargs):
-        """Initialize SpyreSiluAndMul layer.
-
-        Sets up the target device (Spyre) and dtype (float16) for computation.
-        The simplified implementation computes directly in forward_oot() without
-        requiring layer registry or custom op registration.
-        """
+        """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
 
         logger.debug("Building custom SiluAndMul")
-
-        self._target_device = torch.device("spyre")
-        self._target_dtype = torch.float16
-
-        logger.warning_once(
-            "SpyreSiluAndMul: no dtype promotion (torch-spyre limitation), "
-            "expect numerical differences to upstream vLLM.",
-        )
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         """Spyre-optimized SiLU and multiply activation (SwiGLU).
 
         Computes silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2.
         
-        Implementation:
-            1. Convert to CPU and target dtype (avoids Spyre dtype conversion issues)
-            2. Slice on CPU (avoids Spyre slicing memory corruption bug)
-            3. Transfer each slice to Spyre (spyre_copy_from handles contiguity)
-            4. Compute F.silu(x1) * x2 on Spyre
-        
-        NOTE: Slicing directly on Spyre tensors causes memory corruption and
-        crashes with "free(): invalid size". This workaround ensures correctness
-        at the cost of a D2H transfer for the input tensor.
-
-        Forward pass is transparent to torch.compile - no custom op boundary.
+        Preserves the input's device and dtype. Slices on CPU to work around
+        Spyre's slicing bug which causes memory corruption and crashes.
 
         Args:
             x: Input tensor of shape [..., 2*d] containing concatenated gate halves.
 
         Returns:
-            Activated output tensor of shape [..., d] on the original device
-            with the original dtype.
+            Activated output tensor of shape [..., d] with same device and dtype as input.
         """
-        x_dtype = x.dtype
-        x_device = x.device
+        original_device = x.device
+        
+        # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
+        if x.device.type == "spyre":
+            x = convert(x, device="cpu")
+        
+        # Slice and make contiguous before transferring to Spyre.
+        # Non-contiguous slices get corrupted during transfer to Spyre!
+        d = x.shape[-1] // 2
+        x1 = x[..., :d].contiguous()
+        x2 = x[..., d:].contiguous()
+        
+        # Transfer contiguous slices back to original device.
+        x1 = convert(x1, device=original_device)
+        x2 = convert(x2, device=original_device)
 
-        # Convert dtype on CPU, slice there, then transfer each half to Spyre.
-        # spyre_copy_from makes non-contiguous slices contiguous during H2D.
-        x_cpu = x.to(device="cpu", dtype=self._target_dtype)
-        d = x_cpu.shape[-1] // 2
-        x1 = x_cpu[..., :d].to(self._target_device)
-        x2 = x_cpu[..., d:].to(self._target_device)
-
-        out = F.silu(x1) * x2
-        return convert(out, device=x_device, dtype=x_dtype)
-
-
-def register():
-    """No-op: the custom-op barrier has been removed."""
-    logger.debug("SpyreSiluAndMul: no custom ops to register")
+        return F.silu(x1) * x2

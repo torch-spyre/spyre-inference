@@ -51,7 +51,7 @@ class SpyreParallelLMHead(ParallelLMHead):
 
     Weights reside on Spyre after model.to(spyre_device).
     The quant_method is replaced so that LogitsProcessor._get_logits()
-    routes through forward_oot, which handles device/dtype conversion
+    routes through forward_oot, which handles device conversion
     and runs F.linear on Spyre.
     """
 
@@ -78,11 +78,29 @@ class SpyreParallelLMHead(ParallelLMHead):
         if isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-        logger.warning_once(
-            "%s: no dtype promotion (torch-spyre limitation), "
-            "expect numerical differences to upstream vLLM.",
-            self.__class__.__name__,
-        )
+        # torch-spyre currently has a limitation with the work division of larger
+        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
+        # an integer.
+        self.padding = 0
+        pad_1 = self.weight.shape[0] % 64
+        if pad_1 == 0:
+            pad_2 = 32 - (self.weight.shape[0] / 64) % 32
+            if pad_2 > 0:
+                self.padding = int(pad_2 * 64)
+                self.padded_weight = F.pad(self.weight, (0, 0, 0, self.padding))
+                logger.warning_once(
+                    "%s: weights padded from %d to %d (torch-spyre limitation)"
+                    "expect numerical differences to upstream vLLM.",
+                    self.__class__.__name__, self.weight.shape[0], self.padded_weight.shape[0],
+                )
+        else:
+            raise ValueError('The weight dimension must be a multiple of 64.')
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        if self.padding > 0:
+            self.padded_weight = fn(self.padded_weight)
+        return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """OOT forward pass — lm_head matmul on Spyre.
@@ -99,19 +117,18 @@ class SpyreParallelLMHead(ParallelLMHead):
             Logits tensor [num_tokens, vocab_size] on the input device
         """
         x_device = x.device
-        # w_device = self.weight.data.device
 
         # Due to a limitation of the current SpyreModelRunner, 
         # the input to the SpyreParallelLMHead resides on CPU.
         # Due to a second limitation regarding sizes that can be used
-        # in a F.linear layer, this operation is currently executed on CPU.
+        # in a F.linear layer, the original weights need to be padded
         out = self.maybe_compiled_forward_spyre(
-            x,
-            convert(self.weight.data, device=x_device),
-            convert(bias, device=x_device) if bias is not None else None,
+            convert(x, device=self.weight.device),
+            self.padded_weight.data,
+            bias if bias is not None else None,
         )
 
-        return convert(out, device=x_device)
+        return convert(out[:, :-self.padding] if self.padding > 0 else out, device=x_device)
 
     @staticmethod
     def forward_spyre(

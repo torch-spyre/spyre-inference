@@ -34,40 +34,18 @@ import os
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model", type=str, default="ibm-ai-platform/micro-g3.3-8b-instruct-1b")
-    parser.add_argument("--max_model_len", "--max-model-len", type=int, default=2048)
-    parser.add_argument("--max_num_seqs", "--max-num-seqs", type=int, default=2)
-    parser.add_argument("--max_num_batched_tokens", "--max-num-batched-tokens", type=int, default=2)
+    parser.add_argument("--max-model-len", type=int, default=2048, dest="max_model_len")
+    parser.add_argument("--max-num-seqs", type=int, default=2, dest="max_num_seqs")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=2, dest="max_num_batched_tokens")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--num-prompts", "-n", type=int, default=3)
-    parser.add_argument(
-        "--max-tokens",
-        type=str,
-        default="20,65",
-        help="Comma separated list of max tokens to use for each prompt. "
-        "This list is repeated until prompts are exhausted.",
-    )
-    parser.add_argument("--compare-with-cpu", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--attention_backend", "--attention-backend", type=str, default=None)
-    parser.add_argument(
-        "--enforce_eager",
-        "--enforce-eager",
-        action="store_true",
-        help="Skip torch.compile, run in eager mode",
-    )
-    parser.add_argument(
-        "--custom_ops",
-        "--custom-ops",
-        type=str,
-        nargs="*",
-        default=None,
-        help=(
-            "Custom ops to enable (e.g., `--custom_ops +RMSNorm +SiluAndMul`). "
-            "Set `--custom_ops none` to disable all custom ops. "
-            "If not set, custom_ops is set to 'all' for both eager and compile mode."
-        ),
-    )
+    parser.add_argument("-n", "--num-prompts", type=int, default=3, dest="num_prompts")
+    parser.add_argument("--max-tokens", type=str, default="20,65", dest="max_tokens", help="Comma-separated list of max tokens per prompt (cycled if shorter than num_prompts)")
+    parser.add_argument("--compare-with-cpu", action="store_true", dest="compare_with_cpu", help="Compare results with HuggingFace CPU inference")
+    parser.add_argument("--attention-backend", type=str, default=None, dest="attention_backend", help="Attention backend to use (e.g., SPYRE, CPU)")
+    parser.add_argument("--enforce-eager", action="store_true", dest="enforce_eager", help="Skip torch.compile, run in eager mode")
+    parser.add_argument("--custom-ops", type=str, nargs="*", default=None, dest="custom_ops", help="Custom ops to enable (e.g., `--custom-ops +RMSNorm +SiluAndMul`). Set `--custom-ops none` to disable all custom ops. If not set, custom_ops is set to 'all' for both eager and compile mode.")
     return parser.parse_args()
 
 

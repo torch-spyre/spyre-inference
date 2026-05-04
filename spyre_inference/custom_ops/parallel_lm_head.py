@@ -10,20 +10,18 @@ Architecture:
     - forward_oot(): Entry point for OOT dispatch, handles device conversion
       and runs the compiled F.linear on Spyre
     - Separate Compilation: forward_spyre is compiled independently via
-      maybe_compile
+      maybe_compile (no opaque custom-op boundary)
     - quant_method override: SpyreUnquantizedLMHeadMethod.apply() calls
       forward_oot() so that LogitsProcessor._get_logits() routes through
       the Spyre path
 
 Spyre Device Constraints:
-    - Computations performed in torch.float16
     - No Tensor Parallelism (TP) support: tp_size > 1 raises NotImplementedError
     - No quantization support: only UnquantizedEmbeddingMethod is replaced
 
 References:
     - Upstream ParallelLMHead:
       vllm/model_executor/layers/vocab_parallel_embedding.py
-    - Pattern reference: spyre_inference/custom_ops/silu_and_mul.py
 """
 
 import torch
@@ -101,15 +99,19 @@ class SpyreParallelLMHead(ParallelLMHead):
             Logits tensor [num_tokens, vocab_size] on the input device
         """
         x_device = x.device
-        w_device = self.weight.data.device
+        # w_device = self.weight.data.device
 
+        # Due to a limitation of the current SpyreModelRunner, 
+        # the input to the SpyreParallelLMHead resides on CPU.
+        # Due to a second limitation regarding sizes that can be used
+        # in a F.linear layer, this operation is currently executed on CPU.
         out = self.maybe_compiled_forward_spyre(
-            convert(x, w_device),
-            self.weight.data,
-            bias if bias is not None else None,
+            x,
+            convert(self.weight.data, device=x_device),
+            convert(bias, device=x_device) if bias is not None else None,
         )
 
-        return convert(out, x_device)
+        return convert(out, device=x_device)
 
     @staticmethod
     def forward_spyre(

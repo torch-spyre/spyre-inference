@@ -8,6 +8,9 @@ description = "pytest plugin for spyre-inference upstream test integration"
 readme = "README.md"
 license = {text = "Apache 2"}
 dependencies = [
+    "pytest",
+    "pyyaml",
+    # upstream vLLM test dependencies: see sync_upstream_test_deps
     "albumentations>=2.0.8",
     "arctic-inference==0.1.1",
     "av>=17.0.1",
@@ -45,14 +48,12 @@ dependencies = [
     "plotly>=6.6.0",
     "pqdm>=0.2.0",
     "pydantic>=2.12",
-    "pytest",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
     "pytest-forked>=1.6.0",
     "pytest-rerunfailures>=16.1",
     "pytest-shard>=0.1.2",
     "pytest-timeout>=2.3.1",
-    "pyyaml",
     "ray[cgraph,default]>=2.48.0",
     "resampy>=0.4.3",
     "runai-model-streamer[azure,gcs,s3]==0.15.7",
@@ -82,7 +83,7 @@ spyre_inference_test = "spyre_testing_plugin.pytest_plugin"
 
 # Register the CLI entrypoint for syncing upstream test dependencies
 [project.scripts]
-sync-upstream-tests = "spyre_testing_plugin.sync_upstream_tests:main"
+sync-upstream-test-deps = "spyre_testing_plugin.sync_upstream_test_deps:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -4,9 +4,9 @@ Sync upstream test dependencies with vLLM test dependencies.
 Run this whenever the vLLM version is updated to keep test dependencies in sync.
 
 Usage:
-    python -m spyre_testing_plugin.sync_upstream_tests
+    python -m spyre_testing_plugin.sync_upstream_test_deps
     # or
-    uv run sync-upstream-tests
+    uv run sync-upstream-test-deps
 """
 
 import re
@@ -125,7 +125,6 @@ def clear_dependencies(pyproject_path: Path) -> None:
         lines = f.readlines()
 
     result, inside, depth = [], False, 0
-    skip_line = False
     for i, line in enumerate(lines):
         # Detect start of dependencies array
         if not inside and re.match(r'^dependencies\s*=\s*\[', line):
@@ -148,6 +147,57 @@ def clear_dependencies(pyproject_path: Path) -> None:
 
     with open(pyproject_path, "w") as f:
         f.writelines(result)
+
+
+def reorder_dependencies(pyproject_path: Path) -> None:
+    """
+    Reorder dependencies so pytest and pyyaml come first, followed by a comment
+    separating them from the upstream vLLM test dependencies.
+    """
+    with open(pyproject_path) as f:
+        content = f.read()
+
+    # Extract the dependencies array
+    match = re.search(r'^(dependencies\s*=\s*\[)\s*\n(.*?)(^\])', content, re.MULTILINE | re.DOTALL)
+    if not match:
+        return
+
+    prefix = match.group(1)
+    body = match.group(2)
+    suffix = match.group(3)
+
+    # Parse individual dependency lines (ignore comments)
+    deps = []
+    for line in body.strip().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            deps.append(stripped.rstrip(","))
+
+    # Separate our deps from upstream deps
+    our_deps = []
+    upstream_deps = []
+    for dep in deps:
+        # Remove quotes for comparison
+        name = dep.strip('"').split("[")[0].split("=")[0].split(">")[0].split("<")[0].split("!")[0]
+        if name in ("pytest", "pyyaml"):
+            our_deps.append(dep)
+        else:
+            upstream_deps.append(dep)
+
+    # Rebuild the dependencies section
+    lines = [f"{prefix}\n"]
+    for dep in our_deps:
+        lines.append(f"    {dep},\n")
+    lines.append("    # upstream vLLM test dependencies: see sync_upstream_test_deps\n")
+    for dep in upstream_deps:
+        lines.append(f"    {dep},\n")
+    lines.append(f"{suffix}\n")
+
+    new_section = "".join(lines)
+    new_content = content[:match.start()] + new_section + content[match.end() + 1:]
+
+    with open(pyproject_path, "w") as f:
+        f.write(new_content)
 
 
 def main():
@@ -202,6 +252,9 @@ def main():
             if result.stderr:
                 print(result.stderr, file=sys.stderr)
             return 1
+
+        # Reorder so pytest/pyyaml come first with a separator comment
+        reorder_dependencies(PYPROJECT_PATH)
 
         print("Done.")
         print("Review changes to tests/plugin/pyproject.toml before committing.")

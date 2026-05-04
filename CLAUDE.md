@@ -75,7 +75,7 @@ This keeps test infrastructure out of the production package.
   - `spyre_testing_plugin/pytest_plugin.py` - Main plugin with pytest hooks
   - `spyre_testing_plugin/models.py` - Data models for YAML config
   - `spyre_testing_plugin/upstream_tests.yaml` - Test filter configuration
-  - `spyre_testing_plugin/sync_upstream_tests.py` - Script to sync vLLM test dependencies
+  - `spyre_testing_plugin/sync_upstream_test_deps.py` - Script to sync vLLM test dependencies
 
 **Environment variables:**
 - `SKIP_UPSTREAM_TESTS=1` - Skip upstream tests
@@ -88,10 +88,10 @@ Whenever vLLM is updated, the dependencies of the test plugin need to be updated
 
 ```bash
 # From the workspace root
-uv run sync-upstream-tests
+uv run sync-upstream-test-deps
 
 # Or run as a module
-python -m spyre_testing_plugin.sync_upstream_tests
+python -m spyre_testing_plugin.sync_upstream_test_deps
 ```
 
 ## Build Configuration

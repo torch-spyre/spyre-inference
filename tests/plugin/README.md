@@ -18,6 +18,6 @@ The plugin is automatically discovered by pytest via the `pytest11` entry point.
 
 ```bash
 cd tests/plugin
-uv sync
+uv sync --inexact
 uv run pytest
 ```

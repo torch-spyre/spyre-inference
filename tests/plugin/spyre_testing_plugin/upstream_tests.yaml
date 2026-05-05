@@ -1,0 +1,85 @@
+# Upstream test filter configuration for spyre-inference.
+#
+# Only tests listed here will run from upstream vLLM. All other upstream
+# tests are skipped by default (opt-in / allowlist model).
+#
+# block_list entries take precedence over allow_list entries.
+#
+# Fields:
+#   rel_path          Path relative to upstream vLLM repo root
+#   allow_list[].test fnmatch glob matched against test function name
+#   allow_list[].mode mandatory_pass (default) | xfail | xfail_strict
+#   allow_list[].tags Labels applied as pytest markers (filterable via -m)
+#   allow_list[].params.skip
+#                     Parameter name -> list of values to skip
+#   allow_list[].params.override
+#                     Parameter name -> replacement values (replaces upstream defaults)
+#   allow_list[].tolerances
+#                     Optional tolerance config for torch.testing.assert_close:
+#                       atol: float (absolute tolerance)
+#                       rtol: float (relative tolerance)
+#   allow_list[].fixture_names Fixture names to inject for this test.
+#                              These fixtures are automatically added to the test's
+#                              fixturenames during collection.
+#   block_list[].test fnmatch glob matched against test function name
+
+tests:
+  files:
+    # RMSNorm tests require either https://github.com/vllm-project/vllm/pull/36246 or vLLM IR
+    # changes to merge in order to pass
+    # - rel_path: tests/kernels/core/test_layernorm.py
+    #   allow_list:
+    #     - test: "test_rms_norm"
+    #       mode: mandatory_pass
+    #       tags: [rmsnorm, upstream]
+    #       params:
+    #         skip:
+    #           strided_input: [true]
+    #         override:
+    #           num_tokens: [1, 16]
+    #           hidden_size: [64]
+    #   block_list:
+    #     - test: "test_fused_rms_norm_quant"
+    - rel_path: tests/kernels/core/test_activation.py
+      allow_list:
+        - test: "test_act_and_mul"
+          mode: mandatory_pass
+          tags: [siluandmul, upstream]
+          params:
+            allow:
+              activation: [silu_and_mul]
+            override:
+              num_tokens: [1, 7, 63, 64, 65, 83, 1024]
+              # Odd values fail op check. Not required for current list of models we plan to support
+              d: [8, 64, 512, 13824]
+              dtype: [torch.float32]
+              device: [cpu]
+          tolerances:
+            atol: 1e-2
+            rtol: 1e-2
+
+    # Model tests are now failing too :(
+    # - rel_path: tests/models/language/generation/test_common.py
+    #   allow_list:
+    #     - test: "test_models"
+    #       mode: mandatory_pass
+    #       # uses_subprocess marker is added to make these tests run first.
+    #       # This must be added for any sets of tests that use `vllm.LLM`
+    #       tags: [facebook, upstream, uses_subprocess]
+    #       params:
+    #         allow:  # skip every model except facebook/opt-125m
+    #           model:
+    #           - facebook/opt-125m
+
+    - rel_path: tests/v1/attention/test_attention_backends.py
+      allow_list:
+        - test: "test_causal_backend_correctness"
+          mode: mandatory_pass
+          tags: [attention, upstream]
+          params:
+            allow:  # skip TP cases that we don't support
+              tensor_parallel_size:
+              - 1
+          fixture_names:
+          - "patch_backend_list"
+

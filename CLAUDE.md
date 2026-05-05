@@ -67,10 +67,32 @@ uv run ty
 
 ### Upstream Test Configuration
 
-Environment variables for `tests/conftest.py`:
+The pytest plugin is packaged separately as `spyre-testing-plugin` in `tests/plugin/`.
+This keeps test infrastructure out of the production package.
+
+**Plugin package structure:**
+- `tests/plugin/` - Separate pytest plugin package
+  - `spyre_testing_plugin/pytest_plugin.py` - Main plugin with pytest hooks
+  - `spyre_testing_plugin/models.py` - Data models for YAML config
+  - `spyre_testing_plugin/upstream_tests.yaml` - Test filter configuration
+  - `spyre_testing_plugin/sync_upstream_test_deps.py` - Script to sync vLLM test dependencies
+
+**Environment variables:**
 - `SKIP_UPSTREAM_TESTS=1` - Skip upstream tests
 - `VLLM_COMMIT=<sha>` - Override vLLM commit
 - `UPSTREAM_TESTS_PATHS=models/language/generation` - Paths to sync from vLLM
+
+**Syncing upstream test dependencies:**
+
+Whenever vLLM is updated, the dependencies of the test plugin need to be updated as well.
+
+```bash
+# From the workspace root
+uv run sync-upstream-test-deps
+
+# Or run as a module
+python -m spyre_testing_plugin.sync_upstream_test_deps
+```
 
 ## Build Configuration
 

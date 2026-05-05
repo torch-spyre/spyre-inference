@@ -44,6 +44,29 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
     def apply(self, layer, x, bias=None):
         return layer.forward_oot(x, bias)
 
+    def process_weights_after_loading(self, layer):
+        super().process_weights_after_loading(layer)
+
+        # torch-spyre currently has a limitation with the work division of larger
+        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
+        # an integer.
+        layer.padding = 0
+        pad_1 = layer.weight.shape[0] % 64
+        if pad_1 != 0:
+            raise ValueError("The weight dimension must be a multiple of 64.")
+        pad_2 = (layer.weight.shape[0] // 64) % 32
+        if pad_2 > 0:
+            pad_2 = 32 - pad_2
+            layer.padding = pad_2 * 64
+            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, layer.padding))
+            logger.warning_once(
+                "%s: weights padded from %d to %d (torch-spyre limitation) "
+                "expect numerical differences to upstream vLLM.",
+                layer.__class__.__name__, layer.weight.shape[0],
+                layer.padded_weight.shape[0],
+            )
+        else:
+            layer.padded_weight = layer.weight
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
@@ -78,28 +101,9 @@ class SpyreParallelLMHead(ParallelLMHead):
         if isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-        # torch-spyre currently has a limitation with the work division of larger
-        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
-        # an integer.
-        self.padding = 0
-        pad_1 = self.weight.shape[0] % 64
-        if pad_1 == 0:
-            pad_2 = 32 - (self.weight.shape[0] / 64) % 32
-            if pad_2 > 0:
-                self.padding = int(pad_2 * 64)
-                self.padded_weight = F.pad(self.weight, (0, 0, 0, self.padding))
-                logger.warning_once(
-                    "%s: weights padded from %d to %d (torch-spyre limitation)"
-                    "expect numerical differences to upstream vLLM.",
-                    self.__class__.__name__, self.weight.shape[0], self.padded_weight.shape[0],
-                )
-        else:
-            raise ValueError('The weight dimension must be a multiple of 64.')
-
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
-        if self.padding > 0:
-            self.padded_weight = fn(self.padded_weight)
+        self.padded_weight = fn(self.padded_weight)
         return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -125,7 +129,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         out = self.maybe_compiled_forward_spyre(
             convert(x, device=self.weight.device),
             self.padded_weight.data,
-            bias if bias is not None else None,
+            bias,
         )
 
         return convert(out[:, :-self.padding] if self.padding > 0 else out, device=x_device)

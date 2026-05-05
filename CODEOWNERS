@@ -2,7 +2,7 @@
 # Format: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owners for the entire repository
-* @joerunde @tdoublep @RajalakshmiSR @rishikakedia
+* @joerunde @tdoublep @RajalakshmiSR @rishikakedia @bohnstingl
 
 # Core platform and registration
 spyre_inference/platform.py @joerunde @yannicks1

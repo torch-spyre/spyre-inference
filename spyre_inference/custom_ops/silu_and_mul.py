@@ -80,3 +80,4 @@ class SpyreSiluAndMul(SiluAndMul):
         x2 = convert(x2, device=original_device)
 
         return F.silu(x1) * x2
+

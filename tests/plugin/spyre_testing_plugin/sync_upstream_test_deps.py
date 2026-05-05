@@ -1,10 +1,12 @@
 """
-Sync upstream-tests dependency group with vLLM test dependencies.
+Sync upstream test dependencies with vLLM test dependencies.
 
 Run this whenever the vLLM version is updated to keep test dependencies in sync.
 
 Usage:
-    python scripts/sync_upstream_tests.py
+    python -m spyre_testing_plugin.sync_upstream_test_deps
+    # or
+    uv run sync-upstream-test-deps
 """
 
 import re
@@ -14,8 +16,11 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+from spyre_testing_plugin import pytest_plugin
 
-PROJECT_ROOT = Path(__file__).parent.parent
+# Plugin package root - syncs the plugin's pyproject.toml
+PLUGIN_ROOT = Path(__file__).parent.parent
+PYPROJECT_PATH = PLUGIN_ROOT / "pyproject.toml"
 
 # Libraries to exclude from upstream test dependencies
 FILTERED_LIBRARIES = {"terratorch"}
@@ -35,7 +40,6 @@ def extract_vllm_commit(pyproject_path: Path) -> str:
 
         # Handle both single source and list of sources
         if isinstance(vllm_source, list):
-            # If it's a list, find the one with git and rev
             for source in vllm_source:
                 if isinstance(source, dict) and "git" in source and "rev" in source:
                     return source["rev"]
@@ -113,27 +117,31 @@ def filter_requirements(test_in: Path, filtered_libs: set[str]) -> Path:
     return filtered_path
 
 
-def clear_upstream_tests_section(pyproject_path: Path) -> None:
+def clear_dependencies(pyproject_path: Path) -> None:
     """
-    Clear the upstream-tests dependency group, leaving an empty group
-    so uv doesn't error on it being referenced in default-groups.
+    Clear the [project].dependencies section, keeping only pytest and pyyaml.
     """
     with open(pyproject_path) as f:
         lines = f.readlines()
 
     result, inside, depth = [], False, 0
-    for line in lines:
-        if not inside and re.match(r"^upstream-tests\s*=\s*\[", line):
+    for i, line in enumerate(lines):
+        # Detect start of dependencies array
+        if not inside and re.match(r'^dependencies\s*=\s*\[', line):
             inside = True
             depth = line.count("[") - line.count("]")
-            result.append("upstream-tests = []\n")
-            if depth <= 0:
+            # Start fresh dependencies with minimal base
+            result.append('dependencies = [\n    "pytest",\n    "pyyaml",\n')
+            if depth <= 0 and ']' in line:
+                # Single-line array, skip to end
                 inside = False
             continue
         if inside:
             depth += line.count("[") - line.count("]")
             if depth <= 0:
                 inside = False
+                # Close the array
+                result.append(']\n')
             continue
         result.append(line)
 
@@ -141,23 +149,78 @@ def clear_upstream_tests_section(pyproject_path: Path) -> None:
         f.writelines(result)
 
 
+def reorder_dependencies(pyproject_path: Path) -> None:
+    """
+    Reorder dependencies so pytest and pyyaml come first, followed by a comment
+    separating them from the upstream vLLM test dependencies.
+    """
+    with open(pyproject_path) as f:
+        content = f.read()
+
+    # Extract the dependencies array
+    match = re.search(r'^(dependencies\s*=\s*\[)\s*\n(.*?)(^\])', content, re.MULTILINE | re.DOTALL)
+    if not match:
+        return
+
+    prefix = match.group(1)
+    body = match.group(2)
+    suffix = match.group(3)
+
+    # Parse individual dependency lines (ignore comments)
+    deps = []
+    for line in body.strip().splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            deps.append(stripped.rstrip(","))
+
+    # Separate our deps from upstream deps
+    our_deps = []
+    upstream_deps = []
+    for dep in deps:
+        # Remove quotes for comparison
+        name = dep.strip('"').split("[")[0].split("=")[0].split(">")[0].split("<")[0].split("!")[0]
+        if name in ("pytest", "pyyaml"):
+            our_deps.append(dep)
+        else:
+            upstream_deps.append(dep)
+
+    # Rebuild the dependencies section
+    lines = [f"{prefix}\n"]
+    for dep in our_deps:
+        lines.append(f"    {dep},\n")
+    lines.append("    # upstream vLLM test dependencies: see sync_upstream_test_deps\n")
+    for dep in upstream_deps:
+        lines.append(f"    {dep},\n")
+    lines.append(f"{suffix}\n")
+
+    new_section = "".join(lines)
+    new_content = content[:match.start()] + new_section + content[match.end() + 1:]
+
+    with open(pyproject_path, "w") as f:
+        f.write(new_content)
+
+
 def main():
     if len(sys.argv) > 1:
-        print(f"Usage: {sys.argv[0]}", file=sys.stderr)
+        print(f"Usage: python -m spyre_testing_plugin.sync_upstream_tests", file=sys.stderr)
         return 1
 
-    pyproject_path = PROJECT_ROOT / "pyproject.toml"
-    if not pyproject_path.exists():
-        print(f"Error: {pyproject_path} not found", file=sys.stderr)
+    if not PYPROJECT_PATH.exists():
+        print(f"Error: {PYPROJECT_PATH} not found", file=sys.stderr)
         return 1
 
     try:
-        # Extract vLLM commit from pyproject.toml
-        vllm_commit = extract_vllm_commit(pyproject_path)
+        # Extract vLLM commit from the ROOT pyproject.toml (workspace root)
+        root_pyproject = PLUGIN_ROOT.parent.parent / "pyproject.toml"
+        if not root_pyproject.exists():
+            print(f"Error: Root pyproject.toml not found at {root_pyproject}", file=sys.stderr)
+            return 1
+
+        vllm_commit = extract_vllm_commit(root_pyproject)
         print(f"Found vLLM commit: {vllm_commit}")
 
         # Create cache directory for downloaded files
-        cache_dir = PROJECT_ROOT / ".cache"
+        cache_dir = pytest_plugin._cache_root() / ".cache"
         cache_dir.mkdir(exist_ok=True)
 
         # Download test.in from the vLLM repository
@@ -169,14 +232,14 @@ def main():
             test_in = filter_requirements(test_in, FILTERED_LIBRARIES)
 
         # Clear existing upstream-tests section
-        print("Clearing existing upstream-tests section...")
-        clear_upstream_tests_section(pyproject_path)
+        print("Clearing existing dependencies...")
+        clear_dependencies(PYPROJECT_PATH)
 
         # Add dependencies using uv
         print(f"Adding dependencies from {test_in}...")
         result = subprocess.run(
-            ["uv", "add", "--group", "upstream-tests", "--no-sync", "-r", test_in],
-            cwd=PROJECT_ROOT,
+            ["uv", "add", "--no-sync", "-r", test_in],
+            cwd=PLUGIN_ROOT,
             stderr=subprocess.PIPE,
             text=True,
         )
@@ -190,8 +253,11 @@ def main():
                 print(result.stderr, file=sys.stderr)
             return 1
 
+        # Reorder so pytest/pyyaml come first with a separator comment
+        reorder_dependencies(PYPROJECT_PATH)
+
         print("Done.")
-        print("Review changes to pyproject.toml and uv.lock before committing.")
+        print("Review changes to tests/plugin/pyproject.toml before committing.")
         return 0
 
     except Exception as e:

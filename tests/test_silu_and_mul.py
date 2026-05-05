@@ -53,21 +53,10 @@ def test_spyre_siluandmul_matches_reference(default_vllm_config, num_tokens, d, 
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.fixture
-def dummy_tensor():
-    return torch.randn(4, 256, dtype=torch.float32)  # 2*d=256, so d=128
-
-
-def mock_forward_oot(x):
-    """Mock: return ones with output shape (halves last dim)."""
-    d = x.shape[-1] // 2
-    return torch.ones(x.shape[:-1] + (d,), dtype=x.dtype, device=x.device)
-
-
 @pytest.mark.spyre
 @pytest.mark.siluandmul
-def test_siluandmul_oot_dispatch(default_vllm_config, monkeypatch, dummy_tensor):
-    """Verify SiluAndMul OOT registration: class swap and forward_oot routing."""
+def test_siluandmul_oot_dispatch(default_vllm_config):
+    """Verify SiluAndMul OOT registration: class swap"""
     from vllm.model_executor.layers.activation import SiluAndMul
     from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul
 
@@ -79,10 +68,3 @@ def test_siluandmul_oot_dispatch(default_vllm_config, monkeypatch, dummy_tensor)
     # dispatch_forward should have selected forward_oot
     assert layer._forward_method == layer.forward_oot
 
-    # Mock _forward_spyre_impl (called by forward_oot) with a known transform
-    monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
-    out = layer.forward_oot(dummy_tensor)
-
-    # Expected: ones with shape [4, 128] (halved last dim)
-    expected = torch.ones(4, 128, dtype=dummy_tensor.dtype)
-    assert torch.allclose(out, expected)

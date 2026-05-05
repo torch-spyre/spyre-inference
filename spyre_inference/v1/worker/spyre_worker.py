@@ -46,52 +46,21 @@ class TorchSpyreWorker(CPUWorker):
         register_all()
 
     def init_device(self) -> None:
-        # Call the relevant parts from the CPUWorker upstream, but don't create the CPUModelRunner
-        
-        # Check whether critical libraries are loaded
-        def check_preloaded_libs(name: str):
-            ld_preload_list = os.environ.get("LD_PRELOAD", "")
-            if name not in ld_preload_list:
-                logger.warning(
-                    "%s is not found in LD_PRELOAD. "
-                    "For best performance, please follow the section "
-                    "`set LD_PRELOAD` in "
-                    "https://docs.vllm.ai/en/latest/getting_started/installation/cpu/ "
-                    "to setup required pre-loaded libraries.",
-                    name,
-                )
-
-        if sys.platform.startswith("linux"):
-            check_preloaded_libs("libtcmalloc")
-            if current_platform.get_cpu_architecture() == CpuArchEnum.X86:
-                check_preloaded_libs("libiomp")
-
-        def skip_set_num_threads(x: int):
-            logger.warning(
-                "CPU backend doesn't allow to use "
-                "`torch.set_num_threads` after the thread binding, skip it."
-            )
-
-        torch.set_num_threads = skip_set_num_threads
-
-        # Note: unique identifier for creating allreduce shared memory
-        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
-        # Initialize the distributed environment.
-        init_worker_distributed_environment(
-            self.vllm_config,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-            current_platform.dist_backend,
-        )
-        # Set random seed.
-        set_random_seed(self.model_config.seed)
-
-        # Construct Spyre model runner with torch.device("spyre")
-        self.model_runner = TorchSpyreModelRunner(
+        import vllm.v1.worker.cpu_worker as cpu_worker_module
+                                
+        # Patch the CPUModelRunner with the TorchSpyreModelRunner
+        original = cpu_worker_module.CPUModelRunner
+        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )
+        try:
+            # We will invoke the upstream init_device method with the
+            # CPUModelRunner patched. This will ensure that everthing for the CPUWorker is setup,
+            # but the spyre-specific model runner is instantiated instead.
+            super().init_device()
+        finally:
+            cpu_worker_module.CPUModelRunner = original
 
     def compile_or_warm_up_model(self) -> float:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420

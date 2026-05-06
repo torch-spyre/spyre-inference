@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Spyre OOT replacements for RotaryEmbedding and ApplyRotaryEmb.
 
-Mirrors the upstream `forward_static` bodies. All ops run on CPU today:
-spyre lacks dynamic tensor indexing (index_select, chunk, last-dim
-slicing) and its fp16 multiply diverges from CPU fp16 by ~16 ULPs per
-op, which flips tokens under greedy decoding. The OOT class structure
-is kept so arithmetic can migrate back to spyre when both issues lift.
+Mirrors the upstream `forward_static` bodies. 
+
+Limitations:
+    *) All ops run on CPU today: spyre lacks dynamic tensor indexing,
+    such as `index_select`, `chunk`, last-dim slicing, etc. 
+    *) FP16 multiply diverges from CPU, which flips tokens under greedy decoding. 
+    Thus, for the moment, the multiplications in `SpyreApplyRotaryEmb` need to run on CPU
+    *) No promotion of the data types, as this is not yet supported in torch-spyre.
+    
 """
 
 import torch
@@ -42,6 +46,7 @@ class SpyreApplyRotaryEmb(ApplyRotaryEmb):
 
         origin_dtype = x_cpu.dtype
         if self.enable_fp32_compute:
+            raise RuntimeError("Spyre currently doesn't support dtype upcasting!")
             x_cpu = x_cpu.float()
 
         cos_cpu = cos_cpu.unsqueeze(-2).to(x_cpu.dtype)

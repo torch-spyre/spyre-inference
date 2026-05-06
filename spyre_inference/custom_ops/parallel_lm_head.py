@@ -98,8 +98,8 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)
 
-        if isinstance(self.quant_method, UnquantizedEmbeddingMethod):
-            self.quant_method = SpyreUnquantizedLMHeadMethod()
+        # Set the custom quantization method to route through spyre
+        self.quant_method = SpyreUnquantizedLMHeadMethod()
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
@@ -110,8 +110,9 @@ class SpyreParallelLMHead(ParallelLMHead):
         """OOT forward pass — lm_head matmul on Spyre.
 
         Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Converts x to the weight device,
-        runs the compiled F.linear, and converts back to the input device.
+        LogitsProcessor._get_logits(). Converts x (arriving on cpu) 
+        to the weight device (residing on spyre), runs the compiled F.linear on spyre
+        and converts back to the x device (cpu).
 
         Args:
             x: Hidden states tensor [num_tokens, hidden_dim]
@@ -122,9 +123,10 @@ class SpyreParallelLMHead(ParallelLMHead):
         """
         x_device = x.device
 
-        # Due to a limitation of the current SpyreModelRunner, 
+        # Due to indexing operations inside the ModelRunner, which have
+        # to be carried out on cpu due to a torch-spyre limitation, 
         # the input to the SpyreParallelLMHead resides on CPU.
-        # Due to a second limitation regarding sizes that can be used
+        # Due to a second limitation of torch-spyre regarding sizes that can be used
         # in a F.linear layer, the original weights need to be padded
         out = self.maybe_compiled_forward_spyre(
             convert(x, device=self.weight.device),

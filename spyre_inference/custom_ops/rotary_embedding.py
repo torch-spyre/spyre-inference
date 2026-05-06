@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Spyre OOT replacements for RotaryEmbedding and ApplyRotaryEmb.
 
+<<<<<<< HEAD
 Mirrors the upstream `forward_static` bodies. 
 
 Limitations:
@@ -11,12 +12,20 @@ Limitations:
     Thus, for the moment, the multiplications in `SpyreApplyRotaryEmb` need to run on CPU
     *) No promotion of the data types, as this is not yet supported in torch-spyre.
     
+=======
+Keeps cos_sin_cache on CPU. Inputs are moved to
+CPU for computation, and outputs are copied back to the original device.
+>>>>>>> 2ab1af6 (feat: add rotary_embedding to model runner)
 """
 
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+<<<<<<< HEAD
 from vllm.model_executor.layers.rotary_embedding.common import ApplyRotaryEmb
+=======
+from functools import lru_cache
+>>>>>>> 2ab1af6 (feat: add rotary_embedding to model runner)
 
 from .utils import convert
 
@@ -24,6 +33,7 @@ from .utils import convert
 logger = init_logger(__name__)
 
 
+<<<<<<< HEAD
 @ApplyRotaryEmb.register_oot(name="ApplyRotaryEmb")
 class SpyreApplyRotaryEmb(ApplyRotaryEmb):
     """Spyre OOT variant of ApplyRotaryEmb.
@@ -134,3 +144,99 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         x_pass = x[..., self.rotary_dim:]
         x_rot = self.apply_rotary_emb(x_rot, cos, sin)
         return torch.cat((x_rot, x_pass), dim=-1).reshape(x_shape)
+=======
+@RotaryEmbedding.register_oot(name="RotaryEmbedding")
+class SpyreRotaryEmbedding(RotaryEmbedding):
+    """RotaryEmbedding on spyre with CPU-only cos/sin computation."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        scaling_type = getattr(self, "scaling_type", "default")
+        rope_parameters = getattr(self, "rope_parameters", {}) or {}
+
+        is_supported = (
+            scaling_type == "default"
+            and "mrope_section" not in rope_parameters
+            and ("use_fope" not in rope_parameters or not rope_parameters["use_fope"])
+        )
+
+        if not is_supported:
+            raise NotImplementedError(
+                f"SpyreRotaryEmbedding only supports default scaling without mrope_section or fope."
+                f"Got scaling_type={scaling_type}, rope_parameters={rope_parameters}"
+            )
+
+        logger.debug("Building Spyre RotaryEmbedding")
+
+        # Precompute inverse frequencies
+        dim = self.rotary_dim
+        base = self.base
+
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+        )
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+    def _compute_cos_sin_cpu(self, positions: torch.Tensor):
+        inv_freq = convert(self.inv_freq, device="cpu")
+        freqs = torch.outer(positions, inv_freq)  # [seq, d/2]
+        
+        cos = freqs.cos()
+        sin = freqs.sin()
+
+        cos = torch.cat([cos, cos], dim=-1)
+        sin = torch.cat([sin, sin], dim=-1)
+
+        return cos, sin
+
+    def _apply_rotary(self, x, cos, sin):
+        """Apply rotary embedding (runs on original device)."""
+
+        T, hidden = x.shape
+        H = hidden // self.head_size
+
+        # --- reshape to heads ---
+        x = x.view(T, H, self.head_size)
+        d = self.rotary_dim
+        x_rot = x[..., :d]          # [T, H, d]
+        x_pass = x[..., d:]         # [T, H, D-d]
+
+        #--- reshape cos/sin properly ---
+        cos = cos.unsqueeze(1)      # [T, 1, d]
+        sin = sin.unsqueeze(1)
+
+        # --- split ---
+        d_half = d // 2
+        x1 = x_rot[..., :d_half]
+        x2 = x_rot[..., d_half:]
+
+        # --- rotate---
+        x_rotated = torch.cat([-x2, x1], dim=-1)
+
+        # --- apply rope ---
+        out = (x_rot * cos) + (x_rotated * sin)
+        # --- concat ---
+        out = torch.cat([out, x_pass], dim=-1)
+        # --- flatten back ---
+        return out.reshape(T, hidden)
+
+    def forward_oot(self, positions, q, k):
+        original_device = q.device
+        dtype = q.dtype
+
+        # --- move positions to CPU ---
+        positions_cpu = convert(positions, device="cpu")
+        # --- compute cos/sin on CPU ---
+        cos_cpu, sin_cpu = self._compute_cos_sin_cpu(positions_cpu)
+        
+        # --- move back to device ---
+        cos = convert(cos_cpu.to(dtype), device=original_device)
+        sin = convert(sin_cpu.to(dtype), device=original_device)
+
+        # --- apply rotary ---
+        q = self._apply_rotary(q, cos, sin)
+        k = self._apply_rotary(k, cos, sin)
+
+        return q, k
+>>>>>>> 2ab1af6 (feat: add rotary_embedding to model runner)

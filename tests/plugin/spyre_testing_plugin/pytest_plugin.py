@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import torch.distributed as dist
 import torch.testing
 
 from pathlib import Path
@@ -657,6 +658,58 @@ def _spyre_default_vllm_config(monkeypatch):
 @pytest.fixture()
 def default_vllm_config(monkeypatch):
     yield from _spyre_default_vllm_config(monkeypatch)
+
+
+@pytest.fixture(scope="session")
+def _distributed_init():
+    """Initialize torch.distributed with gloo backend once per test session.
+
+    Uses a FileStore so no network port is required. The process group is
+    destroyed at the end of the session.
+    """
+    fd, store_path = tempfile.mkstemp(suffix=".store")
+    os.close(fd)
+    try:
+        store = dist.FileStore(store_path, 1)
+        dist.init_process_group(
+            backend="gloo",
+            store=store,
+            world_size=1,
+            rank=0,
+        )
+        yield
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if os.path.exists(store_path):
+            os.unlink(store_path)
+
+
+@pytest.fixture()
+def tp_group(_distributed_init, default_vllm_config):
+    """Set up a real TP=1 GroupCoordinator inside vLLM's parallel_state.
+
+    Depends on `default_vllm_config` so the VllmConfig context and OOT
+    platform patch are already active when the GroupCoordinator is created.
+    After the test the previous _TP value is restored.
+
+    Tests that create vLLM linear layers should use this fixture instead of
+    (or in addition to) `default_vllm_config`.
+    """
+    from vllm.distributed.parallel_state import GroupCoordinator
+    import vllm.distributed.parallel_state as ps
+
+    group = GroupCoordinator(
+        group_ranks=[[0]],
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        use_device_communicator=False,
+        group_name="tp",
+    )
+    original_tp = ps._TP
+    ps._TP = group
+    yield group
+    ps._TP = original_tp
 
 
 @pytest.fixture()

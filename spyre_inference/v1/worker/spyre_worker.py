@@ -1,15 +1,11 @@
 """A Torch Spyre worker class."""
 
-import os
-import sys
 import torch
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
-from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-from vllm.utils.torch_utils import set_random_seed
-from vllm.platforms import CpuArchEnum, current_platform
+import vllm.v1.worker.cpu_worker as cpu_worker_module
 
 from spyre_inference.custom_ops import register_all
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
@@ -45,9 +41,7 @@ class TorchSpyreWorker(CPUWorker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-    def init_device(self) -> None:
-        import vllm.v1.worker.cpu_worker as cpu_worker_module
-                                
+    def init_device(self) -> None:                                
         # Patch the CPUModelRunner with the TorchSpyreModelRunner
         original = cpu_worker_module.CPUModelRunner
         cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(
@@ -56,7 +50,7 @@ class TorchSpyreWorker(CPUWorker):
         )
         try:
             # We will invoke the upstream init_device method with the
-            # CPUModelRunner patched. This will ensure that everthing for the CPUWorker is setup,
+            # CPUModelRunner patched. This will ensure that everything for the CPUWorker is setup,
             # but the spyre-specific model runner is instantiated instead.
             super().init_device()
         finally:

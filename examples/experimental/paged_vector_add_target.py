@@ -155,8 +155,7 @@ def paged_vector_add(
         #   as a new tensor in DRAM
         sum = a_pages[a_page_table[i]] + b_pages[b_page_table[i]]
         # in the future, we would also like to do SLICING with indirect access...
-        #   (e.g. required for hybrid models, but also for tuning prefill 
-        #    and decode heavy batches)
+        #   (see comment below)
         # also, the format of the indirect views needs to be compatile with 
         #   attention computation, esp. torch.matmul/torch.bmm
         # for paged attention, there would be THREE indirect access tensors
@@ -167,6 +166,19 @@ def paged_vector_add(
         # (also, masking and padding would be required for this type 
         #   of "compiled loop" computation, but this can be done in
         #   the attention metadata creation on CPU)
+
+
+# comment for SLICING and indirect_access:
+# Based on our experience, we need to have different "Tile sizes" within the
+# paged attention computation that are _different_ from the "page sizes" of vLLM,
+# for e.g. apply different optimizations for prefill/decode.
+# One way to implement this would be via Slicing. We imagine smth like this:
+#   - in case TILE_SIZE > PAGE_SIZE
+#       a_pages[a_page_table[i:i+2]]
+#   - in case TILE_SIZE < PAGE_SIZE
+#       a_pages[a_page_table[i],:8]
+# (This is of course a more complex discussion, I just added the comment here
+#  to make clear that also slicing would be critical in the future.)
 
 
 def create_compilable_paged_vector_add(page_table_length):

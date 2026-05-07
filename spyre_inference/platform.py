@@ -102,7 +102,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_name = vllm_config.model_config.model if vllm_config.model_config else "N/A"
 
-        logger.info(message, version, model_name)
+        print(message % (version, model_name), flush=True)
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:

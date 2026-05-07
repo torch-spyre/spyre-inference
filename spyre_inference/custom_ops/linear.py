@@ -12,8 +12,10 @@ layer classes used inside MLP blocks:
     - SpyreRowParallelLinear          — replaces RowParallelLinear
       (vllm/model_executor/layers/linear.py)
 
-Since tensor_parallel=1 is assumed, both classes are functionally equivalent
-to F.linear(input, weight, bias) and share the same implementation pattern.
+At TP=1, the upstream forward() methods reduce to quant_method.apply() + bias
+handling.  We inject a custom quant_method (SpyreUnquantizedLinearMethod) that
+performs F.linear directly, QKV and RowParallel still override forward()
+for device placement (D2H after GEMM, H2D before GEMM).
 
 Spyre Device Constraints:
     - Computations performed in torch.float16:
@@ -22,185 +24,81 @@ Spyre Device Constraints:
     - Tensor parallelism: TP=1 assumed (single Spyre device)
 
 References:
-    - Upstream linear layers: vllm/model_executor/layers/linear.py
-    - Pattern reference:      spyre_inference/custom_ops/rms_norm.py
+    - Upstream linear layers:   vllm/model_executor/layers/linear.py
 """
 
-import torch
 import torch.nn.functional as F
-from functools import lru_cache
 
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 
-from .utils import convert, register_layer, get_layer, _fake_impl
+from .utils import convert
 
 logger = init_logger(__name__)
 
 
-class SpyreLinearBase:
-    """Shared implementation for Spyre linear layers at TP=1."""
+class SpyreUnquantizedLinearMethod(UnquantizedLinearMethod):
+    """Spyre-specific linear method: F.linear without platform GEMM dispatch.
 
-    def _init_spyre_linear(self, layer_prefix: str):
-        """Common initialization for Spyre linear layers."""
+    Replaces the default UnquantizedLinearMethod so that upstream forward()
+    methods work unchanged on Spyre at TP=1.
+
+    - create_weights() is inherited — standard ModelWeightParameter works.
+    - apply() does F.linear directly (no platform-specific GEMM dispatch).
+    - process_weights_after_loading() is a no-op (skips CPU GEMM dispatch).
+    """
+
+    def apply(self, layer, x, bias=None):
+        return F.linear(x, layer.weight.data, bias)
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+
+class SpyreLinearBase:
+    """Shared initialization for Spyre linear layers at TP=1."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         if self.tp_size > 1:
             raise NotImplementedError(
                 f"{self.__class__.__name__} only supports TP=1, got TP={self.tp_size}"
             )
 
-        logger.debug("Building custom %s", self.__class__.__name__)
-
-        self._target_device = torch.device("spyre")
-        self._target_dtype = torch.float16
-
-        # NOTE: Using torch.compile directly here since PluggableLayer (unlike CustomOp)
-        # does not provide a maybe_compile method. This should be revisited in the future
-        # to align with vLLM's compilation infrastructure once PluggableLayer supports
-        # compilation hooks similar to CustomOp.maybe_compile.
-        self.maybe_compiled_forward_spyre = torch.compile(self.forward_spyre, dynamic=False)
-        self._layer_name = register_layer(self, layer_prefix)
-
-        logger.warning_once(
-            "%s: no dtype promotion (torch-spyre limitation),"
-            "expect numerical differences to upstream vLLM.",
-            self.__class__.__name__,
-        )
-
-    def forward_spyre(
-        self,
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return F.linear(x, weight, bias)
-
-    def _forward_spyre_impl(self, x: torch.Tensor) -> torch.Tensor:
-        x_dtype = x.dtype
-        x_device = x.device
-
-        # Bias is fused into F.linear only when not skipping bias add
-        bias = self.bias.data if (self.bias is not None and not self.skip_bias_add) else None
-
-        out = self.maybe_compiled_forward_spyre(
-            convert(x, self._target_device, self._target_dtype),
-            convert(self.weight.data, self._target_device, self._target_dtype),
-            convert(bias, self._target_device, self._target_dtype) if bias is not None else None,
-        )
-
-        return convert(out, dtype=x_dtype, device=x_device)
+        if isinstance(self.quant_method, UnquantizedLinearMethod):
+            self.quant_method = SpyreUnquantizedLinearMethod()
 
 
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
 class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinear):
     """Spyre MergedColumnParallelLinear (TP=1 only)."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._init_spyre_linear("spyre_merged_col_linear")
-
-    # `MergedColumnParallelLinear` is a PluggableLayer and we register a class as OOT,
-    # thus, the `forward` method is invoked when the OOT is triggered.
-    def forward(self, input_: torch.Tensor):
-        if input_.device.type == "spyre":
-            output = self._forward_spyre_impl(input_)
-        else:
-            output = input_.new_empty(
-                input_.shape[0],
-                self.output_size_per_partition,
-            )
-            torch.ops.vllm.spyre_merged_col_linear(input_, output, self._layer_name)
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
 class SpyreQKVParallelLinear(SpyreLinearBase, QKVParallelLinear):
     """Spyre QKVParallelLinear (TP=1 only)."""
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._init_spyre_linear("spyre_qkv_parallel_linear")
-
-    def forward(self, input_: torch.Tensor):
-        if input_.device.type == "spyre":
-            output = self._forward_spyre_impl(input_)
-            # D2H before downstream .split() — Spyre can't handle strided views
-            output = convert(output, device="cpu")
-        else:
-            output = input_.new_empty(
-                input_.shape[0],
-                self.output_size_per_partition,
-            )
-            torch.ops.vllm.spyre_qkv_parallel_linear(input_, output, self._layer_name)
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+    def forward(self, input_):
+        result = super().forward(input_)
+        # D2H before downstream .split() — Spyre can't handle strided views
+        if self.return_bias:
+            return convert(result[0], device="cpu"), result[1]
+        return convert(result, device="cpu")
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
 class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
-    """Spyre RowParallelLinear (TP=1 only)."""
+    """Spyre RowParallelLinear (TP=1 only).
+    RowParallelLinear is currently invoked from `GraniteAttention` where
+    `input_` is on `cpu` and from `GraniteMLP` where `input_` is on spyre.
+    Thus, we always convert the `input_` to `spyre`, which is a NoOp in
+    case of `GraniteMLP`.
+    """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._init_spyre_linear("spyre_row_parallel_linear")
-
-    # `SpyreRowParallelLinear` is a PluggableLayer and we register a class as OOT,
-    # thus, the `forward` method is invoked when the OOT is triggered.
-    def forward(self, input_: torch.Tensor):
-        if input_.device.type == "spyre":
-            output = self._forward_spyre_impl(input_)
-        else:
-            output = input_.new_empty(
-                *input_.shape[:-1],
-                self.output_size_per_partition,
-            )
-            torch.ops.vllm.spyre_row_parallel_linear(input_, output, self._layer_name)
-            # Always output on Spyre — needed for residual add with Spyre hidden_states
-            output = convert(output, device=self._target_device, dtype=self._target_dtype)
-
-        if not self.return_bias:
-            return output
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
-
-def _make_spyre_linear_op_func(op_name: str):
-    def _op_func(
-        x: torch.Tensor,
-        output: torch.Tensor,
-        layer_name: str,
-    ) -> None:
-        layer = get_layer(layer_name)
-        result = layer._forward_spyre_impl(x)
-        output.copy_(result)
-
-    _op_func.__name__ = f"_{op_name}_op_func"
-    return _op_func
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register Spyre linear custom ops."""
-    for op_name in [
-        "spyre_merged_col_linear",
-        "spyre_qkv_parallel_linear",
-        "spyre_row_parallel_linear",
-    ]:
-        direct_register_custom_op(
-            op_name=op_name,
-            op_func=_make_spyre_linear_op_func(op_name),
-            mutates_args=["output"],
-            fake_impl=_fake_impl,
-        )
-        logger.info("Registered custom op: %s", op_name)
+    def forward(self, input_):
+        return super().forward(convert(input_, device=self.weight.device))

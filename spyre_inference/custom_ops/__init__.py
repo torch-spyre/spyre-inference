@@ -15,9 +15,4 @@ logger = init_logger(__name__)
 @lru_cache(maxsize=1)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
-<<<<<<< HEAD
-=======
-    vocab_parallel_embedding.register()
-    parallel_lm_head.register()
->>>>>>> 2ab1af6 (feat: add rotary_embedding to model runner)
     rms_norm.register()

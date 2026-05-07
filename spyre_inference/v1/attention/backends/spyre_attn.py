@@ -20,6 +20,18 @@ Terminology:
   - aligned_max_seq_len: max_seq_len rounded up to a multiple of
     KV_LENGTH_ALIGNMENT (256), bucketing sequence lengths to reduce
     torch.compile recompilations.
+  - num_tokens: number of real (non-padding) tokens inserted into the KV cache this
+    forward — i.e. num_actual_tokens from AttentionMetadata. 1 during decode, chunk
+    size during prefill. Drives the shapes of the per-call scatter selectors.
+  - padded_query_len: max_query_len rounded up to a multiple of QUERY_CHUNK_SIZE (32),
+    keeping the attention kernel's tensor shapes constant across steps to avoid
+    torch.compile recompilation.
+
+Naming:
+  - `_dev` suffix: tensor resides on Spyre (device), not CPU.
+  - `k_cache_dev` / `v_cache_dev`: the full paged KV cache (Spyre-resident, persists across steps).
+  - `k_new_*` / `v_new_*`: newly arrived token K/V for the current forward, to be scattered into the cache.
+  - `compact_k` / `compact_v`: dense K/V for the active sequence, gathered from the cache.
 """
 
 from dataclasses import dataclass
@@ -51,11 +63,8 @@ QUERY_CHUNK_SIZE = 32
 # Tokens land at different block rows and column offsets, requiring
 # advanced indexing to construct the values tensor (not supported on Spyre).
 
-def _scatter_prefill(cache, mask, values):
+def _scatter_cache(cache, mask, values):
     return cache * (1.0 - mask) + values
-
-
-_compiled_scatter_prefill = torch.compile(_scatter_prefill, dynamic=False)
 
 
 # --- Attention ---
@@ -66,9 +75,6 @@ def _attn_4d(q, k, v, scale, mask):
     scores = scores + mask
     p = scores.softmax(dim=-1)
     return p @ v
-
-
-_compiled_attn = torch.compile(_attn_4d, dynamic=False)
 
 
 @dataclass
@@ -115,9 +121,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Scatter position mask on Spyre: [num_kv_heads, aligned_num_physical_blocks, block_width]
     scatter_mask_dev: torch.Tensor | None = None
 
-    # Flat scatter indices for vectorized CPU values fill
-    scatter_row_idx: torch.Tensor | None = None  # [num_tokens * head_size]
-    scatter_col_idx: torch.Tensor | None = None  # [num_tokens * head_size]
+    # Scatter row selector on Spyre: [num_kv_heads, aligned_num_physical_blocks, num_tokens]
+    # one-hot: row_sel[h, r, t] = 1 iff block_indices[t] == r (broadcast-identical across heads)
+    scatter_row_sel_dev: torch.Tensor | None = None
+
+    # Scatter column placement selector on Spyre: [num_tokens, head_size, block_width]
+    # one-hot: col_sel[t, d, c] = 1 iff c == block_offsets[t]*head_size + d
+    scatter_col_sel_dev: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -241,10 +251,20 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         sel_mask_3d = sel_mask_2d.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
         return sel_mask_3d.to(device=self._target_device)
 
-    def _build_scatter_mask(
+    def _build_scatter_mask_and_selectors(
         self,
         slot_mapping: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build scatter mask and on-device selectors for two-bmm scatter.
+
+        Returns (scatter_mask_dev, scatter_row_sel_dev, scatter_col_sel_dev):
+          - scatter_mask_dev:    [num_kv_heads, aligned_num_physical_blocks, block_width]
+                                  — positions written by this step
+          - scatter_row_sel_dev: [num_kv_heads, aligned_num_physical_blocks, num_tokens]
+                                  — row_sel[h,r,t] = 1 iff block_indices[t]==r
+          - scatter_col_sel_dev: [num_tokens, head_size, block_width]
+                                  — col_sel[t,d,c] = 1 iff c == block_offsets[t]*head_size + d
+        """
         block_size = self.block_size
         aligned_num_physical_blocks = self.aligned_num_physical_blocks
         block_width = self.block_width
@@ -261,9 +281,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         mask = torch.zeros(num_kv_heads, aligned_num_physical_blocks, block_width, dtype=self._target_dtype)
         mask[:, row_idx, col_idx] = 1.0
-
         mask_dev = mask.to(device=self._target_device)
-        return mask_dev, row_idx, col_idx
+
+        # row_sel: [aligned_num_physical_blocks, num_tokens], one-hot on block_indices
+        row_sel_2d = torch.zeros(aligned_num_physical_blocks, num_tokens, dtype=self._target_dtype)
+        t_range = torch.arange(num_tokens)
+        row_sel_2d[block_indices.long(), t_range] = 1.0
+        row_sel_3d = row_sel_2d.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
+        row_sel_dev = row_sel_3d.to(device=self._target_device)
+
+        # col_sel: [num_tokens, head_size, block_width], one-hot on block_offsets*head_size + d_range
+        col_sel = torch.zeros(num_tokens, head_size, block_width, dtype=self._target_dtype)
+        base_col = (block_offsets * head_size).long()  # [num_tokens]
+        t_idx = t_range.unsqueeze(1).expand(num_tokens, head_size)             # [num_tokens, head_size]
+        d_idx = d_range.unsqueeze(0).expand(num_tokens, head_size)             # [num_tokens, head_size]
+        c_idx = base_col.unsqueeze(1) + d_idx                                   # [num_tokens, head_size]
+        col_sel[t_idx.reshape(-1), d_idx.reshape(-1), c_idx.reshape(-1)] = 1.0
+        col_sel_dev = col_sel.to(device=self._target_device)
+
+        return mask_dev, row_sel_dev, col_sel_dev
 
     def build(
         self,
@@ -302,8 +338,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             block_table, seq_lens, aligned_max_seq_len,
         )
 
-        scatter_mask_dev, scatter_row_idx, scatter_col_idx = self._build_scatter_mask(
-            slot_mapping,
+        scatter_mask_dev, scatter_row_sel_dev, scatter_col_sel_dev = (
+            self._build_scatter_mask_and_selectors(slot_mapping)
         )
 
         return SpyreAttentionMetadata(
@@ -323,8 +359,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             gather_sel_mask_dev=gather_sel_mask_dev,
             aligned_max_seq_len=aligned_max_seq_len,
             scatter_mask_dev=scatter_mask_dev,
-            scatter_row_idx=scatter_row_idx,
-            scatter_col_idx=scatter_col_idx,
+            scatter_row_sel_dev=scatter_row_sel_dev,
+            scatter_col_sel_dev=scatter_col_sel_dev,
         )
 
 
@@ -439,15 +475,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             device=self._target_device,
         )
 
-        self._k_vals_buf = torch.zeros(
-            self.num_kv_heads, self._aligned_num_physical_blocks, self._block_width,
-            dtype=self._target_dtype,
-        )
-        self._v_vals_buf = torch.zeros(
-            self.num_kv_heads, self._aligned_num_physical_blocks, self._block_width,
-            dtype=self._target_dtype,
-        )
-
     def forward(
         self,
         layer: torch.nn.Module,
@@ -474,13 +501,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if self._k_cache_dev is None:
             self._init_device_cache(kv_cache.shape[0], attn_metadata.block_size)
 
-        # Step 1: Scatter — mask is precomputed by builder, only fill values per layer
+        # Step 1: Scatter — selectors precomputed by builder, transfer compact K/V and place on Spyre
         self._scatter_to_device_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
             attn_metadata.scatter_mask_dev,
-            attn_metadata.scatter_row_idx,
-            attn_metadata.scatter_col_idx,
+            attn_metadata.scatter_row_sel_dev,
+            attn_metadata.scatter_col_sel_dev,
         )
 
         # Step 2: Gather — sel_mask is precomputed by builder and lives on Spyre
@@ -509,25 +536,33 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         scatter_mask_dev: torch.Tensor,
-        row_idx: torch.Tensor,
-        col_idx: torch.Tensor,
+        row_sel_dev: torch.Tensor,
+        col_sel_dev: torch.Tensor,
     ) -> None:
-        """Scatter: build values on CPU, transfer to Spyre."""
-        num_kv_heads = self.num_kv_heads
+        """Scatter: transfer compact K/V to Spyre, place via two bmms against one-hot selectors."""
+        # Compact per-layer transfer: [num_tokens, num_kv_heads, head_size] on Spyre
+        k_new_dev = key.to(self._target_dtype).to(self._target_device).contiguous()      # [num_tokens, num_kv_heads, head_size]
+        v_new_dev = value.to(self._target_dtype).to(self._target_device).contiguous()
 
-        k_flat = key.transpose(0, 1).reshape(num_kv_heads, -1).to(self._target_dtype)
-        v_flat = value.transpose(0, 1).reshape(num_kv_heads, -1).to(self._target_dtype)
+        # bmm 1: place each token's head_size-vector into its block-width slot.
+        # [num_tokens, num_kv_heads, head_size] @ [num_tokens, head_size, block_width]
+        #   -> [num_tokens, num_kv_heads, block_width]
+        k_spread = torch.bmm(k_new_dev, col_sel_dev)
+        v_spread = torch.bmm(v_new_dev, col_sel_dev)
 
-        self._k_vals_buf.zero_()
-        self._v_vals_buf.zero_()
-        self._k_vals_buf[:, row_idx, col_idx] = k_flat
-        self._v_vals_buf[:, row_idx, col_idx] = v_flat
+        # Permute to [num_kv_heads, num_tokens, block_width] for the row-placement bmm
+        k_spread = k_spread.transpose(0, 1).contiguous()
+        v_spread = v_spread.transpose(0, 1).contiguous()
 
-        k_vals_dev = self._k_vals_buf.to(device=self._target_device)
-        v_vals_dev = self._v_vals_buf.to(device=self._target_device)
+        # bmm 2: route each token row to its physical block row.
+        # [num_kv_heads, aligned_num_physical_blocks, num_tokens]
+        #   @ [num_kv_heads, num_tokens, block_width]
+        #   -> [num_kv_heads, aligned_num_physical_blocks, block_width]
+        k_vals = torch.bmm(row_sel_dev, k_spread)
+        v_vals = torch.bmm(row_sel_dev, v_spread)
 
-        self._k_cache_dev = _compiled_scatter_prefill(self._k_cache_dev, scatter_mask_dev, k_vals_dev)
-        self._v_cache_dev = _compiled_scatter_prefill(self._v_cache_dev, scatter_mask_dev, v_vals_dev)
+        self._k_cache_dev = _scatter_cache(self._k_cache_dev, scatter_mask_dev, k_vals)
+        self._v_cache_dev = _scatter_cache(self._v_cache_dev, scatter_mask_dev, v_vals)
 
     def _gather_from_device_cache(
         self,
@@ -552,14 +587,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _compute_attention(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        compact_k: torch.Tensor,
+        compact_v: torch.Tensor,
         mask: torch.Tensor,
-        device: torch.device,
-        dtype: torch.dtype,
+        output_device: torch.device,
+        output_dtype: torch.dtype,
     ) -> torch.Tensor:
         num_seqs, max_query_len, num_heads, head_size = query.shape
-        _, num_kv_heads, kv_len, _ = key.shape
+        _, num_kv_heads, kv_len, _ = compact_k.shape
         num_queries_per_kv = self.num_queries_per_kv
 
         padded_query_len = (
@@ -577,14 +612,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         q = query.transpose(1, 2).contiguous()
         q = q.reshape(num_seqs * num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
 
-        k = key.reshape(num_seqs * num_kv_heads, 1, kv_len, head_size)
-        v = value.reshape(num_seqs * num_kv_heads, 1, kv_len, head_size)
+        k = compact_k.reshape(num_seqs * num_kv_heads, 1, kv_len, head_size)
+        v = compact_v.reshape(num_seqs * num_kv_heads, 1, kv_len, head_size)
 
         q_spyre = convert(q, self._target_device, self._target_dtype)
 
-        output_spyre = _compiled_attn(q_spyre, k, v, self.scale, mask)
+        output_spyre = _attn_4d(q_spyre, k, v, self.scale, mask)
 
-        output_4d = convert(output_spyre, device, dtype)
+        output_4d = convert(output_spyre, output_device, output_dtype)
         output_reshaped = output_4d.reshape(num_seqs, num_heads, padded_query_len, head_size)
         output = output_reshaped.transpose(1, 2).contiguous()
         return output[:, :max_query_len, :, :]

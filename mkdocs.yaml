@@ -1,0 +1,91 @@
+site_name: Spyre Inference Plugin
+site_url: https://torch-spyre.github.io/spyre-inference/
+repo_url: https://github.com/torch-spyre/spyre-inference
+exclude_docs: |
+  *.inc.md
+  *.template.md
+theme:
+  name: material
+  custom_dir: docs/mkdocs/overrides
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      toggle:
+        icon: material/brightness-2
+        name: Switch to system preference
+  version:
+    provider: mike
+  features:
+    - content.code.copy
+    - content.tabs.link
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.prune
+    - navigation.top
+    - search.highlight
+    - search.share
+    - toc.follow
+
+hooks:
+  - docs/mkdocs/hooks/generate_examples.py
+  - docs/mkdocs/hooks/url_schemes.py
+
+plugins:
+  - meta
+  - search
+  - autorefs
+  - awesome-nav
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            filters: []
+            summary:
+              modules: true
+            show_if_no_docstring: true
+            show_signature_annotations: true
+            separate_signature: true
+            show_overloads: true
+            signature_crossrefs: true
+          inventories:
+          - https://docs.python.org/3/objects.inv
+          - https://pytorch.org/docs/stable/objects.inv
+
+markdown_extensions:
+  - attr_list
+  - md_in_html
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - toc:
+      permalink: true
+
+use_directory_urls: false

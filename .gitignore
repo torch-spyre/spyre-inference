@@ -39,3 +39,6 @@ htmlcov/
 # probable secrets
 .env
 
+# mkdocs documentation
+/site
+docs/examples

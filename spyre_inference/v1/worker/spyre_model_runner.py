@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Spyre-specific model runner for vLLM v1.
 
 Inherits from GPUModelRunner to preserve the CpuGpuBuffer
@@ -14,7 +28,7 @@ Data flow in the current WIP version:
 - There are few exceptions where a CPU fallback is currently needed:
   - Attention block: Spyre input → CPU (and partial Spyre) compute → Spyre output.
   - Layers that are not yet wrapped for torch-spyre,
-    for example RotaryEmbedding or ParallelLMHead
+    for example RotaryEmbedding
 
 As the TorchSpyreModelRunner is evolving, more layers will natively support inputs
 arriving as a Spyre tensor and perform their operations on Spyre.
@@ -103,8 +117,9 @@ class _SpyreModelWrapper:
 
     Output conversion (Spyre → CPU):
         The model's final hidden_states come out on Spyre. Downstream
-        operations (indexing via logits_indices, compute_logits/lm_head,
-        sampling) all run on CPU.
+        operations (indexing via logits_indices, sampling) run on CPU.
+        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
+        which handles H2D/D2H for the sample_hidden_states subset.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -226,8 +241,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         # SpyreCpuFallbackMixin._apply() no-op keeps CPU fallback layer
-        # weights on CPU (linear, embedding, rotary, lm_head).
-        # Spyre-native layers (RMSNorm, SiluAndMul) get their weights moved.
+        # weights on CPU (linear, embedding, rotary).
+        # Spyre-native layers (RMSNorm, SiluAndMul, ParallelLMHead) get
+        # their weights moved.
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
 

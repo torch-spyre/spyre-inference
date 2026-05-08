@@ -2,6 +2,8 @@ nav:
   - Home: README.md
   - Getting Started:
     - Installation: getting_started/installation.md
+  - Architecture:
+    - Plugin Overview: architecture/index.md
   - Examples:
     - Offline Inference: examples/offline_inference
   - Developer Guide:

@@ -1,0 +1,162 @@
+direction: down
+
+api: "n >= 1 API server procs" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  APIServer: APIServer {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  AsyncLLM: AsyncLLM {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  EngineClient: EngineClient {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+
+  APIServer -> AsyncLLM -> EngineClient
+}
+
+engine: "1 engine core proc" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  EngineCore: EngineCore {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  Scheduler: Scheduler {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  KVCacheManager: KVCacheManager {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+
+  EngineCore -> Scheduler
+  EngineCore -> KVCacheManager
+}
+
+worker: "n == num devices worker procs (TP, DP)" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  CPUWorker: CPUWorker {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyreWorker: TorchSpyreWorker {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+
+  GPUModelRunner: GPUModelRunner {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyreModelRunner: TorchSpyreModelRunner {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  SpyreWrapper: "_SpyreModelWrapper\n(I/O device conversion)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+
+  Model: "Model\nwith Spyre custom ops" {
+    style.fill: "#827717"
+    style.stroke: "#558b2f"
+    style.font-color: "#ffffff"
+  }
+
+  AttentionBackend: AttentionBackend {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyreAttnBackend: SpyreAttentionBackend {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  SpyreAttnImpl: SpyreAttentionImpl {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  SpyreMetaBuilder: SpyreAttentionMetadataBuilder {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+
+  Sampler: Sampler {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+
+  CPUWorker -> SpyreWorker: "▷" {style.stroke-dash: 3}
+  GPUModelRunner -> SpyreModelRunner: "▷" {style.stroke-dash: 3}
+  AttentionBackend -> SpyreAttnBackend: "▷" {style.stroke-dash: 3}
+
+  SpyreWorker -> SpyreModelRunner: has-a
+  SpyreModelRunner -> SpyreWrapper: wraps
+  SpyreWrapper -> Model: has-a
+  SpyreModelRunner -> SpyreAttnBackend: uses
+  SpyreModelRunner -> Sampler
+  SpyreAttnBackend -> SpyreAttnImpl: creates
+  SpyreAttnBackend -> SpyreMetaBuilder: creates
+}
+
+platform: "Platform API (used in all processes)" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  CpuPlatform: CpuPlatform {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyrePlatform: TorchSpyrePlatform {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  CudaPlatform: CudaPlatform {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+
+  CpuPlatform -> SpyrePlatform: "▷" {style.stroke-dash: 3}
+}
+
+api.EngineClient -> engine.EngineCore: {style.stroke-dash: 3}
+engine.EngineCore -> worker.CPUWorker: "executes via"

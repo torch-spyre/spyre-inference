@@ -1,0 +1,141 @@
+direction: down
+
+bookends: "Model Bookends" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+  direction: right
+
+  EMB: "VocabParallelEmbedding\nint64 → float16" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  LM: "SpyreParallelLMHead\nfloat16 → logits\nvocab padded to 64×32" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+}
+
+granite: "Granite-3 8B Decoder Layer (× 32)" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  N1: "SpyreRMSNorm" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  QKV: "SpyreQKVParallelLinear" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  ROPE: "SpyreRotaryEmbedding\n(CPU fallback)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  ATTN: "SpyreAttentionImpl\n(mixed CPU+Spyre)" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
+    style.font-color: "#ffffff"
+  }
+  O_PROJ: "SpyreRowParallelLinear" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  N2: "SpyreRMSNorm" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  GATE: "SpyreMergedColumnParallelLinear" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  ACT: "SpyreSiluAndMul" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  DOWN: "SpyreRowParallelLinear" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+
+  N1 -> QKV -> ROPE -> ATTN -> O_PROJ
+  O_PROJ -> N2: "+residual"
+  N2 -> GATE -> ACT -> DOWN
+}
+
+attn_detail: "SpyreAttentionImpl Pipeline" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  S1: "Update KV cache\n(scatter via slot_mapping)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  S2: "Gather KV pages\n(compact + pad to 256)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  S3: "Q @ Kᵀ\n(batched matmul on Spyre)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  S4: "Causal mask + softmax" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  S5: "Attn @ V\n(batched matmul on Spyre)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  S6: "Extract output\n(trim padding)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+
+  S1 -> S2 -> S3 -> S4 -> S5 -> S6
+}
+
+bookends.EMB -> granite: "hidden states"
+granite -> bookends.LM: "final hidden"
+granite.ATTN -> attn_detail: "detail" {style.stroke-dash: 3}
+
+legend: " " {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+  direction: right
+
+  L1: "Spyre device" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  L2: "CPU fallback" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  L3: "Mixed CPU + Spyre" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
+    style.font-color: "#ffffff"
+  }
+}

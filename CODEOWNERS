@@ -15,15 +15,3 @@ spyre_inference/v1/worker/ @bohnstingl @joerunde
 
 # Attention backend (PyTorch-native Spyre attention)
 spyre_inference/v1/attention/ @jvlunteren
-
-# Test infrastructure and pytest plugins
-tests/ @joerunde @romitjain
-
-# CI/CD workflows
-.github/workflows/ @romitjain @joerunde
-
-# Documentation
-docs/ @joerunde @rafvasq
-
-# Build configuration
-pyproject.toml @joerunde @yannicks1

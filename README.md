@@ -67,7 +67,7 @@ See [Contributing Guide](docs/contributing/README.md) for:
 
 ## License
 
-Apache 2.0
+[Apache-2.0](LICENSE)
 
 ## Related Projects
 

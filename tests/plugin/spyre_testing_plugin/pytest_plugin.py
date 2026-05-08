@@ -738,7 +738,7 @@ def _distributed_init(_spyre_session_config):
             os.unlink(store_path)
 
 
-@pytest.fixture()
+@pytest.fixture(scope="session")
 def tp_group(_distributed_init):
     """Set up a real TP=1 GroupCoordinator inside vLLM's parallel_state.
 

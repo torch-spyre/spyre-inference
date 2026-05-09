@@ -65,7 +65,7 @@ class SpyreSiluAndMul(SiluAndMul):
         """Spyre-optimized SiLU and multiply activation (SwiGLU).
 
         Computes silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2.
-        
+
         Preserves the input's device and dtype. Slices on CPU to work around
         Spyre's slicing bug which causes memory corruption and crashes.
 
@@ -76,20 +76,19 @@ class SpyreSiluAndMul(SiluAndMul):
             Activated output tensor of shape [..., d] with same device and dtype as input.
         """
         original_device = x.device
-        
+
         # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
         if x.device.type == "spyre":
             x = convert(x, device="cpu")
-        
+
         # Slice and make contiguous before transferring to Spyre.
         # Non-contiguous slices get corrupted during transfer to Spyre!
         d = x.shape[-1] // 2
         x1 = x[..., :d].contiguous()
         x2 = x[..., d:].contiguous()
-        
+
         # Transfer contiguous slices back to original device.
         x1 = convert(x1, device=original_device)
         x2 = convert(x2, device=original_device)
 
         return F.silu(x1) * x2
-

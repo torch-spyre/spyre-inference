@@ -81,4 +81,3 @@ def test_siluandmul_oot_dispatch(default_vllm_config):
 
     # dispatch_forward should have selected forward_oot
     assert layer._forward_method == layer.forward_oot
-

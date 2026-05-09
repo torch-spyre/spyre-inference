@@ -17,38 +17,10 @@ Test SpyreParallelLMHead custom op correctness against a reference implementatio
 """
 
 import sys
-import tempfile
 
 import pytest
 import torch
 import torch.nn.functional as F
-
-
-@pytest.fixture
-def dist_init():
-    """Initialize a single-rank TP group so ParallelLMHead.__init__ can query rank.
-
-    VocabParallelEmbedding (ParallelLMHead's parent) calls
-    get_tensor_model_parallel_rank() at construction time. Tests run on CPU,
-    so use the `gloo` backend.
-    """
-    from vllm.distributed import (
-        cleanup_dist_env_and_memory,
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-
-    temp_file = tempfile.mkstemp()[1]
-    init_distributed_environment(
-        world_size=1,
-        rank=0,
-        distributed_init_method=f"file://{temp_file}",
-        local_rank=0,
-        backend="gloo",
-    )
-    initialize_model_parallel(1, 1)
-    yield
-    cleanup_dist_env_and_memory()
 
 
 def reference_lm_head(
@@ -66,7 +38,7 @@ def reference_lm_head(
 @pytest.mark.parametrize("vocab_size", [64, 128, 49216, 51200])
 @pytest.mark.parametrize("embedding_dim", [64, 128])
 def test_spyre_parallel_lm_head_matches_reference(
-    default_vllm_config, dist_init, num_tokens, vocab_size, embedding_dim
+    tp_group, num_tokens, vocab_size, embedding_dim
 ):
     """SpyreParallelLMHead.forward_oot output matches a plain F.linear reference.
 
@@ -120,7 +92,7 @@ def test_spyre_parallel_lm_head_matches_reference(
     ],
 )
 def test_padded_weight_reflects_loaded_weight(
-    default_vllm_config, dist_init, vocab_size, expect_padding, expect_padded_shape
+    tp_group, vocab_size, expect_padding, expect_padded_shape
 ):
     """padded_weight must hold the loaded checkpoint values, not uninitialized data.
 
@@ -156,7 +128,7 @@ def test_padded_weight_reflects_loaded_weight(
             rtol=0.0,
         )
         # Padding rows are zeros (F.pad default), so they contribute 0 to logits.
-        assert torch.all(layer.padded_weight[layer.weight.shape[0]:] == 0)
+        assert torch.all(layer.padded_weight[layer.weight.shape[0] :] == 0)
     else:
         # Aligned shape: no padding applied, padded_weight aliases the weight
         # Parameter so we don't allocate or copy a second vocab-sized tensor.
@@ -172,7 +144,7 @@ def test_padded_weight_reflects_loaded_weight(
 
 @pytest.mark.spyre
 @pytest.mark.parallel_lm_head
-def test_lm_head_oot_dispatch(default_vllm_config, dist_init):
+def test_lm_head_oot_dispatch(tp_group):
     """Verify ParallelLMHead OOT registration: class swap + quant_method swap."""
     from spyre_inference.custom_ops.parallel_lm_head import (
         SpyreParallelLMHead,
@@ -191,7 +163,7 @@ def test_lm_head_oot_dispatch(default_vllm_config, dist_init):
 @pytest.mark.spyre
 @pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
-def test_invalid_weight_shape_raises(default_vllm_config, dist_init):
+def test_invalid_weight_shape_raises(tp_group):
     """process_weights_after_loading rejects weight rows not divisible by 64.
 
     Part of the padding workaround — remove together with the other
@@ -202,9 +174,7 @@ def test_invalid_weight_shape_raises(default_vllm_config, dist_init):
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
     # Force a weight whose leading dim is not a multiple of 64 to exercise
     # the Spyre-specific validation (upstream vocab padding normally prevents this).
-    layer.weight = torch.nn.Parameter(
-        torch.empty(63, 64, dtype=torch.float16), requires_grad=False
-    )
+    layer.weight = torch.nn.Parameter(torch.empty(63, 64, dtype=torch.float16), requires_grad=False)
 
     with pytest.raises(ValueError, match="multiple of 64"):
         layer.quant_method.process_weights_after_loading(layer)

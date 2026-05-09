@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Architecture
 
 ### Platform Integration
+
 - Registers as `spyre_inference` vLLM platform plugin via entry points (`spyre_inference:register`)
 - `TorchSpyrePlatform` extends `CpuPlatform`, overriding device execution for Spyre hardware
 - Forces `torch.float16` dtype and eager execution mode (torch.compile incompatible with current CPU fallback ops)
@@ -16,17 +17,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Key Components
 
 **Core Modules:**
+
 - `spyre_inference/platform.py` - Platform registration and configuration
 - `spyre_inference/v1/worker/spyre_worker.py` - Worker class that executes model on Spyre device
 - `spyre_inference/v1/worker/spyre_model_runner.py` - Model runner with `torch.device("spyre")`
 - `spyre_inference/v1/attention/backends/spyre_attn.py` - PyTorch-native attention with paged KV cache
 
 **Custom Operations (OOT - Out-of-Tree):**
+
 - `spyre_inference/custom_ops/` - Device-specific layer implementations:
-  - `linear.py` - `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`
-  - `rms_norm.py`, `rotary_embedding.py`, `silu_and_mul.py`, `vocab_parallel_embedding.py`, `parallel_lm_head.py`
+    - `linear.py` - `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`
+    - `rms_norm.py`, `rotary_embedding.py`, `silu_and_mul.py`, `vocab_parallel_embedding.py`, `parallel_lm_head.py`
 
 **Attention Implementation:**
+
 - Uses transposed matmul kernel (`_attn_transposed`) for Spyre execution
 - KV cache alignment: 256 tokens (avoids per-step recompilation)
 - Query chunking: 32 tokens per chunk for consistent tensor sizes
@@ -71,13 +75,15 @@ The pytest plugin is packaged separately as `spyre-testing-plugin` in `tests/plu
 This keeps test infrastructure out of the production package.
 
 **Plugin package structure:**
+
 - `tests/plugin/` - Separate pytest plugin package
-  - `spyre_testing_plugin/pytest_plugin.py` - Main plugin with pytest hooks
-  - `spyre_testing_plugin/models.py` - Data models for YAML config
-  - `spyre_testing_plugin/upstream_tests.yaml` - Test filter configuration
-  - `spyre_testing_plugin/sync_upstream_test_deps.py` - Script to sync vLLM test dependencies
+    - `spyre_testing_plugin/pytest_plugin.py` - Main plugin with pytest hooks
+    - `spyre_testing_plugin/models.py` - Data models for YAML config
+    - `spyre_testing_plugin/upstream_tests.yaml` - Test filter configuration
+    - `spyre_testing_plugin/sync_upstream_test_deps.py` - Script to sync vLLM test dependencies
 
 **Environment variables:**
+
 - `SKIP_UPSTREAM_TESTS=1` - Skip upstream tests
 - `VLLM_COMMIT=<sha>` - Override vLLM commit
 - `UPSTREAM_TESTS_PATHS=models/language/generation` - Paths to sync from vLLM
@@ -97,6 +103,7 @@ python -m spyre_testing_plugin.sync_upstream_test_deps
 ## Build Configuration
 
 **pyproject.toml key settings:**
+
 - `build-constraint-dependencies = ["torch==2.10.0"]` - Ensures consistent torch version
 - `extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }` - CPU backend for vLLM
 - `tool.uv.sources` - Pulls vllm and torch-spyre from GitHub (not PyPI)

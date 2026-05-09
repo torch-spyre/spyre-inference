@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "spyre-testing-plugin"
 description = "pytest plugin for spyre-inference upstream test integration"
 readme = "README.md"
-license = {text = "Apache 2"}
+license = {text = "Apache-2.0"}
 dependencies = [
     "pytest",
     "pyyaml",

@@ -74,11 +74,13 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
             logger.warning_once(
                 "%s: weights padded from %d to %d (torch-spyre limitation) "
                 "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__, layer.weight.shape[0],
+                layer.__class__.__name__,
+                layer.weight.shape[0],
                 layer.padded_weight.shape[0],
             )
         else:
             layer.padded_weight = layer.weight
+
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
@@ -122,7 +124,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         """OOT forward pass — lm_head matmul on Spyre.
 
         Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Converts x (arriving on cpu) 
+        LogitsProcessor._get_logits(). Converts x (arriving on cpu)
         to the weight device (residing on spyre), runs the compiled F.linear on spyre
         and converts back to the x device (cpu).
 
@@ -136,7 +138,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         x_device = x.device
 
         # Due to indexing operations inside the ModelRunner, which have
-        # to be carried out on cpu due to a torch-spyre limitation, 
+        # to be carried out on cpu due to a torch-spyre limitation,
         # the input to the SpyreParallelLMHead resides on CPU.
         # Due to a second limitation of torch-spyre regarding sizes that can be used
         # in a F.linear layer, the original weights need to be padded
@@ -146,7 +148,7 @@ class SpyreParallelLMHead(ParallelLMHead):
             bias,
         )
 
-        return convert(out[:, :-self.padding] if self.padding > 0 else out, device=x_device)
+        return convert(out[:, : -self.padding] if self.padding > 0 else out, device=x_device)
 
     @staticmethod
     def forward_spyre(

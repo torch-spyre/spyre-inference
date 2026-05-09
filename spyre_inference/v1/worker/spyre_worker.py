@@ -55,7 +55,7 @@ class TorchSpyreWorker(CPUWorker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-    def init_device(self) -> None:                                
+    def init_device(self) -> None:
         # Patch the CPUModelRunner with the TorchSpyreModelRunner
         original = cpu_worker_module.CPUModelRunner
         cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(

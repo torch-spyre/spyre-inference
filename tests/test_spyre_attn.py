@@ -25,6 +25,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
 )
 
+
 @pytest.fixture(autouse=True)
 def requires_spyre():
     """Lazy check that spyre devices are available.

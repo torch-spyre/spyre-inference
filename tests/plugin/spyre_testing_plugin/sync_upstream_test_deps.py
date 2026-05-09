@@ -141,12 +141,12 @@ def clear_dependencies(pyproject_path: Path) -> None:
     result, inside, depth = [], False, 0
     for i, line in enumerate(lines):
         # Detect start of dependencies array
-        if not inside and re.match(r'^dependencies\s*=\s*\[', line):
+        if not inside and re.match(r"^dependencies\s*=\s*\[", line):
             inside = True
             depth = line.count("[") - line.count("]")
             # Start fresh dependencies with minimal base
             result.append('dependencies = [\n    "pytest",\n    "pyyaml",\n')
-            if depth <= 0 and ']' in line:
+            if depth <= 0 and "]" in line:
                 # Single-line array, skip to end
                 inside = False
             continue
@@ -155,7 +155,7 @@ def clear_dependencies(pyproject_path: Path) -> None:
             if depth <= 0:
                 inside = False
                 # Close the array
-                result.append(']\n')
+                result.append("]\n")
             continue
         result.append(line)
 
@@ -172,7 +172,7 @@ def reorder_dependencies(pyproject_path: Path) -> None:
         content = f.read()
 
     # Extract the dependencies array
-    match = re.search(r'^(dependencies\s*=\s*\[)\s*\n(.*?)(^\])', content, re.MULTILINE | re.DOTALL)
+    match = re.search(r"^(dependencies\s*=\s*\[)\s*\n(.*?)(^\])", content, re.MULTILINE | re.DOTALL)
     if not match:
         return
 
@@ -208,7 +208,7 @@ def reorder_dependencies(pyproject_path: Path) -> None:
     lines.append(f"{suffix}\n")
 
     new_section = "".join(lines)
-    new_content = content[:match.start()] + new_section + content[match.end() + 1:]
+    new_content = content[: match.start()] + new_section + content[match.end() + 1 :]
 
     with open(pyproject_path, "w") as f:
         f.write(new_content)
@@ -216,7 +216,7 @@ def reorder_dependencies(pyproject_path: Path) -> None:
 
 def main():
     if len(sys.argv) > 1:
-        print(f"Usage: python -m spyre_testing_plugin.sync_upstream_tests", file=sys.stderr)
+        print("Usage: python -m spyre_testing_plugin.sync_upstream_test_deps", file=sys.stderr)
         return 1
 
     if not PYPROJECT_PATH.exists():

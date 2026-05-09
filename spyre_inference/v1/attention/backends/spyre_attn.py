@@ -26,7 +26,7 @@ Required configuration:
   - max_model_len <= num_gpu_blocks_override * block_size (e.g. 1024 with block_size=16)
 
 Terminology:
-  - aligned_num_physical_blocks: num_blocks rounded up to a multiple of 64 for Spyre stick alignment.
+  - aligned_num_physical_blocks: num_blocks rounded up to multiple of 64 for Spyre stick alignment.
   - block_width: block_size * head_size — number of columns per head in cache tensors
     (all tokens in a block concatenated across the head dimension).
   - aligned_max_seq_len: max_seq_len rounded up to a multiple of
@@ -42,7 +42,7 @@ Terminology:
 Naming:
   - `_dev` suffix: tensor resides on Spyre (device), not CPU.
   - `k_cache_dev` / `v_cache_dev`: the full paged KV cache (Spyre-resident, persists across steps).
-  - `k_new_*` / `v_new_*`: newly arrived token K/V for the current forward, to be scattered into the cache.
+  - `k_new_*` / `v_new_*`: new token K/V for the current forward, to be scattered into the cache.
   - `compact_k` / `compact_v`: dense K/V for the active sequence, gathered from the cache.
 """
 
@@ -144,7 +144,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # fp16, masked positions = -65504, unmasked = 0.
     attention_mask: torch.Tensor | None = None
 
-    # Gather selection mask on Spyre: [num_kv_heads, aligned_num_logical_blocks, aligned_num_physical_blocks]
+    # Gather selection mask on Spyre:
+    # [num_kv_heads, aligned_num_logical_blocks, aligned_num_physical_blocks]
     gather_sel_mask_dev: torch.Tensor | None = None
 
     # Aligned max seq len used by gather (needed for reshape)
@@ -326,7 +327,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         row_sel_3d = row_sel_2d.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
         row_sel_dev = row_sel_3d.to(device=self._target_device)
 
-        # col_sel: [num_tokens, head_size, block_width], one-hot on block_offsets*head_size + d_range
+        # col_sel: [num_tokens, head_size, block_width],
+        #     one-hot on block_offsets*head_size + d_range
         col_sel = torch.zeros(num_tokens, head_size, block_width, dtype=self._target_dtype)
         base_col = (block_offsets * head_size).long()  # [num_tokens]
         t_idx = t_range.unsqueeze(1).expand(num_tokens, head_size)  # [num_tokens, head_size]
@@ -545,7 +547,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if self._k_cache_dev is None:
             self._init_device_cache(kv_cache.shape[0], attn_metadata.block_size)
 
-        # Step 1: Scatter — selectors precomputed by builder, transfer compact K/V and place on Spyre
+        # Step 1: Scatter — selectors precomputed by builder, transfer compact K/V, place on Spyre
         self._scatter_to_device_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],

@@ -68,8 +68,7 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile,
-        run in eager mode"
+        help="Skip torch.compile, run in eager mode"
     )
     parser.add_argument(
         "--custom-ops",

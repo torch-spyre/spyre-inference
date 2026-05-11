@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "spyre-inference"
 description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
-license = {text = "Apache 2"}
+license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
     "vllm",
@@ -21,6 +21,12 @@ dependencies = [
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/torch-spyre/spyre-inference"
+Documentation = "https://torch-spyre.github.io/spyre-inference/"
+Repository = "https://github.com/torch-spyre/spyre-inference"
+Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 
 [project.entry-points."vllm.platform_plugins"]
 spyre_inference = "spyre_inference:register"

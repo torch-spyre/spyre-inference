@@ -14,8 +14,7 @@
 
 ## Checklist
 
-<!-- TODO: add the spyre-inference contributing guidelines URL once available. -->
-- [ ] I have read the [contributing guidelines]()
+- [ ] I have read the [contributing guidelines](https://torch-spyre.github.io/spyre-inference/contributing/)
 - [ ] My code follows the project's code style (run `bash format.sh`)
 - [ ] I have added tests for my changes (if applicable)
 - [ ] I have updated the documentation (if applicable)

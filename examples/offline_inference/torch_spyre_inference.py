@@ -75,7 +75,9 @@ def parse_args():
         nargs="*",
         default=None,
         dest="custom_ops",
-        help="Custom ops to enable (e.g., `--custom-ops +RMSNorm +SiluAndMul`). Set `--custom-ops none` to disable all custom ops. If not set, custom_ops is set to 'all' for both eager and compile mode.",
+        help="Custom ops to enable (e.g., `--custom-ops +RMSNorm +SiluAndMul`). \
+            Set `--custom-ops none` to disable all custom ops. \
+            If not set, custom_ops is set to 'all' for both eager and compile mode.",
     )
     return parser.parse_args()
 

@@ -16,7 +16,6 @@ repos:
   rev: v1.41.0
   hooks:
   - id: typos
-    exclude: 'tests/hf_cache\.json'
 - repo: https://github.com/igorshubovych/markdownlint-cli
   rev: v0.45.0
   hooks:

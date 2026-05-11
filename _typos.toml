@@ -1,0 +1,6 @@
+[default.extend-words]
+# Mirrors `tool.codespell.ignore-words-list` in pyproject.toml so the typos
+# hook doesn't "correct" the documented list of allowed misspellings.
+dout = "dout"
+indicies = "indicies"
+subtile = "subtile"

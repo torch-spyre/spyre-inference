@@ -207,9 +207,7 @@ def _extract_vllm_commit_from_pyproject() -> str:
     repo_root_dir = Path(__file__).parent.parent.parent.parent
     pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
-        raise FileNotFoundError(
-            f"pyproject.toml not found in {repo_root_dir}"
-        )
+        raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
 
     content = pyproject_path.read_text()
     # Look for vllm source with git and rev
@@ -755,6 +753,8 @@ def relax_torch_tolerances(request, monkeypatch):
         return _original(*args, **kwargs)
 
     monkeypatch.setattr(torch.testing, "assert_close", relaxed_assert_close)
+
+
 @pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""

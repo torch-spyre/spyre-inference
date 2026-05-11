@@ -1,0 +1,35 @@
+# This tests the publication process for spyre-inference by pushing a pre-release
+# to test.pypi.org. Only triggers on pre-release tags (e.g. spyre-inference-v0.1.0-rc1)
+name: Test publication of spyre-inference on test.pypi.org
+
+on:
+  push:
+    tags:
+      - 'spyre-inference-v*-rc*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/spyre-inference
+    permissions:
+      id-token: write  # IMPORTANT: this permission is mandatory for trusted publishing
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+            # Fetch all history for setuptools_scm to work correctly
+            fetch-depth: 0
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+            version: "latest"
+            python-version: "3.12"
+      - name: Build package
+        run: uv build
+      - name: Publish package distributions to test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+            repository-url: https://test.pypi.org/legacy/

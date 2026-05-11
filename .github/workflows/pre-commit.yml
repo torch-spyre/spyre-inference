@@ -1,0 +1,38 @@
+name: pre-commit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    
+    # Need to pull real deps from cache so that `ty` can type check against vllm
+    - name: "Set up Python 3.12"
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.12"
+        enable-cache: true
+        ignore-nothing-to-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+    # Required to build vllm's CPU backend
+    - name: "Install system dependencies for vllm CPU build"
+      run: sudo apt-get update && sudo apt-get install -y libnuma-dev
+    - name: "Install dependencies"
+      run: uv sync --frozen --no-install-package torch-spyre
+    - run: echo "::add-matcher::.github/workflows/matchers/ruff.json"
+    - uses: j178/prek-action@v1
+      with:
+        extra_args: --all-files --hook-stage manual

@@ -21,6 +21,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
 )
 
+
 @pytest.fixture(autouse=True)
 def requires_spyre():
     """Lazy check that spyre devices are available.
@@ -31,6 +32,7 @@ def requires_spyre():
         del test_tensor
     except Exception:
         pytest.skip("Spyre device not available - these tests require Spyre hardware")
+
 
 NUM_HEADS = [(4, 4), (8, 2)]  # (num_query_heads, num_kv_heads)
 HEAD_SIZES = [128, 256]

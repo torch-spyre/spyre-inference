@@ -215,7 +215,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
-        
+
         # Load model on CPU
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
@@ -225,10 +225,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Cases appearing in GPUModelRunner.
         # When needed, they can be implemented for Spyre.
         if self.lora_config:
-            raise NotImplementedError('LoRA adapters are not yet implemented and tested for Spyre.')
-        
+            raise NotImplementedError("LoRA adapters are not yet implemented and tested for Spyre.")
+
         if hasattr(self, "drafter"):
-            raise NotImplementedError('Models with a drafter model are not yet implemented and tested for Spyre.')
+            raise NotImplementedError(
+                "Models with a drafter model are not yet implemented and tested for Spyre."
+            )
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Attention is nn.Module (not PluggableLayer) so OOT registration is

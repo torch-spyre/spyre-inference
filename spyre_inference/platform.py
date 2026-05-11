@@ -118,7 +118,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # run natively on Spyre, this can be removed to enable compilation.
         vllm_config.model_config.enforce_eager = True
 
-        # In check_and_update_config we assert this must be flaot16 for spyre.
+        # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16

@@ -37,9 +37,7 @@ def reference_lm_head(
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
 @pytest.mark.parametrize("vocab_size", [64, 128, 49216, 51200])
 @pytest.mark.parametrize("embedding_dim", [64, 128])
-def test_spyre_parallel_lm_head_matches_reference(
-    tp_group, num_tokens, vocab_size, embedding_dim
-):
+def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_size, embedding_dim):
     """SpyreParallelLMHead.forward_oot output matches a plain F.linear reference.
 
     Exercises the full padded-weight path: checkpoint values are written into
@@ -128,7 +126,7 @@ def test_padded_weight_reflects_loaded_weight(
             rtol=0.0,
         )
         # Padding rows are zeros (F.pad default), so they contribute 0 to logits.
-        assert torch.all(layer.padded_weight[layer.weight.shape[0]:] == 0)
+        assert torch.all(layer.padded_weight[layer.weight.shape[0] :] == 0)
     else:
         # Aligned shape: no padding applied, padded_weight aliases the weight
         # Parameter so we don't allocate or copy a second vocab-sized tensor.
@@ -174,9 +172,7 @@ def test_invalid_weight_shape_raises(tp_group):
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
     # Force a weight whose leading dim is not a multiple of 64 to exercise
     # the Spyre-specific validation (upstream vocab padding normally prevents this).
-    layer.weight = torch.nn.Parameter(
-        torch.empty(63, 64, dtype=torch.float16), requires_grad=False
-    )
+    layer.weight = torch.nn.Parameter(torch.empty(63, 64, dtype=torch.float16), requires_grad=False)
 
     with pytest.raises(ValueError, match="multiple of 64"):
         layer.quant_method.process_weights_after_loading(layer)

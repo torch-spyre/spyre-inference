@@ -24,14 +24,13 @@ jobs:
       with:
         python-version: "3.12"
         enable-cache: true
-        ignore-nothing-to-cache: true
-        cache-dependency-glob: |
-          pyproject.toml
     # Required to build vllm's CPU backend
     - name: "Install system dependencies for vllm CPU build"
       run: sudo apt-get update && sudo apt-get install -y libnuma-dev
+    # torch-spyre cannot install without the spyre runtime libs installed
+    # we're not running any tests so we can skip the dev group with `--no-dev`
     - name: "Install dependencies"
-      run: uv sync --frozen --no-install-package torch-spyre
+      run: uv sync --frozen --no-install-package torch-spyre --no-dev
     - run: echo "::add-matcher::.github/workflows/matchers/ruff.json"
     - uses: j178/prek-action@v1
       with:

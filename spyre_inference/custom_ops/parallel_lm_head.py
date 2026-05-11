@@ -148,8 +148,9 @@ class SpyreParallelLMHead(ParallelLMHead):
             bias,
         )
 
-        out_cpu = convert(out, device=x_device)
-        return out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
+        out_cpu = convert(out, device="cpu")
+        out_real = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
+        return convert(out_real, device=x_device)
 
     @staticmethod
     def forward_spyre(

@@ -35,26 +35,32 @@ Read these vLLM source files (in `.venv/lib/python3.12/site-packages/vllm/`) to 
 base class names, inheritance relationships, and any new extension points:
 
 **Platform:**
+
 - `platforms/interface.py` — `Platform` base class
 - `platforms/cpu.py` — `CpuPlatform` (parent of `TorchSpyrePlatform`)
 
 **Worker & model runner:**
+
 - `v1/worker/cpu_worker.py` — `CPUWorker` base class
 - `v1/worker/gpu_model_runner.py` — `GPUModelRunner` (pattern reference for model runners)
 
 **Engine & scheduling:**
+
 - `v1/engine/core.py` — `EngineCore`
 - `v1/engine/async_llm.py` — `AsyncLLM`
 - `v1/core/kv_cache_manager.py` — `KVCacheManager`
 - `v1/core/scheduler.py` — vLLM's `Scheduler`
 
 **Attention:**
+
 - `v1/attention/backend.py` — `AttentionBackend` base class
 
 **API:**
+
 - `entrypoints/openai/api_server.py` — `APIServer` entry point
 
 Check these for:
+
 - Renamed classes or moved modules (vLLM refactors frequently)
 - New base class methods that spyre-inference should override
 - New components in the engine/worker pipeline (e.g., new coordinator classes)
@@ -80,6 +86,7 @@ Update these three files in `docs/architecture/`:
 Follow these conventions exactly:
 
 **Container (subgraph) styling — light background for both light/dark mode:**
+
 ```d2
 container: "Label" {
   style.fill: "#e0e0e0"
@@ -89,6 +96,7 @@ container: "Label" {
 ```
 
 **Node color scheme:**
+
 - Spyre-native (runs on Spyre device): `fill: "#1565c0"`, `stroke: "#0d47a1"`, `font-color: "#ffffff"`
 - CPU fallback: `fill: "#e65100"`, `stroke: "#bf360c"`, `font-color: "#ffffff"`
 - Mixed CPU + Spyre: `fill: "#2e7d32"`, `stroke: "#1b5e20"`, `font-color: "#ffffff"`
@@ -97,17 +105,20 @@ container: "Label" {
 - Spyre plugin classes get `style.bold: true`
 
 **Relationship arrows:**
+
 - Inheritance: `A -> B: "▷" {style.stroke-dash: 3}`
 - Composition/has-a: solid arrow with label
 - Data flow: solid arrow with label describing what flows
 
 **Plugin-architecture.d2 specific:**
+
 - Include a legend container with `direction: right` showing the three device colors
 - Attention detail panel connects from the ATTN node via `{style.stroke-dash: 3}`
 
 ## Rendering
 
 After updating the `.d2` files, render them to SVG:
+
 ```bash
 d2 --pad 50 docs/architecture/system-overview.d2 docs/architecture/system-overview.svg
 d2 --pad 50 docs/architecture/plugin-architecture.d2 docs/architecture/plugin-architecture.svg
@@ -140,6 +151,7 @@ Compare the current code against the diagrams and docs:
 ## index.md Image Styling
 
 Keep the figure tags with width overrides for legibility:
+
 ```markdown
 ![System Overview](system-overview.svg){: style="width: 140%; max-width: 1200px; margin-left: -20%;" }
 ![Plugin Architecture](plugin-architecture.svg){: style="width: 140%; max-width: 1000px; margin-left: -20%" }

@@ -30,7 +30,7 @@ uv sync --frozen
 ## Usage
 
 The plugin automatically registers with vLLM when installed.
-Use it by setting `VLLM_PLUGINS=spyre_inference"
+Use it by setting `VLLM_PLUGINS=spyre_inference`
 
 ```python
 from vllm import LLM
@@ -67,7 +67,7 @@ See [Contributing Guide](docs/contributing/README.md) for:
 
 ## License
 
-Apache 2.0
+[Apache-2.0](LICENSE)
 
 ## Related Projects
 

@@ -39,4 +39,4 @@ To get started with spyre-inference, see the [Installation Guide](getting_starte
 
 ## License
 
-Apache 2.0
+Apache-2.0

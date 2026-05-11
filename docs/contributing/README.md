@@ -8,7 +8,7 @@ Thank you for your interest in contributing to the Spyre plugin for vLLM! There 
 
 ## Issues
 
-If you encounter a bug or have a feature request, please search [existing issues](https://github.com/vllm-project/vllm-spyre/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/vllm-project/vllm-spyre/issues/new/choose):
+If you encounter a bug or have a feature request, please search [existing issues](https://github.com/torch-spyre/spyre-inference/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/torch-spyre/spyre-inference/issues/new/choose):
 
 - **🐛 Bug Report**: For reporting bugs and unexpected behavior
 - **🚀 Feature Request**: For suggesting new features or improvements
@@ -129,7 +129,7 @@ prek install
 
 ### DCO and Signed-off-by
 
-When contributing, you must agree to the [DCO](https://github.com/vllm-project/vllm-spyre/blob/main/DCO).Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
+When contributing, you must agree to the <gh-file:DCO>. Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
 
 Using `-s` with `git commit` will automatically add this header.
 

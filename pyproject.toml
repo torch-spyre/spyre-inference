@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 name = "spyre-inference"
 description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
-license = {text = "Apache 2"}
+license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
     "vllm",
@@ -21,6 +21,12 @@ dependencies = [
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/torch-spyre/spyre-inference"
+Documentation = "https://torch-spyre.github.io/spyre-inference/"
+Repository = "https://github.com/torch-spyre/spyre-inference"
+Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 
 [project.entry-points."vllm.platform_plugins"]
 spyre_inference = "spyre_inference:register"
@@ -56,7 +62,7 @@ override-dependencies = [
     "ray; platform_machine not in 's390x, ppc64le'",
     # uv doesn't resolve numba->llvmlite constraint correctly...
     #   if numba is updated, this version will likely need to be too
-    "llvmlite==0.44.0; platform_machine not in 's390x, ppc64le'",
+    "llvmlite==0.47.0; platform_machine not in 's390x, ppc64le'",
     "pyarrow; platform_machine not in 's390x, ppc64le'",
     # This torch version must match the one below in `build-constraint-dependencies`
     "torch==2.11.0 ; platform_machine not in 's390x, ppc64le'",
@@ -87,7 +93,7 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
 vllm = { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1" }
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "bdd54af5549532e4ff7a21c9787b1397aeb85c75" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "539a1a0c2d54b228c19c982ee80044e210bcde98" }
 torch = [
   { index = "pytorch-cpu" },
 ]

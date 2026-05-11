@@ -26,7 +26,9 @@ import torch.nn.functional as F
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize("hidden_size,intermediate_size", [(64, 128), (128, 256), (512, 1024)])
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_merged_column_matches_reference(tp_group, num_tokens, hidden_size, intermediate_size, use_bias):
+def test_merged_column_matches_reference(
+    tp_group, num_tokens, hidden_size, intermediate_size, use_bias
+):
     """SpyreMergedColumnParallelLinear output matches upstream CPU F.linear."""
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
     from spyre_inference.custom_ops.linear import SpyreMergedColumnParallelLinear
@@ -65,9 +67,9 @@ def test_merged_column_matches_reference(tp_group, num_tokens, hidden_size, inte
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_size",
     [
-        (8, 8, 64),   # MHA
-        (8, 2, 64),   # GQA
-        (8, 1, 64),   # MQA
+        (8, 8, 64),  # MHA
+        (8, 2, 64),  # GQA
+        (8, 1, 64),  # MQA
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
@@ -172,19 +174,34 @@ def test_linear_oot_registration(tp_group):
     )
 
     gate_up = MergedColumnParallelLinear(
-        input_size=64, output_sizes=[128, 128],
-        bias=False, params_dtype=torch.float16, quant_config=None,
-        disable_tp=True, prefix="gate_up_proj",
+        input_size=64,
+        output_sizes=[128, 128],
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        disable_tp=True,
+        prefix="gate_up_proj",
     )
     qkv = QKVParallelLinear(
-        hidden_size=64, head_size=8, total_num_heads=8, total_num_kv_heads=8,
-        bias=False, params_dtype=torch.float16, quant_config=None,
-        disable_tp=True, prefix="qkv_proj",
+        hidden_size=64,
+        head_size=8,
+        total_num_heads=8,
+        total_num_kv_heads=8,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        disable_tp=True,
+        prefix="qkv_proj",
     )
     down = RowParallelLinear(
-        input_size=128, output_size=64,
-        bias=False, params_dtype=torch.float16, quant_config=None,
-        reduce_results=True, disable_tp=True, prefix="down_proj",
+        input_size=128,
+        output_size=64,
+        bias=False,
+        params_dtype=torch.float16,
+        quant_config=None,
+        reduce_results=True,
+        disable_tp=True,
+        prefix="down_proj",
     )
 
     assert isinstance(gate_up, SpyreMergedColumnParallelLinear)
@@ -205,5 +222,3 @@ def test_linear_oot_registration(tp_group):
     x_row = torch.randn(4, 128, dtype=torch.float16)
     out_down, _ = down(x_row)
     assert out_down.shape == (4, 64)
-
-

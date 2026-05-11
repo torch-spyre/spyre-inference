@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "spyre-testing-plugin"
 description = "pytest plugin for spyre-inference upstream test integration"
 readme = "README.md"
-license = {text = "Apache 2"}
+license = {text = "Apache-2.0"}
 dependencies = [
     "pytest",
     "pyyaml",
@@ -38,7 +38,7 @@ dependencies = [
     "mistral-common[audio,image]>=1.9.1",
     "mteb[bm25s]>=2,<3",
     "num2words>=0.5.14",
-    "numba==0.61.2",
+    "numba==0.65.0",
     "numpy>=2.2.6",
     "open-clip-torch==2.32.0",
     "opencv-python-headless>=4.13.0",

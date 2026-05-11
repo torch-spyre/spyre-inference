@@ -37,9 +37,7 @@ def reference_lm_head(
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
 @pytest.mark.parametrize("vocab_size", [64, 128, 49216, 51200])
 @pytest.mark.parametrize("embedding_dim", [64, 128])
-def test_spyre_parallel_lm_head_matches_reference(
-    tp_group, num_tokens, vocab_size, embedding_dim
-):
+def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_size, embedding_dim):
     """SpyreParallelLMHead.forward_oot output matches a plain F.linear reference.
 
     Exercises the full padded-weight path: checkpoint values are written into

@@ -8,10 +8,10 @@
 spyre_inference/platform.py @joerunde @yannicks1
 
 # Custom operations (OOT layers for Spyre)
-spyre_inference/custom_ops/ @bohnstingl @yannicks1 @romitjain @dilipgb
+spyre_inference/custom_ops/ @bohnstingl @yannicks1 @dilipgb
 
 # v1 worker and model runner
 spyre_inference/v1/worker/ @bohnstingl @joerunde
 
 # Attention backend (PyTorch-native Spyre attention)
-spyre_inference/v1/attention/ @jvlunteren
+spyre_inference/v1/attention/ @jvlunteren @bohnstingl @bringlein

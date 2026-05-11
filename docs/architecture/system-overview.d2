@@ -125,8 +125,8 @@ worker: "n == num devices worker procs (TP, DP)" {
   AttentionBackend -> SpyreAttnBackend: "▷" {style.stroke-dash: 3}
 
   SpyreWorker -> SpyreModelRunner: has-a
-  SpyreModelRunner -> SpyreWrapper: wraps
-  SpyreWrapper -> Model: has-a
+  SpyreModelRunner -> SpyreWrapper: creates
+  SpyreWrapper -> Model: wraps
   SpyreModelRunner -> SpyreAttnBackend: uses
   SpyreModelRunner -> Sampler
   SpyreAttnBackend -> SpyreAttnImpl: creates

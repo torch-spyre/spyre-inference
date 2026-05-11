@@ -56,16 +56,20 @@ decorator intercepts and returns the Spyre implementation instead.
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The forward pass is split between CPU and Spyre:
+(no custom CUDA kernels). Most prep work runs on CPU; the hot inner kernel is a single
+compiled 4D attention call on Spyre:
 
 | Step | Device | Operation |
 |---|---|---|
 | 1. KV cache update | CPU | Scatter new keys/values via `slot_mapping` |
-| 2. KV gather | CPU | Gather pages into compact tensors, pad to 256-token alignment |
-| 3. Q @ K^T | Spyre | Batched matmul |
-| 4. Mask + softmax | Spyre | Additive causal mask, then softmax |
-| 5. Attn @ V | Spyre | Batched matmul |
-| 6. Output extract | CPU | Trim alignment padding |
+| 2. Gather compact KV | CPU | Gather pages into per-seq tensors, pad `seq_len` to 256 |
+| 3. Reshape Q + build mask | CPU | Pad `query_len` to 32, build additive mask (`0.0` / `-65504.0`) |
+| 4. 4D attention kernel | Spyre | One compiled call: `Q @ Kᵀ` → `+ mask` → `softmax` → `@ V` |
+| 5. Output extract | CPU | Trim query/sequence padding back to `num_actual_tokens` |
+
+The backend also exposes an `use_sdpa=True` fallback path that routes through
+`torch.nn.functional.scaled_dot_product_attention` on CPU — currently used for cases that
+the 4D kernel doesn't cover (no GQA, non-square attention).
 
 Key constraints:
 
@@ -75,13 +79,28 @@ Key constraints:
 
 ## Device Placement Strategy
 
-The model runner uses `device="cpu"` for buffer management (scatter, indexing, scheduling)
-while placing float compute tensors on Spyre via `_spyre_device`. The `_SpyreModelWrapper`
-handles conversion at the boundary:
+`TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
+"GPU" in the `CpuGpuBuffer` pattern. Buffers are created via a `SpyreCpuGpuBuffer`
+override:
+
+- **Float dtypes**: `.cpu` on CPU (numpy staging for the scheduler), `.gpu` on Spyre as
+  `float16`
+- **Int / bool dtypes**: `.gpu` aliased to `.cpu` (Spyre doesn't natively support these)
+
+`self.device` stays `cpu` so that scatter, indexing, and block-table ops run on CPU, but
+float compute tensors land on Spyre via `self._spyre_device`.
+
+`_SpyreModelWrapper` sits between the model runner and the model and converts at the
+call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling)
 
-This means hidden states flow entirely on Spyre between decoder layers, with CPU
-round-trips only for operations that Spyre doesn't yet support natively (rotary
-embeddings, KV cache indexing).
+`VocabParallelEmbedding` is **not** OOT-replaced — it is the upstream vLLM class. Its
+weights are moved onto Spyre by `model.to(spyre_device)` during `load_model`, and the
+wrapper supplies an `int64` Spyre tensor at the input, so the embedding lookup runs on
+Spyre without any custom op.
+
+Hidden states flow entirely on Spyre between decoder layers, with CPU round-trips only
+for operations that Spyre doesn't yet support natively (rotary embeddings, attention
+KV scatter/gather, logits indexing).

@@ -6,7 +6,7 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "VocabParallelEmbedding\nint64 → float16" {
+  EMB: "VocabParallelEmbedding\n(upstream; weights on Spyre,\nint64 input via wrapper)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -84,33 +84,28 @@ attn_detail: "SpyreAttentionImpl Pipeline" {
     style.stroke: "#bf360c"
     style.font-color: "#ffffff"
   }
-  S2: "Gather KV pages\n(compact + pad to 256)" {
+  S2: "Gather compact KV\n(pad seq_len to 256)" {
     style.fill: "#e65100"
     style.stroke: "#bf360c"
     style.font-color: "#ffffff"
   }
-  S3: "Q @ Kᵀ\n(batched matmul on Spyre)" {
+  S3: "Reshape Q + build additive mask\n(pad query_len to 32)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  S4: "4D attention kernel\nQ @ Kᵀ → +mask → softmax → @V\n(compiled, one call)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  S4: "Causal mask + softmax" {
-    style.fill: "#1565c0"
-    style.stroke: "#0d47a1"
-    style.font-color: "#ffffff"
-  }
-  S5: "Attn @ V\n(batched matmul on Spyre)" {
-    style.fill: "#1565c0"
-    style.stroke: "#0d47a1"
-    style.font-color: "#ffffff"
-  }
-  S6: "Extract output\n(trim padding)" {
+  S5: "Extract output\n(trim Q/seq padding)" {
     style.fill: "#e65100"
     style.stroke: "#bf360c"
     style.font-color: "#ffffff"
   }
 
-  S1 -> S2 -> S3 -> S4 -> S5 -> S6
+  S1 -> S2 -> S3 -> S4 -> S5
 }
 
 bookends.EMB -> granite: "hidden states"

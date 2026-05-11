@@ -6,30 +6,27 @@ component view) and a markdown page that explains the plugin architecture.
 
 ## Source Files to Inspect
 
-Read these files to understand the current architecture:
+Discover the current source layout rather than relying on a hardcoded list — files get
+added, renamed, and removed over time. Run:
 
-**Plugin registration & platform:**
-- `spyre_inference/__init__.py` — entry point, `register()` and `register_all()`
-- `spyre_inference/platform.py` — `TorchSpyrePlatform` class
+```bash
+find spyre_inference -type f -name "*.py" | sort
+```
 
-**Worker & model runner:**
-- `spyre_inference/v1/worker/spyre_worker.py` — `TorchSpyreWorker`
-- `spyre_inference/v1/worker/spyre_model_runner.py` — `TorchSpyreModelRunner`, `_SpyreModelWrapper`
+Then read every file under these areas to understand the current architecture:
 
-**Attention backend:**
-- `spyre_inference/v1/attention/backends/spyre_attn.py` — `SpyreAttentionBackend`, `SpyreAttentionImpl`, `SpyreAttentionMetadataBuilder`
+- **Plugin registration & platform** — top-level `spyre_inference/` (entry point
+  `__init__.py`, `platform.py`).
+- **Worker & model runner** — everything under `spyre_inference/v1/worker/`.
+- **Attention backend** — everything under `spyre_inference/v1/attention/`.
+- **Custom ops (OOT layer replacements)** — every `.py` file in
+  `spyre_inference/custom_ops/`. Start with `__init__.py` to see the registration list,
+  then read each op module that it references.
+- **Scheduler and other v1 core** — everything under `spyre_inference/v1/core/` (may be
+  empty if no overrides are present).
 
-**Custom ops (OOT layer replacements):**
-- `spyre_inference/custom_ops/__init__.py` — lists all registered ops
-- `spyre_inference/custom_ops/linear.py` — parallel linear layers
-- `spyre_inference/custom_ops/rms_norm.py`
-- `spyre_inference/custom_ops/rotary_embedding.py`
-- `spyre_inference/custom_ops/silu_and_mul.py`
-- `spyre_inference/custom_ops/vocab_parallel_embedding.py`
-- `spyre_inference/custom_ops/parallel_lm_head.py`
-
-**Scheduler (if present):**
-- `spyre_inference/v1/core/scheduler.py`
+When you read these, note the public class names — the diagrams label nodes with them, so
+any rename needs to propagate to the `.d2` files.
 
 ## vLLM Base Classes to Cross-Reference
 

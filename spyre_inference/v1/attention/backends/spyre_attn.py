@@ -268,6 +268,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata is None:
             return output
 
+        # The value still resides on CPU, as it is
+        # created in the GraniteAttention through a split
+        # operation, which has to be carried out on CPU
+        query = convert(query.contiguous(), device="cpu").contiguous()
+        key = convert(key.contiguous(), device="cpu").contiguous()
+
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Step 1: Update KV cache (CPU)

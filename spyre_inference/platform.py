@@ -66,6 +66,19 @@ class TorchSpyrePlatform(CpuPlatform):
     )
 
     @classmethod
+    def opaque_attention_op(cls) -> bool:
+        # Inherited from CpuPlatform as True, which would route attention through
+        # torch.ops.vllm.unified_attention_with_output. That op is registered
+        # only for dispatch key "CPU" and fails when q/k/v/output reside on the
+        # the Spyre device.
+        # This override disables the opaque-op boundary and vLLM then calls the
+        # Attention.forward directly.
+        #
+        # This has though implications for torch.compile, because if
+        # enforce_eager=False, the attention implementation is also traced and compiled.
+        return False
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 

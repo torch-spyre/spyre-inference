@@ -111,6 +111,3 @@ class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
     Thus, we always convert the `input_` to `spyre`, which is a NoOp in
     case of `GraniteMLP`.
     """
-
-    def forward(self, input_):
-        return super().forward(convert(input_, device=self.weight.device))

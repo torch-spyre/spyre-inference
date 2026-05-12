@@ -327,7 +327,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # [num_actual_tokens, num_heads, head_size]
         attn_output_flat = self._extract_relevant_output(attn_output, attn_metadata.query_start_loc)
 
-        output[:num_actual_tokens].copy_(attn_output_flat)
+        if output.device.type == "spyre":
+            # Workaround for torch-spyre bug: a CPU->Spyre `.copy_()` into a
+            # destination whose rank differs from its allocation rank (here,
+            # vLLM allocates `output` as 2-D and views it as 3-D) crashes in
+            # spyre::get_device_stride_infos. Instead, build the full output
+            # on CPU, transfer it to a freshly-allocated Spyre tensor (works),
+            # and finish with a Spyre->Spyre copy, which dispatches through
+            # torch.ops.spyre.copy_from_d2d and avoids the broken path.
+            full_cpu = torch.zeros(output.shape, dtype=output.dtype, device="cpu")
+            full_cpu[:num_actual_tokens] = attn_output_flat
+            full_spyre = convert(full_cpu.contiguous(), "spyre", output.dtype)
+            output.copy_(full_spyre)
+        else:
+            output[:num_actual_tokens].copy_(attn_output_flat)
         return output
 
     def _write_to_kv_cache(

@@ -63,9 +63,9 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             cpu_key,
         )
 
-        out_query = convert(result_query.contiguous(), device=target_device, dtype=target_dtype)
+        out_query = convert(result_query, device=target_device, dtype=target_dtype)
         out_key = (
-            convert(result_key.contiguous(), device=target_device, dtype=target_dtype)
+            convert(result_key, device=target_device, dtype=target_dtype)
             if result_key is not None
             else None
         )

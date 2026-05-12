@@ -16,10 +16,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: docs-${{ hashFiles('docs/requirements-docs.txt') }}
+          restore-keys: docs-
       - run: pip install -r docs/requirements-docs.txt
       - run: mkdocs build --strict
       - uses: actions/upload-artifact@v4
         with:
           name: preview-docs
           path: site/
+          retention-days: 7
+      - name: Save PR metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "$PR_NUMBER" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-number
+          path: pr-number.txt
           retention-days: 7

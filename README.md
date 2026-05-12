@@ -12,7 +12,7 @@ This plugin leverages `torch-spyre` to utilize PyTorch's native Inductor compile
 
 - Python >= 3.11
 - Access to IBM Spyre hardware with the Spyre Runtime stack
-- PyTorch 2.10.0 (CPU backend)
+- PyTorch 2.11.0 (CPU backend)
 
 ## Installation
 

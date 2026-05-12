@@ -19,6 +19,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
+from vllm.v1.worker.worker_base import CompilationTimes
 import vllm.v1.worker.cpu_worker as cpu_worker_module
 
 from spyre_inference.custom_ops import register_all
@@ -70,7 +71,7 @@ class TorchSpyreWorker(CPUWorker):
         finally:
             cpu_worker_module.CPUModelRunner = original
 
-    def compile_or_warm_up_model(self) -> float:
+    def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420
         # Ensure registration of Spyre decompositions before FX Graph tracing
         import torch._inductor.decomposition
@@ -87,4 +88,7 @@ class TorchSpyreWorker(CPUWorker):
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
-        return self.compilation_config.compilation_time
+        return CompilationTimes(
+            language_model=self.compilation_config.compilation_time,
+            encoder=self.compilation_config.encoder_compilation_time,
+        )

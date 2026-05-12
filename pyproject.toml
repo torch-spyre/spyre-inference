@@ -62,10 +62,10 @@ override-dependencies = [
     "ray; platform_machine not in 's390x, ppc64le'",
     # uv doesn't resolve numba->llvmlite constraint correctly...
     #   if numba is updated, this version will likely need to be too
-    "llvmlite==0.44.0; platform_machine not in 's390x, ppc64le'",
+    "llvmlite==0.47.0; platform_machine not in 's390x, ppc64le'",
     "pyarrow; platform_machine not in 's390x, ppc64le'",
     # This torch version must match the one below in `build-constraint-dependencies`
-    "torch==2.10.0 ; platform_machine not in 's390x, ppc64le'",
+    "torch==2.11.0 ; platform_machine not in 's390x, ppc64le'",
 
     # torch-spyre declares a dependency on numpy>2.3, conflicting with numba needed by vLLM
     # The range here should match the numba dependency
@@ -84,7 +84,7 @@ override-dependencies = [
 ]
 # This adds constraints to all dependent build environments, which will ensure everything is built
 # with the same version of torch. This CANNOT conflict with a package's existing build dependencies
-build-constraint-dependencies = ["torch==2.10.0"]
+build-constraint-dependencies = ["torch==2.11.0"]
 # This ensures that we build the cpu backend for vLLM
 extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }
 
@@ -92,8 +92,8 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
-vllm = { git = "https://github.com/vllm-project/vllm", rev = "v0.19.1" }
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "bdd54af5549532e4ff7a21c9787b1397aeb85c75" }
+vllm = { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "539a1a0c2d54b228c19c982ee80044e210bcde98" }
 torch = [
   { index = "pytorch-cpu" },
 ]
@@ -112,7 +112,7 @@ members = ["tests/plugin"]
 # In the future, we may need to use this section to specify extra dependencies required to build
 # vllm from source for the cpu backend.
 # NB: This section CANNOT be used to override dependencies to a conflicting version. For example,
-# you cannot add torch==2.9.1 if vllm's build dependencies already specify torch>=2.10.0
+# you cannot add torch==2.10.0 if vllm's build dependencies already specify torch>=2.11.0
 # [tool.uv.extra-build-dependencies]
 # vllm = [
 #     "ninja",

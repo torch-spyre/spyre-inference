@@ -29,7 +29,7 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
-    
+
     # IR provider registration (triggered by import)
     logger.info("Registering vLLM IR providers for spyre_inference")
     from . import kernels as _kernels  # noqa: F401

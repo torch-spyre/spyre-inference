@@ -35,11 +35,11 @@ def spyre_rms_norm(
     """
     # Implementation adopted from vllm/ir/ops/layernorm.py
     orig_dtype = x.dtype
-    
+
     # Additional components in upstream vLLM
     # x = x.to(torch.float32)
     # x_var = x if variance_size is None else x[..., :variance_size]
-    
+
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + epsilon)
     x = x.to(orig_dtype)

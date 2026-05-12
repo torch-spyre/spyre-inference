@@ -77,7 +77,7 @@ def download_test_requirements(commit: str, cache_dir: Path) -> Path:
 
     Returns the path to the downloaded file.
     """
-    url = f"https://raw.githubusercontent.com/vllm-project/vllm/{commit}/requirements/test.in"
+    url = f"https://raw.githubusercontent.com/vllm-project/vllm/{commit}/requirements/test/cuda.in"
     cache_file = cache_dir / f"vllm-{commit[:8]}-test.in"
 
     print(f"Downloading test requirements from vLLM commit {commit[:8]}...")

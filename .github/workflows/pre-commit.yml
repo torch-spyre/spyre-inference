@@ -27,6 +27,8 @@ jobs:
     # Required to build vllm's CPU backend
     - name: "Install system dependencies for vllm CPU build"
       run: sudo apt-get update && sudo apt-get install -y libnuma-dev
+    - name: Install CMake & Ninja
+      uses: lukka/get-cmake@latest
     # torch-spyre cannot install without the spyre runtime libs installed
     # we're not running any tests so we can skip the dev group with `--no-dev`
     - name: "Install dependencies"

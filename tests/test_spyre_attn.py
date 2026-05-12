@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import pytest
 import torch
@@ -11,20 +22,17 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 
 
-def is_spyre_available():
+@pytest.fixture(autouse=True)
+def requires_spyre():
+    """Lazy check that spyre devices are available.
+    This must be done lazily to avoid accessing a device at import time.
+    """
     try:
         test_tensor = torch.randn(1, device=torch.device("spyre"))
         del test_tensor
-        return True
     except Exception:
-        return False
+        pytest.skip("Spyre device not available - these tests require Spyre hardware")
 
-
-SPYRE_AVAILABLE = is_spyre_available()
-
-pytestmark = pytest.mark.skipif(
-    not SPYRE_AVAILABLE, reason="Spyre device not available - these tests require Spyre hardware"
-)
 
 NUM_HEADS = [(4, 4), (8, 2)]  # (num_query_heads, num_kv_heads)
 HEAD_SIZES = [128, 256]

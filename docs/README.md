@@ -9,7 +9,7 @@ The `spyre-inference` plugin represents the next iteration of sendnn-inference, 
 - **Torch Inductor Backend**: Utilizes PyTorch's native Inductor compiler for optimized model execution
 - **torch-spyre Integration**: Built on the torch-spyre framework for advanced compilation and optimization
 - **vLLM Platform Plugin**: Seamlessly integrates with vLLM's plugin architecture via the `vllm.platform_plugins` entry point
-- **CPU-Optimized**: Configured for efficient CPU-based inference with vLLM 0.15.1+cpu
+- **CPU-Optimized**: Configured for efficient CPU-based inference with vLLM 0.20.1+cpu
 
 ## Architecture
 
@@ -34,9 +34,9 @@ To get started with spyre-inference, see the [Installation Guide](getting_starte
 
 - Python >= 3.11
 - torch-spyre (built from source)
-- vLLM 0.15.1+cpu
-- PyTorch 2.10.0 (CPU version)
+- vLLM 0.20.1+cpu
+- PyTorch 2.11.0 (CPU version)
 
 ## License
 
-Apache 2.0
+Apache-2.0

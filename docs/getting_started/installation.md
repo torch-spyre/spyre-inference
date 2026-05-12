@@ -25,7 +25,7 @@ This command will:
 1. Install all project dependencies
 2. Build vLLM from source with CPU backend support
 3. Build torch-spyre from source
-4. Install PyTorch 2.10.0 from the CPU-specific index
+4. Install PyTorch 2.11.0 from the CPU-specific index
 
 ### Configuration Highlights
 
@@ -35,13 +35,13 @@ The `pyproject.toml` file includes several key configurations:
 
 ```toml
 [tool.uv]
-build-constraint-dependencies = ["torch==2.10.0"]
+build-constraint-dependencies = ["torch==2.11.0"]
 extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }
 ```
 
 These settings ensure:
 
-- All packages are built with the same PyTorch version (2.10.0)
+- All packages are built with the same PyTorch version (2.11.0)
 - vLLM is built specifically for the CPU backend
 
 #### 2. Source Repositories

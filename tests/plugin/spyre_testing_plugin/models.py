@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Data models for the spyre-inference test infrastructure."""
 
 from __future__ import annotations
@@ -40,6 +54,14 @@ class ParamOverride:
 
 
 @dataclass(frozen=True)
+class Tolerances:
+    """Tolerance configuration for torch.testing.assert_close."""
+
+    atol: float
+    rtol: float
+
+
+@dataclass(frozen=True)
 class AllowEntry:
     """An allow_list entry for an upstream test function.
 
@@ -51,6 +73,9 @@ class AllowEntry:
         param_allows:    Parameter combinations to allow (whitelist). If specified,
                          only these parameter values will run.
         param_overrides: Parameter values to replace upstream defaults with.
+        tolerances:      Optional tolerance config for torch.testing.assert_close.
+        fixture_names:   Fixture names to inject for this test (e.g. "foo" for a
+                         custom fixture that prints "hello world").
     """
 
     test: str
@@ -59,6 +84,8 @@ class AllowEntry:
     param_skips: tuple[ParamSkip, ...] = ()
     param_allows: tuple[ParamAllow, ...] = ()
     param_overrides: tuple[ParamOverride, ...] = ()
+    tolerances: Tolerances | None = None
+    fixture_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

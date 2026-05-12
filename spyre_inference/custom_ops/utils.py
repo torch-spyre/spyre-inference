@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Utility functions for Spyre custom operations.
 
 This module provides helper functions for preparing tensors and data structures
@@ -6,8 +20,6 @@ dtype conversion.
 """
 
 from typing import Any
-
-import torch
 
 from vllm.logger import init_logger
 
@@ -60,17 +72,23 @@ def convert(tensor, device=None, dtype=None):
     Returns:
         Converted tensor, or None if input is None.
     """
-    if tensor is None or not isinstance(tensor, torch.Tensor):
+    if tensor is None:
+        return None
+
+    target_device = device if device is not None else tensor.device.type
+    target_dtype = dtype if dtype is not None else tensor.dtype
+
+    if tensor.device.type == target_device and tensor.dtype == target_dtype:
         return tensor
-    if tensor.device.type == "spyre":
-        # In case the tensor is on spyre, we first need to move it to cpu and then change the dtype.
-        if device is not None:
-            tensor = tensor.to(device=device)
-        if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
-    else:
-        if dtype is not None:
-            tensor = tensor.to(dtype=dtype)
-        if device is not None:
-            tensor = tensor.to(device=device)
+
+    # Spyre requires CPU for dtype changes
+    if tensor.device.type == "spyre" and tensor.dtype != target_dtype:
+        tensor = tensor.to(device="cpu")
+
+    if tensor.dtype != target_dtype:
+        tensor = tensor.to(dtype=target_dtype)
+
+    if tensor.device.type != target_device:
+        tensor = tensor.to(device=target_device)
+
     return tensor

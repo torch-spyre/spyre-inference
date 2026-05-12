@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 Documentation
+    url: https://torch-spyre.github.io/spyre-inference/
+    about: Read the Spyre-Inference documentation
+  - name: 💬 Discussions
+    url: https://inviter.co/vllm-slack
+    about: Ask questions and discuss in the `#sig-spyre` channel.
+  - name: 🤝 Contributing Guide
+    url: https://torch-spyre.github.io/spyre-inference/contributing/
+    about: Learn how to contribute to Spyre-Inference

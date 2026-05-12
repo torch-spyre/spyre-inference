@@ -8,12 +8,53 @@ Thank you for your interest in contributing to the Spyre plugin for vLLM! There 
 
 ## Issues
 
-If you encounter a bug or have a feature request, please search [existing issues](https://github.com/vllm-project/vllm-spyre/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/vllm-project/vllm-spyre/issues/new/choose):
+If you encounter a bug or have a feature request, please search [existing issues](https://github.com/torch-spyre/spyre-inference/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/torch-spyre/spyre-inference/issues/new/choose):
 
 - **🐛 Bug Report**: For reporting bugs and unexpected behavior
 - **🚀 Feature Request**: For suggesting new features or improvements
 
 You can also reach out for support in the `#sig-spyre` channel in the [vLLM Slack](https://inviter.co/vllm-slack) workspace.
+
+## Docs
+
+### Building the docs with MkDocs
+
+#### Install MkDocs and Plugins
+
+Install MkDocs along with the [plugins](https://github.com/torch-spyre/spyre-inference/blob/main/mkdocs.yaml) used in the Spyre Inference documentation.
+
+```bash
+uv pip install -r docs/requirements-docs.txt
+```
+
+!!! note
+    Ensure that your Python version is compatible with the plugins (e.g., `mkdocs-awesome-nav` requires Python 3.10+)
+
+#### Start the Development Server
+
+MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it.
+
+Make sure you're in the same directory as the `mkdocs.yaml` configuration file in the `spyre-inference` repository, and then start the server by running the `mkdocs serve` command:
+
+```bash
+mkdocs serve
+```
+
+Example output:
+
+```console
+INFO    -  Documentation built in 106.83 seconds
+INFO    -  [22:02:02] Watching paths for changes: 'docs', 'mkdocs.yaml'
+INFO    -  [22:02:02] Serving on http://127.0.0.1:8000/
+```
+
+#### View in Your Browser
+
+Open up [http://127.0.0.1:8000/](http://127.0.0.1:8000/) in your browser to see a live preview.
+
+#### Learn More
+
+For additional features and advanced configurations, refer to the official [MkDocs Documentation](https://www.mkdocs.org/).
 
 ## Getting Started
 
@@ -88,7 +129,7 @@ prek install
 
 ### DCO and Signed-off-by
 
-When contributing, you must agree to the [DCO](https://github.com/vllm-project/vllm-spyre/blob/main/DCO).Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
+When contributing, you must agree to the <gh-file:DCO>. Commits must include a `Signed-off-by:` header which certifies agreement with the terms of the DCO.
 
 Using `-s` with `git commit` will automatically add this header.
 

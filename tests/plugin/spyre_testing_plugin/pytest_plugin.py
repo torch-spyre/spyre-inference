@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 pytest11 plugin for spyre-inference.
 
@@ -40,18 +54,24 @@ import subprocess
 import sys
 import tempfile
 import time
+import torch.distributed as dist
+import torch.testing
+
 from pathlib import Path
 
 import pytest
+import torch
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 import yaml
 
-from spyre_inference.testing.models import (
+from spyre_testing_plugin.models import (
     AllowEntry,
     BlockEntry,
     FileConfig,
     ParamAllow,
     ParamOverride,
     ParamSkip,
+    Tolerances,
     UpstreamTestConfig,
 )
 
@@ -111,6 +131,13 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                 ParamOverride(param_name=k, values=tuple(v))
                 for k, v in params_section.get("override", {}).items()
             ]
+            tolerances_section = allow.get("tolerances")
+            tolerances = None
+            if tolerances_section:
+                tolerances = Tolerances(
+                    atol=float(tolerances_section.get("atol", 1e-3)),
+                    rtol=float(tolerances_section.get("rtol", 1e-3)),
+                )
             allow_list.append(
                 AllowEntry(
                     test=allow["test"],
@@ -119,6 +146,8 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                     param_skips=tuple(param_skips),
                     param_allows=tuple(param_allows),
                     param_overrides=tuple(param_overrides),
+                    tolerances=tolerances,
+                    fixture_names=tuple(allow.get("fixture_names", ())),
                 )
             )
         block_list = [BlockEntry(test=b["test"]) for b in file_entry.get("block_list", [])]
@@ -174,11 +203,11 @@ def _extract_vllm_commit_from_pyproject() -> str:
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    pyproject_path = Path(__file__).parent.parent.parent / "pyproject.toml"
+    # Look for pyproject.toml at repo root
+    repo_root_dir = Path(__file__).parent.parent.parent.parent
+    pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
-        raise FileNotFoundError(
-            f"pyproject.toml not found in {Path(__file__).parent.parent.parent}"
-        )
+        raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
 
     content = pyproject_path.read_text()
     # Look for vllm source with git and rev
@@ -326,6 +355,26 @@ def _prepare_upstream_tests_dir() -> Path:
     return tests_dir
 
 
+def _temp_upstream_code_edits(upstream_tests_dir: Path):
+    """Apply small code edits to the upstream tests directory before importing.
+
+    These should be _temporary_ edits to source code for vllm tests while we work to make them more
+    portable. This should only be used where mocking is not possible or too cumbersome.
+    """
+
+    # Mocking out torch.device seems impossible to do (at least multiple rounds of Bob and Claude
+    # were unsuccessful). So we patch the source code to change the hardcoded
+    # `torch.device("cuda:0")` to `torch.device("cpu")`.
+    hardcoded_cuda_test_path = (
+        upstream_tests_dir / "v1" / "attention" / "test_attention_backends.py"
+    )
+    with open(hardcoded_cuda_test_path) as f:
+        content = f.read()
+    content = content.replace('torch.device("cuda:0")', 'torch.device("cpu")')
+    with open(hardcoded_cuda_test_path, "w") as f:
+        f.write(content)
+
+
 # ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
@@ -366,6 +415,7 @@ def pytest_configure(config):
         try:
             # Clone vLLM to cache
             upstream_tests_base = _prepare_upstream_tests_dir()
+            _temp_upstream_code_edits(upstream_tests_base)
             config._upstream_tests_base = upstream_tests_base
 
             # Determine which test paths to inject
@@ -499,6 +549,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         elif allow_entry.mode == "xfail_strict":
             item.add_marker(pytest.mark.xfail(strict=True))
 
+        # Store tolerances on item for fixture access
+        if allow_entry.tolerances:
+            item._spyre_tolerances = allow_entry.tolerances
+        # Inject fixtures for tests that have fixture_names defined
+        for fixture_name in allow_entry.fixture_names:
+            item.fixturenames.append(fixture_name)
+
     # Reorder tests so that tests with "uses_subprocess" marker run first
     _reorder_tests_by_name(items)
 
@@ -525,6 +582,28 @@ def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
         return (priority, stable_map[item])
 
     items.sort(key=sort_key)
+
+
+def _convert_yaml_value(value):
+    """Convert YAML string values to Python objects where appropriate.
+
+    Handles torch dtype strings like "torch.half" -> torch.half.
+    """
+    if isinstance(value, str):
+        import torch
+
+        dtype_map = {
+            "torch.half": torch.half,
+            "torch.float16": torch.float16,
+            "torch.bfloat16": torch.bfloat16,
+            "torch.float32": torch.float32,
+            "torch.float": torch.float,
+            "torch.float64": torch.float64,
+            "torch.double": torch.double,
+        }
+        if value in dtype_map:
+            return dtype_map[value]
+    return value
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -555,7 +634,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         for i, marker in enumerate(metafunc.definition.own_markers):
             if marker.name == "parametrize" and marker.args[0] == po.param_name:
                 metafunc.definition.own_markers[i] = pytest.mark.parametrize(
-                    po.param_name, list(po.values)
+                    po.param_name, [_convert_yaml_value(v) for v in po.values]
                 ).mark
                 break
 
@@ -566,7 +645,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 def _spyre_default_vllm_config(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.platforms import PlatformEnum, current_platform
     from vllm.forward_context import set_forward_context
@@ -581,6 +660,7 @@ def _spyre_default_vllm_config(monkeypatch):
     config = VllmConfig(
         device_config=DeviceConfig(device="cpu"),
         compilation_config=CompilationConfig(custom_ops=["all"]),
+        model_config=ModelConfig(dtype=torch.float16),
     )
     with set_current_vllm_config(config), set_forward_context(None, config):
         # Set forward context so custom ops can access the vllm config
@@ -592,10 +672,153 @@ def default_vllm_config(monkeypatch):
     yield from _spyre_default_vllm_config(monkeypatch)
 
 
+@pytest.fixture(scope="session")
+def _distributed_init():
+    """Initialize torch.distributed with gloo backend once per test session.
+
+    Uses a FileStore so no network port is required. The process group is
+    destroyed at the end of the session.
+    """
+    fd, store_path = tempfile.mkstemp(suffix=".store")
+    os.close(fd)
+    try:
+        store = dist.FileStore(store_path, 1)
+        dist.init_process_group(
+            backend="gloo",
+            store=store,
+            world_size=1,
+            rank=0,
+        )
+        yield
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if os.path.exists(store_path):
+            os.unlink(store_path)
+
+
+@pytest.fixture()
+def tp_group(_distributed_init, default_vllm_config):
+    """Set up a real TP=1 GroupCoordinator inside vLLM's parallel_state.
+
+    Depends on `default_vllm_config` so the VllmConfig context and OOT
+    platform patch are already active when the GroupCoordinator is created.
+    After the test the previous _TP value is restored.
+
+    Tests that create vLLM linear layers should use this fixture instead of
+    (or in addition to) `default_vllm_config`.
+    """
+    from vllm.distributed.parallel_state import GroupCoordinator
+    import vllm.distributed.parallel_state as ps
+
+    group = GroupCoordinator(
+        group_ranks=[[0]],
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        use_device_communicator=False,
+        group_name="tp",
+    )
+    original_tp = ps._TP
+    ps._TP = group
+    yield group
+    ps._TP = original_tp
+
+
 @pytest.fixture()
 def should_do_global_cleanup_after_test():
     """Skip global cleanup for Spyre - torch.accelerator.empty_cache() doesn't work yet."""
     return False
+
+
+@pytest.fixture(autouse=True)
+def relax_torch_tolerances(request, monkeypatch):
+    """Relax torch.testing.assert_close tolerances for upstream tests.
+
+    Only applies to tests with explicit tolerances configured in upstream_tests.yaml:
+
+        - test: "test_foo"
+          tolerances:
+            atol: 1e-3
+            rtol: 1e-3
+    """
+    tolerances = getattr(request.node, "_spyre_tolerances", None)
+    if tolerances is None:
+        return
+
+    _original = torch.testing.assert_close
+
+    def relaxed_assert_close(*args, **kwargs):
+        kwargs["atol"] = tolerances.atol
+        kwargs["rtol"] = tolerances.rtol
+        return _original(*args, **kwargs)
+
+    monkeypatch.setattr(torch.testing, "assert_close", relaxed_assert_close)
+
+
+@pytest.fixture()
+def patch_backend_list(request, monkeypatch):
+    """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
+
+    # The BACKENDS_TO_TEST list has to be patched with only our backend
+    our_backend_list = [
+        AttentionBackendEnum.CUSTOM,
+    ]
+    test_module = request.node.module
+    monkeypatch.setattr(test_module, "BACKENDS_TO_TEST", our_backend_list)
+
+    # _test_backend_correctness may be called with a hardcoded AttentionBackendEnum.FLEX_ATTENTION,
+    # which we want to ignore
+    orig_tbc = test_module._test_backend_correctness
+
+    def tbc_wrapper(
+        batch_spec, model, backend_to_test: list[AttentionBackendEnum | str], *args, **kwargs
+    ):
+        if "AttentionBackendEnum.FLEX_ATTENTION" in str(backend_to_test):
+            return
+        return orig_tbc(batch_spec, model, backend_to_test, *args, **kwargs)
+
+    monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
+
+    # Patch the KV cache layout handling to include CUSTOM backend
+    # The spyre backend uses [num_blocks, 2, block_size, num_kv_heads, head_size] layout,
+    # same as TRITON_ATTN, but the test creates KV cache as [2, num_blocks, ...] by default
+    orig_run_attention_backend = test_module.run_attention_backend
+
+    def patched_run_attention_backend(
+        backend,
+        kv_cache_spec,
+        layer_names,
+        vllm_config,
+        device,
+        common_attn_metadata,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_type=None,
+        sliding_window=None,
+    ):
+        # Transpose KV cache for CUSTOM backend to match expected layout
+        if backend == AttentionBackendEnum.CUSTOM:
+            kv_cache = kv_cache.transpose(0, 1).contiguous()
+        return orig_run_attention_backend(
+            backend,
+            kv_cache_spec,
+            layer_names,
+            vllm_config,
+            device,
+            common_attn_metadata,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_type,
+            sliding_window,
+        )
+
+    monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
+
+    yield
 
 
 @pytest.hookimpl(tryfirst=True)

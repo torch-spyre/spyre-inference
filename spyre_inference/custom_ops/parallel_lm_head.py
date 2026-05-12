@@ -145,7 +145,7 @@ class SpyreParallelLMHead(ParallelLMHead):
             self.padded_weight.data,
             bias,
         )
-        
+
         out_cpu = convert(out, device="cpu")
         out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
         return convert(out_cpu_no_pad, device=x_device)

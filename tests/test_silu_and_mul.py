@@ -46,7 +46,7 @@ def reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
         torch.float32,
     ],
 )
-def test_spyre_siluandmul_matches_reference(default_vllm_config, num_tokens, d, dtype):
+def test_spyre_siluandmul_matches_reference(num_tokens, d, dtype):
     """SpyreSiluAndMul output matches golden reference.
 
     Tests both paths:
@@ -69,7 +69,7 @@ def test_spyre_siluandmul_matches_reference(default_vllm_config, num_tokens, d, 
 
 @pytest.mark.spyre
 @pytest.mark.siluandmul
-def test_siluandmul_oot_dispatch(default_vllm_config):
+def test_siluandmul_oot_dispatch():
     """Verify SiluAndMul OOT registration: class swap"""
     from vllm.model_executor.layers.activation import SiluAndMul
     from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul

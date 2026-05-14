@@ -14,7 +14,7 @@ Follow the [Installation Guide](../getting_started/installation.md) to get the b
 uv sync --group dev
 ```
 
-This includes additional tools like pytest, pytest-asyncio, and other testing utilities.
+This includes `pytest`, `pyyaml`, and the `spyre-testing-plugin` for running the test suite.
 
 ### Linting
 

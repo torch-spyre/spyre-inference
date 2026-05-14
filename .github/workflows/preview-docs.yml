@@ -28,6 +28,8 @@ jobs:
           name: preview-docs
           path: site/
           retention-days: 7
+      # The PR number must be passed via artifact because doc_comment.yml runs on
+      # workflow_run (triggered after this workflow), which has no pull_request context.
       - name: Save PR metadata
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}

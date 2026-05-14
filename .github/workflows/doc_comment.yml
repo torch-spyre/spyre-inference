@@ -44,13 +44,19 @@ jobs:
             const prNumber = parseInt(fs.readFileSync('pr-number.txt', 'utf8').trim());
             const sha = '${{ github.event.workflow_run.head_sha }}'.slice(0, 7);
             const artifactUrl = '${{ steps.artifact-url.outputs.result }}';
-            const body = `## Docs preview\n\nBuilt from ${sha}. [Download artifact](${artifactUrl}), or build the docs locally:\n\`\`\`bash\nuv pip install -r docs/requirements-docs.txt\nmkdocs serve\n\`\`\``;
+            const body = [
+              `📖 This PR includes doc changes. [Download the preview](${artifactUrl}) (built from \`${sha}\`), or build locally:`,
+              `\`\`\`bash`,
+              `uv pip install -r docs/requirements-docs.txt`,
+              `mkdocs serve`,
+              `\`\`\``,
+            ].join('\n');
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: prNumber,
             });
-            const existing = comments.find(c => c.body.startsWith('## Docs preview'));
+            const existing = comments.find(c => c.body.startsWith('📖'));
             if (existing) {
               await github.rest.issues.updateComment({
                 owner: context.repo.owner,

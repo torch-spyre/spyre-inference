@@ -6,7 +6,7 @@ This guide covers the installation of `spyre-inference` using `uv`, a fast Pytho
 
 - Python >= 3.11
 - `uv` package manager installed ([installation guide](https://github.com/astral-sh/uv))
-- Access to systems where `sendnn` is available (required for torch-spyre compilation)
+- Access to IBM Spyre hardware with the Spyre Runtime Stack (required for torch-spyre compilation)
 
 ## Installation with uv sync
 
@@ -91,10 +91,28 @@ This includes additional tools like pytest, pytest-asyncio, and other testing ut
 
 If you encounter build failures:
 
-1. **torch-spyre compilation**: Ensure `sendnn` is available on your system. See internal development documentation for how to set up a dev environment with `sendnn`.
+1. **torch-spyre compilation**: Ensure the Spyre Runtime Stack is available on your system. See internal development documentation for environment setup.
 2. **vLLM build**: Check that you have sufficient memory and CPU resources for compilation
 3. **Dependency conflicts**: Review the `override-dependencies` section in `pyproject.toml`
 
 ## Next Steps
 
-After installation, you can start using spyre-inference with your vLLM applications. The plugin will automatically be loaded by vLLM when the appropriate platform is detected.
+To load the plugin, set the `VLLM_PLUGINS` environment variable before running vLLM:
+
+```bash
+export VLLM_PLUGINS=spyre_inference
+```
+
+You can then use vLLM as usual:
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+    max_model_len=128,
+    max_num_seqs=2,
+)
+```
+
+See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.

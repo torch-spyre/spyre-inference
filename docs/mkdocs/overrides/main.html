@@ -1,6 +1,12 @@
 {% extends "base.html" %}
 
 {% block announce %}
-  {# TODO: add the spyre-inference stable docs URL once available. #}
-  <p>You are viewing the latest developer preview docs. <a href="">Click here</a> to view docs for the latest stable release.</p>
+  <p id="dev-banner" style="display:none">
+    You are viewing development docs. <a href="{{ config.site_url }}stable/">Click here</a> to view docs for the latest stable release.
+  </p>
+  <script>
+    if (window.location.pathname.includes('/latest/')) {
+      document.getElementById('dev-banner').style.display = '';
+    }
+  </script>
 {% endblock %}

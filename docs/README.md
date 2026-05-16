@@ -1,42 +1,19 @@
-# spyre-inference
+# Welcome to Spyre Inference
 
-## Overview
+<p style="text-align:center">
+<script async defer src="https://buttons.github.io/buttons.js"></script>
+<a class="github-button" href="https://github.com/torch-spyre/spyre-inference" data-show-count="true" data-size="large" aria-label="Star">Star</a>
+<a class="github-button" href="https://github.com/torch-spyre/spyre-inference/subscription" data-icon="octicon-eye" data-size="large" aria-label="Watch">Watch</a>
+<a class="github-button" href="https://github.com/torch-spyre/spyre-inference/fork" data-icon="octicon-repo-forked" data-size="large" aria-label="Fork">Fork</a>
+</p>
 
-The `spyre-inference` plugin represents the next iteration of sendnn-inference, built on the `torch-spyre` stack. This plugin integrates with `torch-spyre` to leverage the PyTorch Inductor backend for model compilation, providing enhanced performance and optimization capabilities for large language model inference.
+**IBM Spyre** is the first production-grade Artificial Intelligence Unit (AIU) accelerator born out of the IBM Research AIU family. It is part of a long-term strategy of developing novel architectures and full-stack technology solutions for the emerging space of generative AI. Spyre builds on the foundation of IBM's internal AIU research and delivers a scalable, efficient architecture for accelerating AI in enterprise environments.
 
-## Key Features
+`spyre-inference` is a vLLM platform plugin that enables seamless integration of IBM Spyre accelerators with vLLM via the [`torch-spyre`](https://github.com/torch-spyre/torch-spyre) PyTorch backend. It is the next evolution of [`sendnn-inference`](https://github.com/torch-spyre/sendnn-inference), leveraging PyTorch's native Inductor compiler backend through vLLM's plugin architecture.
 
-- **Torch Inductor Backend**: Utilizes PyTorch's native Inductor compiler for optimized model execution
-- **torch-spyre Integration**: Built on the torch-spyre framework for advanced compilation and optimization
-- **vLLM Platform Plugin**: Seamlessly integrates with vLLM's plugin architecture via the `vllm.platform_plugins` entry point
-- **CPU-Optimized**: Configured for efficient CPU-based inference with vLLM 0.15.1+cpu
+For more information, check out the following:
 
-## Architecture
-
-The plugin registers itself as a vLLM platform plugin through the entry point:
-
-```python
-[project.entry-points."vllm.platform_plugins"]
-spyre_inference = "spyre_inference:register"
-```
-
-This allows vLLM to automatically discover and load the plugin, enabling torch-spyre-based compilation and execution.
-
-## Getting Started
-
-To get started with spyre-inference, see the [Installation Guide](getting_started/installation.md).
-
-## Documentation
-
-- [Installation](getting_started/installation.md) - Setup and installation instructions
-
-## Requirements
-
-- Python >= 3.11
-- torch-spyre (built from source)
-- vLLM 0.15.1+cpu
-- PyTorch 2.10.0 (CPU version)
-
-## License
-
-Apache-2.0
+- 📚 [Meet the IBM Artificial Intelligence Unit](https://research.ibm.com/blog/ibm-artificial-intelligence-unit-aiu)
+- 📽️ [AI Accelerators: Transforming Scalability & Model Efficiency](https://www.youtube.com/watch?v=KX0qBM-ByAg)
+- 🚀 [Spyre Accelerator for IBM Z](https://research.ibm.com/blog/spyre-for-z)
+- 🚀 [Spyre Accelerator for IBM POWER](https://newsroom.ibm.com/2025-07-08-ibm-power11-raises-the-bar-for-enterprise-it)

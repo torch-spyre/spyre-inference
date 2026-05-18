@@ -54,11 +54,13 @@ If you don't set these first, expect ~10–15 permission prompts during a typica
 ### What you're allowed to do without asking
 
 Local experiments are fair game:
+
 - Run any pytest selection under `tests/`.
 - Write scratch scripts and artifacts under `.claude/skills/debug-spyre/logs/<slug>/`.
 - Edit source files in this repo (`spyre_inference/`, `tests/`) to prototype and test a fix — but revert before marking the session `resolved` or `blocked` unless the user has explicitly approved the patch.
 
 The following still require human confirmation:
+
 - `git commit`, `git push`, creating/merging PRs.
 - Editing anything under `.venv/` (torch-spyre site-packages) — those changes are invisible to version control and wiped on the next `uv sync`. If you need to instrument torch-spyre, write a standalone repro script instead.
 - Installing, upgrading, or downgrading dependencies, or changing `pyproject.toml` / `uv.lock`.
@@ -66,6 +68,7 @@ The following still require human confirmation:
 ### Hardware constraint: Spyre is a single accelerator
 
 **Never run two Spyre-backed commands at once.** This includes:
+
 - Launching multiple `uv run pytest` invocations in parallel tool calls.
 - Using `run_in_background=true` on a Spyre test and then starting another before it finishes.
 - `pytest -n` / `xdist` — always run serially.
@@ -86,6 +89,7 @@ uv run --no-sync python .claude/skills/debug-spyre/logs/<slug>/repro.py
 ```
 
 A few related gotchas worth knowing:
+
 - `uv pip install` from a path also caches the built wheel. If a fresh edit doesn't seem to take effect, `uv cache clean torch-spyre` and reinstall with `--no-cache --no-build-isolation`.
 - The torch-spyre wheel build is C++-heavy and takes ~50 s. Plan your iteration loop accordingly — batch up source changes before each rebuild rather than one-edit-one-rebuild.
 - Verify the install actually landed before running the test: `grep -n <new-symbol-name> /home/senuser/spyre-inference/.venv/lib/python3.12/site-packages/torch_spyre/.../<file>.py`. If the symbol you just added isn't there, the install didn't take and `--no-sync` won't help yet — fix the install first.
@@ -101,10 +105,12 @@ Each invocation of this skill investigates **one cluster of related failures**, 
 Before doing anything else, build the cluster:
 
 1. Run the failing test surface once (or read a recent run the human points you at). Use the narrowest selector that still includes every failure you've been told about — a single test file, a marker, or a path. Tee to the session directory:
+
    ```bash
    uv run pytest <selector> -m "not upstream" --tb=short -q 2>&1 \
      | tee .claude/skills/debug-spyre/logs/<slug>/full-matrix.txt
    ```
+
 2. Read every failure. Sort them by symptom:
    - near-100 % mismatch with large abs diff → likely one cluster (structural bug),
    - small-ratio mismatch with small abs diff → likely a different cluster (fp16 accumulation),
@@ -193,6 +199,7 @@ For each `queued` row:
 6. Move to the next `queued` row.
 
 Stop the hypothesis loop only when one of these holds:
+
 - You have a fix that clears the baseline probe → proceed to Step 4 (cluster validation). Do not mark the cluster `resolved` yet.
 - You have identified the bug but a fix needs human judgment (design choice, scope question) → document a concrete next action in the log and set status to `blocked`.
 - Every hypothesis in the queue has been tested and none explain the failure → log this explicitly and propose the next tier of experiments (instrument torch-spyre itself, escalate) before pausing.
@@ -277,13 +284,14 @@ uv run pytest -m "not upstream" '<node id>' \
 
 `torch-spyre` silently routes unsupported ops to CPU and emits a `FallbackWarning`. Example shape:
 
-```
+```shell
 spyre_inference/.../<file>.py:<line>: FallbackWarning:
     torch.ops.spyre.<op> is falling back to cpu
     <the line that triggered it>
 ```
 
 A fallback is not always wrong, but it:
+
 - Changes the numerical path (CPU vs Spyre matmul kernels differ in precision & accumulation order for fp16).
 - Incurs extra D2H/H2D transfers (sometimes these silently clobber dtype or layout).
 - Can mask a real bug: the op that fell back may not match the op you thought you called.
@@ -295,11 +303,11 @@ Turn the warning into an error using the specific `FallbackWarning` filter shown
 `torch-spyre` is installed from GitHub (see `pyproject.toml` `tool.uv.sources`), so the site-packages copy is the source of truth. Key files:
 
 - `.venv/lib/python3.12/site-packages/torch_spyre/ops/eager.py`
-  - Lists every aten op registered as a Spyre kernel via `register_torch_compile_kernel([...])`. If an op is **not** in that list, it either has a fallback or is missing entirely. Currently covered: `mm`, `bmm`, `cat`, `add`, `mul`, `div`, `exp`, `log`, `_softmax`, `sum`, `sqrt`, `rsqrt`, `sigmoid`, `relu`, `tanh`, `sub`, `addmm`, `eq`, `ge`, `gt`, `lt`, `maximum`, `pow`, `linalg_vector_norm`, and a few others. Anything else goes through fallbacks.
+    - Lists every aten op registered as a Spyre kernel via `register_torch_compile_kernel([...])`. If an op is **not** in that list, it either has a fallback or is missing entirely. Currently covered: `mm`, `bmm`, `cat`, `add`, `mul`, `div`, `exp`, `log`, `_softmax`, `sum`, `sqrt`, `rsqrt`, `sigmoid`, `relu`, `tanh`, `sub`, `addmm`, `eq`, `ge`, `gt`, `lt`, `maximum`, `pow`, `linalg_vector_norm`, and a few others. Anything else goes through fallbacks.
 - `.venv/lib/python3.12/site-packages/torch_spyre/ops/fallbacks.py`
-  - Every op that moves to CPU and back. Notable: `arange`, `sin`, `cos`, `embedding`, `tril`, `triu`, `bitwise_or`/`xor`, `argmax`, `cumsum`, `repeat.out`, `isin`, `max_dim_int64_fallback`, `max_default_int64_fallback`. Read the top-of-file comment block — it documents the *process* for adding new fallbacks.
+    - Every op that moves to CPU and back. Notable: `arange`, `sin`, `cos`, `embedding`, `tril`, `triu`, `bitwise_or`/`xor`, `argmax`, `cumsum`, `repeat.out`, `isin`, `max_dim_int64_fallback`, `max_default_int64_fallback`. Read the top-of-file comment block — it documents the *process* for adding new fallbacks.
 - `.venv/lib/python3.12/site-packages/torch_spyre/_monkey_patch.py`
-  - Patches `torch.Tensor.to`, `torch.empty`, and `__repr__` for Spyre. Explains why `.to(device="spyre")` can behave oddly when combined with dtype changes (the patch only kicks in when `device_layout` is provided).
+    - Patches `torch.Tensor.to`, `torch.empty`, and `__repr__` for Spyre. Explains why `.to(device="spyre")` can behave oddly when combined with dtype changes (the patch only kicks in when `device_layout` is provided).
 - `.venv/lib/python3.12/site-packages/torch_spyre/_inductor/` — decompositions, lowerings, and custom ops. If a compile error blames an inductor pass, this is the place.
 
 Grep patterns that usually get you to the right file fast:
@@ -371,21 +379,25 @@ When a test fails with `Tensor-likes are not close`:
 ## When to stop debugging locally and escalate
 
 Escalate to the torch-spyre team (open an issue / file it in the shared tracker) when:
+
 - You have a minimal repro that runs an op on Spyre and produces either wrong output or an unhelpful error.
 - The op is listed as registered in `torch_spyre/ops/eager.py` but still falls back.
 - A compile error references internal inductor files (`torch_spyre/_inductor/*.py`) with no obvious misuse on our side.
 - An overload that *should* be supported (per `op.overloads()`) is not.
 
 Before escalating, always re-run the same scenario on CPU to confirm the bug is Spyre-specific, and capture:
+
 1. The failing test node id.
 2. The full traceback.
 3. torch-spyre identification — `torch_spyre.__version__` is currently pinned at `"0.0.1"` and is **not** a useful identifier on its own. Capture the actual source revision:
+
    ```bash
    # Preferred: exact git revision recorded by uv
    grep -A2 '"torch-spyre"' uv.lock | head
    # Or: the wheel's recorded source
    uv run pip show torch-spyre | grep -iE "version|home-?page|location"
    ```
+
    Include the revision hash in the escalation.
 4. The torch version (`uv run python -c "import torch; print(torch.__version__)"`).
 5. A repro, in this order of preference — always prefer the minimal one that reliably triggers the bug:

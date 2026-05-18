@@ -13,7 +13,18 @@ If the failing surface is the attention backend, the workflow below still applie
 
 ## Before you start
 
-### Permissions (set once per workspace)
+### Bypass-permissions mode (strongly recommended)
+
+This skill runs an autonomous hypothesis loop — many pytest invocations, many writes into `logs/<slug>/`, many `git checkout`s to revert experiments. Each new log filename, each new env-var combination, and each scratch-script execution is a separate permission prompt under path-specific rules; over a typical session that's dozens of interruptions, and the loop is the whole point.
+
+The cleanest setup is to launch the session in bypass-permissions mode (a.k.a. "yolo mode") so the agent can iterate without prompting. Either:
+
+- Start Claude Code with `claude --dangerously-skip-permissions`, or
+- Toggle "Bypass permissions" in the harness's permission-mode picker before invoking this skill.
+
+If you can't enable bypass mode (shared workstation, paranoid environment, untrusted branch), fall back to the explicit allowlist below. The allowlist gets you most of the way but will still prompt on commands you didn't anticipate — when that happens, either approve and continue, or pause the session, add the new pattern to `.claude/settings.json`, and resume.
+
+### Permissions (fallback if bypass mode is off)
 
 Debugging Spyre code runs a handful of commands repeatedly — pytest with env-var prefixes, `tee` into session log files, `grep` into those logs, `git checkout` to revert experiments, and `Write`/`Edit` on the HTML/artifacts directory. Pre-approve these in `.claude/settings.json` under `permissions.allow` so the loop isn't interrupted every time a new log file appears:
 

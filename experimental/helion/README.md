@@ -288,6 +288,15 @@ Setting `do_verify_run_on_cpu=True` runs the FX graph on CPU before Spyre compil
 - **torch_spyre**: Spyre backend for PyTorch
 - **torch.profiler**: Performance profiling (optional)
 
+### Installation
+
+```bash
+# Install Helion
+uv pip install helion
+
+# Other dependencies should already be available in your torch-spyre environment
+```
+
 ## Path Configuration
 
 The scripts assume the following directory structure:

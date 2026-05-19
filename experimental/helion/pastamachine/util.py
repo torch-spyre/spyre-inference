@@ -74,7 +74,7 @@ def _capture_sdsc_paths() -> Generator[TranspileMeta, None, None]:
     Yields a :class:`TranspileMeta` whose ``sdsc_paths`` list is populated
     by the time the context exits.
     """
-    from torch_spyre._inductor.runtime.async_compile import SpyreAsyncCompile
+    from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
     meta = TranspileMeta()
     original_sdsc = SpyreAsyncCompile.sdsc

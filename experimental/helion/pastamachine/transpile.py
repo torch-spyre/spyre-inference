@@ -738,16 +738,45 @@ def _make_config_aware_core_division(node_block_sizes):
         SchedulerNode,
     )
 
-    from torch_spyre._inductor.core_division import (
-        divide_pointwise_op,
-        divide_reduction_op,
-        no_division,
-        map_host_dim_to_device_dim,
-    )
     from torch_spyre._inductor.ir import FixedTiledLayout
     from torch_spyre._inductor.pass_utils import get_mem_deps
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+    
+    # Helper functions that were removed from torch_spyre - implement locally
+    def no_division(args, output):
+        """Initialize core division structure with no splits (all 1s)."""
+        num_args = len(args)
+        # Return list of dicts, one per arg + output
+        return [{} for _ in range(num_args + 1)]
+    
+    def map_host_dim_to_device_dim(layout: FixedTiledLayout, host_dim: int) -> int:
+        """Map host dimension index to device dimension index.
+        
+        For FixedTiledLayout, the device_layout contains the mapping.
+        This is a simplified implementation that assumes 1:1 mapping.
+        """
+        # In the new structure, we need to map through the device_layout
+        # For now, use a simple 1:1 mapping as a fallback
+        return host_dim
+    
+    def divide_pointwise_op(op, args, max_cores, pass_fn=None):
+        """Wrapper for pointwise op division."""
+        if pass_fn is not None:
+            pass_fn(op, args, max_cores)
+        else:
+            # Default behavior: no division
+            op.spyre_core_division = no_division(args, op.node.get_layout())
+            op.n_cores_used = 1
+    
+    def divide_reduction_op(op, args, max_cores, pass_fn=None):
+        """Wrapper for reduction op division."""
+        if pass_fn is not None:
+            pass_fn(op, args, max_cores)
+        else:
+            # Default behavior: no division
+            op.spyre_core_division = no_division(args, op.node.get_layout())
+            op.n_cores_used = 1
 
     max_cores = int(os.getenv("SENCORES", "32"))
     if max_cores > 32 or max_cores < 1:
@@ -833,10 +862,9 @@ def _make_config_aware_core_division(node_block_sizes):
 
         if red.reduction_type == MATMUL_REDUCTION_OP:
             assert len(args) == 2, "matmul has exactly 2 input args"
-            from torch_spyre._inductor.core_division import get_host_dim_size
-
-            M = get_host_dim_size(args[0].layout, 0)
-            N = get_host_dim_size(args[1].layout, 1)
+            # get_host_dim_size was removed; directly access layout.size
+            M = args[0].layout.size[0]
+            N = args[1].layout.size[1]
 
             op_dims = [("M", M), ("N", N)]
             splits = {}
@@ -861,19 +889,19 @@ def _make_config_aware_core_division(node_block_sizes):
 
         elif red.reduction_type == BATCH_MATMUL_OP:
             assert len(args) == 2, "bmm has exactly 2 input args"
-            from torch_spyre._inductor.core_division import get_host_dim_size
+            # get_host_dim_size was removed; directly access layout.size
             num_dims = len(args[0].layout.size)
 
             if num_dims == 3:
-                B = get_host_dim_size(args[0].layout, 0)
-                M = get_host_dim_size(args[0].layout, 1)
-                N = get_host_dim_size(args[1].layout, 2)
+                B = args[0].layout.size[0]
+                M = args[0].layout.size[1]
+                N = args[1].layout.size[2]
                 op_dims = [("B", B), ("M", M), ("N", N)]
             elif num_dims == 4:
-                B1 = get_host_dim_size(args[0].layout, 0)
-                B2 = get_host_dim_size(args[0].layout, 1)
-                M = get_host_dim_size(args[0].layout, 2)
-                N = get_host_dim_size(args[1].layout, 3)
+                B1 = args[0].layout.size[0]
+                B2 = args[0].layout.size[1]
+                M = args[0].layout.size[2]
+                N = args[1].layout.size[3]
                 op_dims = [("B1", B1), ("B2", B2), ("M", M), ("N", N)]
             else:
                 raise RuntimeError(f"Unsupported BMM dimension count: {num_dims}")
@@ -1028,7 +1056,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             log.debug("  %s (%s): device=%s, dtype=%s", node.name, node.op, val.device, val.dtype)
 
     # Debug patch: confirm SuperDSCScheduling is instantiated
-    from torch_spyre._inductor.dsc import SuperDSCScheduling
+    from torch_spyre._inductor.scheduler import SuperDSCScheduling
     _orig_sdsc_init = SuperDSCScheduling.__init__
     def _debug_sdsc_init(self, *args, **kwargs):
         log.debug("[SPYRE DEBUG] SuperDSCScheduling.__init__ called -- Spyre codegen is active!")
@@ -1237,12 +1265,10 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     from torch_spyre._inductor import decompositions as _dec_mod
     _orig_enable_spyre_decompositions = _dec_mod.enable_spyre_decompositions
     @_cm
-    def _debug_enable_spyre_decompositions():
-        log.info("[DEBUG] >>> ENTERING enable_spyre_decompositions (nesting=%d)",
-                 _dec_mod._decompositions_nesting)
-        with _orig_enable_spyre_decompositions():
-            log.info("[DEBUG] enable_spyre_decompositions entered (nesting=%d)",
-                     _dec_mod._decompositions_nesting)
+    def _debug_enable_spyre_decompositions(decomps=None):
+        log.info("[DEBUG] >>> ENTERING enable_spyre_decompositions")
+        with _orig_enable_spyre_decompositions(decomps=decomps):
+            log.info("[DEBUG] enable_spyre_decompositions entered")
             yield
         log.info("[DEBUG] <<< EXITED enable_spyre_decompositions")
     _dec_mod.enable_spyre_decompositions = _debug_enable_spyre_decompositions

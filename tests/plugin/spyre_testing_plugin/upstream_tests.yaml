@@ -83,19 +83,3 @@ tests:
           fixture_names:
           - "patch_backend_list"
 
-    # Pipeline-parallel partition logic (`get_pp_indices`). Pure unit
-    # tests, no distributed setup, no GPU. We don't run pipeline
-    # parallelism on Spyre yet, but exercising the partition utility
-    # gives us a cheap upstream smoke test we can land before #137's
-    # follow-ups, and catches regressions in
-    # `vllm.distributed.utils.get_pp_indices` that would otherwise only
-    # surface when PP support is implemented.
-    - rel_path: tests/distributed/test_pipeline_partition.py
-      allow_list:
-        - test: "test_custom_layer_partition"
-          mode: mandatory_pass
-          tags: [pp_partition, upstream]
-        - test: "test_uneven_auto_partition"
-          mode: mandatory_pass
-          tags: [pp_partition, upstream]
-

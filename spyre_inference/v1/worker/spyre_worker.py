@@ -79,8 +79,7 @@ class TorchSpyreWorker(CPUWorker):
 
         # `libspyre_comms.so::SpyreDeviceInfo` reads RANK / WORLD_SIZE /
         # LOCAL_RANK / LOCAL_WORLD_SIZE from the environment when the
-        # spyreccl backend is constructed (see
-        # spyre-comms/src/device.cpp `get_env_var(...)`) and throws
+        # spyreccl backend is constructed and throws
         # `EnvironmentVariableException` if any are unset. vllm's
         # MultiprocExecutor uses TCP-based init (`tcp://...`) and does
         # NOT set those env vars, so we populate them here before
@@ -88,9 +87,11 @@ class TorchSpyreWorker(CPUWorker):
         # worker is launched via torchrun the env vars are already set
         # and `setdefault` leaves them alone.
         #
-        # Single-node TP only: LOCAL_WORLD_SIZE == WORLD_SIZE. Once
-        # multi-node TP is supported, derive LOCAL_WORLD_SIZE from the
-        # node-local rank count.
+        # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
+        # so parallel_config.world_size (TP*PP*PCP) is the global rank
+        # count here, and on a single node LOCAL_WORLD_SIZE == WORLD_SIZE.
+        # Once multi-node TP is supported, derive LOCAL_WORLD_SIZE from
+        # the node-local rank count.
         world_size = self.vllm_config.parallel_config.world_size
         os.environ.setdefault("RANK", str(self.rank))
         os.environ.setdefault("WORLD_SIZE", str(world_size))

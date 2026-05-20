@@ -29,13 +29,14 @@ import pytest
 def _spyre_device_count() -> int:
     """Return the number of visible Spyre cards, or 0 if unavailable.
 
-    Counts numeric entries under /dev/vfio rather than calling
-    `torch.spyre.device_count()`, because `uses_subprocess` tests must
-    not touch the Spyre runtime in the main pytest process.
+    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
+    cards are visible) instead of touching the Spyre runtime, so
+    `uses_subprocess` tests don't import torch_spyre in the main
+    pytest process.
     """
     try:
-        return sum(1 for n in os.listdir("/dev/vfio") if n.isdigit())
-    except OSError:
+        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
+    except ValueError:
         return 0
 
 
@@ -45,6 +46,14 @@ def _free_tcp_port() -> int:
         return s.getsockname()[1]
 
 
+# TEMPORARY: this test exercises the low-level distributed init path
+# directly (subprocess + env-rendezvous + init_worker_distributed_environment
+# + manual all_reduce probe) because the higher-level LLM(tp=2) tests
+# below are xfail-strict on #134/#135. Once those land and
+# test_tp2_llm_construction / test_tp2_llm_generate_matches_tp1 pass,
+# this test is redundant — delete it (and _TP_ALLREDUCE_CODE) along
+# with the xfail markers on the LLM tests.
+#
 # Inner-rank script for `test_tp2_tensor_model_parallel_all_reduce`.
 # Launched once per rank as a fresh `python -c` subprocess with
 # RANK / WORLD_SIZE / LOCAL_RANK / LOCAL_WORLD_SIZE / MASTER_{ADDR,PORT}
@@ -68,12 +77,10 @@ _TP_ALLREDUCE_CODE = textwrap.dedent(
     from vllm.plugins import load_general_plugins
     load_general_plugins()
 
-    from vllm.platforms import PlatformEnum, current_platform
-    type(current_platform)._enum = PlatformEnum.OOT
-
     from vllm.engine.arg_utils import EngineArgs
     from vllm.config import set_current_vllm_config
     from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
+    from vllm.platforms import current_platform
 
     cfg = EngineArgs(
         model="facebook/opt-125m",
@@ -217,19 +224,24 @@ def test_tp2_llm_construction() -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
+# xfail-strict here can mask a TP=1 regression in the body of this test;
+# accepted because the marker will be deleted when #134/#135 land.
 @pytest.mark.xfail(
     strict=True,
     reason=(
         "needs #134, #135, and a TP=2 fallback for all_gather "
         "(LM head logits gather hits unimplemented _allgather_base). "
-        "When all three land, TP=1 vs TP=2 token outputs should match."
+        "When all three land, TP=1 vs TP=2 should match on the first "
+        "few decoded tokens."
     ),
 )
 def test_tp2_llm_generate_matches_tp1() -> None:
-    """TP=1 vs TP=2 greedy-decode golden test on opt-125m.
+    """TP=1 vs TP=2 greedy-decode prefix-match test on opt-125m.
 
     Runs identical prompts at TP=1 and TP=2 with `temperature=0` and
-    asserts equal output token IDs. xfail-strict so it surfaces the
+    asserts the first 2 output tokens match per prompt. Later divergence
+    is expected from float16 reduction-order differences between the
+    TP=1 and TP=2 paths. xfail-strict so the test flips to passing the
     moment end-to-end TP=2 forward correctness lands.
     """
     from vllm import LLM, SamplingParams
@@ -248,10 +260,23 @@ def test_tp2_llm_generate_matches_tp1() -> None:
         )
         outs = llm.generate(prompts, sp)
         result = [list(o.outputs[0].token_ids) for o in outs]
+        # vllm doesn't expose an explicit LLM.shutdown(); rely on GC +
+        # child-process reaping. Revisit if this flakes.
         del llm
         gc.collect()
         return result
 
+    def _matching_prefix_len(a: list[int], b: list[int]) -> int:
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                return i
+        return min(len(a), len(b))
+
     tp1 = run(1)
     tp2 = run(2)
-    assert tp1 == tp2, f"tp1 != tp2: {tp1} vs {tp2}"
+    for i, (a, b) in enumerate(zip(tp1, tp2)):
+        n = _matching_prefix_len(a, b)
+        assert n >= 2, (
+            f"prompt {i}: tp1 and tp2 diverged at token {n} "
+            f"(expected >=2 matching tokens). tp1={a} tp2={b}"
+        )

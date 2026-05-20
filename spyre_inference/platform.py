@@ -63,10 +63,8 @@ class TorchSpyrePlatform(CpuPlatform):
     # `init_distributed_environment` and `torch.distributed.new_group`.
     # `gloo` handles CPU tensors (used by vllm's parallel-state cpu_group
     # and any host-side coordination); `spyreccl` handles Spyre tensors
-    # for the device_group. Registered by `torch_spyre._autoload()` on
-    # `import torch`. See
-    # /home/senuser/spyre-inference/.venv/.../torch_spyre/__init__.py
-    # `dist.Backend.register_backend(DISTRIBUTED_BACKEND_NAME, ...)`.
+    # for the device_group. See `torch_spyre._autoload` (registers
+    # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend
@@ -162,8 +160,19 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
-        # ---- worker ----
         parallel_config = vllm_config.parallel_config
+
+        # Spyre does not currently support data parallelism. The worker's
+        # WORLD_SIZE / RANK derivation in spyre_worker.init_device assumes a
+        # single DP replica, and the spyre-comms global rank space has not
+        # been validated for DP×TP configurations.
+        if parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                f"Spyre does not support data_parallel_size > 1 "
+                f"(got {parallel_config.data_parallel_size})."
+            )
+
+        # ---- worker ----
         if parallel_config.worker_cls == "auto":
             # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
             # Override with TorchSpyreWorker for Spyre-specific functionality

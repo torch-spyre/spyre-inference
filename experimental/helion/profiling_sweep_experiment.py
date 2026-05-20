@@ -244,7 +244,8 @@ HELION_CONFIGS = [
 script_dir = os.path.dirname(os.path.abspath(__file__))
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 sweep_dir = os.path.join(
-    "/home/ngl/results",
+    os.path.dirname(__file__),
+    "results",
     f"{timestamp}_helion_to_spyre_v6",
 )
 os.makedirs(sweep_dir, exist_ok=True)

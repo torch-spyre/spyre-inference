@@ -22,6 +22,7 @@ Metadata container returned by transpilation when ``return_meta=True``.
 from __future__ import annotations
 
 import contextlib
+import glob
 import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, Generator, List, Optional
@@ -58,7 +59,11 @@ class TranspileMeta:
     tile_dim_to_block_value: Dict[str, Dict[int, int]] = field(default_factory=dict)
 
     def load_sdsc(self, index: int = 0) -> Dict[str, Any]:
-        """Load and return the parsed JSON of the *index*-th SDSC file."""
+        """Load and return the parsed JSON of the *index*-th SDSC file.
+
+        With the new torch-spyre, each kernel produces ``sdsc_0.json``,
+        ``sdsc_1.json``, … directly in the kernel output directory.
+        """
         import json
 
         with open(self.sdsc_paths[index], "r") as f:
@@ -72,24 +77,28 @@ def _capture_sdsc_paths() -> Generator[TranspileMeta, None, None]:
     written during compilation.
 
     Yields a :class:`TranspileMeta` whose ``sdsc_paths`` list is populated
-    by the time the context exits.
+    by the time the context exits.  Also ensures torch-spyre inductor logging
+    is enabled so that compilation artifacts are emitted regardless of the
+    caller's environment.
     """
     from torch_spyre.execution.async_compile import SpyreAsyncCompile
 
     meta = TranspileMeta()
     original_sdsc = SpyreAsyncCompile.sdsc
 
-    def _patched_sdsc(self, kernel_name, ks):
-        runner = original_sdsc(self, kernel_name, ks)
-        # The original writes sdsc.json under code_dir/execute/<name>/
+    # Enable torch-spyre inductor logging for the duration of compilation
+    # so that SDSC generation proceeds with full diagnostics.
+    prev_log = os.environ.get("SPYRE_INDUCTOR_LOG")
+    prev_level = os.environ.get("SPYRE_INDUCTOR_LOG_LEVEL")
+    os.environ["SPYRE_INDUCTOR_LOG"] = "1"
+    os.environ.setdefault("SPYRE_INDUCTOR_LOG_LEVEL", "INFO")
+
+    def _patched_sdsc(self, kernel_name, specs):
+        runner = original_sdsc(self, kernel_name, specs)
         code_dir = getattr(runner, "code_dir", None)
         if code_dir is not None:
-            sdsc_path = os.path.join(
-                code_dir, "execute", kernel_name, "sdsc.json"
-            )
-            if os.path.isfile(sdsc_path):
-                meta.sdsc_paths.append(sdsc_path)
-
+            for path in sorted(glob.glob(os.path.join(code_dir, "sdsc_*.json"))):
+                meta.sdsc_paths.append(path)
         return runner
 
     SpyreAsyncCompile.sdsc = _patched_sdsc
@@ -97,5 +106,13 @@ def _capture_sdsc_paths() -> Generator[TranspileMeta, None, None]:
         yield meta
     finally:
         SpyreAsyncCompile.sdsc = original_sdsc
+        if prev_log is None:
+            os.environ.pop("SPYRE_INDUCTOR_LOG", None)
+        else:
+            os.environ["SPYRE_INDUCTOR_LOG"] = prev_log
+        if prev_level is None:
+            os.environ.pop("SPYRE_INDUCTOR_LOG_LEVEL", None)
+        else:
+            os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = prev_level
 
 # Made with Bob

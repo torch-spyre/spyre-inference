@@ -1010,8 +1010,6 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     Returns the compiled callable.
     """
     from torch._inductor import compile_fx as cfx_module
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from torch.fx.passes.fake_tensor_prop import FakeTensorProp
     from torch_spyre._inductor.spyre_kernel import SpyreOpFuncs
     from torch_spyre._inductor.patches import enable_spyre_context
 
@@ -1118,20 +1116,6 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     
     log.info(f"Processed {len(processed_inputs)} inputs")
     example_spyre_inputs = processed_inputs
-
-    # Propagate FakeTensors so compile_fx sees Spyre devices
-    log.info("Creating Spyre FakeTensors and propagating through graph...")
-    fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
-    with fake_mode:
-        fake_inputs = [fake_mode.from_tensor(t) for t in example_spyre_inputs]
-        log.info("  FakeTensor devices: %s", [t.device for t in fake_inputs])
-        FakeTensorProp(graph_module_spyre, fake_mode).propagate(*fake_inputs)
-
-    log.debug("Node metadata after FakeTensorProp:")
-    for node in graph_module_spyre.graph.nodes:
-        val = node.meta.get('val')
-        if val is not None and hasattr(val, 'device'):
-            log.debug("  %s (%s): device=%s, dtype=%s", node.name, node.op, val.device, val.dtype)
 
     # Debug patch: confirm SuperDSCScheduling is instantiated
     from torch_spyre._inductor.scheduler import SuperDSCScheduling
@@ -1378,7 +1362,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     #
     # We call the ORIGINAL compile_fx (not the Spyre-wrapped version) to
     # avoid double-nesting of enable_spyre_context.
-    log.info("Calling compile_fx with Spyre FakeTensors (inside enable_spyre_context)...")
+    log.info("Calling compile_fx inside enable_spyre_context...")
     try:
         with enable_spyre_context(example_spyre_inputs):
             # Post-context-enter checks
@@ -1393,11 +1377,9 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             log.info("[DEBUG]   lowerings nesting: %d", _spyre_low_mod._lowerings_nesting)
 
             from torch._inductor.decomposition import decompositions
-            # Pass the processed inputs (with layouts) as the real inputs
-            # compile_fx will use these when V.get_real_inputs() is called
             compiled_fn = _orig_compile_fx(
                 graph_module_spyre,
-                example_spyre_inputs,  # Use processed inputs with layouts, not fake_inputs
+                example_spyre_inputs,
                 decompositions=decompositions,
             )
     finally:

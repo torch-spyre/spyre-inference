@@ -1185,7 +1185,10 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     for i, t in enumerate(example_spyre_inputs):
         log.info(
             "  Processing input %d: device=%s, shape=%s, dtype=%s",
-            i, t.device, t.shape, t.dtype,
+            i,
+            t.device,
+            t.shape,
+            t.dtype,
         )
         if t.device.type == "spyre":
             # Check if tensor already has a layout

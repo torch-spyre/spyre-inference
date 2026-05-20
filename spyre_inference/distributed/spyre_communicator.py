@@ -171,9 +171,7 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             )
         )
 
-    def gather(
-        self, input_: torch.Tensor, dst: int = 0, dim: int = -1
-    ) -> torch.Tensor | None:
+    def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor | None:
         # REPLACE-WITH-NATIVE: when libspyre_comms supports gather natively,
         # delete this override.
         if self.world_size == 1:

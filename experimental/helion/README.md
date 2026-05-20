@@ -29,7 +29,7 @@ uv pip install helion debugpy
 
 ## Directory Structure
 
-```
+```text
 spyre-inference/experimental/helion/
 ├── pastamachine/                    # Core transpilation framework
 │   ├── __init__.py                 # Public API exports
@@ -48,21 +48,22 @@ spyre-inference/experimental/helion/
 ### Core Components
 
 #### `transpile.py`
+
 The heart of the transpilation pipeline. Key functions:
 
 - **`compile_helion_to_spyre()`**: Main entry point for transpilation
-  - Converts Helion kernels to Spyre-compiled callables
-  - Supports CPU verification before hardware execution
-  - Optional config-aware core division planning
-  - Returns metadata for SDSC analysis when `return_meta=True`
+    - Converts Helion kernels to Spyre-compiled callables
+    - Supports CPU verification before hardware execution
+    - Optional config-aware core division planning
+    - Returns metadata for SDSC analysis when `return_meta=True`
 
 - **`transpile_fx_graphs()`**: Helion IR → FX graph conversion
-  - Extracts aten operations from Helion device IR
-  - Handles block-size parameters and tiling dimensions
-  - Tracks which operations are affected by Helion configs
-
+    - Extracts aten operations from Helion device IR
+    - Handles block-size parameters and tiling dimensions
+    - Tracks which operations are affected by Helion configs
 
 #### `analyze.py`
+
 SDSC metadata inspection and validation:
 
 - **`extract_key_sdsc_info()`**: Parses SDSC JSON files
@@ -70,11 +71,11 @@ SDSC metadata inspection and validation:
 - **`print_meta_summary()`**: Pretty-prints analysis with config validation
 
 #### `verify.py`
+
 CPU-side correctness checking:
 
 - **`verify_on_cpu()`**: Runs FX graph on CPU before Spyre compilation
 - Returns CPU results for comparison with hardware execution
-
 
 ## Example Scripts
 
@@ -106,6 +107,7 @@ result = compiled_fn(a_spyre, b_spyre, out_spyre)
 ```
 
 **Features:**
+
 - Single vector size (configurable: 512 by default)
 - Config-driven core division (block_size=32)
 - CPU verification before hardware execution
@@ -136,6 +138,7 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]):
 ```
 
 **Features:**
+
 - Multi-dimensional parameter sweeps (size × config)
 - PyTorch profiler integration (CPU + Spyre/AIU)
 - JSON output for all profiling data
@@ -145,7 +148,8 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]):
 - Timestamped result directories
 
 **Output Structure:**
-```
+
+```text
 path/to/results/YYYYMMDD_HHMMSS_profiling_sweep_experiment/
 ├── profiling_v6_vecsize32_cfgdefault_sencoresdefault.json
 ├── profiling_v6_vecsize64_cfgbs16_sencoresdefault.json
@@ -156,6 +160,7 @@ path/to/results/YYYYMMDD_HHMMSS_profiling_sweep_experiment/
 ### SDSC Metadata
 
 SDSC (Spyre Data Structure Compiler) files contain:
+
 - **numCoresUsed**: Actual cores allocated
 - **numWkSlicesPerDim**: Work division per dimension
 - **coreIdToDsc**: Core-to-DSC mapping
@@ -166,9 +171,7 @@ The framework validates that `numCoresUsed == prod(numWkSlicesPerDim)`.
 ### CPU Verification
 
 Setting `do_verify_run_on_cpu=True` runs the FX graph on CPU before Spyre compilation:
+
 - Catches transpilation errors early
 - Provides reference results for correctness checking
 - Useful for debugging complex kernels
-
-
-

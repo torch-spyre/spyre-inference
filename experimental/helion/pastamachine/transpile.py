@@ -1,10 +1,10 @@
-# Copyright 2026 The Torch-Spyre Authors.
+# Copyright 2026 The Spyre-Inference Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -122,10 +122,13 @@ def _resolve_constant_symnode(node, kernel_params):
         _log.debug(
             "    fallback check param %r: annotation=%s, default=%r", pname, ann, param.default
         )
-        if ann is not inspect.Parameter.empty and ann is not torch.Tensor:
-            if param.default is not inspect.Parameter.empty:
-                _log.debug("    -> resolved from fallback param %r: %s", pname, param.default)
-                return param.default
+        if (
+            ann is not inspect.Parameter.empty
+            and ann is not torch.Tensor
+            and param.default is not inspect.Parameter.empty
+        ):
+            _log.debug("    -> resolved from fallback param %r: %s", pname, param.default)
+            return param.default
 
     _log.warning("  _resolve_constant_symnode: could not resolve %s", node.name)
     return None
@@ -301,7 +304,8 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
     """Transpiles a helion FX graph to a spyre compatible FX graph.
 
     This happens via binding a *helion_kernel* with CPU tensors and convert its device IR into a
-    plain ``torch.fx.GraphModule`` containing only ``aten`` ops while taking care of spyre-specific dtypes and operations.
+    plain ``torch.fx.GraphModule`` containing only ``aten`` ops while taking care of
+    spyre-specific dtypes and operations.
 
     Parameters
     ----------
@@ -1163,7 +1167,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
         graph_module_spyre = torch.fx.GraphModule({}, graph_module.graph)
         log.info("Created fresh GraphModule")
     except Exception as e:
-        log.error(f"Error creating GraphModule: {e}")
+        log.error("Error creating GraphModule: %s", e)
         raise
 
     # Ensure all Spyre input tensors have device layouts attached
@@ -1173,33 +1177,36 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 
         log.info("Imported SpyreTensorLayout successfully")
     except Exception as e:
-        log.error(f"Error importing SpyreTensorLayout: {e}")
+        log.error("Error importing SpyreTensorLayout: %s", e)
         raise
     from torch_spyre._C import spyre_empty_with_layout
 
     processed_inputs = []
     for i, t in enumerate(example_spyre_inputs):
-        log.info(f"  Processing input {i}: device={t.device}, shape={t.shape}, dtype={t.dtype}")
+        log.info(
+            "  Processing input %d: device=%s, shape=%s, dtype=%s",
+            i, t.device, t.shape, t.dtype,
+        )
         if t.device.type == "spyre":
             # Check if tensor already has a layout
             try:
                 existing_layout = t.device_tensor_layout()
-                log.info(f"    Existing layout: {existing_layout}")
+                log.info("    Existing layout: %s", existing_layout)
                 if existing_layout is not None:
-                    log.info(f"    Tensor {i} already has layout, keeping it")
+                    log.info("    Tensor %d already has layout, keeping it", i)
                     processed_inputs.append(t)
                     continue
             except Exception as e:
-                log.info(f"    Error checking existing layout: {e}")
+                log.info("    Error checking existing layout: %s", e)
 
             # Create tensor with default layout using spyre_empty_with_layout
-            log.info(f"    Creating tensor with default layout for tensor {i}")
+            log.info("    Creating tensor with default layout for tensor %d", i)
             layout = SpyreTensorLayout(list(t.shape), t.dtype)
-            log.info(f"    Created layout: {layout}")
+            log.info("    Created layout: %s", layout)
 
             # Create new tensor with layout
             t_cpu = t.cpu()
-            log.info(f"    Moved to CPU: {t_cpu.shape}")
+            log.info("    Moved to CPU: %s", t_cpu.shape)
 
             # Use spyre_empty_with_layout to create tensor with layout
             # Compute stride - for contiguous tensor, stride[i] = product of sizes[i+1:]
@@ -1208,10 +1215,10 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             for size in reversed(list(t.shape)):
                 stride.insert(0, s)
                 s *= size
-            log.info(f"    Computed stride: {stride}")
+            log.info("    Computed stride: %s", stride)
 
             t_with_layout = spyre_empty_with_layout(list(t.shape), stride, t.dtype, layout)
-            log.info(f"    Created empty tensor with layout: device={t_with_layout.device}")
+            log.info("    Created empty tensor with layout: device=%s", t_with_layout.device)
 
             # Copy data from CPU to Spyre using .copy_() which internally uses _C.copy_tensor
             t_with_layout.copy_(t_cpu)
@@ -1220,15 +1227,15 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             # Verify the layout was attached
             try:
                 verify_layout = t_with_layout.device_tensor_layout()
-                log.info(f"    Verified layout on new tensor: {verify_layout}")
+                log.info("    Verified layout on new tensor: %s", verify_layout)
             except Exception as e:
-                log.error(f"    ERROR: Failed to verify layout: {e}")
+                log.error("    ERROR: Failed to verify layout: %s", e)
             processed_inputs.append(t_with_layout)
         else:
-            log.info(f"    Tensor {i} is not on spyre device, keeping as-is")
+            log.info("    Tensor %d is not on spyre device, keeping as-is", i)
             processed_inputs.append(t)
 
-    log.info(f"Processed {len(processed_inputs)} inputs")
+    log.info("Processed %d inputs", len(processed_inputs))
     example_spyre_inputs = processed_inputs
 
     # Debug patch: confirm SuperDSCScheduling is instantiated

@@ -31,17 +31,19 @@ os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
 # os.environ["DTLOG_LEVEL"] = "debug"
 
 # Add pastamachine and torch-spyre to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../new_stack/torch-spyre'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../new_stack/torch-spyre"))
 
 import pastamachine
 
 import logging
+
 # logging.getLogger("pastamachine").setLevel(logging.WARNING)  # suppress info
 logging.getLogger("pastamachine").setLevel(logging.DEBUG)
 
 
 # ── Define a Helion kernel ──────────────────────────────────────────────────
+
 
 @helion.kernel()
 def inplace_add(
@@ -51,6 +53,7 @@ def inplace_add(
 ):
     for tile in hl.tile(out.size()):
         out[tile] += a[tile] + b[tile]
+
 
 # ── Prepare Spyre inputs ───────────────────────────────────────────────────
 
@@ -84,7 +87,7 @@ pastamachine.print_meta_summary(meta)
 
 print("\n--- Executing Spyre Compiled Function ---")
 result = compiled_for_spyre(a_spyre, b_spyre, out_spyre)
-print(f"Spyre execution complete")
+print("Spyre execution complete")
 print(f"Result type: {type(result)}")
 
 # we know it is in-place

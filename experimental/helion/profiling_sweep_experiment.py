@@ -37,18 +37,18 @@ from datetime import datetime
 from torch.profiler import profile, ProfilerActivity
 
 # Add pastamachine and torch-spyre to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../new_stack/torch-spyre'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../new_stack/torch-spyre"))
 
 import pastamachine
 
 import math
-import logging
 # logging.getLogger("pastamachine").setLevel(logging.WARNING)
 # logging.getLogger("pastamachine").setLevel(logging.DEBUG)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
+
 
 def parse_profiler_table(table_str):
     """Parse a PyTorch profiler table string into a list of dicts."""
@@ -56,7 +56,7 @@ def parse_profiler_table(table_str):
 
     separator_indices = []
     for i, line in enumerate(lines):
-        if set(line.strip()) <= {'-', ' '}:
+        if set(line.strip()) <= {"-", " "}:
             separator_indices.append(i)
 
     if len(separator_indices) < 2:
@@ -69,9 +69,9 @@ def parse_profiler_table(table_str):
     col_ranges = []
     start = None
     for i, ch in enumerate(sep):
-        if ch == '-' and start is None:
+        if ch == "-" and start is None:
             start = i
-        elif ch != '-' and start is not None:
+        elif ch != "-" and start is not None:
             col_ranges.append((start, i))
             start = None
     if start is not None:
@@ -83,7 +83,7 @@ def parse_profiler_table(table_str):
 
     rows = []
     for line in lines[data_start:]:
-        if set(line.strip()) <= {'-', ' ', ''}:
+        if set(line.strip()) <= {"-", " ", ""}:
             break
         if line.strip().startswith("Self") or line.strip().startswith("---"):
             break
@@ -105,7 +105,7 @@ def parse_self_totals(table_str):
     totals = {}
     for line in table_str.strip().splitlines():
         line = line.strip()
-        m = re.match(r'^(Self .+ time total):\s*(.+)$', line)
+        m = re.match(r"^(Self .+ time total):\s*(.+)$", line)
         if m:
             totals[m.group(1)] = m.group(2).strip()
     return totals
@@ -113,13 +113,13 @@ def parse_self_totals(table_str):
 
 def parse_time_us(s):
     """Parse a time string like '1.234ms' or '567.890us' to microseconds."""
-    m = re.search(r'([\d.]+)\s*(ms|us|s)', s)
+    m = re.search(r"([\d.]+)\s*(ms|us|s)", s)
     if not m:
         return 0.0
     val, unit = float(m.group(1)), m.group(2)
-    if unit == 's':
+    if unit == "s":
         return val * 1_000_000
-    elif unit == 'ms':
+    elif unit == "ms":
         return val * 1_000
     return val
 
@@ -132,7 +132,7 @@ def _is_device_col(col_name):
 
 def parse_percentage(s):
     """Extract a numeric percentage value from a string like '45.23%'."""
-    m = re.search(r'([\d.]+)%', s)
+    m = re.search(r"([\d.]+)%", s)
     return float(m.group(1)) if m else 0.0
 
 
@@ -164,34 +164,37 @@ def verify_sdsc_cores(meta, cfg):
 
         # If no config was given or this op wasn't affected, skip the check
         if cfg is None or not dim_to_bs:
-            results.append({
-                "operation": op_name,
-                "numCoresUsed": num_cores_used,
-                "expected": expected,
-                "status": "SKIP (no config)",
-            })
+            results.append(
+                {
+                    "operation": op_name,
+                    "numCoresUsed": num_cores_used,
+                    "expected": expected,
+                    "status": "SKIP (no config)",
+                }
+            )
             continue
 
-        matched = {
-            name: dims for name, dims in dim_to_bs.items()
-            if op_name and op_name in name
-        }
+        matched = {name: dims for name, dims in dim_to_bs.items() if op_name and op_name in name}
         if not matched:
-            results.append({
-                "operation": op_name,
-                "numCoresUsed": num_cores_used,
-                "expected": expected,
-                "status": "SKIP (not affected)",
-            })
+            results.append(
+                {
+                    "operation": op_name,
+                    "numCoresUsed": num_cores_used,
+                    "expected": expected,
+                    "status": "SKIP (not affected)",
+                }
+            )
             continue
 
         if num_cores_used == "N/A":
-            results.append({
-                "operation": op_name,
-                "numCoresUsed": num_cores_used,
-                "expected": expected,
-                "status": "SKIP (N/A)",
-            })
+            results.append(
+                {
+                    "operation": op_name,
+                    "numCoresUsed": num_cores_used,
+                    "expected": expected,
+                    "status": "SKIP (N/A)",
+                }
+            )
             continue
 
         if num_cores_used == expected:
@@ -199,17 +202,20 @@ def verify_sdsc_cores(meta, cfg):
         else:
             status = "MISMATCH"
 
-        results.append({
-            "operation": op_name,
-            "numCoresUsed": num_cores_used,
-            "expected": expected,
-            "status": status,
-        })
+        results.append(
+            {
+                "operation": op_name,
+                "numCoresUsed": num_cores_used,
+                "expected": expected,
+                "status": status,
+            }
+        )
 
     return results
 
 
 # ── Define a Helion kernel ──────────────────────────────────────────────────
+
 
 @helion.kernel()
 def inplace_add(
@@ -267,9 +273,9 @@ for vec_size in VECTOR_SIZES:
             print(f"\nSKIP: vec_size={vec_size}, config={cfg_lbl} (block_size > vec_size)")
             continue
 
-        print(f"\n{'#'*70}")
+        print(f"\n{'#' * 70}")
         print(f"#  vector_size = {vec_size},  config = {cfg_lbl}")
-        print(f"{'#'*70}")
+        print(f"{'#' * 70}")
 
         # ── Prepare tensors ───────────────────────────────────────────────
         a_spyre = torch.full([vec_size], 1.0, device=SPYRE_DEVICE)
@@ -296,13 +302,14 @@ for vec_size in VECTOR_SIZES:
         # ── Verify core counts ────────────────────────────────────────────
         core_results = verify_sdsc_cores(meta, cfg)
         for cr in core_results:
-            print(f"  [core check] op={cr['operation']}: "
-                  f"numCoresUsed={cr['numCoresUsed']}, "
-                  f"expected={cr['expected']} → {cr['status']}")
+            print(
+                f"  [core check] op={cr['operation']}: "
+                f"numCoresUsed={cr['numCoresUsed']}, "
+                f"expected={cr['expected']} → {cr['status']}"
+            )
         mismatches = [cr for cr in core_results if cr["status"] == "MISMATCH"]
         assert not mismatches, (
-            f"SDSC core count MISMATCH for vec_size={vec_size}, config={cfg_lbl}: "
-            f"{mismatches}"
+            f"SDSC core count MISMATCH for vec_size={vec_size}, config={cfg_lbl}: {mismatches}"
         )
 
         # ── Compute core count ────────────────────────────────────────────
@@ -314,14 +321,12 @@ for vec_size in VECTOR_SIZES:
             block_size = None
             num_cores = None
             for cr in core_results:
-                if cr['numCoresUsed'] != 'N/A':
-                    num_cores = cr['numCoresUsed']
+                if cr["numCoresUsed"] != "N/A":
+                    num_cores = cr["numCoresUsed"]
                     break
 
         # ── Snapshot inputs on CPU (before Spyre execution mutates out) ──
-        cpu_inputs_snapshot = tuple(
-            t.detach().cpu().clone() for t in (a_spyre, b_spyre, out_spyre)
-        )
+        cpu_inputs_snapshot = tuple(t.detach().cpu().clone() for t in (a_spyre, b_spyre, out_spyre))
 
         # ── Profile ───────────────────────────────────────────────────────
         print("\n--- Executing with profiling ---")
@@ -376,7 +381,7 @@ for vec_size in VECTOR_SIZES:
         # ── Compute Spyre time excl. memory ops ─────────────────────────
         MEMORY_OPS = {"Memset (Device)", "Memcpy (HtoD)"}
         self_spyre_key = None
-        for col in (parsed_spyre[0].keys() if parsed_spyre else []):
+        for col in parsed_spyre[0].keys() if parsed_spyre else []:
             if col.startswith("Self") and _is_device_col(col) and "%" not in col:
                 self_spyre_key = col
                 break
@@ -411,7 +416,7 @@ for vec_size in VECTOR_SIZES:
         # ── Top-5 by Spyre share ─────────────────────────────────────────
         spyre_pct_col = None
         spyre_time_col = None
-        for col in (parsed_spyre[0].keys() if parsed_spyre else []):
+        for col in parsed_spyre[0].keys() if parsed_spyre else []:
             if _is_device_col(col) and "%" in col:
                 spyre_pct_col = col
             if _is_device_col(col) and "total" in col.lower() and "%" not in col:
@@ -427,13 +432,13 @@ for vec_size in VECTOR_SIZES:
                 reverse=True,
             )
             top5 = sorted_entries[:5]
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"  Top 5 by Spyre share (column: {sort_col})")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             name_col = "Name" if "Name" in top5[0] else list(top5[0].keys())[0]
             for i, row in enumerate(top5, 1):
                 print(f"  {i}. {row.get(name_col, 'N/A'):40s}  {row.get(sort_col, 'N/A')}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
         else:
             print("\nWARNING: Could not identify an AIU/Spyre time column.")
 
@@ -445,7 +450,9 @@ for vec_size in VECTOR_SIZES:
             print(f"Correctness:  vec_size={vec_size}, config={cfg_lbl}: PASSED")
         else:
             max_diff = torch.max(torch.abs(spyre_output_cpu - expected)).item()
-            print(f"Correctness:  vec_size={vec_size}, config={cfg_lbl}: FAILED (max diff={max_diff})")
+            print(
+                f"Correctness:  vec_size={vec_size}, config={cfg_lbl}: FAILED (max diff={max_diff})"
+            )
 
 # ── Save sweep summary ────────────────────────────────────────────────────
 

@@ -24,8 +24,7 @@ returned by :func:`~pastamachine.compile_helion_to_spyre` when
 
 from __future__ import annotations
 
-import json
-from typing import Any, Dict, List
+from typing import Any
 
 from pastamachine._logging import getLogger
 from pastamachine.util import TranspileMeta
@@ -33,7 +32,7 @@ from pastamachine.util import TranspileMeta
 log = getLogger("analyze")
 
 
-def extract_key_sdsc_info(sdsc_data: Dict[str, Any]) -> Dict[str, Any]:
+def extract_key_sdsc_info(sdsc_data: dict[str, Any]) -> dict[str, Any]:
     """Extract key information from a parsed SDSC JSON structure.
 
     Parameters
@@ -50,7 +49,7 @@ def extract_key_sdsc_info(sdsc_data: Dict[str, Any]) -> Dict[str, Any]:
         ``numWkSlicesPerDim``, and (when present) per-DSC core/corelet info
         and compute operation details.
     """
-    info: Dict[str, Any] = {}
+    info: dict[str, Any] = {}
 
     op_keys = list(sdsc_data.keys())
     if not op_keys:
@@ -82,7 +81,7 @@ def extract_key_sdsc_info(sdsc_data: Dict[str, Any]) -> Dict[str, Any]:
     return info
 
 
-def summarize_meta(meta: TranspileMeta) -> List[Dict[str, Any]]:
+def summarize_meta(meta: TranspileMeta) -> list[dict[str, Any]]:
     """Return a list of key-info dicts, one per SDSC file in *meta*.
 
     This is a convenience wrapper that loads each SDSC file referenced by the
@@ -130,17 +129,14 @@ def print_meta_summary(meta: TranspileMeta) -> None:
         # Match SDSC operation to affected FX nodes.
         # SDSC operation (e.g. "add") is a substring of transpiled node
         # names (e.g. "add", "add_1").
-        matched = {
-            name: dims for name, dims in dim_to_bs.items()
-            if op_name and op_name in name
-        }
+        matched = {name: dims for name, dims in dim_to_bs.items() if op_name and op_name in name}
 
         if not matched:
             log.info("  [config check] not an affected op — used default division")
             continue
 
         # Gather block_sizes applied to this op
-        all_dim_bs: Dict[int, int] = {}
+        all_dim_bs: dict[int, int] = {}
         for dims in matched.values():
             all_dim_bs.update(dims)
 
@@ -153,12 +149,17 @@ def print_meta_summary(meta: TranspileMeta) -> None:
             continue
 
         if num_cores_used == expected_from_slices:
-            log.info("  [config check] PASS: numCoresUsed=%d == "
-                     "prod(numWkSlicesPerDim)=%d",
-                     num_cores_used, expected_from_slices)
+            log.info(
+                "  [config check] PASS: numCoresUsed=%d == prod(numWkSlicesPerDim)=%d",
+                num_cores_used,
+                expected_from_slices,
+            )
         else:
-            log.info("  [config check] MISMATCH: numCoresUsed=%d != "
-                     "prod(numWkSlicesPerDim)=%d",
-                     num_cores_used, expected_from_slices)
+            log.info(
+                "  [config check] MISMATCH: numCoresUsed=%d != prod(numWkSlicesPerDim)=%d",
+                num_cores_used,
+                expected_from_slices,
+            )
+
 
 # Made with Bob

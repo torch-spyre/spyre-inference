@@ -31,7 +31,7 @@ import torch
 from torch._ops import OpOverload
 
 from pastamachine._logging import getLogger
-from pastamachine.util import TranspileMeta, _capture_sdsc_paths
+from pastamachine.util import _capture_sdsc_paths
 from pastamachine.verify import verify_on_cpu
 
 log = getLogger("transpile")
@@ -41,8 +41,10 @@ log = getLogger("transpile")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def print_fx_graph_and_extract_nodes(graph, graph_name="FX Graph", detailed=True,
-                                     level=logging.INFO):
+
+def print_fx_graph_and_extract_nodes(
+    graph, graph_name="FX Graph", detailed=True, level=logging.INFO
+):
     """Print FX graph information in a structured format and return node list."""
     log.log(level, "%s", "=" * 60)
     log.log(level, "%s", graph_name)
@@ -75,6 +77,7 @@ def print_fx_graph_and_extract_nodes(graph, graph_name="FX Graph", detailed=True
 # Helpers for Helion IR → aten conversion
 # ---------------------------------------------------------------------------
 
+
 def _resolve_constant_symnode(node, kernel_params):
     """Resolve a non-block-size ``_get_symnode`` node to its concrete value.
 
@@ -84,12 +87,16 @@ def _resolve_constant_symnode(node, kernel_params):
     """
     _log = getLogger("transpile")
     debug_name = str(node.args[0]) if node.args else ""
-    _log.debug("  _resolve_constant_symnode: node=%s, debug_name=%r, "
-               "meta keys=%s", node.name, debug_name, list(node.meta.keys()))
+    _log.debug(
+        "  _resolve_constant_symnode: node=%s, debug_name=%r, meta keys=%s",
+        node.name,
+        debug_name,
+        list(node.meta.keys()),
+    )
 
     # 1. Try FX node metadata — only accept concrete numeric values
     #    (SymInt / SymFloat are symbolic and print as variable names)
-    for key in ('val', 'example_value'):
+    for key in ("val", "example_value"):
         val = node.meta.get(key)
         _log.debug("    meta[%r] = %r (type=%s)", key, val, type(val).__name__)
         if isinstance(val, (int, float)):
@@ -99,8 +106,12 @@ def _resolve_constant_symnode(node, kernel_params):
     # 2. Try matching the debug_name to a kernel parameter name
     if debug_name in kernel_params:
         param = kernel_params[debug_name]
-        _log.debug("    debug_name %r matches param: annotation=%s, default=%r",
-                   debug_name, param.annotation, param.default)
+        _log.debug(
+            "    debug_name %r matches param: annotation=%s, default=%r",
+            debug_name,
+            param.annotation,
+            param.default,
+        )
         if param.default is not inspect.Parameter.empty:
             _log.debug("    -> resolved from param default: %s", param.default)
             return param.default
@@ -108,12 +119,12 @@ def _resolve_constant_symnode(node, kernel_params):
     # 3. Fallback: first non-tensor parameter with a default value
     for pname, param in kernel_params.items():
         ann = param.annotation
-        _log.debug("    fallback check param %r: annotation=%s, default=%r",
-                   pname, ann, param.default)
+        _log.debug(
+            "    fallback check param %r: annotation=%s, default=%r", pname, ann, param.default
+        )
         if ann is not inspect.Parameter.empty and ann is not torch.Tensor:
             if param.default is not inspect.Parameter.empty:
-                _log.debug("    -> resolved from fallback param %r: %s",
-                           pname, param.default)
+                _log.debug("    -> resolved from fallback param %r: %s", pname, param.default)
                 return param.default
 
     _log.warning("  _resolve_constant_symnode: could not resolve %s", node.name)
@@ -138,13 +149,14 @@ def _subscript_to_unsqueeze_dim(node):
 # Graph transformations
 # ---------------------------------------------------------------------------
 
+
 def _get_node_dtype(node):
     """Extract the tensor dtype from a node's metadata."""
-    meta = node.meta.get('val') or node.meta.get('example_value')
-    if meta is not None and hasattr(meta, 'dtype'):
+    meta = node.meta.get("val") or node.meta.get("example_value")
+    if meta is not None and hasattr(meta, "dtype"):
         return meta.dtype
-    tm = node.meta.get('tensor_meta')
-    if tm is not None and hasattr(tm, 'dtype'):
+    tm = node.meta.get("tensor_meta")
+    if tm is not None and hasattr(tm, "dtype"):
         return tm.dtype
     return None
 
@@ -191,7 +203,7 @@ def prevent_reduction_upcasts(graph_module):
 
         # Pin dtype on reduction ops to prevent automatic float32 promotion
         if node.target in _PINNABLE_REDUCTION_OPS:
-            if node.kwargs.get('dtype') is not None:
+            if node.kwargs.get("dtype") is not None:
                 continue  # already pinned
 
             # Determine the input tensor's dtype
@@ -201,10 +213,9 @@ def prevent_reduction_upcasts(graph_module):
                 _log.debug("Cannot pin dtype for %s: missing dtype metadata", node.name)
                 continue
 
-            node.kwargs = {**node.kwargs, 'dtype': input_dtype}
+            node.kwargs = {**node.kwargs, "dtype": input_dtype}
             modified = True
-            _log.info("Pinned reduction %s (%s) to dtype=%s",
-                      node.name, node.target, input_dtype)
+            _log.info("Pinned reduction %s (%s) to dtype=%s", node.name, node.target, input_dtype)
 
     if modified:
         graph.lint()
@@ -266,8 +277,13 @@ def fix_scalar_args_for_spyre(graph_module):
         old_target = node.target
         node.target = scalar_target
         modified = True
-        _log.info("Converted %s: %s → %s (scalar arg: %s)",
-                  old_name, old_target, scalar_target, scalar_arg)
+        _log.info(
+            "Converted %s: %s → %s (scalar arg: %s)",
+            old_name,
+            old_target,
+            scalar_target,
+            scalar_arg,
+        )
 
     if modified:
         graph.lint()
@@ -279,6 +295,7 @@ def fix_scalar_args_for_spyre(graph_module):
 # ---------------------------------------------------------------------------
 # Step 1: Helion kernel  →  FX GraphModule
 # ---------------------------------------------------------------------------
+
 
 def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
     """Transpiles a helion FX graph to a spyre compatible FX graph.
@@ -330,14 +347,14 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
 
     new_graph = torch.fx.Graph()
 
-    node_mapping = {}                # old node → new node
+    node_mapping = {}  # old node → new node
     arg_nodes_needing_placeholders = set()
     block_size_nodes = []
-    store_ops = []                   # (dst_node, value_node)
-    host_tensor_to_param = {}        # _host_tensor node → param name
-    constant_symnode_values = {}     # non-block-size _get_symnode node → value
-    extra_lowering_inputs = {}       # _inductor_lowering_extra node → input node
-    view_op_nodes = {}               # subscript/view node → input tensor node
+    store_ops = []  # (dst_node, value_node)
+    host_tensor_to_param = {}  # _host_tensor node → param name
+    constant_symnode_values = {}  # non-block-size _get_symnode node → value
+    extra_lowering_inputs = {}  # _inductor_lowering_extra node → input node
+    view_op_nodes = {}  # subscript/view node → input tensor node
     kernel_params = inspect.signature(helion_kernel).parameters
 
     # First pass: identify OverloadOp nodes, stores, and arguments
@@ -359,15 +376,14 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                     log.info("    Kwarg node: %s", v.name)
 
         elif node.op == "call_function":
-            target_name = getattr(node.target, '__qualname__',
-                                  getattr(node.target, '__name__', ''))
-            target_module = getattr(node.target, '__module__', '')
+            target_name = getattr(node.target, "__qualname__", getattr(node.target, "__name__", ""))
+            target_module = getattr(node.target, "__module__", "")
             target_repr = str(node.target)
 
-            is_store = ('store' in target_name or 'store' in target_repr)
-            is_helion = ('helion' in target_module or 'helion' in target_repr)
+            is_store = "store" in target_name or "store" in target_repr
+            is_helion = "helion" in target_module or "helion" in target_repr
 
-            if '_host_tensor' in target_name or '_host_tensor' in target_repr:
+            if "_host_tensor" in target_name or "_host_tensor" in target_repr:
                 host_tensor_to_param[node] = node.name
                 log.info("  Found _host_tensor [%d]: %s -> param '%s'", i, node.name, node.name)
 
@@ -376,35 +392,56 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                 val_node = node.args[2] if len(node.args) > 2 else None
                 if isinstance(dst_node, torch.fx.Node) and isinstance(val_node, torch.fx.Node):
                     store_ops.append((dst_node, val_node))
-                    log.info("  Found store [%d]: %s -> store(%s, ..., %s, ...)",
-                             i, node.name, dst_node.name, val_node.name)
+                    log.info(
+                        "  Found store [%d]: %s -> store(%s, ..., %s, ...)",
+                        i,
+                        node.name,
+                        dst_node.name,
+                        val_node.name,
+                    )
                 else:
-                    log.info("  Found store [%d] but args not Nodes: args=%s",
-                             i, [type(a).__name__ for a in node.args])
+                    log.info(
+                        "  Found store [%d] but args not Nodes: args=%s",
+                        i,
+                        [type(a).__name__ for a in node.args],
+                    )
 
             elif is_helion:
-                if '_get_symnode' in target_name:
+                if "_get_symnode" in target_name:
                     debug_name = node.args[0] if node.args else ""
                     if isinstance(debug_name, str) and debug_name.startswith("block_size_"):
-                        log.info("  Found block size node [%d]: %s -> %s (debug=%s)",
-                                 i, node.name, target_name, debug_name)
+                        log.info(
+                            "  Found block size node [%d]: %s -> %s (debug=%s)",
+                            i,
+                            node.name,
+                            target_name,
+                            debug_name,
+                        )
                     else:
                         # Non-block-size symnode (e.g. eps) → resolve as constant
                         val = _resolve_constant_symnode(node, kernel_params)
                         constant_symnode_values[node] = val
-                        log.info("  Found constant symnode [%d]: %s = %s (debug=%s)",
-                                 i, node.name, val, debug_name)
+                        log.info(
+                            "  Found constant symnode [%d]: %s = %s (debug=%s)",
+                            i,
+                            node.name,
+                            val,
+                            debug_name,
+                        )
 
-                elif '_inductor_lowering_extra' in target_name:
+                elif "_inductor_lowering_extra" in target_name:
                     # Reduction helper — input is the most recent OverloadOp
                     # (Helion IR uses positional convention, not explicit args)
                     preceding_overload = overload_nodes[-1] if overload_nodes else None
                     extra_lowering_inputs[node] = preceding_overload
-                    log.info("  Found _inductor_lowering_extra [%d]: %s -> input=%s",
-                             i, node.name,
-                             preceding_overload.name if preceding_overload else "None")
+                    log.info(
+                        "  Found _inductor_lowering_extra [%d]: %s -> input=%s",
+                        i,
+                        node.name,
+                        preceding_overload.name if preceding_overload else "None",
+                    )
 
-                elif 'subscript' in target_name:
+                elif "subscript" in target_name:
                     # View op (e.g. tensor[:, None]) → will convert to aten.unsqueeze
                     input_node = None
                     for a in node.args:
@@ -412,22 +449,36 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                             input_node = a
                             break
                     view_op_nodes[node] = input_node
-                    log.info("  Found view op [%d]: %s -> input=%s, args=%s",
-                             i, node.name,
-                             input_node.name if input_node else "None",
-                             [str(a) if isinstance(a, torch.fx.Node) else repr(a)
-                              for a in node.args])
+                    log.info(
+                        "  Found view op [%d]: %s -> input=%s, args=%s",
+                        i,
+                        node.name,
+                        input_node.name if input_node else "None",
+                        [str(a) if isinstance(a, torch.fx.Node) else repr(a) for a in node.args],
+                    )
 
                 else:
-                    log.info("  Skipped helion node [%d]: %s -> name=%r module=%r",
-                             i, node.name, target_name, target_module)
+                    log.info(
+                        "  Skipped helion node [%d]: %s -> name=%r module=%r",
+                        i,
+                        node.name,
+                        target_name,
+                        target_module,
+                    )
             else:
-                log.info("  Skipped unknown call_function [%d]: %s -> type=%s, repr=%s",
-                         i, node.name, type(node.target).__name__, target_repr[:80])
+                log.info(
+                    "  Skipped unknown call_function [%d]: %s -> type=%s, repr=%s",
+                    i,
+                    node.name,
+                    type(node.target).__name__,
+                    target_repr[:80],
+                )
 
     log.info("Found %d OverloadOp nodes", len(overload_nodes))
     log.info("Found %d store operations", len(store_ops))
-    log.info("Found %d unique argument nodes needing placeholders", len(arg_nodes_needing_placeholders))
+    log.info(
+        "Found %d unique argument nodes needing placeholders", len(arg_nodes_needing_placeholders)
+    )
 
     # Filter pass: Remove nested placeholders (outputs of other OverloadOp nodes)
     log.info("=== Filter Pass: Remove nested placeholders ===")
@@ -438,16 +489,22 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
         if arg_node in overload_node_set:
             log.info("  Removing nested placeholder: %s (is output of OverloadOp)", arg_node.name)
         elif arg_node in constant_symnode_values:
-            log.info("  Removing constant symnode: %s (value=%s)",
-                     arg_node.name, constant_symnode_values[arg_node])
+            log.info(
+                "  Removing constant symnode: %s (value=%s)",
+                arg_node.name,
+                constant_symnode_values[arg_node],
+            )
         elif arg_node in view_op_nodes:
             log.info("  Removing view op: %s (will be converted to aten)", arg_node.name)
         else:
             filtered_arg_nodes.add(arg_node)
             log.info("  Keeping placeholder: %s", arg_node.name)
 
-    log.info("Filtered from %d to %d placeholder nodes",
-             len(arg_nodes_needing_placeholders), len(filtered_arg_nodes))
+    log.info(
+        "Filtered from %d to %d placeholder nodes",
+        len(arg_nodes_needing_placeholders),
+        len(filtered_arg_nodes),
+    )
     arg_nodes_needing_placeholders = filtered_arg_nodes
 
     # Second pass: Create placeholders ordered by kernel signature
@@ -460,7 +517,7 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
     load_to_param = {}  # load node → param name
 
     def _param_index(load_node):
-        if load_node.op == 'call_function' and len(load_node.args) > 0:
+        if load_node.op == "call_function" and len(load_node.args) > 0:
             host_tensor = load_node.args[0]
             if isinstance(host_tensor, torch.fx.Node) and host_tensor in host_tensor_to_param:
                 pname = host_tensor_to_param[host_tensor]
@@ -492,12 +549,19 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                     args=(node_mapping[input_node], unsqueeze_dim),
                 )
                 node_mapping[node] = new_node
-                log.info("  Created unsqueeze for %s: input=%s, dim=%d -> %s",
-                         node.name, input_node.name, unsqueeze_dim, new_node.name)
+                log.info(
+                    "  Created unsqueeze for %s: input=%s, dim=%d -> %s",
+                    node.name,
+                    input_node.name,
+                    unsqueeze_dim,
+                    new_node.name,
+                )
             else:
-                log.warning("  Could not convert view op %s: input %s not in mapping",
-                            node.name,
-                            input_node.name if input_node else "None")
+                log.warning(
+                    "  Could not convert view op %s: input %s not in mapping",
+                    node.name,
+                    input_node.name if input_node else "None",
+                )
             continue
 
         # --- OverloadOp nodes ---
@@ -509,15 +573,19 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
 
         # Resolve _extra_args → actual input tensor (for reductions like mean)
         extra_input_mapped = None
-        extra_nodes = node.kwargs.get('_extra_args', [])
+        extra_nodes = node.kwargs.get("_extra_args", [])
         if isinstance(extra_nodes, (list, tuple)):
             for en in extra_nodes:
                 if isinstance(en, torch.fx.Node) and en in extra_lowering_inputs:
                     src = extra_lowering_inputs[en]
                     if src is not None and src in node_mapping:
                         extra_input_mapped = node_mapping[src]
-                        log.info("    Resolved _extra_args: %s -> %s -> %s",
-                                 en.name, src.name, extra_input_mapped.name)
+                        log.info(
+                            "    Resolved _extra_args: %s -> %s -> %s",
+                            en.name,
+                            src.name,
+                            extra_input_mapped.name,
+                        )
                         break
 
         new_args = []
@@ -528,16 +596,20 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                     log.info("      Mapped arg %s -> %s", arg.name, node_mapping[arg].name)
                 elif arg in constant_symnode_values:
                     new_args.append(constant_symnode_values[arg])
-                    log.info("      Resolved constant arg %s -> %s",
-                             arg.name, constant_symnode_values[arg])
+                    log.info(
+                        "      Resolved constant arg %s -> %s",
+                        arg.name,
+                        constant_symnode_values[arg],
+                    )
                 else:
                     log.warning("      Arg %s not in mapping, using as-is", arg.name)
                     new_args.append(arg)
             elif arg is None and j == 0 and extra_input_mapped is not None:
                 # Reduction op: replace None first arg with _extra_args input
                 new_args.append(extra_input_mapped)
-                log.info("      Replaced None arg[0] with _extra_args input: %s",
-                         extra_input_mapped.name)
+                log.info(
+                    "      Replaced None arg[0] with _extra_args input: %s", extra_input_mapped.name
+                )
             elif arg is None and new_args:
                 # Binary self-op (e.g. x * x): None means "same as first operand"
                 first_tensor = None
@@ -547,8 +619,11 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                         break
                 if first_tensor is not None:
                     new_args.append(first_tensor)
-                    log.info("      Replaced None arg[%d] with first tensor arg: %s",
-                             j, first_tensor.name)
+                    log.info(
+                        "      Replaced None arg[%d] with first tensor arg: %s",
+                        j,
+                        first_tensor.name,
+                    )
                 else:
                     new_args.append(arg)
                     log.warning("      Unresolved None arg[%d]", j)
@@ -558,7 +633,7 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
 
         new_kwargs = {}
         for k, v in node.kwargs.items():
-            if k == '_extra_args':
+            if k == "_extra_args":
                 log.info("      Dropped Helion-internal kwarg: %s", k)
                 continue
             if isinstance(v, torch.fx.Node):
@@ -572,11 +647,7 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                 new_kwargs[k] = v
                 log.info("      Kept constant kwarg %s: %s", k, v)
 
-        new_node = new_graph.call_function(
-            node.target,
-            args=tuple(new_args),
-            kwargs=new_kwargs
-        )
+        new_node = new_graph.call_function(node.target, args=tuple(new_args), kwargs=new_kwargs)
         node_mapping[node] = new_node
         log.info("    -> Created node: %s with target %s", new_node.name, new_node.target)
 
@@ -587,11 +658,13 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
     for load_node, pname in load_to_param.items():
         if load_node in node_mapping:
             param_to_placeholder[pname] = node_mapping[load_node]
-    log.info("  Param -> placeholder: {%s}",
-             ", ".join(f"{k!r}: {v.name}" for k, v in param_to_placeholder.items()))
+    log.info(
+        "  Param -> placeholder: {%s}",
+        ", ".join(f"{k!r}: {v.name}" for k, v in param_to_placeholder.items()),
+    )
 
-    inplace_stores = []   # successful write-backs to input buffers
-    output_values = []    # store values whose dst is output-only (no placeholder)
+    inplace_stores = []  # successful write-backs to input buffers
+    output_values = []  # store values whose dst is output-only (no placeholder)
 
     for store_dst, store_val in store_ops:
         dst_param = host_tensor_to_param.get(store_dst)
@@ -603,27 +676,32 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                 args=(dst_new, val_new),
             )
             inplace_stores.append(dst_param)
-            log.info("  Added write-back: copy_(%s, %s)  [param '%s']",
-                     dst_new.name, val_new.name, dst_param)
+            log.info(
+                "  Added write-back: copy_(%s, %s)  [param '%s']",
+                dst_new.name,
+                val_new.name,
+                dst_param,
+            )
         elif val_new is not None:
             # Store to an output-only tensor (e.g. out = empty_like(x))
             # — this is a return value, not an inplace write-back.
             output_values.append(val_new)
-            log.info("  Store to output-only tensor '%s': will return %s",
-                     dst_param, val_new.name)
+            log.info("  Store to output-only tensor '%s': will return %s", dst_param, val_new.name)
         else:
-            log.warning("  Could not map store(%s, ..., %s)"
-                        " -- dst_param=%r, dst=%s, val=%s",
-                        store_dst.name, store_val.name, dst_param,
-                        "found" if dst_new else "MISSING",
-                        "found" if val_new else "MISSING")
+            log.warning(
+                "  Could not map store(%s, ..., %s) -- dst_param=%r, dst=%s, val=%s",
+                store_dst.name,
+                store_val.name,
+                dst_param,
+                "found" if dst_new else "MISSING",
+                "found" if val_new else "MISSING",
+            )
 
     if output_values:
         # Kernel creates and returns new tensor(s) via stores to output-only
         # buffers.  Return the last such value.
         new_graph.output(output_values[-1])
-        log.info("  Created output node returning %s (non-inplace kernel)",
-                 output_values[-1].name)
+        log.info("  Created output node returning %s (non-inplace kernel)", output_values[-1].name)
     elif inplace_stores:
         # Pure inplace kernel: the copy_ nodes are side-effects that write
         # directly into the caller's buffers; no return value needed.
@@ -640,12 +718,12 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
 
     # 1. Find _get_symnode nodes and extract block_size index from debug_name.
     #    E.g. _get_symnode("block_size_0") → index 0.
-    block_size_by_index = {}   # block_size_index → helion FX node
+    block_size_by_index = {}  # block_size_index → helion FX node
     for node in helion_root_nodes:
         if node.op != "call_function":
             continue
-        target_name = getattr(node.target, '__name__', '')
-        if '_get_symnode' not in target_name:
+        target_name = getattr(node.target, "__name__", "")
+        if "_get_symnode" not in target_name:
             continue
         debug_name = node.args[0] if node.args else ""
         if isinstance(debug_name, str) and debug_name.startswith("block_size_"):
@@ -679,12 +757,15 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
                 continue
             visited.add(arg)
             # Check if this is a load with block_size references
-            arg_target = getattr(arg.target, '__name__', '') if arg.op == "call_function" else ''
-            if 'load' in arg_target and len(arg.args) > 1:
+            arg_target = getattr(arg.target, "__name__", "") if arg.op == "call_function" else ""
+            if "load" in arg_target and len(arg.args) > 1:
                 bs_list = arg.args[1]
                 if isinstance(bs_list, (list, tuple)):
                     for dim, bs_node in enumerate(bs_list):
-                        if isinstance(bs_node, torch.fx.Node) and bs_node in block_size_by_index.values():
+                        if (
+                            isinstance(bs_node, torch.fx.Node)
+                            and bs_node in block_size_by_index.values()
+                        ):
                             # Reverse-lookup the index for this node
                             for bs_idx, bs_n in block_size_by_index.items():
                                 if bs_n is bs_node:
@@ -707,6 +788,7 @@ def transpile_fx_graphs(helion_kernel, example_cpu_inputs):
 # ---------------------------------------------------------------------------
 # Config-aware core division
 # ---------------------------------------------------------------------------
+
 
 def _make_config_aware_core_division(node_block_sizes):
     """Return a replacement for ``core_division_planning`` that uses
@@ -742,24 +824,24 @@ def _make_config_aware_core_division(node_block_sizes):
     from torch_spyre._inductor.pass_utils import get_mem_deps
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.constants import BATCH_MATMUL_OP
-    
+
     # Helper functions that were removed from torch_spyre - implement locally
     def no_division(args, output):
         """Initialize core division structure with no splits (all 1s)."""
         num_args = len(args)
         # Return list of dicts, one per arg + output
         return [{} for _ in range(num_args + 1)]
-    
+
     def map_host_dim_to_device_dim(layout: FixedTiledLayout, host_dim: int) -> int:
         """Map host dimension index to device dimension index.
-        
+
         For FixedTiledLayout, the device_layout contains the mapping.
         This is a simplified implementation that assumes 1:1 mapping.
         """
         # In the new structure, we need to map through the device_layout
         # For now, use a simple 1:1 mapping as a fallback
         return host_dim
-    
+
     def divide_pointwise_op(op, args, max_cores, pass_fn=None):
         """Wrapper for pointwise op division."""
         if pass_fn is not None:
@@ -768,7 +850,7 @@ def _make_config_aware_core_division(node_block_sizes):
             # Default behavior: no division
             op.spyre_core_division = no_division(args, op.node.get_layout())
             op.n_cores_used = 1
-    
+
     def divide_reduction_op(op, args, max_cores, pass_fn=None):
         """Wrapper for reduction op division."""
         if pass_fn is not None:
@@ -790,22 +872,23 @@ def _make_config_aware_core_division(node_block_sizes):
         Returns the ``{host_dim: block_size_value}`` dict if affected,
         or ``None`` if the node should use the default division.
         """
-        origins = n.node.get_origins() if hasattr(n.node, 'get_origins') else set()
+        origins = n.node.get_origins() if hasattr(n.node, "get_origins") else set()
         for origin_fx_node in origins:
             bs = node_block_sizes.get(origin_fx_node.name)
             if bs is not None:
                 return bs
-        log.debug("scheduler node not matched to any affected op (origins: %s)",
-                  [o.name for o in origins])
+        log.debug(
+            "scheduler node not matched to any affected op (origins: %s)", [o.name for o in origins]
+        )
         return None
 
     def _compute_split(host_dim_size, block_size, remaining_cores):
         """Compute cores for one dimension: host_dim_size / block_size."""
         if block_size <= 0 or host_dim_size % block_size != 0:
             log.warning(
-                "block_size %d does not evenly divide host dim size %d; "
-                "skipping this dimension",
-                block_size, host_dim_size,
+                "block_size %d does not evenly divide host dim size %d; skipping this dimension",
+                block_size,
+                host_dim_size,
             )
             return 1
         return min(host_dim_size // block_size, remaining_cores)
@@ -883,10 +966,14 @@ def _make_config_aware_core_division(node_block_sizes):
                 n.n_cores_used = math.prod(splits.values()) if splits else 1
 
                 if splits.get("M", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["M"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = (
+                        splits["M"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = splits["M"]
                 if splits.get("N", 1) > 1:
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = splits["N"]
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = (
+                        splits["N"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = splits["N"]
 
             elif num_dims == 3:
@@ -909,14 +996,22 @@ def _make_config_aware_core_division(node_block_sizes):
                 n.n_cores_used = math.prod(splits.values()) if splits else 1
 
                 if splits.get("B", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["B"]
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = splits["B"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = (
+                        splits["B"]
+                    )
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = (
+                        splits["B"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = splits["B"]
                 if splits.get("M", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 1)] = splits["M"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 1)] = (
+                        splits["M"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = splits["M"]
                 if splits.get("N", 1) > 1:
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 2)] = splits["N"]
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 2)] = (
+                        splits["N"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = splits["N"]
 
             elif num_dims == 4:
@@ -940,18 +1035,30 @@ def _make_config_aware_core_division(node_block_sizes):
                 n.n_cores_used = math.prod(splits.values()) if splits else 1
 
                 if splits.get("B1", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["B1"]
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = splits["B1"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = (
+                        splits["B1"]
+                    )
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = (
+                        splits["B1"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = splits["B1"]
                 if splits.get("B2", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 1)] = splits["B2"]
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = splits["B2"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 1)] = (
+                        splits["B2"]
+                    )
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = (
+                        splits["B2"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = splits["B2"]
                 if splits.get("M", 1) > 1:
-                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 2)] = splits["M"]
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 2)] = (
+                        splits["M"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = splits["M"]
                 if splits.get("N", 1) > 1:
-                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 3)] = splits["N"]
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 3)] = (
+                        splits["N"]
+                    )
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 3)] = splits["N"]
 
             else:
@@ -983,8 +1090,7 @@ def _make_config_aware_core_division(node_block_sizes):
                 if isinstance(n.node, FallbackKernel):
                     n = next(it, None)
                     if not (
-                        isinstance(n, ExternKernelSchedulerNode)
-                        and isinstance(n.node, MultiOutput)
+                        isinstance(n, ExternKernelSchedulerNode) and isinstance(n.node, MultiOutput)
                     ):
                         raise RuntimeError("FallbackKernel must be followed by MultiOutput")
                     pass
@@ -1002,6 +1108,7 @@ def _make_config_aware_core_division(node_block_sizes):
 # ---------------------------------------------------------------------------
 # Step 2: Compile for Spyre
 # ---------------------------------------------------------------------------
+
 
 def lower_to_spyre(graph_module, example_spyre_inputs):
     """Propagate Spyre FakeTensors through *graph_module* and compile it via
@@ -1025,23 +1132,28 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     # avoid the double-nesting and ensure the Spyre lowerings dict is
     # the one actually consulted during GraphLowering.run().
     from torch_spyre._inductor import _autoload
+
     _autoload()
     # Also ensure the Spyre C++ runtime is initialized (the compile_fx
     # wrapper normally does this, but we're bypassing it).
     import torch.spyre
+
     torch.spyre._impl._lazy_init()
 
     # Grab the unwrapped compile_fx.  If the Spyre wrapper was already
     # installed (e.g. by an earlier import), extract the original via
     # __wrapped__ (set by @wraps).
-    _already_wrapped = getattr(cfx_module, '_spyre_wrapped', False)
+    _already_wrapped = getattr(cfx_module, "_spyre_wrapped", False)
     if _already_wrapped:
         _orig_compile_fx = cfx_module.compile_fx.__wrapped__
         log.info("[DEBUG] compile_fx was already Spyre-wrapped; extracted __wrapped__")
     else:
         _orig_compile_fx = cfx_module.compile_fx
-    log.info("[DEBUG] Using original compile_fx: %s (was wrapped? %s)",
-             _orig_compile_fx, _already_wrapped)
+    log.info(
+        "[DEBUG] Using original compile_fx: %s (was wrapped? %s)",
+        _orig_compile_fx,
+        _already_wrapped,
+    )
 
     log.info("=== Continue compilation with Spyre Stack ===")
 
@@ -1058,11 +1170,13 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     log.info("Ensuring Spyre tensors have device layouts...")
     try:
         from torch_spyre._C import SpyreTensorLayout
+
         log.info("Imported SpyreTensorLayout successfully")
     except Exception as e:
         log.error(f"Error importing SpyreTensorLayout: {e}")
         raise
     from torch_spyre._C import spyre_empty_with_layout
+
     processed_inputs = []
     for i, t in enumerate(example_spyre_inputs):
         log.info(f"  Processing input {i}: device={t.device}, shape={t.shape}, dtype={t.dtype}")
@@ -1077,16 +1191,16 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
                     continue
             except Exception as e:
                 log.info(f"    Error checking existing layout: {e}")
-            
+
             # Create tensor with default layout using spyre_empty_with_layout
             log.info(f"    Creating tensor with default layout for tensor {i}")
             layout = SpyreTensorLayout(list(t.shape), t.dtype)
             log.info(f"    Created layout: {layout}")
-            
+
             # Create new tensor with layout
             t_cpu = t.cpu()
             log.info(f"    Moved to CPU: {t_cpu.shape}")
-            
+
             # Use spyre_empty_with_layout to create tensor with layout
             # Compute stride - for contiguous tensor, stride[i] = product of sizes[i+1:]
             stride = []
@@ -1095,14 +1209,14 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
                 stride.insert(0, s)
                 s *= size
             log.info(f"    Computed stride: {stride}")
-            
+
             t_with_layout = spyre_empty_with_layout(list(t.shape), stride, t.dtype, layout)
             log.info(f"    Created empty tensor with layout: device={t_with_layout.device}")
-            
+
             # Copy data from CPU to Spyre using .copy_() which internally uses _C.copy_tensor
             t_with_layout.copy_(t_cpu)
-            log.info(f"    Copied data to Spyre tensor")
-            
+            log.info("    Copied data to Spyre tensor")
+
             # Verify the layout was attached
             try:
                 verify_layout = t_with_layout.device_tensor_layout()
@@ -1113,26 +1227,35 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
         else:
             log.info(f"    Tensor {i} is not on spyre device, keeping as-is")
             processed_inputs.append(t)
-    
+
     log.info(f"Processed {len(processed_inputs)} inputs")
     example_spyre_inputs = processed_inputs
 
     # Debug patch: confirm SuperDSCScheduling is instantiated
     from torch_spyre._inductor.scheduler import SuperDSCScheduling
+
     _orig_sdsc_init = SuperDSCScheduling.__init__
+
     def _debug_sdsc_init(self, *args, **kwargs):
         log.debug("[SPYRE DEBUG] SuperDSCScheduling.__init__ called -- Spyre codegen is active!")
         _orig_sdsc_init(self, *args, **kwargs)
+
     SuperDSCScheduling.__init__ = _debug_sdsc_init
 
     # Debug patch: print what devices compile_fx_inner sees
     import torch._inductor.compile_fx as _cfx_mod
+
     _orig_cfx_inner = _cfx_mod.compile_fx_inner
+
     def _debug_cfx_inner(gm, example_inputs, *args, **kwargs):
-        devices = [getattr(getattr(t, 'device', None), 'type', 'N/A')
-                   for t in example_inputs if isinstance(t, torch.Tensor)]
+        devices = [
+            getattr(getattr(t, "device", None), "type", "N/A")
+            for t in example_inputs
+            if isinstance(t, torch.Tensor)
+        ]
         log.debug("[SPYRE DEBUG] compile_fx_inner: input devices=%s", devices)
         return _orig_cfx_inner(gm, example_inputs, *args, **kwargs)
+
     _cfx_mod.compile_fx_inner = _debug_cfx_inner
 
     # Strip to_dtype ops at the Spyre codegen level.
@@ -1151,25 +1274,23 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     # -----------------------------------------------------------------------
     import torch._inductor.lowering as _ind_lowering
     from torch_spyre._inductor.lowering import (
-        enable_spyre_lowerings,
         spyre_lowerings,
-        lower_mean,
-    )
-    from torch_spyre._inductor.decompositions import (
-        enable_spyre_decompositions,
-        spyre_decompositions,
     )
     from torch_spyre._inductor import lowering as _spyre_low_mod
 
     # 1) Dump what's in spyre_lowerings before entering context
     log.info("[DEBUG] spyre_lowerings dict has %d entries:", len(spyre_lowerings))
     _mean_dim = torch.ops.aten.mean.dim
-    log.info("[DEBUG] Reference: aten.mean.dim = %s (id=%d, type=%s)",
-             _mean_dim, id(_mean_dim), type(_mean_dim).__name__)
+    log.info(
+        "[DEBUG] Reference: aten.mean.dim = %s (id=%d, type=%s)",
+        _mean_dim,
+        id(_mean_dim),
+        type(_mean_dim).__name__,
+    )
     _found_mean_in_spyre = False
     for op_key in spyre_lowerings:
-        is_mean = (op_key is _mean_dim)
-        eq_mean = (op_key == _mean_dim)
+        is_mean = op_key is _mean_dim
+        eq_mean = op_key == _mean_dim
         marker = ""
         if is_mean:
             marker = " <-- MEAN (identity match)"
@@ -1177,46 +1298,63 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
         elif eq_mean:
             marker = " <-- MEAN (equality match, DIFFERENT object!)"
             _found_mean_in_spyre = True
-        log.info("[DEBUG]   %s  (id=%d, type=%s)%s", op_key, id(op_key), type(op_key).__name__, marker)
+        log.info(
+            "[DEBUG]   %s  (id=%d, type=%s)%s", op_key, id(op_key), type(op_key).__name__, marker
+        )
     if not _found_mean_in_spyre:
         log.warning("[DEBUG] !!! aten.mean.dim NOT FOUND in spyre_lowerings !!!")
         log.warning("[DEBUG]     The Spyre lower_mean was never registered.")
         for op_key in spyre_lowerings:
-            if 'mean' in str(op_key):
+            if "mean" in str(op_key):
                 log.warning("[DEBUG]     But found mean-like key: %s (id=%d)", op_key, id(op_key))
 
     # 2) Check if aten.mean.dim is already in the main lowerings dict
-    log.info("[DEBUG] aten.mean.dim (id=%d) in lowerings BEFORE context? %s",
-             id(_mean_dim), _mean_dim in _ind_lowering.lowerings)
+    log.info(
+        "[DEBUG] aten.mean.dim (id=%d) in lowerings BEFORE context? %s",
+        id(_mean_dim),
+        _mean_dim in _ind_lowering.lowerings,
+    )
     if _mean_dim in _ind_lowering.lowerings:
         log.info("[DEBUG]   current lowering: %s", _ind_lowering.lowerings[_mean_dim])
     log.info("[DEBUG] All mean-related keys in main lowerings dict:")
     for k in _ind_lowering.lowerings:
-        if 'mean' in str(k).lower():
+        if "mean" in str(k).lower():
             log.info("[DEBUG]   %s (id=%d) → %s", k, id(k), _ind_lowering.lowerings[k])
 
     # 3) Monkey-patch enable_spyre_lowerings to log entry/exit
     _orig_enable_spyre_lowerings = _spyre_low_mod.enable_spyre_lowerings
 
     from contextlib import contextmanager as _cm
+
     @_cm
     def _debug_enable_spyre_lowerings():
-        log.info("[DEBUG] >>> ENTERING enable_spyre_lowerings (nesting=%d)",
-                 _spyre_low_mod._lowerings_nesting)
+        log.info(
+            "[DEBUG] >>> ENTERING enable_spyre_lowerings (nesting=%d)",
+            _spyre_low_mod._lowerings_nesting,
+        )
         with _orig_enable_spyre_lowerings():
-            log.info("[DEBUG] enable_spyre_lowerings entered (nesting=%d)",
-                     _spyre_low_mod._lowerings_nesting)
-            log.info("[DEBUG] aten.mean.dim in lowerings AFTER enter? %s",
-                     _mean_dim in _ind_lowering.lowerings)
+            log.info(
+                "[DEBUG] enable_spyre_lowerings entered (nesting=%d)",
+                _spyre_low_mod._lowerings_nesting,
+            )
+            log.info(
+                "[DEBUG] aten.mean.dim in lowerings AFTER enter? %s",
+                _mean_dim in _ind_lowering.lowerings,
+            )
             if _mean_dim in _ind_lowering.lowerings:
                 fn = _ind_lowering.lowerings[_mean_dim]
-                log.info("[DEBUG]   lowerings[aten.mean.dim] = %s (module: %s)",
-                         fn, getattr(fn, '__module__', '?'))
-                wrapped = getattr(fn, '__wrapped__', None)
+                log.info(
+                    "[DEBUG]   lowerings[aten.mean.dim] = %s (module: %s)",
+                    fn,
+                    getattr(fn, "__module__", "?"),
+                )
+                wrapped = getattr(fn, "__wrapped__", None)
                 log.info("[DEBUG]   __wrapped__ = %s", wrapped)
             yield
-        log.info("[DEBUG] <<< EXITED enable_spyre_lowerings (nesting=%d)",
-                 _spyre_low_mod._lowerings_nesting)
+        log.info(
+            "[DEBUG] <<< EXITED enable_spyre_lowerings (nesting=%d)",
+            _spyre_low_mod._lowerings_nesting,
+        )
 
     _spyre_low_mod.enable_spyre_lowerings = _debug_enable_spyre_lowerings
 
@@ -1225,9 +1363,11 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     _debug_mean_lowering = None
     if _mean_in_lowerings is not None:
         import functools
+
         @functools.wraps(_mean_in_lowerings)
         def _debug_mean_lowering(*args, **kwargs):
             import traceback
+
             log.warning("[DEBUG] !!! STANDARD INDUCTOR mean lowering called !!!")
             log.warning("[DEBUG]     This means the Spyre lower_mean was NOT used.")
             log.warning("[DEBUG]     Traceback:\n%s", "".join(traceback.format_stack()[-5:]))
@@ -1237,32 +1377,44 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 
     # 5) Monkey-patch the Spyre lower_mean to log when called.
     from torch_spyre._inductor.ir import SpyreReduction as _SpyreReduction
+
     _orig_lower_mean = _spyre_low_mod.lower_mean
 
     _spyre_mean_wrapped = spyre_lowerings.get(_mean_dim)
     if _spyre_mean_wrapped is not None:
+
         def _debug_spyre_mean_wrapped(*args, **kwargs):
             import traceback
+
             log.info("[DEBUG] +++ SPYRE lower_mean (wrapped) called! +++")
             log.info("[DEBUG]     args types: %s", [type(a).__name__ for a in args])
-            if args and hasattr(args[0], 'get_dtype'):
+            if args and hasattr(args[0], "get_dtype"):
                 log.info("[DEBUG]     x.get_dtype() = %s", args[0].get_dtype())
             try:
                 result = _spyre_mean_wrapped(*args, **kwargs)
-                log.info("[DEBUG]     lower_mean returned: %s (type: %s)", result, type(result).__name__)
-                if hasattr(result, 'data') and hasattr(result.data, 'data'):
+                log.info(
+                    "[DEBUG]     lower_mean returned: %s (type: %s)", result, type(result).__name__
+                )
+                if hasattr(result, "data") and hasattr(result.data, "data"):
                     inner = result.data.data
-                    log.info("[DEBUG]     inner IR node: %s (type: %s)", type(inner).__name__, type(inner))
-                    log.info("[DEBUG]     is SpyreReduction? %s", isinstance(inner, _SpyreReduction))
-                    if hasattr(inner, 'dtype'):
+                    log.info(
+                        "[DEBUG]     inner IR node: %s (type: %s)",
+                        type(inner).__name__,
+                        type(inner),
+                    )
+                    log.info(
+                        "[DEBUG]     is SpyreReduction? %s", isinstance(inner, _SpyreReduction)
+                    )
+                    if hasattr(inner, "dtype"):
                         log.info("[DEBUG]     inner.dtype = %s", inner.dtype)
-                    if hasattr(inner, 'reduction_type'):
+                    if hasattr(inner, "reduction_type"):
                         log.info("[DEBUG]     inner.reduction_type = %s", inner.reduction_type)
                 return result
             except Exception as e:
                 log.error("[DEBUG]     !!! lower_mean RAISED: %s: %s", type(e).__name__, e)
                 log.error("[DEBUG]     traceback:\n%s", "".join(traceback.format_exc()))
                 raise
+
         spyre_lowerings[_mean_dim] = _debug_spyre_mean_wrapped
         log.info("[DEBUG] Installed debug wrapper on spyre_lowerings[aten.mean.dim]")
     else:
@@ -1270,62 +1422,88 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 
     # Also patch SpyreReduction.create to log when called
     _orig_spyre_reduction_create = _SpyreReduction.create
+
     @classmethod
     def _debug_spyre_reduction_create(cls, **kwargs):
         log.info("[DEBUG] SpyreReduction.create called!")
-        log.info("[DEBUG]   reduction_type=%s, dst_dtype=%s, src_dtype=%s",
-                 kwargs.get('reduction_type'), kwargs.get('dst_dtype'), kwargs.get('src_dtype'))
+        log.info(
+            "[DEBUG]   reduction_type=%s, dst_dtype=%s, src_dtype=%s",
+            kwargs.get("reduction_type"),
+            kwargs.get("dst_dtype"),
+            kwargs.get("src_dtype"),
+        )
         return _orig_spyre_reduction_create.__func__(cls, **kwargs)
+
     _SpyreReduction.create = _debug_spyre_reduction_create
 
     # Also patch standard Reduction.create to log when called with mean origins
     from torch._inductor.ir import Reduction as _StdReduction
+
     _orig_std_reduction_create = _StdReduction.create
+
     @classmethod
     def _debug_std_reduction_create(cls, reduction_type=None, **kwargs):
-        log.info("[DEBUG] Reduction.create called: reduction_type=%s, dst_dtype=%s",
-                 reduction_type, kwargs.get('dst_dtype'))
-        if reduction_type == 'sum':
+        log.info(
+            "[DEBUG] Reduction.create called: reduction_type=%s, dst_dtype=%s",
+            reduction_type,
+            kwargs.get("dst_dtype"),
+        )
+        if reduction_type == "sum":
             import traceback
-            log.info("[DEBUG]   (sum reduction) traceback:\n%s",
-                     "".join(traceback.format_stack()[-8:]))
+
+            log.info(
+                "[DEBUG]   (sum reduction) traceback:\n%s", "".join(traceback.format_stack()[-8:])
+            )
         return _orig_std_reduction_create.__func__(cls, reduction_type=reduction_type, **kwargs)
+
     _StdReduction.create = _debug_std_reduction_create
 
     # 6) Monkey-patch the lowering dispatch (graph.py call_function) to trace mean ops
     import torch._inductor.graph as _graph_mod
+
     _OrigGraphLowering = _graph_mod.GraphLowering
     _orig_call_function = _OrigGraphLowering.call_function
+
     def _debug_call_function(self, target, args, kwargs):
-        if target is _mean_dim or (hasattr(target, 'name') and 'mean' in str(target)):
+        if target is _mean_dim or (hasattr(target, "name") and "mean" in str(target)):
             log.info("[DEBUG] GraphLowering.call_function: target=%s (id=%d)", target, id(target))
             log.info("[DEBUG]   target in lowerings? %s", target in _ind_lowering.lowerings)
             if target in _ind_lowering.lowerings:
                 fn = _ind_lowering.lowerings[target]
-                log.info("[DEBUG]   will dispatch to: %s (module: %s)",
-                         fn, getattr(fn, '__module__', '?'))
-                wrapped = getattr(fn, '__wrapped__', None)
+                log.info(
+                    "[DEBUG]   will dispatch to: %s (module: %s)",
+                    fn,
+                    getattr(fn, "__module__", "?"),
+                )
+                wrapped = getattr(fn, "__wrapped__", None)
                 log.info("[DEBUG]   __wrapped__ = %s", wrapped)
         return _orig_call_function(self, target, args, kwargs)
+
     _OrigGraphLowering.call_function = _debug_call_function
 
     # 7) Monkey-patch spyre_data_types to confirm it's entered
     from torch_spyre._inductor import patches as _patches
+
     _orig_spyre_data_types = _patches.spyre_data_types
+
     @_cm
     def _debug_spyre_data_types():
         import torch._prims_common as _pc
+
         log.info("[DEBUG] >>> ENTERING spyre_data_types")
         log.info("[DEBUG]   _computation_dtype_map BEFORE: %s", _pc._computation_dtype_map)
         with _orig_spyre_data_types():
             log.info("[DEBUG]   _computation_dtype_map AFTER: %s", _pc._computation_dtype_map)
             yield
         log.info("[DEBUG] <<< EXITED spyre_data_types")
+
     _patches.spyre_data_types = _debug_spyre_data_types
 
     # 8) Monkey-patch enable_spyre_decompositions to log entry
     from torch_spyre._inductor import decompositions as _dec_mod
+
     _orig_enable_spyre_decompositions = _dec_mod.enable_spyre_decompositions
+
     @_cm
     def _debug_enable_spyre_decompositions(decomps=None):
         log.info("[DEBUG] >>> ENTERING enable_spyre_decompositions")
@@ -1333,6 +1511,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             log.info("[DEBUG] enable_spyre_decompositions entered")
             yield
         log.info("[DEBUG] <<< EXITED enable_spyre_decompositions")
+
     _dec_mod.enable_spyre_decompositions = _debug_enable_spyre_decompositions
 
     # 9) Install the debug mean lowering trap on the CURRENT lowerings dict.
@@ -1342,8 +1521,8 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 
     # 10) Check if aten.mean.dim has a decomposition that might fire before lowering
     from torch._inductor.decomposition import decompositions as _decomp_table
-    log.info("[DEBUG] aten.mean.dim in decompositions table? %s",
-             _mean_dim in _decomp_table)
+
+    log.info("[DEBUG] aten.mean.dim in decompositions table? %s", _mean_dim in _decomp_table)
     if _mean_dim in _decomp_table:
         log.info("[DEBUG]   decomposition: %s", _decomp_table[_mean_dim])
     _mean_pkg = torch.ops.aten.mean
@@ -1367,16 +1546,18 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
         with enable_spyre_context(example_spyre_inputs):
             # Post-context-enter checks
             log.info("[DEBUG] Inside enable_spyre_context. Checking lowerings state:")
-            log.info("[DEBUG]   aten.mean.dim in lowerings? %s",
-                     _mean_dim in _ind_lowering.lowerings)
+            log.info(
+                "[DEBUG]   aten.mean.dim in lowerings? %s", _mean_dim in _ind_lowering.lowerings
+            )
             if _mean_dim in _ind_lowering.lowerings:
                 fn = _ind_lowering.lowerings[_mean_dim]
                 log.info("[DEBUG]   lowerings[aten.mean.dim] = %s", fn)
-                log.info("[DEBUG]   __wrapped__ = %s", getattr(fn, '__wrapped__', None))
+                log.info("[DEBUG]   __wrapped__ = %s", getattr(fn, "__wrapped__", None))
                 log.info("[DEBUG]   is debug_mean? %s", fn is _debug_mean_lowering)
             log.info("[DEBUG]   lowerings nesting: %d", _spyre_low_mod._lowerings_nesting)
 
             from torch._inductor.decomposition import decompositions
+
             compiled_fn = _orig_compile_fx(
                 graph_module_spyre,
                 example_spyre_inputs,
@@ -1403,6 +1584,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def compile_helion_to_spyre(
     helion_kernel,
@@ -1447,19 +1629,17 @@ def compile_helion_to_spyre(
     """
     # Derive CPU dummy inputs (same shapes / dtypes, on CPU)
     cpu_inputs = tuple(
-        torch.zeros_like(t, device="cpu") if t.device.type != "cpu"
-        else t.clone()
+        torch.zeros_like(t, device="cpu") if t.device.type != "cpu" else t.clone()
         for t in example_spyre_inputs
     )
 
     # Step 1: Helion kernel → FX GraphModule
-    graph_module, block_size_nodes, affected_ops = transpile_fx_graphs(
-        helion_kernel, cpu_inputs
-    )
+    graph_module, block_size_nodes, affected_ops = transpile_fx_graphs(helion_kernel, cpu_inputs)
 
     # Propagate shapes through the graph so node metadata is available
     # for subsequent passes (e.g. prevent_reduction_upcasts needs dtype info).
     from torch.fx.passes.shape_prop import ShapeProp
+
     ShapeProp(graph_module).propagate(*cpu_inputs)
 
     # Step 1b: Spyre-specific FX graph transformations
@@ -1469,10 +1649,12 @@ def compile_helion_to_spyre(
     # Log the final graph that will be verified / compiled
     log.info("=== Final Spyre-Compatible Graph ===")
     log.info("Total nodes: %d", len(list(graph_module.graph.nodes)))
-    log.info("Placeholder nodes: %d",
-             len([n for n in graph_module.graph.nodes if n.op == "placeholder"]))
-    log.info("Call nodes: %d",
-             len([n for n in graph_module.graph.nodes if n.op == "call_function"]))
+    log.info(
+        "Placeholder nodes: %d", len([n for n in graph_module.graph.nodes if n.op == "placeholder"])
+    )
+    log.info(
+        "Call nodes: %d", len([n for n in graph_module.graph.nodes if n.op == "call_function"])
+    )
     log.info("Block size nodes tracked: %d", len(block_size_nodes))
     log.info("Affected ops: %s", affected_ops)
     log.info("Graph structure:\n%s", graph_module.graph)
@@ -1498,15 +1680,23 @@ def compile_helion_to_spyre(
                     if bs_idx < len(block_sizes_cfg):
                         resolved[dim] = block_sizes_cfg[bs_idx]
                     else:
-                        log.warning("block_size index %d out of range for "
-                                    "config.block_sizes (len=%d), skipping "
-                                    "dim %d of %s",
-                                    bs_idx, len(block_sizes_cfg), dim, node_name)
+                        log.warning(
+                            "block_size index %d out of range for "
+                            "config.block_sizes (len=%d), skipping "
+                            "dim %d of %s",
+                            bs_idx,
+                            len(block_sizes_cfg),
+                            dim,
+                            node_name,
+                        )
                 if resolved:
                     node_block_sizes[node_name] = resolved
 
-            log.info("Using config-aware core division: block_sizes=%s, "
-                     "affected nodes=%s", block_sizes_cfg, node_block_sizes)
+            log.info(
+                "Using config-aware core division: block_sizes=%s, affected nodes=%s",
+                block_sizes_cfg,
+                node_block_sizes,
+            )
 
             patched_fn = _make_config_aware_core_division(node_block_sizes)
             original_fn = spyre_passes.core_division_planning
@@ -1528,17 +1718,21 @@ def compile_helion_to_spyre(
         if config is not None:
             block_sizes_cfg = config.block_sizes
             meta.tile_dim_to_block_value = {
-                name: {dim: block_sizes_cfg[idx]
-                       for dim, idx in dim_to_idx.items()
-                       if idx < len(block_sizes_cfg)}
+                name: {
+                    dim: block_sizes_cfg[idx]
+                    for dim, idx in dim_to_idx.items()
+                    if idx < len(block_sizes_cfg)
+                }
                 for name, dim_to_idx in affected_ops.items()
             }
         else:
             meta.tile_dim_to_block_value = {}
-        log.info("Captured %d SDSC path(s), %d block-size node(s), "
-                 "%d affected op(s)",
-                 len(meta.sdsc_paths), len(meta.block_size_nodes),
-                 len(meta.tile_dim_to_block_index))
+        log.info(
+            "Captured %d SDSC path(s), %d block-size node(s), %d affected op(s)",
+            len(meta.sdsc_paths),
+            len(meta.block_size_nodes),
+            len(meta.tile_dim_to_block_index),
+        )
         return compiled_fn, meta
 
     compiled_fn = _compile(graph_module, example_spyre_inputs)

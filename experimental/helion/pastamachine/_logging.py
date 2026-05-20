@@ -48,4 +48,5 @@ def getLogger(name: str) -> logging.Logger:
     """Return a child logger under the ``pastamachine`` namespace."""
     return logging.getLogger(f"pastamachine.{name}")
 
+
 # Made with Bob

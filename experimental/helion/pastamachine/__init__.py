@@ -5,7 +5,7 @@ from pastamachine.analyze import extract_key_sdsc_info, summarize_meta, print_me
 
 __all__ = [
     "compile_helion_to_spyre",
-"verify_on_cpu",
+    "verify_on_cpu",
     "TranspileMeta",
     "extract_key_sdsc_info",
     "summarize_meta",

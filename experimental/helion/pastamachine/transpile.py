@@ -741,7 +741,7 @@ def _make_config_aware_core_division(node_block_sizes):
     from torch_spyre._inductor.ir import FixedTiledLayout
     from torch_spyre._inductor.pass_utils import get_mem_deps
     from torch_spyre._inductor.errors import Unsupported
-    from torch_spyre._inductor.constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
+    from torch_spyre._inductor.constants import BATCH_MATMUL_OP
     
     # Helper functions that were removed from torch_spyre - implement locally
     def no_division(args, output):
@@ -860,67 +860,54 @@ def _make_config_aware_core_division(node_block_sizes):
         if max_cores == 1:
             return
 
-        if red.reduction_type == MATMUL_REDUCTION_OP:
+        if red.reduction_type == BATCH_MATMUL_OP:
             assert len(args) == 2, "matmul has exactly 2 input args"
-            # get_host_dim_size was removed; directly access layout.size
-            M = args[0].layout.size[0]
-            N = args[1].layout.size[1]
-
-            op_dims = [("M", M), ("N", N)]
-            splits = {}
-            remaining_cores = max_cores
-            for host_dim, (name, dim_size) in enumerate(op_dims):
-                bs = dim_to_bs.get(host_dim)
-                if bs is None:
-                    continue
-                cores = _compute_split(dim_size, bs, remaining_cores)
-                if cores > 1:
-                    splits[name] = cores
-                    remaining_cores //= cores
-
-            n.n_cores_used = math.prod(splits.values()) if splits else 1
-
-            if splits.get("M", 1) > 1:
-                n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["M"]
-                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = splits["M"]
-            if splits.get("N", 1) > 1:
-                n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = splits["N"]
-                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = splits["N"]
-
-        elif red.reduction_type == BATCH_MATMUL_OP:
-            assert len(args) == 2, "bmm has exactly 2 input args"
-            # get_host_dim_size was removed; directly access layout.size
             num_dims = len(args[0].layout.size)
 
-            if num_dims == 3:
+            if num_dims == 2:
+                M = args[0].layout.size[0]
+                N = args[1].layout.size[1]
+
+                op_dims = [("M", M), ("N", N)]
+                splits = {}
+                remaining_cores = max_cores
+                for host_dim, (name, dim_size) in enumerate(op_dims):
+                    bs = dim_to_bs.get(host_dim)
+                    if bs is None:
+                        continue
+                    cores = _compute_split(dim_size, bs, remaining_cores)
+                    if cores > 1:
+                        splits[name] = cores
+                        remaining_cores //= cores
+
+                n.n_cores_used = math.prod(splits.values()) if splits else 1
+
+                if splits.get("M", 1) > 1:
+                    n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["M"]
+                    n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = splits["M"]
+                if splits.get("N", 1) > 1:
+                    n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = splits["N"]
+                    n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = splits["N"]
+
+            elif num_dims == 3:
                 B = args[0].layout.size[0]
                 M = args[0].layout.size[1]
                 N = args[1].layout.size[2]
                 op_dims = [("B", B), ("M", M), ("N", N)]
-            elif num_dims == 4:
-                B1 = args[0].layout.size[0]
-                B2 = args[0].layout.size[1]
-                M = args[0].layout.size[2]
-                N = args[1].layout.size[3]
-                op_dims = [("B1", B1), ("B2", B2), ("M", M), ("N", N)]
-            else:
-                raise RuntimeError(f"Unsupported BMM dimension count: {num_dims}")
 
-            splits = {}
-            remaining_cores = max_cores
-            for host_dim, (name, dim_size) in enumerate(op_dims):
-                bs = dim_to_bs.get(host_dim)
-                if bs is None:
-                    continue
-                cores = _compute_split(dim_size, bs, remaining_cores)
-                if cores > 1:
-                    splits[name] = cores
-                    remaining_cores //= cores
+                splits = {}
+                remaining_cores = max_cores
+                for host_dim, (name, dim_size) in enumerate(op_dims):
+                    bs = dim_to_bs.get(host_dim)
+                    if bs is None:
+                        continue
+                    cores = _compute_split(dim_size, bs, remaining_cores)
+                    if cores > 1:
+                        splits[name] = cores
+                        remaining_cores //= cores
 
-            n.n_cores_used = math.prod(splits.values()) if splits else 1
+                n.n_cores_used = math.prod(splits.values()) if splits else 1
 
-            # Apply splits per tensor — same pattern as original divide_reduction_op
-            if num_dims == 3:
                 if splits.get("B", 1) > 1:
                     n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["B"]
                     n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = splits["B"]
@@ -931,7 +918,27 @@ def _make_config_aware_core_division(node_block_sizes):
                 if splits.get("N", 1) > 1:
                     n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 2)] = splits["N"]
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = splits["N"]
+
             elif num_dims == 4:
+                B1 = args[0].layout.size[0]
+                B2 = args[0].layout.size[1]
+                M = args[0].layout.size[2]
+                N = args[1].layout.size[3]
+                op_dims = [("B1", B1), ("B2", B2), ("M", M), ("N", N)]
+
+                splits = {}
+                remaining_cores = max_cores
+                for host_dim, (name, dim_size) in enumerate(op_dims):
+                    bs = dim_to_bs.get(host_dim)
+                    if bs is None:
+                        continue
+                    cores = _compute_split(dim_size, bs, remaining_cores)
+                    if cores > 1:
+                        splits[name] = cores
+                        remaining_cores //= cores
+
+                n.n_cores_used = math.prod(splits.values()) if splits else 1
+
                 if splits.get("B1", 1) > 1:
                     n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = splits["B1"]
                     n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 0)] = splits["B1"]
@@ -946,6 +953,9 @@ def _make_config_aware_core_division(node_block_sizes):
                 if splits.get("N", 1) > 1:
                     n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 3)] = splits["N"]
                     n.spyre_core_division[2][map_host_dim_to_device_dim(output, 3)] = splits["N"]
+
+            else:
+                raise RuntimeError(f"Unsupported matmul dimension count: {num_dims}")
         else:
             # Unknown reduction type — fall back to original logic
             divide_reduction_op(n, args, max_cores)
@@ -1039,7 +1049,75 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
 
     # Build a fresh GraphModule from the same graph (CPU validation may have
     # mutated internal state of the original).
-    graph_module_spyre = torch.fx.GraphModule({}, graph_module.graph)
+    try:
+        graph_module_spyre = torch.fx.GraphModule({}, graph_module.graph)
+        log.info("Created fresh GraphModule")
+    except Exception as e:
+        log.error(f"Error creating GraphModule: {e}")
+        raise
+
+    # Ensure all Spyre input tensors have device layouts attached
+    log.info("Ensuring Spyre tensors have device layouts...")
+    try:
+        from torch_spyre._C import SpyreTensorLayout
+        log.info("Imported SpyreTensorLayout successfully")
+    except Exception as e:
+        log.error(f"Error importing SpyreTensorLayout: {e}")
+        raise
+    from torch_spyre._C import spyre_empty_with_layout
+    processed_inputs = []
+    for i, t in enumerate(example_spyre_inputs):
+        log.info(f"  Processing input {i}: device={t.device}, shape={t.shape}, dtype={t.dtype}")
+        if t.device.type == "spyre":
+            # Check if tensor already has a layout
+            try:
+                existing_layout = t.device_tensor_layout()
+                log.info(f"    Existing layout: {existing_layout}")
+                if existing_layout is not None:
+                    log.info(f"    Tensor {i} already has layout, keeping it")
+                    processed_inputs.append(t)
+                    continue
+            except Exception as e:
+                log.info(f"    Error checking existing layout: {e}")
+            
+            # Create tensor with default layout using spyre_empty_with_layout
+            log.info(f"    Creating tensor with default layout for tensor {i}")
+            layout = SpyreTensorLayout(list(t.shape), t.dtype)
+            log.info(f"    Created layout: {layout}")
+            
+            # Create new tensor with layout
+            t_cpu = t.cpu()
+            log.info(f"    Moved to CPU: {t_cpu.shape}")
+            
+            # Use spyre_empty_with_layout to create tensor with layout
+            # Compute stride - for contiguous tensor, stride[i] = product of sizes[i+1:]
+            stride = []
+            s = 1
+            for size in reversed(list(t.shape)):
+                stride.insert(0, s)
+                s *= size
+            log.info(f"    Computed stride: {stride}")
+            
+            t_with_layout = spyre_empty_with_layout(list(t.shape), stride, t.dtype, layout)
+            log.info(f"    Created empty tensor with layout: device={t_with_layout.device}")
+            
+            # Copy data from CPU to Spyre using .copy_() which internally uses _C.copy_tensor
+            t_with_layout.copy_(t_cpu)
+            log.info(f"    Copied data to Spyre tensor")
+            
+            # Verify the layout was attached
+            try:
+                verify_layout = t_with_layout.device_tensor_layout()
+                log.info(f"    Verified layout on new tensor: {verify_layout}")
+            except Exception as e:
+                log.error(f"    ERROR: Failed to verify layout: {e}")
+            processed_inputs.append(t_with_layout)
+        else:
+            log.info(f"    Tensor {i} is not on spyre device, keeping as-is")
+            processed_inputs.append(t)
+    
+    log.info(f"Processed {len(processed_inputs)} inputs")
+    example_spyre_inputs = processed_inputs
 
     # Propagate FakeTensors so compile_fx sees Spyre devices
     log.info("Creating Spyre FakeTensors and propagating through graph...")
@@ -1302,7 +1380,7 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
     # avoid double-nesting of enable_spyre_context.
     log.info("Calling compile_fx with Spyre FakeTensors (inside enable_spyre_context)...")
     try:
-        with enable_spyre_context(fake_inputs):
+        with enable_spyre_context(example_spyre_inputs):
             # Post-context-enter checks
             log.info("[DEBUG] Inside enable_spyre_context. Checking lowerings state:")
             log.info("[DEBUG]   aten.mean.dim in lowerings? %s",
@@ -1315,9 +1393,11 @@ def lower_to_spyre(graph_module, example_spyre_inputs):
             log.info("[DEBUG]   lowerings nesting: %d", _spyre_low_mod._lowerings_nesting)
 
             from torch._inductor.decomposition import decompositions
+            # Pass the processed inputs (with layouts) as the real inputs
+            # compile_fx will use these when V.get_real_inputs() is called
             compiled_fn = _orig_compile_fx(
                 graph_module_spyre,
-                fake_inputs,
+                example_spyre_inputs,  # Use processed inputs with layouts, not fake_inputs
                 decompositions=decompositions,
             )
     finally:

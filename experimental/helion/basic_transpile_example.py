@@ -23,6 +23,13 @@ import helion.language as hl
 import sys
 import os
 
+
+os.environ["SPYRE_INDUCTOR_LOG"] = "1"
+os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
+os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
+# os.environ["DT_DEEPRT_VERBOSE"] = "1"
+# os.environ["DTLOG_LEVEL"] = "debug"
+
 # Add pastamachine and torch-spyre to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../new_stack/torch-spyre'))

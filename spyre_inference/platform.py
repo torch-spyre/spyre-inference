@@ -59,6 +59,16 @@ class TorchSpyrePlatform(CpuPlatform):
     # so dispatch works regardless of tensor device.
     dispatch_key: str = "CPU"
 
+    # Multi-backend init string consumed by both vllm's
+    # `init_distributed_environment` and `torch.distributed.new_group`.
+    # `gloo` handles CPU tensors (used by vllm's parallel-state cpu_group
+    # and any host-side coordination); `spyreccl` handles Spyre tensors
+    # for the device_group. Registered by `torch_spyre._autoload()` on
+    # `import torch`. See
+    # /home/senuser/spyre-inference/.venv/.../torch_spyre/__init__.py
+    # `dist.Backend.register_backend(DISTRIBUTED_BACKEND_NAME, ...)`.
+    dist_backend: str = "cpu:gloo,spyre:spyreccl"
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend
     register_backend(
         AttentionBackendEnum.CUSTOM,
@@ -122,6 +132,16 @@ class TorchSpyrePlatform(CpuPlatform):
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
+
+    @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        # The base `CpuPlatform` returns `CpuCommunicator`, which delegates
+        # to gloo collectives. With `dist_backend = "cpu:gloo,spyre:spyreccl"`
+        # the device_group is bound to spyreccl, so we need a Spyre-aware
+        # communicator that knows which collectives the comms library
+        # actually implements (and falls back manually for the rest).
+        # See `spyre_inference/distributed/spyre_communicator.py`.
+        return "spyre_inference.distributed.spyre_communicator.SpyreCommunicator"
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:

@@ -163,7 +163,7 @@ def ref_attn(
     "num_heads",
     [
         pytest.param((32, 8), id="GQA"),
-        pytest.param((32, 32), id="MHA"),
+        pytest.param((32, 32), id="MHA", marks=pytest.mark.skip("Most MHA cases fail to compile, see https://github.com/torch-spyre/torch-spyre/issues/2195")),
         pytest.param((32, 1), id="MQA"),
     ],
 )
@@ -209,12 +209,6 @@ def test_spyre_attn(
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
     num_query_heads, num_kv_heads = num_heads
-    if not use_sdpa and num_query_heads == num_kv_heads:
-        # torch-spyre regression introduced by #2083 (commit f23fe0c): the
-        # fused softmax+matmul kernel fails SDSC compilation
-        # ("must fit in LX for SuperDSC: 1_batchmatmul") whenever q, k, and v
-        # all share a size-1 second dimension, which is the MHA layout.
-        pytest.skip("MHA + manual softmax: torch-spyre compile regression (#2083)")
     torch.set_default_device("cpu")
     set_random_seed(0)
 

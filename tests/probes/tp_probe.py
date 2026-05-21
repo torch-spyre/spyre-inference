@@ -1,3 +1,16 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TP=N probe dispatcher.
 
 Each probe exercises one collective on a real spyreccl device_group.
@@ -74,15 +87,10 @@ def probe_native_all_gather_into_tensor(device, device_group, world_size, rank):
 def probe_native_all_gather_list(device, device_group, world_size, rank):
     """Raw `dist.all_gather` (list form) on the spyreccl device_group."""
     t = torch.full((1024,), float(rank + 1), dtype=torch.float16, device=device)
-    out_list = [
-        torch.empty((1024,), dtype=torch.float16, device=device)
-        for _ in range(world_size)
-    ]
+    out_list = [torch.empty((1024,), dtype=torch.float16, device=device) for _ in range(world_size)]
     dist.all_gather(out_list, t, group=device_group)
     for r, o in enumerate(out_list):
-        torch.testing.assert_close(
-            o.cpu(), torch.full((1024,), float(r + 1), dtype=torch.float16)
-        )
+        torch.testing.assert_close(o.cpu(), torch.full((1024,), float(r + 1), dtype=torch.float16))
 
 
 def probe_native_gather(device, device_group, world_size, rank):
@@ -90,8 +98,7 @@ def probe_native_gather(device, device_group, world_size, rank):
     t = torch.full((1024,), float(rank + 1), dtype=torch.float16, device=device)
     if rank == 0:
         gather_list = [
-            torch.empty((1024,), dtype=torch.float16, device=device)
-            for _ in range(world_size)
+            torch.empty((1024,), dtype=torch.float16, device=device) for _ in range(world_size)
         ]
     else:
         gather_list = None

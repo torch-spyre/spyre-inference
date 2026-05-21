@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     SPYRE_ATTN_IMPL: str = "default"
     SPYRE_SCATTER_USE_OVERWRITE: bool = False
+    SPYRE_USE_OVERWRITE_F: bool = True
 
 _cache: dict[str, Any] = {}
 
@@ -45,6 +46,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Requires PR #2084 (specialize_int=True) applied to torch-spyre or
     # the kernel will reuse the first call's offsets.
     "SPYRE_SCATTER_USE_OVERWRITE": lambda: bool(int(os.getenv("SPYRE_SCATTER_USE_OVERWRITE", "0"))),
+    # Controls whether reshape_and_cache uses torch.ops.spyre.overwrite_f
+    # (default, requires Spyre device) or plain slice assignment (for CPU
+    # testing without Spyre hardware). Set to "0" for CPU-only mode.
+    "SPYRE_USE_OVERWRITE_F": lambda: bool(int(os.getenv("SPYRE_USE_OVERWRITE_F", "1"))),
 }
 # --8<-- [end:env-vars-definition]
 

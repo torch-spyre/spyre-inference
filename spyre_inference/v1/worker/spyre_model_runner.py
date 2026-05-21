@@ -319,11 +319,58 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Warmup done.")
 
     # --- KV cache allocation ---
-    # Potential sub to override KV cache tensor allocation
-    # def _allocate_kv_cache_tensors(
-    #     self,
-    #     kv_cache_config,
-    # ) -> dict[str, torch.Tensor]:
+
+    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+        """Allocate KV cache as lists of individual page tensors on Spyre.
+
+        Each layer gets a tuple (k_pages, v_pages) where each is a list of
+        tensors of shape [num_kv_heads, block_size, head_size] on the Spyre
+        device. This matches upstream vLLM's paged model but uses list indices
+        instead of tensor indices — enabling direct per-page bmm without
+        advanced indexing.
+        """
+        from vllm.v1.worker.utils import bind_kv_cache
+
+        kv_caches: dict[str, torch.Tensor] = {}
+
+        for group in kv_cache_config.kv_cache_groups:
+            kv_cache_spec = group.kv_cache_spec
+            num_blocks = (
+                kv_cache_config.kv_cache_tensors[0].size
+                // kv_cache_spec.page_size_bytes
+            )
+            block_size = kv_cache_spec.block_size
+            num_kv_heads = kv_cache_spec.num_kv_heads
+            head_size = kv_cache_spec.head_size
+
+            # Default stickification splits head_size into 64-element sticks.
+            # Alternative: stickify block_size or num_kv_heads for different
+            # access patterns (would require explicit SpyreTensorLayout).
+            k_pages: list[torch.Tensor] = []
+            v_pages: list[torch.Tensor] = []
+            for _ in range(num_blocks):
+                k_pages.append(torch.zeros(
+                    num_kv_heads, block_size, head_size,
+                    dtype=torch.float16, device=self._spyre_device,
+                ))
+                v_pages.append(torch.zeros(
+                    num_kv_heads, block_size, head_size,
+                    dtype=torch.float16, device=self._spyre_device,
+                ))
+
+            page_cache = (k_pages, v_pages)
+            for layer_name in group.layer_names:
+                kv_caches[layer_name] = page_cache  # type: ignore[assignment]
+
+        for layer_name, target in self.shared_kv_cache_layers.items():
+            kv_caches[layer_name] = kv_caches[target]
+
+        bind_kv_cache(
+            kv_caches,
+            self.compilation_config.static_forward_context,
+            self.kv_caches,
+        )
+        return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

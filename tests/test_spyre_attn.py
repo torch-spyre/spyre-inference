@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from unittest.mock import Mock
+import os
 
 import pytest
 import torch
@@ -24,18 +25,32 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
 )
+from spyre_inference import envs
+
+
+def _spyre_available() -> bool:
+    try:
+        torch.randn(1, device=torch.device("spyre"))
+        return True
+    except Exception:
+        return False
+
+
+SPYRE_AVAILABLE = _spyre_available()
 
 
 @pytest.fixture(autouse=True)
-def requires_spyre():
-    """Lazy check that spyre devices are available.
-    This must be done lazily to avoid accessing a device at import time.
+def configure_device(monkeypatch):
+    """Configure overwrite_f based on hardware availability.
+
+    On Spyre: enable overwrite_f (uses compiled path).
+    On CPU: disable overwrite_f (uses eager slice assignment).
     """
-    try:
-        test_tensor = torch.randn(1, device=torch.device("spyre"))
-        del test_tensor
-    except Exception:
-        pytest.skip("Spyre device not available - these tests require Spyre hardware")
+    if SPYRE_AVAILABLE:
+        monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "1")
+    else:
+        monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "0")
+    envs.clear_env_cache()
 
 
 def _build_metadata(
@@ -43,7 +58,6 @@ def _build_metadata(
     num_kv_heads: int,
     head_size: int,
     block_size: int,
-    num_blocks: int,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,
     block_table: torch.Tensor,
@@ -53,8 +67,6 @@ def _build_metadata(
     vllm_config = Mock()
     vllm_config.model_config.get_num_attention_heads.return_value = num_query_heads
     vllm_config.model_config.get_num_kv_heads.return_value = num_kv_heads
-    vllm_config.cache_config.num_gpu_blocks_override = num_blocks
-    vllm_config.cache_config.num_gpu_blocks = num_blocks
 
     kv_cache_spec = AttentionSpec(
         block_size=block_size,
@@ -95,19 +107,21 @@ def _build_metadata(
 
 def ref_attn(
     query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
+    key_cache: list[torch.Tensor],
+    value_cache: list[torch.Tensor],
     query_lens: list[int],
     kv_lens: list[int],
     block_tables: torch.Tensor,
+    block_size: int,
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
 ) -> torch.Tensor:
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
-    block_tables = block_tables.cpu().numpy()
-    _, block_size, num_kv_heads, head_size = key_cache.shape
+    block_tables_np = block_tables.cpu().numpy()
+    num_kv_heads = key_cache[0].shape[0]
+    head_size = key_cache[0].shape[2]
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -115,13 +129,18 @@ def ref_attn(
         query_len = query_lens[i]
         kv_len = kv_lens[i]
         q = query[start_idx : start_idx + query_len]
-        q = q * scale  # avoid in-place mutation of the input tensor
+        q = q * scale
 
         num_kv_blocks = (kv_len + block_size - 1) // block_size
-        block_indices = block_tables[i, :num_kv_blocks]
+        block_indices = block_tables_np[i, :num_kv_blocks]
 
-        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
+        # Gather from page lists
+        k_blocks = [key_cache[idx] for idx in block_indices]
+        v_blocks = [value_cache[idx] for idx in block_indices]
+        # Each block: [num_kv_heads, block_size, head_size]
+        # cat along block_size dim → [num_kv_heads, total_tokens, head_size]
+        k = torch.cat(k_blocks, dim=1).transpose(0, 1)[:kv_len]  # [kv_len, num_kv_heads, head_size]
+        v = torch.cat(v_blocks, dim=1).transpose(0, 1)[:kv_len]
 
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
@@ -157,6 +176,9 @@ def ref_attn(
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
         pytest.param([(64, 512)], id="prefill(q=64,kv=512)"),
         pytest.param([(100, 512)], id="prefill(q=100,kv=512)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
     ],
 )
 @pytest.mark.parametrize(
@@ -216,7 +238,6 @@ def test_spyre_attn(
     kv_lens = [x[1] for x in seq_lens]
     num_query_heads, num_kv_heads = num_heads
     assert num_query_heads % num_kv_heads == 0
-    max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
     scale = head_size**-0.5
 
@@ -224,9 +245,17 @@ def test_spyre_attn(
     key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
-    kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype)
-    key_cache = kv_cache[:, 0]
-    value_cache = kv_cache[:, 1]
+    # Pages stay on CPU — eager Spyre ops require torch.compile which is only
+    # available in end-to-end model runs. This test validates algorithm correctness.
+    cache_device = torch.device("spyre") if SPYRE_AVAILABLE else torch.device("cpu")
+    k_pages_cpu: list[torch.Tensor] = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
+        for _ in range(num_blocks)
+    ]
+    v_pages_cpu: list[torch.Tensor] = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
+        for _ in range(num_blocks)
+    ]
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -238,7 +267,7 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Pre-populate KV cache with historical context
+    # Pre-populate KV cache with historical context (on CPU)
     for seq_idx in range(num_seqs):
         query_len = query_lens[seq_idx]
         kv_len = kv_lens[seq_idx]
@@ -250,8 +279,12 @@ def test_spyre_attn(
                 block_idx = token_idx // block_size
                 block_offset = token_idx % block_size
                 actual_block = block_tables[seq_idx, block_idx].item()
-                key_cache[actual_block, block_offset] = historical_keys[token_idx]
-                value_cache[actual_block, block_offset] = historical_values[token_idx]
+                k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
+                v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
+
+    # Transfer populated pages to device
+    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
+    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
 
     # Create slot mapping for new query tokens
     slot_mapping = []
@@ -269,7 +302,6 @@ def test_spyre_attn(
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         block_size=block_size,
-        num_blocks=num_blocks,
         seq_lens=kv_lens_tensor,
         query_start_loc=cu_query_lens,
         block_table=block_tables,
@@ -288,6 +320,7 @@ def test_spyre_attn(
     )
 
     output = torch.empty_like(query)
+    kv_cache = (k_pages, v_pages)
     attn_impl.forward(
         layer=None,
         query=query,
@@ -298,19 +331,24 @@ def test_spyre_attn(
         output=output,
     )
 
+    # Bring pages back to CPU for reference (they now contain the new tokens too)
+    k_pages_final = [p.cpu() for p in k_pages]
+    v_pages_final = [p.cpu() for p in v_pages]
+
     ref_output = ref_attn(
         query=query,
-        key_cache=key_cache,
-        value_cache=value_cache,
+        key_cache=k_pages_final,
+        value_cache=v_pages_final,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,
+        block_size=block_size,
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
     )
 
-    if max_query_len >= 32:
+    if max(query_lens) >= 32:
         atol, rtol = 0.3, 5.0
     else:
         atol, rtol = 0.2, 0.2

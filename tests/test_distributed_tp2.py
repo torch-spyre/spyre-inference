@@ -18,10 +18,6 @@ from __future__ import annotations
 
 import gc
 import os
-import socket
-import subprocess
-import sys
-import textwrap
 
 import pytest
 
@@ -40,96 +36,19 @@ def _spyre_device_count() -> int:
         return 0
 
 
-def _free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 # TEMPORARY: this test exercises the low-level distributed init path
-# directly (subprocess + env-rendezvous + init_worker_distributed_environment
-# + manual all_reduce probe) because the higher-level LLM(tp=2) tests
-# below are xfail-strict on #134/#135. Once those land and
+# directly because the higher-level LLM(tp=2) tests below are
+# xfail-strict on #134/#135. Once those land and
 # test_tp2_llm_construction / test_tp2_llm_generate_matches_tp1 pass,
-# this test is redundant — delete it (and _TP_ALLREDUCE_CODE) along
-# with the xfail markers on the LLM tests.
-#
-# Inner-rank script for `test_tp2_tensor_model_parallel_all_reduce`.
-# Launched once per rank as a fresh `python -c` subprocess with
-# RANK / WORLD_SIZE / LOCAL_RANK / LOCAL_WORLD_SIZE / MASTER_{ADDR,PORT}
-# set in the environment (env://-style rendezvous, same as torchrun).
-_TP_ALLREDUCE_CODE = textwrap.dedent(
-    """
-    import os
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
-    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-
-    import torch
-    import torch.distributed as dist
-    import torch_spyre  # registers spyreccl backend
-
-    torch.spyre.set_device(local_rank)
-
-    from vllm.plugins import load_general_plugins
-    load_general_plugins()
-
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.config import set_current_vllm_config
-    from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-    from vllm.platforms import current_platform
-
-    cfg = EngineArgs(
-        model="facebook/opt-125m",
-        tensor_parallel_size=world_size,
-        dtype="float16",
-        enforce_eager=True,
-        distributed_executor_backend="external_launcher",
-    ).create_engine_config()
-
-    with set_current_vllm_config(cfg):
-        init_worker_distributed_environment(
-            cfg, rank,
-            distributed_init_method="env://",
-            local_rank=local_rank,
-            backend=current_platform.dist_backend,
-        )
-
-        import vllm.distributed.parallel_state as ps
-        comm_cls = type(ps._TP.device_communicator).__name__
-        assert comm_cls == "SpyreCommunicator", f"got {comm_cls}"
-
-        from vllm.distributed.communication_op import (
-            tensor_model_parallel_all_reduce,
-        )
-
-        device = torch.device(f"spyre:{local_rank}")
-        for shape in [(128,), (16, 1024)]:
-            t = torch.full(
-                shape, float(rank + 1),
-                dtype=torch.float16, device=device,
-            )
-            out = tensor_model_parallel_all_reduce(t)
-            expected = float(sum(range(1, world_size + 1)))
-            cpu = out.cpu()
-            torch.testing.assert_close(cpu, torch.full_like(cpu, expected))
-            dist.barrier(device_ids=[local_rank])
-
-    dist.destroy_process_group()
-    """
-)
-
-
+# this test is redundant — delete it along with the xfail markers on
+# the LLM tests.
 @pytest.mark.spyre
 @pytest.mark.uses_subprocess
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
-def test_tp2_tensor_model_parallel_all_reduce() -> None:
+def test_tp2_tensor_model_parallel_all_reduce(run_tp_probe) -> None:
     """End-to-end TP=2 `tensor_model_parallel_all_reduce` on real Spyre cards.
 
     Spawns one subprocess per rank, each running through vllm's real
@@ -137,50 +56,7 @@ def test_tp2_tensor_model_parallel_all_reduce() -> None:
     then verifies SpyreCommunicator's manual TP=2 fallback returns
     numerically correct results on a 1-D probe and a (seq, hidden) slab.
     """
-    port = _free_tcp_port()
-    world_size = 2
-    procs = []
-    for rank in range(world_size):
-        env = {
-            **os.environ,
-            "RANK": str(rank),
-            "WORLD_SIZE": str(world_size),
-            "LOCAL_RANK": str(rank),
-            "LOCAL_WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(port),
-            "PYTHONUNBUFFERED": "1",
-        }
-        procs.append(
-            subprocess.Popen(  # noqa: S603
-                [sys.executable, "-c", _TP_ALLREDUCE_CODE],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        )
-
-    results: list[tuple[int, str, str]] = []
-    for p in procs:
-        try:
-            out, err = p.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, err = p.communicate()
-            results.append((-1, out or "", err or ""))
-        else:
-            results.append((p.returncode, out or "", err or ""))
-
-    failed = [(i, rc, out, err) for i, (rc, out, err) in enumerate(results) if rc != 0]
-    if failed:
-        msg = "\n".join(
-            f"--- rank {i} (rc={rc}) ---\n"
-            f"stdout (tail):\n{out[-2000:]}\n"
-            f"stderr (tail):\n{err[-2000:]}"
-            for i, rc, out, err in failed
-        )
-        pytest.fail(f"TP=2 ranks failed:\n{msg}")
+    run_tp_probe("tp_all_reduce", world_size=2)
 
 
 @pytest.mark.spyre

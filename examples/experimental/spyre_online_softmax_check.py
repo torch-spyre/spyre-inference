@@ -56,8 +56,10 @@ KNOWN SPYRE BUGS THIS SCRIPT WORKS AROUND
        data when consumed by bmm. .clone() and .contiguous() on the device
        do NOT repair it — they faithfully copy the corrupted source. The
        only known fix is to slice on host, then transfer (see _seq_slice).
-       Symmetric to the destination-side bug already worked around in
-       torch_spyre/ops/eager.py:_is_narrowed_view (spyre__copy_from).
+    3. Seq-dim narrowed-view writes — writing to a sliced Spyre tensor along
+       the seq dimension (e.g. output[:, 32:64, :] = data) corrupts the data.
+       Workaround: transfer output to CPU, perform the write, transfer back.
+       This is the destination-side counterpart to bug #2.
 """
 
 import os
@@ -297,7 +299,16 @@ def fused_tiled_attention(
                 tile_output = tile_output + torch.bmm(tile_probs, v_tile)
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
 
-        output[:, q_start:q_end, :] = tile_output / tile_sum
+        final_tile = tile_output / tile_sum
+        
+        # Workaround for destination-side narrowed-view write bug on Spyre
+        if query.device.type == "spyre":
+            # Write via CPU to avoid corrupted narrowed-view writes
+            output_cpu = output.cpu()
+            output_cpu[:, q_start:q_end, :] = final_tile.cpu()
+            output = output_cpu.to(query.device)
+        else:
+            output[:, q_start:q_end, :] = final_tile
 
     return output
 
@@ -474,3 +485,5 @@ else:
 print("\n  Known bugs requiring workarounds:")
 print("    - seq-dim narrowed-view reads on Spyre (bmm yields garbage)")
 print("      workaround: slice on host then transfer (_seq_slice)")
+print("    - seq-dim narrowed-view writes on Spyre (data corruption)")
+print("      workaround: write via CPU round-trip (fused_tiled_attention line 340-344)")

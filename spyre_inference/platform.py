@@ -75,6 +75,14 @@ class TorchSpyrePlatform(CpuPlatform):
         return "torch-spyre"
 
     @classmethod
+    def inference_mode(cls):
+        """A device-specific wrapper of `torch.inference_mode`.
+
+        See https://github.com/torch-spyre/torch-spyre/issues/2029
+        """
+        return torch.no_grad()
+
+    @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:
         # Only log in main process (not in TP workers)
         if multiprocessing.current_process().name != "MainProcess":

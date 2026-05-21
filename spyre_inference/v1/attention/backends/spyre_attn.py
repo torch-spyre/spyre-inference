@@ -35,6 +35,7 @@ from typing import ClassVar
 import torch
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.utils import convert
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -74,19 +75,72 @@ def _maybe_compile(fn):
 
 
 # ---------------------------------------------------------------------------
-# Spyre workarounds
+# Compilable factory functions (PR #5 pattern)
 # ---------------------------------------------------------------------------
 
 
-def _seq_slice(t: torch.Tensor, lo: int, hi: int) -> torch.Tensor:
-    """Slice a tensor along dim 0 (token dim).
+def _create_compilable_reshape_and_cache(num_tokens: int):
+    """Create a reshape_and_cache with fixed token count for torch.compile.
 
-    Workaround for Spyre narrowed-view read bug — on Spyre we round-trip
-    through host.
+    Dynamo unrolls the loop because num_tokens is a closure constant.
     """
-    if t.device.type == "spyre":
-        return t.cpu()[lo:hi].contiguous().to(t.device)
-    return t[lo:hi]
+    def fn(key, value, k_pages, v_pages, block_indices, block_offsets):
+        for t in range(num_tokens):
+            block_idx = block_indices[t]
+            block_offset = block_offsets[t]
+            k_tok = key[t].unsqueeze(1)
+            v_tok = value[t].unsqueeze(1)
+            k_pages[block_idx] = torch.ops.spyre.overwrite_f(
+                input=k_tok, output=k_pages[block_idx],
+                dims=[1], offsets=[block_offset],
+            )
+            v_pages[block_idx] = torch.ops.spyre.overwrite_f(
+                input=v_tok, output=v_pages[block_idx],
+                dims=[1], offsets=[block_offset],
+            )
+    return fn
+
+
+def _create_compilable_page_attn(num_blocks: int):
+    """Create online softmax attention over a fixed number of pages for torch.compile.
+
+    Dynamo unrolls the loop because num_blocks is a closure constant.
+    """
+    def fn(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+        tile_max = None
+        tile_sum = None
+        tile_output = None
+
+        for i in range(num_blocks):
+            page_idx = page_indices[i]
+            k_page = k_pages[page_idx]
+            v_page = v_pages[page_idx]
+            k_page_4d = k_page.unsqueeze(1)
+            v_page_4d = v_page.unsqueeze(1)
+
+            mask_tile = mask_tiles[i]
+
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            scores = scores + mask_tile
+            scores_max = scores.max(dim=-1, keepdim=True)[0]
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+
+        return tile_output / tile_sum
+    return fn
 
 @dataclass
 class SpyreAttentionMetadata(AttentionMetadata):
@@ -117,6 +171,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Additive attention mask on Spyre:
     # [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
     attention_mask: torch.Tensor | None = None
+
+    # Pre-tiled attention mask: attention_mask_tiles[seq_idx][block_idx]
+    # Each tile: [num_kv_heads, 1, padded_query_len, block_size] on target device
+    attention_mask_tiles: list[list[torch.Tensor]] | None = None
 
     aligned_max_seq_len: int = 0
 
@@ -213,7 +271,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             .contiguous()
         )
 
-        return mask_4d.to(device=self._target_device)
+        return mask_4d
 
     def build(
         self,
@@ -234,14 +292,39 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
-        attention_mask = self._build_attention_mask(
+        mask_4d_cpu = self._build_attention_mask(
             seq_lens,
             query_start_loc,
             apply_causal_mask,
             max_query_len,
             aligned_max_seq_len,
-            seq_lens.device,
+            torch.device("cpu"),
         )
+
+        # Pre-tile the mask: split into per-sequence, per-block tiles and upload
+        # each as a separate contiguous tensor (avoids narrowed-view slicing on Spyre)
+        num_seqs = common_attn_metadata.num_reqs
+        num_kv_heads = self.num_kv_heads
+        block_size = self.block_size
+        padded_query_len = (
+            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
+        )
+        attention_mask_tiles: list[list[torch.Tensor]] = []
+        for s in range(num_seqs):
+            seq_tiles: list[torch.Tensor] = []
+            row_start = s * num_kv_heads
+            row_end = row_start + num_kv_heads
+            kv_len_s = int(seq_lens[s].item())
+            num_blocks_s = (kv_len_s + block_size - 1) // block_size
+            for b in range(num_blocks_s):
+                col_start = b * block_size
+                col_end = col_start + block_size
+                tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len, col_start:col_end]
+                seq_tiles.append(tile.contiguous().to(self._target_device))
+            attention_mask_tiles.append(seq_tiles)
+
+        # Full mask on device (kept for backward compat, may be removed later)
+        attention_mask = mask_4d_cpu.to(device=self._target_device)
 
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
         sm_cpu = slot_mapping.detach().cpu()
@@ -264,6 +347,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             attention_mask=attention_mask,
+            attention_mask_tiles=attention_mask_tiles,
             aligned_max_seq_len=aligned_max_seq_len,
         )
 
@@ -323,6 +407,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     KV cache is a tuple (k_pages, v_pages) where each is a list of tensors
     of shape [num_kv_heads, block_size, head_size] on Spyre. No monolithic
     cache tensor, no gather masks.
+
+    On Spyre, the per-page attention loop and reshape_and_cache are compiled
+    via torch.compile with fixed iteration counts (PR #5 pattern). A dict
+    caches compiled variants per unique loop length.
     """
 
     def __init__(
@@ -349,12 +437,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._target_device: torch.device | None = None
         self._target_dtype = torch.float16
 
+        # Compiled function caches (keyed by iteration count)
+        self._reshape_fns: dict[int, object] = {}
+        self._attn_fns: dict[int, object] = {}
+
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
         if sliding_window is not None:
             raise NotImplementedError("Sliding window not supported yet")
         if logits_soft_cap is not None:
             raise NotImplementedError("Logits soft cap not supported yet")
+
+    def _get_reshape_fn(self, num_tokens: int):
+        if num_tokens not in self._reshape_fns:
+            self._reshape_fns[num_tokens] = _maybe_compile(
+                _create_compilable_reshape_and_cache(num_tokens)
+            )
+        return self._reshape_fns[num_tokens]
+
+    def _get_attn_fn(self, num_blocks: int):
+        if num_blocks not in self._attn_fns:
+            self._attn_fns[num_blocks] = _maybe_compile(
+                _create_compilable_page_attn(num_blocks)
+            )
+        return self._attn_fns[num_blocks]
 
     def forward(
         self,
@@ -375,13 +481,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
-        block_size = attn_metadata.block_size
 
         # Derive target device from the pages themselves
         if self._target_device is None:
             self._target_device = k_pages[0].device
 
-        # Step 1: Reshape and cache — write new tokens into pages (on device)
+        # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
@@ -392,7 +497,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         # Step 2: Online softmax attention over pages (varlen)
-        # Writes directly into output buffer — avoids torch.cat
         output = self._online_softmax_attention(
             query[:num_actual_tokens],
             k_pages,
@@ -414,32 +518,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
-        key, value: [num_tokens, num_kv_heads, head_size] — already on target device
+        key, value: [num_tokens, num_kv_heads, head_size]
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key.shape[0]
         use_overwrite_f = envs.SPYRE_USE_OVERWRITE_F
 
-        for t in range(num_tokens):
-            block_idx = block_indices[t]
-            block_offset = block_offsets[t]
+        if use_overwrite_f:
+            # Spyre path: build tokens on CPU, upload as fresh tensors, then
+            # call compiled overwrite_f loop (avoids narrowed-view bug)
+            k_cpu = key.detach().cpu().to(self._target_dtype).contiguous()
+            v_cpu = value.detach().cpu().to(self._target_dtype).contiguous()
+            k_dev = k_cpu.to(self._target_device)
+            v_dev = v_cpu.to(self._target_device)
 
-            if use_overwrite_f:
-                k_tok = key[t].unsqueeze(1)
-                v_tok = value[t].unsqueeze(1)
-
-                k_pages[block_idx] = torch.ops.spyre.overwrite_f(
-                    input=k_tok, output=k_pages[block_idx],
-                    dims=[1], offsets=[block_offset],
-                )
-                v_pages[block_idx] = torch.ops.spyre.overwrite_f(
-                    input=v_tok, output=v_pages[block_idx],
-                    dims=[1], offsets=[block_offset],
-                )
-            else:
-                k_pages[block_idx][:, block_offset, :] = key[t]
-                v_pages[block_idx][:, block_offset, :] = value[t]
+            fn = self._get_reshape_fn(num_tokens)
+            fn(k_dev, v_dev, k_pages, v_pages, block_indices, block_offsets)
+        else:
+            # CPU/eager path — direct slice assignment
+            for t in range(num_tokens):
+                k_pages[block_indices[t]][:, block_offsets[t], :] = key[t]
+                v_pages[block_indices[t]][:, block_offsets[t], :] = value[t]
 
     def _online_softmax_attention(
         self,
@@ -457,9 +557,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the output buffer (avoids torch.cat).
         Returns the output tensor (may be a new tensor when using overwrite_f).
-
-        query: [num_actual_tokens, num_heads, head_size] — already on target device
-        output: [>=num_actual_tokens, num_heads, head_size] — pre-allocated buffer
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -471,9 +568,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
-        attention_mask = attn_metadata.attention_mask
+        mask_tiles_all = attn_metadata.attention_mask_tiles
 
         use_overwrite_f = envs.SPYRE_USE_OVERWRITE_F
+
+        # Global padded query length — must match what the mask tiles were built with
+        max_query_len = attn_metadata.max_query_len
+        padded_query_len = (
+            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
+        )
 
         for seq_idx in range(num_seqs):
             q_start = int(query_start_loc[seq_idx].item())
@@ -481,12 +584,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            q_seq = _seq_slice(query, q_start, q_end)
+            q_seq = query[q_start:q_end]
 
-            # Pad query to QUERY_CHUNK_SIZE
-            padded_query_len = (
-                (query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-            )
+            # Pad query to global padded_query_len (mask tiles share this dimension)
             if padded_query_len > query_len:
                 q_seq = torch.nn.functional.pad(
                     q_seq, (0, 0, 0, 0, 0, padded_query_len - query_len),
@@ -498,54 +598,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
             q = q.reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
 
-            # Per-sequence mask slice:
-            # attention_mask is [num_seqs * num_kv_heads, 1, padded_max_query_len, aligned_max_seq_len]
-            mask_start = seq_idx * num_kv_heads
-            mask_end = mask_start + num_kv_heads
-            seq_mask = attention_mask[mask_start:mask_end, :, :padded_query_len, :]
-
             num_blocks_needed = (kv_len + block_size - 1) // block_size
+            page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
+            mask_tiles = mask_tiles_all[seq_idx]
 
-            tile_max: torch.Tensor | None = None
-            tile_sum: torch.Tensor | None = None
-            tile_output: torch.Tensor | None = None
-
-            for i in range(num_blocks_needed):
-                page_idx = int(block_table[seq_idx, i])
-                k_page = k_pages[page_idx]
-                v_page = v_pages[page_idx]
-
-                # Expand for GQA: [num_kv_heads, 1, block_size, head_size]
-                k_page_4d = k_page.unsqueeze(1)
-                v_page_4d = v_page.unsqueeze(1)
-
-                # Q @ K^T: [num_kv_heads, num_queries_per_kv, padded_query_len, block_size]
-                scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * self.scale
-
-                # Apply per-tile mask slice
-                mask_tile = seq_mask[:, :, :, i * block_size:(i + 1) * block_size]
-                scores = scores + mask_tile
-
-                scores_max = scores.max(dim=-1, keepdim=True)[0]
-
-                if i == 0:
-                    tile_max = scores_max
-                    tile_probs = torch.exp(scores - tile_max)
-                    tile_output = torch.matmul(tile_probs, v_page_4d)
-                    tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-                else:
-                    old_max = tile_max
-                    tile_max = torch.maximum(tile_max, scores_max)
-                    rescale = torch.exp(old_max - tile_max)
-                    tile_output = tile_output * rescale
-                    tile_sum = tile_sum * rescale
-                    tile_probs = torch.exp(scores - tile_max)
-                    tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                    tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-
-            # Normalize
-            assert tile_output is not None and tile_sum is not None
-            result = tile_output / tile_sum
+            if use_overwrite_f:
+                # Spyre compiled path: transfer query, run compiled attn, transfer back
+                q_dev = convert(q, self._target_device, self._target_dtype)
+                attn_fn = self._get_attn_fn(num_blocks_needed)
+                result = attn_fn(
+                    q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale
+                )
+                result = convert(result, "cpu", output.dtype)
+            else:
+                # CPU/eager path
+                result = self._eager_page_attn(q, k_pages, v_pages, page_indices, mask_tiles)
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]
@@ -553,13 +620,55 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result = result.transpose(1, 2).contiguous()
             seq_result = result[0, :query_len, :, :]
 
-            # Write into output buffer without torch.cat
+            # Write into output buffer
             if use_overwrite_f:
+                seq_result_dev = seq_result.contiguous().to(self._target_device)
                 output = torch.ops.spyre.overwrite_f(
-                    input=seq_result, output=output,
+                    input=seq_result_dev, output=output,
                     dims=[0], offsets=[q_start],
                 )
             else:
                 output[q_start:q_end].copy_(seq_result)
 
         return output
+
+    def _eager_page_attn(
+        self,
+        q: torch.Tensor,
+        k_pages: list[torch.Tensor],
+        v_pages: list[torch.Tensor],
+        page_indices: list[int],
+        mask_tiles: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """CPU/eager online softmax over pages."""
+        tile_max = None
+        tile_sum = None
+        tile_output = None
+
+        for i, page_idx in enumerate(page_indices):
+            k_page_4d = k_pages[page_idx].unsqueeze(1)
+            v_page_4d = v_pages[page_idx].unsqueeze(1)
+            mask_tile = mask_tiles[i]
+
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * self.scale
+            scores = scores + mask_tile
+
+            scores_max = scores.max(dim=-1, keepdim=True)[0]
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+
+        assert tile_output is not None and tile_sum is not None
+        return tile_output / tile_sum

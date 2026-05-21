@@ -41,10 +41,16 @@ SPYRE_AVAILABLE = _spyre_available()
 
 @pytest.fixture(autouse=True)
 def configure_device(monkeypatch):
-    """Configure target device: Spyre if available, else CPU with overwrite_f disabled."""
-    if not SPYRE_AVAILABLE:
+    """Configure overwrite_f based on hardware availability.
+
+    On Spyre: enable overwrite_f (uses compiled path).
+    On CPU: disable overwrite_f (uses eager slice assignment).
+    """
+    if SPYRE_AVAILABLE:
+        monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "1")
+    else:
         monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "0")
-        envs.clear_env_cache()
+    envs.clear_env_cache()
 
 
 def _build_metadata(
@@ -239,14 +245,15 @@ def test_spyre_attn(
     key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
-    # Create KV cache as two separate page lists
+    # Pages stay on CPU — eager Spyre ops require torch.compile which is only
+    # available in end-to-end model runs. This test validates algorithm correctness.
     cache_device = torch.device("spyre") if SPYRE_AVAILABLE else torch.device("cpu")
-    k_pages: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype, device=cache_device)
+    k_pages_cpu: list[torch.Tensor] = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
         for _ in range(num_blocks)
     ]
-    v_pages: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype, device=cache_device)
+    v_pages_cpu: list[torch.Tensor] = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
         for _ in range(num_blocks)
     ]
 
@@ -260,7 +267,7 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Pre-populate KV cache with historical context
+    # Pre-populate KV cache with historical context (on CPU)
     for seq_idx in range(num_seqs):
         query_len = query_lens[seq_idx]
         kv_len = kv_lens[seq_idx]
@@ -272,9 +279,12 @@ def test_spyre_attn(
                 block_idx = token_idx // block_size
                 block_offset = token_idx % block_size
                 actual_block = block_tables[seq_idx, block_idx].item()
-                # Write into page: page shape is [num_kv_heads, block_size, head_size]
-                k_pages[actual_block][:, block_offset, :] = historical_keys[token_idx].to(cache_device)
-                v_pages[actual_block][:, block_offset, :] = historical_values[token_idx].to(cache_device)
+                k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
+                v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
+
+    # Transfer populated pages to device
+    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
+    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
 
     # Create slot mapping for new query tokens
     slot_mapping = []
@@ -321,10 +331,14 @@ def test_spyre_attn(
         output=output,
     )
 
+    # Bring pages back to CPU for reference (they now contain the new tokens too)
+    k_pages_final = [p.cpu() for p in k_pages]
+    v_pages_final = [p.cpu() for p in v_pages]
+
     ref_output = ref_attn(
         query=query,
-        key_cache=k_pages,
-        value_cache=v_pages,
+        key_cache=k_pages_final,
+        value_cache=v_pages_final,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,

@@ -21,6 +21,7 @@ from . import rms_norm
 from . import rotary_embedding
 from . import linear
 from . import silu_and_mul
+from . import vocab_parallel_embedding  # noqa: F401
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)

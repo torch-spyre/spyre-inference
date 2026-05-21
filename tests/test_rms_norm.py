@@ -1,3 +1,17 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Test SpyreRMSNorm custom op correctness against a reference implementation.
 """
@@ -33,16 +47,14 @@ def reference_rms_norm(
 # @pytest.mark.parametrize("hidden_size", [63, 64, 65, 127, 128, 129, 256, 512])
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("use_residual", [False, True])
-def test_spyre_rmsnorm_matches_reference(
-    default_vllm_config, batch_size, hidden_size, use_residual
-):
+def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
     """SpyreRMSNorm output matches golden reference.
 
     Tests both paths:
     - forward_oot(): OOT dispatch via custom op (torch.ops.vllm.spyre_rmsnorm)
     - reference_rms_norm(): golden reference, similar to vLLM upstream pure PyTorch (ground truth)
     """
-    from vllm_spyre_next.custom_ops.rms_norm import SpyreRMSNorm
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     eps = 1e-6
     torch.manual_seed(42)
@@ -85,10 +97,10 @@ def mock_forward_oot_with_residual(x, residual=None):
 @pytest.mark.spyre
 @pytest.mark.rmsnorm
 @pytest.mark.parametrize("use_residual", [False, True])
-def test_rmsnorm_oot_dispatch(default_vllm_config, monkeypatch, dummy_tensor, use_residual):
+def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
     """Verify RMSNorm OOT registration: class swap and forward_oot routing."""
     from vllm.model_executor.layers.layernorm import RMSNorm
-    from vllm_spyre_next.custom_ops.rms_norm import SpyreRMSNorm
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     layer = RMSNorm(128, eps=1e-6)
 

@@ -1,0 +1,195 @@
+# Copyright 2026 The Torch-Spyre Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+# os.environ["SPYRE_INDUCTOR_LOG"] = "1"
+os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
+# os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
+# os.environ["DT_DEEPRT_VERBOSE"] = "1"
+# os.environ["DTLOG_LEVEL"] = "debug"
+
+import torch
+from torch.profiler import profile, ProfilerActivity
+
+import torch._logging
+
+# Enable graph code printing
+# torch._logging.set_logs(graph_code=True)
+
+# debug = True
+debug = False
+
+if debug:
+    import debugpy
+    host_addr = os.environ.get("TORCH_SPYRE_DEBUG_ADDR", "0.0.0.0")
+    pdb_port = int(os.environ.get("TORCH_SPYRE_DEBUG_PORT", "5679"))
+    debugpy.listen((host_addr, pdb_port))
+    print(f"[debugpy] listening at {host_addr}:{pdb_port}; wait for client...\n")
+    debugpy.wait_for_client()
+    print("[debugpy] connected")
+
+DEVICE = torch.device("spyre")
+
+def profile_and_print(func, name, num_runs=10):
+    """Helper to profile a function and extract CPU total time"""
+    # # Warmup
+    # for _ in range(3):
+    #     func()
+    
+    # Profile
+    print(f"\nProfiling {name}...")
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        record_shapes=True,
+    ) as prof:
+        # for _ in range(num_runs):
+        #     func()
+        func()
+    
+    table_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=10)
+    table_cpu_display = table_cpu.replace("CUDA", "Spyre")
+    
+    table_spyre = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
+    table_spyre_display = table_spyre.replace("CUDA", "Spyre")
+    
+    print(f"\n{name} - Sorted by CPU time:")
+    print(table_cpu_display)
+    
+    print(f"\n{name} - Sorted by SPYRE time:")
+    print(table_spyre_display)
+    
+    # Extract total CPU time from the profiler
+    total_cpu_time = sum(evt.cpu_time_total for evt in prof.key_averages())
+    return total_cpu_time / num_runs  # Average per run
+
+
+
+def create_paged_memory(
+    page_size: int, number_of_pages: int, fill_value: float = 0.0, dtype=torch.float16
+):
+    list_of_pages = []
+    for i in range(number_of_pages):
+        new_page = torch.full([page_size], fill_value, dtype=dtype)
+        new_page_device = new_page.to(DEVICE)
+        list_of_pages.append(new_page_device)
+    return list_of_pages
+
+
+print("create paged memory...")
+PAGE_SIZE = 16
+# create paged memory 
+a_pages = create_paged_memory(PAGE_SIZE, 512, 1.0)
+b_pages = create_paged_memory(PAGE_SIZE, 512, 2.0)
+
+# test output also as paged
+out_pages = create_paged_memory(PAGE_SIZE, 256)
+
+
+# manipulate individual pages 
+
+a_pages[42].fill_(40.0)
+b_pages[312].fill_(31.0)
+
+# 0 page as padding index
+a_pages[0].fill_(0.0)
+b_pages[0].fill_(0.0)
+
+print("prepare computation...")
+# create page table 
+page_table = [13, 312, 42, 14, 15]
+
+
+def paged_vector_add(a_pages, b_pages, page_table, max_page_table_length, out_pages):
+    # output pages are starting from 0, in this case
+    for i in range(max_page_table_length):
+        page_index = page_table[i]
+        a_page = a_pages[page_index]
+        b_page = b_pages[page_index]
+        out_page = out_pages[i]
+        sum = a_page + b_page
+        out_page.copy_(sum)
+
+
+def create_compilable_paged_vector_add(page_table_length):
+    def paged_vector_add_with_fixed_length(a_pages, b_pages, page_table, out_pages):
+        assert len(page_table) == page_table_length
+        return paged_vector_add(
+            a_pages, b_pages, page_table, page_table_length, out_pages
+        )
+    return paged_vector_add_with_fixed_length
+
+
+list_of_compiled_functions_per_request_length = {}
+
+page_table_length = len(page_table)
+list_of_compiled_functions_per_request_length[page_table_length] = torch.compile(
+    create_compilable_paged_vector_add(page_table_length)
+)
+
+
+# do the computation
+print("computing paged vector add...")
+
+list_of_compiled_functions_per_request_length[page_table_length](
+    a_pages, b_pages, page_table, out_pages
+)
+
+print("result...")
+
+# print result, should have the following pages
+#  0: 3.0
+#  1: 32.0
+#  2: 42.0
+#  3: 3.0
+#  4: 3.0
+
+out_pages_cpu = [p.cpu() for p in out_pages]
+for i in range(len(page_table)):
+    print(f"out page {i}: {out_pages_cpu[i].tolist()}")
+    # print(
+    #     f"  dtype: {out_pages_cpu[i].dtype}, shape: {out_pages_cpu[i].shape}, "
+    #     f"device: {out_pages_cpu[i].device}"
+    # )
+
+
+print("\n repeat now with updated pages...")
+
+page_table_2 = [500, 501, 312, 0, 0]
+
+list_of_compiled_functions_per_request_length[len(page_table_2)](
+    a_pages, b_pages, page_table_2, out_pages
+)
+
+# print result, exptected this time
+#  0: 3.0
+#  1: 3.0
+#  2: 32.0
+#  3: 0.0
+#  4: 0.0
+
+print("results of 2nd run:")
+# copy back again
+out_pages_cpu = [p.cpu() for p in out_pages]
+for i in range(len(page_table)):
+    print(f"out page {i}: {out_pages_cpu[i].tolist()}")
+
+
+print("profiling 2nd run...")
+avg_per_run = profile_and_print(
+    lambda: list_of_compiled_functions_per_request_length[len(page_table_2)](
+        a_pages, b_pages, page_table_2, out_pages
+    ),
+    "2nd run, list on CPU"
+)
+

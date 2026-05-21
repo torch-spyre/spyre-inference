@@ -19,6 +19,8 @@ from string import Template
 import multiprocessing
 import importlib.metadata
 
+from spyre_inference import envs
+
 
 # When running this plugin on a Mac, we assume it's for local development
 # purposes. However, due to a compatibility issue with vLLM, which overrides
@@ -59,11 +61,14 @@ class TorchSpyrePlatform(CpuPlatform):
     # so dispatch works regardless of tensor device.
     dispatch_key: str = "CPU"
 
-    # Register the PyTorch Native Attention implementation as the CUSTOM backend
-    register_backend(
-        AttentionBackendEnum.CUSTOM,
-        "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend",
-    )
+    # Register the PyTorch Native Attention implementation as the CUSTOM backend.
+    # SPYRE_ATTN_IMPL=exp selects spyre_attn_exp.py; anything else uses spyre_attn.py.
+    if envs.SPYRE_ATTN_IMPL == "exp":
+        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn_exp.SpyreAttentionBackend"
+    else:
+        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
+
+    register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

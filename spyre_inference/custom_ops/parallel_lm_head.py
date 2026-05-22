@@ -19,10 +19,13 @@ Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
 Architecture:
     - OOT Registration: @ParallelLMHead.register_oot() replaces upstream
       at instantiation
-    - forward_oot(): Entry point for OOT dispatch, handles device conversion
-      and runs the compiled F.linear on Spyre
-    - Separate Compilation: forward_spyre is compiled independently via
-      maybe_compile (no opaque custom-op boundary)
+    - forward_oot(): Entry point for OOT dispatch, defers to shared
+      forward_lm_head_oot which uses ``layer._spyre_matmul_state``
+    - Chunked matmul: LmHeadMatmulState splits the weight along the vocab
+      dim into N padded sub-weights (driven by SPYRE_LM_HEAD_NUM_CHUNKS),
+      runs one F.linear per chunk on Spyre, and concatenates on CPU. This
+      sidesteps torch-spyre's per-core 256 MB EAR span limit for large
+      lm_head matmuls (e.g. Qwen3-8B 151936×4096).
     - quant_method override: SpyreUnquantizedLMHeadMethod.apply() calls
       forward_oot() so that LogitsProcessor._get_logits() routes through
       the Spyre path
@@ -34,62 +37,34 @@ Spyre Device Constraints:
 References:
     - Upstream ParallelLMHead:
       vllm/model_executor/layers/vocab_parallel_embedding.py
+    - Chunking pattern: hf_adapters/hf_common.py chunk_lm_head
 """
 
 import torch
-import torch.nn.functional as F
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
-    UnquantizedEmbeddingMethod,
 )
 
-from .utils import convert
+from .lm_head_common import (
+    SpyreUnquantizedLMHeadMethod,
+    forward_lm_head_oot,
+)
+
+__all__ = ["SpyreParallelLMHead", "SpyreUnquantizedLMHeadMethod"]
 
 logger = init_logger(__name__)
-
-
-class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
-    """Routes lm_head computation through SpyreParallelLMHead.forward_oot()."""
-
-    def apply(self, layer, x, bias=None):
-        return layer.forward_oot(x, bias)
-
-    def process_weights_after_loading(self, layer):
-        super().process_weights_after_loading(layer)
-
-        # torch-spyre currently has a limitation with the work division of larger
-        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
-        # an integer.
-        layer.padding = 0
-        pad_1 = layer.weight.shape[0] % 64
-        if pad_1 != 0:
-            raise ValueError("The weight dimension must be a multiple of 64.")
-        pad_2 = (layer.weight.shape[0] // 64) % 32
-        if pad_2 > 0:
-            pad_2 = 32 - pad_2
-            layer.padding = pad_2 * 64
-            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, layer.padding))
-            logger.warning_once(
-                "%s: weights padded from %d to %d (torch-spyre limitation) "
-                "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__,
-                layer.weight.shape[0],
-                layer.padded_weight.shape[0],
-            )
-        else:
-            layer.padded_weight = layer.weight
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
     """OOT ParallelLMHead that executes the lm_head matmul on Spyre.
 
-    Weights reside on Spyre after model.to(spyre_device).
-    The quant_method is replaced so that LogitsProcessor._get_logits()
-    routes through forward_oot, which handles device conversion
-    and runs F.linear on Spyre.
+    Weights reside on Spyre after model.to(spyre_device). The shared
+    LmHeadMatmulState (built in process_weights_after_loading) holds the
+    padded weight chunks and compiled F.linear; forward_oot iterates over
+    them and concatenates logits on CPU.
     """
 
     def __init__(self, *args, **kwargs):
@@ -110,42 +85,27 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         logger.debug("Building custom ParallelLMHead for Spyre")
 
-        # Set the custom quantization method to route through spyre
+        # Set the custom quantization method to route through spyre.
+        # The chunked LmHeadMatmulState is materialized in
+        # SpyreUnquantizedLMHeadMethod.process_weights_after_loading once the
+        # checkpoint values are loaded into self.weight.
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
     def _apply(self, fn, recurse=True):
         super()._apply(fn, recurse=recurse)
-        self.padded_weight = fn(self.padded_weight)
+        # Move every padded chunk to the new device; chunks that alias
+        # self.weight are already handled by super().
+        state = getattr(self, "_spyre_matmul_state", None)
+        if state is not None:
+            new_chunks = []
+            for chunk in state.chunks:
+                if chunk is self.weight:
+                    new_chunks.append(self.weight)
+                else:
+                    new_chunks.append(fn(chunk))
+            state.chunks = new_chunks
         return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        """OOT forward pass — lm_head matmul on Spyre.
-
-        Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Converts x (arriving on cpu)
-        to the weight device (residing on spyre), runs the compiled F.linear on spyre
-        and converts back to the x device (cpu).
-
-        Args:
-            x: Hidden states tensor [num_tokens, hidden_dim]
-            bias: Optional bias tensor
-
-        Returns:
-            Logits tensor [num_tokens, vocab_size] on the input device
-        """
-        x_device = x.device
-
-        # Due to indexing operations inside the ModelRunner, which have
-        # to be carried out on cpu due to a torch-spyre limitation,
-        # the input to the SpyreParallelLMHead resides on CPU.
-        # Due to a second limitation of torch-spyre regarding sizes that can be used
-        # in a F.linear layer, the original weights need to be padded
-        out = F.linear(
-            convert(x, device=self.weight.device),
-            self.padded_weight.data,
-            bias,
-        )
-
-        out_cpu = convert(out, device="cpu")
-        out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        return convert(out_cpu_no_pad, device=x_device)
+        """OOT forward pass — chunked lm_head matmul on Spyre."""
+        return forward_lm_head_oot(self, x, bias)

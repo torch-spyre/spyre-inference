@@ -42,7 +42,7 @@ def parse_args():
         "--max-num-batched-tokens", type=int, default=2, dest="max_num_batched_tokens"
     )
     parser.add_argument(
-        "--num_gpu_blocks_override", type=int, default=None, dest="--num-gpu-blocks-override"
+        "--num-gpu-blocks-override", type=int, default=None, dest="num_gpu_blocks_override"
     )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("-n", "--num-prompts", type=int, default=3, dest="num_prompts")

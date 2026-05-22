@@ -89,18 +89,18 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
         (51200, False, 51200),  # 51200 = 64 * (25 * 32) → already aligned, no padding
     ],
 )
-def test_padded_weight_reflects_loaded_weight(
+def test_padded_chunk_reflects_loaded_weight(
     tp_group, vocab_size, expect_padding, expect_padded_shape
 ):
-    """padded_weight must hold the loaded checkpoint values, not uninitialized data.
+    """The single-chunk padded weight must hold the loaded checkpoint values.
 
     Regression guard: padded_weight was previously snapshotted in __init__,
     before load_weights ran, so it held whatever torch.empty produced. It is
-    now materialized in process_weights_after_loading instead.
+    now materialized in process_weights_after_loading via LmHeadMatmulState.
 
-    Also asserts the no-padding path: when the weight row count is already a
-    multiple of 64 * 32, process_weights_after_loading must leave padded_weight
-    identical to the weight Parameter (no F.pad, no extra allocation).
+    Also asserts the no-padding path: when the row count is already a
+    multiple of 64 * 32, the chunk aliases ``layer.weight`` so no extra
+    vocab-sized allocation is made.
     """
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -112,32 +112,30 @@ def test_padded_weight_reflects_loaded_weight(
 
     layer.quant_method.process_weights_after_loading(layer)
 
+    state = layer._spyre_matmul_state
+    assert state is not None
+    assert state.num_chunks == 1
+    chunk = state.chunks[0]
+    real_size = state.real_sizes[0]
+
     if expect_padding:
-        assert layer.padding > 0
-        assert layer.padded_weight.shape == (
-            expect_padded_shape,
-            embedding_dim,
-        )
+        assert real_size == vocab_size
+        assert chunk.shape == (expect_padded_shape, embedding_dim)
         # Top slice mirrors the loaded weight bit-for-bit.
         torch.testing.assert_close(
-            layer.padded_weight[: layer.weight.shape[0]],
+            chunk[:vocab_size],
             layer.weight,
             atol=0.0,
             rtol=0.0,
         )
         # Padding rows are zeros (F.pad default), so they contribute 0 to logits.
-        assert torch.all(layer.padded_weight[layer.weight.shape[0] :] == 0)
+        assert torch.all(chunk[vocab_size:] == 0)
     else:
-        # Aligned shape: no padding applied, padded_weight aliases the weight
+        # Aligned shape: no padding applied, the chunk aliases the weight
         # Parameter so we don't allocate or copy a second vocab-sized tensor.
-        assert layer.padding == 0
-        assert layer.padded_weight is layer.weight
-        torch.testing.assert_close(
-            layer.padded_weight,
-            layer.weight,
-            atol=0.0,
-            rtol=0.0,
-        )
+        assert chunk is layer.weight
+        assert real_size == chunk.shape[0]
+        torch.testing.assert_close(chunk, layer.weight, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.spyre
@@ -176,6 +174,126 @@ def test_invalid_weight_shape_raises(tp_group):
 
     with pytest.raises(ValueError, match="multiple of 64"):
         layer.quant_method.process_weights_after_loading(layer)
+
+
+# ---------------------------------------------------------------------------
+# Chunked lm_head workaround
+#
+# torch-spyre's F.linear lowering has a per-core EAR span limit of 256 MB
+# (torch_spyre/_inductor/work_division.py). Large lm_heads (e.g. Qwen3-8B
+# 151936 × 4096 fp16 → 300 MB per core after split across 8 cores) overflow
+# and abort with SIGABRT during compilation. The chunked path splits the
+# matmul along the vocab dim into N smaller F.linears that each fit under
+# the span limit, mirroring hf_adapters/hf_common.py chunk_lm_head.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.spyre
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize("num_chunks", [1, 2, 4, 8])
+def test_chunked_lm_head_matches_reference(tp_group, monkeypatch, num_chunks):
+    """Chunked SpyreParallelLMHead matches plain F.linear for any chunk count."""
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    monkeypatch.setenv("SPYRE_LM_HEAD_NUM_CHUNKS", str(num_chunks))
+    torch.manual_seed(0)
+
+    vocab_size = 51200
+    embedding_dim = 64
+    num_tokens = 4
+
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    assert isinstance(layer, SpyreParallelLMHead)
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    state = layer._spyre_matmul_state
+    assert state is not None
+    assert state.num_chunks == num_chunks
+    assert sum(state.real_sizes) == vocab_size
+
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
+    expected = reference_lm_head(x, layer.weight.data)
+    actual = layer.forward_oot(x)
+
+    assert actual.shape == (num_tokens, vocab_size)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.spyre
+@pytest.mark.parallel_lm_head
+def test_chunked_lm_head_handles_uneven_split(tp_group, monkeypatch):
+    """Vocab whose stick count isn't divisible by num_chunks still covers all rows."""
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    # 49216 = 64 * 769; 769 / 8 = 96 r 1 -> first chunk gets the extra stick.
+    monkeypatch.setenv("SPYRE_LM_HEAD_NUM_CHUNKS", "8")
+    torch.manual_seed(0)
+
+    vocab_size = 49216
+    embedding_dim = 64
+
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    assert isinstance(layer, SpyreParallelLMHead)
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    state = layer._spyre_matmul_state
+    assert state is not None
+    assert state.num_chunks == 8
+    assert sum(state.real_sizes) == vocab_size
+    # First chunk gets the extra 64-row stick.
+    assert state.real_sizes[0] == state.real_sizes[-1] + 64
+
+    x = torch.randn(3, embedding_dim, dtype=torch.float16)
+    expected = reference_lm_head(x, layer.weight.data)
+    actual = layer.forward_oot(x)
+
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.spyre
+@pytest.mark.parallel_lm_head
+def test_chunk_count_env_override(tp_group, monkeypatch):
+    """SPYRE_LM_HEAD_NUM_CHUNKS forces the chunk count regardless of weight size."""
+    from spyre_inference.custom_ops.lm_head_common import build_lm_head_matmul_state
+
+    torch.manual_seed(0)
+    weight = torch.randn(64 * 16, 8, dtype=torch.float16)
+
+    monkeypatch.setenv("SPYRE_LM_HEAD_NUM_CHUNKS", "4")
+    state = build_lm_head_matmul_state(weight, "test", torch.nn.Identity())
+    assert state.num_chunks == 4
+
+    monkeypatch.setenv("SPYRE_LM_HEAD_NUM_CHUNKS", "1")
+    state = build_lm_head_matmul_state(weight, "test", torch.nn.Identity())
+    assert state.num_chunks == 1
+
+
+@pytest.mark.spyre
+@pytest.mark.parallel_lm_head
+def test_chunk_count_size_heuristic(tp_group, monkeypatch):
+    """Without an env override, small weights stay single-chunk; big ones split."""
+    from spyre_inference.custom_ops.lm_head_common import build_lm_head_matmul_state
+
+    monkeypatch.delenv("SPYRE_LM_HEAD_NUM_CHUNKS", raising=False)
+    monkeypatch.setenv("SPYRE_LM_HEAD_SINGLE_THRESHOLD_MIB", "1")
+    monkeypatch.setenv("SPYRE_LM_HEAD_DEFAULT_CHUNKS", "4")
+
+    small = torch.randn(64, 8, dtype=torch.float16)  # 1 KiB
+    state = build_lm_head_matmul_state(small, "small", torch.nn.Identity())
+    assert state.num_chunks == 1
+
+    big = torch.randn(64 * 16, 4096, dtype=torch.float16)  # 8 MiB > 1 MiB
+    state = build_lm_head_matmul_state(big, "big", torch.nn.Identity())
+    assert state.num_chunks == 4
 
 
 if __name__ == "__main__":

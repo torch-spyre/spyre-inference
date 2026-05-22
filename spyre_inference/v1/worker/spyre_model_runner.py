@@ -118,8 +118,8 @@ class _SpyreModelWrapper:
     Output conversion (Spyre → CPU):
         The model's final hidden_states come out on Spyre. Downstream
         operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
+        Logits matmul runs on Spyre via SpyreParallelLMHead, which handles
+        the H2D/D2H transfers around its compiled F.linear chunks.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -255,7 +255,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Wrap model so ALL forward() calls to the entire model,
         # for example in execute_model, _dummy_run, etc.,
         # automatically convert Spyre outputs to CPU. This ensures downstream
-        # indexing (logits_indices), lm_head (CPU weights), and sampling all
+        # indexing (logits_indices), sampling, and logits outputs all
         # receive CPU tensors without needing per-call-site overrides.
         self.model = _SpyreModelWrapper(self.model, self._spyre_device)
 

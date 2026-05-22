@@ -59,164 +59,26 @@ def test_tp2_tensor_model_parallel_all_reduce(run_tp_probe) -> None:
     run_tp_probe("tp_all_reduce", world_size=2)
 
 
-# Subprocess script for `test_tp2_vocab_parallel_embedding`. Each rank:
-#   1. brings up the spyreccl device_group (env-rendezvous, same as the
-#      LLM(tp=2) entry path),
-#   2. constructs a VocabParallelEmbedding (which OOT-swaps to
-#      SpyreVocabParallelEmbedding),
-#   3. loads its slice of a deterministic full-vocab weight,
-#   4. runs forward(input_ids) — which masks, looks up, zeroes out-of-shard
-#      rows, and all_reduces via SpyreCommunicator,
-#   5. asserts the result matches a single-rank F.embedding over the full
-#      weight bit-for-bit (modulo float16 reduction noise).
-#
-# This isolates the embedding-TP correctness check from #134 (linear TP)
-# and #136-equivalent (LM head TP) so the embedding work can land
-# independently. When the full LLM(tp=2) test passes, this subprocess
-# test is redundant and can be deleted.
-_TP_VOCAB_EMBED_CODE = textwrap.dedent("""
-    import os
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
-    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-
-    import torch
-    import torch.distributed as dist
-    import torch.nn.functional as F
-    import torch_spyre  # registers spyreccl backend
-
-    torch.spyre.set_device(local_rank)
-
-    from vllm.plugins import load_general_plugins
-    load_general_plugins()
-
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.config import set_current_vllm_config
-    from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
-    from vllm.platforms import current_platform
-
-    cfg = EngineArgs(
-        model="facebook/opt-125m",
-        tensor_parallel_size=world_size,
-        dtype="float16",
-        enforce_eager=True,
-        distributed_executor_backend="external_launcher",
-    ).create_engine_config()
-
-    vocab_size = 1024
-    embedding_dim = 64
-
-    with set_current_vllm_config(cfg):
-        init_worker_distributed_environment(
-            cfg, rank,
-            distributed_init_method="env://",
-            local_rank=local_rank,
-            backend=current_platform.dist_backend,
-        )
-
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            VocabParallelEmbedding,
-        )
-        from spyre_inference.custom_ops.vocab_parallel_embedding import (
-            SpyreVocabParallelEmbedding,
-        )
-
-        layer = VocabParallelEmbedding(
-            vocab_size, embedding_dim, params_dtype=torch.float16,
-        )
-        assert isinstance(layer, SpyreVocabParallelEmbedding), type(layer)
-        assert layer.tp_size == world_size, layer.tp_size
-
-        # Both ranks reconstruct the same full-vocab reference, then each
-        # populates its shard from the same source — keeps the assertion
-        # below independent of weight initialization.
-        torch.manual_seed(42)
-        full_weight = (
-            torch.randn(vocab_size, embedding_dim, dtype=torch.float16) * 0.02
-        )
-
-        start = layer.shard_indices.org_vocab_start_index
-        end = layer.shard_indices.org_vocab_end_index
-        layer.weight.data.zero_()
-        layer.weight.data[: end - start].copy_(full_weight[start:end])
-        layer.to(torch.device(f"spyre:{local_rank}"))
-
-        torch.manual_seed(7)
-        input_ids = torch.randint(0, vocab_size, (16,), dtype=torch.int64)
-        device = torch.device(f"spyre:{local_rank}")
-
-        out = layer(input_ids.to(device)).cpu()
-        expected = F.embedding(input_ids, full_weight)
-        torch.testing.assert_close(
-            out.float(), expected.float(), atol=1e-3, rtol=1e-3
-        )
-        dist.barrier(device_ids=[local_rank])
-
-    dist.destroy_process_group()
-    """)
-
-
 @pytest.mark.spyre
 @pytest.mark.uses_subprocess
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
-def test_tp2_vocab_parallel_embedding() -> None:
+def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
     """End-to-end TP=2 SpyreVocabParallelEmbedding forward on real Spyre cards.
 
     Spawns one subprocess per rank, brings up spyreccl through vllm's
     real init path, constructs the OOT VocabParallelEmbedding, and
     asserts each rank's all-reduced output matches the full-vocab
     F.embedding reference. Independent of #134 (linear TP).
+
+    Isolates the embedding-TP correctness check from #134 (linear TP) and
+    #136-equivalent (LM head TP) so the embedding work can land
+    independently. When the full LLM(tp=2) test passes, this is
+    redundant and can be deleted.
     """
-    port = _free_tcp_port()
-    world_size = 2
-    procs = []
-    for rank in range(world_size):
-        env = {
-            **os.environ,
-            "RANK": str(rank),
-            "WORLD_SIZE": str(world_size),
-            "LOCAL_RANK": str(rank),
-            "LOCAL_WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": str(port),
-            "PYTHONUNBUFFERED": "1",
-        }
-        procs.append(
-            subprocess.Popen(  # noqa: S603
-                [sys.executable, "-c", _TP_VOCAB_EMBED_CODE],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        )
-
-    results: list[tuple[int, str, str]] = []
-    for p in procs:
-        try:
-            out, err = p.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, err = p.communicate()
-            results.append((-1, out or "", err or ""))
-        else:
-            results.append((p.returncode, out or "", err or ""))
-
-    failed = [(i, rc, out, err) for i, (rc, out, err) in enumerate(results) if rc != 0]
-    if failed:
-        msg = "\n".join(
-            f"--- rank {i} (rc={rc}) ---\n"
-            f"stdout (tail):\n{out[-2000:]}\n"
-            f"stderr (tail):\n{err[-2000:]}"
-            for i, rc, out, err in failed
-        )
-        pytest.fail(f"TP=2 ranks failed:\n{msg}")
+    run_tp_probe("vocab_parallel_embedding", world_size=2)
 
 
 @pytest.mark.spyre

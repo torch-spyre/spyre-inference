@@ -1,4 +1,4 @@
-# Copyright 2026 The Torch-Spyre Authors.
+# Copyright 2026 The Spyre-Inference Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+
 # os.environ["SPYRE_INDUCTOR_LOG"] = "1"
 os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
 # os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
@@ -32,6 +33,7 @@ debug = False
 
 if debug:
     import debugpy
+
     host_addr = os.environ.get("TORCH_SPYRE_DEBUG_ADDR", "0.0.0.0")
     pdb_port = int(os.environ.get("TORCH_SPYRE_DEBUG_PORT", "5679"))
     debugpy.listen((host_addr, pdb_port))
@@ -41,12 +43,13 @@ if debug:
 
 DEVICE = torch.device("spyre")
 
+
 def profile_and_print(func, name, num_runs=10):
     """Helper to profile a function and extract CPU total time"""
     # # Warmup
     # for _ in range(3):
     #     func()
-    
+
     # Profile
     print(f"\nProfiling {name}...")
     with profile(
@@ -56,23 +59,22 @@ def profile_and_print(func, name, num_runs=10):
         # for _ in range(num_runs):
         #     func()
         func()
-    
+
     table_cpu = prof.key_averages().table(sort_by="cpu_time_total", row_limit=10)
     table_cpu_display = table_cpu.replace("CUDA", "Spyre")
-    
+
     table_spyre = prof.key_averages().table(sort_by="cuda_time_total", row_limit=10)
     table_spyre_display = table_spyre.replace("CUDA", "Spyre")
-    
+
     print(f"\n{name} - Sorted by CPU time:")
     print(table_cpu_display)
-    
+
     print(f"\n{name} - Sorted by SPYRE time:")
     print(table_spyre_display)
-    
+
     # Extract total CPU time from the profiler
     total_cpu_time = sum(evt.cpu_time_total for evt in prof.key_averages())
     return total_cpu_time / num_runs  # Average per run
-
 
 
 def create_paged_memory(
@@ -88,7 +90,7 @@ def create_paged_memory(
 
 print("create paged memory...")
 PAGE_SIZE = 16
-# create paged memory 
+# create paged memory
 a_pages = create_paged_memory(PAGE_SIZE, 512, 1.0)
 b_pages = create_paged_memory(PAGE_SIZE, 512, 2.0)
 
@@ -96,7 +98,7 @@ b_pages = create_paged_memory(PAGE_SIZE, 512, 2.0)
 out_pages = create_paged_memory(PAGE_SIZE, 256)
 
 
-# manipulate individual pages 
+# manipulate individual pages
 
 a_pages[42].fill_(40.0)
 b_pages[312].fill_(31.0)
@@ -106,7 +108,7 @@ a_pages[0].fill_(0.0)
 b_pages[0].fill_(0.0)
 
 print("prepare computation...")
-# create page table 
+# create page table
 page_table = [13, 312, 42, 14, 15]
 
 
@@ -124,9 +126,8 @@ def paged_vector_add(a_pages, b_pages, page_table, max_page_table_length, out_pa
 def create_compilable_paged_vector_add(page_table_length):
     def paged_vector_add_with_fixed_length(a_pages, b_pages, page_table, out_pages):
         assert len(page_table) == page_table_length
-        return paged_vector_add(
-            a_pages, b_pages, page_table, page_table_length, out_pages
-        )
+        return paged_vector_add(a_pages, b_pages, page_table, page_table_length, out_pages)
+
     return paged_vector_add_with_fixed_length
 
 
@@ -171,7 +172,7 @@ list_of_compiled_functions_per_request_length[len(page_table_2)](
     a_pages, b_pages, page_table_2, out_pages
 )
 
-# print result, exptected this time
+# print result, expected this time
 #  0: 3.0
 #  1: 3.0
 #  2: 32.0
@@ -190,6 +191,5 @@ avg_per_run = profile_and_print(
     lambda: list_of_compiled_functions_per_request_length[len(page_table_2)](
         a_pages, b_pages, page_table_2, out_pages
     ),
-    "2nd run, list on CPU"
+    "2nd run, list on CPU",
 )
-

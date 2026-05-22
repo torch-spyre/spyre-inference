@@ -1,0 +1,41 @@
+name: Preview docs
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "examples/**"
+      - "mkdocs.yaml"
+      - "docs/requirements-docs.txt"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: docs-${{ hashFiles('docs/requirements-docs.txt') }}
+          restore-keys: docs-
+      - run: pip install -r docs/requirements-docs.txt
+      - run: mkdocs build --strict
+      - uses: actions/upload-artifact@v4
+        with:
+          name: preview-docs
+          path: site/
+          retention-days: 7
+      # The PR number must be passed via artifact because doc_comment.yml runs on
+      # workflow_run (triggered after this workflow), which has no pull_request context.
+      - name: Save PR metadata
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: echo "$PR_NUMBER" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-number
+          path: pr-number.txt
+          retention-days: 7

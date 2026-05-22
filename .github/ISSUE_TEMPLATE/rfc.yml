@@ -1,0 +1,27 @@
+name: 💭 Request for comments
+description: Start a discussion for larger changes related to Spyre Inference
+title: "[RFC]: "
+labels: []
+
+body:
+- type: markdown
+  attributes:
+    value: |
+      Before submitting, please search [existing issues](https://github.com/torch-spyre/spyre-inference/issues) to avoid duplicates.
+
+- type: textarea
+  attributes:
+    label: To discuss
+    description: |
+      Describe what you want to discuss or get feedback on. Consider covering
+      the motivation, your proposed approach, and any alternatives you considered.
+  validations:
+    required: true
+
+- type: checkboxes
+  attributes:
+    label: Checklist
+    options:
+      - label: I have searched for similar feature requests or RFCs.
+        required: true
+

@@ -1,0 +1,58 @@
+name: Deploy docs
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "examples/**"
+      - "mkdocs.yaml"
+      - "docs/requirements-docs.txt"
+      - ".github/workflows/deploy-docs.yml"
+  release:
+    types:
+      - published
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: docs-${{ hashFiles('docs/requirements-docs.txt') }}
+          restore-keys: docs-
+      - run: pip install -r docs/requirements-docs.txt
+      - name: Configure git
+        run: |
+          git fetch origin gh-pages --depth=1
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Deploy latest (main)
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          mike deploy --push latest
+          mike set-default --push latest
+      - name: Deploy release
+        if: github.event_name == 'release'
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          mike deploy --push --update-aliases "$VERSION" stable

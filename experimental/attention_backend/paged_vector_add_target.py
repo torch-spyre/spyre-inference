@@ -1,4 +1,4 @@
-# Copyright 2026 The Torch-Spyre Authors.
+# Copyright 2026 The Spyre-Inference Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -90,7 +90,7 @@ value_cache[312, :, :, :] = torch.full([PAGE_SIZE, NUM_HEADS, HEAD_SIZE], 31.0, 
 key_cache_dev = key_cache.to("spyre", device_layout=cache_stl)
 value_cache_dev = value_cache.to("spyre", device_layout=cache_stl)
 
-print("paged memory created & transfered.")
+print("paged memory created & transferred.")
 
 # check layout
 actual_layout = key_cache_dev.device_tensor_layout()
@@ -128,16 +128,16 @@ abs_page_table_K_dev = abs_page_table_K.to(DEVICE)
 abs_page_table_V_dev = abs_page_table_V.to(DEVICE)
 
 # NOTE: we have TWO page tables here, due to separate tensors for K and V
-#  -> addresses for pages in K and V are different. 
+#  -> addresses for pages in K and V are different.
 #  but I think this is not a problem for vLLM
-#  alternatively, we could have the same appraoch with one tensor and then
+#  alternatively, we could have the same approach with one tensor and then
 #   using separate indexes/addresses (would still be two page table tensors)
 
 
 #########################################
 # computation
 #  (and yes, paged vector add is here just a placeholder for attention
-#   ...but we want to seperate the infrastructure for paged access from
+#   ...but we want to separate the infrastructure for paged access from
 #   attention computation ops enablement....)
 
 print("prepare computation...")
@@ -150,20 +150,21 @@ def paged_vector_add(
     for i in range(max_page_table_length):
         out_page = out_pages[i]
         # here we have two indirect accesses per computation
-        #   for paged attention, one indirect access per computation 
+        #   for paged attention, one indirect access per computation
         #   COULD be enough, if they are then views, i.e. NOT realized
         #   as a new tensor in DRAM
         sum = a_pages[a_page_table[i]] + b_pages[b_page_table[i]]
-        # in the future, we would also like to do SLICING with indirect access...
+        # NOTE: this syntax is _not_ correct on CPU/GPU with absolute addresses
+        # NOTE: in the future, we would also like to do SLICING with indirect access...
         #   (see comment below)
-        # also, the format of the indirect views needs to be compatile with 
+        # also, the format of the indirect views needs to be compatile with
         #   attention computation, esp. torch.matmul/torch.bmm
         # for paged attention, there would be THREE indirect access tensors
         #   K and V (as simulated here)
         #   but also Q, due to the varlen representation
         out_page.copy_(sum)
-        # copy into right ouptut format
-        # (also, masking and padding would be required for this type 
+        # copy into right output format
+        # (also, masking and padding would be required for this type
         #   of "compiled loop" computation, but this can be done in
         #   the attention metadata creation on CPU)
 

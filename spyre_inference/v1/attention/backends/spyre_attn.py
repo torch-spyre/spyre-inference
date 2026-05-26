@@ -55,7 +55,6 @@ KV_LENGTH_ALIGNMENT = 256
 QUERY_CHUNK_SIZE = 32
 
 
-
 def _maybe_compile(fn):
     """Compile fn unless vLLM's compilation config disables it.
 
@@ -84,6 +83,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
     """
+
     def fn(key, value, k_pages, v_pages, block_indices, block_offsets):
         for t in range(num_tokens):
             block_idx = block_indices[t]
@@ -91,13 +91,18 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
             k_tok = key[t].unsqueeze(1)
             v_tok = value[t].unsqueeze(1)
             k_pages[block_idx] = torch.ops.spyre.overwrite_f(
-                input=k_tok, output=k_pages[block_idx],
-                dims=[1], offsets=[block_offset],
+                input=k_tok,
+                output=k_pages[block_idx],
+                dims=[1],
+                offsets=[block_offset],
             )
             v_pages[block_idx] = torch.ops.spyre.overwrite_f(
-                input=v_tok, output=v_pages[block_idx],
-                dims=[1], offsets=[block_offset],
+                input=v_tok,
+                output=v_pages[block_idx],
+                dims=[1],
+                offsets=[block_offset],
             )
+
     return fn
 
 
@@ -106,6 +111,7 @@ def _create_compilable_page_attn(num_blocks: int):
 
     Dynamo unrolls the loop because num_blocks is a closure constant.
     """
+
     def fn(q, k_pages, v_pages, page_indices, mask_tiles, scale):
         tile_max = None
         tile_sum = None
@@ -140,7 +146,9 @@ def _create_compilable_page_attn(num_blocks: int):
                 tile_max = new_max
 
         return tile_output / tile_sum
+
     return fn
+
 
 @dataclass
 class SpyreAttentionMetadata(AttentionMetadata):
@@ -167,10 +175,6 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     num_kv_heads: int = 0
     num_heads: int = 0
-
-    # Additive attention mask on Spyre:
-    # [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
-    attention_mask: torch.Tensor | None = None
 
     # Pre-tiled attention mask: attention_mask_tiles[seq_idx][block_idx]
     # Each tile: [num_kv_heads, 1, padded_query_len, block_size] on target device
@@ -203,10 +207,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
 
-        try:
-            torch.randn(1, device=torch.device("spyre"))
-            self._target_device = torch.device("spyre")
-        except Exception:
+        if envs.SPYRE_USE_OVERWRITE_F:
+            try:
+                torch.randn(1, device=torch.device("spyre"))
+                self._target_device = torch.device("spyre")
+            except Exception:
+                self._target_device = torch.device("cpu")
+        else:
             self._target_device = torch.device("cpu")
         self._target_dtype = torch.float16
 
@@ -323,9 +330,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 seq_tiles.append(tile.contiguous().to(self._target_device))
             attention_mask_tiles.append(seq_tiles)
 
-        # Full mask on device (kept for backward compat, may be removed later)
-        attention_mask = mask_4d_cpu.to(device=self._target_device)
-
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
         sm_cpu = slot_mapping.detach().cpu()
         slot_block_indices = (sm_cpu // self.block_size).tolist()
@@ -346,7 +350,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             apply_causal_mask=apply_causal_mask,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
-            attention_mask=attention_mask,
             attention_mask_tiles=attention_mask_tiles,
             aligned_max_seq_len=aligned_max_seq_len,
         )
@@ -457,9 +460,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _get_attn_fn(self, num_blocks: int):
         if num_blocks not in self._attn_fns:
-            self._attn_fns[num_blocks] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks)
-            )
+            self._attn_fns[num_blocks] = _maybe_compile(_create_compilable_page_attn(num_blocks))
         return self._attn_fns[num_blocks]
 
     def forward(
@@ -589,8 +590,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Pad query to global padded_query_len (mask tiles share this dimension)
             if padded_query_len > query_len:
                 q_seq = torch.nn.functional.pad(
-                    q_seq, (0, 0, 0, 0, 0, padded_query_len - query_len),
-                    mode="constant", value=0.0,
+                    q_seq,
+                    (0, 0, 0, 0, 0, padded_query_len - query_len),
+                    mode="constant",
+                    value=0.0,
                 )
 
             # Reshape: [padded_query_len, num_heads, head_size]
@@ -606,9 +609,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 # Spyre compiled path: transfer query, run compiled attn, transfer back
                 q_dev = convert(q, self._target_device, self._target_dtype)
                 attn_fn = self._get_attn_fn(num_blocks_needed)
-                result = attn_fn(
-                    q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale
-                )
+                result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
                 result = convert(result, "cpu", output.dtype)
             else:
                 # CPU/eager path
@@ -623,9 +624,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Write into output buffer
             if use_overwrite_f:
                 seq_result_dev = seq_result.contiguous().to(self._target_device)
+                # overwrite_f returns a new tensor (not in-place); rebind output
                 output = torch.ops.spyre.overwrite_f(
-                    input=seq_result_dev, output=output,
-                    dims=[0], offsets=[q_start],
+                    input=seq_result_dev,
+                    output=output,
+                    dims=[0],
+                    offsets=[q_start],
                 )
             else:
                 output[q_start:q_end].copy_(seq_result)

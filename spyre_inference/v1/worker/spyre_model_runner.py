@@ -335,10 +335,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         for group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = group.kv_cache_spec
-            num_blocks = (
-                kv_cache_config.kv_cache_tensors[0].size
-                // kv_cache_spec.page_size_bytes
-            )
+            num_blocks = kv_cache_config.kv_cache_tensors[0].size // kv_cache_spec.page_size_bytes
             block_size = kv_cache_spec.block_size
             num_kv_heads = kv_cache_spec.num_kv_heads
             head_size = kv_cache_spec.head_size
@@ -349,14 +346,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
             k_pages: list[torch.Tensor] = []
             v_pages: list[torch.Tensor] = []
             for _ in range(num_blocks):
-                k_pages.append(torch.zeros(
-                    num_kv_heads, block_size, head_size,
-                    dtype=torch.float16, device=self._spyre_device,
-                ))
-                v_pages.append(torch.zeros(
-                    num_kv_heads, block_size, head_size,
-                    dtype=torch.float16, device=self._spyre_device,
-                ))
+                k_pages.append(
+                    torch.zeros(
+                        num_kv_heads,
+                        block_size,
+                        head_size,
+                        dtype=torch.float16,
+                        device=self._spyre_device,
+                    )
+                )
+                v_pages.append(
+                    torch.zeros(
+                        num_kv_heads,
+                        block_size,
+                        head_size,
+                        dtype=torch.float16,
+                        device=self._spyre_device,
+                    )
+                )
 
             page_cache = (k_pages, v_pages)
             for layer_name in group.layer_names:

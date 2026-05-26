@@ -13,7 +13,6 @@
 # limitations under the License.
 
 from unittest.mock import Mock
-import os
 
 import pytest
 import torch
@@ -36,21 +35,26 @@ def _spyre_available() -> bool:
         return False
 
 
-SPYRE_AVAILABLE = _spyre_available()
+@pytest.fixture()
+def configure_device(request, monkeypatch):
+    """Configure overwrite_f and cache device based on the device_mode parameter.
 
-
-@pytest.fixture(autouse=True)
-def configure_device(monkeypatch):
-    """Configure overwrite_f based on hardware availability.
-
-    On Spyre: enable overwrite_f (uses compiled path).
-    On CPU: disable overwrite_f (uses eager slice assignment).
+    The spyre card check is done lazily here (not at import time) to avoid
+    claiming the device before subprocess-based tests have a chance to run.
     """
-    if SPYRE_AVAILABLE:
+    import os
+
+    device_mode = request.param
+    if device_mode == "spyre":
+        if not _spyre_available():
+            pytest.skip("Spyre device not available")
+        if os.environ.get("SPYRE_USE_OVERWRITE_F") == "0":
+            pytest.skip("Spyre tests require SPYRE_USE_OVERWRITE_F=1")
         monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "1")
     else:
         monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "0")
     envs.clear_env_cache()
+    return device_mode
 
 
 def _build_metadata(
@@ -120,8 +124,6 @@ def ref_attn(
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
     block_tables_np = block_tables.cpu().numpy()
-    num_kv_heads = key_cache[0].shape[0]
-    head_size = key_cache[0].shape[2]
 
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -168,6 +170,14 @@ def ref_attn(
     return torch.cat(outputs, dim=0)
 
 
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="cpu"),
+        pytest.param("spyre", id="spyre"),
+    ],
+    indirect=True,
+)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -220,6 +230,7 @@ def ref_attn(
 @torch.inference_mode()
 def test_spyre_attn(
     default_vllm_config,
+    configure_device: str,
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
@@ -245,16 +256,12 @@ def test_spyre_attn(
     key = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
-    # Pages stay on CPU — eager Spyre ops require torch.compile which is only
-    # available in end-to-end model runs. This test validates algorithm correctness.
-    cache_device = torch.device("spyre") if SPYRE_AVAILABLE else torch.device("cpu")
+    cache_device = torch.device(configure_device)
     k_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
-        for _ in range(num_blocks)
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
     v_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype)
-        for _ in range(num_blocks)
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(

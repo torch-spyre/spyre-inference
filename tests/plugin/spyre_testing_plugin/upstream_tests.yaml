@@ -77,9 +77,12 @@ tests:
           mode: mandatory_pass
           tags: [attention, upstream]
           params:
-            allow:  # skip TP cases that we don't support
+            allow:  # We only support TP=1, BS=1
               tensor_parallel_size:
               - 1
+              batch_spec_name:
+              - single_decode
+              - single_prefill
           fixture_names:
           - "patch_backend_list"
 

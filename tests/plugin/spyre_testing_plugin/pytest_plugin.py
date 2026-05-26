@@ -644,6 +644,48 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _spyre_session_config():
+    """Session-wide plugin setup and default VllmConfig context.
+
+    Runs once per test session to:
+    1. Set env vars and load plugins
+    2. Register custom ops
+    3. Patch platform to OOT
+    4. Enter set_current_vllm_config + set_forward_context for the session
+
+    Individual tests no longer need to request default_vllm_config just for
+    plugin initialization. Tests that need a different config can still enter
+    their own set_current_vllm_config context (nesting is safe).
+    """
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+
+    from vllm.plugins import load_general_plugins
+
+    load_general_plugins()
+
+    from spyre_inference.custom_ops import register_all
+
+    register_all()
+
+    from vllm.platforms import PlatformEnum, current_platform
+
+    type(current_platform)._enum = PlatformEnum.OOT
+
+    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.forward_context import set_forward_context
+
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        model_config=ModelConfig(dtype=torch.float16),
+    )
+    with set_current_vllm_config(config), set_forward_context(None, config):
+        yield
+
+
 def _spyre_default_vllm_config(monkeypatch):
     from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
@@ -663,7 +705,6 @@ def _spyre_default_vllm_config(monkeypatch):
         model_config=ModelConfig(dtype=torch.float16),
     )
     with set_current_vllm_config(config), set_forward_context(None, config):
-        # Set forward context so custom ops can access the vllm config
         yield
 
 
@@ -673,7 +714,7 @@ def default_vllm_config(monkeypatch):
 
 
 @pytest.fixture(scope="session")
-def _distributed_init():
+def _distributed_init(_spyre_session_config):
     """Initialize torch.distributed with gloo backend once per test session.
 
     Uses a FileStore so no network port is required. The process group is
@@ -697,12 +738,12 @@ def _distributed_init():
             os.unlink(store_path)
 
 
-@pytest.fixture()
-def tp_group(_distributed_init, default_vllm_config):
+@pytest.fixture(scope="session")
+def tp_group(_distributed_init):
     """Set up a real TP=1 GroupCoordinator inside vLLM's parallel_state.
 
-    Depends on `default_vllm_config` so the VllmConfig context and OOT
-    platform patch are already active when the GroupCoordinator is created.
+    The session-scoped _spyre_session_config fixture (autouse) ensures the
+    VllmConfig context and OOT platform patch are already active.
     After the test the previous _TP value is restored.
 
     Tests that create vLLM linear layers should use this fixture instead of

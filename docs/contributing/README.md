@@ -6,65 +6,37 @@ Thank you for your interest in contributing to the Spyre plugin for vLLM! There 
 - Suggest or implement new features.
 - Improve documentation or contribute a how-to guide.
 
-## Issues
+## Developing
 
-If you encounter a bug or have a feature request, please search [existing issues](https://github.com/torch-spyre/spyre-inference/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/torch-spyre/spyre-inference/issues/new/choose):
-
-- **🐛 Bug Report**: For reporting bugs and unexpected behavior
-- **🚀 Feature Request**: For suggesting new features or improvements
-
-You can also reach out for support in the `#sig-spyre` channel in the [vLLM Slack](https://inviter.co/vllm-slack) workspace.
-
-## Docs
-
-### Building the docs with MkDocs
-
-#### Install MkDocs and Plugins
-
-Install MkDocs along with the [plugins](https://github.com/torch-spyre/spyre-inference/blob/main/mkdocs.yaml) used in the Spyre Inference documentation.
+Follow the [Installation Guide](../getting_started/installation.md) to get the base package installed, then install the dev dependency group:
 
 ```bash
-uv pip install -r docs/requirements-docs.txt
+uv sync --group dev
 ```
 
-!!! note
-    Ensure that your Python version is compatible with the plugins (e.g., `mkdocs-awesome-nav` requires Python 3.10+)
+This includes `pytest`, `pyyaml`, and the `spyre-testing-plugin` for running the test suite.
 
-#### Start the Development Server
+### Linting
 
-MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it.
+When submitting a PR, please make sure your code passes all linting checks. We use prek with a .pre-commit-config.yaml file to run checks on every commit.
 
-Make sure you're in the same directory as the `mkdocs.yaml` configuration file in the `spyre-inference` repository, and then start the server by running the `mkdocs serve` command:
+The `format.sh` script will run prek from an isolated virtual environment using [uvx](https://docs.astral.sh/uv/guides/tools/). The only requirement is that you have `uv` installed.
 
-```bash
-mkdocs serve
+```sh
+bash format.sh
 ```
 
-Example output:
+Alternatively, you can [install prek](https://github.com/j178/prek?tab=readme-ov-file#installation) and set up a git hook to run it on every commit with:
 
-```console
-INFO    -  Documentation built in 106.83 seconds
-INFO    -  [22:02:02] Watching paths for changes: 'docs', 'mkdocs.yaml'
-INFO    -  [22:02:02] Serving on http://127.0.0.1:8000/
+```sh
+prek install
 ```
 
-#### View in Your Browser
-
-Open up [http://127.0.0.1:8000/](http://127.0.0.1:8000/) in your browser to see a live preview.
-
-#### Learn More
-
-For additional features and advanced configurations, refer to the official [MkDocs Documentation](https://www.mkdocs.org/).
-
-## Getting Started
-
-Check out the [Installation Guide](../getting_started/installation.md) for instructions on how to set up your development environment.
-
-## Testing
+### Testing
 
 The project includes both local tests (located in `spyre_inference/tests/`) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
 
-### Test Markers
+#### Test Markers
 
 The test suite uses pytest markers to categorize tests:
 
@@ -85,7 +57,7 @@ pytest -m upstream
 pytest -m "attention"
 ```
 
-### Upstream Test Integration
+#### Upstream Test Integration
 
 Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference` set automatically. See `tests/conftest.py` for implementation details.
 
@@ -96,7 +68,7 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
     rm -rf ~/.cache/vllm-upstream-tests
     ```
 
-### Configuration
+#### Configuration
 
 **SKIP_UPSTREAM_TESTS**: Skip upstream tests entirely. Accepts `1`, `true`, or `yes`.
 
@@ -109,23 +81,35 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
 !!! tip
     Environment variables can be passed directly to the `pytest` command, e.g. `VLLM_COMMIT=abc123def456 pytest`.
 
+### Docs
+
+Install MkDocs along with the [plugins](https://github.com/torch-spyre/spyre-inference/blob/main/mkdocs.yaml) used in the Spyre Inference documentation.
+
+```bash
+uv pip install -r docs/requirements-docs.txt
+```
+
+!!! note
+    Ensure that your Python version is compatible with the plugins (e.g., `mkdocs-awesome-nav` requires Python 3.10+)
+
+MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it. Make sure you're in the same directory as the `mkdocs.yaml` configuration file and run:
+
+```bash
+mkdocs serve
+```
+
+Open up [http://127.0.0.1:8000/](http://127.0.0.1:8000/) in your browser to see a live preview. For additional features and advanced configurations, refer to the official [MkDocs Documentation](https://www.mkdocs.org/).
+
+## Issues
+
+If you encounter a bug or have a feature request, please search [existing issues](https://github.com/torch-spyre/spyre-inference/issues?q=is%3Aissue) first to see if it has already been reported. If not, please create a new issue, by using our [issue templates](https://github.com/torch-spyre/spyre-inference/issues/new/choose):
+
+- **🐛 Bug Report**: For reporting bugs and unexpected behavior
+- **🚀 Feature Request**: For suggesting new features or improvements
+
+You can also reach out for support in the `#sig-spyre` channel in the [vLLM Slack](https://inviter.co/vllm-slack) workspace.
+
 ## Pull Requests
-
-### Linting
-
-When submitting a PR, please make sure your code passes all linting checks. We use prek with a .pre-commit-config.yaml file to run checks on every commit.
-
-The `format.sh` script will run prek from an isolated virtual environment using [uvx](https://docs.astral.sh/uv/guides/tools/). The only requirement is that you have `uv` installed.
-
-```sh
-bash format.sh
-```
-
-Alternatively, you can [install prek](https://github.com/j178/prek?tab=readme-ov-file#installation) and set up a git hook to run it on every commit with:
-
-```sh
-prek install
-```
 
 ### DCO and Signed-off-by
 

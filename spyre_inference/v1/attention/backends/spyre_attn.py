@@ -556,8 +556,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         Each k_page/v_page is [num_kv_heads, block_size, head_size] — a complete
         tensor on Spyre, passed to bmm directly without slicing.
 
-        Writes results directly into the output buffer (avoids torch.cat).
-        Returns the output tensor (may be a new tensor when using overwrite_f).
+        Writes results directly into the caller's output buffer in-place.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -621,10 +620,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result = result.transpose(1, 2).contiguous()
             seq_result = result[0, :query_len, :, :]
 
-            # Write into output buffer
+            # Write into output buffer.
+            # Compiled path: overwrite_f is functional (returns new tensor);
+            # the compiler's inplaceable_ops converts it to in-place overwrite.
+            # CPU path: plain copy_ — no dependency on spyre ops.
             if use_overwrite_f:
                 seq_result_dev = seq_result.contiguous().to(self._target_device)
-                # overwrite_f returns a new tensor (not in-place); rebind output
                 output = torch.ops.spyre.overwrite_f(
                     input=seq_result_dev,
                     output=output,

@@ -26,19 +26,14 @@ def spyre_rms_norm(
     epsilon: float,
     variance_size: int | None = None,  # noqa: ARG001 — required by IR schema
 ) -> torch.Tensor:
-    """Spyre IR provider for rms_norm.
+    """Spyre IR provider for rms_norm, adopted from vllm/ir/ops/layernorm.py
 
     Spyre-specific implementation details:
     - No dtype promotion: torch-spyre limitation, stays in input dtype.
     - variance_size: not supported; _supports_spyre rejects it so dispatch
       falls back to native.
     """
-    # Implementation adopted from vllm/ir/ops/layernorm.py
     orig_dtype = x.dtype
-
-    # Additional components in upstream vLLM
-    # x = x.to(torch.float32)
-    # x_var = x if variance_size is None else x[..., :variance_size]
 
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     x = x * torch.rsqrt(variance + epsilon)

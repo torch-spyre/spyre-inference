@@ -144,6 +144,7 @@ class TorchSpyrePlatform(CpuPlatform):
         return IrOpPriorityConfig.with_default(
             ["native"],
             rms_norm=["spyre", "native"],
+            # rms_norm=["native"],
         )
 
     @classmethod

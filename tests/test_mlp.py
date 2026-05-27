@@ -159,6 +159,51 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
 
 
 @pytest.mark.spyre
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Spyre cannot use a strided tensor as the source of an indexed scatter. "
+        "After qkv.split(), v is a strided view; Attention.forward() then calls "
+        "v.view(-1, num_kv_heads, head_size) which produces a non-contiguous 3D "
+        "tensor (strides [Q+2K, head_size, 1] instead of [K, head_size, 1]). "
+        "SpyreAttentionImpl._write_to_kv_cache then does "
+        "kv_cache[block_indices, 1, block_offsets] = value with that strided source. "
+        "SpyreQKVParallelLinear.forward() works around this with a D2H before "
+        "returning so the split and view run on CPU. "
+        "When this flips to passing, remove the D2H workaround from "
+        "SpyreQKVParallelLinear.forward()."
+    ),
+)
+def test_spyre_strided_scatter_source():
+    """Probe: Spyre accepts a non-contiguous tensor as a scatter-write source.
+
+    The failure path when D2H is removed from SpyreQKVParallelLinear:
+      1. qkv.split()        → strided 2D Spyre views
+      2. v.view(-1, H, D)   → non-contiguous 3D Spyre tensor (Attention.forward)
+      3. kv_cache[idx] = v  → scatter write with strided source (_write_to_kv_cache)
+    """
+    device = torch.device("spyre")
+    dtype = torch.float16
+    num_tokens = 16
+    num_heads, num_kv_heads, head_size = 8, 2, 64
+    q_size, kv_size = num_heads * head_size, num_kv_heads * head_size
+
+    qkv = torch.randn(num_tokens, q_size + 2 * kv_size, dtype=dtype, device=device)
+    _, _, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+    # Replicate what Attention.forward() does before calling impl.forward()
+    v = v.view(-1, num_kv_heads, head_size)
+
+    # Replicate _write_to_kv_cache's scatter write
+    num_blocks, block_size = 4, 8
+    kv_cache = torch.zeros(
+        num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+    )
+    block_indices = torch.zeros(num_tokens, dtype=torch.long, device=device)
+    block_offsets = torch.arange(num_tokens, dtype=torch.long, device=device) % block_size
+    kv_cache[block_indices, 1, block_offsets] = v
+
+
+@pytest.mark.spyre
 @pytest.mark.mlp
 def test_linear_oot_registration(tp_group):
     """Verify OOT class swaps for all three linear layer types."""

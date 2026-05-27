@@ -156,21 +156,6 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         dist.broadcast(input_, src=self.ranks[0], group=self.device_group)
         return input_
 
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # REPLACE-WITH-NATIVE: when libspyre_comms exposes the list-form
-        # SpyreCommsContext::allgather (and torch-spyre's spyreccl backend
-        # wires up `_allgather_base`), delete this override and let the
-        # base class use `dist.all_gather_into_tensor`.
-        if self.world_size == 1:
-            return input_
-        raise NotImplementedError(
-            _spyre_collective_unsupported_message(
-                "allgather",
-                self.world_size,
-                blocker="libspyre_comms list-form allgather + torch-spyre _allgather_base",
-            )
-        )
-
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor | None:
         # REPLACE-WITH-NATIVE: when libspyre_comms supports gather natively,
         # delete this override.

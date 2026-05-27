@@ -160,6 +160,146 @@ def probe_native_gather(device, device_group, world_size, rank):
             )
 
 
+def probe_merged_column_parallel_linear(device, device_group, world_size, rank):
+    """TP=N MergedColumnParallelLinear forward vs single-rank F.linear.
+    Constructs MergedColumnParallelLinear (OOT-swapped to SpyreMergedColumnParallelLinear),
+    loads each rank's output-dim shard from deterministic full weight, runs
+    forward, and asserts the result matches single-rank F.linear.
+
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
+    from spyre_inference.custom_ops.linear import SpyreMergedColumnParallelLinear
+    from spyre_inference.custom_ops.utils import convert
+
+    input_size = 512
+    output_size = 1024
+
+    layer = MergedColumnParallelLinear(
+        input_size,
+        [output_size],
+        bias=False,
+        params_dtype=torch.float16,
+        gather_output=False,
+    )
+    assert isinstance(layer, SpyreMergedColumnParallelLinear), type(layer)
+
+    torch.manual_seed(42)
+    full_weight = torch.randn(output_size, input_size, dtype=torch.float16) * 0.02
+
+    output_size_per_partition = output_size // world_size
+    start = rank * output_size_per_partition
+    end = (rank + 1) * output_size_per_partition
+    layer.weight.data.copy_(full_weight[start:end])
+    layer.to(device)
+
+    torch.manual_seed(7)
+    x = torch.randn(16, input_size, dtype=torch.float16)
+
+    out, bias = layer(convert(x, device=device))
+    out = convert(out, device="cpu")
+    expected_full = F.linear(x, full_weight)
+    expected = expected_full[:, start:end]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    dist.barrier(device_ids=[device.index])
+
+
+def probe_qkv_parallel_linear(device, device_group, world_size, rank):
+    """TP=N SpyreQKVParallelLinear forward vs single-rank F.linear.
+
+    Constructs QKVParallelLinear (OOT-swapped to SpyreQKVParallelLinear),
+    loads each rank's Q/K/V shard from deterministic full weight, runs
+    forward with gather_output=False, and asserts the result
+    matches single-rank F.linear.
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.linear import QKVParallelLinear
+
+    from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
+    from spyre_inference.custom_ops.utils import convert
+
+    hidden_size = 512
+    num_heads = 8
+    head_dim = 64
+    total_num_heads = num_heads  # total_num_heads = num_heads + 2 * num_kv_heads
+
+    layer = QKVParallelLinear(
+        hidden_size,
+        head_dim,
+        total_num_heads,
+        bias=False,
+        params_dtype=torch.float16,
+    )
+    assert isinstance(layer, SpyreQKVParallelLinear), type(layer)
+
+    actual_output_size = layer.weight.shape[0] * world_size
+
+    torch.manual_seed(43)
+    full_weight = torch.randn(actual_output_size, hidden_size, dtype=torch.float16) * 0.02
+
+    qkv_size_per_partition = actual_output_size // world_size
+    start = rank * qkv_size_per_partition
+    end = (rank + 1) * qkv_size_per_partition
+    layer.weight.data.copy_(full_weight[start:end])
+    layer.to(device)
+
+    torch.manual_seed(8)
+    x = torch.randn(16, hidden_size, dtype=torch.float16)
+
+    out, bias = layer(convert(x, device=device))
+    out = convert(out, device="cpu")
+    expected_full = F.linear(x, full_weight)
+    expected = expected_full[:, start:end]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    dist.barrier(device_ids=[device.index])
+
+
+def probe_row_parallel_linear(device, device_group, world_size, rank):
+    """TP=N SpyreRowParallelLinear forward vs single-rank F.linear.
+
+    Constructs RowParallelLinear (OOT-swapped to SpyreRowParallelLinear),
+    loads each rank's input-dim shard from deterministic full weight, runs
+    forward, and asserts the all-reduced result matches single-rank F.linear
+    (modulo float16 all_reduce noise).
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.linear import RowParallelLinear
+
+    from spyre_inference.custom_ops.linear import SpyreRowParallelLinear
+    from spyre_inference.custom_ops.utils import convert
+
+    input_size = 1024
+    output_size = 512
+
+    layer = RowParallelLinear(
+        input_size,
+        output_size,
+        bias=False,
+        params_dtype=torch.float16,
+    )
+    assert isinstance(layer, SpyreRowParallelLinear), type(layer)
+
+    torch.manual_seed(44)
+    full_weight = torch.randn(output_size, input_size, dtype=torch.float16) * 0.02
+
+    input_size_per_partition = input_size // world_size
+    start = rank * input_size_per_partition
+    end = (rank + 1) * input_size_per_partition
+    layer.weight.data.copy_(full_weight[:, start:end])
+    layer.to(device)
+
+    torch.manual_seed(9)
+    x_full = torch.randn(16, input_size, dtype=torch.float16)
+    x = x_full[:, start:end]
+
+    out, bias = layer(convert(x, device=device))
+    out = convert(out, device="cpu")
+    expected = F.linear(x_full, full_weight)
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    dist.barrier(device_ids=[device.index])
+
+
 PROBES = {
     "tp_all_reduce": probe_tp_all_reduce,
     "native_all_reduce": probe_native_all_reduce,
@@ -167,6 +307,9 @@ PROBES = {
     "native_all_gather_list": probe_native_all_gather_list,
     "native_gather": probe_native_gather,
     "vocab_parallel_embedding": probe_vocab_parallel_embedding,
+    "merged_column_parallel_linear": probe_merged_column_parallel_linear,
+    "qkv_parallel_linear": probe_qkv_parallel_linear,
+    "row_parallel_linear": probe_row_parallel_linear,
 }
 
 

@@ -148,8 +148,8 @@ def test_tp2_llm_generate_matches_tp1() -> None:
                 return i
         return min(len(a), len(b))
 
-    tp1 = run(1)
-    tp2 = run(2)
+    tp1 = run(tp=1)
+    tp2 = run(tp=2)
     for i, (a, b) in enumerate(zip(tp1, tp2)):
         n = _matching_prefix_len(a, b)
         assert n >= 2, (

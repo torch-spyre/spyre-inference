@@ -163,13 +163,7 @@ def ref_attn(
     "num_heads",
     [
         pytest.param((32, 8), id="GQA"),
-        pytest.param(
-            (32, 32),
-            id="MHA",
-            marks=pytest.mark.skip(
-                "Most MHA cases fail to compile, see https://github.com/torch-spyre/torch-spyre/issues/2195"
-            ),
-        ),
+        pytest.param((32, 32), id="MHA"),
         pytest.param((32, 1), id="MQA"),
     ],
 )

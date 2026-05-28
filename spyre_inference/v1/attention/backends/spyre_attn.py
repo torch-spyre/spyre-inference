@@ -61,12 +61,11 @@ def _overwrite(
     if output.device.type == "spyre":
         torch.ops.spyre.overwrite(input, output, dims, offsets)
     else:
-        # CPU fallback: use advanced indexing to copy the full input region
-        indices = [slice(None)] * output.ndim
-        for dim, offset in zip(dims, offsets):
-            size = input.shape[dim]
-            indices[dim] = slice(offset, offset + size)
-        output[tuple(indices)].copy_(input)
+        # intended behaviour on cpu
+        sliced_t = output
+        for i, dim in enumerate(dims):
+            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t.copy_(input)
 
 
 def _maybe_compile(fn):
@@ -105,19 +104,9 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
             block_offset = block_offsets[t]
             k_tok = key[t].unsqueeze(1)
             v_tok = value[t].unsqueeze(1)
-            _overwrite(
-                input=k_tok,
-                output=k_pages[block_idx],
-                dims=[1],
-                offsets=[block_offset],
-            )
-            _overwrite(
-                input=v_tok,
-                output=v_pages[block_idx],
-                dims=[1],
-                offsets=[block_offset],
-            )
-
+            _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
+            _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
+    
     return specialized_reshape_and_cache_kernel
 
 
@@ -622,21 +611,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Convert to output dtype and write into output buffer
             seq_result = convert(seq_result, self._target_device, output.dtype)
-            if output.device.type == "spyre":
-                # Spyre op expects size-1 in overwritten dims, loop over dim 0
-                for i in range(seq_result.shape[0]):
-                    _overwrite(
-                        input=seq_result[i : i + 1],
-                        output=output,
-                        dims=[0],
-                        offsets=[q_start + i],
-                    )
-            else:
-                _overwrite(
-                    input=seq_result,
-                    output=output,
-                    dims=[0],
-                    offsets=[q_start],
-                )
+            for i in range(seq_result.shape[0]):
+                _overwrite(seq_result[i : i + 1], output, [0], [q_start + i])
 
         return output

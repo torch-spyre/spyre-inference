@@ -85,16 +85,19 @@ def _indirect_matmul_mock(
         assert (isinstance(a, list) or address_of_a is None), "here needs to be true indirect access"
         assert (isinstance(b, list) or address_of_b is None), "here needs to be true indirect access"
     
+    # resolving indirect access
+    # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
+    # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_of_a is not None):
         # pytorch syntax is the same like for python lists here
         a = a[address_of_a]
         if transform_a:
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_of_b is not None):
-        # pytorch syntax is the same like for python lists here
         b = b[address_of_b]
         if transform_b:
             b = transform_b(b)
+    
     # do the actual matmul
     output = torch.matmul(a, b)
     return output

@@ -48,11 +48,6 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre":
         if not _spyre_available():
             pytest.skip("Spyre device not available")
-        if os.environ.get("SPYRE_USE_OVERWRITE_F") == "0":
-            pytest.skip("Spyre tests require SPYRE_USE_OVERWRITE_F=1")
-        monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "1")
-    else:
-        monkeypatch.setenv("SPYRE_USE_OVERWRITE_F", "0")
     envs.clear_env_cache()
     return device_mode
 
@@ -173,8 +168,8 @@ def ref_attn(
 @pytest.mark.parametrize(
     "configure_device",
     [
-        pytest.param("cpu", id="cpu"),
-        pytest.param("spyre", id="spyre"),
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
     ],
     indirect=True,
 )
@@ -241,6 +236,7 @@ def test_spyre_attn(
     num_blocks: int,
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
+    # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
     set_random_seed(0)
 
@@ -326,7 +322,7 @@ def test_spyre_attn(
         logits_soft_cap=soft_cap,
     )
 
-    output = torch.empty_like(query)
+    output = torch.empty_like(query).to(cache_device)
     kv_cache = (k_pages, v_pages)
     attn_impl.forward(
         layer=None,

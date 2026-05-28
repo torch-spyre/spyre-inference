@@ -16,16 +16,12 @@
 
 This backend implements attention using individual page tensors (one per KV block)
 and FlashAttention-style online softmax that iterates over pages. Each page is a
-complete tensor [num_kv_heads, block_size, head_size] on the Spyre device, passed
+complete tensor [num_kv_heads, block_size, head_size] on the target device, passed
 directly to bmm without any slicing.
-
-Required configuration:
-  - num_gpu_blocks_override must be set (e.g. 64)
-  - max_model_len <= num_gpu_blocks_override * block_size (e.g. 1024 with block_size=16)
 
 Architecture:
   - KV cache: two separate lists (k_pages, v_pages), managed by the model runner.
-  - reshape_and_cache: writes new K/V tokens into pages via overwrite_f (all on device).
+  - reshape_and_cache: writes new K/V tokens into pages via _overwrite (all on device).
   - Attention: online softmax iterating over pages — no gather/materialization step.
 """
 
@@ -61,27 +57,16 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place).
-
-    Uses torch.ops.spyre.overwrite on Spyre device, falls back to
-    standard slice assignment on CPU for testing without Spyre hardware.
-    """
+    """Write input into output at the specified position (in-place)."""
     if output.device.type == "spyre":
         torch.ops.spyre.overwrite(input, output, dims, offsets)
     else:
-        # CPU fallback: use slice assignment
-        if len(dims) == 1 and dims[0] == 0:
-            # Writing along first dimension at offset
-            offset = offsets[0]
-            size = input.shape[0]
-            output[offset:offset + size].copy_(input)
-        elif len(dims) == 1 and dims[0] == 1:
-            # Writing along second dimension at offset
-            offset = offsets[0]
-            output[:, offset:offset + input.shape[1]].copy_(input)
-        else:
-            raise NotImplementedError(
-                f"CPU fallback for dims={dims}, offsets={offsets} not implemented")
+        # CPU fallback: use advanced indexing to copy the full input region
+        indices = [slice(None)] * output.ndim
+        for dim, offset in zip(dims, offsets):
+            size = input.shape[dim]
+            indices[dim] = slice(offset, offset + size)
+        output[tuple(indices)].copy_(input)
 
 
 def _maybe_compile(fn):
@@ -113,7 +98,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     Dynamo unrolls the loop because num_tokens is a closure constant.
     """
 
-    def fn(key, value, k_pages, v_pages, block_indices, block_offsets):
+    def specialized_reshape_and_cache_kernel(key, value, k_pages, v_pages, block_indices, block_offsets):
+        # this kernels specializes (i.e. compiles for specific constants) for num_tokens
         for t in range(num_tokens):
             block_idx = block_indices[t]
             block_offset = block_offsets[t]
@@ -132,7 +118,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
                 offsets=[block_offset],
             )
 
-    return fn
+    return specialized_reshape_and_cache_kernel
 
 
 def _create_compilable_page_attn(num_blocks: int):
@@ -141,7 +127,8 @@ def _create_compilable_page_attn(num_blocks: int):
     Dynamo unrolls the loop because num_blocks is a closure constant.
     """
 
-    def fn(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+        # this kernels specializes (i.e. compiles for specific constants) for num_blocks
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -176,7 +163,7 @@ def _create_compilable_page_attn(num_blocks: int):
 
         return tile_output / tile_sum
 
-    return fn
+    return specialized_paged_attn_kernel
 
 
 @dataclass
@@ -264,11 +251,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         q_pos = torch.arange(max_query_len, device=device)
         kv_pos = torch.arange(aligned_max_seq_len, device=device)
 
+        # Padding mask: valid positions are within actual sequence/query lengths
         q_valid = q_pos.unsqueeze(0) < query_lens.unsqueeze(1)
         kv_valid = kv_pos.unsqueeze(0) < seq_lens.unsqueeze(1)
-
         attend = q_valid.unsqueeze(2) & kv_valid.unsqueeze(1)
 
+        # Causal mask: prevent attending to future tokens during generation
         if apply_causal_mask:
             context_lens = seq_lens - query_lens
             causal_limit = (context_lens.unsqueeze(1) + q_pos.unsqueeze(0)).unsqueeze(2)
@@ -276,6 +264,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             causal_ok = kv_pos_exp <= causal_limit
             attend = attend & causal_ok
 
+        # Convert to additive mask: -65504 for masked, 0 for valid (float16 min)
         mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
 
         if padded_query_len > max_query_len:
@@ -331,8 +320,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             torch.device("cpu"),
         )
 
-        # Pre-tile the mask: split into per-sequence, per-block tiles and upload
-        # each as a separate contiguous tensor (avoids narrowed-view slicing on Spyre)
+        # Pre-tile the mask: split into per-sequence, per-block tiles.
+        # This handles partial final pages (padding mask) and per-page attention.
         num_seqs = common_attn_metadata.num_reqs
         num_kv_heads = self.num_kv_heads
         block_size = self.block_size
@@ -414,7 +403,11 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # TODO this should be:
+        #     return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        # but for the lists it is actually
+        return [(num_blocks, block_size, num_kv_heads, head_size), 
+                (num_blocks, block_size, num_kv_heads, head_size)]
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
@@ -590,6 +583,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         for seq_idx in range(num_seqs):
+            # This is the most-naive possible implementation: no parallelization over sequences or GQA optimizaiton
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start
@@ -613,7 +607,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            mask_tiles = mask_tiles_all[seq_idx]
+            mask_tiles = [m.to(self._target_device) for m in mask_tiles_all[seq_idx]]
 
             # Run attention on target device
             q_dev = convert(q, self._target_device, self._target_dtype)
@@ -628,11 +622,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Convert to output dtype and write into output buffer
             seq_result = convert(seq_result, self._target_device, output.dtype)
-            _overwrite(
-                input=seq_result,
-                output=output,
-                dims=[0],
-                offsets=[q_start],
-            )
+            if output.device.type == "spyre":
+                # Spyre op expects size-1 in overwritten dims, loop over dim 0
+                for i in range(seq_result.shape[0]):
+                    _overwrite(
+                        input=seq_result[i : i + 1],
+                        output=output,
+                        dims=[0],
+                        offsets=[q_start + i],
+                    )
+            else:
+                _overwrite(
+                    input=seq_result,
+                    output=output,
+                    dims=[0],
+                    offsets=[q_start],
+                )
 
         return output

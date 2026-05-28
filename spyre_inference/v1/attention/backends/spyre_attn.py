@@ -26,7 +26,7 @@ Architecture:
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, Callable
 
 import torch
 
@@ -66,6 +66,38 @@ def _overwrite(
         for i, dim in enumerate(dims):
             sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
         sliced_t.copy_(input)
+
+
+def _indirect_matmul_mock(
+        a: torch.Tensor | list[torch.Tensor],
+        address_of_a: int | torch.Tensor | None,
+        b: torch.Tensor | list[torch.Tensor],
+        address_of_b: int | torch.Tensor | None,
+        # we need the option to transform a and/or b, after the indirect access
+        transform_a: Callable | None = None,
+        transform_b: Callable | None = None,
+) -> torch.Tensor:
+    """mock implementation for custom indirect matmul"""
+    current_device = a[0].device.type  # works with tensors and lists (?)
+    if current_device == "spyre":
+        # constriants for now -> this should change with true indirect access
+        # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
+        assert (isinstance(a, list) or address_of_a is None), "here needs to be true indirect access"
+        assert (isinstance(b, list) or address_of_b is None), "here needs to be true indirect access"
+    
+    if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_of_a is not None):
+        # pytorch syntax is the same like for python lists here
+        a = a[address_of_a]
+        if transform_a:
+            a = transform_a(a)
+    if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_of_b is not None):
+        # pytorch syntax is the same like for python lists here
+        b = b[address_of_b]
+        if transform_b:
+            b = transform_b(b)
+    # do the actual matmul
+    output = torch.matmul(a, b)
+    return output
 
 
 def _maybe_compile(fn):
@@ -117,28 +149,41 @@ def _create_compilable_page_attn(num_blocks: int):
     """
 
     def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
-        # this kernels specializes (i.e. compiles for specific constants) for num_blocks
+        """
+        This kernels specializes (i.e. compiles for specific constants) for num_blocks
+        expected shapes:
+         k_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
+         v_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
+         page_indicies: [num_blocks]
+         mask_tiles: [num_blocks]
+        """
+
         tile_max = None
         tile_sum = None
         tile_output = None
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            k_page = k_pages[page_idx]
-            v_page = v_pages[page_idx]
-            k_page_4d = k_page.unsqueeze(1)
-            v_page_4d = v_page.unsqueeze(1)
+            # this would be the syntax with views and indirect access (i.e. instead of _indirect_matmul_mock)
+            # k_page = k_pages[page_idx]
+            # v_page = v_pages[page_idx]
+            # k_page_4d = k_page.unsqueeze(1)
+            # v_page_4d = v_page.unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
-            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            # NOTE: for true "varlen" layout, q would be an indirect access too (avoided here for simplicity...)
+            scores = _indirect_matmul_mock(q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1))
+            scores *= scale
             scores = scores + mask_tile
             scores_max = scores.max(dim=-1, keepdim=True)[0]
 
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                tile_output = torch.matmul(tile_probs, v_page_4d)
+                # tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_output = _indirect_matmul_mock(tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1))
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 new_max = torch.maximum(tile_max, scores_max)
@@ -146,7 +191,8 @@ def _create_compilable_page_attn(num_blocks: int):
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+                tile_output += _indirect_matmul_mock(tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1))
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 

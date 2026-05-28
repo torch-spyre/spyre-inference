@@ -140,7 +140,7 @@ def test_fake_tp2_forward_matches_reference(
 #
 # A 0-D tensor workaround compiles but produces silently-wrong values, so
 # CPU bounce is the only correct path today. This tripwire is
-# xfail(strict=True): when it flips to passing, delete the custom 
+# xfail(strict=True): when it flips to passing, delete the custom
 # SpyreVocabParallelEmbedding and check that the upstream code correctly runs
 # on TP > 1.
 

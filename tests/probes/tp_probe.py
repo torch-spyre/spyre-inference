@@ -115,7 +115,9 @@ def probe_vocab_parallel_embedding(device, device_group, world_size, rank):
     embedding_dim = 64
 
     layer = VocabParallelEmbedding(
-        vocab_size, embedding_dim, params_dtype=torch.float16,
+        vocab_size,
+        embedding_dim,
+        params_dtype=torch.float16,
     )
     assert isinstance(layer, SpyreVocabParallelEmbedding), type(layer)
     assert layer.tp_size == world_size, layer.tp_size
@@ -124,9 +126,7 @@ def probe_vocab_parallel_embedding(device, device_group, world_size, rank):
     # populates its shard from the same source — keeps the assertion
     # below independent of weight initialization.
     torch.manual_seed(42)
-    full_weight = (
-        torch.randn(vocab_size, embedding_dim, dtype=torch.float16) * 0.02
-    )
+    full_weight = torch.randn(vocab_size, embedding_dim, dtype=torch.float16) * 0.02
 
     start = layer.shard_indices.org_vocab_start_index
     end = layer.shard_indices.org_vocab_end_index
@@ -139,9 +139,7 @@ def probe_vocab_parallel_embedding(device, device_group, world_size, rank):
 
     out = layer(input_ids.to(device)).cpu()
     expected = F.embedding(input_ids, full_weight)
-    torch.testing.assert_close(
-        out.float(), expected.float(), atol=1e-3, rtol=1e-3
-    )
+    torch.testing.assert_close(out.float(), expected.float(), atol=1e-3, rtol=1e-3)
     dist.barrier(device_ids=[device.index])
 
 

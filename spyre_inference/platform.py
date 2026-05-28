@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import sys
-from typing import TYPE_CHECKING
-from string import Template
-import multiprocessing
 import importlib.metadata
+import multiprocessing
+import os
+import sys
+from string import Template
+from typing import TYPE_CHECKING
+
+import torch
 
 from spyre_inference import envs
 
@@ -193,6 +195,18 @@ class TorchSpyrePlatform(CpuPlatform):
         # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
+
+        # CPUWorker derives its KV-cache budget from host RAM, but on Spyre
+        # the cache lives on-device — the host-RAM math is meaningless and
+        # `gpu_memory_utilization * total_RAM` typically exceeds available
+        # RAM on Spyre boxes, tripping CPUWorker.__init__'s preflight check.
+        # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
+        # populate `cache_config.kv_cache_memory_bytes` below, which both
+        # bypasses the preflight check and short-circuits the host-RSS math
+        # in CPUWorker.determine_available_memory. Skip when the user has
+        # explicitly supplied --kv-cache-memory-bytes so we don't clobber it.
+        if vllm_config.cache_config.kv_cache_memory_bytes is None:
+            os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)

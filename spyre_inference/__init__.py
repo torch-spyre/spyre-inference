@@ -14,8 +14,16 @@
 
 import importlib.metadata
 import json
+import os
 from logging.config import dictConfig
 from typing import Any
+
+# Defer torch_spyre's autoload until we explicitly trigger it inside
+# `TorchSpyreWorker.init_device`. Autoload loads `libspyre_comms.so`,
+# which captures `RANK`/`WORLD_SIZE`/`LOCAL_RANK`/`LOCAL_WORLD_SIZE`
+# at dlopen time — those env vars are only known per-worker, so the
+# library can't load before init_device runs.
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
 from vllm.logger import DEFAULT_LOGGING_CONFIG

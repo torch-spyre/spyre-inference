@@ -18,21 +18,19 @@ import os
 
 import torch
 
-# `import torch_spyre` triggers the autoload that calls
-# `torch.utils.rename_privateuse1_backend("spyre")`, registers the
-# `spyre` device module, and registers the `spyreccl` distributed
-# backend with torch.distributed. This must run before vllm's
-# `init_distributed_environment` calls `dist.is_backend_available` /
-# `dist.init_process_group` with the platform's
-# `dist_backend = "cpu:gloo,spyre:spyreccl"` string. The
-# `# noqa: F401` is intentional — we only import for the side effect.
-import torch_spyre  # noqa: F401
+# `import torch_spyre` is intentionally deferred to inside `init_device`.
+# Importing it loads `libspyre_comms.so`, which captures
+# `RANK` / `WORLD_SIZE` / `LOCAL_RANK` / `LOCAL_WORLD_SIZE` via
+# `std::getenv` at dlopen time and caches them. Those env vars are only
+# known per-worker, so they must be populated before the C library
+# loads. `spyre_inference/__init__.py` sets
+# `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
+# autoload doesn't trigger the load at `import torch` time.
 
-from vllm.config import VllmConfig
+import vllm.v1.worker.cpu_worker as cpu_worker_module
 from vllm.logger import init_logger
 from vllm.v1.worker.cpu_worker import CPUWorker
 from vllm.v1.worker.worker_base import CompilationTimes
-import vllm.v1.worker.cpu_worker as cpu_worker_module
 
 from spyre_inference.custom_ops import register_all
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
@@ -47,56 +45,35 @@ class TorchSpyreWorker(CPUWorker):
     - Create a TorchSpyreModelRunner with torch.device("spyre")
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        local_rank: int,
-        rank: int,
-        distributed_init_method: str,
-        is_driver_worker: bool = False,
-    ) -> None:
-        super().__init__(
-            vllm_config,
-            local_rank,
-            rank,
-            distributed_init_method,
-            is_driver_worker,
-        )
-
-        # Register all the custom ops here when a worker is created.
-        # This has to happen before the model is loaded, so that all the
-        # layers will be swapped out with the custom implementations for spyre.
-        register_all()
-
     def init_device(self) -> None:
-        # Pin this worker process to its assigned Spyre card before any
-        # Spyre runtime / spyreccl backend construction occurs. The
-        # spyreccl backend creator (in torch_spyre/__init__.py) calls
-        # `torch.spyre._impl._lazy_init()` against `current_device()`,
-        # so this must happen before `super().init_device()` runs the
-        # `dist.init_process_group(...)` that materializes spyreccl.
-        torch.spyre.set_device(self.local_rank)
-
-        # `libspyre_comms.so::SpyreDeviceInfo` reads RANK / WORLD_SIZE /
-        # LOCAL_RANK / LOCAL_WORLD_SIZE from the environment when the
-        # spyreccl backend is constructed and throws
-        # `EnvironmentVariableException` if any are unset. vllm's
-        # MultiprocExecutor uses TCP-based init (`tcp://...`) and does
-        # NOT set those env vars, so we populate them here before
-        # `super().init_device()` runs init_process_group. When the
-        # worker is launched via torchrun the env vars are already set
-        # and `setdefault` leaves them alone.
-        #
+        # Populate the env vars that `libspyre_comms.so` reads at dlopen
+        # time. `setdefault` leaves torchrun-supplied values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
-        # so parallel_config.world_size (TP*PP*PCP) is the global rank
-        # count here, and on a single node LOCAL_WORLD_SIZE == WORLD_SIZE.
-        # Once multi-node TP is supported, derive LOCAL_WORLD_SIZE from
-        # the node-local rank count.
+        # so parallel_config.world_size is the global rank count and
+        # LOCAL_WORLD_SIZE == WORLD_SIZE on a single node. Revisit once
+        # multi-node TP is supported.
         world_size = self.vllm_config.parallel_config.world_size
         os.environ.setdefault("RANK", str(self.rank))
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
+
+        # Trigger torch_spyre's autoload manually now that the env vars
+        # are set. Autoload registers the `spyre` device and the
+        # `spyreccl` distributed backend, and imports
+        # `torch_spyre._C` (which loads `libspyre_comms.so`).
+        import torch_spyre
+
+        torch_spyre._autoload()
+
+        # Pin this worker to its assigned card before the spyreccl
+        # backend is constructed in `init_process_group`.
+        torch.spyre.set_device(self.local_rank)
+
+        # Register all the custom ops here when a worker is created.
+        # This has to happen before the model is loaded, so that all the
+        # layers will be swapped out with the custom implementations for spyre.
+        register_all()
 
         # Patch the CPUModelRunner with the TorchSpyreModelRunner.
         # We pass the unindexed `torch.device("spyre")` because the
@@ -109,11 +86,6 @@ class TorchSpyreWorker(CPUWorker):
             torch.device("spyre"),
         )
         try:
-            # Invoke the upstream init_device method with the
-            # CPUModelRunner patched. This wires up the distributed
-            # environment via vllm's init_worker_distributed_environment,
-            # which uses TorchSpyrePlatform.dist_backend
-            # ("cpu:gloo,spyre:spyreccl") to build the world / TP groups.
             super().init_device()
         finally:
             cpu_worker_module.CPUModelRunner = original
@@ -121,6 +93,8 @@ class TorchSpyreWorker(CPUWorker):
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420
         # Ensure registration of Spyre decompositions before FX Graph tracing
+        import time
+
         import torch._inductor.decomposition
         from torch_spyre._inductor.decompositions import spyre_decompositions  # ty: ignore[unresolved-import]
 
@@ -130,7 +104,6 @@ class TorchSpyreWorker(CPUWorker):
                     "FIXME: Adding %s decomposition to work-around torch-spyre crash", op.name()
                 )
                 torch._inductor.decomposition.decompositions[op] = impl
-        import time
 
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()

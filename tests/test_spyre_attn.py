@@ -287,15 +287,17 @@ def test_spyre_attn(
         logits_soft_cap=soft_cap,
     )
 
-    output = torch.empty_like(query)
+    query_spyre = query.clone().to("spyre")
+    key_spyre = key.clone().to("spyre")
+    output_spyre = torch.empty_like(query_spyre)
     attn_impl.forward(
         layer=None,
-        query=query,
-        key=key,
+        query=query_spyre,
+        key=key_spyre,
         value=value,
         kv_cache=kv_cache,
         attn_metadata=attn_metadata,
-        output=output,
+        output=output_spyre,
     )
 
     ref_output = ref_attn(
@@ -315,4 +317,4 @@ def test_spyre_attn(
     else:
         atol, rtol = 0.2, 0.2
 
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(output_spyre.to("cpu"), ref_output, atol=atol, rtol=rtol)

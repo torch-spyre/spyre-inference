@@ -111,16 +111,20 @@ def _indirect_matmul_mock(
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
-        if isinstance(address_or_index_of_a, torch.Tensor)
-            assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
+        if isinstance(address_or_index_of_a, torch.Tensor):
+            assert len(address_or_index_of_a) == 1, (
+                "for now, we support only one page at a time"
+            )
             address_or_index_of_a = address_or_index_of_a.item()
         # pytorch syntax is the same like for python lists here
         a = a[address_or_index_of_a]
         if transform_a:
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
-        if isinstance(address_or_index_of_b, torch.Tensor)
-            assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
+        if isinstance(address_or_index_of_b, torch.Tensor):
+            assert len(address_or_index_of_b) == 1, (
+                "for now, we support only one page at a time"
+            )
             address_or_index_of_b = address_or_index_of_b.item()
         b = b[address_or_index_of_b]
         if transform_b:
@@ -183,12 +187,13 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
 
     def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
         """
-        This kernels specializes (i.e. compiles for specific constants) for num_blocks and padded_query_len
-        expected shapes:
-         k_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
-         v_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
-         page_indicies: [num_blocks]
-         mask_tiles: [num_blocks]
+        This kernels specializes for num_blocks and padded_query_len.
+
+        Expected shapes:
+            k_pages: list of [num_kv_heads, block_size, head_size]
+            v_pages: list of [num_kv_heads, block_size, head_size]
+            page_indices: [num_blocks]
+            mask_tiles: [num_blocks]
         """
 
         tile_max = None
@@ -425,7 +430,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len_s, col_start:col_end]
                 # Sanity check: ensure tile has correct shape
                 assert tile.shape[2] == padded_query_len_s, (
-                    f"Tile shape mismatch: expected query dim {padded_query_len_s}, got {tile.shape[2]}"
+                    f"Tile shape mismatch: expected {padded_query_len_s}, "
+                    f"got {tile.shape[2]}"
                 )
                 seq_tiles.append(tile.contiguous().to(self.device))
             attention_mask_tiles.append(seq_tiles)

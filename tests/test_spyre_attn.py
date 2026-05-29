@@ -53,6 +53,7 @@ def configure_device(request, monkeypatch):
 @pytest.fixture()
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
+    import torch
     from vllm.config.compilation import CompilationMode
     from vllm.config import get_cached_compilation_config
 
@@ -61,9 +62,19 @@ def configure_compilation(request, monkeypatch):
     
     cfg = get_cached_compilation_config()
     original_mode = cfg.mode
+    original_limit = cfg.accumulated_recompile_limit
+    
     cfg.mode = compilation_mode
+    # Increase recompilation limit to handle list-based page_indices
+    # which trigger recompilation on each unique block index value
+    cfg.accumulated_recompile_limit = 1024
+    
     yield mode_name
+    
+    # Cleanup: reset mode and limits
     cfg.mode = original_mode
+    cfg.accumulated_recompile_limit = original_limit
+    torch._dynamo.reset()
 
 
 def _build_metadata(

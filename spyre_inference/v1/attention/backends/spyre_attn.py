@@ -24,11 +24,6 @@ from typing import ClassVar
 import torch
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention.backends.spyre_attn_utils import (
-    _attn_4d,
-    _maybe_compile,
-    copy_attn_output,
-)
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -54,6 +49,42 @@ KV_LENGTH_ALIGNMENT = 256
 
 # Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
 QUERY_CHUNK_SIZE = 32
+
+
+def _maybe_compile(fn):
+    """Compile fn unless vLLM's compilation config disables it.
+
+    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
+    inheritance: returns fn unchanged when compilation mode is NONE or the
+    backend is "eager", otherwise wraps it with torch.compile.
+    """
+    from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
+
+    cfg = get_cached_compilation_config()
+    if cfg.mode == CompilationMode.NONE:
+        return fn
+    if cfg.backend == "eager":
+        return fn
+    return torch.compile(fn, dynamic=False)
+
+
+def _attn_4d(q, k, v, scale, mask):
+    scores = q @ k.transpose(-2, -1)
+    scores = scores * scale
+    scores = scores + mask
+    p = scores.softmax(dim=-1)
+    return p @ v
+
+
+def copy_attn_output(attn_output, num_actual_tokens, output):
+    """Place `attn_output[:num_actual_tokens]` into the caller-provided `output` buffer."""
+    if output.device.type == "spyre":
+        attn_output_spyre = convert(attn_output, "spyre", output.dtype)
+        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])
+    else:
+        output[:num_actual_tokens].copy_(attn_output)
+    return output
 
 
 @dataclass

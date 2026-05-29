@@ -111,11 +111,17 @@ def _indirect_matmul_mock(
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
+        if isinstance(address_or_index_of_a, torch.Tensor)
+            assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
+            address_or_index_of_a = address_or_index_of_a.item()
         # pytorch syntax is the same like for python lists here
         a = a[address_or_index_of_a]
         if transform_a:
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
+        if isinstance(address_or_index_of_b, torch.Tensor)
+            assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
+            address_or_index_of_b = address_or_index_of_b.item()
         b = b[address_or_index_of_b]
         if transform_b:
             b = transform_b(b)

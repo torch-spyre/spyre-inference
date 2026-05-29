@@ -169,15 +169,15 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     return specialized_reshape_and_cache_kernel
 
 
-def _create_compilable_page_attn(num_blocks: int):
+def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks is a closure constant.
+    Dynamo unrolls the loop because num_blocks and padded_query_len are closure constants.
     """
 
     def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
         """
-        This kernels specializes (i.e. compiles for specific constants) for num_blocks
+        This kernels specializes (i.e. compiles for specific constants) for num_blocks and padded_query_len
         expected shapes:
          k_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
          v_pages: [num_blocks, num_kv_heads, block_size, head_size] (first dimension is a list)
@@ -266,6 +266,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Each tile: [num_kv_heads, 1, padded_query_len, block_size] on target device
     attention_mask_tiles: list[list[torch.Tensor]] | None = None
 
+    # Per-sequence padded query length for stable kernel compilation
+    padded_query_lens: torch.Tensor | None = None  # [num_seqs] on CPU
+
     aligned_max_seq_len: int = 0
 
     @property
@@ -305,18 +308,24 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         max_query_len: int,
         aligned_max_seq_len: int,
         device: torch.device,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Build additive attention mask on Spyre.
 
-        Returns: [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
+        Returns:
+            - mask_4d: [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
+            - padded_query_lens: [num_seqs] per-sequence padded query lengths
         """
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         num_seqs = len(seq_lens)
         num_kv_heads = self.num_kv_heads
 
-        padded_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
+        # Compute per-sequence padded query length
+        padded_query_lens = (
+            (query_lens + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
+        )  # [num_seqs]
+
+        # Use global max for mask tensor allocation
+        padded_query_len = int(padded_query_lens.max().item())
 
         q_pos = torch.arange(max_query_len, device=device)
         kv_pos = torch.arange(aligned_max_seq_len, device=device)
@@ -360,7 +369,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             .contiguous()
         )
 
-        return mask_4d
+        return mask_4d, padded_query_lens
 
     def build(
         self,
@@ -381,7 +390,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
-        mask_4d_cpu = self._build_attention_mask(
+        mask_4d_cpu, padded_query_lens = self._build_attention_mask(
             seq_lens,
             query_start_loc,
             apply_causal_mask,
@@ -395,9 +404,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_seqs = common_attn_metadata.num_reqs
         num_kv_heads = self.num_kv_heads
         block_size = self.block_size
-        padded_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
         attention_mask_tiles: list[list[torch.Tensor]] = []
         for s in range(num_seqs):
             seq_tiles: list[torch.Tensor] = []
@@ -405,10 +411,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             row_end = row_start + num_kv_heads
             kv_len_s = int(seq_lens[s].item())
             num_blocks_s = (kv_len_s + block_size - 1) // block_size
+            # Use per-sequence padded query length for mask tile slicing
+            padded_query_len_s = int(padded_query_lens[s].item())
             for b in range(num_blocks_s):
                 col_start = b * block_size
                 col_end = col_start + block_size
-                tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len, col_start:col_end]
+                tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len_s, col_start:col_end]
+                # Sanity check: ensure tile has correct shape
+                assert tile.shape[2] == padded_query_len_s, (
+                    f"Tile shape mismatch: expected query dim {padded_query_len_s}, got {tile.shape[2]}"
+                )
                 seq_tiles.append(tile.contiguous().to(self.device))
             attention_mask_tiles.append(seq_tiles)
 
@@ -417,6 +429,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         slot_block_indices = (sm_cpu // self.block_size).tolist()
         slot_block_offsets = (sm_cpu % self.block_size).tolist()
 
+        # NOTE: since the outer loop of the paged attention implementaiton
+        #  runs on the CPU (list-based), most meta-data also remains on CPU
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_seqs=common_attn_metadata.num_reqs,
@@ -433,6 +447,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             attention_mask_tiles=attention_mask_tiles,
+            padded_query_lens=padded_query_lens,
             aligned_max_seq_len=aligned_max_seq_len,
         )
 
@@ -546,10 +561,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._reshape_fns[num_tokens]
 
-    def _get_attn_fn(self, num_blocks: int):
-        if num_blocks not in self._attn_fns:
-            self._attn_fns[num_blocks] = _maybe_compile(_create_compilable_page_attn(num_blocks))
-        return self._attn_fns[num_blocks]
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+        key = (num_blocks, padded_query_len)
+        if key not in self._attn_fns:
+            self._attn_fns[key] = _maybe_compile(
+                _create_compilable_page_attn(num_blocks, padded_query_len)
+            )
+        return self._attn_fns[key]
 
     def forward(
         self,
@@ -647,12 +665,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
-
-        # Global padded query length — must match what the mask tiles were built with
-        max_query_len = attn_metadata.max_query_len
-        padded_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
+        padded_query_lens = attn_metadata.padded_query_lens  # [num_seqs]
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -662,9 +675,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
+            # Use per-sequence padded query length
+            padded_query_len = int(padded_query_lens[seq_idx].item())
+
             q_seq = query[q_start:q_end]
 
-            # Pad query to global padded_query_len (mask tiles share this dimension)
+            # Pad query to per-sequence padded_query_len
             if padded_query_len > query_len:
                 q_seq = torch.nn.functional.pad(
                     q_seq,
@@ -684,7 +700,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Run attention on target device
             q_dev = convert(q, self._target_device, self._target_dtype)
-            attn_fn = self._get_attn_fn(num_blocks_needed)
+            attn_fn = self._get_attn_fn(num_blocks_needed, padded_query_len)
             result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]

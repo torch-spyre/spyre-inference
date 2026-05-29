@@ -191,7 +191,8 @@ def _create_compilable_page_attn(num_blocks: int):
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            # this would be the syntax with views and indirect access (i.e. instead of _indirect_matmul_mock)
+            # Syntax with views and indirect access
+            # (i.e. instead of _indirect_matmul_mock)
             # k_page = k_pages[page_idx]
             # v_page = v_pages[page_idx]
             # k_page_4d = k_page.unsqueeze(1)
@@ -200,7 +201,8 @@ def _create_compilable_page_attn(num_blocks: int):
             mask_tile = mask_tiles[i]
 
             # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            # NOTE: for true "varlen" layout, q would be an indirect access too (avoided here for simplicity...)
+            # NOTE: for true "varlen" layout, q would be
+            # an indirect access too (avoided here for simplicity...)
             scores = _indirect_matmul_mock(
                 q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
             )
@@ -653,7 +655,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         for seq_idx in range(num_seqs):
-            # This is the most-naive possible implementation: no parallelization over sequences or GQA optimizaiton
+            # Most-naive implementation: no parallelization
+            # over sequences or GQA optimization
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start

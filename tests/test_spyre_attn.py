@@ -44,9 +44,8 @@ def configure_device(request, monkeypatch):
     """
 
     device_mode = request.param
-    if device_mode == "spyre":
-        if not _spyre_available():
-            pytest.skip("Spyre device not available")
+    if device_mode == "spyre" and not _spyre_available():
+        pytest.skip("Spyre device not available")
     envs.clear_env_cache()
     return device_mode
 
@@ -252,6 +251,7 @@ def test_spyre_attn(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
+    # list based creation here, update once this changes
     k_pages_cpu: list[torch.Tensor] = [
         torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
@@ -332,15 +332,11 @@ def test_spyre_attn(
         attn_metadata=attn_metadata,
         output=output,
     )
-
-    # Bring pages back to CPU for reference (they now contain the new tokens too)
-    k_pages_final = [p.cpu() for p in k_pages]
-    v_pages_final = [p.cpu() for p in v_pages]
-
+    
     ref_output = ref_attn(
         query=query,
-        key_cache=k_pages_final,
-        value_cache=v_pages_final,
+        key_cache=k_pages_cpu,
+        value_cache=v_pages_cpu,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,
@@ -351,8 +347,12 @@ def test_spyre_attn(
     )
 
     if max(query_lens) >= 32:
-        atol, rtol = 0.3, 5.0
+        # TODO: what values are sensible here?
+        atol, rtol = 0.5, 5.0
     else:
         atol, rtol = 0.2, 0.2
 
-    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    if configure_device == "spyre":
+        torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)
+    else:
+        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)

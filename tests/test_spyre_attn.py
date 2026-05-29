@@ -42,7 +42,6 @@ def configure_device(request, monkeypatch):
     The spyre card check is done lazily here (not at import time) to avoid
     claiming the device before subprocess-based tests have a chance to run.
     """
-    import os
 
     device_mode = request.param
     if device_mode == "spyre":

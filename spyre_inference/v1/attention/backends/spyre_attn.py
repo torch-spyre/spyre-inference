@@ -31,7 +31,6 @@ from typing import ClassVar, Callable
 import torch
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference import envs
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -69,35 +68,58 @@ def _overwrite(
 
 
 def _indirect_matmul_mock(
-        a: torch.Tensor | list[torch.Tensor],
-        address_of_a: int | torch.Tensor | None,
-        b: torch.Tensor | list[torch.Tensor],
-        address_of_b: int | torch.Tensor | None,
-        # we need the option to transform a and/or b, after the indirect access
-        transform_a: Callable | None = None,
-        transform_b: Callable | None = None,
+    a: torch.Tensor | list[torch.Tensor],
+    address_or_index_of_a: int | torch.Tensor | None,
+    b: torch.Tensor | list[torch.Tensor],
+    address_or_index_of_b: int | torch.Tensor | None,
+    # we need the option to transform a and/or b, after the indirect access
+    transform_a: Callable | None = None,
+    transform_b: Callable | None = None,
 ) -> torch.Tensor:
-    """mock implementation for custom indirect matmul"""
+    """mock implementation for custom indirect matmul
+
+    address_or_index_of_ : this can be both: index if running on the CPU or if
+                           the outer-dimension of the tensors are lists. Or then
+                           absolute addresses if it is supported on Spyre.
+                           The semantic is always to access ONE slice of the outer-most
+                           dimension: I.e. if we have a 2D tensor like [8, 32, 32], then
+                           the address_or_index_of would access the first dimension here
+                           (which has the size of 8) and return one element of shape
+                           [1, 32, 32]. Same example for a 3D tensor: if tensor a
+                           would be e.g. [8, 32, 8, 128], and the
+                           address_or_index_of_a is 5, then this matmul would
+                           access the 5th slice of Tensor a and return a slice of
+                           shape [1, 32, 8, 128].
+
+    transform_ : This is a torch-compilable function to transform (e.g.
+                 transpose/rotate) the tensor-slice after it was loaded via
+                 the indirect access before the matmul happens.
+
+    """
     current_device = a[0].device.type  # works with tensors and lists (?)
     if current_device == "spyre":
-        # constriants for now -> this should change with true indirect access
+        # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
-        assert (isinstance(a, list) or address_of_a is None), "here needs to be true indirect access"
-        assert (isinstance(b, list) or address_of_b is None), "here needs to be true indirect access"
-    
+        assert isinstance(a, list) or address_or_index_of_a is None, (
+            "here needs to be true indirect access"
+        )
+        assert isinstance(b, list) or address_or_index_of_b is None, (
+            "here needs to be true indirect access"
+        )
+
     # resolving indirect access
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
-    if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_of_a is not None):
+    if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
         # pytorch syntax is the same like for python lists here
-        a = a[address_of_a]
+        a = a[address_or_index_of_a]
         if transform_a:
             a = transform_a(a)
-    if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_of_b is not None):
-        b = b[address_of_b]
+    if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
+        b = b[address_or_index_of_b]
         if transform_b:
             b = transform_b(b)
-    
+
     # do the actual matmul
     output = torch.matmul(a, b)
     return output
@@ -132,7 +154,9 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     Dynamo unrolls the loop because num_tokens is a closure constant.
     """
 
-    def specialized_reshape_and_cache_kernel(key, value, k_pages, v_pages, block_indices, block_offsets):
+    def specialized_reshape_and_cache_kernel(
+        key, value, k_pages, v_pages, block_indices, block_offsets
+    ):
         # this kernels specializes (i.e. compiles for specific constants) for num_tokens
         for t in range(num_tokens):
             block_idx = block_indices[t]
@@ -141,7 +165,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
             v_tok = value[t].unsqueeze(1)
             _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
             _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
-    
+
     return specialized_reshape_and_cache_kernel
 
 
@@ -177,7 +201,9 @@ def _create_compilable_page_attn(num_blocks: int):
 
             # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
             # NOTE: for true "varlen" layout, q would be an indirect access too (avoided here for simplicity...)
-            scores = _indirect_matmul_mock(q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1))
+            scores = _indirect_matmul_mock(
+                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+            )
             scores *= scale
             scores = scores + mask_tile
             scores_max = scores.max(dim=-1, keepdim=True)[0]
@@ -186,7 +212,9 @@ def _create_compilable_page_attn(num_blocks: int):
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
                 # tile_output = torch.matmul(tile_probs, v_page_4d)
-                tile_output = _indirect_matmul_mock(tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1))
+                tile_output = _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 new_max = torch.maximum(tile_max, scores_max)
@@ -195,7 +223,9 @@ def _create_compilable_page_attn(num_blocks: int):
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
                 # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                tile_output += _indirect_matmul_mock(tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1))
+                tile_output += _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
@@ -444,8 +474,10 @@ class SpyreAttentionBackend(AttentionBackend):
         # TODO this should be:
         #     return (num_blocks, 2, block_size, num_kv_heads, head_size)
         # but for the lists it is actually
-        return [(num_blocks, block_size, num_kv_heads, head_size), 
-                (num_blocks, block_size, num_kv_heads, head_size)]
+        return [
+            (num_blocks, block_size, num_kv_heads, head_size),
+            (num_blocks, block_size, num_kv_heads, head_size),
+        ]
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:

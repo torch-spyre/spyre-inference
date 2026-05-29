@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import sys
-from typing import TYPE_CHECKING
-from string import Template
-import multiprocessing
 import importlib.metadata
+import multiprocessing
+import os
+import sys
+from string import Template
+from typing import TYPE_CHECKING
+
+import torch
 
 from spyre_inference import envs
 
@@ -60,6 +62,14 @@ class TorchSpyrePlatform(CpuPlatform):
     # register_spyre_dispatch() in each module's register() function,
     # so dispatch works regardless of tensor device.
     dispatch_key: str = "CPU"
+
+    # Multi-backend init string consumed by both vllm's
+    # `init_distributed_environment` and `torch.distributed.new_group`.
+    # `gloo` handles CPU tensors (used by vllm's parallel-state cpu_group
+    # and any host-side coordination); `spyreccl` handles Spyre tensors
+    # for the device_group. See `torch_spyre._autoload` (registers
+    # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
+    dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     # SPYRE_ATTN_IMPL=exp selects spyre_attn_exp.py; anything else uses spyre_attn.py.
@@ -129,6 +139,16 @@ class TorchSpyrePlatform(CpuPlatform):
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
+    def get_device_communicator_cls(cls) -> str:
+        # The base `CpuPlatform` returns `CpuCommunicator`, which delegates
+        # to gloo collectives. With `dist_backend = "cpu:gloo,spyre:spyreccl"`
+        # the device_group is bound to spyreccl, so we need a Spyre-aware
+        # communicator that knows which collectives the comms library
+        # actually implements (and falls back manually for the rest).
+        # See `spyre_inference/distributed/spyre_communicator.py`.
+        return "spyre_inference.distributed.spyre_communicator.SpyreCommunicator"
+
+    @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
         if selected_backend == AttentionBackendEnum.CUSTOM:
             return AttentionBackendEnum.CUSTOM.get_path()
@@ -147,8 +167,19 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
-        # ---- worker ----
         parallel_config = vllm_config.parallel_config
+
+        # Spyre does not currently support data parallelism. The worker's
+        # WORLD_SIZE / RANK derivation in spyre_worker.init_device assumes a
+        # single DP replica, and the spyre-comms global rank space has not
+        # been validated for DP×TP configurations.
+        if parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                f"Spyre does not support data_parallel_size > 1 "
+                f"(got {parallel_config.data_parallel_size})."
+            )
+
+        # ---- worker ----
         if parallel_config.worker_cls == "auto":
             # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
             # Override with TorchSpyreWorker for Spyre-specific functionality
@@ -164,6 +195,18 @@ class TorchSpyrePlatform(CpuPlatform):
         # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
+
+        # CPUWorker derives its KV-cache budget from host RAM, but on Spyre
+        # the cache lives on-device — the host-RAM math is meaningless and
+        # `gpu_memory_utilization * total_RAM` typically exceeds available
+        # RAM on Spyre boxes, tripping CPUWorker.__init__'s preflight check.
+        # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
+        # populate `cache_config.kv_cache_memory_bytes` below, which both
+        # bypasses the preflight check and short-circuits the host-RSS math
+        # in CPUWorker.determine_available_memory. Skip when the user has
+        # explicitly supplied --kv-cache-memory-bytes so we don't clobber it.
+        if vllm_config.cache_config.kv_cache_memory_bytes is None:
+            os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)

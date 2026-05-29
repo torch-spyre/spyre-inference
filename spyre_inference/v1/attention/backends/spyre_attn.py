@@ -91,7 +91,7 @@ def _indirect_matmul_mock(
                            access the 5th slice of Tensor a and return a slice of
                            shape [1, 32, 8, 128].
 
-    transform_ : This is a torch-compilable function to transform (e.g.
+    transform_ : This is an optional torch-compilable function to transform (e.g.
                  transpose/rotate) the tensor-slice after it was loaded via
                  the indirect access before the matmul happens.
 

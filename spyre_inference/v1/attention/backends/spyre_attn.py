@@ -112,9 +112,7 @@ def _indirect_matmul_mock(
     # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
         if isinstance(address_or_index_of_a, torch.Tensor):
-            assert len(address_or_index_of_a) == 1, (
-                "for now, we support only one page at a time"
-            )
+            assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
             address_or_index_of_a = address_or_index_of_a.item()
         # pytorch syntax is the same like for python lists here
         a = a[address_or_index_of_a]
@@ -122,9 +120,7 @@ def _indirect_matmul_mock(
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
         if isinstance(address_or_index_of_b, torch.Tensor):
-            assert len(address_or_index_of_b) == 1, (
-                "for now, we support only one page at a time"
-            )
+            assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
             address_or_index_of_b = address_or_index_of_b.item()
         b = b[address_or_index_of_b]
         if transform_b:
@@ -430,8 +426,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len_s, col_start:col_end]
                 # Sanity check: ensure tile has correct shape
                 assert tile.shape[2] == padded_query_len_s, (
-                    f"Tile shape mismatch: expected {padded_query_len_s}, "
-                    f"got {tile.shape[2]}"
+                    f"Tile shape mismatch: expected {padded_query_len_s}, got {tile.shape[2]}"
                 )
                 seq_tiles.append(tile.contiguous().to(self.device))
             attention_mask_tiles.append(seq_tiles)
@@ -441,7 +436,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         slot_block_indices = (sm_cpu // self.block_size).tolist()
         slot_block_offsets = (sm_cpu % self.block_size).tolist()
 
-        # NOTE: since the outer loop of the paged attention implementaiton
+        # NOTE: since the outer loop of the paged attention implementation
         #  runs on the CPU (list-based), most meta-data also remains on CPU
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,

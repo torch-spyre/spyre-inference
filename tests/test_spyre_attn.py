@@ -332,7 +332,7 @@ def test_spyre_attn(
         attn_metadata=attn_metadata,
         output=output,
     )
-    
+
     ref_output = ref_attn(
         query=query,
         key_cache=k_pages_cpu,

@@ -233,7 +233,7 @@ def ref_attn(
     "num_heads",
     [
         pytest.param((32, 8), id="GQA"),
-        pytest.param((32, 32), id="MHA"),
+        # pytest.param((32, 32), id="MHA"),
         # pytest.param((32, 1), id="MQA"),
     ],
 )

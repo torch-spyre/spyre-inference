@@ -701,6 +701,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
             q = q.reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
 
+            # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
+            # bug in layout propagation through transpose operations. The compiler's
+            # deadcode elimination pass fails with stride/index mismatches when
+            # handling the degenerate dimension in MHA. GQA (num_queries_per_kv > 1)
+            # works correctly. See error: "cannot restickify any input layout of y
+            # to carry y_var=d2" in propagate_layouts.py:341
+
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
             mask_tiles = [m.to(self._target_device) for m in mask_tiles_all[seq_idx]]

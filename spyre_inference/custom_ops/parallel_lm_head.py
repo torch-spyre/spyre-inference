@@ -110,8 +110,6 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         logger.debug("Building custom ParallelLMHead for Spyre")
 
-        self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)
-
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
@@ -142,7 +140,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         # the input to the SpyreParallelLMHead resides on CPU.
         # Due to a second limitation of torch-spyre regarding sizes that can be used
         # in a F.linear layer, the original weights need to be padded
-        out = self.maybe_compiled_forward_spyre(
+        out = F.linear(
             convert(x, device=self.weight.device),
             self.padded_weight.data,
             bias,
@@ -151,12 +149,3 @@ class SpyreParallelLMHead(ParallelLMHead):
         out_cpu = convert(out, device="cpu")
         out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
         return convert(out_cpu_no_pad, device=x_device)
-
-    @staticmethod
-    def forward_spyre(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Spyre lm_head kernel compiled via maybe_compile."""
-        return F.linear(x, weight, bias)

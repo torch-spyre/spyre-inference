@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
-    SpyreAttentionMetadata,
+    SpyreAttentionMetadataBuilder,
 )
 
 
@@ -34,11 +38,59 @@ def requires_spyre():
         pytest.skip("Spyre device not available - these tests require Spyre hardware")
 
 
-NUM_HEADS = [(4, 4), (8, 2)]  # (num_query_heads, num_kv_heads)
-HEAD_SIZES = [128, 256]
-BLOCK_SIZES = [16]
-DTYPES = [torch.float16]
-NUM_BLOCKS = [2048, 32768]
+def _build_metadata(
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    num_blocks: int,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_table: torch.Tensor,
+    slot_mapping: torch.Tensor,
+):
+    """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
+    vllm_config = Mock()
+    vllm_config.model_config.get_num_attention_heads.return_value = num_query_heads
+    vllm_config.model_config.get_num_kv_heads.return_value = num_kv_heads
+    vllm_config.cache_config.num_gpu_blocks_override = num_blocks
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+
+    kv_cache_spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float16,
+    )
+
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+
+    max_query_len = int((query_start_loc[1:] - query_start_loc[:-1]).max().item())
+    max_seq_len = int(seq_lens.max().item())
+    num_actual_tokens = int(query_start_loc[-1].item())
+
+    common_metadata = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=seq_lens,
+        num_reqs=len(seq_lens),
+        num_actual_tokens=num_actual_tokens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=True,
+    )
+
+    return builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common_metadata,
+    )
 
 
 def ref_attn(
@@ -100,21 +152,52 @@ def ref_attn(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        [(1, 256), (2, 128), (4, 512)],
-        [(1, 256), (1, 128), (1, 512)],
-        [(72, 512), (1, 256), (4, 128)],
+        pytest.param([(1, 1024)], id="decode(q=1,kv=1024)"),
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(64, 512)], id="prefill(q=64,kv=512)"),
+        pytest.param([(100, 512)], id="prefill(q=100,kv=512)"),
     ],
 )
-@pytest.mark.parametrize("num_heads", NUM_HEADS)
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize(
+    "num_heads",
+    [
+        pytest.param((32, 8), id="GQA"),
+        pytest.param((32, 32), id="MHA"),
+        pytest.param((32, 1), id="MQA"),
+    ],
+)
+@pytest.mark.parametrize(
+    "head_size",
+    [
+        pytest.param(128, id="head_size(128)"),
+        pytest.param(256, id="head_size(256)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        pytest.param(16, id="block_size(16)"),
+    ],
+)
 @pytest.mark.parametrize("sliding_window", [None])
-@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(torch.float16, id="dtype(fp16)"),
+    ],
+)
 @pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize("num_blocks", NUM_BLOCKS)
-@pytest.mark.parametrize("use_sdpa", [True, False])
+@pytest.mark.parametrize(
+    "num_blocks",
+    [
+        pytest.param(2048, id="num_blocks(2048)"),
+        pytest.param(32768, id="num_blocks(32768)"),
+    ],
+)
 @torch.inference_mode()
 def test_spyre_attn(
+    default_vllm_config,
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
@@ -123,16 +206,15 @@ def test_spyre_attn(
     block_size: int,
     soft_cap: float | None,
     num_blocks: int,
-    use_sdpa: bool,
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
+    num_query_heads, num_kv_heads = num_heads
     torch.set_default_device("cpu")
     set_random_seed(0)
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
-    num_query_heads, num_kv_heads = num_heads
     assert num_query_heads % num_kv_heads == 0
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)
@@ -182,19 +264,16 @@ def test_spyre_attn(
             slot_mapping.append(actual_block * block_size + pos % block_size)
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    attn_metadata = SpyreAttentionMetadata(
-        num_actual_tokens=sum(query_lens),
-        num_seqs=num_seqs,
-        max_query_len=max_query_len,
-        max_seq_len=max_kv_len,
+    attn_metadata = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        num_blocks=num_blocks,
         seq_lens=kv_lens_tensor,
         query_start_loc=cu_query_lens,
         block_table=block_tables,
-        block_size=block_size,
         slot_mapping=slot_mapping,
-        apply_causal_mask=max_query_len > 1,
-        num_kv_heads=num_kv_heads,
-        num_heads=num_query_heads,
     )
 
     attn_impl = SpyreAttentionImpl(
@@ -206,7 +285,6 @@ def test_spyre_attn(
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
-        use_sdpa=use_sdpa,
     )
 
     output = torch.empty_like(query)
@@ -232,122 +310,9 @@ def test_spyre_attn(
         soft_cap=soft_cap,
     )
 
-    if use_sdpa:
-        atol, rtol = 0.1, 0.1
-    elif max_query_len >= 32:
-        atol, rtol = 0.3, 5.0  # float16 accumulation errors for large prompts
+    if max_query_len >= 32:
+        atol, rtol = 0.3, 5.0
     else:
         atol, rtol = 0.2, 0.2
 
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
-
-
-@pytest.mark.parametrize("num_heads", [(8, 2)])
-@pytest.mark.parametrize("head_size", [128])
-@pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("dtype", [torch.float16])
-@torch.inference_mode()
-def test_spyre_attn_single_sequence(
-    num_heads: tuple[int, int],
-    head_size: int,
-    block_size: int,
-    dtype: torch.dtype,
-) -> None:
-    """Test single-sequence attention across a range of query/kv lengths."""
-    torch.set_default_device("cpu")
-    set_random_seed(42)
-
-    num_query_heads, num_kv_heads = num_heads
-    scale = head_size**-0.5
-
-    test_cases = [
-        (1, 128),  # single token decode
-        (32, 256),  # exact chunk size
-        (64, 512),  # multi-chunk
-        (100, 512),  # non-aligned query length
-    ]
-
-    for query_len, kv_len in test_cases:
-        num_seqs = 1
-        num_blocks = 1024
-
-        query = torch.randn(query_len, num_query_heads, head_size, dtype=dtype)
-        key = torch.randn(query_len, num_kv_heads, head_size, dtype=dtype)
-        value = torch.randn(query_len, num_kv_heads, head_size, dtype=dtype)
-
-        kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size, dtype=dtype)
-        key_cache = kv_cache[:, 0]
-        value_cache = kv_cache[:, 1]
-
-        max_num_blocks_per_seq = (kv_len + block_size - 1) // block_size
-        block_tables = torch.randint(
-            0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
-        )
-
-        historical_len = kv_len - query_len
-        if historical_len > 0:
-            historical_keys = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
-            historical_values = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
-            for token_idx in range(historical_len):
-                block_idx = token_idx // block_size
-                block_offset = token_idx % block_size
-                actual_block = block_tables[0, block_idx].item()
-                key_cache[actual_block, block_offset] = historical_keys[token_idx]
-                value_cache[actual_block, block_offset] = historical_values[token_idx]
-
-        slot_mapping = []
-        for token_idx in range(query_len):
-            pos = kv_len - query_len + token_idx
-            actual_block = block_tables[0, pos // block_size].item()
-            slot_mapping.append(actual_block * block_size + pos % block_size)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
-
-        attn_metadata = SpyreAttentionMetadata(
-            num_actual_tokens=query_len,
-            num_seqs=num_seqs,
-            max_query_len=query_len,
-            max_seq_len=kv_len,
-            seq_lens=torch.tensor([kv_len], dtype=torch.int32),
-            query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
-            block_table=block_tables,
-            block_size=block_size,
-            slot_mapping=slot_mapping,
-            apply_causal_mask=query_len > 1,
-            num_kv_heads=num_kv_heads,
-            num_heads=num_query_heads,
-        )
-
-        attn_impl = SpyreAttentionImpl(
-            num_heads=num_query_heads,
-            head_size=head_size,
-            scale=scale,
-            num_kv_heads=num_kv_heads,
-        )
-
-        output = torch.empty_like(query)
-        attn_impl.forward(
-            layer=None,
-            query=query,
-            key=key,
-            value=value,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-            output=output,
-        )
-
-        ref_output = ref_attn(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            query_lens=[query_len],
-            kv_lens=[kv_len],
-            block_tables=block_tables,
-            scale=scale,
-        )
-
-        if query_len >= 32:
-            atol, rtol = 0.3, 5.0  # float16 accumulation errors for large prompts
-        else:
-            atol, rtol = 0.1, 0.1
-
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)

@@ -1,4 +1,4 @@
-site_name: Spyre Inference Plugin
+site_name: Spyre Inference
 site_url: https://torch-spyre.github.io/spyre-inference/
 repo_url: https://github.com/torch-spyre/spyre-inference
 exclude_docs: |
@@ -29,10 +29,12 @@ theme:
   features:
     - content.code.copy
     - content.tabs.link
+    - navigation.instant
+    - navigation.instant.progress
     - navigation.tracking
     - navigation.tabs
+    - navigation.tabs.sticky
     - navigation.sections
-    - navigation.prune
     - navigation.top
     - search.highlight
     - search.share

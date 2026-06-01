@@ -1,76 +1,40 @@
-# spyre-inference
+<h1 align="center">
+Spyre Inference
+</h1>
 
-A vLLM platform plugin for IBM Spyre AI accelerators.
+<p align="center">
+| <a href="https://torch-spyre.github.io/spyre-inference/"><b>Documentation</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/"><b>Users Forum</b></a> | <a href="https://slack.vllm.ai"><b>#sig-spyre</b></a> |
+</p>
 
-## Overview
+---
 
-`spyre-inference` is the next evolution of [`sendnn-inference`](https://github.com/torch-spyre/sendnn-inference), providing seamless integration of IBM's Spyre hardware accelerators with vLLM for high-performance large language model inference.
+**IBM Spyre** is the first production-grade Artificial Intelligence Unit (AIU) accelerator born out of the IBM Research AIU family, and is part of a long-term strategy of developing novel architectures and full-stack technology solutions for the emerging space of generative AI. Spyre builds on the foundation of IBM's internal AIU research and delivers a scalable, efficient architecture for accelerating AI in enterprise environments.
 
-This plugin leverages `torch-spyre` to utilize PyTorch's native Inductor compiler backend, enabling optimized model execution on Spyre devices through vLLM's plugin architecture.
+`spyre-inference` is a vLLM platform plugin that enables seamless integration of IBM Spyre accelerators with vLLM via the [`torch-spyre`](https://github.com/torch-spyre/torch-spyre) PyTorch backend. It is the next evolution of [`sendnn-inference`](https://github.com/torch-spyre/sendnn-inference), leveraging PyTorch's native Inductor compiler backend through vLLM's plugin architecture.
 
-## Requirements
+For more information, check out the following:
 
-- Python >= 3.11
-- Access to IBM Spyre hardware with the Spyre Runtime stack
-- PyTorch 2.10.0 (CPU backend)
+- 📚 [Meet the IBM Artificial Intelligence Unit](https://research.ibm.com/blog/ibm-artificial-intelligence-unit-aiu)
+- 📽️ [AI Accelerators: Transforming Scalability & Model Efficiency](https://www.youtube.com/watch?v=KX0qBM-ByAg)
+- 🚀 [Spyre Accelerator for IBM Z](https://research.ibm.com/blog/spyre-for-z)
+- 🚀 [Spyre Accelerator for IBM POWER](https://newsroom.ibm.com/2025-07-08-ibm-power11-raises-the-bar-for-enterprise-it)
 
-## Installation
+## Getting Started
 
-```bash
-# Clone the repository
-git clone https://github.com/torch-spyre/spyre-inference
-cd spyre-inference
+Visit our [documentation](https://torch-spyre.github.io/spyre-inference/):
 
-# Install with uv (recommended)
-uv sync --frozen
-```
-
-**Note:** `torch-spyre` compilation requires access to IBM Spyre hardware with the Spyre Runtime stack. See internal development documentation for environment setup.
-
-## Usage
-
-The plugin automatically registers with vLLM when installed.
-Use it by setting `VLLM_PLUGINS=spyre_inference`
-
-```python
-from vllm import LLM
-
-llm = LLM(
-    model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-    max_model_len=128,
-    max_num_seqs=2,
-)
-```
-
-## Testing
-
-The test suite includes:
-
-- **Local tests** (`-m spyre`) - Spyre-specific functionality validation
-- **Upstream tests** (`-m upstream`) - vLLM compatibility verification
-
-Upstream tests are automatically synced from the vLLM repository at the commit specified in `pyproject.toml`.
+- [Installation](https://torch-spyre.github.io/spyre-inference/latest/getting_started/installation.html)
+- [Examples](https://torch-spyre.github.io/spyre-inference/latest/examples/offline_inference/)
+- [Contributing Guide](https://torch-spyre.github.io/spyre-inference/latest/contributing/)
 
 ## Contributing
 
-See [Contributing Guide](docs/contributing/README.md) for:
+We welcome and value any contributions and collaborations. Please check out [Contributing to Spyre Inference](https://torch-spyre.github.io/spyre-inference/latest/contributing/) for how to get involved.
 
-- Issue reporting and feature requests
-- Development setup
-- Testing guidelines
-- Pull request process
+## Contact
 
-## Documentation
-
-- [Installation Guide](docs/getting_started/installation.md)
-- [Contributing Guide](docs/contributing/README.md)
+You can reach out for discussion or support in the `#sig-spyre` channel in the [vLLM Slack](https://inviter.co/vllm-slack) workspace or by [opening an issue](https://github.com/torch-spyre/spyre-inference/issues).
 
 ## License
 
 [Apache-2.0](LICENSE)
-
-## Related Projects
-
-- [torch-spyre](https://github.com/torch-spyre/torch-spyre) - PyTorch backend for Spyre accelerators
-- [vLLM](https://github.com/vllm-project/vllm) - High-throughput LLM inference engine
-- [sendnn-inference](https://github.com/torch-spyre/sendnn-inference) - Previous generation Spyre vLLM plugin

@@ -16,7 +16,6 @@ repos:
   rev: v1.41.0
   hooks:
   - id: typos
-    exclude: 'tests/hf_cache\.json'
 - repo: https://github.com/igorshubovych/markdownlint-cli
   rev: v0.45.0
   hooks:
@@ -26,9 +25,9 @@ repos:
       "pyproject.toml",
       "--configPointer",
       "/tool/markdownlint",
+      "--fix"
     ]
     exclude: '.*\.inc\.md'
-    stages: [manual] # Only run in CI
 - repo: https://github.com/rhysd/actionlint
   rev: v1.7.7
   hooks:

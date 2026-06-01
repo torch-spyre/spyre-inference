@@ -208,13 +208,13 @@ def test_spyre_attn(
     num_blocks: int,
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
+    num_query_heads, num_kv_heads = num_heads
     torch.set_default_device("cpu")
     set_random_seed(0)
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
-    num_query_heads, num_kv_heads = num_heads
     assert num_query_heads % num_kv_heads == 0
     max_query_len = max(query_lens)
     max_kv_len = max(kv_lens)

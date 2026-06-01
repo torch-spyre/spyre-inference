@@ -50,6 +50,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -763,6 +764,71 @@ def tp_group(_distributed_init):
     ps._TP = group
     yield group
     ps._TP = original_tp
+
+
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@pytest.fixture
+def run_tp_probe(pytestconfig):
+    """Spawn one subprocess per rank running `tp_probe.py --probe NAME`.
+
+    The probe body lives in `tests/probes/tp_probe.py`. Tests pass the
+    probe name and world size; this fixture handles port allocation,
+    env-rendezvous setup, and process collection. If any rank exits
+    non-zero (or times out), the test fails with stdout/stderr tails
+    from the failing ranks.
+    """
+    probe_script = pytestconfig.rootpath / "tests" / "probes" / "tp_probe.py"
+
+    def _run(probe_name: str, *, world_size: int, timeout: float = 300.0) -> None:
+        port = _free_tcp_port()
+        procs = []
+        for rank in range(world_size):
+            env = {
+                **os.environ,
+                "RANK": str(rank),
+                "WORLD_SIZE": str(world_size),
+                "LOCAL_RANK": str(rank),
+                "LOCAL_WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": str(port),
+                "PYTHONUNBUFFERED": "1",
+            }
+            procs.append(
+                subprocess.Popen(  # noqa: S603
+                    [sys.executable, str(probe_script), "--probe", probe_name],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+
+        results: list[tuple[int, str, str]] = []
+        for p in procs:
+            try:
+                out, err = p.communicate(timeout=timeout)
+                results.append((p.returncode, out or "", err or ""))
+            except subprocess.TimeoutExpired:
+                p.kill()
+                out, err = p.communicate()
+                results.append((-1, out or "", err or ""))
+
+        failed = [(i, rc, out, err) for i, (rc, out, err) in enumerate(results) if rc != 0]
+        if failed:
+            msg = "\n".join(
+                f"--- rank {i} (rc={rc}) ---\n"
+                f"stdout (tail):\n{out[-2000:]}\n"
+                f"stderr (tail):\n{err[-2000:]}"
+                for i, rc, out, err in failed
+            )
+            pytest.fail(f"probe {probe_name!r} ranks failed:\n{msg}")
+
+    return _run
 
 
 @pytest.fixture()

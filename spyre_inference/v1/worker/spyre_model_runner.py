@@ -53,7 +53,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)

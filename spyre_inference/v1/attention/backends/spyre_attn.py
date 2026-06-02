@@ -147,9 +147,7 @@ def _resolve_compilation_config():
     cfg = config.compilation_config
     if cfg.mode == CompilationMode.NONE:
         return False
-    if cfg.backend == "eager":
-        return False
-    return True
+    return cfg.backend != "eager"
 
 
 _ENABLE_COMPILE = _resolve_compilation_config()
@@ -613,6 +611,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata is None:
             return output
 
+        # TODO: need to take care if the K and V are on CPU due to the split
+        # operation of GraniteAttention
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
 

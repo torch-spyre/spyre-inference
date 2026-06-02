@@ -46,7 +46,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+# TODO: Make these hyperparameters configurable
+# KV length alignment: KV tensors are padded to the next multiple of this value.
+# Because torch.compile treats shapes as static constants, every distinct kv_len
+# triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
+# (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
+# rather than recompiling on every decode step.
 KV_LENGTH_ALIGNMENT = 256
+
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
 QUERY_CHUNK_SIZE = 32
 
 
@@ -263,25 +271,31 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
 class SpyreAttentionMetadata(AttentionMetadata):
     """Metadata for paged online-softmax attention on Spyre."""
 
+    # Batch information
     num_actual_tokens: int
     num_seqs: int
     max_query_len: int
     max_seq_len: int
 
+    # Sequence lengths
     seq_lens: torch.Tensor  # [num_seqs]
     query_start_loc: torch.Tensor  # [num_seqs + 1]
 
+    # Block table for paged KV cache
     block_table: torch.Tensor  # [num_seqs, max_num_blocks_per_seq]
     block_size: int
 
+    # Slot mapping for KV cache updates
     slot_mapping: torch.Tensor  # [num_actual_tokens]
 
     # Precomputed from slot_mapping (avoids CPU round-trip during forward)
     slot_block_indices: list[int] | None = None
     slot_block_offsets: list[int] | None = None
 
+    # Whether causal masking is needed (True when max_query_len > 1)
     apply_causal_mask: bool = False
 
+    # For grouped-query attention
     num_kv_heads: int = 0
     num_heads: int = 0
 
@@ -296,6 +310,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     @property
     def query_lens(self) -> torch.Tensor:
+        """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
 
@@ -400,6 +415,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> SpyreAttentionMetadata:
+        """Build attention metadata from common metadata."""
+
         seq_lens = common_attn_metadata.seq_lens
         query_start_loc = common_attn_metadata.query_start_loc
         max_seq_len = common_attn_metadata.max_seq_len
@@ -597,9 +614,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def forward(
         self,
         layer: torch.nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query: torch.Tensor,  # [num_tokens, num_heads, head_size]
+        key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+        value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         kv_cache: tuple[list[torch.Tensor], list[torch.Tensor]],
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor | None = None,

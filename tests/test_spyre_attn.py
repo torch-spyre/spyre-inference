@@ -24,7 +24,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
 )
-from spyre_inference import envs
 
 
 def _spyre_available() -> bool:
@@ -46,7 +45,6 @@ def configure_device(request, monkeypatch):
     device_mode = request.param
     if device_mode == "spyre" and not _spyre_available():
         pytest.skip("Spyre device not available")
-    envs.clear_env_cache()
     return device_mode
 
 
@@ -407,7 +405,4 @@ def test_spyre_attn(
     else:
         atol, rtol = 0.2, 0.2
 
-    if configure_device == "spyre":
-        torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)
-    else:
-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol)
+    torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)

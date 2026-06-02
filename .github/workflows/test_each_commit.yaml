@@ -102,8 +102,6 @@ jobs:
             --frozen \
             --verbose \
             --all-extras \
-            --active \
-            --inexact \
             --group dev
           # Print the resolved torch install for log visibility.
           uv pip show torch

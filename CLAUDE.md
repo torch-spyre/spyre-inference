@@ -54,8 +54,10 @@ uv run pytest -m upstream
 # Run specific test file
 uv run pytest tests/test_spyre_attn.py
 
-# Run single test
-uv run pytest tests/test_spyre_attn.py::test_spyre_attn_single_sequence
+# Run a single parametrized test (parametrize IDs contain (), =, , which break pytest -k —
+# list node IDs first, then quote the full node ID)
+uv run pytest tests/test_spyre_attn.py -m "not upstream" --collect-only -q
+uv run pytest -m "not upstream" 'tests/test_spyre_attn.py::test_spyre_attn[<id>]'
 
 # Format code (uses prek via uvx)
 bash format.sh
@@ -68,6 +70,16 @@ uv run ty
 
 - `spyre` - Tests defined in this repo
 - `upstream` - vLLM upstream compatibility tests
+
+When running a subset, prefer `-m "not upstream"` unless you specifically want upstream tests — broad selectors can otherwise match tests pulled in by `spyre-testing-plugin`. Tests that need real Spyre hardware are gated by the `requires_spyre` fixture and skip silently on CPU-only hosts; "all green" on a non-Spyre machine does not mean the change works.
+
+### Test Layout
+
+- `tests/test_spyre_attn.py` — attention backend (`SpyreAttentionImpl`, `SpyreAttentionMetadataBuilder`) vs a CPU reference (`ref_attn`).
+- `tests/test_mlp.py`, `tests/test_rms_norm.py`, `tests/test_silu_and_mul.py`, `tests/test_parallel_lm_head.py` — per-custom-op tests, each comparing a Spyre-device run against a CPU reference.
+- `tests/test_vllm_spyre_next.py` — end-to-end vLLM path.
+
+Test runs are slow (~3 min) because of vLLM startup; prefer single-test invocations during iteration.
 
 ### Upstream Test Configuration
 
@@ -109,12 +121,27 @@ python -m spyre_testing_plugin.sync_upstream_test_deps
 - `tool.uv.sources` - Pulls vllm and torch-spyre from GitHub (not PyPI)
 - `[[tool.uv.index]]` - PyTorch CPU index for torch/torchvision
 
+## Iterating on a Local `torch-spyre` Checkout
+
+When editing `./torch-spyre/` (or any sibling checkout) and reinstalling via `uv pip install --no-deps --force-reinstall ./torch-spyre`, the next plain `uv run pytest …` will silently revert the install. `uv run` re-syncs deps from `pyproject.toml` on every invocation, and `pyproject.toml` pins `torch-spyre` to an upstream git rev — so each `uv run` reinstalls the upstream commit on top of the local-source install. Symptom: the installed file has your changes, but the test fails as if nothing happened (look for `Uninstalled 1 package … Installed 1 package …` near the top of pytest output).
+
+**Always use `uv run --no-sync …`** for any iteration cycle that depends on a hand-installed local dependency. The `torch-spyre` wheel build is C++-heavy and takes ~50s, so batch source edits before each rebuild.
+
 ## Spyre-Specific Constraints
 
 - **Device alignment**: Head size must be multiple of 64 (128-byte stick size / 2 bytes for float16)
 - **No tensor parallelism**: Custom linear layers assume TP=1
 - **dtype**: float16 only (model_config.dtype check in platform.py)
-- **Compilation**: Disabled (`CompilationMode.NONE`) due to CPU fallback ops creating intermediates
+- **Compilation**: Platform-level compile is set to `CompilationMode.NONE` due to CPU fallback ops creating intermediates. **Caveat**: under the pytest `default_vllm_config` fixture, `cfg.mode` is Python `None` (not the `NONE=0` enum), so per-module gates like `_maybe_compile` in `spyre_attn.py` may still wrap kernels with `torch.compile(..., dynamic=False)`. Don't assume "eager in tests" when comparing pytest behavior to a plain script.
+- **Single accelerator**: Spyre is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/`xdist`, no parallel `uv run pytest` invocations, no backgrounding one Spyre test while starting another. Parallel invocations hang, produce undefined device state, or corrupt the compile cache.
+
+## Debugging
+
+When a test fails with numerical mismatch, a compile error on `spyre`, or a silent CPU fallback, invoke the `debug-spyre` skill (`.claude/skills/debug-spyre/SKILL.md`). It encodes the cluster-of-failures workflow, hypothesis-queue protocol, torch-spyre site-packages tracing, and escalation criteria. Attention-specific notes live in `.claude/skills/debug-spyre/attention-notes.md`.
+
+The single most important signal: `FallbackWarning`. `torch-spyre` silently routes unsupported ops to CPU and emits this warning. A fallback changes the numerical path (CPU vs Spyre matmul kernels differ in accumulation order for fp16) and can mask the real bug. Turn it into an error with `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"` to get a traceback to the triggering line.
+
+Most "Spyre is broken" bugs are not in our code — they are torch-spyre op gaps, dtype/layout limitations, or shape-bucket misses. Read the relevant `.venv/lib/python3.12/site-packages/torch_spyre/ops/{eager,fallbacks}.py` files before assuming a local bug.
 
 ## Code Style
 

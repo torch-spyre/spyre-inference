@@ -74,6 +74,11 @@ def configure_compilation(request, monkeypatch):
     # which trigger recompilation on each unique block index value
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
+    # Sync module-level compile gate with the test's compilation mode
+    from spyre_inference.v1.attention.backends import spyre_attn
+
+    monkeypatch.setattr(spyre_attn, "_ENABLE_COMPILE", compilation_mode != CompilationMode.NONE)
+
     yield mode_name
 
     # Cleanup: reset mode and limits

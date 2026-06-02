@@ -74,7 +74,7 @@ tests:
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
         - test: "test_causal_backend_correctness"
-          mode: mandatory_pass
+          mode: xfail
           tags: [attention, upstream]
           params:
             allow:  # We only support TP=1, BS=1

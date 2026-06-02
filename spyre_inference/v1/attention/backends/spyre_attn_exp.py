@@ -68,7 +68,15 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+# TODO: Make these hyperparameters configurable
+# KV length alignment: KV tensors are padded to the next multiple of this value.
+# Because torch.compile treats shapes as static constants, every distinct kv_len
+# triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
+# (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
+# rather than recompiling on every decode step.
 KV_LENGTH_ALIGNMENT = 256
+
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
 QUERY_CHUNK_SIZE = 32
 
 
@@ -90,24 +98,22 @@ def _maybe_compile(fn):
     return torch.compile(fn, dynamic=False)
 
 
-# --- Scatter: values built on CPU, then transferred to Spyre ---
-# Tokens land at different block rows and column offsets, requiring
-# advanced indexing to construct the values tensor (not supported on Spyre).
-
-
-def _scatter_cache(cache, mask, values):
-    return cache * (1.0 - mask) + values
-
-
-# --- Attention ---
-
-
 def _attn_4d(q, k, v, scale, mask):
     scores = q @ k.transpose(-2, -1)
     scores = scores * scale
     scores = scores + mask
     p = scores.softmax(dim=-1)
     return p @ v
+
+
+def copy_attn_output(attn_output, num_actual_tokens, output):
+    """Place `attn_output[:num_actual_tokens]` into the caller-provided `output` buffer."""
+    if output.device.type == "spyre":
+        attn_output_spyre = convert(attn_output, "spyre", output.dtype)
+        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])
+    else:
+        output[:num_actual_tokens].copy_(attn_output)
+    return output
 
 
 @dataclass
@@ -261,7 +267,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             .contiguous()
         )
 
-        return mask_4d.to(device=self._target_device)
+        return convert(mask_4d, device=self._target_device)
 
     def _build_gather_sel_mask(
         self,
@@ -285,7 +291,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         sel_mask_2d[logical, physical] = 1.0
 
         sel_mask_3d = sel_mask_2d.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
-        return sel_mask_3d.to(device=self._target_device)
+        return convert(sel_mask_3d, device=self._target_device)
 
     def _build_scatter_mask_and_selectors(
         self,
@@ -319,14 +325,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_kv_heads, aligned_num_physical_blocks, block_width, dtype=self._target_dtype
         )
         mask[:, row_idx, col_idx] = 1.0
-        mask_dev = mask.to(device=self._target_device)
+        mask_dev = convert(mask, device=self._target_device)
 
         # row_sel: [aligned_num_physical_blocks, num_tokens], one-hot on block_indices
         row_sel_2d = torch.zeros(aligned_num_physical_blocks, num_tokens, dtype=self._target_dtype)
         t_range = torch.arange(num_tokens)
         row_sel_2d[block_indices.long(), t_range] = 1.0
         row_sel_3d = row_sel_2d.unsqueeze(0).expand(num_kv_heads, -1, -1).contiguous()
-        row_sel_dev = row_sel_3d.to(device=self._target_device)
+        row_sel_dev = convert(row_sel_3d, device=self._target_device)
 
         # col_sel: [num_tokens, head_size, block_width],
         #     one-hot on block_offsets*head_size + d_range
@@ -336,7 +342,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         d_idx = d_range.unsqueeze(0).expand(num_tokens, head_size)  # [num_tokens, head_size]
         c_idx = base_col.unsqueeze(1) + d_idx  # [num_tokens, head_size]
         col_sel[t_idx.reshape(-1), d_idx.reshape(-1), c_idx.reshape(-1)] = 1.0
-        col_sel_dev = col_sel.to(device=self._target_device)
+        col_sel_dev = convert(col_sel, device=self._target_device)
 
         return mask_dev, row_sel_dev, col_sel_dev
 
@@ -501,27 +507,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if logits_soft_cap is not None:
             raise NotImplementedError("Logits soft cap not supported yet")
 
-    def _init_device_cache(self, num_blocks: int, block_size: int) -> None:
-        self._block_size = block_size
-        self._num_blocks = num_blocks
-        self._aligned_num_physical_blocks = ((num_blocks + 63) // 64) * 64
-        self._block_width = block_size * self.head_size
-
-        self._k_cache_dev = torch.zeros(
-            self.num_kv_heads,
-            self._aligned_num_physical_blocks,
-            self._block_width,
-            dtype=self._target_dtype,
-            device=self._target_device,
-        )
-        self._v_cache_dev = torch.zeros(
-            self.num_kv_heads,
-            self._aligned_num_physical_blocks,
-            self._block_width,
-            dtype=self._target_dtype,
-            device=self._target_device,
-        )
-
     def forward(
         self,
         layer: torch.nn.Module,
@@ -551,8 +536,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        if self._k_cache_dev is None:
-            self._init_device_cache(kv_cache.shape[0], attn_metadata.block_size)
+        # The kv_cache holds a tuple with (k_cache_dev and v_cache_dev)
+        block_size = attn_metadata.block_size
+        self._block_size = block_size
+        self._block_width = block_size * self.head_size
+
+        # Consume the KV cache generated in the ModelRunner
+        self._k_cache_dev = kv_cache[0]
+        self._v_cache_dev = kv_cache[1]
 
         # Step 1: Scatter — selectors precomputed by builder, transfer compact K/V, place on Spyre
         self._scatter_to_device_cache(
@@ -582,21 +573,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         # Step 6: Extract actual tokens (num_seqs=1 → simple slice)
-        if output.device.type == "spyre":
-            # Workaround for torch-spyre bug: a CPU->Spyre `.copy_()` into a
-            # destination whose rank differs from its allocation rank (here,
-            # vLLM allocates `output` as 2-D and views it as 3-D) crashes in
-            # spyre::get_device_stride_infos. Instead, build the full output
-            # on CPU, transfer it to a freshly-allocated Spyre tensor (works),
-            # and finish with a Spyre->Spyre copy, which dispatches through
-            # torch.ops.spyre.copy_from_d2d and avoids the broken path.
-            full_cpu = torch.zeros(output.shape, dtype=output.dtype, device="cpu")
-            full_cpu[:num_actual_tokens] = attn_output[0]
-            full_spyre = convert(full_cpu.contiguous(), "spyre", output.dtype)
-            output.copy_(full_spyre)
-        else:
-            output[:num_actual_tokens].copy_(attn_output[0])
-        return output
+        return copy_attn_output(attn_output[0], num_actual_tokens, output)
+
+    # Mask-based scatter: write `values` at positions where `mask==1`, keep `cache` elsewhere.
+    # Avoids advanced indexing, which Spyre does not support.
+    def _scatter_cache(self, cache, mask, values):
+        return cache * (1.0 - mask) + values
 
     def _scatter_to_device_cache(
         self,
@@ -616,9 +598,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         # Compact per-layer transfer: [num_tokens, num_kv_heads, head_size] on Spyre
         k_new_dev = (
-            key.to(self._target_dtype).to(self._target_device).contiguous()
+            convert(key, dtype=self._target_dtype, device=self._target_device)  # .contiguous()
         )  # [num_tokens, num_kv_heads, head_size]
-        v_new_dev = value.to(self._target_dtype).to(self._target_device).contiguous()
+        v_new_dev = convert(
+            value, dtype=self._target_dtype, device=self._target_device
+        )  # .contiguous()
 
         if envs.SPYRE_SCATTER_USE_OVERWRITE:
             # Per-token spyre.overwrite_f path. For each token t, write
@@ -631,34 +615,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             head_size = self.head_size
             block_size = self._block_size
             assert block_size is not None
-            sm = slot_mapping.detach().to("cpu")
+            sm = convert(slot_mapping, device="cpu")
             block_indices = (sm // block_size).tolist()
             block_offsets = (sm % block_size).tolist()
             num_tokens = k_new_dev.shape[0]
 
-            # Build per-token inputs on CPU and upload as fresh tensors.
-            # Slicing k_new_dev[t] produces a Spyre view whose device
-            # layout doesn't match what overwrite_f's bundle compiler
-            # expects (triggers patch (A)'s narrowed-view guard). A
-            # fresh CPU->Spyre upload reshapes cleanly.
-            k_cpu = key.to(self._target_dtype).contiguous()
-            v_cpu = value.to(self._target_dtype).contiguous()
-
-            k_cache = self._k_cache_dev
-            v_cache = self._v_cache_dev
+            # Use spyre.overwrite (mutates_args=("output",)) so the underlying
+            # KV cache tensor is updated in place. spyre.overwrite_f clones
+            # output in eager mode and only becomes in-place via inductor's
+            # ReinplacePass — but Attention.forward() runs opaque-to-dynamo,
+            # so the clone path persists and writes are lost across forwards.
             for t in range(num_tokens):
                 br = int(block_indices[t])
                 cs = int(block_offsets[t]) * head_size
-                k_tok = k_cpu[t].unsqueeze(1).contiguous().to(self._target_device)
-                v_tok = v_cpu[t].unsqueeze(1).contiguous().to(self._target_device)
-                k_cache = torch.ops.spyre.overwrite_f(
-                    input=k_tok, output=k_cache, dims=[1, 2], offsets=[br, cs]
-                )
-                v_cache = torch.ops.spyre.overwrite_f(
-                    input=v_tok, output=v_cache, dims=[1, 2], offsets=[br, cs]
-                )
-            self._k_cache_dev = k_cache
-            self._v_cache_dev = v_cache
+                k_tok = convert(key[t].unsqueeze(1).contiguous(), device=self._target_device)
+                v_tok = convert(value[t].unsqueeze(1).contiguous(), device=self._target_device)
+                torch.ops.spyre.overwrite(k_tok, self._k_cache_dev, [1, 2], [br, cs])
+                torch.ops.spyre.overwrite(v_tok, self._v_cache_dev, [1, 2], [br, cs])
             return
 
         # bmm 1: place each token's head_size-vector into its block-width slot.
@@ -678,8 +651,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_vals = torch.bmm(row_sel_dev, k_spread)
         v_vals = torch.bmm(row_sel_dev, v_spread)
 
-        self._k_cache_dev = _scatter_cache(self._k_cache_dev, scatter_mask_dev, k_vals)
-        self._v_cache_dev = _scatter_cache(self._v_cache_dev, scatter_mask_dev, v_vals)
+        # Mutate the persistent KV cache in place.
+        self._k_cache_dev.copy_(self._scatter_cache(self._k_cache_dev, scatter_mask_dev, k_vals))
+        self._v_cache_dev.copy_(self._scatter_cache(self._v_cache_dev, scatter_mask_dev, v_vals))
 
     def _gather_from_device_cache(
         self,

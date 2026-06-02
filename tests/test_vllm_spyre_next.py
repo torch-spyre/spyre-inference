@@ -13,6 +13,8 @@
 # limitations under the License.
 
 from vllm import LLM, RequestOutput, SamplingParams
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.config import AttentionConfig
 
 import pytest
 
@@ -20,7 +22,12 @@ import pytest
 @pytest.mark.spyre
 @pytest.mark.uses_subprocess
 def test_basic_model_load():
-    model = LLM("ibm-ai-platform/micro-g3.3-8b-instruct-1b", max_model_len=128, max_num_seqs=2)
+    model = LLM(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        max_model_len=128,
+        max_num_seqs=2,
+        attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
+    )
 
     sampling_params = SamplingParams(max_tokens=5)
     output: list[RequestOutput] = model.generate(

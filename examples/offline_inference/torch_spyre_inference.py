@@ -13,24 +13,32 @@
 # limitations under the License.
 
 """
-This example shows how to run offline inference on CPU using the new (torch-spyre)
-plugin code. So far the new stack (torch-spyre) is simply using upstream vLLM CPU
-worker/runner classes.
+This example shows how to run offline inference on Spyre using the torch-spyre
+plugin code with the TorchSpyreModelRunner.
 
 Optionally, individual layers can be offloaded to Spyre via --custom_ops:
-  - "all": Run all supported ops on Spyre (default)
-  - "none": Run entirely on CPU
+  - "all": Run all supported ops on Spyre (default when enforce_eager=False)
+  - "none": Run entirely on CPU (default when enforce_eager=True)
   - "+LayerName": Selectively enable specific layers on Spyre
     (e.g., --custom_ops +RMSNorm +SiluAndMul)
 
-Use --enforce_eager to skip torch.compile and run in eager mode.
+Use --enforce-eager to skip torch.compile and run in eager mode.
+
+Environment variables must be set BEFORE importing vLLM:
+  - VLLM_TARGET_DEVICE=spyre_inference: Selects the Spyre platform
+  - VLLM_PLUGINS=spyre_inference,spyre_inference_ops: Loads the plugins
 """
+
+import os
+
+# Set environment variables BEFORE importing vLLM
+os.environ["VLLM_TARGET_DEVICE"] = "spyre_inference"
+os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
 
 import argparse
 import multiprocessing as mp
 import platform
 import time
-import os
 
 
 def parse_args():
@@ -42,7 +50,7 @@ def parse_args():
         "--max-num-batched-tokens", type=int, default=2, dest="max_num_batched_tokens"
     )
     parser.add_argument(
-        "--num_gpu_blocks_override", type=int, default=None, dest="--num-gpu-blocks-override"
+        "--num-gpu-blocks-override", type=int, default=None, dest="num_gpu_blocks_override"
     )
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("-n", "--num-prompts", type=int, default=3, dest="num_prompts")
@@ -62,9 +70,9 @@ def parse_args():
     parser.add_argument(
         "--attention-backend",
         type=str,
-        default=None,
+        default="CUSTOM",
         dest="attention_backend",
-        help="Attention backend to use (e.g., SPYRE, CPU)",
+        help="Attention backend to use (e.g., CUSTOM for Spyre, CPU)",
     )
     parser.add_argument(
         "--enforce-eager",
@@ -154,6 +162,16 @@ def main():
     ]
 
     # Create an LLM.
+    # The spyre_inference platform is loaded via VLLM_PLUGINS.
+    # Set VLLM_TARGET_DEVICE to select the platform.
+    os.environ["VLLM_TARGET_DEVICE"] = "spyre_inference"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    print(
+        f"[torch_spyre_inference] VLLM_TARGET_DEVICE={os.environ['VLLM_TARGET_DEVICE']!r} "
+        f"VLLM_PLUGINS={os.environ.get('VLLM_PLUGINS')!r}",
+        flush=True,
+    )
+
     llm = LLM(
         model=args.model,
         tokenizer=args.model,

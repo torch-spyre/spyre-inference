@@ -131,20 +131,38 @@ def _indirect_matmul_mock(
     return output
 
 
-def _maybe_compile(fn):
-    """Compile fn unless vLLM's compilation config disables it.
+def _resolve_compilation_config():
+    """Resolve compilation config once at module load time.
 
-    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
-    inheritance: returns fn unchanged when compilation mode is NONE or the
-    backend is "eager", otherwise wraps it with torch.compile.
+    Returns True if torch.compile should be applied, False otherwise.
+    Falls back to False (no compilation) if the vLLM config context
+    is not set — matching the Spyre platform default (CompilationMode.NONE).
     """
-    from vllm.config import get_cached_compilation_config
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.config.compilation import CompilationMode
 
-    cfg = get_cached_compilation_config()
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return False
+    cfg = config.compilation_config
     if cfg.mode == CompilationMode.NONE:
-        return fn
+        return False
     if cfg.backend == "eager":
+        return False
+    return True
+
+
+_ENABLE_COMPILE = _resolve_compilation_config()
+
+
+def _maybe_compile(fn):
+    """Compile fn unless compilation is disabled.
+
+    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
+    inheritance. Skips torch.compile when _ENABLE_COMPILE is False
+    (CompilationMode.NONE, backend="eager", or config context unavailable).
+    """
+    if not _ENABLE_COMPILE:
         return fn
     return torch.compile(fn, dynamic=False)
 
@@ -553,6 +571,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Compiled function caches (keyed by iteration count)
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[int, object] = {}
+
+        print("Using SpyreAttentionBackend with LIST-BASED online softmax (v0)")
 
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")

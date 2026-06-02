@@ -369,6 +369,10 @@ def test_spyre_attn(
 
     output = torch.empty_like(query).to(cache_device)
     kv_cache = (k_pages, v_pages)
+    # Note: attn_impl.forward() internally calls _reshape_and_cache() to write
+    # the new K/V tokens into the cache, so this test exercises both the cache
+    # writing and attention computation paths. TODO: Add a dedicated unit test
+    # for _reshape_and_cache to independently verify cache writes.
     attn_impl.forward(
         layer=None,
         query=query,

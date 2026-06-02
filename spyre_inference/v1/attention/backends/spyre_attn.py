@@ -51,12 +51,6 @@ KV_LENGTH_ALIGNMENT = 256
 QUERY_CHUNK_SIZE = 32
 
 
-def _maybe_compile(fn):
-    """Wrap fn always with torch.compile
-    As the _attn_4d currently requires it."""
-    return torch.compile(fn)
-
-
 def _attn_4d(q, k, v, scale, mask):
     scores = q @ k.transpose(-2, -1)
     scores = scores * scale
@@ -244,7 +238,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.attn_op = _attn_4d
 
         # Compile the attention function once for reuse.
-        self.attn_op = _maybe_compile(self.attn_op)
+        self.attn_op = torch.compile(self.attn_op)
 
         # Simplified implementation: don't support these features initially
         if alibi_slopes is not None:

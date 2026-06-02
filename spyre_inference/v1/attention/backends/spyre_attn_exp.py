@@ -81,9 +81,21 @@ QUERY_CHUNK_SIZE = 32
 
 
 def _maybe_compile(fn):
-    """Wrap fn always with torch.compile
-    As the _attn_4d currently requires it."""
-    return torch.compile(fn)
+    """Compile fn unless vLLM's compilation config disables it.
+
+    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
+    inheritance: returns fn unchanged when compilation mode is NONE or the
+    backend is "eager", otherwise wraps it with torch.compile.
+    """
+    from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
+
+    cfg = get_cached_compilation_config()
+    if cfg.mode == CompilationMode.NONE:
+        return fn
+    if cfg.backend == "eager":
+        return fn
+    return torch.compile(fn, dynamic=False)
 
 
 def _attn_4d(q, k, v, scale, mask):

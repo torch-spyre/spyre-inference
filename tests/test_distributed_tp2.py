@@ -89,6 +89,22 @@ def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
+def test_tp2_parallel_lm_head(run_tp_probe) -> None:
+    """End-to-end TP=2 SpyreParallelLMHead on real Spyre cards.
+
+    Verifies vocabulary sharding: each rank computes logits for its vocab
+    partition and the results match single-rank F.linear on the corresponding
+    slice (modulo float16 noise and padding).
+    """
+    run_tp_probe("parallel_lm_head", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
 @pytest.mark.parametrize(
     "probe",
     [
@@ -117,27 +133,16 @@ def test_tp_linear_layers(run_tp_probe, probe: str) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "needs TP-aware Spyre custom linear layers (#134) and "
-        "TP-aware LM head (still pending — embedding done in #135). "
-        "MultiprocExecutor + spyreccl init succeed; failure is at "
-        "SpyreQKVParallelLinear NotImplementedError(TP>1)."
-    ),
-)
 def test_tp2_llm_construction() -> None:
     """Construct `vllm.LLM(tensor_parallel_size=2)` end-to-end.
 
     Goes through the real `MultiprocExecutor` worker-spawn path that
-    `vllm serve --tensor-parallel-size 2` uses. Today fails at TP-naive
-    layer construction; xfail-strict here so the test flips to passing
-    automatically when #134/#135 land.
+    `vllm serve --tensor-parallel-size 2` uses.
     """
     from vllm import LLM
 
     LLM(
-        model="facebook/opt-125m",
+        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         tensor_parallel_size=2,
         dtype="float16",
         enforce_eager=True,
@@ -152,25 +157,13 @@ def test_tp2_llm_construction() -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
-# xfail-strict here can mask a TP=1 regression in the body of this test;
-# accepted because the marker will be deleted when #134/#135 land.
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "needs #134, the LM head half of #135, and a TP=2 fallback for "
-        "all_gather (LM head logits gather hits unimplemented "
-        "_allgather_base). When all three land, TP=1 vs TP=2 should "
-        "match on the first few decoded tokens."
-    ),
-)
 def test_tp2_llm_generate_matches_tp1() -> None:
-    """TP=1 vs TP=2 greedy-decode prefix-match test on opt-125m.
+    """TP=1 vs TP=2 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b.
 
     Runs identical prompts at TP=1 and TP=2 with `temperature=0` and
     asserts the first 2 output tokens match per prompt. Later divergence
     is expected from float16 reduction-order differences between the
-    TP=1 and TP=2 paths. xfail-strict so the test flips to passing the
-    moment end-to-end TP=2 forward correctness lands.
+    TP=1 and TP=2 paths.
     """
     from vllm import LLM, SamplingParams
 
@@ -179,7 +172,7 @@ def test_tp2_llm_generate_matches_tp1() -> None:
 
     def run(tp: int) -> list[list[int]]:
         llm = LLM(
-            model="facebook/opt-125m",
+            model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
             tensor_parallel_size=tp,
             dtype="float16",
             enforce_eager=True,

@@ -157,8 +157,8 @@ def test_lm_head_oot_dispatch(tp_group):
 
 @pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
-def test_invalid_weight_shape_raises(tp_group):
-    """process_weights_after_loading rejects weight rows not divisible by 64.
+def test_non_aligned_weight_is_padded(tp_group):
+    """process_weights_after_loading pads weight rows not divisible by 64.
 
     Part of the padding workaround — remove together with the other
     `padding_workaround` tests once torch-spyre lifts the shape restriction.
@@ -167,11 +167,18 @@ def test_invalid_weight_shape_raises(tp_group):
 
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
     # Force a weight whose leading dim is not a multiple of 64 to exercise
-    # the Spyre-specific validation (upstream vocab padding normally prevents this).
-    layer.weight = torch.nn.Parameter(torch.empty(63, 64, dtype=torch.float16), requires_grad=False)
 
-    with pytest.raises(ValueError, match="multiple of 64"):
-        layer.quant_method.process_weights_after_loading(layer)
+    original = torch.randn(63, 64, dtype=torch.float16)
+    layer.weight = torch.nn.Parameter(original.clone(), requires_grad=False)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    # Weight should be padded up to the nearest multiple of 64
+    assert layer.weight.shape[0] == 64
+    # Original values preserved in the top rows
+    torch.testing.assert_close(layer.weight[:63], original, atol=0.0, rtol=0.0)
+    # Padding row is zeros
+    assert torch.all(layer.weight[63:] == 0)
 
 
 if __name__ == "__main__":

@@ -335,6 +335,56 @@ def probe_row_parallel_linear(device, device_group, world_size, rank):
     dist.barrier(device_ids=[device.index])
 
 
+def probe_parallel_lm_head(device, device_group, world_size, rank):
+    """TP=N SpyreParallelLMHead forward vs single-rank F.linear.
+
+    Constructs ParallelLMHead (OOT-swapped to SpyreParallelLMHead),
+    loads each rank's vocabulary shard from deterministic full weight,
+    runs forward, and asserts each rank's sharded output matches the
+    corresponding slice from single-rank F.linear (modulo float16 noise
+    and padding implications).
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from spyre_inference.custom_ops.utils import convert
+
+    hidden_size = 512
+    vocab_size = 4096
+
+    layer = ParallelLMHead(
+        num_embeddings=vocab_size,
+        embedding_dim=hidden_size,
+        params_dtype=torch.float16,
+    )
+    assert isinstance(layer, SpyreParallelLMHead), type(layer)
+
+    torch.manual_seed(45)
+    full_weight = torch.randn(vocab_size, hidden_size, dtype=torch.float16) * 0.02
+
+    vocab_size_per_partition = vocab_size // world_size
+    start = rank * vocab_size_per_partition
+    end = (rank + 1) * vocab_size_per_partition
+    layer.weight.data.copy_(full_weight[start:end])
+
+    # process_weights_after_loading pads the weight for torch-spyre limitations
+    layer.quant_method.process_weights_after_loading(layer)
+    layer.to(device)
+
+    torch.manual_seed(10)
+    x = torch.randn(16, hidden_size, dtype=torch.float16)
+
+    # forward_oot handles device conversion and computes on Spyre
+    out = layer.forward_oot(x, bias=None)
+    out = convert(out, device="cpu")
+
+    expected_full = F.linear(x, full_weight)
+    expected = expected_full[:, start:end]
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    dist.barrier(device_ids=[device.index])
+
+
 PROBES = {
     "tp_all_reduce": probe_tp_all_reduce,
     "native_all_reduce": probe_native_all_reduce,
@@ -345,6 +395,7 @@ PROBES = {
     "merged_column_parallel_linear": probe_merged_column_parallel_linear,
     "qkv_parallel_linear": probe_qkv_parallel_linear,
     "row_parallel_linear": probe_row_parallel_linear,
+    "parallel_lm_head": probe_parallel_lm_head,
 }
 
 

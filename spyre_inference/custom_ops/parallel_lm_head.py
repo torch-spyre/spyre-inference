@@ -28,7 +28,8 @@ Architecture:
       the Spyre path
 
 Spyre Device Constraints:
-    - No Tensor Parallelism (TP) support: tp_size > 1 raises NotImplementedError
+    - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
+      computes logits for its vocab partition)
     - No quantization support: only UnquantizedEmbeddingMethod is replaced
 
 References:
@@ -38,6 +39,7 @@ References:
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -62,24 +64,42 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         # torch-spyre currently has a limitation with the work division of larger
         # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
         # an integer.
-        layer.padding = 0
-        pad_1 = layer.weight.shape[0] % 64
+
+        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size
+        original_vocab_size = layer.weight.shape[0]
+        vocab_size_per_partition = original_vocab_size
+
+        pad_1 = vocab_size_per_partition % 64
         if pad_1 != 0:
-            raise ValueError("The weight dimension must be a multiple of 64.")
-        pad_2 = (layer.weight.shape[0] // 64) % 32
+            pad_1 = 64 - pad_1
+            logger.warning_once(
+                "%s: vocabulary partition size %d is not a multiple of 64, "
+                "padding by %d (torch-spyre limitation)",
+                layer.__class__.__name__,
+                vocab_size_per_partition,
+                pad_1,
+            )
+            padded_tensor = F.pad(layer.weight, (0, 0, 0, pad_1))
+            layer.weight = Parameter(padded_tensor, requires_grad=layer.weight.requires_grad)
+            vocab_size_per_partition = layer.weight.shape[0]
+
+        # Second padding: ensure (size // 64) is multiple of 32
+        pad_2 = (vocab_size_per_partition // 64) % 32
         if pad_2 > 0:
             pad_2 = 32 - pad_2
-            layer.padding = pad_2 * 64
-            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, layer.padding))
+            pad_2_size = pad_2 * 64
+            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, pad_2_size))
             logger.warning_once(
                 "%s: weights padded from %d to %d (torch-spyre limitation) "
                 "expect numerical differences to upstream vLLM.",
                 layer.__class__.__name__,
-                layer.weight.shape[0],
+                vocab_size_per_partition,
                 layer.padded_weight.shape[0],
             )
         else:
             layer.padded_weight = layer.weight
+
+        layer.padding = layer.padded_weight.shape[0] - original_vocab_size
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -90,6 +110,10 @@ class SpyreParallelLMHead(ParallelLMHead):
     The quant_method is replaced so that LogitsProcessor._get_logits()
     routes through forward_oot, which handles device conversion
     and runs F.linear on Spyre.
+
+    Supports TP>=1: With TP>1, the vocabulary is sharded across ranks.
+    Each rank computes logits for its vocabulary partition
+    [vocab_size/tp_size, hidden_dim]. The sampler gathers logits when needed.
     """
 
     padding: int
@@ -105,11 +129,7 @@ class SpyreParallelLMHead(ParallelLMHead):
                 f"(quant_config={quant_config}). Only quant_config=None is supported."
             )
 
-        if self.tp_size > 1:
-            raise NotImplementedError(
-                f"SpyreParallelLMHead does not support Tensor Parallelism "
-                f"(tp_size={self.tp_size}). Only tp_size=1 is supported."
-            )
+        logger.debug("Building SpyreParallelLMHead with TP size %d ", self.tp_size)
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
@@ -127,12 +147,17 @@ class SpyreParallelLMHead(ParallelLMHead):
         to the weight device (residing on spyre), runs the compiled F.linear on spyre
         and converts back to the x device (cpu).
 
+        At TP>1: Each rank computes logits for its vocabulary shard. The weight
+        matrix is [num_embeddings_per_partition, hidden_dim], producing logits
+        [num_tokens, num_embeddings_per_partition]. The sampler gathers these
+        sharded logits across ranks when needed.
+
         Args:
             x: Hidden states tensor [num_tokens, hidden_dim]
             bias: Optional bias tensor
 
         Returns:
-            Logits tensor [num_tokens, vocab_size] on the input device
+            Logits tensor [num_tokens, vocab_size_per_partition] on the input device
         """
         x_device = x.device
 

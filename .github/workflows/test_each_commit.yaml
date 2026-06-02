@@ -99,6 +99,7 @@ jobs:
           # a different index than the pytorch-cpu source in uv.lock).
           uv add --editable "$CLONED_TORCH_SPYRE_DIR"
           uv sync \
+            --frozen \
             --verbose \
             --all-extras \
             --active \

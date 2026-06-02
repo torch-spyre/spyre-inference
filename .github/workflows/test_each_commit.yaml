@@ -1,0 +1,131 @@
+name: 'test_each_commit'
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  test:
+    name: 'build and run tests'
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - image_spyre_inference
+    timeout-minutes: 720
+    env:
+      # The CI env var is very important.
+      # GitHub actions automatically sets CI=true
+      # which causes the pytest inductor tests to fail with AssertionError
+      # due to a mix of fallbacks and decompositions.
+      # Here we set it to an empty string (or we could also unset it).
+      CI: ''
+      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
+      CLONED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
+
+    steps:
+      - name: Checkout PR branch/commit in pre-cloned spyre-inference
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          # The pre-cloned repo may be owned by a different user than the
+          # runner process; mark all directories as safe to avoid git's
+          # "dubious ownership" error.
+          git config --global --add safe.directory '*'
+          cd "$CLONED_SPYRE_INFERENCE_DIR"
+          # Prefer the PR head SHA when triggered by pull_request, otherwise
+          # fall back to the SHA of the push/tag that triggered the workflow.
+          TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
+          TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git log -1 --oneline
+
+      - name: Gather runner info
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          date
+          pwd
+          whoami
+          id
+          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
+          echo "PATH $PATH"
+          echo "HOME $HOME"
+          python3 --version
+          python3 -c 'import sys; print(sys.path)'
+          echo "--- env ---"
+          env | sort
+          echo "--- AIU env ---"
+          env | sort | grep AIU || true
+          echo "--- repo listing ---"
+          ls -lart "$CLONED_SPYRE_INFERENCE_DIR"
+          echo "---"
+
+      - name: Build spyre-inference
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_SPYRE_INFERENCE_DIR"
+          uv sync \
+            --frozen \
+            --verbose \
+            --all-extras \
+            --group dev
+          # Print the resolved torch install for log visibility.
+          uv pip show torch
+          uv pip freeze
+
+      - name: Run tests
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          cd "$CLONED_SPYRE_INFERENCE_DIR"
+          echo "Running tests..."
+          uv run pytest -s -vvv
+          echo "tests done"
+
+  # ---------------------------------------------------------------------------
+  # Required check gate -- this job name must match the existing branch
+  # protection rule: "tests / Run Spyre unit tests".
+  # It fans in all parallel jobs so the single required check
+  # passes only when every suite passes.
+  # ---------------------------------------------------------------------------
+  run-spyre-unit-tests:
+    name: run spyre unit tests
+    runs-on: ubuntu-latest
+    needs: test
+    if: always()
+    steps:
+      - name: Check all suites passed
+        run: |-
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "One or more test suites failed."
+            exit 1
+          fi
+          echo "All test suites passed."

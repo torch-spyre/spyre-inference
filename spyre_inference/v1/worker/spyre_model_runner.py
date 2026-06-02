@@ -53,6 +53,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -320,10 +321,61 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
     # Potential sub to override KV cache tensor allocation
-    # def _allocate_kv_cache_tensors(
-    #     self,
-    #     kv_cache_config,
-    # ) -> dict[str, torch.Tensor]:
+    def _allocate_kv_cache_tensors(
+        self,
+        kv_cache_config,
+    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
+        if envs.SPYRE_ATTN_IMPL == "exp":
+            kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                block_size = self.vllm_config.cache_config.block_size
+                num_blocks = kv_cache_config.num_blocks
+                head_size = self.vllm_config.model_config.model_arch_config.head_size
+                num_kv_heads = self.vllm_config.model_config.model_arch_config.total_num_kv_heads
+
+                aligned_num_physical_blocks = ((num_blocks + 63) // 64) * 64
+                block_width = block_size * head_size
+
+                k_cache_dev = torch.zeros(
+                    num_kv_heads,
+                    aligned_num_physical_blocks,
+                    block_width,
+                    dtype=self.dtype,
+                    device="spyre",
+                )
+                v_cache_dev = torch.zeros(
+                    num_kv_heads,
+                    aligned_num_physical_blocks,
+                    block_width,
+                    dtype=self.dtype,
+                    device="spyre",
+                )
+
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = (k_cache_dev, v_cache_dev)
+
+            layer_names = set()
+            for group in kv_cache_config.kv_cache_groups:
+                for layer_name in group.layer_names:
+                    if layer_name in self.runner_only_attn_layers:
+                        continue
+                    layer_names.add(layer_name)
+            assert layer_names == set(kv_cache_raw_tensors.keys()), (
+                "Some layers are not correctly initialized"
+            )
+            return kv_cache_raw_tensors
+        else:
+            return super()._allocate_kv_cache_tensors(kv_cache_config)
+
+    def _reshape_kv_cache_tensors(
+        self,
+        kv_cache_raw_tensors: dict[str, torch.Tensor],
+        kernel_block_sizes: list[int],
+    ) -> dict[str, torch.Tensor]:
+        if envs.SPYRE_ATTN_IMPL == "exp":
+            return kv_cache_raw_tensors
+        else:
+            return super()._reshape_kv_cache_tensors(kv_cache_raw_tensors, kernel_block_sizes)
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.

@@ -39,6 +39,35 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+# TODO: Make these hyperparameters configurable
+# KV length alignment: KV tensors are padded to the next multiple of this value.
+# Because torch.compile treats shapes as static constants, every distinct kv_len
+# triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
+# (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
+# rather than recompiling on every decode step.
+KV_LENGTH_ALIGNMENT = 256
+
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
+QUERY_CHUNK_SIZE = 32
+
+
+def _attn_4d(q, k, v, scale, mask):
+    scores = q @ k.transpose(-2, -1)
+    scores = scores * scale
+    scores = scores + mask
+    p = scores.softmax(dim=-1)
+    return p @ v
+
+
+def copy_attn_output(attn_output, num_actual_tokens, output):
+    """Place `attn_output[:num_actual_tokens]` into the caller-provided `output` buffer."""
+    if output.device.type == "spyre":
+        attn_output_spyre = convert(attn_output, "spyre", output.dtype)
+        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])
+    else:
+        output[:num_actual_tokens].copy_(attn_output)
+    return output
+
 
 @dataclass
 class SpyreAttentionMetadata(AttentionMetadata):
@@ -173,35 +202,6 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """PyTorch native implementation of attention with paged KV cache on Spyre."""
 
-    # TODO: Make these hyperparameters configurable
-    # KV length alignment: KV tensors are padded to the next multiple of this value.
-    # Because torch.compile treats shapes as static constants, every distinct kv_len
-    # triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
-    # (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
-    # rather than recompiling on every decode step.
-    KV_LENGTH_ALIGNMENT = 256
-
-    # Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
-    QUERY_CHUNK_SIZE = 32
-
-    @staticmethod
-    def _attn_4d(q, k, v, scale, mask):
-        """4D broadcast attention for Spyre: handles batched GQA.
-
-        Args:
-            q: Query [num_seqs*num_kv_heads, num_queries_per_kv, query_len, head_size]
-            k: Key [num_seqs*num_kv_heads, 1, kv_len, head_size]
-            v: Value [num_seqs*num_kv_heads, 1, kv_len, head_size]
-            scale: Scale factor (float)
-            mask: Additive mask [num_seqs*num_kv_heads, 1, query_len, kv_len]
-                  Pre-computed on CPU: 0.0 for valid, -65504.0 for masked/padded
-        """
-        scores = q @ k.transpose(-2, -1)
-        scores = scores * scale
-        scores = scores + mask
-        p = scores.softmax(dim=-1)
-        return p @ v
-
     def __init__(
         self,
         num_heads: int,
@@ -235,11 +235,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if self.use_sdpa:
             self.attn_op = torch.nn.functional.scaled_dot_product_attention
         else:
-            self.attn_op = self._attn_4d
+            self.attn_op = _attn_4d
 
         # Compile the attention function once for reuse.
-        # dynamic=False forces static shapes, required by the Spyre compiler.
-        self.attn_op = torch.compile(self.attn_op, dynamic=False)
+        self.attn_op = torch.compile(self.attn_op)
 
         # Simplified implementation: don't support these features initially
         if alibi_slopes is not None:
@@ -267,6 +266,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         if attn_metadata is None:
             return output
+
+        # The value still resides on CPU, as it is
+        # created in the GraniteAttention through a split
+        # operation, which has to be carried out on CPU
+        query = convert(query, device="cpu")
+        key = convert(key, device="cpu")
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -321,8 +326,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # [num_actual_tokens, num_heads, head_size]
         attn_output_flat = self._extract_relevant_output(attn_output, attn_metadata.query_start_loc)
 
-        output[:num_actual_tokens].copy_(attn_output_flat)
-        return output
+        return copy_attn_output(attn_output_flat, num_actual_tokens, output)
 
     def _write_to_kv_cache(
         self,
@@ -369,9 +373,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Align max_seq_len to KV_LENGTH_ALIGNMENT
         aligned_max_seq_len = (
-            (max_seq_len + self.KV_LENGTH_ALIGNMENT - 1)
-            // self.KV_LENGTH_ALIGNMENT
-            * self.KV_LENGTH_ALIGNMENT
+            (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
         key_cache = kv_cache[:, 0]  # [num_blocks, block_size, num_kv_heads, head_size]
@@ -444,9 +446,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Align max_seq_len to KV_LENGTH_ALIGNMENT
         aligned_max_seq_len = (
-            (max_seq_len + self.KV_LENGTH_ALIGNMENT - 1)
-            // self.KV_LENGTH_ALIGNMENT
-            * self.KV_LENGTH_ALIGNMENT
+            (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
         # Positions along query and KV dimensions
@@ -575,9 +575,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Pad query length to QUERY_CHUNK_SIZE alignment
         padded_query_len = (
-            (max_query_len + self.QUERY_CHUNK_SIZE - 1)
-            // self.QUERY_CHUNK_SIZE
-            * self.QUERY_CHUNK_SIZE
+            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
         )
 
         if padded_query_len > max_query_len:

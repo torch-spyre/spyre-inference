@@ -93,6 +93,56 @@ def probe_native_all_gather_list(device, device_group, world_size, rank):
         torch.testing.assert_close(o.cpu(), torch.full((1024,), float(r + 1), dtype=torch.float16))
 
 
+def probe_vocab_parallel_embedding(device, device_group, world_size, rank):
+    """TP=N SpyreVocabParallelEmbedding forward vs single-rank F.embedding.
+
+    Constructs the OOT VocabParallelEmbedding (which OOT-swaps to
+    SpyreVocabParallelEmbedding), loads each rank's shard from a
+    deterministic full-vocab weight, runs forward, and asserts the
+    all-reduced result matches a single-rank F.embedding over the full
+    weight bit-for-bit (modulo float16 reduction noise).
+    """
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.vocab_parallel_embedding import (
+        SpyreVocabParallelEmbedding,
+    )
+
+    vocab_size = 1024
+    embedding_dim = 64
+
+    layer = VocabParallelEmbedding(
+        vocab_size,
+        embedding_dim,
+        params_dtype=torch.float16,
+    )
+    assert isinstance(layer, SpyreVocabParallelEmbedding), type(layer)
+    assert layer.tp_size == world_size, layer.tp_size
+
+    # Both ranks reconstruct the same full-vocab reference, then each
+    # populates its shard from the same source — keeps the assertion
+    # below independent of weight initialization.
+    torch.manual_seed(42)
+    full_weight = torch.randn(vocab_size, embedding_dim, dtype=torch.float16) * 0.02
+
+    start = layer.shard_indices.org_vocab_start_index
+    end = layer.shard_indices.org_vocab_end_index
+    layer.weight.data.zero_()
+    layer.weight.data[: end - start].copy_(full_weight[start:end])
+    layer.to(device)
+
+    torch.manual_seed(7)
+    input_ids = torch.randint(0, vocab_size, (16,), dtype=torch.int64)
+
+    out = layer(input_ids.to(device)).cpu()
+    expected = F.embedding(input_ids, full_weight)
+    torch.testing.assert_close(out.float(), expected.float(), atol=1e-3, rtol=1e-3)
+    dist.barrier(device_ids=[device.index])
+
+
 def probe_native_gather(device, device_group, world_size, rank):
     """Raw `dist.gather` to rank 0 on the spyreccl device_group."""
     t = torch.full((1024,), float(rank + 1), dtype=torch.float16, device=device)
@@ -116,6 +166,7 @@ PROBES = {
     "native_all_gather_into_tensor": probe_native_all_gather_into_tensor,
     "native_all_gather_list": probe_native_all_gather_list,
     "native_gather": probe_native_gather,
+    "vocab_parallel_embedding": probe_vocab_parallel_embedding,
 }
 
 

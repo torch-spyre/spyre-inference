@@ -39,6 +39,7 @@ jobs:
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
       CLONED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
     steps:
       - name: Checkout PR branch/commit in pre-cloned spyre-inference

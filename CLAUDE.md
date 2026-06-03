@@ -186,6 +186,16 @@ The single most important signal: `FallbackWarning`. `torch-spyre` silently rout
 
 Most "Spyre is broken" bugs are not in our code — they are torch-spyre op gaps, dtype/layout limitations, or shape-bucket misses. Read the relevant `.venv/lib/python3.12/site-packages/torch_spyre/ops/{eager,fallbacks}.py` files before assuming a local bug.
 
+## Researching torch-spyre Issues and PRs
+
+When exploring a new feature area (e.g., FP8 quantization, new operators, hardware support), **survey the torch-spyre repo for existing issues and PRs first**. This avoids duplicating work and surfaces known blockers.
+
+**How to search:**
+
+1. GitHub issue/PR search: `https://github.com/torch-spyre/torch-spyre/issues?q=<keyword>` and `/pulls?q=<keyword>`
+2. Search terms: Use both short and long forms (e.g., `FP8`, `float8`, `scaled_mm`, `_scaled_mm`)
+3. Check both open and closed/merged items — merged PRs show what's landed, closed issues may explain why something was deferred
+
 ## Code Style
 
 - **Line length**: 100 characters (ruff)

@@ -135,6 +135,49 @@ When editing `./torch-spyre/` (or any sibling checkout) and reinstalling via `uv
 - **Compilation**: Platform-level compile is set to `CompilationMode.NONE` due to CPU fallback ops creating intermediates. **Caveat**: under the pytest `default_vllm_config` fixture, `cfg.mode` is Python `None` (not the `NONE=0` enum), so per-module gates like `_maybe_compile` in `spyre_attn.py` may still wrap kernels with `torch.compile(..., dynamic=False)`. Don't assume "eager in tests" when comparing pytest behavior to a plain script.
 - **Single accelerator**: Spyre is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/`xdist`, no parallel `uv run pytest` invocations, no backgrounding one Spyre test while starting another. Parallel invocations hang, produce undefined device state, or corrupt the compile cache.
 
+## Spyre Knowledgebase
+
+  Before searching code for questions about Spyre architecture, PyTorch integration, vLLM stack, or hardware interfaces, query the spyre-knowledgebase MCP server first. It contains curated documentation on:
+
+  - Hardware microarchitecture and execution models
+  - Upstream components (PyTorch, vLLM, Triton)
+  - Software stack layers (torch-spyre, deeptools, torch-runtime, flex-runtime)
+  - Interface contracts and end-to-end flows
+  - Tracked repository knowledge
+
+  **Usage:**
+
+  *Search the knowledgebase*
+
+  ```
+  mcp__spyre-knowledgebase__search(query="your question", scope="wiki")
+  ```
+
+  *Read specific pages*
+
+  ```
+  mcp__spyre-knowledgebase__read(path="wiki/stack/torch-spyre.md")
+  ```
+
+  *Get the wiki schema/structure*
+
+  ```
+  mcp__spyre-knowledgebase__guide()
+  ```
+
+  **When to use:**
+
+  - Checking hardware constraints or format requirements
+  - Finding upstream component behavior
+
+  **When to skip:**
+
+  - Debugging a specific code bug (go straight to code)
+  - Questions about this repo's test layout or development commands
+  - Looking for this repo's specific implementation details
+
+  Treat the knowledgebase as the authoritative map; verify against live code before making changes.
+
 ## Debugging
 
 When a test fails with numerical mismatch, a compile error on `spyre`, or a silent CPU fallback, invoke the `debug-spyre` skill (`.claude/skills/debug-spyre/SKILL.md`). It encodes the cluster-of-failures workflow, hypothesis-queue protocol, torch-spyre site-packages tracing, and escalation criteria. Attention-specific notes live in `.claude/skills/debug-spyre/attention-notes.md`.

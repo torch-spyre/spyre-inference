@@ -139,42 +139,42 @@ When editing `./torch-spyre/` (or any sibling checkout) and reinstalling via `uv
 
   Before searching code for questions about Spyre architecture, PyTorch integration, vLLM stack, or hardware interfaces, query the spyre-knowledgebase MCP server first. It contains curated documentation on:
 
-  - Hardware microarchitecture and execution models
-  - Upstream components (PyTorch, vLLM, Triton)
-  - Software stack layers (torch-spyre, deeptools, torch-runtime, flex-runtime)
-  - Interface contracts and end-to-end flows
-  - Tracked repository knowledge
+- Hardware microarchitecture and execution models
+- Upstream components (PyTorch, vLLM, Triton)
+- Software stack layers (torch-spyre, deeptools, torch-runtime, flex-runtime)
+- Interface contracts and end-to-end flows
+- Tracked repository knowledge
 
   **Usage:**
 
   *Search the knowledgebase*
 
-  ```
+  ```txt
   mcp__spyre-knowledgebase__search(query="your question", scope="wiki")
   ```
 
   *Read specific pages*
 
-  ```
+  ```txt
   mcp__spyre-knowledgebase__read(path="wiki/stack/torch-spyre.md")
   ```
 
   *Get the wiki schema/structure*
 
-  ```
+  ```txt
   mcp__spyre-knowledgebase__guide()
   ```
 
   **When to use:**
 
-  - Checking hardware constraints or format requirements
-  - Finding upstream component behavior
+- Checking hardware constraints or format requirements
+- Finding upstream component behavior
 
   **When to skip:**
 
-  - Debugging a specific code bug (go straight to code)
-  - Questions about this repo's test layout or development commands
-  - Looking for this repo's specific implementation details
+- Debugging a specific code bug (go straight to code)
+- Questions about this repo's test layout or development commands
+- Looking for this repo's specific implementation details
 
   Treat the knowledgebase as the authoritative map; verify against live code before making changes.
 

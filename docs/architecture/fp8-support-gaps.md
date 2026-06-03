@@ -31,7 +31,7 @@ As of June 2026, there are **9+ open issues and PRs** related to FP8 in torch-sp
 
 ## Summary
 
-**Hardware capability:** The AIU accelerator supports FP8 natively — both E4M3 (1-4-3) and E5M2 (1-5-2) formats are available on AIU 1.0 and AIU 1.5.
+**Hardware capability:** The AIU accelerator supports FP8 natively — both E4M3 (1-4-3) and E5M2 (1-5-2) formats are available on AIU 1.0 and AIU 1.5. These are the **standard** FP8 formats (same as NVIDIA H100+), not the FNUZ variants used by some other accelerators.
 
 **Software reality:** The spyre-inference plugin and torch-spyre stack do **not** support FP8 quantization. All custom ops explicitly exclude quantized paths, and torch-spyre lacks the necessary kernel support for FP8 matmul operations.
 
@@ -60,9 +60,9 @@ As of June 2026, there are **9+ open issues and PRs** related to FP8 in torch-sp
 
 **FP8 dtype support:**
 
-- PyTorch provides `torch.float8_e4m3fn` and `torch.float8_e5m2` dtypes
+- PyTorch provides `torch.float8_e4m3fn` and `torch.float8_e5m2` dtypes (standard formats, not FNUZ variants)
 - Basic FP8 tensor creation works on CPU
-- **FP8 tensors cannot be created on spyre device**: `"normal_kernel_cpu" not implemented for 'Float8_e4m3fn'` — random initialization kernels don't support FP8
+- **FP8 tensors cannot be directly initialized on spyre device**: Random initialization kernels like `torch.randn()` don't support FP8 dtypes on spyre (`"normal_kernel_cpu" not implemented for 'Float8_e4m3fn'`). However, FP8 tensors can be created on CPU (e.g., `torch.rand().to(dtype=torch.float8_e4m3fn)`) and transferred to spyre successfully.
 
 **Matmul kernel support:**
 
@@ -142,10 +142,11 @@ None of these components have Spyre-specific implementations.
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| FP8 tensor creation on device | ❌ Blocked | `"normal_kernel_cpu" not implemented` |
+| FP8 tensor creation on device | ⚠️ Partial | Direct initialization (`torch.randn`) unsupported; CPU→spyre transfer works |
 | FP8 matmul kernel | ❌ Missing | No `_scaled_mm` or equivalent |
 | FP8 decompositions | ❌ Missing | Not registered in patches.py |
 | FP8 lowerings | ❌ Missing | Not in lowering registry |
+| FP8 ops trigger InductorError | ⚠️ Known issue | Issue #1474: "Support operations on Float8 (SEN143_FP8) tensors" |
 | Scale tensor ops | ⚠️ Unknown | Need to verify basic support |
 
 ### spyre-inference Gaps
@@ -170,7 +171,11 @@ To detect when FP8 support lands in torch-spyre:
 
 3. **Test FP8 tensor creation**:
    ```python
+   # Direct initialization (currently fails):
    torch.randn(8, 8, dtype=torch.float8_e4m3fn, device='spyre')
+
+   # CPU creation + transfer (works):
+   torch.rand(8, 8, dtype=torch.float8_e4m3fn).to('spyre')
    ```
 
 4. **Monitor vLLM FP8 tests** — when they start passing on spyre, the backend support is ready
@@ -179,4 +184,5 @@ To detect when FP8 support lands in torch-spyre:
 
 - vLLM FP8 implementation: `vllm/model_executor/layers/quantization/fp8.py`
 - vLLM FP8 kernels: `vllm/model_executor/kernels/linear/scaled_mm.py`
-- PyTorch FP8 docs: `torch.float8_e4m3fn`, `torch.float8_e5m2`
+- PyTorch FP8 docs: `torch.float8_e4m3fn`, `torch.float8_e5m2` (standard formats; AIU does **not** use FNUZ variants)
+- Hardware precision formats: spyre-knowledgebase `wiki/foundations/hardware/precision-formats.md`

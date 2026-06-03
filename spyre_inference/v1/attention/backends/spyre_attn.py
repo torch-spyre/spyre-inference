@@ -185,8 +185,14 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """
 
     def specialized_reshape_and_cache_kernel(
-        key_cpu, value_cpu, target_device, target_dtype,
-        k_pages, v_pages, block_indices, block_offsets,
+        key_cpu,
+        value_cpu,
+        target_device,
+        target_dtype,
+        k_pages,
+        v_pages,
+        block_indices,
+        block_offsets,
     ):
         # this kernels specializes (i.e. compiles for specific constants) for num_tokens
         # Slice on CPU (Spyre slicing corrupts memory),
@@ -194,12 +200,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         for t in range(num_tokens):
             block_idx = block_indices[t]
             block_offset = block_offsets[t]
-            k_tok = convert(
-                key_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype
-            )
-            v_tok = convert(
-                value_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype
-            )
+            k_tok = convert(key_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
+            v_tok = convert(value_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
             _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
             _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
 
@@ -269,6 +271,7 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
+        assert tile_output is not None and tile_sum is not None
         return tile_output / tile_sum
 
     return specialized_paged_attn_kernel
@@ -538,7 +541,7 @@ class SpyreAttentionBackend(AttentionBackend):
         # TODO this should be:
         #     return (num_blocks, 2, block_size, num_kv_heads, head_size)
         # but for the lists it is actually
-        return [
+        return [  # ty: ignore[invalid-return-type]
             (num_blocks, block_size, num_kv_heads, head_size),
             (num_blocks, block_size, num_kv_heads, head_size),
         ]
@@ -638,6 +641,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        assert (
+            attn_metadata.slot_block_indices is not None
+            and attn_metadata.slot_block_offsets is not None
+        ), "slot_block_indices/offsets must be precomputed by the metadata builder"
+
         # Derive target device from the pages themselves
         if self._target_device is None:
             self._target_device = k_pages[0].device
@@ -689,8 +697,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         fn = self._get_reshape_fn(num_tokens)
         fn(
-            key_cpu, value_cpu, self._target_device, self._target_dtype,
-            k_pages, v_pages, block_indices, block_offsets,
+            key_cpu,
+            value_cpu,
+            self._target_device,
+            self._target_dtype,
+            k_pages,
+            v_pages,
+            block_indices,
+            block_offsets,
         )
 
     def _online_softmax_attention(
@@ -721,6 +735,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
         padded_query_lens = attn_metadata.padded_query_lens  # [num_seqs]
+        assert mask_tiles_all is not None and padded_query_lens is not None, (
+            "attention_mask_tiles and padded_query_lens must be precomputed by the metadata builder"
+        )
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization

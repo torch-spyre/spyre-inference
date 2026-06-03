@@ -333,9 +333,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
-            ln: g.kv_cache_spec
-            for g in kv_cache_config.kv_cache_groups
-            for ln in g.layer_names
+            ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
         }
 
         kv_caches: dict[str, torch.Tensor] = {}
@@ -371,7 +369,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
             page_cache = (k_pages, v_pages)
             for layer_name in kv_cache_tensor.shared_by:
-                kv_caches[layer_name] = page_cache  # type: ignore[assignment]
+                kv_caches[layer_name] = page_cache
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]

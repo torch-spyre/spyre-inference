@@ -33,7 +33,8 @@ import torch
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 quantization not supported in torch-spyre: FP8 tensor creation on device fails with 'normal_kernel_cpu not implemented for Float8_e4m3fn'",
+    reason="FP8 quantization not supported: FP8 tensor creation on device fails "
+    "with 'normal_kernel_cpu not implemented for Float8_e4m3fn'",
 )
 def test_fp8_tensor_creation_on_spyre(tp_group):
     """FP8 tensors must be creatable directly on spyre device.
@@ -128,7 +129,8 @@ def test_fp8_linear_layer_with_quant_config(tp_group):
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 online quantization (W8A16 dynamic) not supported - requires activation quantization kernels",
+    reason="FP8 online quantization (W8A16 dynamic) not supported - "
+    "requires activation quantization kernels",
 )
 def test_fp8_online_quantization(tp_group):
     """FP8 online (dynamic) quantization path must work.
@@ -244,9 +246,6 @@ def test_fp8_kv_cache(tp_group):
     """
     from vllm.model_executor.layers.quantization.kv_cache import Fp8KVCacheMethod
     from vllm.attention.backends.abstract import Attention
-
-    # FP8 KV cache method
-    kv_cache_config = type("KVCacheConfig", (), {"dtype": "fp8_e4m3fn"})()
 
     # Attention layer with FP8 KV cache
     attn = Attention(

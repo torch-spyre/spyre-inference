@@ -197,11 +197,9 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
             k_tok = convert(
                 key_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype
             )
-            # k_tok = key_cpu[t].unsqueeze(1).contiguous()
             v_tok = convert(
                 value_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype
             )
-            # v_tok = value_cpu[t].unsqueeze(1).contiguous()
             _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
             _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
 

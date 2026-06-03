@@ -331,10 +331,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        # Iterate kv_cache_tensors (one entry per physical buffer) rather than
-        # kv_cache_groups: groups bundle all layers with the same spec, but
-        # each layer needs its OWN pages — sharing one (k_pages, v_pages)
-        # across layers makes them clobber each other's K/V every forward.
+        # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
             ln: g.kv_cache_spec
             for g in kv_cache_config.kv_cache_groups

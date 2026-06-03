@@ -4,7 +4,7 @@ This page documents the current state of FP8 (float8) quantization support in th
 
 **Status: Not Supported** — FP8 quantization is explicitly excluded from current implementation
 
-**Related:** [Hardware Precision Formats](../../wiki/foundations/hardware/precision-formats.md), [Model Enablement](../../wiki/stack/model-enablement.md), [Torch-Spyre](../../wiki/stack/torch-spyre.md)
+**Related:** See the spyre-knowledgebase MCP server for hardware precision formats and torch-spyre architecture details. Use `mcp__spyre-knowledgebase__search(query="FP8 float8 precision")` to query.
 
 ## Summary
 

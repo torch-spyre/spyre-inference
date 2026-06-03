@@ -108,8 +108,6 @@ class SpyreParallelLMHead(ParallelLMHead):
                 f"(tp_size={self.tp_size}). Only tp_size=1 is supported."
             )
 
-        logger.debug("Building custom ParallelLMHead for Spyre")
-
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 

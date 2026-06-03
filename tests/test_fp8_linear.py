@@ -33,7 +33,7 @@ import torch
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 quantization not supported in torch-spyre: FP8 tensor creation on device fails with 'normal_kernel_cpu not implemented for Float8_e4m3fn'"
+    reason="FP8 quantization not supported in torch-spyre: FP8 tensor creation on device fails with 'normal_kernel_cpu not implemented for Float8_e4m3fn'",
 )
 def test_fp8_tensor_creation_on_spyre(tp_group):
     """FP8 tensors must be creatable directly on spyre device.
@@ -56,7 +56,7 @@ def test_fp8_tensor_creation_on_spyre(tp_group):
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 matmul kernel (_scaled_mm or equivalent) not implemented in torch-spyre"
+    reason="FP8 matmul kernel (_scaled_mm or equivalent) not implemented in torch-spyre",
 )
 def test_fp8_matmul_w8a8(tp_group):
     """FP8 W8A8 (weight 8-bit, activation 8-bit) matmul must be supported.
@@ -88,7 +88,7 @@ def test_fp8_matmul_w8a8(tp_group):
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="spyre-inference does not intercept Fp8Config - only UnquantizedLinearMethod is handled"
+    reason="spyre-inference does not intercept Fp8Config - only UnquantizedLinearMethod is handled",
 )
 def test_fp8_linear_layer_with_quant_config(tp_group):
     """Linear layers must work with vLLM's Fp8Config quantization config.
@@ -120,6 +120,7 @@ def test_fp8_linear_layer_with_quant_config(tp_group):
 
     # Should get a Spyre FP8 method, not the unquantized one
     from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
+
     assert not isinstance(layer.quant_method, SpyreUnquantizedLinearMethod)
 
 
@@ -127,7 +128,7 @@ def test_fp8_linear_layer_with_quant_config(tp_group):
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 online quantization (W8A16 dynamic) not supported - requires activation quantization kernels"
+    reason="FP8 online quantization (W8A16 dynamic) not supported - requires activation quantization kernels",
 )
 def test_fp8_online_quantization(tp_group):
     """FP8 online (dynamic) quantization path must work.
@@ -166,7 +167,7 @@ def test_fp8_online_quantization(tp_group):
 @pytest.mark.fp8
 @pytest.mark.xfail(
     strict=True,
-    reason="FP8 checkpoint loading (process_weights_after_loading) not implemented for FP8 weights"
+    reason="FP8 checkpoint loading (process_weights_after_loading) not implemented for FP8 weights",
 )
 def test_fp8_weight_loading(tp_group):
     """FP8 quantized weights must load correctly through the quantization path.
@@ -204,8 +205,7 @@ def test_fp8_weight_loading(tp_group):
 @pytest.mark.spyre
 @pytest.mark.fp8
 @pytest.mark.xfail(
-    strict=True,
-    reason="Block-wise FP8 quantization (per-block scales) not supported"
+    strict=True, reason="Block-wise FP8 quantization (per-block scales) not supported"
 )
 def test_fp8_blockwise_quantization(tp_group):
     """FP8 block-wise quantization must be supported.
@@ -232,8 +232,7 @@ def test_fp8_blockwise_quantization(tp_group):
 @pytest.mark.spyre
 @pytest.mark.fp8
 @pytest.mark.xfail(
-    strict=True,
-    reason="FP8 KV cache quantization not supported in attention backend"
+    strict=True, reason="FP8 KV cache quantization not supported in attention backend"
 )
 def test_fp8_kv_cache(tp_group):
     """FP8 KV cache must be supported in the attention backend.
@@ -247,7 +246,7 @@ def test_fp8_kv_cache(tp_group):
     from vllm.attention.backends.abstract import Attention
 
     # FP8 KV cache method
-    kv_cache_config = type('KVCacheConfig', (), {'dtype': 'fp8_e4m3fn'})()
+    kv_cache_config = type("KVCacheConfig", (), {"dtype": "fp8_e4m3fn"})()
 
     # Attention layer with FP8 KV cache
     attn = Attention(

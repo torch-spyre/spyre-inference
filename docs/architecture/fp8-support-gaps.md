@@ -146,6 +146,7 @@ To detect when FP8 support lands in torch-spyre:
    - FP8-specific decompositions
 
 3. **Test FP8 tensor creation**:
+
    ```python
    torch.randn(8, 8, dtype=torch.float8_e4m3fn, device='spyre')
    ```

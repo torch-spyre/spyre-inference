@@ -59,8 +59,6 @@ class SpyreSiluAndMul(SiluAndMul):
         """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
 
-        logger.debug("Building custom SiluAndMul")
-
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         """Spyre-optimized SiLU and multiply activation (SwiGLU).
 

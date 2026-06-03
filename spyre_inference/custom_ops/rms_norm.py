@@ -74,8 +74,6 @@ class SpyreRMSNorm(RMSNorm):
         """
         super().__init__(*args, **kwargs)
 
-        logger.debug("Building custom RMS norm")
-
         self._target_device = torch.device("spyre")
         self._target_dtype = torch.float16
         self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)

@@ -26,7 +26,7 @@ jobs:
     name: 'build and run tests'
     runs-on:
       - x86_64
-      - spyre_pf_x1
+      - spyre_pf_x1__pvc_1tb_x1
       - linux
       - image_spyre_inference
     timeout-minutes: 720
@@ -39,6 +39,8 @@ jobs:
       CI: ''
       CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
       CLONED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
 
     steps:
       - name: Checkout PR branch/commit in pre-cloned spyre-inference

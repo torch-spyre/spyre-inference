@@ -48,7 +48,7 @@ Some useful overrides:
 
 ```bash
 # Run only local tests
-pytest -m spyre
+pytest
 
 # Run all upstream tests
 pytest -m upstream

@@ -21,7 +21,6 @@ import torch
 import torch.nn.functional as F
 
 
-@pytest.mark.spyre
 @pytest.mark.mlp
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize("hidden_size,intermediate_size", [(64, 128), (128, 256), (512, 1024)])
@@ -61,7 +60,6 @@ def test_merged_column_matches_reference(
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.spyre
 @pytest.mark.mlp
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize(
@@ -114,7 +112,6 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.spyre
 @pytest.mark.mlp
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize("input_size,output_size", [(128, 64), (256, 128), (1024, 512)])
@@ -158,7 +155,6 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.spyre
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -203,7 +199,6 @@ def test_spyre_strided_scatter_source():
     kv_cache[block_indices, 1, block_offsets] = v
 
 
-@pytest.mark.spyre
 @pytest.mark.mlp
 def test_linear_oot_registration(tp_group):
     """Verify OOT class swaps for all three linear layer types."""

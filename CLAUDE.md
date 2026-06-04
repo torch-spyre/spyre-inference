@@ -45,8 +45,11 @@ uv sync --frozen
 # Development install with test dependencies
 uv sync --group dev
 
-# Run Spyre device tests
-uv run pytest -m spyre
+# Run all tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest
+
+# Run distributed tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest -m distributed
 
 # Run upstream vLLM tests (cached in ~/.cache/vllm-upstream-tests)
 uv run pytest -m upstream

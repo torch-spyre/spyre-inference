@@ -34,17 +34,15 @@ jobs:
               - linux
               - image_spyre_inference
             flags: >-
-              -m "not (upstream or uses_subprocess)"
+              -m "not (distributed or upstream)"
           - cfg: Distributed spyre tests
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
               - image_spyre_inference
-            env:
-              AIU_WORLD_SIZE: 2
             flags: >-
-              -m "uses_subprocess and not (spyre or upstream)"
+              -m distributed
           - cfg: Upstream vLLM tests
             runs_on:
               - x86_64
@@ -129,9 +127,9 @@ jobs:
           uv pip freeze
 
       - name: Run tests
-        env:
-          AIU_WORLD_SIZE: ${{ matrix.env.AIU_WORLD_SIZE }}
         run: |
+          unset _IBM_AIU_SETUP
+          rm /tmp/etc/ibm/spyre/topo.json
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_SPYRE_INFERENCE_DIR"

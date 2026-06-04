@@ -53,8 +53,8 @@ def _spyre_device_count() -> int:
         return 0
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
@@ -71,8 +71,8 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
     run_tp_probe("native_all_reduce", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
@@ -91,8 +91,8 @@ def test_native_all_gather_into_tensor_works(run_tp_probe) -> None:
     run_tp_probe("native_all_gather_into_tensor", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
@@ -109,8 +109,8 @@ def test_native_all_gather_list_works(run_tp_probe) -> None:
     run_tp_probe("native_all_gather_list", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",

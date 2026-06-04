@@ -145,13 +145,15 @@ def _indirect_matmul_mock(
 def _maybe_compile(fn):
     """Compile fn unless vLLM's compilation config disables it.
 
-    Mirrors the gating in CustomOp.maybe_compile (vllm/model_executor/custom_op.py)
-    without requiring CustomOp inheritance.
+    Mirrors the gating in CustomOp.maybe_compile.
     """
-    from vllm.config import get_cached_compilation_config
+    from vllm.config import get_current_vllm_config_or_none
     from vllm.config.compilation import CompilationMode
 
-    cfg = get_cached_compilation_config()
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return fn
+    cfg = config.compilation_config
     if cfg.mode == CompilationMode.NONE or cfg.backend == "eager":
         return fn
     return torch.compile(fn, dynamic=False)
@@ -169,21 +171,17 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """
 
     def specialized_reshape_and_cache_kernel(
-        key_dev,
-        value_dev,
+        key,
+        value,
         k_pages,
         v_pages,
         block_indices,
         block_offsets,
+        target_device,
     ):
-        # key_dev/value_dev are full [num_tokens, num_kv_heads, head_size] Spyre
-        # tensors. Per-token select+unsqueeze runs inside the compiled graph —
-        # Spyre's eager slicing is broken, but the inductor lowering handles
-        # aten.select fine, and having real ops next to spyre.overwrite avoids
-        # the SDSC compiler crash on trivial mutation-only graphs.
         for t in range(num_tokens):
-            k_tok = key_dev[t].unsqueeze(1)
-            v_tok = value_dev[t].unsqueeze(1)
+            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
+            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
             _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
             _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
 
@@ -670,16 +668,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         num_tokens = key_cpu.shape[0]
 
-        # Force CPU contiguous (value from QKV split-along-last-dim is
-        # non-contiguous; transferring non-contiguous CPU tensors to Spyre
-        # silently corrupts data — see custom_ops/silu_and_mul.py). Single
-        # CPU→Spyre transfer; the per-token select+unsqueeze happens inside
-        # the compiled kernel.
-        key_dev = convert(key_cpu.contiguous(), device=_target_device)
-        value_dev = convert(value_cpu.contiguous(), device=_target_device)
+        # Force CPU contiguous: value from QKV split-along-last-dim is
+        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
+        # silently corrupts data (see custom_ops/silu_and_mul.py).
+        key_cpu = key_cpu.contiguous()
+        value_cpu = value_cpu.contiguous()
 
         fn = self._get_reshape_fn(num_tokens)
-        fn(key_dev, value_dev, k_pages, v_pages, block_indices, block_offsets)
+        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
 
     def _online_softmax_attention(
         self,

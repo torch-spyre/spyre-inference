@@ -55,13 +55,6 @@ def parse_args():
         help="Compare results with HuggingFace CPU inference",
     )
     parser.add_argument(
-        "--attention-backend",
-        type=str,
-        default="CUSTOM",
-        dest="attention_backend",
-        help="Attention backend to use (e.g., CUSTOM for Spyre, CPU)",
-    )
-    parser.add_argument(
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
@@ -123,8 +116,6 @@ def main():
     # lazy import to switch between old an new platform:
     # platform registration happens at import time
     from vllm import LLM, SamplingParams
-    from vllm.config import AttentionConfig
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     sampling_params = [
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
@@ -140,9 +131,6 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        attention_config=AttentionConfig(backend=AttentionBackendEnum[args.attention_backend])
-        if args.attention_backend is not None
-        else None,
     )
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects

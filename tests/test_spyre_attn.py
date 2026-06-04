@@ -200,7 +200,7 @@ def ref_attn(
 @pytest.mark.parametrize(
     "configure_device",
     [
-        # pytest.param("cpu", id="device_cpu"),
+        pytest.param("cpu", id="device_cpu"),
         pytest.param("spyre", id="device_spyre"),
     ],
     indirect=True,
@@ -208,8 +208,7 @@ def ref_attn(
 @pytest.mark.parametrize(
     "configure_compilation",
     [
-        # TODO: eager fails?
-        # pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("NONE", id="compilation_NONE"),
         pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
     ],
     indirect=True,
@@ -278,9 +277,10 @@ def test_spyre_attn(
     configure_device: str,
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
-    # # TODO: STOCK_TORCH_COMPILE + Spyre device crashes dxp_standalone
-    # if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
-    #     pytest.skip("STOCK + device_spyre fails in torch-spyre's SDSC compiler; follow-up PR")
+    # TODO: STOCK_TORCH_COMPILE + Spyre device crashes.
+    # Re-enable once that's fixed.
+    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
+        pytest.skip("STOCK + device_spyre fails in torch-spyre.")
 
     num_query_heads, num_kv_heads = num_heads
     # only for preparation, actual device is set via `configure_device`

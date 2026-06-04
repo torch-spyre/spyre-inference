@@ -2,19 +2,19 @@
 # Format: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
 
 # Default owners for the entire repository
-* @joerunde @tdoublep @RajalakshmiSR @rishikakedia @bohnstingl
+* @torch-spyre/spyre-inference-default-codeowners @RajalakshmiSR @rishikakedia
 
 # Core platform and registration
-spyre_inference/platform.py @joerunde @yannicks1
+spyre_inference/platform.py @torch-spyre/spyre-inference-default-codeowners @yannicks1
 
 # Custom operations (OOT layers for Spyre)
-spyre_inference/custom_ops/ @bohnstingl @yannicks1 @dilipgb
+spyre_inference/custom_ops/ @torch-spyre/spyre-inference-default-codeowners @yannicks1 @dilipgb
 
 # v1 worker and model runner
-spyre_inference/v1/worker/ @bohnstingl @joerunde
+spyre_inference/v1/worker/ @torch-spyre/spyre-inference-default-codeowners
 
 # Attention backend (PyTorch-native Spyre attention)
-spyre_inference/v1/attention/ @jvlunteren @bohnstingl @bringlein
+spyre_inference/v1/attention/ @torch-spyre/spyre-inference-default-codeowners @jvlunteren @bringlein
 
 # CICD
-.github @joerunde @tdoublep @HarikrishnanBalagopal @ashokponkumar @kmehant
+.github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant

@@ -20,7 +20,6 @@ import pytest
 
 
 @pytest.mark.spyre
-@pytest.mark.uses_subprocess
 def test_basic_model_load():
     model = LLM(
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",

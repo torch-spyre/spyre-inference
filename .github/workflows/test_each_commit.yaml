@@ -23,12 +23,37 @@ permissions:
 
 jobs:
   test:
-    name: 'build and run tests'
-    runs-on:
-      - x86_64
-      - spyre_pf_x1__pvc_1tb_x1
-      - linux
-      - image_spyre_inference
+    name: 'build and run tests (${{ matrix.cfg }})'
+    strategy:
+      matrix:
+        include:
+          - cfg: Non-distributed spyre tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+              - image_spyre_inference
+            flags: >-
+              -m "not (upstream or uses_subprocess)"
+          - cfg: Distributed spyre tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x2__pvc_1tb_x1
+              - linux
+              - image_spyre_inference
+            env:
+              AIU_WORLD_SIZE: 2
+            flags: >-
+              -m "uses_subprocess and not (spyre or upstream)"
+          - cfg: Upstream vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+              - image_spyre_inference
+            flags: >-
+              -m upstream
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 720
     env:
       # The CI env var is very important.
@@ -98,25 +123,26 @@ jobs:
           uv sync \
             --frozen \
             --verbose \
-            --all-extras \
             --group dev
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze
 
       - name: Run tests
+        env:
+          AIU_WORLD_SIZE: ${{ matrix.env.AIU_WORLD_SIZE }}
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_SPYRE_INFERENCE_DIR"
-          echo "Running tests..."
-          uv run pytest -s -vvv
+          echo "Running tests for config: ${{ matrix.cfg }}..."
+          uv run pytest -s -vvv ${{ matrix.flags }}
           echo "tests done"
 
   # ---------------------------------------------------------------------------
   # Required check gate -- this job name must match the existing branch
   # protection rule: "tests / Run Spyre unit tests".
-  # It fans in all parallel jobs so the single required check
+  # It fans in all matrix jobs so the single required check
   # passes only when every suite passes.
   # ---------------------------------------------------------------------------
   run-spyre-unit-tests:
@@ -127,7 +153,7 @@ jobs:
     steps:
       - name: Check all suites passed
         run: |-
-          if [[ "${{ needs.test.result }}" != "success" ]]; then
+          if ${{ contains(needs.test.result, 'failure') || contains(needs.test.result, 'cancelled') }}; then
             echo "One or more test suites failed."
             exit 1
           fi

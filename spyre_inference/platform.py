@@ -79,7 +79,7 @@ class TorchSpyrePlatform(CpuPlatform):
         _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
 
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
-    
+
     @classmethod
     def opaque_attention_op(cls) -> bool:
         # This is required to keep the output tensor of attention on Spyre.

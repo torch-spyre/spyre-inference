@@ -83,9 +83,7 @@ QUERY_CHUNK_SIZE = 32
 def _maybe_compile(fn):
     """Compile fn unless vLLM's compilation config disables it.
 
-    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
-    inheritance: returns fn unchanged when compilation mode is NONE or the
-    backend is "eager", otherwise wraps it with torch.compile.
+    Mirrors the gating in CustomOp.maybe_compile.
     """
     from vllm.config import get_cached_compilation_config
     from vllm.config.compilation import CompilationMode

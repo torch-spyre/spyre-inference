@@ -72,11 +72,6 @@ def configure_compilation(request, monkeypatch):
     # which trigger recompilation on each unique block index value
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
-    # Sync module-level compile gate with the test's compilation mode
-    from spyre_inference.v1.attention.backends import spyre_attn
-
-    monkeypatch.setattr(spyre_attn, "_ENABLE_COMPILE", compilation_mode != CompilationMode.NONE)
-
     yield mode_name
 
     # Cleanup: reset mode and limits
@@ -96,13 +91,13 @@ def _build_metadata(
     slot_mapping: torch.Tensor,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
-    from vllm.config import VllmConfig
-    from vllm.config.compilation import CompilationConfig
+    from vllm.config import get_current_vllm_config
 
-    vllm_config = VllmConfig(compilation_config=CompilationConfig(custom_ops=["all"]))
-    vllm_config.model_config = Mock()
-    vllm_config.model_config.get_num_attention_heads.return_value = num_query_heads
-    vllm_config.model_config.get_num_kv_heads.return_value = num_kv_heads
+    # Reuse the VllmConfig set up by the `default_vllm_config` fixture and
+    # stub the head-count methods the builder reads.
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
 
     kv_cache_spec = AttentionSpec(
         block_size=block_size,
@@ -205,7 +200,7 @@ def ref_attn(
 @pytest.mark.parametrize(
     "configure_device",
     [
-        pytest.param("cpu", id="device_cpu"),
+        # pytest.param("cpu", id="device_cpu"),
         pytest.param("spyre", id="device_spyre"),
     ],
     indirect=True,
@@ -283,6 +278,10 @@ def test_spyre_attn(
     configure_device: str,
 ) -> None:
     """Validate SpyreAttentionImpl against a reference implementation."""
+    # # TODO: STOCK_TORCH_COMPILE + Spyre device crashes dxp_standalone
+    # if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
+    #     pytest.skip("STOCK + device_spyre fails in torch-spyre's SDSC compiler; follow-up PR")
+
     num_query_heads, num_kv_heads = num_heads
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")

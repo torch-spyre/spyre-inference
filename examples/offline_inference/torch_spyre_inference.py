@@ -16,24 +16,11 @@
 This example shows how to run offline inference on Spyre using the torch-spyre
 plugin code with the TorchSpyreModelRunner.
 
-Optionally, individual layers can be offloaded to Spyre via --custom_ops:
-  - "all": Run all supported ops on Spyre (default when enforce_eager=False)
-  - "none": Run entirely on CPU (default when enforce_eager=True)
-  - "+LayerName": Selectively enable specific layers on Spyre
-    (e.g., --custom_ops +RMSNorm +SiluAndMul)
-
 Use --enforce-eager to skip torch.compile and run in eager mode.
-
-Environment variables must be set BEFORE importing vLLM:
-  - VLLM_TARGET_DEVICE=spyre_inference: Selects the Spyre platform
-  - VLLM_PLUGINS=spyre_inference,spyre_inference_ops: Loads the plugins
 """
 
 import os
 
-# Set environment variables BEFORE importing vLLM
-os.environ["VLLM_TARGET_DEVICE"] = "spyre_inference"
-os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
 
 import argparse
 import multiprocessing as mp
@@ -80,28 +67,11 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile, run in eager mode",
     )
-    parser.add_argument(
-        "--custom-ops",
-        type=str,
-        nargs="*",
-        default=None,
-        dest="custom_ops",
-        help="Custom ops to enable (e.g., `--custom-ops +RMSNorm +SiluAndMul`). \
-            Set `--custom-ops none` to disable all custom ops. \
-            If not set, custom_ops is set to 'all' for both eager and compile mode.",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    if args.custom_ops is None:
-        if not args.enforce_eager:
-            print("Setting custom_ops to ['all'] in compile mode (enforce_eager=False)")
-            args.custom_ops = ["all"]
-        else:
-            args.custom_ops = []
 
     if platform.machine() == "arm64":
         print(
@@ -161,17 +131,6 @@ def main():
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
     ]
 
-    # Create an LLM.
-    # The spyre_inference platform is loaded via VLLM_PLUGINS.
-    # Set VLLM_TARGET_DEVICE to select the platform.
-    os.environ["VLLM_TARGET_DEVICE"] = "spyre_inference"
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
-    print(
-        f"[torch_spyre_inference] VLLM_TARGET_DEVICE={os.environ['VLLM_TARGET_DEVICE']!r} "
-        f"VLLM_PLUGINS={os.environ.get('VLLM_PLUGINS')!r}",
-        flush=True,
-    )
-
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -182,7 +141,6 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
-        compilation_config=CompilationConfig(custom_ops=args.custom_ops),
         attention_config=AttentionConfig(backend=AttentionBackendEnum[args.attention_backend])
         if args.attention_backend is not None
         else None,

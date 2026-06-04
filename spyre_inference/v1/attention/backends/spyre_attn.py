@@ -33,6 +33,7 @@ import torch
 from spyre_inference.custom_ops.utils import convert
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -44,6 +45,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+logger = init_logger(__name__)
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 # TODO: Make these hyperparameters configurable
@@ -139,36 +141,17 @@ def _indirect_matmul_mock(
     return output
 
 
-def _resolve_compilation_config():
-    """Resolve compilation config once at module load time.
+def _maybe_compile(fn):
+    """Compile fn unless vLLM's compilation config disables it.
 
-    Returns True if torch.compile should be applied, False otherwise.
-    Falls back to False (no compilation) if the vLLM config context
-    is not set — matching the Spyre platform default (CompilationMode.NONE).
+    Mirrors the gating in CustomOp.maybe_compile (vllm/model_executor/custom_op.py)
+    without requiring CustomOp inheritance.
     """
-    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config import get_cached_compilation_config
     from vllm.config.compilation import CompilationMode
 
-    config = get_current_vllm_config_or_none()
-    if config is None:
-        return False
-    cfg = config.compilation_config
-    if cfg.mode == CompilationMode.NONE:
-        return False
-    return cfg.backend != "eager"
-
-
-_ENABLE_COMPILE = _resolve_compilation_config()
-
-
-def _maybe_compile(fn):
-    """Compile fn unless compilation is disabled.
-
-    Mirrors the gating in CustomOp.maybe_compile without requiring CustomOp
-    inheritance. Skips torch.compile when _ENABLE_COMPILE is False
-    (CompilationMode.NONE, backend="eager", or config context unavailable).
-    """
-    if not _ENABLE_COMPILE:
+    cfg = get_cached_compilation_config()
+    if cfg.mode == CompilationMode.NONE or cfg.backend == "eager":
         return fn
     return torch.compile(fn, dynamic=False)
 
@@ -185,25 +168,18 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """
 
     def specialized_reshape_and_cache_kernel(
-        key_cpu,
-        value_cpu,
-        target_device,
-        target_dtype,
-        k_pages,
-        v_pages,
-        block_indices,
-        block_offsets,
+        key_dev, value_dev, k_pages, v_pages, block_indices, block_offsets,
     ):
-        # this kernels specializes (i.e. compiles for specific constants) for num_tokens
-        # Slice on CPU (Spyre slicing corrupts memory),
-        # then transfer each contiguous per-token slice to Spyre for the scatter.
+        # key_dev/value_dev are full [num_tokens, num_kv_heads, head_size] Spyre
+        # tensors. Per-token select+unsqueeze runs inside the compiled graph —
+        # Spyre's eager slicing is broken, but the inductor lowering handles
+        # aten.select fine, and having real ops next to spyre.overwrite avoids
+        # the SDSC compiler crash on trivial mutation-only graphs.
         for t in range(num_tokens):
-            block_idx = block_indices[t]
-            block_offset = block_offsets[t]
-            k_tok = convert(key_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
-            v_tok = convert(value_cpu[t].unsqueeze(1).contiguous(), target_device, target_dtype)
-            _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
-            _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
+            k_tok = key_dev[t].unsqueeze(1)
+            v_tok = value_dev[t].unsqueeze(1)
+            _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
+            _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
 
     return specialized_reshape_and_cache_kernel
 
@@ -343,10 +319,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
-
-        # Device is passed from model runner (spyre or cpu)
-        self._target_device = device
-        self._target_dtype = torch.float16
+        self.model_dtype = model_config.dtype
 
     def _build_attention_mask(
         self,
@@ -406,8 +379,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         mask_additive = torch.where(
             mask_bool,
-            torch.tensor(-65504.0, dtype=self._target_dtype, device=device),
-            torch.tensor(0.0, dtype=self._target_dtype, device=device),
+            torch.tensor(-65504.0, dtype=self.model_dtype, device=device),
+            torch.tensor(0.0, dtype=self.model_dtype, device=device),
         )
 
         mask_4d = (
@@ -471,7 +444,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 assert tile.shape[2] == padded_query_len_s, (
                     f"Tile shape mismatch: expected {padded_query_len_s}, got {tile.shape[2]}"
                 )
-                seq_tiles.append(tile.contiguous().to(self.device))
+                seq_tiles.append(tile.contiguous())
             attention_mask_tiles.append(seq_tiles)
 
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
@@ -538,9 +511,6 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # TODO this should be:
-        #     return (num_blocks, 2, block_size, num_kv_heads, head_size)
-        # but for the lists it is actually
         return [  # ty: ignore[invalid-return-type]
             (num_blocks, block_size, num_kv_heads, head_size),
             (num_blocks, block_size, num_kv_heads, head_size),
@@ -590,14 +560,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        self._target_device: torch.device | None = None
-        self._target_dtype = torch.float16
-
         # Compiled function caches (keyed by iteration count)
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[int, object] = {}
 
-        print("Using SpyreAttentionBackend with LIST-BASED online softmax (v0)")
+        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax (v0)")
 
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
@@ -637,6 +604,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         if attn_metadata is None:
             return output
+        
+        _target_device = query.device
 
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -645,10 +614,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_block_indices is not None
             and attn_metadata.slot_block_offsets is not None
         ), "slot_block_indices/offsets must be precomputed by the metadata builder"
-
-        # Derive target device from the pages themselves
-        if self._target_device is None:
-            self._target_device = k_pages[0].device
 
         # Spyre slicing corrupts memory, so
         # bring q/k/v to CPU once for all slicing below; per-token slices get
@@ -665,15 +630,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
             attn_metadata.slot_block_offsets[:num_actual_tokens],
+            _target_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            convert(query_cpu[:num_actual_tokens], self._target_device),
+            query_cpu[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata,
             output,
+            _target_device,
         )
 
         return output
@@ -686,6 +653,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
+        _target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
@@ -695,25 +663,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         num_tokens = key_cpu.shape[0]
 
+        # Force CPU contiguous (value from QKV split-along-last-dim is
+        # non-contiguous; transferring non-contiguous CPU tensors to Spyre
+        # silently corrupts data — see custom_ops/silu_and_mul.py). Single
+        # CPU→Spyre transfer; the per-token select+unsqueeze happens inside
+        # the compiled kernel.
+        key_dev = convert(key_cpu.contiguous(), device=_target_device)
+        value_dev = convert(value_cpu.contiguous(), device=_target_device)
+
         fn = self._get_reshape_fn(num_tokens)
-        fn(
-            key_cpu,
-            value_cpu,
-            self._target_device,
-            self._target_dtype,
-            k_pages,
-            v_pages,
-            block_indices,
-            block_offsets,
-        )
+        fn(key_dev, value_dev, k_pages, v_pages, block_indices, block_offsets)
 
     def _online_softmax_attention(
         self,
-        query: torch.Tensor,
+        query_cpu: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
+        _target_device: torch.device,
     ) -> torch.Tensor:
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
@@ -750,8 +718,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Use per-sequence padded query length
             padded_query_len = int(padded_query_lens[seq_idx].item())
 
-            query_cpu = convert(query, device="cpu")
-            q_seq = convert(query_cpu[q_start:q_end], device=self._target_device)
+            q_seq = query_cpu[q_start:q_end]
 
             # Pad query to per-sequence padded_query_len
             if padded_query_len > query_len:
@@ -776,10 +743,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            mask_tiles = [m.to(self._target_device) for m in mask_tiles_all[seq_idx]]
+            # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
+            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
             # Run attention on target device
-            q_dev = convert(q, self._target_device, self._target_dtype)
+            q_dev = convert(q, device=_target_device)
             attn_fn = self._get_attn_fn(num_blocks_needed, padded_query_len)
             result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
@@ -793,7 +761,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             for i in range(query_len):
                 tok = convert(
                     result_cpu[0, i : i + 1, :, :].contiguous(),
-                    self._target_device,
+                    _target_device,
                     output.dtype,
                 )
                 _overwrite(tok, output, [0], [q_start + i])

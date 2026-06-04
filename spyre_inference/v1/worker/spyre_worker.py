@@ -96,7 +96,7 @@ class TorchSpyreWorker(CPUWorker):
         import time
 
         import torch._inductor.decomposition
-        from torch_spyre._inductor.decompositions import spyre_decompositions
+        from torch_spyre._inductor.decompositions import spyre_decompositions  # ty: ignore[unresolved-import]
 
         for op, impl in spyre_decompositions.items():
             if "addm" in op.name():

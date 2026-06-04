@@ -45,8 +45,9 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-logger = init_logger(__name__)
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+logger = init_logger(__name__)
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -168,7 +169,12 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """
 
     def specialized_reshape_and_cache_kernel(
-        key_dev, value_dev, k_pages, v_pages, block_indices, block_offsets,
+        key_dev,
+        value_dev,
+        k_pages,
+        v_pages,
+        block_indices,
+        block_offsets,
     ):
         # key_dev/value_dev are full [num_tokens, num_kv_heads, head_size] Spyre
         # tensors. Per-token select+unsqueeze runs inside the compiled graph —
@@ -604,10 +610,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         if attn_metadata is None:
             return output
-        
-        _target_device = query.device
 
         k_pages, v_pages = kv_cache
+        # Derive target device from the KV pages — query may arrive on CPU
+        # (e.g. in unit tests) while pages live on the real Spyre device.
+        _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         assert (

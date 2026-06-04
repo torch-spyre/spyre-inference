@@ -125,7 +125,6 @@ def main():
     from vllm import LLM, SamplingParams
     from vllm.config import AttentionConfig
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
-    from vllm.config import CompilationConfig
 
     sampling_params = [
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens

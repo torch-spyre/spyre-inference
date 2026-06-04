@@ -15,3 +15,6 @@ spyre_inference/v1/worker/ @bohnstingl @joerunde
 
 # Attention backend (PyTorch-native Spyre attention)
 spyre_inference/v1/attention/ @jvlunteren @bohnstingl @bringlein
+
+# CICD
+.github @joerunde @tdoublep @HarikrishnanBalagopal @ashokponkumar @kmehant

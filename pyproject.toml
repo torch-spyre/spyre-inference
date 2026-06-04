@@ -14,10 +14,9 @@ dependencies = [
     "torch-spyre",
     "vllm",
 
-    # Listing as direct deps to ensure they're picked up from the correct index.
-    # Versions intentionally left out because these are dependencies of dependencies.
+    # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
+    # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
-    "torchvision",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -54,8 +53,14 @@ default-groups = ["dev"]
 override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
+
+    # Test deps that aren't actually required
     "arctic-inference; sys_platform == 'never'",
     "perf-analyzer; sys_platform == 'never'",
+
+    # Skipping torch-vision temporarily
+    # TODO: This will be required in the future for VLM support via vllm
+    "torchvision; sys_platform == 'never'",
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "vllm ; platform_machine not in 's390x, ppc64le'",

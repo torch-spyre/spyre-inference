@@ -162,10 +162,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
-        if selected_backend == AttentionBackendEnum.CUSTOM:
-            return AttentionBackendEnum.CUSTOM.get_path()
-        else:
-            return super().get_attn_backend_cls(selected_backend, *args, **kwargs)
+        return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

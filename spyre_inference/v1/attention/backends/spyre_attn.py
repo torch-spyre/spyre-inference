@@ -287,10 +287,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Precomputed from slot_mapping to avoid CPU round-trips during forward:
     # each entry is the physical page index for one token.
-    slot_block_indices: list[int] | None = None
+    slot_block_indices: list[int]
 
     # Precomputed from slot_mapping: offset within the page for each token.
-    slot_block_offsets: list[int] | None = None
+    slot_block_offsets: list[int]
 
     # True when causal masking is needed (prefill/mixed, i.e. max_query_len > 1).
     # Decode steps (max_query_len=1) don't need explicit causal masking because
@@ -622,8 +622,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (e.g. in unit tests) while pages live on the real Spyre device.
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
-        assert attn_metadata.slot_block_indices is not None
-        assert attn_metadata.slot_block_offsets is not None
 
         # Spyre slicing corrupts memory, so
         # bring q/k/v to CPU once for all slicing below; per-token slices get

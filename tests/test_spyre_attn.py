@@ -400,7 +400,7 @@ def test_spyre_attn(
 
     if max(query_lens) >= 32:
         # TODO: what values are sensible here?
-        atol, rtol = 0.9, 5.0
+        atol, rtol = 0.55, 5.0
     else:
         atol, rtol = 0.2, 0.2
 

@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged KV-cache attention backend for Spyre using list-of-pages and online softmax.
-"""
+"""Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
 from dataclasses import dataclass
 from typing import ClassVar, Callable
@@ -153,7 +152,7 @@ def _maybe_compile(fn):
 
 
 # ---------------------------------------------------------------------------
-# Compilable factory functions 
+# Compilable factory functions
 # ---------------------------------------------------------------------------
 
 

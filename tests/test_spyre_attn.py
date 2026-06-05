@@ -198,7 +198,8 @@ def assert_close_outliers(
         )
         raise AssertionError(
             f"{prefix}"
-            f"max_outliers={max_outliers} was specified but {n_outliers} element(s) exceed tolerance. "
+            f"max_outliers={max_outliers} was specified "
+            f"but {n_outliers} element(s) exceed tolerance."
             f"{msg}"
         ) from e
 

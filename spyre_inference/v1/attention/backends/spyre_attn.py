@@ -528,6 +528,8 @@ class SpyreAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
+        # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
+        # so head_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
         return head_size % 64 == 0
 
     @classmethod
@@ -620,11 +622,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (e.g. in unit tests) while pages live on the real Spyre device.
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
-
-        assert (
-            attn_metadata.slot_block_indices is not None
-            and attn_metadata.slot_block_offsets is not None
-        ), "slot_block_indices/offsets must be precomputed by the metadata builder"
 
         # Spyre slicing corrupts memory, so
         # bring q/k/v to CPU once for all slicing below; per-token slices get

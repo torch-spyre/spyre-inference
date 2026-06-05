@@ -21,6 +21,9 @@ Use --enforce-eager to skip torch.compile and run in eager mode.
 
 import os
 
+# Environment variables must be set BEFORE importing vLLM
+# (if not already in environment or to correct other env variables)
+os.environ["VLLM_PLUGINS"] = "spyre_inference"
 
 import argparse
 import multiprocessing as mp

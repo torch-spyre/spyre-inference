@@ -299,21 +299,7 @@ def test_spyre_attn(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    # Allocate pages directly on the target device. This mirrors the production
-    # path in TorchSpyreModelRunner.initialize_kv_cache_tensors, which calls
-    # torch.zeros(..., device="spyre"). Allocating on CPU and `.to("spyre")`-ing
-    # afterwards produces tensors whose internal layout differs and breaks the
-    # Spyre compiler when subsequent `spyre.overwrite` writes target them.
-    k_pages: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype, device=cache_device)
-        for _ in range(num_blocks)
-    ]
-    v_pages: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype, device=cache_device)
-        for _ in range(num_blocks)
-    ]
-    # Mirror copies on CPU so the reference attention reads the same values
-    # the device-side cache will see after pre-population.
+    # list based creation here, update once this changes
     k_pages_cpu: list[torch.Tensor] = [
         torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
@@ -331,11 +317,7 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Pre-populate the historical context.
-    # CPU side: direct slice assignment for the reference path.
-    # Device side: spyre.overwrite (same op the production scatter uses) so the
-    # device pages get populated through the same write path that's exercised
-    # in production — never via Spyre slicing, which is broken.
+    # Pre-populate KV cache with historical context (on CPU)
     for seq_idx in range(num_seqs):
         query_len = query_lens[seq_idx]
         kv_len = kv_lens[seq_idx]
@@ -349,14 +331,10 @@ def test_spyre_attn(
                 actual_block = block_tables[seq_idx, block_idx].item()
                 k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
                 v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
-                k_tok = historical_keys[token_idx].unsqueeze(1).contiguous().to(cache_device)
-                v_tok = historical_values[token_idx].unsqueeze(1).contiguous().to(cache_device)
-                if cache_device.type == "spyre":
-                    torch.ops.spyre.overwrite(k_tok, k_pages[actual_block], [1], [block_offset])
-                    torch.ops.spyre.overwrite(v_tok, v_pages[actual_block], [1], [block_offset])
-                else:
-                    k_pages[actual_block][:, block_offset:block_offset + 1, :].copy_(k_tok)
-                    v_pages[actual_block][:, block_offset:block_offset + 1, :].copy_(v_tok)
+
+    # Transfer populated pages to device
+    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
+    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
 
     # Create slot mapping for new query tokens
     slot_mapping = []

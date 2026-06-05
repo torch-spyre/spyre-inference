@@ -13,16 +13,6 @@
 # limitations under the License.
 
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax.
-
-This backend implements attention using individual page tensors (one per KV block)
-and FlashAttention-style online softmax that iterates over pages. Each page is a
-complete tensor [num_kv_heads, block_size, head_size] on the target device, passed
-directly to bmm without any slicing.
-
-Architecture:
-  - KV cache: two separate lists (k_pages, v_pages), managed by the model runner.
-  - reshape_and_cache: writes new K/V tokens into pages via _overwrite (all on device).
-  - Attention: online softmax iterating over pages — no gather/materialization step.
 """
 
 from dataclasses import dataclass
@@ -160,7 +150,7 @@ def _maybe_compile(fn):
 
 
 # ---------------------------------------------------------------------------
-# Compilable factory functions (PR #5 pattern)
+# Compilable factory functions 
 # ---------------------------------------------------------------------------
 
 
@@ -337,12 +327,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Build additive attention mask on Spyre.
 
         Returns:
-            - mask_4d: [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
+            - mask: [num_seqs, padded_query_len, aligned_max_seq_len] additive mask
             - padded_query_lens: [num_seqs] per-sequence padded query lengths
         """
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         num_seqs = len(seq_lens)
-        num_kv_heads = self.num_kv_heads
 
         # Compute per-sequence padded query length
         padded_query_lens = (
@@ -387,14 +376,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             torch.tensor(0.0, dtype=self.model_dtype, device=device),
         )
 
-        mask_4d = (
-            mask_additive.unsqueeze(1)
-            .expand(-1, num_kv_heads, -1, -1)
-            .reshape(num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len)
-            .contiguous()
-        )
-
-        return mask_4d, padded_query_lens
+        return mask_additive, padded_query_lens
 
     def build(
         self,
@@ -417,7 +399,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
-        mask_4d_cpu, padded_query_lens = self._build_attention_mask(
+        mask_cpu, padded_query_lens = self._build_attention_mask(
             seq_lens,
             query_start_loc,
             apply_causal_mask,
@@ -434,20 +416,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         attention_mask_tiles: list[list[torch.Tensor]] = []
         for s in range(num_seqs):
             seq_tiles: list[torch.Tensor] = []
-            row_start = s * num_kv_heads
-            row_end = row_start + num_kv_heads
             kv_len_s = int(seq_lens[s].item())
             num_blocks_s = (kv_len_s + block_size - 1) // block_size
-            # Use per-sequence padded query length for mask tile slicing
             padded_query_len_s = int(padded_query_lens[s].item())
             for b in range(num_blocks_s):
                 col_start = b * block_size
                 col_end = col_start + block_size
-                tile = mask_4d_cpu[row_start:row_end, :, :padded_query_len_s, col_start:col_end]
-                # Sanity check: ensure tile has correct shape
-                assert tile.shape[2] == padded_query_len_s, (
-                    f"Tile shape mismatch: expected {padded_query_len_s}, got {tile.shape[2]}"
-                )
+                tile = mask_cpu[s, :padded_query_len_s, col_start:col_end]
                 seq_tiles.append(tile.contiguous())
             attention_mask_tiles.append(seq_tiles)
 

@@ -195,6 +195,7 @@ def ref_attn(
         pytest.param(32768, id="num_blocks(32768)"),
     ],
 )
+@pytest.mark.spyre
 @torch.inference_mode()
 def test_spyre_attn(
     default_vllm_config,

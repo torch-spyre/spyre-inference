@@ -576,7 +576,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[int, object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax (v0)")
+        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
@@ -622,6 +622,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (e.g. in unit tests) while pages live on the real Spyre device.
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
+        assert attn_metadata.slot_block_indices is not None
+        assert attn_metadata.slot_block_offsets is not None
 
         # Spyre slicing corrupts memory, so
         # bring q/k/v to CPU once for all slicing below; per-token slices get

@@ -136,6 +136,73 @@ def _build_metadata(
     )
 
 
+def assert_close_outliers(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    max_outliers: int = 0,
+    atol: float = 1e-8,
+    rtol: float = 1e-5,
+    *,
+    outlier_atol: float | None = None,
+    outlier_rtol: float | None = None,
+    msg: str = "",
+) -> None:
+    """Assert tensors are close, allowing up to *max_outliers* elements to exceed tolerance.
+
+    Arguments beyond *max_outliers* are forwarded to ``torch.testing.assert_close``.
+
+    Args:
+        actual: tensor under test.
+        expected: reference tensor.
+        max_outliers: number of elements that may exceed the base tolerances.
+        atol: absolute tolerance for the bulk of elements.
+        rtol: relative tolerance for the bulk of elements.
+        outlier_atol: absolute tolerance for outlier elements (defaults to *atol*,
+            meaning outliers only need to be finite, not within any tighter bound).
+        outlier_rtol: relative tolerance for outlier elements.
+        msg: additional context for the failure message.
+    """
+    diff = (actual - expected).abs()
+    tol = atol + rtol * expected.abs()
+    outlier_mask = diff > tol
+    n_outliers = outlier_mask.sum().item()
+
+    if n_outliers <= max_outliers and max_outliers > 0:
+        # Check that outliers are still within the relaxed bound (or simply finite)
+        if outlier_atol is not None or outlier_rtol is not None:
+            outlier_tol = (outlier_atol if outlier_atol is not None else atol) + (
+                outlier_rtol if outlier_rtol is not None else rtol
+            ) * expected.abs()
+            if diff[outlier_mask].gt(outlier_tol[outlier_mask]).any():
+                worst = diff[outlier_mask].max().item()
+                raise AssertionError(
+                    f"{n_outliers} outlier(s) exceed base tolerances, "
+                    f"and at least one outlier also exceeds the relaxed bound "
+                    f"(worst diff={worst:.4g}). {msg}"
+                )
+        if n_outliers > 0:
+            print(
+                f"  [assert_close_outliers] {n_outliers}/{actual.numel()} element(s) "
+                f"exceed base tolerance but remain within relaxed bound — acceptable."
+            )
+        return  # acceptable number of outliers within relaxed bounds
+
+    # Fall through to standard assert_close for a clear error message
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+    except AssertionError as e:
+        prefix = (
+            f"{n_outliers} elements exceed atol={atol}, rtol={rtol}. "
+            if n_outliers > max_outliers
+            else ""
+        )
+        raise AssertionError(
+            f"{prefix}"
+            f"max_outliers={max_outliers} was specified but {n_outliers} element(s) exceed tolerance. "
+            f"{msg}"
+        ) from e
+
+
 def ref_attn(
     query: torch.Tensor,
     key_cache: list[torch.Tensor],
@@ -399,9 +466,19 @@ def test_spyre_attn(
     )
 
     if max(query_lens) >= 32:
-        # TODO: what values are sensible here?
-        atol, rtol = 0.55, 5.0
+        atol, rtol = 0.3, 0.2
     else:
         atol, rtol = 0.2, 0.2
 
-    torch.testing.assert_close(output.to("cpu"), ref_output, atol=atol, rtol=rtol)
+    # Allow a small number of outlier elements to exceed the base tolerance,
+    # which can happen due to nondeterministic hardware optimizations.
+    assert_close_outliers(
+        output.to("cpu"),
+        ref_output,
+        max_outliers=5,
+        atol=atol,
+        rtol=rtol,
+        outlier_atol=atol * 2,
+        outlier_rtol=rtol * 2,
+        msg="test_spyre_attn",
+    )

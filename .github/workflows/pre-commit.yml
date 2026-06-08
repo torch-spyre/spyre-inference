@@ -14,40 +14,55 @@ permissions:
 
 jobs:
   pre-commit:
-    # `ty` (run as part of the prek hooks below) needs the real
-    # torch/vllm/torch-spyre deps installed to type-check imports, and
-    # those need the spyre runtime libs (carried by `image_spyre_inference`)
-    # to install. The check itself does not exercise the Spyre device, so it
-    # runs on `spyre_pf_x0` (no cards) to avoid contesting a card slot with
-    # the test job in test_each_commit.yaml.
-    runs-on:
-      - x86_64
-      - spyre_pf_x0__pvc_1tb_x1
-      - linux
-      - image_spyre_inference
-    env:
-      STORAGE_1_DIR: /storage-1/spyre-inference
-      UV_CACHE_DIR: /storage-1/spyre-inference/.cache/uv
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-    # The `markdownlint` hook installs node via npm, which links against
-    # libatomic — not present in the `image_spyre_inference` image by default.
-    - name: "Install libatomic for node"
-      run: sudo dnf install -y libatomic
 
     - name: "Set up Python 3.12"
       uses: astral-sh/setup-uv@v5
       with:
         python-version: "3.12"
         enable-cache: true
-    # Full sync (including torch-spyre + vllm) so `ty` can resolve every
-    # import in the project. `--no-dev` skips the test deps we don't need here.
+    # Required to build vllm's CPU backend
+    - name: "Install system dependencies for vllm CPU build"
+      run: sudo apt-get update && sudo apt-get install -y libnuma-dev
+    # torch-spyre cannot install without the spyre runtime libs installed
+    # we're not running any tests so we can skip the dev group with `--no-dev`
     - name: "Install dependencies"
-      run: |
-        source /etc/profile.d/ibm-aiu-setup.sh
-        uv sync --frozen --no-dev -v
+      run: uv sync --frozen --no-install-package torch-spyre --no-install-package vllm --no-dev -v
     - run: echo "::add-matcher::.github/workflows/matchers/ruff.json"
     - uses: j178/prek-action@v1
       with:
         extra_args: --all-files --hook-stage manual
+
+  type-check:
+    name: 'ty type check'
+    # `ty` needs the real torch/vllm/torch-spyre deps to type check imports,
+    # which need the spyre runtime libs (carried by `image_spyre_inference`)
+    # to install. The check itself does not exercise the Spyre device, so it
+    # runs on `spyre_pf_x0` (no cards). The `__pvc_1tb_x1` suffix gives us a
+    # persistent volume so we can cache `uv` artifacts across runs.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0__pvc_1tb_x1
+      - linux
+      - image_spyre_inference
+    timeout-minutes: 30
+    env:
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      UV_CACHE_DIR: /storage-1/spyre-inference/.cache/uv
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+    - name: "Set up Python 3.12"
+      uses: astral-sh/setup-uv@v5
+      with:
+        python-version: "3.12"
+    - name: "Install dependencies"
+      run: |
+        source /etc/profile.d/ibm-aiu-setup.sh
+        uv sync --frozen --no-dev -v
+    - name: "Run ty via prek"
+      run: |
+        source /etc/profile.d/ibm-aiu-setup.sh
+        uvx prek@v0.4.4 run ty --all-files --stage pre-commit

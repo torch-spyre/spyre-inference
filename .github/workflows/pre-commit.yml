@@ -55,7 +55,13 @@ jobs:
       uses: astral-sh/setup-uv@v5
       with:
         python-version: "3.12"
-        enable-cache: true
+        # `enable-cache: true` would prune the local cache and upload it to
+        # the GitHub Actions cache at end-of-job — which destroys the
+        # pre-built wheels on our PVC. `setup-uv` docs recommend against
+        # GHA cache on self-hosted runners with persistent storage; we just
+        # point uv at the PVC via `cache-local-path` (which sets
+        # `UV_CACHE_DIR` for the rest of the job).
+        enable-cache: false
         cache-local-path: /storage-1/spyre-inference/.cache/uv
     - name: "Install dependencies"
       run: |

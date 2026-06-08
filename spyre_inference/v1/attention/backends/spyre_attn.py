@@ -19,7 +19,7 @@ such as matmul, softmax, etc. It supports vLLM's KV cache.
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 import torch
 
@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionLayer,
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
@@ -63,7 +64,9 @@ def copy_attn_output(attn_output, num_actual_tokens, output):
     """Place `attn_output[:num_actual_tokens]` into the caller-provided `output` buffer."""
     if output.device.type == "spyre":
         attn_output_spyre = convert(attn_output, "spyre", output.dtype)
-        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])
+        # `torch.ops.spyre.overwrite` is dynamically registered, so its signature
+        # is opaque to the type checker (ParamSpec resolves to `...`).
+        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])  # ty: ignore[invalid-argument-type]
     else:
         output[:num_actual_tokens].copy_(attn_output)
     return output
@@ -232,13 +235,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Otherwise, use the 4D matmul kernel (_attn_4d).
         self.use_sdpa = use_sdpa
 
-        if self.use_sdpa:
-            self.attn_op = torch.nn.functional.scaled_dot_product_attention
-        else:
-            self.attn_op = _attn_4d
-
-        # Compile the attention function once for reuse.
-        self.attn_op = torch.compile(self.attn_op)
+        # Annotated as a permissive Callable so ty doesn't try to resolve
+        # the union of SDPA's kwarg signature with `_attn_4d`'s positional one.
+        # The dispatch in `_compute_attention` selects the right call shape.
+        fn = torch.nn.functional.scaled_dot_product_attention if self.use_sdpa else _attn_4d
+        self.attn_op: Callable[..., torch.Tensor] = torch.compile(fn)
 
         # Simplified implementation: don't support these features initially
         if alibi_slopes is not None:
@@ -250,20 +251,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def forward(
         self,
-        layer: torch.nn.Module,
+        layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]
         key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         kv_cache: torch.Tensor,  # [num_blocks, 2, block_size, num_kv_heads, head_size]
         attn_metadata: SpyreAttentionMetadata,
-        output: torch.Tensor | None = None,
+        output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute attention output using PyTorch native operations."""
-
-        assert output is not None, "Output tensor must be provided"
-
         if attn_metadata is None:
             return output
 

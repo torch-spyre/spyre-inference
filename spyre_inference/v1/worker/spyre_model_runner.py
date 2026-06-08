@@ -50,6 +50,7 @@ from vllm.config import VllmConfig, CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -59,13 +60,16 @@ from spyre_inference.custom_ops.utils import convert
 logger = init_logger(__name__)
 
 
-class SpyreCpuGpuBuffer:
+class SpyreCpuGpuBuffer(CpuGpuBuffer):
     """Spyre-specific CpuGpuBuffer with Spyre-safe copies and split dtypes.
     This buffer is closely related to the CpuGpuBuffer in vllm/v1/utils.py.
 
     For float dtypes: .cpu on CPU, .gpu on Spyre (float16).
     For int/bool dtypes: .gpu aliased to .cpu (CPUModelRunner pattern).
     All copies are currently synchronous as torch-spyre does not yet support `non_blocking`.
+
+    Inherits from `CpuGpuBuffer` (without invoking its `__init__`) so that
+    `_make_buffer` overrides remain Liskov-compatible with `GPUModelRunner`.
     """
 
     def __init__(
@@ -102,10 +106,13 @@ class SpyreCpuGpuBuffer:
         dst.copy_(src)
         return dst
 
-    # Currently only the copy_to_gpu function is invoked.
-    # If the copy_to_cpu also becomes required, override it here with
-    # spyre-specific aspects.
-    # def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+        # Currently only the copy_to_gpu function is invoked.
+        # If the copy_to_cpu also becomes required, override it here with
+        # spyre-specific aspects.
+        raise NotImplementedError(
+            "SpyreCpuGpuBuffer.copy_to_cpu is not implemented"
+        )
 
 
 class _SpyreModelWrapper:
@@ -320,13 +327,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Warmup done.")
 
     # --- KV cache allocation ---
-    # Potential sub to override KV cache tensor allocation
-    def _allocate_kv_cache_tensors(
+    # The "exp" path stores (k_cache, v_cache) tuples through this dict so
+    # that `_reshape_kv_cache_tensors` (also overridden) can pass them
+    # through unchanged. The base contract is `dict[str, torch.Tensor]`, but
+    # only the matching overridden `_reshape_kv_cache_tensors` consumes the
+    # values for the exp path, so the runtime contract is preserved between
+    # the pair of overrides. ty cannot see this co-evolution, hence the
+    # widened return type and the suppressions.
+    def _allocate_kv_cache_tensors(  # ty: ignore[invalid-method-override]
         self,
         kv_cache_config,
     ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
         if envs.SPYRE_ATTN_IMPL == "exp":
             kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+            # `model_config.dtype` is typed as `ModelDType | torch.dtype`, but
+            # `TorchSpyrePlatform.check_and_update_config` rejects anything but
+            # `torch.float16` before this point.
+            assert isinstance(self.dtype, torch.dtype)
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
                 block_size = self.vllm_config.cache_config.block_size
                 num_blocks = kv_cache_config.num_blocks
@@ -363,9 +380,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             assert layer_names == set(kv_cache_raw_tensors.keys()), (
                 "Some layers are not correctly initialized"
             )
-            return kv_cache_raw_tensors
+            return kv_cache_raw_tensors  # ty: ignore[invalid-return-type]
         else:
-            return super()._allocate_kv_cache_tensors(kv_cache_config)
+            return super()._allocate_kv_cache_tensors(kv_cache_config)  # ty: ignore[invalid-return-type]
 
     def _reshape_kv_cache_tensors(
         self,
@@ -402,6 +419,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Unwrap torch.compile's OptimizedModule (has _orig_mod attribute)
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
+        assert isinstance(model, nn.Module)
         return model
 
     # --- Buffer management ---

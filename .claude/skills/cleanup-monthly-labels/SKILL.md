@@ -79,6 +79,31 @@ For every open issue on the board still carrying `<closing>YYYY` (work that star
 last month and continues): add `<active>YYYY`, remove `<closing>YYYY`. Also remove any
 other stale monthlies.
 
+A rule-2 swap is a deferral signal: the issue was slated for the closing month but did
+not finish. To prevent issues from silently rolling forward month after month, **post a
+comment on each rule-2 issue** pinging the assignee(s) for a status update and a new
+ETA. This creates a written record of why work slipped and gives anyone watching the
+issue visibility into the new target.
+
+Suggested comment template (adjust the months each run):
+
+```text
+Monthly cleanup: this issue carried the `<closing>YYYY` label and is rolling into
+`<active>YYYY`. @<assignees> — could you share a quick status update and a new
+estimated completion date? If the work has been deprioritized or blocked, please
+note that here too so anyone tracking this knows what to expect.
+```
+
+Apply with:
+
+```bash
+gh issue comment <n> --repo torch-spyre/spyre-inference --body "<rendered comment>"
+```
+
+Surface the rule-2 list in the dry-run with the assignees, and ask the user before
+posting comments — they may want to skip the ping for issues they personally own, or
+batch a single status thread across several related issues.
+
 ### Rule 3 — open, no monthly, Q2-relevant → add `<active>YYYY`
 
 For every open issue on the board with **no** monthly label, decide whether it relates
@@ -279,9 +304,13 @@ jq -c 'select(.s == "OPEN" and (.labels | index("<previous>YYYY")) and
 7. **Detect anomalies** — A/B/C buckets above.
 8. **Dry-run report** — present rules 1, 2, 3 (with Q2 grouping) and anomalies. Wait
    for user approval. Make borderline Q2 calls explicit.
-9. **Apply** — `gh issue edit <n> --repo torch-spyre/spyre-inference --add-label X
-   --remove-label Y`, sequentially, one log line per issue. On any failure, halt.
-10. **Verify** — re-fetch the board and re-run the classifier; output should be empty
+9. **Apply labels** — `gh issue edit <n> --repo torch-spyre/spyre-inference --add-label
+   X --remove-label Y`, sequentially, one log line per issue. On any failure, halt.
+10. **Post rule-2 status pings** — for each rule-2 issue (deferral), post a comment
+    asking the assignee for a status update and new ETA. See "Rule 2" section above
+    for the template. Confirm the list with the user first; some issues may warrant a
+    skip or a batched thread.
+11. **Verify** — re-fetch the board and re-run the classifier; output should be empty
     (no rule-violating issues remain). Spot-check 2–3 issues in the GitHub UI.
 
 ## Apply step (template)

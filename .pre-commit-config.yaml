@@ -45,5 +45,3 @@ repos:
       # check all files because the staged changes may cause errors in unmodified files. Think
       # deleting a method but forgetting to remove all of the call sites in other files.
       pass_filenames: false
-      # Local commits only — CI installs without vllm/torch-spyre, so ty would fail on every import
-      stages: [pre-commit]

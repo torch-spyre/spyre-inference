@@ -110,9 +110,7 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         # Currently only the copy_to_gpu function is invoked.
         # If the copy_to_cpu also becomes required, override it here with
         # spyre-specific aspects.
-        raise NotImplementedError(
-            "SpyreCpuGpuBuffer.copy_to_cpu is not implemented"
-        )
+        raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
 
 
 class _SpyreModelWrapper:

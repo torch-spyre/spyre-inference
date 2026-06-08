@@ -31,6 +31,11 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+    # The `markdownlint` hook installs node via npm, which links against
+    # libatomic — not present in the `image_spyre_inference` image by default.
+    - name: "Install libatomic for node"
+      run: sudo dnf install -y libatomic
+
     - name: "Set up Python 3.12"
       uses: astral-sh/setup-uv@v5
       with:

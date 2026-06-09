@@ -121,13 +121,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
         vllm_config.compilation_config.mode = CompilationMode.NONE
 
-        # Force eager execution. torch.compile with the Spyre inductor
-        # backend requires ALL graph tensors on Spyre, but our CPU fallback
-        # ops (embedding, linear, rotary, attention) create intermediate
-        # CPU tensors that the Spyre backend cannot codegen. Once all layers
-        # run natively on Spyre, this can be removed to enable compilation.
-        vllm_config.model_config.enforce_eager = True
-
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.

@@ -34,13 +34,10 @@ logger = init_logger(__name__)
 class SpyreRotaryEmbedding(RotaryEmbedding):
     """OOT RotaryEmbedding that falls back to CPU execution.
 
-    Keeps cos_sin_cache on CPU via an _apply no-op. Inputs are moved to
+    Keeps cos_sin_cache on Spyre.
+    During forward(), inputs and cos_sin_cache are moved to
     CPU for computation, and outputs are copied back to the original device.
     """
-
-    def _apply(self, fn, recurse=True):
-        # Keep cos_sin_cache on CPU so forward_native can use it directly.
-        return self
 
     def forward(
         self,
@@ -55,6 +52,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         cpu_positions = convert(positions, device="cpu")
         cpu_query = convert(query, device="cpu")
         cpu_key = convert(key, device="cpu")
+        self.cos_sin_cache = convert(self.cos_sin_cache, device="cpu")
 
         result_query, result_key = RotaryEmbedding.forward_native(
             self,

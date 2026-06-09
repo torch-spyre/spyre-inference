@@ -17,7 +17,7 @@ The upstream vLLM `OffloadingConnector` framework gives every CUDA platform thre
 2. A worker-side `OffloadingHandler` registry keyed by `(src_type, dst_type)` that performs the actual transfer.
 3. An `OffloadingSpec` factory that lets out-of-tree platforms drop in their own manager + handlers without touching upstream code.
 
-As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** (`TieringOffloadingSpec` + `SecondaryTierManager` ABC + `SecondaryTierFactory`, PR #40020). Filesystem (`tiering/fs`, PR #41735) and object-store (`tiering/obj`, PR #41968) secondary tiers ship in-tree. The previously-standalone `llmd-fs-connector` is end-of-life as of `v0.22`; its logic is now upstream as the `fs` secondary tier.
+As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** (`TieringOffloadingSpec` + `SecondaryTierManager` ABC + `SecondaryTierFactory`, PR #40020). Filesystem (`tiering/fs`, PR #41735) and object-store (`tiering/obj`, PR #41968) secondary tiers ship in-tree. The standalone PyPI package `llmd-fs-connector` is end-of-life as of `==0.22`, and its logic also exists upstream as the `fs` secondary tier — but the in-tree `llmd_fs_backend` module in `llm-d/llm-d-kv-cache` (which provides `SharedStorageOffloadingSpec`) is **not** EOL: it remains the path llm-d v0.8 deployments use today and is pinned to vLLM v0.22.x. `tiering/fs` and `llmd_fs_backend` are different shapes (a `SecondaryTierManager` plugin vs. a top-level `OffloadingSpec`); both matter for this RFC, in different milestones.
 
 The existing `spyre-inference` plugin has **none** of this wired up. `TorchSpyreWorker` extends `CPUWorker` and never calls `register_kv_caches`. Both the single-tier `CPUOffloadingSpec` and the new `TieringOffloadingSpec` (which subclasses `CPUOffloadingSpec`) error out on non-CUDA platforms via the `current_platform.is_cuda_alike()` check at `vllm/v1/kv_offload/cpu/spec.py:89`. So the entire upstream offload + tiering stack is unreachable from Spyre today, and the only KV-tier story we have is "the whole cache is on-device, full-stop."
 
@@ -43,7 +43,7 @@ This RFC proposes how to combine the two: take the prototype's data-copy primiti
 
 - PD disaggregation. The prototype's NIXL adapter is reusable but lives in a follow-up RFC because it requires worker-to-worker NIXL agent setup that is orthogonal to the connector port.
 - Replacing the flit-offset addressing scheme with a stable on-device API. The `flit_offset` map is read from `perfdsc` artifacts and is fragile; M1 keeps the same approach as the prototype and we file a separate issue against torch-spyre to expose a stable kv-region descriptor.
-- Replacing `llmd-fs-connector` integrations *outside* the upstream `tiering/fs` path. The standalone connector is end-of-life as of `llmd-fs-connector==0.22`; the supported path forward is the upstream `fs` secondary tier, which M1.5 makes available.
+- Replacing today's `MultiConnector + llmd_fs_backend` deployment shape with `tiering/fs` is **not** in scope. The standalone PyPI `llmd-fs-connector==0.22` is EOL, but the in-tree `llmd_fs_backend` (`SharedStorageOffloadingSpec`) is alive at vLLM v0.22.x and is what llm-d v0.8 clusters actually run. M1.5 makes both shapes work on Spyre — Path A via `MultiConnector + llmd_fs_backend`, Path B via `SpyreTieringOffloadingSpec + tiering/fs|obj` — and lets deployments choose. See §4a.
 
 ## 3. Background: what the upstream `OffloadingConnector` actually requires
 
@@ -117,9 +117,18 @@ There are two viable shapes for tiered KV caching during the v0.22 transition wi
 | Spyre device ↔ host RAM ↔ filesystem/object (Path B) | M1.5+ | `OffloadingConnector` + `SpyreTieringOffloadingSpec` + `tiering/fs` or `tiering/obj` | The v0.22+ canonical shape. Internal cascade (`TieringOffloadingManager`), not save-to-both. Supersedes the standalone `llmd-fs-connector` (final standalone release `v0.22`). |
 | Direct Spyre device ↔ filesystem / object store | Out of scope | n/a | Would require a Spyre-side analogue of NVIDIA GDS so a secondary tier can DMA without a host bounce. Not provided by torch-spyre today, and the upstream `SecondaryTierManager` contract assumes the `primary_kv_view` is over CPU memory; supporting this would change both. Filed as a future-work item. |
 
-**Why Path A and Path B are both M1.5 in scope.** Path A is what's deployed today across llm-d v0.8 clusters. Path B is the upstream-canonical direction. Yue's example config (in the M1.5 acceptance criterion below) is Path A verbatim. Both paths reuse the same `SpyreOffloadingSpec` from M1 — the only difference is what sits on the other side of host RAM, which is configured per-deployment, not coded in the plugin.
+**Path A vs. Path B — the architectural difference, not just the config difference** (formulation per [@yuezhu1](https://github.com/yuezhu1) on the M1.5 draft):
 
-**A subtle but important property of Path A.** `MultiConnector.register_kv_caches` hands the same `kv_caches: dict[str, torch.Tensor]` to *every* child connector — it does not pre-process or stage tensors between them. So the second `OffloadingConnector` (`SharedStorageOffloadingSpec`) receives the raw *Spyre* device tensors, just like the first one does. Whether `SharedStorageOffloadingSpec`'s `StorageOffloadingHandlers` work against Spyre tensors as-is is an open question — see §10 — and resolving it is part of M1.5's work, not deferred.
+- **Path A (`MultiConnector`)** stacks two *independent* `OffloadingConnector`s that operate in parallel without coordination. `MultiConnector.save_kv_layer` fans out the same save call to every child (`vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:304`); `MultiConnector.get_num_new_matched_tokens` returns from whichever child reports a hit first (`:395`). Neither child knows the other exists. Promotion, demotion, and eviction are not coordinated across tiers — each connector manages its own state.
+- **Path B (`SpyreTieringOffloadingSpec`)** uses a single `TieringOffloadingManager` that orchestrates a primary tier (CPU host-RAM, mmap-backed via `SharedOffloadRegion`) and one or more `SecondaryTierManager`s (`fs`, `obj`, …) as a coherent hierarchy. Stores can cascade primary→secondary; loads can promote secondary→primary; the manager owns the bookkeeping and decides when to demote/evict.
+
+Operationally: Path A behaves like "two write-through caches with `MultiConnector` deciding lookups," Path B behaves like "a real tiered cache with one manager."
+
+**Why both are M1.5 in scope.** Path A is what's deployed today across llm-d v0.8 clusters. Path B is the upstream-canonical direction. Yue's example config (in the M1.5 acceptance criterion below) is Path A verbatim. Both paths reuse the same `SpyreOffloadingSpec` from M1 — the only difference is what sits on the other side of host RAM, which is configured per-deployment, not coded in the plugin.
+
+**A subtle but important property of Path A.** `MultiConnector.register_kv_caches` hands the same `kv_caches: dict[str, torch.Tensor]` to *every* child connector — it does not pre-process or stage tensors between them. So the second `OffloadingConnector` (`SharedStorageOffloadingSpec`) receives the raw *Spyre* device tensors, just like the first one does. Whether `SharedStorageOffloadingSpec`'s `StorageOffloadingHandlers` work against Spyre tensors as-is is an open question — see §10 Q7 — and resolving it is part of M1.5's work, not deferred.
+
+**`SharedOffloadRegion` only matters for Path B.** The mmap-backed `SharedOffloadRegion` (`vllm/v1/kv_offload/cpu/shared_offload_region.py`) exists to give every `SecondaryTierManager` a `memoryview` over the primary tier's CPU buffer. Path A doesn't go through `TieringOffloadingManager` at all — each child connector keeps its own host buffers — so Path A has no `SharedOffloadRegion` requirement. §6.3a and §10 Q6 below describe `SharedOffloadRegion` adoption as Path B work.
 
 ## 5. Proposed architecture
 
@@ -275,7 +284,7 @@ class SpyreTieringOffloadingSpec(SpyreOffloadingSpec):
         ...
 ```
 
-The `SharedOffloadRegion` (`vllm/v1/kv_offload/cpu/shared_offload_region.py`) is an mmap-backed CPU buffer; the `primary_kv_view: memoryview` it produces is what every `SecondaryTierManager` reads/writes from. Nothing in `SharedOffloadRegion` is CUDA-specific — it's plain `mmap` plus `multiprocessing.shared_memory`. We reuse it as-is.
+The `SharedOffloadRegion` (`vllm/v1/kv_offload/cpu/shared_offload_region.py`) is an mmap-backed CPU buffer; the `primary_kv_view: memoryview` it produces is what every `SecondaryTierManager` reads/writes from. Nothing in `SharedOffloadRegion` is CUDA-specific — it's plain `mmap` plus `multiprocessing.shared_memory`. We reuse it as-is. Note that `SharedOffloadRegion` is a **Path B** concept only: in Path A, each child connector keeps its own host-side buffers and `MultiConnector` does not place anything between them.
 
 User invocation:
 
@@ -359,6 +368,7 @@ New tests in `tests/v1/kv_offload/`:
 | `spyre_inference/v1/kv_offload/tiering_spec.py` | `SpyreTieringOffloadingSpec` (subclasses `SpyreOffloadingSpec`; reuses upstream `TieringOffloadingManager` + `SecondaryTierFactory`) | ~50 |
 | `spyre_inference/__init__.py` | Add a second `OffloadingSpecFactory.register_spec(...)` call for `SpyreTieringOffloadingSpec`. | +5 |
 | `tests/v1/kv_offload/test_tiering_spec.py` | Pure-CPU test: build a `SpyreTieringOffloadingSpec` with a `dummy` secondary tier, store/load through the cascade, assert promotion semantics match upstream. | ~120 |
+| `tests/v1/kv_offload/test_multiconnector_register.py` | Spyre-runner test (gated like `test_copier_round_trip.py`): construct `MultiConnector(SpyreOffloadingSpec, SharedStorageOffloadingSpec)` with `llmd_fs_backend` installed, call `register_kv_caches(...)` with a real Spyre `kv_caches` dict, and assert *both* children's `register_kv_caches` succeed. This is the cheap falsifier for §10 Q7 — runs in seconds, doesn't need a real model warmup, and tells us early whether `llmd_fs_backend.StorageOffloadingHandlers` accepts Spyre tensors as-is. | ~80 |
 
 ## 8. Compatibility with existing connectors and tiers
 
@@ -374,7 +384,7 @@ After M1 + M1.5 ship, the following work on Spyre **without further plugin code*
 - **`tiering/obj` secondary tier** (PR #41968) — object-store backend (S3-style).
 - **`tiering/example` secondary tier** — in-memory tier shipped upstream as a reference implementation; we use it in tests.
 - **Future secondary tiers** — anything someone registers with `SecondaryTierFactory.register_tier(name, module, class)` works on Spyre as soon as it works on CUDA, since the Spyre-specific code stops at the primary tier.
-- **LMCache offloading** — talks to the same `OffloadingHandler` API at the device↔host seam; M1 alone is enough.
+- **LMCache connectors that route through the `OffloadingHandler` device↔host seam** — M1 alone is enough. LMCache ships several connector flavors, not all of which use this seam (some implement their own CUDA copy path); M1 supports the ones that do, and the others would need an LMCache-side change to swap their device↔host hop for `SpyreKvDmaCopier` (this is the M2 use case in §11).
 
 The only connector that does **not** drop in is anything that requires async copy semantics (e.g. CUDA-graph-capturable transfers). None of the M1/M1.5-relevant tiers do — the upstream `SecondaryTierManager` contract is explicitly async-via-job-poll, not async-via-CUDA-events.
 
@@ -387,7 +397,7 @@ For users currently running the prior standalone NIXL demo, the migration shape 
 | Standalone `demo.py --role prefill/decode` | `vllm serve --kv-transfer-config '{"kv_connector":"OffloadingConnector",...}'` on each side |
 | Prototype's accessor driven directly from script | `SpyreKvDmaCopier` driven by the handler |
 | Custom NIXL connector module | Upstream `NixlConnector` does the cross-host hop after the device→host hop is in place |
-| Cross-instance sharing via custom router copies | Built-in via `tiering/fs` content-hashed paths over a shared `root_dir` (M1.5; needs matching `PYTHONHASHSEED`) |
+| Cross-instance sharing via custom router copies | Built-in over a shared volume in M1.5: Path A via `llmd_fs_backend`'s `SharedStorageOffloadingSpec` (the deployed shape today), or Path B via `tiering/fs`. Both compute filenames from the upstream offload-key chain hash, so both require matching `PYTHONHASHSEED` across instances. |
 | flit-offsets read from `perfdsc` JSON | Same — until torch-spyre exposes a stable descriptor (filed separately) |
 
 PD disaggregation is not delivered by M1 — but every component PD needs **except** the cross-host transport is delivered by M1. The follow-up RFC for PD on Spyre is purely about how to wire a NIXL agent into the upstream PD producer/consumer connectors.
@@ -399,8 +409,8 @@ PD disaggregation is not delivered by M1 — but every component PD needs **exce
 3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
 4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
 5. **`SpyreOffloadingSpec` parent class.** Two viable bases: subclass `OffloadingSpec` directly (clean, but we duplicate the ~30 lines of `__init__` math from `CPUOffloadingSpec` that compute `num_blocks` from `cpu_bytes_to_use`); or subclass `CPUOffloadingSpec` and override `get_handlers` to skip the `is_cuda_alike()` gate (less duplication, but inherits a parent that documents itself as CUDA-only). The implementation will pick one once we see how much of `CPUOffloadingSpec` is genuinely CUDA-coupled vs. just gated. M1.5's `SpyreTieringOffloadingSpec` then subclasses whichever we picked, so the choice cascades.
-6. **Mmap region on Spyre.** `TieringOffloadingManager` requires a `SharedOffloadRegion` to hand a `memoryview` to each `SecondaryTierManager`. The region is mmap-backed and platform-agnostic, but in M1 we may build host-side block tensors with `torch.empty` instead of from a `SharedOffloadRegion`. M1.5 needs to switch to the `SharedOffloadRegion` allocation path. Cost is small (one-line allocator swap) but worth noting up front so M1's `SpyreCpuOffloadingHandlers` accepts an optional pre-built region.
-7. **Does `SharedStorageOffloadingSpec` work as the second connector in `MultiConnector` on Spyre?** This is the load-bearing question for M1.5 Path A. The spec itself extends `OffloadingSpec` directly (no `is_cuda_alike()` gate), but its worker-side `StorageOffloadingHandlers` ([`llmd_fs_backend/worker.py`](https://github.com/llm-d/llm-d-kv-cache/blob/main/kv_connectors/llmd_fs_backend/llmd_fs_backend/worker.py)) accepts a generic `GPULoadStoreSpec` tag and reads/writes via thread-pooled file I/O against a CPU staging buffer. It does **not** appear to call CUDA-specific copy ops on the device tensor itself — the device→host hop is owned by the *first* connector in the `MultiConnector` (us). If that holds, Path A works on Spyre with **zero** changes to `llmd_fs_backend`. Verifying this against a real run is M1.5 acceptance criterion #1 below; if it fails, the fix is a small upstream PR to `llmd_fs_backend` (likely a tag check) rather than Spyre-side glue.
+6. **Mmap region on Spyre — Path B only.** `TieringOffloadingManager` requires a `SharedOffloadRegion` to hand a `memoryview` to each `SecondaryTierManager`. The region is mmap-backed and platform-agnostic, but in M1 we may build host-side block tensors with `torch.empty` instead of from a `SharedOffloadRegion`. **Path B** of M1.5 (`SpyreTieringOffloadingSpec`) needs to switch to the `SharedOffloadRegion` allocation path. **Path A** does not — `MultiConnector` doesn't route through `TieringOffloadingManager`, so each child connector keeps its own host buffers. Cost is small (one-line allocator swap) but worth noting up front so M1's `SpyreCpuOffloadingHandlers` accepts an optional pre-built region.
+7. **Does `SharedStorageOffloadingSpec` work as the second connector in `MultiConnector` on Spyre?** This is the load-bearing question for M1.5 Path A. The spec itself extends `OffloadingSpec` directly (no `is_cuda_alike()` gate). Its worker side ([`kv_connectors/llmd_fs_backend/llmd_fs_backend/worker.py`](https://github.com/llm-d/llm-d-kv-cache/blob/main/kv_connectors/llmd_fs_backend/llmd_fs_backend/worker.py) in the `llm-d/llm-d-kv-cache` repo — see §13) defines `BaseStorageOffloadingHandler`, `GPUToStorageHandler`, `StorageToGPUHandler`, and the `StorageOffloadingHandlers` aggregator. The `GPULoadStoreSpec` tag is used as a generic device-side identifier (asserted with `isinstance` only), and the actual transfer goes through thread-pooled file I/O against a CPU staging buffer. The handler does **not** appear to invoke CUDA-specific copy ops on the device tensor itself — the device→host hop is owned by the *first* connector in the `MultiConnector` (us). If that holds, Path A works on Spyre with **zero** changes to `llmd_fs_backend`. Verifying this against a real run is M1.5 acceptance criterion A1.5.1 below, with a cheap pre-check (`test_multiconnector_register.py`, see §7) that asserts both child `register_kv_caches` calls succeed against Spyre tensors before we run the full integration. If the integration fails, the fix is a small PR to the `llm-d/llm-d-kv-cache` repo (likely a `GPULoadStoreSpec` `medium()` check or a tensor-device branch) rather than Spyre-side glue.
 
 ## 11. Out of scope (filed as follow-ups)
 
@@ -432,8 +442,8 @@ vllm serve <model> --kv-transfer-config '{
 ```
 
 - [ ] Server boots. `OffloadingConnectorWorker.register_kv_caches` is reached on the Spyre worker without raising.
-- [ ] A 1k-prompt sweep with overlapping prefixes reports a non-zero `kv_offload_blocks_evicted` (or the equivalent prefix-cache-hit metric exposed by `OffloadingConnector` in this vLLM version).
-- [ ] Generated outputs match a non-offloading baseline run on the same prompts (allow ≤1e-3 token-distribution drift; with `temperature=0` outputs should be identical).
+- [ ] A two-prompt sweep where the second prompt extends the first by ≥256 tokens reports a host-tier hit on the second prompt. Concretely: the worker log emits `OffloadingConnectorWorker: loading N blocks from host` (or the same `kv_offload_blocks_loaded` counter exposed by `OffloadingConnectorScheduler.get_metrics()` in v0.22, depending on which interface the deployment scrapes) with `N > 0`. Either source is sufficient — pick one in the test harness.
+- [ ] With `temperature=0`, generated tokens for both prompts are byte-identical to a baseline run with the same model and `--kv-transfer-config` omitted. (No tolerance — `temperature=0` is deterministic.)
 
 **A1.2 — plugin-side test suite green.**
 
@@ -442,7 +452,8 @@ vllm serve <model> --kv-transfer-config '{
 
 **A1.3 — no plugin-platform-side regressions.**
 
-- [ ] No changes required to `TorchSpyreWorker` or `TorchSpyrePlatform`. (If we have to change them, the RFC's premise is wrong — pause and revise.)
+- [ ] No source changes required to `TorchSpyreWorker` or `TorchSpyrePlatform` for M1 to land. (If we have to change them, the RFC's premise is wrong — pause and revise.) Verified by inspecting the M1 PR diff: `spyre_inference/v1/worker/` and `spyre_inference/platform.py` are unchanged.
+- [ ] The existing Spyre platform/worker test suite (`pytest spyre_inference/tests/ -k 'not kv_offload'`) passes both with `SpyreOffloadingSpec` registered (M1 default after `spyre_inference` is imported) and with the connector unselected (no `--kv-transfer-config`). Same suite, two configs, both green — confirms registration alone has no effect when the connector isn't selected.
 - [ ] `bash format.sh` clean.
 
 ### M1.5 acceptance
@@ -480,11 +491,12 @@ vllm serve <model> --kv-transfer-config '{
 }'
 ```
 
-- [ ] Server boots; both child connectors register `kv_caches` against the Spyre worker without raising. (The second connector receives Spyre device tensors per `MultiConnector.register_kv_caches`. If `llmd_fs_backend` raises here, file an upstream issue and either contribute a tag-only fix or document a workaround in this RFC — see §10 Q7.)
-- [ ] After a warmup run, block files appear under `/mnt/files-storage/` with content-hashed filenames (the `FileMapper` scheme).
-- [ ] Restart the server with the same config and same model; re-issue prompts that were warmed up; observe storage hits in `OffloadingConnector` metrics for the second connector.
-- [ ] On a second host mounting the same `/mnt/files-storage`, a fresh `vllm serve` with the same config picks up the warmed prefixes (cross-instance share).
-- [ ] Generated outputs match the M1 (single-tier) baseline.
+- [ ] **Boot.** Server boots with both children attached. `OffloadingConnectorWorker.register_kv_caches` is reached for *each* child without raising. (The second connector receives Spyre device tensors per `MultiConnector.register_kv_caches`. If `llmd_fs_backend` raises here, the cheap pre-check `test_multiconnector_register.py` from §7 already failed in CI — fix that first and either contribute the fix to `llm-d/llm-d-kv-cache` or document the workaround. See §10 Q7.)
+- [ ] **Store side.** After a warmup prompt, block files appear under `/mnt/files-storage/<safe_model_name>_<sha256-prefix>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash>.bin` (the `FileMapper` scheme — same `_r<rank>` content-hash layout `tiering/fs` uses).
+- [ ] **Load side, same instance.** Restart the server with the same config, same model, and the same `PYTHONHASHSEED` value as the warmup run. Send a *second* prompt that shares its first ≥256 tokens with the warmup prompt. Worker log emits a `kv_offload_blocks_loaded` increment attributable to the *second* connector (or its `llmd_fs_backend`-side equivalent — `llmd_fs_backend` exposes its own `metrics.py` counters). Generated tokens for the new prompt are byte-identical to a no-cache baseline at `temperature=0`.
+- [ ] **Load side, cross-instance.** On a second host that mounts the same `/mnt/files-storage` (RWX volume), start a fresh `vllm serve` with the same config and the *same* `PYTHONHASHSEED` value. Issue the same prefix-sharing prompt. Observe a storage-tier hit on the *first* request (no warmup needed on the second host). Tokens identical.
+- [ ] **`PYTHONHASHSEED` failure mode is documented.** If `PYTHONHASHSEED` differs across instances, the cross-instance step above MUST miss (different hash chain → different filenames). Run this once with mismatched seeds to confirm the negative case — record the result in the M1.5 implementation issue, not as a recurring CI gate.
+- [ ] **Outputs match M1 baseline.** A1.1's two-prompt sweep, run under the A1.5.1 config, produces identical tokens to A1.1's single-tier run at `temperature=0`.
 
 **A1.5.2 — Forward-looking: upstream `tiering/fs` (Path B).** Smaller scope; tests that the upstream-canonical path works once we ship `SpyreTieringOffloadingSpec`:
 
@@ -507,7 +519,8 @@ vllm serve <model> --kv-transfer-config '{
 
 **A1.5.3 — plugin-side test suite green.**
 
-- [ ] `pytest spyre_inference/tests/v1/kv_offload/test_tiering_spec.py` passes on CPU-only runners using the upstream `example` secondary tier.
+- [ ] `pytest spyre_inference/tests/v1/kv_offload/test_tiering_spec.py` passes on CPU-only runners using the upstream `example` secondary tier (Path B coverage).
+- [ ] `pytest spyre_inference/tests/v1/kv_offload/test_multiconnector_register.py` passes on a Spyre runner with `llmd_fs_backend` installed (Path A pre-check, see §10 Q7). If it fails, A1.5.1 will fail — fixing this is the gate to running A1.5.1.
 
 **A1.5.4 — Engineering budget held.**
 
@@ -524,4 +537,5 @@ vllm serve <model> --kv-transfer-config '{
 - Upstream object-store secondary tier (PR #41968, merged 2026-06-05): `vllm/v1/kv_offload/tiering/obj/`
 - Upstream `SharedOffloadRegion`: `vllm/v1/kv_offload/cpu/shared_offload_region.py`
 - Upstream `FileMapper` (content-hashed paths): `vllm/v1/kv_offload/file_mapper.py`
+- `llmd_fs_backend` / `SharedStorageOffloadingSpec` (Path A): [`llm-d/llm-d-kv-cache`](https://github.com/llm-d/llm-d-kv-cache), specifically [`kv_connectors/llmd_fs_backend/llmd_fs_backend/`](https://github.com/llm-d/llm-d-kv-cache/tree/main/kv_connectors/llmd_fs_backend/llmd_fs_backend) (`spec.py`, `worker.py`, `manager.py`, `file_mapper.py`)
 - Spyre KV allocation today: `spyre_inference/v1/worker/spyre_model_runner.py:322–368`

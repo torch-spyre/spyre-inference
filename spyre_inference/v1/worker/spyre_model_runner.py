@@ -341,7 +341,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
         }
 
-        kv_caches: dict[str, torch.Tensor] = {}
+        # Each value is a (k_pages, v_pages) tuple of per-page tensor lists.
+        # vLLM's `bind_kv_cache` types this as `dict[str, torch.Tensor]`, but
+        # the matching `SpyreAttentionImpl.forward` unpacks the tuple — see
+        # the suppression on `bind_kv_cache(...)` below.
+        kv_caches: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # All layers in `shared_by` use the same spec by construction.
@@ -380,7 +384,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             kv_caches[layer_name] = kv_caches[target]
 
         bind_kv_cache(
-            kv_caches,
+            kv_caches,  # ty: ignore[invalid-argument-type]
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )

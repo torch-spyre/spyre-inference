@@ -117,7 +117,7 @@ def copy_attn_output(attn_output, num_actual_tokens, output):
     return output
 
 
-@dataclass
+@dataclass(kw_only=True)
 class SpyreAttentionMetadata(AttentionMetadata):
     """Metadata for PyTorch native attention computation on Spyre."""
 
@@ -146,29 +146,31 @@ class SpyreAttentionMetadata(AttentionMetadata):
     num_heads: int = 0
 
     # --- Precomputed by builder (shared across all layers) ---
+    # Always populated by SpyreAttentionMetadataBuilder.build(); declared
+    # required (kw_only dataclass) so consumers don't need to narrow `| None`.
 
     # Additive attention mask on Spyre, ready for the compiled attention op.
     # Shape: [num_seqs * num_kv_heads, 1, padded_query_len, aligned_max_seq_len]
     # fp16, masked positions = -65504, unmasked = 0.
-    attention_mask: torch.Tensor | None = None
+    attention_mask: torch.Tensor
 
     # Gather selection mask on Spyre:
     # [num_kv_heads, aligned_num_logical_blocks, aligned_num_physical_blocks]
-    gather_sel_mask_dev: torch.Tensor | None = None
+    gather_sel_mask_dev: torch.Tensor
 
     # Aligned max seq len used by gather (needed for reshape)
-    aligned_max_seq_len: int = 0
+    aligned_max_seq_len: int
 
     # Scatter position mask on Spyre: [num_kv_heads, aligned_num_physical_blocks, block_width]
-    scatter_mask_dev: torch.Tensor | None = None
+    scatter_mask_dev: torch.Tensor
 
     # Scatter row selector on Spyre: [num_kv_heads, aligned_num_physical_blocks, num_tokens]
     # one-hot: row_sel[h, r, t] = 1 iff block_indices[t] == r (broadcast-identical across heads)
-    scatter_row_sel_dev: torch.Tensor | None = None
+    scatter_row_sel_dev: torch.Tensor
 
     # Scatter column placement selector on Spyre: [num_tokens, head_size, block_width]
     # one-hot: col_sel[t, d, c] = 1 iff c == block_offsets[t]*head_size + d
-    scatter_col_sel_dev: torch.Tensor | None = None
+    scatter_col_sel_dev: torch.Tensor
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -468,6 +470,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     per-layer work: fill K/V values, scatter, bmm gather, attention.
     """
 
+    # Set in `forward()` from `kv_cache` and `attn_metadata` before any helper
+    # reads them. Declared without `| None` so ty doesn't require narrowing
+    # asserts in every helper method.
+    _block_size: int
+    _k_cache_dev: torch.Tensor
+    _v_cache_dev: torch.Tensor
+
     def __init__(
         self,
         num_heads: int,
@@ -494,12 +503,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         self._attn_4d = _maybe_compile(_attn_4d)
 
-        self._block_size: int | None = None
         self._num_blocks: int | None = None
         self._aligned_num_physical_blocks: int | None = None
         self._block_width: int | None = None
-        self._k_cache_dev: torch.Tensor | None = None
-        self._v_cache_dev: torch.Tensor | None = None
 
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
@@ -527,21 +533,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"Spyre attention requires num_seqs=1, got {attn_metadata.num_seqs}"
         )
 
-        # The metadata builder always populates these on Spyre; narrow the
-        # `Tensor | None` declared on SpyreAttentionMetadata for the type checker.
-        scatter_mask_dev = attn_metadata.scatter_mask_dev
-        scatter_row_sel_dev = attn_metadata.scatter_row_sel_dev
-        scatter_col_sel_dev = attn_metadata.scatter_col_sel_dev
-        gather_sel_mask_dev = attn_metadata.gather_sel_mask_dev
-        attention_mask = attn_metadata.attention_mask
-        assert (
-            scatter_mask_dev is not None
-            and scatter_row_sel_dev is not None
-            and scatter_col_sel_dev is not None
-            and gather_sel_mask_dev is not None
-            and attention_mask is not None
-        ), "SpyreAttentionMetadataBuilder must populate all device-side selectors"
-
         # The value still resides on CPU, as it is
         # created in the GraniteAttention through a split
         # operation, which has to be carried out on CPU
@@ -563,24 +554,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._scatter_to_device_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
-            scatter_mask_dev,
-            scatter_row_sel_dev,
-            scatter_col_sel_dev,
+            attn_metadata.scatter_mask_dev,
+            attn_metadata.scatter_row_sel_dev,
+            attn_metadata.scatter_col_sel_dev,
             attn_metadata.slot_mapping[:num_actual_tokens],
         )
 
         # Step 2: Gather — sel_mask is precomputed by builder and lives on Spyre
         compact_k, compact_v = self._gather_from_device_cache(
-            gather_sel_mask_dev,
+            attn_metadata.gather_sel_mask_dev,
             attn_metadata.aligned_max_seq_len,
         )
 
         # Step 3: Add batch dim (num_seqs=1)
         query_per_seq = query[:num_actual_tokens].unsqueeze(0)
 
-        # Step 5: Compute attention (mask precomputed by builder)
+        # Step 4: Compute attention (mask precomputed by builder)
         attn_output = self._compute_attention(
-            query_per_seq, compact_k, compact_v, attention_mask, query.device, query.dtype
+            query_per_seq,
+            compact_k,
+            compact_v,
+            attn_metadata.attention_mask,
+            query.device,
+            query.dtype,
         )
 
         # Step 6: Extract actual tokens (num_seqs=1 → simple slice)
@@ -624,14 +620,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Input must be [num_kv_heads, 1, head_size] to match the
             # output's rank (3D) with the listed dims being singleton.
             head_size = self.head_size
-            block_size = self._block_size
-            k_cache_dev = self._k_cache_dev
-            v_cache_dev = self._v_cache_dev
-            assert block_size is not None
-            assert k_cache_dev is not None and v_cache_dev is not None
             sm = convert(slot_mapping, device="cpu")
-            block_indices = (sm // block_size).tolist()
-            block_offsets = (sm % block_size).tolist()
+            block_indices = (sm // self._block_size).tolist()
+            block_offsets = (sm % self._block_size).tolist()
             num_tokens = k_new_dev.shape[0]
 
             # Use spyre.overwrite (mutates_args=("output",)) so the underlying
@@ -646,8 +637,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 cs = int(block_offsets[t]) * head_size
                 k_tok = convert(key[t].unsqueeze(1).contiguous(), device=self._target_device)
                 v_tok = convert(value[t].unsqueeze(1).contiguous(), device=self._target_device)
-                torch.ops.spyre.overwrite(k_tok, k_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
-                torch.ops.spyre.overwrite(v_tok, v_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
+                torch.ops.spyre.overwrite(k_tok, self._k_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
+                torch.ops.spyre.overwrite(v_tok, self._v_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
             return
 
         # bmm 1: place each token's head_size-vector into its block-width slot.
@@ -668,11 +659,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_vals = torch.bmm(row_sel_dev, v_spread)
 
         # Mutate the persistent KV cache in place.
-        k_cache_dev = self._k_cache_dev
-        v_cache_dev = self._v_cache_dev
-        assert k_cache_dev is not None and v_cache_dev is not None
-        k_cache_dev.copy_(self._scatter_cache(k_cache_dev, scatter_mask_dev, k_vals))
-        v_cache_dev.copy_(self._scatter_cache(v_cache_dev, scatter_mask_dev, v_vals))
+        self._k_cache_dev.copy_(self._scatter_cache(self._k_cache_dev, scatter_mask_dev, k_vals))
+        self._v_cache_dev.copy_(self._scatter_cache(self._v_cache_dev, scatter_mask_dev, v_vals))
 
     def _gather_from_device_cache(
         self,
@@ -683,11 +671,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_kv_heads = self.num_kv_heads
         head_size = self.head_size
 
-        k_cache_dev = self._k_cache_dev
-        v_cache_dev = self._v_cache_dev
-        assert k_cache_dev is not None and v_cache_dev is not None
-        gathered_k = torch.bmm(sel_mask_dev, k_cache_dev)
-        gathered_v = torch.bmm(sel_mask_dev, v_cache_dev)
+        gathered_k = torch.bmm(sel_mask_dev, self._k_cache_dev)
+        gathered_v = torch.bmm(sel_mask_dev, self._v_cache_dev)
 
         gathered_k = gathered_k.reshape(num_kv_heads, aligned_max_seq_len, head_size)
         gathered_v = gathered_v.reshape(num_kv_heads, aligned_max_seq_len, head_size)

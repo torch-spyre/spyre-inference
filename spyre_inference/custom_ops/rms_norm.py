@@ -115,15 +115,14 @@ class SpyreRMSNorm(RMSNorm):
             return self._forward_spyre_impl(x, residual)
 
         output = torch.empty_like(x)
+        residual_out = torch.empty_like(residual) if residual is not None else None
 
         # `torch.ops.vllm.spyre_rmsnorm` is dynamically registered, so its
         # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        if residual is not None:
-            residual_out = torch.empty_like(residual)
-            torch.ops.vllm.spyre_rmsnorm(x, output, self._layer_name, residual, residual_out)  # ty: ignore[invalid-argument-type]
-            return output, residual_out
+        torch.ops.vllm.spyre_rmsnorm(x, output, self._layer_name, residual, residual_out)  # ty: ignore[invalid-argument-type]
 
-        torch.ops.vllm.spyre_rmsnorm(x, output, self._layer_name, None, None)  # ty: ignore[invalid-argument-type]
+        if residual_out is not None:
+            return output, residual_out
         return output
 
     @staticmethod

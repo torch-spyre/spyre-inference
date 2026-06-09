@@ -15,7 +15,7 @@
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
 from dataclasses import dataclass
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, NamedTuple
 
 import torch
 
@@ -52,6 +52,26 @@ KV_LENGTH_ALIGNMENT = 256
 # Explore a separate decode kernel path that doesn't need query padding, or use
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
+
+
+class SpyrePagedKVCache(NamedTuple):
+    """Per-layer paged KV cache for the Spyre backend.
+
+    NamedTuple (not dataclass) because it is a tuple at runtime — Dynamo
+    specializes tuple subscripts at trace time, which is what makes the
+    compile-unrolled per-page loop in `_create_compilable_page_attn` work.
+    A regular dataclass would cross an unverified line with Dynamo's tracing
+    of attribute access on custom objects. Index-by-int and unpacking
+    (`k_pages, v_pages = cache`) keep working unchanged.
+
+    Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
+    consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
+    the relay path as `dict[str, torch.Tensor]`; see the suppression at the
+    `bind_kv_cache(...)` call site for why that type-hole is benign.
+    """
+
+    k_pages: list[torch.Tensor]
+    v_pages: list[torch.Tensor]
 
 
 def _overwrite(
@@ -618,18 +638,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._attn_fns[key]
 
-    # `kv_cache` widens the base's `torch.Tensor` to a `(k_pages, v_pages)`
-    # tuple — `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
-    # this shape and `bind_kv_cache` smuggles it through a dict typed as
-    # `dict[str, torch.Tensor]`. The matching pair of overrides preserves
-    # the runtime contract; ty cannot see the co-evolution.
+    # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
+    # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
+    # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
+    # The matching pair of overrides preserves the runtime contract; ty
+    # cannot see the co-evolution.
     def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]
         key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
-        kv_cache: tuple[list[torch.Tensor], list[torch.Tensor]],
+        kv_cache: SpyrePagedKVCache,
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
         output_scale: torch.Tensor | None = None,

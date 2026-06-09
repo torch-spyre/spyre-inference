@@ -328,24 +328,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as lists of individual page tensors on Spyre.
 
-        Each layer gets its own tuple (k_pages, v_pages) where each is a list
-        of tensors of shape [num_kv_heads, block_size, head_size] on the Spyre
-        device. This matches upstream vLLM's paged model but uses list indices
-        instead of tensor indices — enabling direct per-page bmm without
-        advanced indexing.
+        Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
+        is a list of tensors of shape [num_kv_heads, block_size, head_size] on
+        the Spyre device. This matches upstream vLLM's paged model but uses
+        list indices instead of tensor indices — enabling direct per-page bmm
+        without advanced indexing.
         """
         from vllm.v1.worker.utils import bind_kv_cache
+        from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
             ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
         }
 
-        # Each value is a (k_pages, v_pages) tuple of per-page tensor lists.
-        # vLLM's `bind_kv_cache` types this as `dict[str, torch.Tensor]`, but
-        # the matching `SpyreAttentionImpl.forward` unpacks the tuple — see
-        # the suppression on `bind_kv_cache(...)` below.
-        kv_caches: dict[str, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        # vLLM's `bind_kv_cache` types this dict as `dict[str, torch.Tensor]`,
+        # but the matching `SpyreAttentionImpl.forward` consumes the
+        # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
+        kv_caches: dict[str, SpyrePagedKVCache] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # All layers in `shared_by` use the same spec by construction.
@@ -376,7 +376,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 for _ in range(num_blocks)
             ]
 
-            page_cache = (k_pages, v_pages)
+            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_caches[layer_name] = page_cache
 

@@ -32,7 +32,6 @@ def reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x1) * x2
 
 
-@pytest.mark.spyre
 @pytest.mark.siluandmul
 @pytest.mark.parametrize("num_tokens", [1, 7, 63, 64, 65, 1024])
 @pytest.mark.parametrize("d", [2, 63, 64, 65, 1024, 13824])
@@ -67,7 +66,6 @@ def test_spyre_siluandmul_matches_reference(num_tokens, d, dtype):
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.spyre
 @pytest.mark.siluandmul
 def test_siluandmul_oot_dispatch():
     """Verify SiluAndMul OOT registration: class swap"""

@@ -37,37 +37,17 @@ jobs:
       # due to a mix of fallbacks and decompositions.
       # Here we set it to an empty string (or we could also unset it).
       CI: ''
-      CLONED_TORCH_SPYRE_DIR: /home/senuser/torch-spyre
-      CLONED_SPYRE_INFERENCE_DIR: /home/senuser/spyre-inference
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      UV_CACHE_DIR: /storage-1/spyre-inference/.cache/uv
+      # UV_CACHE_DIR is exported by the spyre-uv-cache action below, keyed by
+      # the Spyre image's component manifest hash so torch-spyre wheels built
+      # against one runtime cannot be reused after an image bump.
 
     steps:
-      - name: Checkout PR branch/commit in pre-cloned spyre-inference
-        env:
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_REF: ${{ github.ref }}
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          # The pre-cloned repo may be owned by a different user than the
-          # runner process; mark all directories as safe to avoid git's
-          # "dubious ownership" error.
-          git config --global --add safe.directory '*'
-          cd "$CLONED_SPYRE_INFERENCE_DIR"
-          # Prefer the PR head SHA when triggered by pull_request, otherwise
-          # fall back to the SHA of the push/tag that triggered the workflow.
-          TARGET_SHA="${PR_HEAD_SHA:-$GITHUB_SHA}"
-          TARGET_REF="${PR_HEAD_REF:-$GITHUB_REF}"
-          echo "TARGET_REF=${TARGET_REF}"
-          echo "TARGET_SHA=${TARGET_SHA}"
-          git fetch --tags --force origin "+${TARGET_SHA}" || \
-            git fetch --tags --force origin
-          git checkout --force "${TARGET_SHA}"
-          git log -1 --oneline
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure image-versioned UV cache
+        uses: ./.github/actions/spyre-uv-cache
 
       - name: Gather runner info
         run: |
@@ -87,14 +67,13 @@ jobs:
           echo "--- AIU env ---"
           env | sort | grep AIU || true
           echo "--- repo listing ---"
-          ls -lart "$CLONED_SPYRE_INFERENCE_DIR"
+          ls -lart
           echo "---"
 
       - name: Build spyre-inference
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_SPYRE_INFERENCE_DIR"
           uv sync \
             --frozen \
             --verbose \
@@ -108,7 +87,6 @@ jobs:
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          cd "$CLONED_SPYRE_INFERENCE_DIR"
           echo "Running tests..."
           uv run pytest -s -vvv
           echo "tests done"

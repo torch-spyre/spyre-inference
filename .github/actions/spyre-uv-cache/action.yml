@@ -1,0 +1,56 @@
+name: 'Spyre image-versioned UV cache'
+description: |
+  Exports UV_CACHE_DIR pointed at a path keyed by the Spyre image's
+  component manifest hash. torch-spyre links against runtime binaries
+  carried by the image. Those binaries are upgraded in place when the 
+  image is rolled, but uv keys its built-wheel cache only by source URL
+  + commit — so without this action a wheel built on image v_N can be 
+  reused against image v_{N+1} and crash at import.
+
+  Each image version gets its own UV_CACHE_DIR subdirectory under the
+  PVC, which means:
+    * No cross-image contamination — image bumps see an empty cache
+      and rebuild once, then warm-cache for every subsequent run.
+    * No mid-run mutation, no race conditions: jobs on the same image
+      hit the same dir, jobs on different images never touch the same
+      files.
+
+  Pair with `astral-sh/setup-uv@v5` set to `enable-cache: false` —
+  setup-uv@v5 honors a pre-set UV_CACHE_DIR and will not override it.
+
+inputs:
+  cache-root:
+    description: 'Persistent root for uv caches (one subdir per image hash).'
+    required: false
+    default: '/storage-1/spyre-inference/.cache'
+  manifest-path:
+    description: 'Spyre image component manifest used as the cache key.'
+    required: false
+    default: '/opt/ibm/spyre/components.txt'
+
+outputs:
+  uv-cache-dir:
+    description: 'The image-versioned UV_CACHE_DIR that was exported.'
+    value: ${{ steps.compute.outputs.uv-cache-dir }}
+  image-hash:
+    description: 'Short hash of the Spyre image component manifest.'
+    value: ${{ steps.compute.outputs.image-hash }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: compute
+      shell: bash
+      run: |
+        set -euo pipefail
+        manifest="${{ inputs.manifest-path }}"
+        if [[ ! -f "$manifest" ]]; then
+          echo "::error::Spyre component manifest not found at $manifest"
+          exit 1
+        fi
+        image_hash=$(sha256sum "$manifest" | cut -c1-12)
+        cache_dir="${{ inputs.cache-root }}/uv-${image_hash}"
+        echo "UV_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"
+        echo "uv-cache-dir=${cache_dir}" >> "$GITHUB_OUTPUT"
+        echo "image-hash=${image_hash}" >> "$GITHUB_OUTPUT"
+        echo "::notice::Using UV cache ${cache_dir} (image hash ${image_hash})"

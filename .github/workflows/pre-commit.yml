@@ -51,18 +51,17 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+    - name: "Configure image-versioned UV cache"
+      uses: ./.github/actions/spyre-uv-cache
+
     - name: "Set up Python 3.12"
       uses: astral-sh/setup-uv@v5
       with:
         python-version: "3.12"
-        # `enable-cache: true` would prune the local cache and upload it to
-        # the GitHub Actions cache at end-of-job — which destroys the
-        # pre-built wheels on our PVC. `setup-uv` docs recommend against
-        # GHA cache on self-hosted runners with persistent storage; we just
-        # point uv at the PVC via `cache-local-path` (which sets
-        # `UV_CACHE_DIR` for the rest of the job).
+        # GHA caching disabled on self-hosted runners — UV_CACHE_DIR (set by
+        # the spyre-uv-cache action above) points at the PVC and survives
+        # across runs. setup-uv@v5 honors a pre-set UV_CACHE_DIR.
         enable-cache: false
-        cache-local-path: /storage-1/spyre-inference/.cache/uv
     - name: "Install dependencies"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh

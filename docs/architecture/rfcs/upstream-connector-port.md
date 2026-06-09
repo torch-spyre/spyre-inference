@@ -17,7 +17,7 @@ The upstream vLLM `OffloadingConnector` framework gives every CUDA platform thre
 2. A worker-side `OffloadingHandler` registry keyed by `(src_type, dst_type)` that performs the actual transfer.
 3. An `OffloadingSpec` factory that lets out-of-tree platforms drop in their own manager + handlers without touching upstream code.
 
-As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** (`TieringOffloadingSpec` + `SecondaryTierManager` ABC + `SecondaryTierFactory`, PR #40020). Filesystem (`tiering/fs`, PR #41735) and object-store (`tiering/obj`, PR #41968) secondary tiers ship in-tree. The standalone PyPI package `llmd-fs-connector` is end-of-life as of `==0.22`, and its logic also exists upstream as the `fs` secondary tier — but the in-tree `llmd_fs_backend` module in `llm-d/llm-d-kv-cache` (which provides `SharedStorageOffloadingSpec`) is **not** EOL: it remains the path llm-d v0.8 deployments use today and is pinned to vLLM v0.22.x. `tiering/fs` and `llmd_fs_backend` are different shapes (a `SecondaryTierManager` plugin vs. a top-level `OffloadingSpec`); both matter for this RFC, in different milestones.
+As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. Two ecosystems put it to work today: upstream vLLM's in-tree `tiering/{fs,obj}` secondary tiers, and the llm-d project's in-tree `llmd_fs_backend` shared-storage spec used by llm-d v0.8 deployments. Both matter for this RFC. §3.5 walks the lineage and the architectural difference between the two shapes.
 
 The existing `spyre-inference` plugin has **none** of this wired up. `TorchSpyreWorker` extends `CPUWorker` and never calls `register_kv_caches`. Both the single-tier `CPUOffloadingSpec` and the new `TieringOffloadingSpec` (which subclasses `CPUOffloadingSpec`) error out on non-CUDA platforms via the `current_platform.is_cuda_alike()` check at `vllm/v1/kv_offload/cpu/spec.py:89`. So the entire upstream offload + tiering stack is unreachable from Spyre today, and the only KV-tier story we have is "the whole cache is on-device, full-stop."
 
@@ -74,6 +74,23 @@ The reference CUDA implementation. It is **not directly reusable on Spyre** beca
 `OffloadingSpecFactory.register_spec(name, module_path, class_name)` records a tuple but does **not** import the module at registration time. The actual import happens lazily in `create_spec(...)` when the user's `kv_connector_extra_config.spec_name` selects this spec. That matters for an out-of-tree platform plugin: we can register `SpyreOffloadingSpec` from `spyre_inference/__init__.py` without dragging in any Spyre-only module at vLLM import time, and CUDA-only deployments that load `spyre-inference` for unrelated reasons pay zero cost for our spec.
 
 The same pattern applies to `SecondaryTierFactory.register_tier(...)` (`vllm/v1/kv_offload/tiering/factory.py`). Adding a new secondary tier from a third-party package — including ours, if M2 ever ships one — is a one-line registration call, not an upstream PR.
+
+### 3.5 The v0.22 multi-tier layer, and why two shapes coexist
+
+vLLM v0.22 added a multi-tier framework on top of the four pieces above:
+
+- **`TieringOffloadingSpec`** (`vllm/v1/kv_offload/tiering/spec.py`, PR #40020) — a concrete `OffloadingSpec` that builds a `TieringOffloadingManager` over a CPU primary tier and one or more secondary tiers.
+- **`SecondaryTierManager`** abstract base class (`vllm/v1/kv_offload/tiering/base.py`, PR #40020) — the contract any new tier must implement (`submit_store`, `submit_load`, `get_finished_jobs`, etc.). Cannot be instantiated directly; concrete tiers subclass it.
+- **`SecondaryTierFactory`** (`vllm/v1/kv_offload/tiering/factory.py`, PR #40020) — the registry where tiers are plugged in by name (mirrors `OffloadingSpecFactory`).
+- **In-tree concrete tiers:** `tiering/fs` (filesystem, PR #41735) and `tiering/obj` (object store, PR #41968), both subclassing `SecondaryTierManager`.
+
+Two ecosystems use this stack today, and the RFC has to support both:
+
+**Upstream-canonical: `TieringOffloadingSpec` + `SecondaryTierManager` plugins.** A deployment selects `spec_name: "TieringOffloadingSpec"` (a single spec) and lists secondary tiers in `extra_config`. The `TieringOffloadingManager` orchestrates a coherent hierarchy — primary CPU tier mmap'd via `SharedOffloadRegion`, plus one or more `SecondaryTierManager`s that read/write through a `primary_kv_view: memoryview`. Stores can cascade primary→secondary; loads can promote secondary→primary; the manager owns the bookkeeping. The previously-standalone PyPI package `llmd-fs-connector` is end-of-life at `==0.22` because its logic now exists upstream as the `tiering/fs` secondary tier.
+
+**llm-d deployment-canonical: `MultiConnector` of two top-level `OffloadingSpec`s.** This is the shape llm-d v0.8 deployments actually run today. It stacks two independent `OffloadingConnector`s — typically one Spyre/CUDA `OffloadingSpec` (for the device↔host hop) and one `SharedStorageOffloadingSpec` from the in-tree `llmd_fs_backend` module in [`llm-d/llm-d-kv-cache`](https://github.com/llm-d/llm-d-kv-cache) (for the host↔shared-storage hop). The two children operate in parallel without coordination: saves fan out to both via `MultiConnector.save_kv_layer` (`vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:304`), loads return from whichever child reports a hit first (`:395`). Each child manages its own state. **`llmd_fs_backend` and its `SharedStorageOffloadingSpec` are not EOL** — only the standalone PyPI package they were originally factored out of is — and the in-tree module is pinned to vLLM v0.22.x.
+
+The two shapes solve overlapping problems with different architectures: a `SecondaryTierManager` plugin slots *under* one `TieringOffloadingSpec` and is governed by it; a top-level `OffloadingSpec` is itself one of N children of a `MultiConnector` and is independent of its siblings. They are not interchangeable, and neither obsoletes the other in the v0.22 transition window. §4a labels them **Path B** and **Path A** respectively, and M1.5 supports both.
 
 ## 4. Background: what the prototype's primitive actually provides
 

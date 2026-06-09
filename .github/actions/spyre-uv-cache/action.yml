@@ -15,8 +15,7 @@ description: |
       hit the same dir, jobs on different images never touch the same
       files.
 
-  Pair with `astral-sh/setup-uv@v5` set to `enable-cache: false` —
-  setup-uv@v5 honors a pre-set UV_CACHE_DIR and will not override it.
+  Pair with `astral-sh/setup-uv@v5` set to `enable-cache: false`
 
 inputs:
   cache-root:
@@ -51,6 +50,10 @@ runs:
         image_hash=$(sha256sum "$manifest" | cut -c1-12)
         cache_dir="${{ inputs.cache-root }}/uv-${image_hash}"
         echo "UV_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"
+        # The PVC backing the cache does not support hardlinks across to the
+        # venv filesystem, so force uv to copy. Without this, uv emits a
+        # warning per package on every sync and falls back to copy anyway.
+        echo "UV_LINK_MODE=copy" >> "$GITHUB_ENV"
         echo "uv-cache-dir=${cache_dir}" >> "$GITHUB_OUTPUT"
         echo "image-hash=${image_hash}" >> "$GITHUB_OUTPUT"
         echo "::notice::Using UV cache ${cache_dir} (image hash ${image_hash})"

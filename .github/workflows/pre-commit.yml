@@ -48,20 +48,31 @@ jobs:
       - linux
       - image_spyre_inference
     timeout-minutes: 30
+    env:
+      # uv serializes builds of the same package via a per-distribution lock.
+      # On a fresh image-versioned cache dir, several concurrent jobs all try
+      # to build torch-spyre (~50s) and the late arrivals time out at the
+      # default 300s. Bump generously — late jobs just wait, no work is lost.
+      UV_LOCK_TIMEOUT: '1800'
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-    - name: "Configure image-versioned UV cache"
+    - id: uv-cache
+      name: "Configure image-versioned UV cache"
       uses: ./.github/actions/spyre-uv-cache
 
     - name: "Set up Python 3.12"
       uses: astral-sh/setup-uv@v5
       with:
         python-version: "3.12"
-        # GHA caching disabled on self-hosted runners — UV_CACHE_DIR (set by
-        # the spyre-uv-cache action above) points at the PVC and survives
-        # across runs. setup-uv@v5 honors a pre-set UV_CACHE_DIR.
+        # GHA caching disabled on self-hosted runners — we point uv at the
+        # PVC instead. Despite what the docs imply, setup-uv@v5 *will*
+        # overwrite a pre-set UV_CACHE_DIR with its own temp path during
+        # this step (observed: "Set UV_CACHE_DIR to /…/_temp/setup-uv-cache").
+        # `cache-local-path` is the only input it reliably honors, so we
+        # pass the same value our spyre-uv-cache action exported.
         enable-cache: false
+        cache-local-path: ${{ steps.uv-cache.outputs.uv-cache-dir }}
     - name: "Install dependencies"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh

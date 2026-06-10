@@ -755,7 +755,9 @@ class SerializedSharedMemoryKVStoreBackend(SpyreKVStoreBackend):
     def _write_payload(payload: bytes) -> str:
         shm = shared_memory.SharedMemory(create=True, size=max(len(payload), 1))
         try:
-            shm.buf[: len(payload)] = payload
+            buf = shm.buf
+            assert buf is not None  # buf is always set on an open SharedMemory
+            buf[: len(payload)] = payload
             return shm.name
         finally:
             shm.close()
@@ -771,7 +773,9 @@ class SerializedSharedMemoryKVStoreBackend(SpyreKVStoreBackend):
             _unregister_shared_memory_attachment(entry.shm_name, shm)
 
         try:
-            return bytes(shm.buf[: entry.payload_size])
+            buf = shm.buf
+            assert buf is not None  # buf is always set on an open SharedMemory
+            return bytes(buf[: entry.payload_size])
         finally:
             shm.close()
 
@@ -1001,7 +1005,9 @@ class SerializedSharedMemoryServiceKVStoreBackend(SpyreKVStoreBackend):
             _unregister_shared_memory_attachment(entry.shm_name, shm)
 
         try:
-            return bytes(shm.buf[: entry.payload_size])
+            buf = shm.buf
+            assert buf is not None  # buf is always set on an open SharedMemory
+            return bytes(buf[: entry.payload_size])
         finally:
             shm.close()
 
@@ -1331,7 +1337,9 @@ def build_spyre_kv_store_backend(
         raise ValueError(
             f"Unknown Spyre KV store backend '{backend_name}'. Supported backends: {supported}"
         )
-    if backend_key == "serialized_shared_memory_service":
+    # issubclass narrows the registry's base type to the concrete
+    # constructor signatures.
+    if issubclass(backend_type, SerializedSharedMemoryServiceKVStoreBackend):
         return backend_type(
             max_bytes=max_bytes,
             socket_path=service_socket or "/tmp/spyre-kv-persistent.sock",
@@ -1357,6 +1365,10 @@ _STATS_KEYS = (
 
 @dataclass
 class SpyreConnectorStats(KVConnectorStats):
+    # Mirrors the base KVConnectorStats field so the generated dataclass
+    # __init__ accepts `data=` even when vLLM types are unresolved.
+    data: dict[str, Any] = field(default_factory=dict)
+
     def __post_init__(self):
         if not self.data:
             self.reset()

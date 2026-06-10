@@ -62,7 +62,9 @@ class _SharedMemoryKVServiceState:
     def _write_payload(self, payload: bytes) -> str:
         shm = shared_memory.SharedMemory(create=True, size=max(len(payload), 1))
         try:
-            shm.buf[: len(payload)] = payload
+            buf = shm.buf
+            assert buf is not None  # buf is always set on an open SharedMemory
+            buf[: len(payload)] = payload
             return shm.name
         finally:
             shm.close()

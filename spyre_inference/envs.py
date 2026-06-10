@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     VLLM_SPYRE_ENABLE_FILE_TRANSFER: bool = False
     VLLM_SPYRE_ENABLE_NIXL_TRANSFER: bool = False
     VLLM_SPYRE_NIXL_BLOCKING_TRANSFER: bool = True
-    VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE: bool = True
     VLLM_SPYRE_KV_CACHE_FILE_PATH: str | None = None
     VLLM_SPYRE_NIXL_REMOTE_IP: str = "10.130.2.89"
     VLLM_SPYRE_KV_ROLE: str = ""
@@ -73,11 +72,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # async transfers.
     "VLLM_SPYRE_NIXL_BLOCKING_TRANSFER": lambda: bool(
         int(os.getenv("VLLM_SPYRE_NIXL_BLOCKING_TRANSFER", "1"))
-    ),
-    # Enable the worker-side KV connector bridge for disaggregated
-    # prefill-decode.
-    "VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE": lambda: bool(
-        int(os.getenv("VLLM_SPYRE_ENABLE_KV_CONNECTOR_BRIDGE", "1"))
     ),
     # Path to KV cache file for file-based transfer.
     "VLLM_SPYRE_KV_CACHE_FILE_PATH": lambda: os.getenv("VLLM_SPYRE_KV_CACHE_FILE_PATH"),

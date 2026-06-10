@@ -211,6 +211,11 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         if self._nixl_agent is not None:
             return  # Already initialized
 
+        if not NIXL_AVAILABLE or nixl_agent is None or nixl_agent_config is None:
+            logger.warning("[InMemorySpyreConnector] NIXL not available; disabling NIXL transfer")
+            self._use_nixl = False
+            return
+
         try:
             port = NIXL_PORT if self._kv_role == "kv_producer" else 0
             config = nixl_agent_config(True, True, port)
@@ -632,12 +637,22 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         logger.info("[InMemorySpyreConnector] Sending LIST_REQUEST to prefill")
         self._nixl_agent.send_notif("server", b"LIST_REQUEST")
 
-        # Step 2: Poll for LIST response
+        # Step 2: Poll for LIST response. The first LIST_REQUEST can be
+        # consumed before the producer has registered this client agent
+        # (NIXL_ERR_NOT_FOUND in the producer handler), so re-send it
+        # every few seconds instead of relying on a settle delay.
         max_wait_seconds = 60
+        list_resend_iters = 500  # 5s at 10ms per iteration
         wait_count = 0
         available_req_ids = []
 
         while wait_count < max_wait_seconds * 100:
+            if wait_count > 0 and wait_count % list_resend_iters == 0:
+                logger.info(
+                    "[InMemorySpyreConnector] No LIST response after %ds, re-sending LIST_REQUEST",
+                    wait_count // 100,
+                )
+                self._nixl_agent.send_notif("server", b"LIST_REQUEST")
             notifs = self._nixl_agent.get_new_notifs()
             if len(notifs) > 0 and "server" in notifs and len(notifs["server"]) > 0:
                 for notif in notifs["server"]:
@@ -791,6 +806,8 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             time.sleep(0.01)
 
         # Reallocate buffers based on remote descriptors
+        assert remote_xfer_descs is not None  # narrowed by the timeout raise above
+
         # CRITICAL: Must match the producer's registered block layout.
         desc_count = remote_xfer_descs.descCount()
         tensors = []
@@ -1145,11 +1162,20 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             )
             return
 
+        # Legacy layouts: monolithic staging tensors (with optional heap KV
+        # addressing on AIU). The paged list-of-pages path above is the main
+        # Spyre path; reaching here on Spyre means an unexpected cache shape.
         first_tensor = next(iter(kv_caches.values()))
         self._dtype_str = str(first_tensor.dtype)
         if first_tensor.dim() >= 4:
             self._num_kv_heads = first_tensor.shape[-2]
             self._head_dim = first_tensor.shape[-1]
+        logger.warning(
+            "[InMemorySpyreConnector] Non-paged KV cache registered "
+            "(layout=%s); falling back to legacy %s path",
+            tuple(first_tensor.shape) if hasattr(first_tensor, "shape") else type(first_tensor),
+            "heap" if self._use_heap_kv else "staging",
+        )
 
     @property
     def uses_heap_kv(self) -> bool:
@@ -1160,6 +1186,16 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
 
     def paged_kv_active(self) -> bool:
         return self._paged_accessor is not None
+
+    def get_active_kv_path(self) -> str:
+        """Which KV access path is active: 'paged' (main Spyre path),
+        'heap' (legacy AIU heap addressing), or 'staging' (legacy
+        monolithic staging tensors)."""
+        if self._paged_accessor is not None:
+            return "paged"
+        if self._use_heap_kv:
+            return "heap"
+        return "staging"
 
     def get_paged_kv_status(self) -> dict[str, Any]:
         if self._paged_accessor is None:

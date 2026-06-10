@@ -933,6 +933,38 @@ def patch_backend_list(request, monkeypatch):
     yield
 
 
+@pytest.fixture()
+def constrain_vllm_runner_kv_cache(request, monkeypatch):
+    """Inject Spyre-friendly KV-cache caps into upstream `vllm_runner`-based tests.
+
+    `spyre_inference/platform.py` sets `VLLM_CPU_KVCACHE_SPACE=4` (4 GB) so that
+    CPUWorker's preflight check passes, but Spyre's VFIO DMA region is far smaller
+    than 4 GB. Without an explicit cap, vLLM tries to map a KV-cache budget that
+    exceeds what the device can DMA-map and `_initialize_kv_caches` fails with
+    `RAS::VFIO::MapDMAFailed: errno=No space left on device`.
+
+    This fixture wraps `VllmRunner.__init__` to set defaults that fit on Spyre.
+    Callers can still override them by passing the same kwargs explicitly.
+    """
+    test_module = request.node.module
+    # The upstream `test_models` test imports `VllmRunner` indirectly via the
+    # `vllm_runner` session fixture, which returns the class itself.
+    runner_fixture = request.getfixturevalue("vllm_runner")
+
+    orig_init = runner_fixture.__init__
+
+    def patched_init(self, model_name, *args, **kwargs):
+        # Cap KV cache to a tiny budget so it fits in Spyre's DMA region.
+        # block_size=16 * num_gpu_blocks_override=16 = 256 tokens,
+        # which covers max_num_seqs=2 * max_model_len=128.
+        kwargs.setdefault("max_model_len", 128)
+        kwargs.setdefault("num_gpu_blocks_override", 16)
+        return orig_init(self, model_name, *args, **kwargs)
+
+    monkeypatch.setattr(runner_fixture, "__init__", patched_init)
+    yield
+
+
 @pytest.hookimpl(tryfirst=True)
 def pytest_fixture_setup(fixturedef, request):
     """Override fixtures when running upstream vLLM tests."""

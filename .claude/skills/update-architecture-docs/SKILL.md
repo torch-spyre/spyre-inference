@@ -173,7 +173,7 @@ ones floating left with nothing on their right. Force a 2×2 grid by putting BOT
 `grid-rows: 2` and `grid-columns: 2` at the top level. Order children
 `api, engine, platform, worker` so the layout is:
 
-```
+```text
 [api ]  [engine]
 [plat]  [worker]
 ```

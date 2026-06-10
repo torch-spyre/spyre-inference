@@ -168,6 +168,12 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
+        # Register the Spyre KV connector before the scheduler instantiates
+        # connectors from kv_transfer_config.
+        from spyre_inference import register_kv_connector
+
+        register_kv_connector()
+
         # Check if the model dtype is different from float16,
         # which is only currently supported in torch-spyre
         if vllm_config.model_config.dtype != torch.float16:

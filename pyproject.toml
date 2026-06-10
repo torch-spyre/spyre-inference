@@ -150,6 +150,8 @@ line-length = 100
 "spyre_inference/version.py" = ["F401"]
 "spyre_inference/_version.py" = ["ALL"]
 "spyre_inference/custom_ops/__init__.py" = ["F401"]
+# Ported from llm-d-on-spyre KV connector baseline; kept close to source.
+"spyre_inference/distributed/kv_transfer/**" = ["E501"]
 
 [tool.ruff.lint]
 select = [

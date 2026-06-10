@@ -312,7 +312,11 @@ def ref_attn(
 @pytest.mark.parametrize(
     "block_size",
     [
+        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
+        # See: https://github.com/torch-spyre/spyre-inference/issues/239
+        pytest.param(64, id="block_size(64)"),
         pytest.param(128, id="block_size(128)"),
+        pytest.param(256, id="block_size(256)"),
     ],
 )
 @pytest.mark.parametrize("sliding_window", [None])

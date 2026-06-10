@@ -124,6 +124,94 @@ d2 --pad 50 docs/architecture/system-overview.d2 docs/architecture/system-overvi
 d2 --pad 50 docs/architecture/plugin-architecture.d2 docs/architecture/plugin-architecture.svg
 ```
 
+If `d2` is not installed, install it once to `~/.local/bin` without sudo:
+
+```bash
+curl -fsSL https://d2lang.com/install.sh | sh -s -- --prefix="$HOME/.local"
+```
+
+## Layout debugging
+
+D2 uses ELK (or dagre) for auto-layout. The result is opinionated and not always what
+you expect, especially with uneven container sizes and cross-container arrows. **Always
+render after every change and inspect the result before declaring the diagram done.**
+
+### Inspecting positions without opening the SVG
+
+Each shape ends up as `<rect x="..." y="..." width="..." height="...">` in the rendered
+SVG, prefixed with `class="<base64-of-path>"`. Grep the SVG to confirm where things
+landed:
+
+```bash
+# Canvas size
+grep -oE 'viewBox="[^"]+"' docs/architecture/system-overview.svg | head -1
+
+# All rect positions inside the worker container
+grep -oE 'class="d29[^"]*"><g class="shape" ><rect x="[0-9.]+" y="[0-9.]+"' \
+  docs/architecture/system-overview.svg
+```
+
+(`d29ya2Vy` is base64 for `worker`. Decode any class name with
+`echo "<class>" | base64 -d`.)
+
+### Common problems and fixes
+
+**Long diagonal arrows cutting across the page.** Cross-container arrows pull the target
+node toward whatever side ELK thinks is closest to the source. If a target like
+`worker.CPUWorker` lands far from where `engine.EngineCore` enters the worker container,
+the arrow has to traverse the whole box. The fix is usually to let ELK's
+connection-based placement do its job naturally: **remove forced directions** (e.g.
+`direction: right` on a container) and let the default flow position incoming-arrow
+targets near the edge closest to their source. The 2×2 grid with default direction in
+each cell tends to put `worker.CPUWorker` at the top-right (closest to the engine cell
+above it) and `worker.SpyreComm` at the bottom-left (closest to the platform cell to its
+left), giving short clean arrows on both sides.
+
+**Dead space above small containers in `direction: down`.** A vertical stack with one
+tall container (worker) and several short ones (api, engine, platform) leaves the small
+ones floating left with nothing on their right. Force a 2×2 grid by putting BOTH
+`grid-rows: 2` and `grid-columns: 2` at the top level. Order children
+`api, engine, platform, worker` so the layout is:
+
+```
+[api ]  [engine]
+[plat]  [worker]
+```
+
+`grid-columns: 2` alone is not enough — D2 will pack column-major when one cell is much
+taller than the others, putting the tall worker in its own full column.
+
+**Reserved keywords as identifiers.** `top` (and other layout keywords) cannot be used
+as a shape name. The compiler error reads `"top" must be the last part of the key`. Pick
+a descriptive name instead (e.g. `control_layer`).
+
+**`near` keyword limits.** `near` is more restricted than it looks:
+
+- Cannot reference shapes inside grid cells (descendants of grid containers).
+- Only accepts an absolute shape path OR one of `top-left`, `top-center`, `top-right`,
+  `center-left`, `center-right`, `bottom-left`, `bottom-center`, `bottom-right`.
+- Compound forms like `near: shape-top-left` are NOT supported.
+
+If you reach for `near`, the layout is probably already fighting you — try restructuring
+connections or container direction first.
+
+**Transparent sub-containers.** You can group nodes with a wrapper to force them to
+cluster, using `style.fill: transparent` AND `style.stroke: transparent` to hide the
+wrapper itself. This adds visual depth (extra nesting) and tends to grow the canvas — try
+the layout without it first. When you do use it, all references from outside need the
+new path (e.g. `worker.CPUWorker` → `worker.bootstrap.CPUWorker`).
+
+### Iteration loop
+
+1. Make a small structural change (reorder, add/remove direction, swap connection).
+2. Re-render.
+3. Grep the SVG for the canvas size and key node positions.
+4. Decide whether the change helped, then repeat.
+
+Don't fight the layout engine. If three attempts haven't fixed an arrow path, the right
+move is usually to **remove** a constraint (a forced direction, a sub-container, an
+explicit `near`), not add one.
+
 ## What to Look For When Updating
 
 Compare the current code against the diagrams and docs:

@@ -1,0 +1,44 @@
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+
+    subgraph vllm["<b>vllm</b> (upstream — unchanged)"]
+        direction TB
+        OC["OffloadingConnector"]
+        OCW["OffloadingConnectorWorker"]
+        Factory["OffloadingSpecFactory<br/>.create_spec(&quot;SpyreOffloadingSpec&quot;)"]
+        OC -- "register_kv_caches" --> OCW
+        OC -- "get_handlers (via factory)" --> Factory
+    end
+
+    subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
+        direction TB
+        Spec["SpyreOffloadingSpec"]
+        Mgr["get_manager() → CPUOffloadingManager<br/><i>reused verbatim from upstream</i>"]
+        Handlers["get_handlers() → SpyreCpuOffloadingHandlers"]
+        D2H["device_to_host_handler<br/>(Spyre → host RAM block tensor)"]
+        H2D["host_to_device_handler<br/>(host RAM block tensor → Spyre)"]
+        Copier["<b>SpyreKvDmaCopier</b><br/>the one and only place we touch<br/>Spyre device addresses<br/>.copy_d2h(spyre_tensor, host_tensor, *, slice)<br/>.copy_h2d(host_tensor, spyre_tensor, *, slice)"]
+        Backend1["<b>impl:</b> torch_spyre._C.{get_dmpa, spyre_from_blob}"]
+        Backend2["<b>fallback:</b> libsenlib DmaiQPush / DmaoQPush<br/>(gated by env var)"]
+
+        Spec --> Mgr
+        Spec --> Handlers
+        Handlers --> D2H
+        Handlers --> H2D
+        D2H --> Copier
+        H2D --> Copier
+        Copier --> Backend1
+        Copier --> Backend2
+    end
+
+    Factory -. "resolves to" .-> Spec
+    OCW -- "run handlers" --> D2H
+    OCW -- "run handlers" --> H2D
+
+    classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
+    classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
+    classDef hot fill:#ffe4e1,stroke:#a83232,color:#3a0000
+
+    class OC,OCW,Factory upstream
+    class Spec,Mgr,Handlers,D2H,H2D plugin
+    class Copier,Backend1,Backend2 hot

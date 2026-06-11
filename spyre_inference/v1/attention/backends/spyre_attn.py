@@ -15,7 +15,7 @@
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
 from dataclasses import dataclass
-from typing import ClassVar, Callable
+from typing import Callable, ClassVar, NamedTuple
 
 import torch
 
@@ -28,6 +28,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionImpl,
+    AttentionLayer,
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionType,
@@ -53,6 +54,26 @@ KV_LENGTH_ALIGNMENT = 256
 QUERY_CHUNK_SIZE = 32
 
 
+class SpyrePagedKVCache(NamedTuple):
+    """Per-layer paged KV cache for the Spyre backend.
+
+    NamedTuple (not dataclass) because it is a tuple at runtime — Dynamo
+    specializes tuple subscripts at trace time, which is what makes the
+    compile-unrolled per-page loop in `_create_compilable_page_attn` work.
+    A regular dataclass would cross an unverified line with Dynamo's tracing
+    of attribute access on custom objects. Index-by-int and unpacking
+    (`k_pages, v_pages = cache`) keep working unchanged.
+
+    Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
+    consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
+    the relay path as `dict[str, torch.Tensor]`; see the suppression at the
+    `bind_kv_cache(...)` call site for why that type-hole is benign.
+    """
+
+    k_pages: list[torch.Tensor]
+    v_pages: list[torch.Tensor]
+
+
 def _overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -61,7 +82,9 @@ def _overwrite(
 ) -> None:
     """Write input into output at the specified position (in-place)."""
     if output.device.type == "spyre":
-        torch.ops.spyre.overwrite(input, output, dims, offsets)
+        # `torch.ops.spyre.overwrite` is dynamically registered, so its
+        # signature is opaque to the type checker (ParamSpec resolves to `...`).
+        torch.ops.spyre.overwrite(input, output, dims, offsets)  # ty: ignore[invalid-argument-type]
     else:
         # intended behaviour on cpu
         sliced_t = output
@@ -116,16 +139,22 @@ def _indirect_matmul_mock(
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
         if isinstance(address_or_index_of_a, torch.Tensor):
             assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
-            address_or_index_of_a = address_or_index_of_a.item()
+            idx_a = int(address_or_index_of_a.item())
+        else:
+            assert address_or_index_of_a is not None
+            idx_a = address_or_index_of_a
         # pytorch syntax is the same like for python lists here
-        a = a[address_or_index_of_a]
+        a = a[idx_a]
         if transform_a:
             a = transform_a(a)
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
         if isinstance(address_or_index_of_b, torch.Tensor):
             assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
-            address_or_index_of_b = address_or_index_of_b.item()
-        b = b[address_or_index_of_b]
+            idx_b = int(address_or_index_of_b.item())
+        else:
+            assert address_or_index_of_b is not None
+            idx_b = address_or_index_of_b
+        b = b[idx_b]
         if transform_b:
             b = transform_b(b)
 
@@ -231,6 +260,10 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 )
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
+                # i > 0 only reachable after the i == 0 branch initialized these.
+                assert tile_max is not None
+                assert tile_sum is not None
+                assert tile_output is not None
                 new_max = torch.maximum(tile_max, scores_max)
                 rescale = torch.exp(tile_max - new_max)
                 tile_output = tile_output * rescale
@@ -345,7 +378,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
-        self.model_dtype = model_config.dtype
+        # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
+        # `TorchSpyrePlatform.check_and_update_config` rejects anything but
+        # `torch.float16` upstream so it's always a real torch.dtype here.
+        assert isinstance(model_config.dtype, torch.dtype)
+        self.model_dtype: torch.dtype = model_config.dtype
 
     def _build_attention_mask(
         self,
@@ -572,9 +609,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        # Compiled function caches (keyed by iteration count)
+        # Compiled function caches (keyed by iteration count for reshape, and
+        # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
-        self._attn_fns: dict[int, object] = {}
+        self._attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
@@ -600,20 +638,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._attn_fns[key]
 
-    def forward(
+    # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
+    # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
+    # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
+    # The matching pair of overrides preserves the runtime contract; ty
+    # cannot see the co-evolution.
+    def forward(  # ty: ignore[invalid-method-override]
         self,
-        layer: torch.nn.Module,
+        layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]
         key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
-        kv_cache: tuple[list[torch.Tensor], list[torch.Tensor]],
+        kv_cache: SpyrePagedKVCache,
         attn_metadata: SpyreAttentionMetadata,
-        output: torch.Tensor | None = None,
+        output: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        assert output is not None, "Output tensor must be provided"
-
         if attn_metadata is None:
             return output
 

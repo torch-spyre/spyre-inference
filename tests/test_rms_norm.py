@@ -40,7 +40,6 @@ def reference_rms_norm(
     return x_normed
 
 
-@pytest.mark.spyre
 @pytest.mark.rmsnorm
 @pytest.mark.parametrize("batch_size", [1])
 # Hidden sizes that aren't multiples of 64 currently fail on CI with size errors
@@ -94,7 +93,6 @@ def mock_forward_oot_with_residual(x, residual=None):
     return 2 * x, 2 * residual
 
 
-@pytest.mark.spyre
 @pytest.mark.rmsnorm
 @pytest.mark.parametrize("use_residual", [False, True])
 def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):

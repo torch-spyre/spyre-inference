@@ -178,3 +178,63 @@ def test_connector_env_overrides_config(monkeypatch):
     )
     assert connector._kv_role == "kv_consumer"  # env wins
     assert connector._nixl_remote_ip == "192.168.1.1"  # env wins
+
+
+def test_connector_use_nixl_true_from_config_at_construction(monkeypatch):
+    """use_nixl=true from kv_connector_extra_config is honored at the
+    connector level when VLLM_SPYRE_ENABLE_NIXL_TRANSFER is unset."""
+    pytest.importorskip("vllm", reason="vLLM required for connector construction")
+    monkeypatch.delenv("VLLM_SPYRE_ENABLE_NIXL_TRANSFER", raising=False)
+    monkeypatch.setenv("VLLM_SPYRE_KV_ROLE", "kv_producer")
+
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+    from spyre_inference.distributed.kv_transfer.kv_connector.v1 import (
+        inmemory_spyre_connector as mod,
+    )
+
+    # Without this, a host lacking NIXL flips _use_nixl off in __init__.
+    # The agent is only created lazily on first transfer (never here), so
+    # no real NIXL/AIU is needed; stub availability and the signal hooks.
+    monkeypatch.setattr(mod, "NIXL_AVAILABLE", True)
+    monkeypatch.setattr(mod.signal, "signal", lambda *a, **k: None)
+
+    kv_cfg = KVTransferConfig(
+        kv_connector="InMemorySpyreConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"use_nixl": True},
+    )
+    connector = mod.InMemorySpyreConnector(
+        VllmConfig(kv_transfer_config=kv_cfg), KVConnectorRole.WORKER
+    )
+    assert connector._use_nixl is True  # from extra_config, no env, availability stubbed
+
+
+def test_connector_env_zero_overrides_config_use_nixl_true(monkeypatch):
+    """VLLM_SPYRE_ENABLE_NIXL_TRANSFER=0 wins over extra_config use_nixl=true."""
+    pytest.importorskip("vllm", reason="vLLM required for connector construction")
+    monkeypatch.setenv("VLLM_SPYRE_ENABLE_NIXL_TRANSFER", "0")
+    monkeypatch.setenv("VLLM_SPYRE_KV_ROLE", "kv_producer")
+
+    from vllm.config import KVTransferConfig, VllmConfig
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+
+    from spyre_inference.distributed.kv_transfer.kv_connector.v1 import (
+        inmemory_spyre_connector as mod,
+    )
+
+    # Stub availability so a True result would survive — proving the env=0
+    # override, not local NIXL absence, is what disables it.
+    monkeypatch.setattr(mod, "NIXL_AVAILABLE", True)
+    monkeypatch.setattr(mod.signal, "signal", lambda *a, **k: None)
+
+    kv_cfg = KVTransferConfig(
+        kv_connector="InMemorySpyreConnector",
+        kv_role="kv_producer",
+        kv_connector_extra_config={"use_nixl": True},
+    )
+    connector = mod.InMemorySpyreConnector(
+        VllmConfig(kv_transfer_config=kv_cfg), KVConnectorRole.WORKER
+    )
+    assert connector._use_nixl is False  # env override wins

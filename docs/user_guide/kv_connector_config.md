@@ -33,19 +33,42 @@ Notes:
 
 ## Examples
 
-Config-driven (no connector env vars needed):
+### Config-driven (no connector env vars needed)
+
+Producer / prefill — enable NIXL and listen on a chosen port:
 
 ```bash
 vllm serve <model> \
-  --kv-transfer-config '{"kv_connector":"InMemorySpyreConnector","kv_role":"kv_producer","kv_connector_extra_config":{"use_nixl":true}}'
+  --kv-transfer-config '{
+    "kv_connector": "InMemorySpyreConnector",
+    "kv_role": "kv_producer",
+    "kv_connector_extra_config": {"use_nixl": true, "nixl_port": 9100}
+  }'
 ```
 
-Env-driven (overrides config when both are present):
+Consumer / decode — enable NIXL and point at the producer entirely
+through `kv_connector_extra_config`, so no `VLLM_SPYRE_NIXL_REMOTE_IP`
+env var is required:
+
+```bash
+vllm serve <model> \
+  --kv-transfer-config '{
+    "kv_connector": "InMemorySpyreConnector",
+    "kv_role": "kv_consumer",
+    "kv_connector_extra_config": {
+      "use_nixl": true,
+      "nixl_remote_ip": "<producer-host>",
+      "nixl_port": 9100
+    }
+  }'
+```
+
+### Env-driven (overrides config when both are present)
 
 ```bash
 export VLLM_SPYRE_KV_ROLE=kv_consumer
 export VLLM_SPYRE_ENABLE_NIXL_TRANSFER=1
-export VLLM_SPYRE_NIXL_REMOTE_IP=<prefill-host>
+export VLLM_SPYRE_NIXL_REMOTE_IP=<producer-host>
 vllm serve <model> \
   --kv-transfer-config '{"kv_connector":"InMemorySpyreConnector"}'
 ```

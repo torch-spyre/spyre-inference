@@ -66,8 +66,8 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             positions,  # ty: ignore[invalid-argument-type]
             query,  # ty: ignore[invalid-argument-type]
             key_in,  # ty: ignore[invalid-argument-type]
-            self.cos_sin_cache,
-            self._spyre_layer_name,
+            self.cos_sin_cache,  # ty: ignore[invalid-argument-type]
+            self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
         )
         if key is None:
             return out_q, None

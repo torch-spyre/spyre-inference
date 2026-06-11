@@ -643,7 +643,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
-    def forward(
+    def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]

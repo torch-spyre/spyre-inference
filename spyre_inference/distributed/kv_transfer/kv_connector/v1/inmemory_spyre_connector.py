@@ -47,6 +47,12 @@ from spyre_inference.distributed.kv_transfer.kv_connector.v1.metadata import (
     StoreKey,
     build_spyre_kv_store_backend,
 )
+from spyre_inference.distributed.kv_transfer.kv_connector.v1.connector_config import (
+    resolve_kv_role,
+    resolve_nixl_port,
+    resolve_nixl_remote_ip,
+    resolve_use_nixl,
+)
 from spyre_inference.distributed.kv_transfer.kv_connector.v1.heap_kv_accessor import (
     resolve_heap_kv_paths,
 )
@@ -139,8 +145,17 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         self._block_size = vllm_config.cache_config.block_size
         self._store = store if store is not None else get_global_store()
 
-        # Step 2: Store KV role for file-based transfer
-        self._kv_role = os.environ.get("VLLM_SPYRE_KV_ROLE", "")
+        # Settings come from vLLM's kv_transfer_config when present
+        # (the `vllm serve --kv-transfer-config` path); an explicitly set
+        # env var always overrides, keeping the baked-image/manual path
+        # working unchanged.
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        config_role = getattr(kv_transfer_config, "kv_role", None)
+        extra_config = getattr(kv_transfer_config, "kv_connector_extra_config", None)
+        config_ip = getattr(kv_transfer_config, "kv_ip", None)
+
+        # KV role: non-empty env wins, else kv_transfer_config.kv_role, else "".
+        self._kv_role = resolve_kv_role(os.environ.get("VLLM_SPYRE_KV_ROLE"), config_role)
 
         self._pending_requests: list[SpyreConnectorRequestMeta] = []
         self._saved_requests: OrderedDict[str, SavedRequestRecord] = OrderedDict()
@@ -173,11 +188,21 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
         # Per-request tracking of computed tokens (fixes cache hit degradation bug)
         self._request_computed_tokens: dict[str, int] = {}
 
-        # NIXL integration for KV cache transfer
-        self._use_nixl = envs_spyre.VLLM_SPYRE_ENABLE_NIXL_TRANSFER
+        # NIXL integration for KV cache transfer. Explicitly set
+        # VLLM_SPYRE_ENABLE_NIXL_TRANSFER wins; otherwise
+        # kv_connector_extra_config["use_nixl"] drives it, else off.
+        self._use_nixl = resolve_use_nixl(
+            os.environ.get("VLLM_SPYRE_ENABLE_NIXL_TRANSFER"), extra_config
+        )
         self._nixl_agent = None
         self._nixl_register_descs = None
-        self._nixl_remote_ip = os.environ.get("VLLM_SPYRE_NIXL_REMOTE_IP", "10.130.2.89")
+        # Remote endpoint: env override, else extra_config, else kv_ip,
+        # else the legacy default. Port: extra_config["nixl_port"] or the
+        # module default (kv_port is auto-assigned by vLLM, so not used).
+        self._nixl_remote_ip = resolve_nixl_remote_ip(
+            os.environ.get("VLLM_SPYRE_NIXL_REMOTE_IP"), extra_config, config_ip
+        )
+        self._nixl_port = resolve_nixl_port(extra_config, NIXL_PORT)
 
         # Decode-initiated pull: Prefill stores pending transfers, decode requests them
         self._pending_transfers = {}  # Map: req_id -> {metadata, descriptors, register_descs, timestamp}
@@ -217,7 +242,7 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
             return
 
         try:
-            port = NIXL_PORT if self._kv_role == "kv_producer" else 0
+            port = self._nixl_port if self._kv_role == "kv_producer" else 0
             config = nixl_agent_config(True, True, port)
             role = "server" if self._kv_role == "kv_producer" else "client"
             self._nixl_agent = nixl_agent(role, config)
@@ -230,10 +255,12 @@ class InMemorySpyreConnector(KVConnectorBase_V1):
                 logger.info(
                     "[InMemorySpyreConnector] Client connecting to server at %s:%d",
                     self._nixl_remote_ip,
-                    NIXL_PORT,
+                    self._nixl_port,
                 )
-                self._nixl_agent.fetch_remote_metadata("server", self._nixl_remote_ip, NIXL_PORT)
-                self._nixl_agent.send_local_metadata(self._nixl_remote_ip, NIXL_PORT)
+                self._nixl_agent.fetch_remote_metadata(
+                    "server", self._nixl_remote_ip, self._nixl_port
+                )
+                self._nixl_agent.send_local_metadata(self._nixl_remote_ip, self._nixl_port)
 
                 # Wait for server to register us before sending signal
                 logger.info(

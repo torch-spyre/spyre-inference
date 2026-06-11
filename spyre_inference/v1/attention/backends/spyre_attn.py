@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import ClassVar, Callable
 
 import torch
+import traceback
 
 from spyre_inference.custom_ops.utils import convert
 
@@ -130,7 +131,11 @@ def _indirect_matmul_mock(
             b = transform_b(b)
 
     # do the actual matmul
-    output = torch.matmul(a, b)
+    try:
+        output = torch.matmul(a, b)
+    except Exception:
+        print(traceback.format_exc())
+        raise Exception('Fail!')
     return output
 
 

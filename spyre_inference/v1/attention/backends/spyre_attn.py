@@ -82,7 +82,9 @@ def _overwrite(
 ) -> None:
     """Write input into output at the specified position (in-place)."""
     if output.device.type == "spyre":
-        torch.ops.spyre.overwrite(input, output, dims, offsets)
+        # `torch.ops.spyre.overwrite` is dynamically registered, so its
+        # signature is opaque to the type checker (ParamSpec resolves to `...`).
+        torch.ops.spyre.overwrite(input, output, dims, offsets)  # ty: ignore[invalid-argument-type]
     else:
         # intended behaviour on cpu
         sliced_t = output

@@ -109,7 +109,9 @@ def copy_attn_output(attn_output, num_actual_tokens, output):
     """Place `attn_output[:num_actual_tokens]` into the caller-provided `output` buffer."""
     if output.device.type == "spyre":
         attn_output_spyre = convert(attn_output, "spyre", output.dtype)
-        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])
+        # `torch.ops.spyre.overwrite` is dynamically registered, so its signature
+        # is opaque to the type checker (ParamSpec resolves to `...`).
+        torch.ops.spyre.overwrite(attn_output_spyre, output, [0], [0])  # ty: ignore[invalid-argument-type]
     else:
         output[:num_actual_tokens].copy_(attn_output)
     return output
@@ -628,13 +630,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # output in eager mode and only becomes in-place via inductor's
             # ReinplacePass — but Attention.forward() runs opaque-to-dynamo,
             # so the clone path persists and writes are lost across forwards.
+            # `torch.ops.spyre.overwrite` is dynamically registered, so its
+            # signature is opaque to the type checker.
             for t in range(num_tokens):
                 br = int(block_indices[t])
                 cs = int(block_offsets[t]) * head_size
                 k_tok = convert(key[t].unsqueeze(1).contiguous(), device=self._target_device)
                 v_tok = convert(value[t].unsqueeze(1).contiguous(), device=self._target_device)
-                torch.ops.spyre.overwrite(k_tok, self._k_cache_dev, [1, 2], [br, cs])
-                torch.ops.spyre.overwrite(v_tok, self._v_cache_dev, [1, 2], [br, cs])
+                torch.ops.spyre.overwrite(k_tok, self._k_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
+                torch.ops.spyre.overwrite(v_tok, self._v_cache_dev, [1, 2], [br, cs])  # ty: ignore[invalid-argument-type]
             return
 
         # bmm 1: place each token's head_size-vector into its block-width slot.

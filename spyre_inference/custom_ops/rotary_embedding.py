@@ -61,10 +61,11 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # infer_schema rejects Optional[Tensor] returns, so use an empty
         # tensor sentinel across the op boundary.
         key_in = key if key is not None else torch.empty(0, device=query.device, dtype=query.dtype)
+        # torch.ops dispatcher signature is opaque to the type checker (resolves to `...`).
         out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
-            positions,
-            query,
-            key_in,
+            positions,  # ty: ignore[invalid-argument-type]
+            query,  # ty: ignore[invalid-argument-type]
+            key_in,  # ty: ignore[invalid-argument-type]
             self.cos_sin_cache,
             self._spyre_layer_name,
         )

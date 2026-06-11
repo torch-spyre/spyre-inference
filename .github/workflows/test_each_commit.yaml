@@ -67,7 +67,15 @@ jobs:
               - linux
               - image_spyre_inference
             flags: >-
-              -m upstream
+              -m "upstream and not distributed"
+          - cfg: Upstream distributed vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x2__pvc_1tb_x1
+              - linux
+              - image_spyre_inference
+            flags: >-
+              -m "upstream and distributed"
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 720
     env:

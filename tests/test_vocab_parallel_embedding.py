@@ -36,7 +36,6 @@ import torch
 import torch.nn.functional as F
 
 
-@pytest.mark.spyre
 @pytest.mark.vocab_parallel_embedding
 def test_vocab_parallel_embedding_oot_dispatch(tp_group):
     """VocabParallelEmbedding(...) instantiates SpyreVocabParallelEmbedding."""
@@ -51,7 +50,6 @@ def test_vocab_parallel_embedding_oot_dispatch(tp_group):
     assert isinstance(layer, SpyreVocabParallelEmbedding)
 
 
-@pytest.mark.spyre
 @pytest.mark.vocab_parallel_embedding
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
 @pytest.mark.parametrize("vocab_size", [128, 1024, 32000])
@@ -76,7 +74,6 @@ def test_tp1_forward_matches_reference(tp_group, num_tokens, vocab_size, embeddi
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.spyre
 @pytest.mark.vocab_parallel_embedding
 @pytest.mark.parametrize("num_tokens", [1, 8, 32])
 @pytest.mark.parametrize("vocab_size", [1024, 32000])
@@ -145,7 +142,6 @@ def test_fake_tp2_forward_matches_reference(
 # on TP > 1.
 
 
-@pytest.mark.spyre
 @pytest.mark.xfail(
     strict=True,
     reason=(

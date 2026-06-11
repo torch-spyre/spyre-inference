@@ -157,12 +157,17 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # CPU tensors dispatch through the gloo half of the multi-backend
+        # `cpu:gloo,spyre:spyreccl` device_group, which implements allgather
+        # fine. Only spyre tensors hit the spyreccl gap, so guard on device.
         # REPLACE-WITH-NATIVE: when libspyre_comms exposes the list-form
         # SpyreCommsContext::allgather (and torch-spyre's spyreccl backend
         # wires up `_allgather_base`), delete this override and let the
         # base class use `dist.all_gather_into_tensor`.
         if self.world_size == 1:
             return input_
+        if input_.device.type == "cpu":
+            return super().all_gather(input_, dim)
         raise NotImplementedError(
             _spyre_collective_unsupported_message(
                 "allgather",
@@ -172,10 +177,14 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         )
 
     def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor | None:
+        # CPU tensors dispatch through gloo on the multi-backend device_group;
+        # only spyre tensors need the spyreccl native gather we don't have yet.
         # REPLACE-WITH-NATIVE: when libspyre_comms supports gather natively,
         # delete this override.
         if self.world_size == 1:
             return input_
+        if input_.device.type == "cpu":
+            return super().gather(input_, dst, dim)
         raise NotImplementedError(
             _spyre_collective_unsupported_message(
                 "gather",

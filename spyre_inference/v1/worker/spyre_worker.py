@@ -81,7 +81,11 @@ class TorchSpyreWorker(CPUWorker):
         # `set_device(local_rank)` above; tensors created on
         # `torch.device("spyre")` will land on that card.
         original = cpu_worker_module.CPUModelRunner
-        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(
+        # Monkey-patching `CPUModelRunner` (a class attribute) with a factory
+        # function widens its declared class type; `cpu_worker_module` does
+        # not type-annotate the attribute so we cannot avoid the assignment
+        # error from ty without a suppression here.
+        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(  # ty: ignore[invalid-assignment]
             self.vllm_config,
             torch.device("spyre"),
         )
@@ -96,7 +100,7 @@ class TorchSpyreWorker(CPUWorker):
         import time
 
         import torch._inductor.decomposition
-        from torch_spyre._inductor.decompositions import spyre_decompositions  # ty: ignore[unresolved-import]
+        from torch_spyre._inductor.decompositions import spyre_decompositions
 
         for op, impl in spyre_decompositions.items():
             if "addm" in op.name():

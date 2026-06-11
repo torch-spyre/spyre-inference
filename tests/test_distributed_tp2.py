@@ -42,8 +42,10 @@ def _spyre_device_count() -> int:
 # test_tp2_llm_construction / test_tp2_llm_generate_matches_tp1 pass,
 # this test is redundant — delete it along with the xfail markers on
 # the LLM tests.
-@pytest.mark.spyre
+
+
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
@@ -59,8 +61,8 @@ def test_tp2_tensor_model_parallel_all_reduce(run_tp_probe) -> None:
     run_tp_probe("tp_all_reduce", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
@@ -79,6 +81,34 @@ def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
     redundant and can be deleted.
     """
     run_tp_probe("vocab_parallel_embedding", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "merged_column_parallel_linear",
+        "qkv_parallel_linear",
+        "row_parallel_linear",
+    ],
+)
+def test_tp_linear_layers(run_tp_probe, probe: str) -> None:
+    """End-to-end TP=2 test of a Spyre linear layer on Spyre cards.
+
+    Spawns one subprocess per rank, running through vllm's real
+    `init_worker_distributed_environment` against a real `VllmConfig`,
+    then verifies the layer returns numerically correct results on
+    TP=2 with Spyre communication. Parametrized over the three layer
+    types: SpyreMergedColumnParallelLinear (output sharding),
+    SpyreQKVParallelLinear (Q/K/V sharding), and SpyreRowParallelLinear
+    (input sharding).
+    """
+    run_tp_probe(probe, world_size=2)
 
 
 @pytest.mark.spyre
@@ -116,8 +146,8 @@ def test_tp2_llm_construction() -> None:
     )
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",

@@ -50,22 +50,25 @@ from vllm.config import VllmConfig, CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
 
-class SpyreCpuGpuBuffer:
+class SpyreCpuGpuBuffer(CpuGpuBuffer):
     """Spyre-specific CpuGpuBuffer with Spyre-safe copies and split dtypes.
     This buffer is closely related to the CpuGpuBuffer in vllm/v1/utils.py.
 
     For float dtypes: .cpu on CPU, .gpu on Spyre (float16).
     For int/bool dtypes: .gpu aliased to .cpu (CPUModelRunner pattern).
     All copies are currently synchronous as torch-spyre does not yet support `non_blocking`.
+
+    Inherits from `CpuGpuBuffer` (without invoking its `__init__`) so that
+    `_make_buffer` overrides remain Liskov-compatible with `GPUModelRunner`.
     """
 
     def __init__(
@@ -102,10 +105,11 @@ class SpyreCpuGpuBuffer:
         dst.copy_(src)
         return dst
 
-    # Currently only the copy_to_gpu function is invoked.
-    # If the copy_to_cpu also becomes required, override it here with
-    # spyre-specific aspects.
-    # def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+    def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
+        # Currently only the copy_to_gpu function is invoked.
+        # If the copy_to_cpu also becomes required, override it here with
+        # spyre-specific aspects.
+        raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
 
 
 class _SpyreModelWrapper:
@@ -320,62 +324,71 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Warmup done.")
 
     # --- KV cache allocation ---
-    # Potential sub to override KV cache tensor allocation
-    def _allocate_kv_cache_tensors(
-        self,
-        kv_cache_config,
-    ) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
-        if envs.SPYRE_ATTN_IMPL == "exp":
-            kv_cache_raw_tensors: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                block_size = self.vllm_config.cache_config.block_size
-                num_blocks = kv_cache_config.num_blocks
-                head_size = self.vllm_config.model_config.model_arch_config.head_size
-                num_kv_heads = self.vllm_config.model_config.model_arch_config.total_num_kv_heads
 
-                aligned_num_physical_blocks = ((num_blocks + 63) // 64) * 64
-                block_width = block_size * head_size
+    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+        """Allocate KV cache as lists of individual page tensors on Spyre.
 
-                k_cache_dev = torch.zeros(
-                    num_kv_heads,
-                    aligned_num_physical_blocks,
-                    block_width,
-                    dtype=self.dtype,
-                    device="spyre",
+        Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
+        is a list of tensors of shape [num_kv_heads, block_size, head_size] on
+        the Spyre device. This matches upstream vLLM's paged model but uses
+        list indices instead of tensor indices — enabling direct per-page bmm
+        without advanced indexing.
+        """
+        from vllm.v1.worker.utils import bind_kv_cache
+        from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+
+        # Iterate kv_cache_tensors (one entry per physical buffer)
+        spec_by_layer = {
+            ln: g.kv_cache_spec for g in kv_cache_config.kv_cache_groups for ln in g.layer_names
+        }
+
+        # vLLM's `bind_kv_cache` types this dict as `dict[str, torch.Tensor]`,
+        # but the matching `SpyreAttentionImpl.forward` consumes the
+        # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
+        kv_caches: dict[str, SpyrePagedKVCache] = {}
+
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            # All layers in `shared_by` use the same spec by construction.
+            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
+            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
+
+            # Default stickification splits head_size into 64-element sticks.
+            # Alternative: stickify block_size or num_kv_heads for different
+            # access patterns (would require explicit SpyreTensorLayout).
+            k_pages: list[torch.Tensor] = [
+                torch.zeros(
+                    spec.num_kv_heads,
+                    spec.block_size,
+                    spec.head_size,
+                    dtype=torch.float16,
+                    device=self._spyre_device,
                 )
-                v_cache_dev = torch.zeros(
-                    num_kv_heads,
-                    aligned_num_physical_blocks,
-                    block_width,
-                    dtype=self.dtype,
-                    device="spyre",
+                for _ in range(num_blocks)
+            ]
+            v_pages: list[torch.Tensor] = [
+                torch.zeros(
+                    spec.num_kv_heads,
+                    spec.block_size,
+                    spec.head_size,
+                    dtype=torch.float16,
+                    device=self._spyre_device,
                 )
+                for _ in range(num_blocks)
+            ]
 
-                for layer_name in kv_cache_tensor.shared_by:
-                    kv_cache_raw_tensors[layer_name] = (k_cache_dev, v_cache_dev)
+            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+            for layer_name in kv_cache_tensor.shared_by:
+                kv_caches[layer_name] = page_cache
 
-            layer_names = set()
-            for group in kv_cache_config.kv_cache_groups:
-                for layer_name in group.layer_names:
-                    if layer_name in self.runner_only_attn_layers:
-                        continue
-                    layer_names.add(layer_name)
-            assert layer_names == set(kv_cache_raw_tensors.keys()), (
-                "Some layers are not correctly initialized"
-            )
-            return kv_cache_raw_tensors
-        else:
-            return super()._allocate_kv_cache_tensors(kv_cache_config)
+        for layer_name, target in self.shared_kv_cache_layers.items():
+            kv_caches[layer_name] = kv_caches[target]
 
-    def _reshape_kv_cache_tensors(
-        self,
-        kv_cache_raw_tensors: dict[str, torch.Tensor],
-        kernel_block_sizes: list[int],
-    ) -> dict[str, torch.Tensor]:
-        if envs.SPYRE_ATTN_IMPL == "exp":
-            return kv_cache_raw_tensors
-        else:
-            return super()._reshape_kv_cache_tensors(kv_cache_raw_tensors, kernel_block_sizes)
+        bind_kv_cache(
+            kv_caches,  # ty: ignore[invalid-argument-type]
+            self.compilation_config.static_forward_context,
+            self.kv_caches,
+        )
+        return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
@@ -402,6 +415,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Unwrap torch.compile's OptimizedModule (has _orig_mod attribute)
         if hasattr(model, "_orig_mod"):
             model = model._orig_mod
+        assert isinstance(model, nn.Module)
         return model
 
     # --- Buffer management ---

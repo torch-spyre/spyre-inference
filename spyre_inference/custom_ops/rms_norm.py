@@ -117,10 +117,11 @@ class SpyreRMSNorm(RMSNorm):
         output = torch.empty_like(x)
         residual_out = torch.empty_like(residual) if residual is not None else None
 
-        # Custom op call - executes outside torch.compile graph
-        torch.ops.vllm.spyre_rmsnorm(x, output, self._layer_name, residual, residual_out)
+        # `torch.ops.vllm.spyre_rmsnorm` is dynamically registered, so its
+        # signature is opaque to the type checker (ParamSpec resolves to `...`).
+        torch.ops.vllm.spyre_rmsnorm(x, output, self._layer_name, residual, residual_out)  # ty: ignore[invalid-argument-type]
 
-        if residual is not None:
+        if residual_out is not None:
             return output, residual_out
         return output
 
@@ -148,13 +149,13 @@ class SpyreRMSNorm(RMSNorm):
         if x.shape[-1] != hidden_size:
             raise ValueError(f"Expected hidden_size to be {hidden_size}, but found: {x.shape[-1]}")
 
-        variance_epsilon = torch.full(
+        variance_epsilon_t = torch.full(
             x.shape, variance_epsilon, dtype=torch.float16, device=x.device
         )
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
-        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * torch.rsqrt(variance + variance_epsilon_t)
 
         if weight is not None:
             x = x * weight

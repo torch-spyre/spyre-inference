@@ -66,40 +66,21 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         # an integer.
 
         # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size
-        original_vocab_size = layer.weight.shape[0]
-        vocab_size_per_partition = original_vocab_size
+        ALIGN = 64 * 32
+        size = layer.weight.shape[0]
+        layer.padding = (-size) % ALIGN
 
-        pad_1 = vocab_size_per_partition % 64
-        if pad_1 != 0:
-            pad_1 = 64 - pad_1
-            logger.warning_once(
-                "%s: vocabulary partition size %d is not a multiple of 64, "
-                "padding by %d (torch-spyre limitation)",
-                layer.__class__.__name__,
-                vocab_size_per_partition,
-                pad_1,
-            )
-            padded_tensor = F.pad(layer.weight, (0, 0, 0, pad_1))
-            layer.weight = Parameter(padded_tensor, requires_grad=layer.weight.requires_grad)
-            vocab_size_per_partition = layer.weight.shape[0]
-
-        # Second padding: ensure (size // 64) is multiple of 32
-        pad_2 = (vocab_size_per_partition // 64) % 32
-        if pad_2 > 0:
-            pad_2 = 32 - pad_2
-            pad_2_size = pad_2 * 64
-            layer.padded_weight = F.pad(layer.weight, (0, 0, 0, pad_2_size))
+        if layer.padding > 0:
+            layer.padded_weight = Parameter(F.pad(layer.weight.data, (0, 0, 0, layer.padding)))
             logger.warning_once(
                 "%s: weights padded from %d to %d (torch-spyre limitation) "
                 "expect numerical differences to upstream vLLM.",
                 layer.__class__.__name__,
-                vocab_size_per_partition,
+                size,
                 layer.padded_weight.shape[0],
             )
         else:
             layer.padded_weight = layer.weight
-
-        layer.padding = layer.padded_weight.shape[0] - original_vocab_size
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -157,7 +138,7 @@ class SpyreParallelLMHead(ParallelLMHead):
             bias: Optional bias tensor
 
         Returns:
-            Logits tensor [num_tokens, vocab_size_per_partition] on the input device
+            Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
         x_device = x.device
 

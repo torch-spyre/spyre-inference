@@ -65,17 +65,19 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
     expected = reference_rms_norm(x, layer.weight.data, eps, residual)
 
     # Test forward_oot (Spyre device execution via custom op)
-    actual = layer.forward_oot(x, residual)
+    actual = layer.forward_oot(x.to("spyre"), residual.to("spyre") if use_residual else None)
 
     if use_residual:
         expected_norm, expected_resid = expected
         actual_norm, actual_resid = actual
-        torch.testing.assert_close(actual_norm.float(), expected_norm.float(), atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
-            actual_resid.float(), expected_resid.float(), atol=1e-2, rtol=1e-2
+            actual_norm.cpu().float(), expected_norm.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            actual_resid.cpu().float(), expected_resid.float(), atol=1e-2, rtol=1e-2
         )
     else:
-        torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.fixture

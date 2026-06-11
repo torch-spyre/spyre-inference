@@ -210,3 +210,4 @@ When exploring a new feature area (e.g., FP8 quantization, new operators, hardwa
 - **Match existing style**: Follow established code patterns and architectural conventions
 - **ASCII only in comments**: No Unicode characters in newly added code comments
 - **Prefer simplicity**: When uncertain, choose the simpler, more concise implementation
+- **Assume vLLM familiarity**: The reader may not be an expert on the specific code being read, but should have general experience with vLLM

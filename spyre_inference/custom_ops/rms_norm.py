@@ -83,13 +83,13 @@ class SpyreRMSNorm(RMSNorm):
         if x.shape[-1] != hidden_size:
             raise ValueError(f"Expected hidden_size to be {hidden_size}, but found: {x.shape[-1]}")
 
-        variance_epsilon = torch.full(
+        variance_epsilon_t = torch.full(
             x.shape, variance_epsilon, dtype=torch.float16, device=x.device
         )
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
-        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * torch.rsqrt(variance + variance_epsilon_t)
 
         if weight is not None:
             x = x * weight

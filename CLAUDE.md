@@ -45,8 +45,11 @@ uv sync --frozen
 # Development install with test dependencies
 uv sync --group dev
 
-# Run Spyre device tests
-uv run pytest -m spyre
+# Run all tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest
+
+# Run distributed tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest -m distributed
 
 # Run upstream vLLM tests (cached in ~/.cache/vllm-upstream-tests)
 uv run pytest -m upstream
@@ -185,6 +188,16 @@ When a test fails with numerical mismatch, a compile error on `spyre`, or a sile
 The single most important signal: `FallbackWarning`. `torch-spyre` silently routes unsupported ops to CPU and emits this warning. A fallback changes the numerical path (CPU vs Spyre matmul kernels differ in accumulation order for fp16) and can mask the real bug. Turn it into an error with `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"` to get a traceback to the triggering line.
 
 Most "Spyre is broken" bugs are not in our code — they are torch-spyre op gaps, dtype/layout limitations, or shape-bucket misses. Read the relevant `.venv/lib/python3.12/site-packages/torch_spyre/ops/{eager,fallbacks}.py` files before assuming a local bug.
+
+## Researching torch-spyre Issues and PRs
+
+When exploring a new feature area (e.g., FP8 quantization, new operators, hardware support), **survey the torch-spyre repo for existing issues and PRs first**. This avoids duplicating work and surfaces known blockers.
+
+**How to search:**
+
+1. GitHub issue/PR search: `https://github.com/torch-spyre/torch-spyre/issues?q=<keyword>` and `/pulls?q=<keyword>`
+2. Search terms: Use both short and long forms (e.g., `FP8`, `float8`, `scaled_mm`, `_scaled_mm`)
+3. Check both open and closed/merged items — merged PRs show what's landed, closed issues may explain why something was deferred
 
 ## Code Style
 

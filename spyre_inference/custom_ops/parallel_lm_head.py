@@ -92,6 +92,9 @@ class SpyreParallelLMHead(ParallelLMHead):
     and runs F.linear on Spyre.
     """
 
+    padding: int
+    padded_weight: torch.Tensor
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

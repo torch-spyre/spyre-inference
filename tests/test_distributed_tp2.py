@@ -42,8 +42,10 @@ def _spyre_device_count() -> int:
 # test_tp2_llm_construction / test_tp2_llm_generate_matches_tp1 pass,
 # this test is redundant — delete it along with the xfail markers on
 # the LLM tests.
-@pytest.mark.spyre
+
+
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
@@ -59,8 +61,8 @@ def test_tp2_tensor_model_parallel_all_reduce(run_tp_probe) -> None:
     run_tp_probe("tp_all_reduce", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
@@ -81,8 +83,8 @@ def test_tp2_vocab_parallel_embedding(run_tp_probe) -> None:
     run_tp_probe("vocab_parallel_embedding", world_size=2)
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
@@ -144,8 +146,8 @@ def test_tp2_llm_construction() -> None:
     )
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",

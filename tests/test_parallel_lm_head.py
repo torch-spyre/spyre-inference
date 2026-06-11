@@ -32,7 +32,6 @@ def reference_lm_head(
     return F.linear(x, weight, bias)
 
 
-@pytest.mark.spyre
 @pytest.mark.parallel_lm_head
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
 @pytest.mark.parametrize("vocab_size", [64, 128, 49216, 51200])
@@ -79,7 +78,6 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.spyre
 @pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
 @pytest.mark.parametrize(
@@ -140,7 +138,6 @@ def test_padded_weight_reflects_loaded_weight(
         )
 
 
-@pytest.mark.spyre
 @pytest.mark.parallel_lm_head
 def test_lm_head_oot_dispatch(tp_group):
     """Verify ParallelLMHead OOT registration: class swap + quant_method swap."""
@@ -158,7 +155,6 @@ def test_lm_head_oot_dispatch(tp_group):
     assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
 
 
-@pytest.mark.spyre
 @pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
 def test_invalid_weight_shape_raises(tp_group):

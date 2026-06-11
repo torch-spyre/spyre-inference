@@ -45,5 +45,7 @@ repos:
       # check all files because the staged changes may cause errors in unmodified files. Think
       # deleting a method but forgetting to remove all of the call sites in other files.
       pass_filenames: false
-      # Local commits only — CI installs without vllm/torch-spyre, so ty would fail on every import
+      # Pinned to the pre-commit stage so the manual-stage CI run on
+      # ubuntu-latest (which does not install vllm/torch-spyre) skips it; a
+      # dedicated CI job on a Spyre runner runs `prek run ty --stage pre-commit`.
       stages: [pre-commit]

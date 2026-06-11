@@ -19,7 +19,6 @@ from vllm.config import AttentionConfig
 import pytest
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
 def test_basic_model_load():
     model = LLM(

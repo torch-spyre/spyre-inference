@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
+    SpyrePagedKVCache,
 )
 
 
@@ -438,7 +439,7 @@ def test_spyre_attn(
     )
 
     output = torch.empty_like(query).to(cache_device)
-    kv_cache = (k_pages, v_pages)
+    kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     # Note: attn_impl.forward() internally calls _reshape_and_cache() to write
     # the new K/V tokens into the cache, so this test exercises both the cache
     # writing and attention computation paths. TODO: Add a dedicated unit test

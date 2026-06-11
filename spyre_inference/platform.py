@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.metadata
+import math
 import multiprocessing
 import os
 import sys
@@ -219,3 +220,20 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+
+        # Pin the on-device KV cache to exactly what's needed to fill the
+        # configured batch area: max_num_seqs sequences × ceil(max_model_len /
+        # block_size) blocks each. Anything more is over-allocation while
+        # the attention op is still unoptimized.
+        cache_config = vllm_config.cache_config
+        if cache_config.num_gpu_blocks_override is None:
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            max_model_len = vllm_config.model_config.max_model_len
+            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+            logger.info(
+                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                cache_config.num_gpu_blocks_override,
+                max_num_seqs,
+                blocks_per_seq,
+            )

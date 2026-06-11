@@ -83,12 +83,14 @@ def dummy_tensor():
     return torch.randn(4, 128, dtype=torch.float32)
 
 
-def mock_forward_oot(x, residual=None):
+def mock_forward_oot(x, variance_epsilon=None, hidden_size=None, weight=None, residual=None):
     """Mock: return x + 1 (no residual path)."""
     return x + 1
 
 
-def mock_forward_oot_with_residual(x, residual=None):
+def mock_forward_oot_with_residual(
+    x, variance_epsilon=None, hidden_size=None, weight=None, residual=None
+):
     """Mock: return (2 * x, 2 * residual) (residual path)."""
     return 2 * x, 2 * residual
 
@@ -110,9 +112,9 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
 
     residual = torch.randn(4, 128, dtype=torch.float32) if use_residual else None
 
-    # Mock _forward_spyre_impl (called by the custom op) with a known transform
+    # Mock _compiled_forward_spyre (called by the custom op) with a known transform
     if residual is not None:
-        monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot_with_residual)
+        monkeypatch.setattr(layer, "_compiled_forward_spyre", mock_forward_oot_with_residual)
         out_x, out_residual = layer.forward(dummy_tensor, residual)
 
         assert torch.allclose(out_x, 2 * dummy_tensor)
@@ -120,7 +122,7 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
         # The residual is modified in-place
         assert torch.allclose(out_residual, 2 * residual)
     else:
-        monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
+        monkeypatch.setattr(layer, "_compiled_forward_spyre", mock_forward_oot)
         out_x = layer.forward(dummy_tensor, residual)
 
         assert torch.allclose(out_x, dummy_tensor + 1)

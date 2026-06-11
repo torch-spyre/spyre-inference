@@ -205,3 +205,8 @@ When exploring a new feature area (e.g., FP8 quantization, new operators, hardwa
 - **Type hints**: Ignore `possibly-missing-attribute` (ty)
 - **Excluded from ty**: `spyre_inference/__init__.py`
 - **Codespell**: Ignore list includes `dout, te, indicies, subtile, ElementE`
+- **Minimize comments**: Code should be self-explanatory; add comments only for global context or non-obvious reasoning
+- **Avoid trivial helpers**: Don't create 1-2 LOC functions used only once
+- **Match existing style**: Follow established code patterns and architectural conventions
+- **ASCII only in comments**: No Unicode characters in newly added code comments
+- **Prefer simplicity**: When uncertain, choose the simpler, more concise implementation

@@ -61,12 +61,12 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # infer_schema rejects Optional[Tensor] returns, so use an empty
         # tensor sentinel across the op boundary.
         key_in = key if key is not None else torch.empty(0, device=query.device, dtype=query.dtype)
+        # cos_sin_cache is fetched inside the op via get_layer(layer_name);
         # torch.ops dispatcher signature is opaque to the type checker (resolves to `...`).
         out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
             positions,  # ty: ignore[invalid-argument-type]
             query,  # ty: ignore[invalid-argument-type]
             key_in,  # ty: ignore[invalid-argument-type]
-            self.cos_sin_cache,  # ty: ignore[invalid-argument-type]
             self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
         )
         if key is None:
@@ -78,7 +78,6 @@ def _rotary_cpu_op_func(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # cos_sin_cache currently stays CPU permanently (see SpyreRotaryEmbedding._apply)
@@ -96,7 +95,7 @@ def _rotary_cpu_op_func(
         cpu_key,
         layer.head_size,
         layer.rotary_dim,
-        cos_sin_cache,
+        layer.cos_sin_cache,
         layer.is_neox_style,
     )
 
@@ -112,7 +111,6 @@ def _rotary_cpu_op_fake(
     positions: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     out_q = torch.empty(query.shape, dtype=query.dtype, device=positions.device)

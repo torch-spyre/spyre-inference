@@ -17,7 +17,7 @@ The upstream vLLM `OffloadingConnector` framework gives every CUDA platform thre
 2. A worker-side `OffloadingHandler` registry keyed by `(src_type, dst_type)` that performs the actual transfer.
 3. An `OffloadingSpec` factory that lets out-of-tree platforms drop in their own manager + handlers without touching upstream code.
 
-As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. Two ecosystems put it to work today: upstream vLLM's in-tree `tiering/{fs,obj}` secondary tiers, and the llm-d project's in-tree `llmd_fs_backend` shared-storage spec used by llm-d v0.8 deployments. Both matter for this RFC. §3.5 walks the lineage and the architectural difference between the two shapes.
+As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. M1.5 of this RFC targets that framework directly via a `SpyreTieringOffloadingSpec` plus the in-tree `tiering/{fs,obj}` secondary tiers; §3.5 walks the lineage.
 
 The existing `spyre-inference` plugin has **none** of this wired up. `TorchSpyreWorker` extends `CPUWorker` and never calls `register_kv_caches`. Both the single-tier `CPUOffloadingSpec` and the new `TieringOffloadingSpec` (which subclasses `CPUOffloadingSpec`) error out on non-CUDA platforms via the `current_platform.is_cuda_alike()` check at `vllm/v1/kv_offload/cpu/spec.py:89`. So the entire upstream offload + tiering stack is unreachable from Spyre today, and the only KV-tier story we have is "the whole cache is on-device, full-stop."
 
@@ -30,7 +30,7 @@ This RFC proposes how to combine the two: take the prototype's data-copy primiti
 ### Goals (M1)
 
 - A user runs vLLM on Spyre with `--kv-transfer-config '{"kv_connector":"OffloadingConnector", "kv_connector_extra_config":{"spec_name":"SpyreOffloadingSpec","cpu_bytes_to_use":"8000000000"}}'` and gets host-RAM offload that survives across requests.
-- The Spyre device↔host copy goes through one named, testable primitive (`SpyreKvDmaCopier`) that wraps the prototype's `DmaiQPush`/`DmaoQPush` path (or its successor `torch_spyre._C.spyre_from_blob` path).
+- The Spyre device↔host copy goes through one named, testable primitive (`SpyreKvDmaCopier`) that wraps `torch_spyre._C.copy_tensor(src, dst, non_blocking=False)` — the public, stream-backed Spyre↔CPU copy entrypoint already exposed in the dev-image-pinned torch-spyre commit. No new device-side primitives needed; no flit-offset / `perfdsc` parsing.
 - `pytest tests/v1/kv_offload/` runs the same matrix as upstream for the CPU spec, plus a Spyre-specific test that round-trips a known-pattern block device→host→device.
 
 ### Goals (M1.5 — small follow-on, scoped here)
@@ -82,38 +82,31 @@ vLLM v0.22 added a multi-tier framework on top of the four pieces above:
 
 A deployment selects `spec_name: "TieringOffloadingSpec"` (a single spec) and lists secondary tiers in `extra_config`. The `TieringOffloadingManager` orchestrates a coherent hierarchy — primary CPU tier mmap'd via `SharedOffloadRegion`, plus one or more `SecondaryTierManager`s that read/write through a `primary_kv_view: memoryview`. Stores can cascade primary→secondary; loads can promote secondary→primary; the manager owns the bookkeeping.
 
-This is the shape this RFC targets for M1.5 (see §4.3).
+This is the shape this RFC targets for M1.5 (see §4.1).
 
 **Historical note on the prior llm-d shape.** llm-d v0.8 deployments use a different shape that pre-dates the v0.22 multi-tier framework: `MultiConnector` stacking two independent top-level `OffloadingSpec`s — typically one Spyre/CUDA `OffloadingSpec` for device↔host plus `SharedStorageOffloadingSpec` from the in-tree `llmd_fs_backend` module in [`llm-d/llm-d-kv-cache`](https://github.com/llm-d/llm-d-kv-cache) for host↔shared-storage. The two children operate in parallel without coordination — saves fan out to both, loads return from whichever child reports a hit first. The standalone PyPI package `llmd-fs-connector` was already EOL at `==0.22`; the maintainers of `llmd_fs_backend` (its in-tree successor in `llm-d/llm-d-kv-cache`) have signaled they are retiring it in favor of the upstream `TieringOffloadingSpec` + `tiering/fs` shape. **This RFC does not target the `MultiConnector + llmd_fs_backend` shape**: it points at a moving target on the way out, and the upstream-canonical replacement is what M1.5 builds against.
 
-## 4. Background: what the prototype's primitive actually provides
+## 4. Background: device↔host copy in current torch-spyre
 
-The prototype exposes the device↔host path in two layers:
-
-### 4.1 Low level: senlib DMA queues
+torch-spyre exposes a public, stream-backed copy entrypoint that handles both directions and is already in the dev-image-pinned commit (`4dcfee15c3a93446`):
 
 ```python
-self.pf.DmaoQPush(self.pf.DmaoDataCB(addr + offset, buf, 0))   # device → host
-self.pf.DmaoQFlush()                                           # synchronous flush
-self.pf.DmaiQPush(self.pf.DmaiDataCB(buf, addr + offset, 0))   # host → device
-self.pf.DmaiQFlush()
+import torch
+import torch_spyre._C as _C   # registered as a private extension; no extra deps
+
+cpu_t   = torch.empty_like(spyre_t, device="cpu")
+_C.copy_tensor(spyre_t, cpu_t, non_blocking=False)   # device → host
+
+cpu_in  = torch.zeros(..., dtype=...)
+spyre_in = torch.empty(..., device="spyre")
+_C.copy_tensor(cpu_in, spyre_in, non_blocking=False) # host → device
 ```
 
-Where `addr = kv_tensor["flit_offset"] * 128` (flit = 128 B), one `flit_offset` per `(layer_idx, k|v)` from the perfdsc `metadata.json`, and `buf` is a host-side `DataArray`. Throughput numbers in the script comments report ~3 GB/s on the demo hardware. The primitive is **synchronous** — no streams, no events, no async fence. This is fine for M1 and matches the way `SpyreCommunicator` falls back today.
+`copy_tensor(src, dst, non_blocking=False)` is bound in [`torch_spyre/csrc/module.cpp:272`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/module.cpp#L272) → `spyre::spyre_copy_from` ([`torch_spyre/csrc/spyre_mem.cpp:581`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/spyre_mem.cpp#L581)) → `SpyreStream::copyAsync` ([`torch_spyre/csrc/spyre_stream.cpp:142`](https://github.com/torch-spyre/torch-spyre/blob/4dcfee15c3a9344652f067149ec65c4bf2941890/torch_spyre/csrc/spyre_stream.cpp#L142)) → `copyAsyncImpl`, which invokes the flex runtime's DMA. Direction is auto-detected from `src.is_cpu()` / `src.is_privateuseone()`; no separate H2D/D2H entrypoints. With `non_blocking=False`, `spyre_copy_from` calls `stream.synchronize()` after the DMA, so callers can treat it as synchronous; `non_blocking=True` returns immediately and the caller is responsible for syncing.
 
-### 4.2 Higher level: a Python accessor class
+This is the only device↔host primitive M1 uses. Earlier internal Spyre prototypes drove the device DMA queues directly (`libsenlib` `DmaiQPush`/`DmaoQPush`, addressed via `flit_offset` parsed from `perfdsc/metadata.json`); those layers existed before torch-spyre exposed `copy_tensor` and are not reused here. With `copy_tensor` available, the connector handler operates on plain `torch.Tensor` arguments and never touches senlib, flit offsets, or perfdsc artifacts.
 
-```python
-self._C = importlib.import_module("torch_spyre._C")
-addr = self._C.get_dmpa(x_spyre)
-buf  = self._C.spyre_from_blob(addr, size=..., stride=..., dtype=torch.float16)
-buf.copy_(data)             # host → device
-host = buf.to('cpu')        # device → host
-```
-
-`get_dmpa` returns the device physical address of an existing Spyre tensor; `spyre_from_blob` constructs a Spyre tensor view at an arbitrary device address. The prototype's accessor uses these to read/write at flit-offset granularity from Python without touching senlib. **This is the path we should prefer for the M1 handler** because it operates on `torch.Tensor` objects (so `OffloadingHandler` doesn't need to know about `DmaoDataCB`) and because it does not depend on a pre-built libsenlib being available in the deployment image.
-
-### 4.3 Data paths in scope
+### 4.1 Data paths in scope
 
 | Path | Milestone | Compose how | Notes |
 |---|---|---|---|
@@ -157,9 +150,8 @@ flowchart TB
         Handlers["get_handlers() → SpyreCpuOffloadingHandlers"]
         D2H["device_to_host_handler<br/>(Spyre → host RAM block tensor)"]
         H2D["host_to_device_handler<br/>(host RAM block tensor → Spyre)"]
-        Copier["<b>SpyreKvDmaCopier</b><br/>the one and only place we touch<br/>Spyre device addresses<br/>.copy_d2h(spyre_tensor, host_tensor, *, slice)<br/>.copy_h2d(host_tensor, spyre_tensor, *, slice)"]
-        Backend1["<b>impl:</b> torch_spyre._C.{get_dmpa, spyre_from_blob}"]
-        Backend2["<b>fallback:</b> libsenlib DmaiQPush / DmaoQPush<br/>(gated by env var)"]
+        Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around torch_spyre._C.copy_tensor<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
+        Backend["<b>torch_spyre._C.copy_tensor(src, dst, non_blocking=False)</b><br/>SpyreStream.copyAsync → flex runtime DMA<br/>(direction auto-detected from src.is_cpu/.is_privateuseone)"]
 
         Spec --> Mgr
         Spec --> Handlers
@@ -167,8 +159,7 @@ flowchart TB
         Handlers --> H2D
         D2H --> Copier
         H2D --> Copier
-        Copier --> Backend1
-        Copier --> Backend2
+        Copier --> Backend
     end
 
     Factory -. "resolves to" .-> Spec
@@ -181,7 +172,7 @@ flowchart TB
 
     class OC,OCW,Factory upstream
     class Spec,Mgr,Handlers,D2H,H2D plugin
-    class Copier,Backend1,Backend2 hot
+    class Copier,Backend hot
 ```
 
 </details>
@@ -202,46 +193,34 @@ The manager is pure bookkeeping. It is keyed by `LoadStoreSpec` types, not by te
 
 ```python
 # spyre_inference/v1/kv_offload/copier.py
+import torch
+import torch_spyre._C as _spyre_c
+
+
 class SpyreKvDmaCopier:
     """Single-purpose owner of every host↔Spyre KV byte transfer.
 
-    Wraps two backends:
-      - 'senlib_dma'       : libsenlib DmaiQPush/DmaoQPush over flit_offset
-                             addresses, matching the prior PD-disagg
-                             prototype's aiu_mem.py. The ONLY working
-                             backend in the current dev image — see §10
-                             Q1 for the verification trail. M1 ships with
-                             this and it is the auto-detect default.
-      - 'spyre_from_blob'  : torch_spyre._C.{get_dma_address, spyre_from_blob}.
-                             Operates on torch.Tensor inputs; preferred
-                             once available. Requires the DMPA accessors
-                             from the flim/pd-disagg branch of torch-spyre
-                             to land in upstream main and ship in the
-                             dev image — see §11. Until then, the auto-
-                             detect logic falls through to 'senlib_dma'.
-
-    Backend selection is driven by SPYRE_KV_DMA_BACKEND env var with auto-
-    detect default ('spyre_from_blob' if torch_spyre._C exposes the
-    DMPA accessors at runtime, else 'senlib_dma').
+    Thin wrapper around torch_spyre._C.copy_tensor, which is bound to
+    SpyreStream.copyAsync → flex runtime DMA. Direction is auto-detected
+    inside the C++ binding from src.is_cpu() / src.is_privateuseone(),
+    so we expose two named methods purely for handler readability — both
+    delegate to the same underlying call.
     """
 
-    def copy_d2h(self, src_spyre: torch.Tensor, dst_host: torch.Tensor) -> None: ...
-    def copy_h2d(self, src_host: torch.Tensor, dst_spyre: torch.Tensor) -> None: ...
+    def copy_d2h(self, src_spyre: torch.Tensor, dst_host: torch.Tensor) -> None:
+        _spyre_c.copy_tensor(src_spyre, dst_host, non_blocking=False)
+
+    def copy_h2d(self, src_host: torch.Tensor, dst_spyre: torch.Tensor) -> None:
+        _spyre_c.copy_tensor(src_host, dst_spyre, non_blocking=False)
 ```
 
 Constraints:
 
-- Both methods are synchronous. There is no `non_blocking` on Spyre yet (`TorchSpyreModelRunner._sync_device` is a no-op for the same reason).
+- Both methods are synchronous (`non_blocking=False` causes `spyre_copy_from` to call `stream.synchronize()` after the DMA). M1 does not pursue async overlap; an async path is a follow-up tracked in §11 ("Async DMA on Spyre").
 - Neither method allocates. The handler caller owns allocation.
-- A single instance is shared across both directions. Construction reads the env var once and locks in a backend.
+- A single instance is shared across both directions; the class holds no state beyond the bound `_C.copy_tensor` reference, so it is effectively a namespace.
 
-The two-backend design is a transitional concession. Verified state of the world as of this RFC:
-
-- `spyre-inference/main` `pyproject.toml` pins `torch-spyre @ 4dcfee15c3a93446` (commit, May 2026). That commit's `torch_spyre/_C.pyi` does **not** export `get_dma_address` / `spyre_from_blob` / any DMPA-related symbol.
-- A live probe of the current dev image (running in `vllm-spyre-*` pods) confirms it: `torch_spyre._C.so` and `_hooks.so` have **zero** exported symbols matching `from_blob` / `dma` / `dmpa` / `FromBlob`. The shared library does not contain those entrypoints at all — not hidden, not present.
-- The DMPA accessors do exist in torch-spyre source — but on Fabian Lim's `flim/pd-disagg` branch (commit `93dc1ae` "add dmpa accessors", Nov 2025), which has not merged to `torch-spyre/main` and is not in the dev image.
-
-So `senlib_dma` is not a fallback for older images — it is the **only** working backend in the current dev image, and `spyre_from_blob` is forward-looking until those accessors land upstream. As soon as they do, the `senlib_dma` backend should be deleted — the design constraint is "single-purpose owner of every host↔Spyre KV byte transfer," and a one-backend implementation is strictly preferable. §11 lists upstreaming the accessors as the follow-up that unblocks that simplification.
+Why a class at all instead of inlining `_C.copy_tensor` into the handler? Two reasons. First, the `OffloadingHandler` shouldn't import `torch_spyre._C` directly — keeping the device-side primitive behind one wrapper means tests can monkey-patch `SpyreKvDmaCopier` without touching the C extension. Second, if torch-spyre later adds an async or batched copy entrypoint, swapping `SpyreKvDmaCopier`'s implementation is a one-file change; everything above it stays unchanged.
 
 ### 6.2 `SpyreCpuOffloadingHandlers`
 
@@ -388,7 +367,7 @@ New files in `spyre_inference/v1/kv_offload/`:
 | File | Purpose | Approx LOC |
 |---|---|---|
 | `__init__.py` | empty | 0 |
-| `copier.py` | `SpyreKvDmaCopier` (both backends + auto-detect) | ~120 |
+| `copier.py` | `SpyreKvDmaCopier` (thin wrapper around `torch_spyre._C.copy_tensor`) | ~30 |
 | `handlers.py` | `SpyreCpuOffloadingHandlers`, `_SingleDirectionSpyreHandler` | ~180 |
 | `spec.py` | `SpyreOffloadingSpec` | ~70 |
 
@@ -397,8 +376,7 @@ Modified files:
 | File | Change |
 |---|---|
 | `spyre_inference/__init__.py` | Add `OffloadingSpecFactory.register_spec(...)` call for `SpyreOffloadingSpec`. |
-| `pyproject.toml` | None (we don't add new deps for M1; senlib fallback is gated on import). |
-| `spyre_inference/envs.py` | Add `SPYRE_KV_DMA_BACKEND` to the env var registry. |
+| `pyproject.toml` | None — `torch_spyre._C.copy_tensor` is already exposed by the existing torch-spyre pin (`4dcfee15c3a93446`). |
 
 New tests in `tests/v1/kv_offload/`:
 
@@ -450,16 +428,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 
 ## 10. Open questions
 
-1. **DMPA accessors are not in the dev image — M1 ships on `senlib_dma`.** Verified in three places:
-
-   - `spyre-inference/main` `pyproject.toml` pins `torch-spyre @ 4dcfee15c3a93446` (May 2026); that commit's `torch_spyre/_C.pyi` `__all__` does not list `get_dma_address`, `spyre_from_blob`, or any DMPA symbol.
-   - Source-side: the accessors are added in `flim/pd-disagg` branch commit `93dc1ae` "add dmpa accessors" (Nov 2025), which has not merged to `torch-spyre/main`.
-   - Live probe of the current dev image (`vllm-spyre-*` pods): `torch_spyre._C.so` and `_hooks.so` export no `dma` / `dmpa` / `from_blob` symbols. The shared library does not contain those entrypoints.
-
-   So M1 ships with the `senlib_dma` backend (libsenlib `DmaiQPush`/`DmaoQPush` over `flit_offset` addresses parsed from `perfdsc/metadata.json`), which is what the prior PD-disagg prototype's `aiu_mem.py` already uses successfully on the dev image. Two follow-ups on this gate the cleanup, but neither blocks M1:
-
-   - **Upstream the accessors and update the dev image.** §11 tracks this as a torch-spyre dependency; once `flim/pd-disagg`-style accessors land in `torch-spyre/main`, the spyre-inference pin moves forward and M1 deletes the `senlib_dma` backend (`SpyreKvDmaCopier` becomes single-implementation).
-   - **`flit_offset` stability.** Whichever backend M1 ships with, the address it operates on must be stable across a forward pass. Today the prototype's `flit_offset` is read from `perfdsc/metadata.json` produced at compile time; a stable on-device descriptor (or `get_dma_address`-equivalent on the allocated KV tensor) would replace this. Tracked separately as §11's "Stable on-device KV descriptor."
+1. ~~**Device↔host primitive.**~~ **Resolved:** `torch_spyre._C.copy_tensor(src, dst, non_blocking=False)` is bound in the dev-image-pinned torch-spyre commit (`4dcfee15c3a93446`), routes through `SpyreStream::copyAsync`, and handles both H→D and D→H by auto-detecting the direction from `src.is_cpu()` / `src.is_privateuseone()`. M1's `SpyreKvDmaCopier` is a thin wrapper over this single entrypoint (see §6.1). The earlier debate about `senlib_dma` fallbacks vs. unmerged DMPA accessors is no longer relevant — the device-side primitive M1 needs already exists in the dev image.
 2. **`OffloadingConnectorWorker` device assertions.** Does any code in the worker path call `.is_cuda` on the registered tensors? A quick grep at implementation time will tell us; if so, we land a one-liner upstream.
 3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
 4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
@@ -472,8 +441,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 - **Direct device ↔ filesystem / object store.** Would need a Spyre-side analogue of NVIDIA GDS so a secondary tier can read/write device memory without a host bounce. Requires both a torch-spyre primitive and a contract change to upstream's `SecondaryTierManager` (which today takes a `primary_kv_view: memoryview` over CPU memory). Tracked separately. (Raised by [@yuezhu1](https://github.com/yuezhu1).)
 - **PD disaggregation on Spyre.** Standalone RFC, builds on M1. Every component PD needs *except* the cross-host transport is delivered by M1 — the follow-up is purely about wiring a NIXL agent into the upstream PD producer/consumer connectors. The prior prototype's NIXL connector and `CpuBufferManager` get two *hosts* exchanging CPU tensors over the network; M1 makes the device→host hop stand on its own, so that NIXL adapter can be lifted into a PD-specific RFC without re-doing the device-side work.
 - **Async DMA on Spyre.** Depends on torch-spyre exposing a stream/event API. Until then, the synchronous handler is fine for offload/prefetch but precludes overlap with compute.
-- **Stable on-device KV descriptor.** Depends on torch-spyre. Filed separately so the M1 handler can swap from `flit_offset+perfdsc` to the descriptor without changing the spec.
-- **Upstream the DMPA accessors into `torch-spyre/main`.** The `get_dma_address` and a `from_blob`-equivalent (currently `spyre_tensor_get_dmpa` / planned `spyre_from_blob`) live on Fabian Lim's `flim/pd-disagg` branch (commit `93dc1ae`). Once merged into torch-spyre `main`, M1's `SpyreKvDmaCopier` can drop the `senlib_dma` fallback backend (§6.1) and the `SPYRE_KV_DMA_BACKEND` env var (§6.5). Tracked as a torch-spyre dependency, not work in this RFC. (Surfaced by [@joerunde](https://github.com/joerunde) on the M1 draft.)
+- **Stable on-device KV descriptor.** Depends on torch-spyre. Not blocking M1 — `_C.copy_tensor` operates on `at::Tensor` allocations directly (no flit-offset addressing). Filed separately for the future case where a Spyre-side direct-storage path needs a descriptor independent of an allocated tensor.
 - **Authoring a new secondary tier.** Anything that does not slot into an existing `SecondaryTierManager` (e.g. a Spyre-to-Spyre direct fabric tier) is a separate design, not a milestone of this RFC.
 
 ## 12. Acceptance criteria

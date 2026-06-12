@@ -176,6 +176,23 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
+        # The list-based attention backend requires 64-element stick alignment for
+        # torch.compile. Only override default (non-user-specified) values.
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            original_block_size = cache_config.block_size
+            if original_block_size % 64 != 0:
+                # Round up to nearest multiple of 64
+                new_block_size = ((original_block_size + 63) // 64) * 64
+                logger.warning(
+                    "Block size must be a multiple of 64 for the list-based attention "
+                    "backend. Overriding block_size from %d to %d.",
+                    original_block_size,
+                    new_block_size,
+                )
+                cache_config.block_size = new_block_size
+
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's

@@ -1,0 +1,93 @@
+name: Build torch-spyre and download RPMS from dispatch
+description: >
+  Install torch-spyre from source checking out the given reference 
+  Download and install spyre RPMs
+  This action is meant for integration dispatch events.
+
+inputs:
+  rpm_names:
+    description: A space separated list of RPM names to download and install
+    required: true
+  rpm_location:
+    description: |
+      Full Artifactory URL to download RPMs from (e.g.
+      https://artifactory.example.com/path/to/rpms). When set, overrides the
+      ARTIFACTORY_BASE_URL + ARTIFACTORY_RPM_PATH secrets.
+    required: false
+    default: ''
+  torch_spyre_ref:
+    description: Branch, tag, or SHA of torch-spyre to check out and test
+    required: false
+    default: ''
+  artifactory_user:
+    description: Artifactory username
+    required: false
+    default: ''
+  artifactory_api_key:
+    description: Artifactory API key
+    required: false
+    default: ''
+  artifactory_base_url:
+    description: Artifactory base URL
+    required: false
+    default: ''
+  artifactory_rpm_path:
+    description: Artifactory RPM path
+    required: false
+    default: ''
+
+
+runs:
+  using: composite
+  steps:
+    - name: Download RPMs
+      if: ${{ inputs.rpm_names != '' }}
+      shell: bash
+      env:
+        ARTIFACTORY_USER: ${{ inputs.artifactory_user }}
+        ARTIFACTORY_API_KEY: ${{ inputs.artifactory_api_key }}
+        ARTIFACTORY_BASE_URL: ${{ inputs.artifactory_base_url }}
+        ARTIFACTORY_RPM_PATH: ${{ inputs.artifactory_rpm_path }}
+        ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}
+        DOWNLOAD_SCRIPT: .github/scripts/download_rpms.sh
+        RPM_NAMES: ${{ inputs.rpm_names }}
+        RPMS_DOWNLOAD_DIR: ${{ inputs.output_dir }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        cd /home/senuser/torch-spyre
+        ls -la "$DOWNLOAD_SCRIPT"
+        "$DOWNLOAD_SCRIPT"
+
+    - name: Install RPMs
+      if: ${{ inputs.rpm_names != '' }}
+      shell: bash
+      run: |
+        cd /home/senuser/torch-spyre
+        ls -la rpms/
+        sudo dnf install -y rpms/*.rpm
+
+    - name: Checkout torch-spyre
+      shell: bash
+      working-directory: /home/senuser
+      env:
+        INPUT_REF: "${{ inputs.torch_spyre_ref }}"
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        git config --global --add safe.directory '*'
+        if [[ -n "$INPUT_REF" ]]; then
+          cd /home/senuser/torch-spyre
+          TARGET_SHA="$INPUT_REF"
+          TARGET_REF="$INPUT_REF"
+          echo "TARGET_REF=${TARGET_REF}"
+          echo "TARGET_SHA=${TARGET_SHA}"
+          git fetch --tags --force origin "+${TARGET_SHA}" || \
+            git fetch --tags --force origin
+          git checkout --force "${TARGET_SHA}"
+          git submodule sync --recursive
+          git submodule update --init --recursive --force
+          git log -1 --oneline
+        fi
+        uv pip show torch
+        uv pip freeze

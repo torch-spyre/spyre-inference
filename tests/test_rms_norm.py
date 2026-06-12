@@ -110,7 +110,8 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
     # dispatch_forward should have selected forward_oot
     assert layer._forward_method == layer.forward_oot
 
-    residual = torch.randn(4, 128, dtype=torch.float32) if use_residual else None
+    dummy_tensor = dummy_tensor.to(device="spyre")
+    residual = torch.randn(4, 128, dtype=torch.float32, device="spyre") if use_residual else None
 
     # Mock _forward_spyre_impl (called by the custom op) with a known transform
     if residual is not None:
@@ -125,7 +126,7 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
         monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
         out_x = layer.forward(dummy_tensor, residual)
 
-        assert torch.allclose(out_x, dummy_tensor + 1)
+        assert torch.allclose(out_x.cpu(), dummy_tensor.cpu() + 1)
 
 
 if __name__ == "__main__":

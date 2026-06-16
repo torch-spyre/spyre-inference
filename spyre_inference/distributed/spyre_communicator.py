@@ -108,52 +108,23 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if self.world_size == 1:
             return input_
 
-        if self.world_size != 2:
-            # REPLACE-WITH-NATIVE: once libspyre_comms supports allreduce
-            # natively, delete this entire `all_reduce` override and let
-            # the base class call `dist.all_reduce(input_, group=self.device_group)`.
-            raise NotImplementedError(
-                _spyre_collective_unsupported_message(
-                    "allreduce",
-                    self.world_size,
-                    blocker="libspyre_comms native allreduce impl",
-                )
-            )
-
-        # We hand `input_` directly to dist.send/dist.recv, which require
-        # contiguous storage. The base class's dist.all_reduce path has
-        # its own internal handling, but ours doesn't.
-        assert input_.is_contiguous(), (
-            "SpyreCommunicator.all_reduce requires a contiguous input tensor; "
-            f"got tensor with shape={tuple(input_.shape)} stride={input_.stride()}"
-        )
-
-        # TP=2 manual all_reduce.
-        #
-        # We verified on this pod that:
-        #   - dist.send / dist.recv on the spyreccl group work for paired
-        #     ranks at world_size=2.
-        #   - dist.broadcast works on the spyreccl group at any world size.
-        #   - The Spyre comms message matcher requires every p2p message
-        #     to have an immediate matching counterpart across all ranks;
-        #     only world_size=2 trivially satisfies that constraint with a
-        #     single send/recv pair.
-        #
-        # Pattern:
-        #   Rank 1 -> Rank 0 (send/recv).
-        #   Rank 0 sums in place.
-        #   Rank 0 -> all (broadcast).
-        #
         # REPLACE-WITH-NATIVE: when libspyre_comms gains a native allreduce
-        # and a comms RPM containing it is available, drop this branch.
-        other = 1 - self.rank_in_group
-        if self.rank_in_group == 0:
-            scratch = torch.empty_like(input_)
-            dist.recv(scratch, src=self.ranks[other], group=self.device_group)
-            input_.add_(scratch)
-        else:
-            dist.send(input_, dst=self.ranks[other], group=self.device_group)
-        dist.broadcast(input_, src=self.ranks[0], group=self.device_group)
+        # and a comms RPM containing it is available, drop this entire
+        # override and let the base class call
+        # `dist.all_reduce(input_, group=self.device_group)`.
+        #
+        # Bounce-through-CPU fallback. The send+recv+broadcast pattern this
+        # used to use is unreliable on the spyreccl backend: those primitives
+        # appear to return before data lands in the destination tensor, so
+        # follow-up reads see stale values. The multi-backend device_group
+        # (cpu:gloo,spyre:spyreccl) dispatches CPU tensors to gloo, which is
+        # well-tested. Copy to CPU, all-reduce there, copy back.
+        if input_.device.type == "spyre":
+            cpu_input = input_.cpu()
+            dist.all_reduce(cpu_input, group=self.device_group)
+            input_.copy_(cpu_input)
+            return input_
+        dist.all_reduce(input_, group=self.device_group)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:

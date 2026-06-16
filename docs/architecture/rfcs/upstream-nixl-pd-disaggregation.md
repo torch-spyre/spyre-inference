@@ -27,18 +27,25 @@ The maintenance argument is the load-bearing one. A Spyre-specific PD connector 
 
 ## 2. Goals and non-goals
 
+### Prerequisites (M0)
+
+- **`SpyreKvDmaCopier`** — the device↔host DMA primitive originally designed in [PR #240](https://github.com/torch-spyre/spyre-inference/pull/240) and intended for public stable export in PR #240's M2. This RFC depends on that primitive being importable from `spyre_inference.v1.kv_offload.copier` (or its eventual stable surface).
+- **`SpyrePagedKVCacheAccessor`** — the page-list ↔ block-layout abstraction from [PR #266](https://github.com/torch-spyre/spyre-inference/pull/266). PR #266 is foundation work, dependency-light. We import it directly; no carve-out fallback needed.
+
+These two primitives bound the work specific to this RFC: everything else is a thin worker subclass and registration plumbing.
+
 ### Goals (M1)
 
-- A user runs `vllm serve` on Spyre with `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_buffer_device":"cpu",...}'` (prefill role) and a matching `kv_consumer` config on a separate decode worker; PD inference works end-to-end across them.
+- A user runs `vllm serve` on Spyre with `--kv-transfer-config '{"kv_connector":"SpyreNixlConnector","kv_role":"kv_producer","kv_buffer_device":"cpu",...}'` (prefill role) and a matching `kv_consumer` config on a separate decode worker; PD inference works end-to-end across them.
 - Intra-host PD also works (two Spyre processes on the same host); UCX auto-selects SHM transport for same-host peers.
-- All cross-host machinery — handshake, agent metadata exchange, transfer state polling, compatibility hash — is upstream `NixlConnector` lifecycle, unchanged. Plugin-side Spyre code is restricted to: (1) a one-method override of `NixlConnectorWorker.initialize_host_xfer_buffer` for the page-list-aware host buffer, (2) a `CopyBlocksOp` factory using `SpyrePagedKVCacheAccessor` + `SpyreKvDmaCopier`, and (3) factory registration of the subclass under the name `"NixlConnector"`.
+- All cross-host machinery — handshake, agent metadata exchange, transfer state polling, compatibility hash — is upstream `NixlConnector` lifecycle, unchanged. Plugin-side Spyre code is restricted to: (1) a one-method override of `NixlBaseConnectorWorker.initialize_host_xfer_buffer` (subclassed via `NixlPullConnectorWorker`) for the page-list-aware host buffer, (2) a `CopyBlocksOp` factory using `SpyrePagedKVCacheAccessor` + `SpyreKvDmaCopier`, and (3) factory registration of the subclass under the name `"SpyreNixlConnector"`.
 - Imports reuse existing modules: `SpyreKvDmaCopier` from `spyre_inference.v1.kv_offload.copier` (PR #240 M2 stable surface) and `SpyrePagedKVCacheAccessor` from `spyre_inference.distributed.kv_transfer.kv_connector.v1.spyre_paged_kv_accessor` (PR #266). No duplicate device↔host primitive, no duplicate page-list abstraction.
 - `pytest tests/v1/kv_transfer/test_spyre_pd_*` exercises the override and adapter on CPU-only runners with mocked upstream worker.
 - Two-process intra-host PD test passes on a Spyre runner.
 
 ### Goals (M1.5)
 
-- Compose with `OffloadingConnector(SpyreOffloadingSpec)` from PR #240 via `MultiConnector`: prefix-cache reuse stays available alongside PD. A request that arrives with `do_remote_prefill=True` is handled by `NixlConnector`; a request that misses but hits a previously-cached prefix is served by `OffloadingConnector`. Save fans out to both.
+- Compose with `OffloadingConnector(SpyreOffloadingSpec)` from PR #240 via `MultiConnector`: prefix-cache reuse stays available alongside PD. A request that arrives with `do_remote_prefill=True` is handled by `SpyreNixlConnector`; a request that misses but hits a previously-cached prefix is served by `OffloadingConnector`. Save fans out to both.
 
 
 ### Non-goals (M1 + M1.5)
@@ -88,7 +95,7 @@ if self.use_host_buffer:
     self.initialize_host_xfer_buffer(kv_caches=kv_caches)
 ```
 
-The `CopyBlocksOp` signature is `Callable[[device_kv, host_buf, src_blocks, dst_blocks, "h2d" | "d2h"], None]`. NixlConnector then calls `register_memory()` on the host buffer (not the device tensor) and ships *that* over the wire.
+The `CopyBlocksOp` signature is `Callable[[device_kv, host_buf, src_blocks, dst_blocks, "h2d" | "d2h"], None]`. Upstream `NixlConnector` then calls `register_memory()` on the host buffer (not the device tensor) and ships *that* over the wire.
 
 This is the seam Spyre plugs into. The same path TPU uses today.
 
@@ -142,7 +149,7 @@ The subclass is registered under the factory name `"SpyreNixlConnector"` (see §
 
 PR #266 introduces `SpyrePagedKVCacheAccessor` — a uniform abstraction over the Spyre paged-cache layout that exposes geometry (`num_pages`, `num_kv_heads`, `block_size`, `head_dim`, `dtype`) and per-page read/write. `InMemorySpyreConnector` (PR #264) uses it to bridge between page-list and contiguous-block views.
 
-**This RFC reuses the accessor directly.** The plugin-side `NixlConnectorWorker` subclass (§5.2) calls `SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)` to derive the host-buffer shape and uses `read_block` / `write_block` inside the `CopyBlocksOp`. No duplication between this RFC and PR #266 — same accessor, two consumers.
+**This RFC reuses the accessor directly.** The plugin-side `SpyrePdNixlWorker` subclass (§5.2; subclasses upstream `NixlPullConnectorWorker`) calls `SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)` to derive the host-buffer shape and uses `read_block` / `write_block` inside the `CopyBlocksOp`. No duplication between this RFC and PR #266 — same accessor, two consumers.
 
 ### 3.7 The two-track relationship to PR #264
 
@@ -462,9 +469,9 @@ If unifying the user-facing name across platforms becomes important later, it ca
 
 | File | Coverage |
 |---|---|
-| `tests/v1/kv_transfer/test_spyre_pd_copy_blocks.py` | Unit: `make_spyre_copy_blocks` round-trip d2h → h2d → d2h preserves bytes; uses a fake `SpyrePagedKVCacheAccessor` over fp16 page tensors. CPU-only. |
+| `tests/v1/kv_transfer/test_spyre_pd_copy_blocks.py` | Unit: `make_spyre_copy_blocks` round-trip d2h → h2d → d2h preserves bytes. **Crucially asserts the CopyBlocksOp shape against `SpyrePagedKVCacheAccessor`'s canonical block layout** (`[block_size, num_kv_heads, head_size]` on CPU side vs `[num_kv_heads, block_size, head_size]` per page on device side, with the accessor's read/write permutation). Page-vs-block layout was where the prior internal prototype found bugs; this test pins the contract. CPU-only. |
 | `tests/v1/kv_transfer/test_spyre_pd_init_buffer.py` | Unit: `SpyrePdNixlWorker.initialize_host_xfer_buffer` over a fake page-list `kv_caches` produces correctly-shaped host buffers; falls through to `super().initialize_host_xfer_buffer` for non-page-list inputs. CPU-only, mocks the upstream worker base where needed. |
-| `tests/v1/kv_transfer/test_spyre_pd_factory.py` | Unit: `KVConnectorFactory.create_connector_v1("NixlConnector", ...)` resolves to `SpyrePdNixlConnector` when `spyre_inference` is loaded. CPU-only. |
+| `tests/v1/kv_transfer/test_spyre_pd_factory.py` | Unit: `KVConnectorFactory.create_connector_v1("SpyreNixlConnector", ...)` resolves to `SpyrePdNixlConnector` when `spyre_inference` is loaded. CPU-only. |
 | `tests/v1/kv_transfer/test_pd_intra_host.py` | Integration: spawn two `vllm serve` subprocesses on one host (one prefill, one decode) with `kv_connector: SpyreNixlConnector`, submit a request, verify generated text matches a single-process baseline. Spyre runner. |
 | `tests/v1/kv_transfer/test_pd_inter_host.py` | Integration: gated, two physical hosts with Spyre on each. Manual or CI-fixture. |
 
@@ -472,25 +479,24 @@ If unifying the user-facing name across platforms becomes important later, it ca
 
 | File | Purpose | Approx LOC |
 |---|---|---|
-| `tests/v1/kv_transfer/test_pd_with_offload_compose.py` | `MultiConnector([NixlConnector, OffloadingConnector(SpyreOffloadingSpec)])` end-to-end. PD + prefix-cache reuse. | ~200 |
+| `tests/v1/kv_transfer/test_pd_with_offload_compose.py` | `MultiConnector([SpyreNixlConnector, OffloadingConnector(SpyreOffloadingSpec)])` end-to-end. PD + prefix-cache reuse. | ~200 |
 
 ### M1.5 deployment YAMLs
 
 | File | Purpose |
 |---|---|
-| `deployment/spyre-pd-prefill.yaml` | k8s Deployment for prefill role (upstream `NixlConnector` + `kv_role: kv_producer`). |
-| `deployment/spyre-pd-decode.yaml` | k8s Deployment for decode role (upstream `NixlConnector` + `kv_role: kv_consumer`). |
-| `deployment/spyre-pd-with-offload.yaml` | `MultiConnector` composition: `NixlConnector` + `OffloadingConnector(SpyreOffloadingSpec)`. |
-| `deployment/spyre-inmemory-to-nixl-migration.md` | One-page migration guide: equivalent `kv_transfer_config` between `InMemorySpyreConnector` and upstream `NixlConnector`. |
+| `deployment/spyre-pd-prefill.yaml` | k8s Deployment for prefill role (`kv_connector: SpyreNixlConnector` + `kv_role: kv_producer`). |
+| `deployment/spyre-pd-decode.yaml` | k8s Deployment for decode role (`kv_connector: SpyreNixlConnector` + `kv_role: kv_consumer`). |
+| `deployment/spyre-pd-with-offload.yaml` | `MultiConnector` composition: `SpyreNixlConnector` + `OffloadingConnector(SpyreOffloadingSpec)`. |
 
 ## 7. Compatibility with PR #240, PR #264, and the wider ecosystem
 
 After M1 ships, the following work on Spyre **without further plugin code**:
 
-- **Standalone PD via `NixlConnector`** (M1) — kv_producer/kv_consumer roles, intra-host (UCX-SHM) or inter-host (UCX-TCP/RDMA).
+- **Standalone PD via `SpyreNixlConnector`** (M1) — kv_producer/kv_consumer roles, intra-host (UCX-SHM) or inter-host (UCX-TCP/RDMA).
 - **PD via `InMemorySpyreConnector` (PR #264)** — unchanged. Both connectors registered; users select via `kv_connector` config.
-- **PD + prefix-cache reuse** (M1.5) — `MultiConnector([NixlConnector, OffloadingConnector(SpyreOffloadingSpec)])`. Requires PR #240 M1 landed.
-- **PD + prefix-cache + tiering** — `MultiConnector([NixlConnector, OffloadingConnector(SpyreTieringOffloadingSpec)])`. Requires PR #240 M1.5.
+- **PD + prefix-cache reuse** (M1.5) — `MultiConnector([SpyreNixlConnector, OffloadingConnector(SpyreOffloadingSpec)])`. Requires PR #240 M1 landed.
+- **PD + prefix-cache + tiering** — `MultiConnector([SpyreNixlConnector, OffloadingConnector(SpyreTieringOffloadingSpec)])`. Requires PR #240 M1.5.
 
 ### 7.1 Coexistence with `InMemorySpyreConnector` (PR #264)
 
@@ -499,11 +505,11 @@ After M1 ships, the following work on Spyre **without further plugin code**:
 | Operational scenario | Recommended choice |
 |---|---|
 | Need PD on Spyre this week | `InMemorySpyreConnector` — it's the working PR. |
-| Long-term deployment with prefix-cache reuse on top of PD | `NixlConnector` (this RFC) + `OffloadingConnector(SpyreOffloadingSpec)` via `MultiConnector`. |
-| Composing with LMCache or other upstream ecosystem connectors | `NixlConnector` — they're built around upstream NixlConnector semantics. |
-| Heterogeneous deployment alongside CUDA / TPU workers | `NixlConnector` — same connector class everywhere; routing rules unchanged. |
+| Long-term deployment with prefix-cache reuse on top of PD | `SpyreNixlConnector` (this RFC) + `OffloadingConnector(SpyreOffloadingSpec)` via `MultiConnector`. |
+| Composing with LMCache or other upstream ecosystem connectors | `SpyreNixlConnector` — it's a subclass of upstream `NixlPullConnector`, so anything built on upstream `NixlConnector` semantics composes with it. |
+| Heterogeneous deployment alongside CUDA / TPU workers | `SpyreNixlConnector` on the Spyre side, `NixlConnector` on CUDA / TPU. Both inherit from upstream's `NixlBaseConnector`, so the orchestrator's routing rules are unchanged. |
 
-The two connectors are not internally compatible: a request prefilled on `InMemorySpyreConnector` cannot be decoded on `NixlConnector` and vice versa, because handshake protocols and metadata schemas differ. **Within a single deployment, pick one.**
+The two connectors are not internally compatible: a request prefilled on `InMemorySpyreConnector` cannot be decoded on `SpyreNixlConnector` and vice versa, because handshake protocols and metadata schemas differ. **Within a single deployment, pick one.**
 
 ### 7.2 Migration path from `InMemorySpyreConnector` to upstream `NixlConnector`
 
@@ -521,49 +527,35 @@ The migration is a `kv_transfer_config` change. Equivalence table for common set
 
 The acceptance criteria (§11) include a same-workload, same-output verification across both connectors.
 
-## 8. Migration: from the prior internal prototype
-
-For users on the prior standalone NIXL demo (`llm-d-on-spyre/llm-d-pd-utils/app/pd_disagg/`):
-
-| Today (prototype) | After this RFC |
-|---|---|
-| Standalone `demo.py --role prefill/decode` | `vllm serve --kv-transfer-config '{"kv_connector":"NixlConnector",...}'` |
-| Custom NIXL connector class | Upstream `NixlConnector` directly (no Spyre subclass) |
-| Custom `CpuBufferManager` | Upstream `initialize_host_xfer_buffer` (works as-is once Spyre's per-layer KV is a contiguous `torch.Tensor` per §5.2) |
-| Custom `KvAccessor` | `SpyrePagedKVCacheAccessor` (PR #266) + `SpyreKvDmaCopier` (PR #240) |
-| Hardcoded TCP port 9990 | `VLLM_NIXL_SIDE_CHANNEL_PORT` env var |
-| Hand-rolled metadata exchange | Upstream `NixlConnector` ZMQ side-channel listener |
-| flit-offsets read from `perfdsc` JSON | Same — until torch-spyre exposes a stable descriptor (filed separately) |
-
-## 9. Open questions
+## 8. Open questions
 
 1. **Worker construction pattern.** §5.2's `SpyrePdNixlConnector.__init__` calls `super().__init__(...)` (which constructs upstream's `NixlPullConnectorWorker`) and then replaces `self.connector_worker` with `SpyrePdNixlWorker` on the WORKER role. This works in the current upstream layout (single worker constructed once, in `connector.py:336-340`), but assumes upstream doesn't reuse or reference the original worker between super-init and our replacement. Worth verifying at implementation — if any base-class code in `__init__` triggers worker startup (e.g., kicks off the side-channel listener), we may need to defer the swap. If upstream's construction model becomes incompatible, the fallback is a small upstream patch parametrising the worker class (e.g., `_worker_cls = NixlPullConnectorWorker` as a class attribute that subclasses can override).
 
 2. **Unifying user-facing connector name across platforms.** §5.7 settles on `kv_connector: SpyreNixlConnector` for Spyre because upstream forbids re-registering `"NixlConnector"`. If `kv_connector: NixlConnector` everywhere is desired later, a small upstream factory enhancement (e.g., `register_connector(..., allow_override=True)` for OOT-platform overrides) would do it. Out of scope for M1.
 
-2. **`flit_offset` stability across processes.** Shared with PR #240 §10 Q1 and (transitively) any PD design including `InMemorySpyreConnector`. The verification is the same one-day spike on real hardware. Result blocks all three workstreams; doing it once unblocks all of them.
+3. **`flit_offset` stability across processes.** Shared with PR #240 §10 Q1 and (transitively) any PD design including `InMemorySpyreConnector`. The verification is the same one-day spike on real hardware. Result blocks all three workstreams; doing it once unblocks all of them.
 
-3. **NIXL `register_memory()` on Spyre's host buffer.** PR #240 §6.2: no `cudaHostRegister` equivalent on Spyre. UCX-SHM and UCX-TCP backends generally accept plain mmap; UCX-RDMA may need pinning. Resolution: verification spike. If RDMA pinning is required and we can't satisfy it, M1 acceptance restricts to UCX-SHM (intra-host) and UCX-TCP (inter-host); RDMA becomes a follow-up.
+4. **NIXL `register_memory()` on Spyre's host buffer.** PR #240 §6.2: no `cudaHostRegister` equivalent on Spyre. UCX-SHM and UCX-TCP backends generally accept plain mmap; UCX-RDMA may need pinning. Resolution: verification spike. If RDMA pinning is required and we can't satisfy it, M1 acceptance restricts to UCX-SHM (intra-host) and UCX-TCP (inter-host); RDMA becomes a follow-up.
 
-4. **TP heterogeneity between prefill and decode.** Upstream `NixlConnector` handles TP_ratio>1; Spyre's `SpyreCommunicator` currently supports TP=2. M1 acceptance restricts to symmetric TP between prefill and decode. Whether asymmetric Spyre TP across PD works is filed as M2.
+5. **TP heterogeneity between prefill and decode.** Upstream `NixlConnector` handles TP_ratio>1; Spyre's `SpyreCommunicator` currently supports TP=2. M1 acceptance restricts to symmetric TP between prefill and decode. Whether asymmetric Spyre TP across PD works is filed as M2.
 
-5. **Compatibility hash composition.** Existing upstream hash is sufficient for M1. If/when HMPM lands and we want to distinguish standalone vs HMPM host buffers, that's a small additive change proposed in a separate RFC — not in this one.
+6. **Compatibility hash composition.** Existing upstream hash is sufficient for M1. If/when HMPM lands and we want to distinguish standalone vs HMPM host buffers, that's a small additive change proposed in a separate RFC — not in this one.
 
-6. **Eviction race during PD handoff.** Resolved for this path: NixlConnector's host buffer is connector-owned (allocated at `initialize_host_xfer_buffer`), not pool-managed. Blocks live in the buffer until decode acks. **No additional action needed.** This was a real concern with the OffloadingConnector-based path we considered earlier and is one of the structural reasons NixlConnector fits PD better.
+7. **Eviction race during PD handoff.** Resolved for this path: upstream `NixlConnector`'s host buffer is connector-owned (allocated at `initialize_host_xfer_buffer`), not pool-managed. Blocks live in the buffer until decode acks. **No additional action needed.** This was a real concern with the OffloadingConnector-based path we considered earlier and is one of the structural reasons NixlConnector fits PD better.
 
-7. **Block-table reconciliation.** Decode allocates its own page IDs; the bytes have to land in those pages. Upstream NixlConnector handles this via per-request `kv_transfer_params.block_ids`. We verify intra-host first; the page-list layout shouldn't make this materially different from the contiguous case because the accessor abstracts page IDs.
+8. **Block-table reconciliation.** Decode allocates its own page IDs; the bytes have to land in those pages. Upstream NixlConnector handles this via per-request `kv_transfer_params.block_ids`. We verify intra-host first; the page-list layout shouldn't make this materially different from the contiguous case because the accessor abstracts page IDs.
 
-## 10. Out of scope (filed as follow-ups)
+## 9. Out of scope (filed as follow-ups)
 
 - **Async DMA on Spyre.** Depends on torch-spyre exposing a stream/event API. Until then, PD throughput is bounded by single-stream sync DMA (~3 GB/s per PR #240 §4.1). Same dependency as PR #240 and PR #264.
 - **Direct Spyre-to-Spyre P2P transfer.** Future torch-spyre primitive. Slots in as a new handler bypassing CPU staging on intra-host. Filed separately.
 - **HMPM integration.** When [wangchen615/vllm PR #51](https://github.com/wangchen615/vllm/pull/51) lands, the host buffer that backs `register_memory()` could mmap from an HMPM region instead of being a fresh `torch.empty`. Filed as a separate RFC; would also propose adding a `host_buffer_source` field to the upstream compatibility hash so standalone and HMPM-backed deployments can't silently mix.
 - **Stable on-device KV descriptor.** Shared with PR #240 and PR #264. Until torch-spyre exposes a stable kv-region descriptor, all three depend on `flit_offset` from `perfdsc` artifacts.
-- **Default-connector recommendation between `NixlConnector` and `InMemorySpyreConnector`.** Out of scope. Decision deferred until both have operational track records.
+- **Default-connector recommendation between `SpyreNixlConnector` and `InMemorySpyreConnector`.** Out of scope. Decision deferred until both have operational track records.
 - **Asymmetric TP between prefill and decode on Spyre.** Filed as M2 work, dependent on `SpyreCommunicator` evolution.
 - **Cross-connector composition beyond `MultiConnector`.** PD + offload + tiering + LMCache stacking is supported through `MultiConnector` already; bespoke composition logic is out of scope.
 
-## 11. Acceptance criteria
+## 10. Acceptance criteria
 
 ### M1 acceptance
 
@@ -683,11 +675,13 @@ vllm serve <model> --kv-transfer-config '{
 
 ## 12. References
 
-- Upstream `NixlConnector`: `vllm/distributed/kv_transfer/kv_connector/v1/nixl_connector.py`
-- Upstream `_NIXL_SUPPORTED_DEVICE`: `nixl_connector.py:1002`
-- Upstream `initialize_host_xfer_buffer`: `nixl_connector.py:1257`
-- Upstream `set_host_xfer_buffer_ops`: `nixl_connector.py:1302`
-- Upstream `compute_nixl_compatibility_hash`: `nixl_connector.py:181`
+- Upstream `NixlConnector` family: `vllm/distributed/kv_transfer/kv_connector/v1/nixl/` (`connector.py`, `base_worker.py`, `pull_worker.py`, `push_worker.py`, `metadata.py`, `utils.py`).
+- Upstream `_NIXL_SUPPORTED_DEVICE` + OOT-platform hook: `nixl/utils.py:18-31`.
+- Upstream `Platform.get_nixl_supported_devices`: `vllm/platforms/interface.py:999`.
+- Upstream `initialize_host_xfer_buffer`: `nixl/base_worker.py:645`.
+- Upstream `set_host_xfer_buffer_ops`: `nixl/base_worker.py:690`.
+- Upstream `compute_nixl_compatibility_hash`: `nixl/metadata.py:79`.
+- Upstream `KVConnectorFactory.register_connector` (raises on duplicate names): `vllm/distributed/kv_transfer/kv_connector/factory.py:31-34`.
 - Upstream `MultiConnector`: `vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py`
 - Upstream `OffloadingConnector` (sibling track): `vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py`
 - Companion RFC (PR #240): `docs/architecture/rfcs/upstream-connector-port.md`

@@ -11,12 +11,12 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    # "torch-spyre",
-    # "vllm",
+    "torch-spyre",
+    "vllm",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
-    # "torch",
+    "torch",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -60,17 +60,17 @@ override-dependencies = [
 
     # Skipping torch-vision temporarily
     # TODO: This will be required in the future for VLM support via vllm
-    # "torchvision; sys_platform == 'never'",
+    "torchvision; sys_platform == 'never'",
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
-    # "vllm ; platform_machine not in 's390x, ppc64le'",
+    "vllm ; platform_machine not in 's390x, ppc64le'",
     "ray; platform_machine not in 's390x, ppc64le'",
     # uv doesn't resolve numba->llvmlite constraint correctly...
     #   if numba is updated, this version will likely need to be too
     "llvmlite==0.47.0; platform_machine not in 's390x, ppc64le'",
     "pyarrow; platform_machine not in 's390x, ppc64le'",
     # This torch version must match the one below in `build-constraint-dependencies`
-    # "torch==2.11.0 ; platform_machine not in 's390x, ppc64le'",
+    "torch==2.11.0 ; platform_machine not in 's390x, ppc64le'",
 
     # torch-spyre declares a dependency on numpy>2.3, conflicting with numba needed by vLLM
     # The range here should match the numba dependency

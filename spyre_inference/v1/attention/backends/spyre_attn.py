@@ -224,25 +224,27 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     return specialized_reshape_and_cache_kernel
 
 
-def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
+def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks and padded_query_len are closure constants.
+    Dynamo unrolls the loop because num_blocks and num_query_tokens are closure constants.
+    The kernel is specialized for a fixed number of query tokens (e.g., 1 for decode, 4 for prefill).
     """
 
-    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale, q_token_indices=None):
+    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
         """
-        This kernels specializes for num_blocks and padded_query_len.
+        This kernel specializes for num_blocks and num_query_tokens.
 
         Expected shapes:
             k_pages: list of [num_kv_heads, block_size, head_size]
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
             mask_tiles: [num_blocks]
-            q: either [num_kv_heads, num_queries_per_kv, padded_query_len, head_size] (tensor)
-               or list of [num_heads, head_size] (list-based, with q_token_indices)
-            q_token_indices: list of int indices into q list (optional, for list-based queries)
+            q: list of [num_heads, head_size] tensors (length = num_query_tokens)
         """
+        # Build fixed list of indices [0, 1, ..., num_query_tokens-1]
+        # This is known at compile time, enabling full unrolling
+        q_token_indices = list(range(num_query_tokens))
 
         tile_max = None
         tile_sum = None
@@ -250,28 +252,14 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            # Syntax with views and indirect access
-            # (i.e. instead of _indirect_matmul_mock)
-            # k_page = k_pages[page_idx]
-            # v_page = v_pages[page_idx]
-            # k_page_4d = k_page.unsqueeze(1)
-            # v_page_4d = v_page.unsqueeze(1)
-
             mask_tile = mask_tiles[i]
 
-            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            # For list-based queries, use indirect matmul with q_token_indices
-            if q_token_indices is not None:
-                # List-based query: use indirect matmul with indices
-                scores = _indirect_matmul_mock(
-                    q, q_token_indices, k_pages, page_idx,
-                    transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
-                )
-            else:
-                # Tensor query: original behavior
-                scores = _indirect_matmul_mock(
-                    q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
-                )
+            # List-based query: use indirect matmul with fixed indices
+            # _indirect_matmul_mock will cat the selected tokens internally
+            scores = _indirect_matmul_mock(
+                q, q_token_indices, k_pages, page_idx,
+                transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+            )
             scores *= scale
             scores = scores + mask_tile
             scores_max = scores.max(dim=-1, keepdim=True)[0]
@@ -279,16 +267,10 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                # tile_output = torch.matmul(tile_probs, v_page_4d)
-                if q_token_indices is not None:
-                    tile_output = _indirect_matmul_mock(
-                        tile_probs, q_token_indices, v_pages, page_idx,
-                        transform_b=lambda t: t.unsqueeze(1)
-                    )
-                else:
-                    tile_output = _indirect_matmul_mock(
-                        tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                    )
+                tile_output = _indirect_matmul_mock(
+                    tile_probs, q_token_indices, v_pages, page_idx,
+                    transform_b=lambda t: t.unsqueeze(1)
+                )
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 # i > 0 only reachable after the i == 0 branch initialized these.
@@ -300,16 +282,10 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                if q_token_indices is not None:
-                    tile_output += _indirect_matmul_mock(
-                        tile_probs, q_token_indices, v_pages, page_idx,
-                        transform_b=lambda t: t.unsqueeze(1)
-                    )
-                else:
-                    tile_output += _indirect_matmul_mock(
-                        tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                    )
+                tile_output += _indirect_matmul_mock(
+                    tile_probs, q_token_indices, v_pages, page_idx,
+                    transform_b=lambda t: t.unsqueeze(1)
+                )
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
@@ -679,11 +655,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._reshape_fns[num_tokens]
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
-        key = (num_blocks, padded_query_len)
+    def _get_attn_fn(self, num_blocks: int, num_query_tokens: int):
+        """Get compiled attention kernel specialized for num_blocks and num_query_tokens."""
+        key = (num_blocks, num_query_tokens)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, padded_query_len)
+                _create_compilable_page_attn(num_blocks, num_query_tokens)
             )
         return self._attn_fns[key]
 
@@ -820,10 +797,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             kv_len = int(seq_lens[seq_idx].item())
 
             # List-based query optimization (works for both decode and prefill)
-            # Pass list + indices to attention kernel, which handles cat internally
-            q_token_indices = list(range(q_start, q_end))
-            q_seq = query_dev_unbound  # Pass entire list
-            # No padding/cat here - attention kernel handles it via indirect matmul
+            # Slice the unbound list to get tokens for this sequence
+            q_seq = query_dev_unbound[q_start:q_end]
+            num_query_tokens = len(q_seq)  # query_len for this sequence
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -838,8 +814,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
             # Run attention on target device with list-based queries
-            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-            result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale, q_token_indices)
+            # Kernel is specialized for (num_blocks, num_query_tokens)
+            attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens)
+            result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]

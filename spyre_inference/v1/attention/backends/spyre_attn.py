@@ -121,21 +121,25 @@ def _indirect_matmul_mock(
                  the indirect access before the matmul happens.
 
     """
-    current_device = a[0].device.type if isinstance(a, list) else a.device.type
+    # Handle both list and tuple (torch.unbind returns tuple)
+    is_a_list = isinstance(a, (list, tuple))
+    is_b_list = isinstance(b, (list, tuple))
+    
+    current_device = a[0].device.type if is_a_list else a.device.type
     if current_device == "spyre":
         # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
-        assert isinstance(a, list) or address_or_index_of_a is None, (
+        assert is_a_list or address_or_index_of_a is None, (
             "here needs to be true indirect access"
         )
-        assert isinstance(b, list) or address_or_index_of_b is None, (
+        assert is_b_list or address_or_index_of_b is None, (
             "here needs to be true indirect access"
         )
 
     # resolving indirect access
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
-    if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
+    if is_a_list or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
         if isinstance(address_or_index_of_a, list):
             # Multiple indices - cat the results (for prefill with list-based queries)
             a_slices = [a[idx] for idx in address_or_index_of_a]
@@ -154,7 +158,7 @@ def _indirect_matmul_mock(
             if transform_a:
                 a = transform_a(a)
                 
-    if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
+    if is_b_list or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
         if isinstance(address_or_index_of_b, list):
             # Multiple indices - cat the results (for prefill with list-based queries)
             b_slices = [b[idx] for idx in address_or_index_of_b]
@@ -788,7 +792,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Unbind query on Spyre to create list of per-token tensors
         # unbind() works on Spyre (unlike slice which creates strided views)
-        query_dev_unbound = query.unbind(dim=0)  # List of [num_heads, head_size]
+        query_dev_unbound = query.unbind(dim=0)  # Tuple of [num_heads, head_size]
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -800,8 +804,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # List-based query optimization (works for both decode and prefill)
             # Slice the list to get tokens for this sequence (list slicing is fine on Spyre)
-            q_seq = query_dev_unbound[q_start:q_end]
-            num_query_tokens = len(q_seq)  # query_len for this sequence
+            q_seq_tokens = query_dev_unbound[q_start:q_end]  # List of [num_heads, head_size]
+            num_query_tokens = len(q_seq_tokens)  # query_len for this sequence
+            
+            # Restructure for GQA: need [num_kv_heads, num_queries_per_kv * num_query_tokens, head_size]
+            # Each token is [num_heads, head_size] = [num_kv_heads * num_queries_per_kv, head_size]
+            # Cat all tokens: [num_query_tokens * num_heads, head_size]
+            # Then reshape: [num_kv_heads, num_queries_per_kv * num_query_tokens, head_size]
+            q_seq_cat = torch.cat(q_seq_tokens, dim=0)  # [num_query_tokens * num_heads, head_size]
+            q_seq = q_seq_cat.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, head_size)
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -812,24 +823,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
-            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+            # Slice mask tiles on CPU to match actual num_query_tokens, then transfer to Spyre
+            mask_tiles_cpu = [m[:num_query_tokens] for m in mask_tiles_all[seq_idx]]
+            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_cpu]
 
             # Run attention on target device with list-based queries
             # Kernel is specialized for (num_blocks, num_query_tokens)
             attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens)
             result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
-            # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+            # Reshape back: result from kernel is [num_kv_heads, num_queries_per_kv * num_query_tokens, block_size]
+            # After matmul with V: [num_kv_heads, num_queries_per_kv * num_query_tokens, head_size]
             #   → [query_len, num_heads, head_size]
             # Pull result to CPU before slicing (Spyre slicing is broken),
             # then transfer each per-token contiguous slice back for scatter.
             result_cpu = convert(result, "cpu", output.dtype)
-            result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
-            result_cpu = result_cpu.transpose(1, 2).contiguous()
+            # Reshape: [num_kv_heads, num_queries_per_kv * num_query_tokens, head_size]
+            #        → [num_query_tokens, num_heads, head_size]
+            result_cpu = result_cpu.reshape(num_query_tokens, num_heads, head_size)
             for i in range(query_len):
                 tok = convert(
-                    result_cpu[0, i : i + 1, :, :].contiguous(),
+                    result_cpu[i : i + 1].contiguous(),
                     _target_device,
                     output.dtype,
                 )

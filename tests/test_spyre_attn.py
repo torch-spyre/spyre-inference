@@ -313,7 +313,11 @@ def ref_attn(
 @pytest.mark.parametrize(
     "block_size",
     [
+        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
+        # See: https://github.com/torch-spyre/spyre-inference/issues/239
+        pytest.param(64, id="block_size(64)"),
         pytest.param(128, id="block_size(128)"),
+        pytest.param(256, id="block_size(256)"),
     ],
 )
 @pytest.mark.parametrize("sliding_window", [None])
@@ -484,3 +488,75 @@ def test_spyre_attn(
         outlier_rtol=rtol * 2,
         msg="test_spyre_attn",
     )
+
+
+def test_block_size_validation():
+    """Test that SpyreAttentionMetadataBuilder validates block_size alignment.
+
+    The list-based attention backend requires block_size to be a multiple of 64
+    for proper stick alignment during torch.compile. This test verifies the
+    validation raises ValueError for invalid block sizes and accepts valid ones.
+    """
+    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config.compilation import CompilationConfig
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    model_config.get_num_attention_heads = Mock(return_value=8)
+    model_config.get_num_kv_heads = Mock(return_value=2)
+
+    # Test invalid block sizes
+    invalid_block_sizes = [1, 8, 16, 32, 63, 100]
+    for block_size in invalid_block_sizes:
+        cache_config = CacheConfig(block_size=block_size)
+
+        compilation_config = CompilationConfig(custom_ops=["all"])
+
+        vllm_config = VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            compilation_config=compilation_config,
+        )
+        kv_cache_spec = AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.float16,
+        )
+        with pytest.raises(ValueError, match="must be a multiple of 64"):
+            SpyreAttentionMetadataBuilder(
+                kv_cache_spec=kv_cache_spec,
+                layer_names=["test"],
+                vllm_config=vllm_config,
+                device=torch.device("cpu"),
+            )
+
+    # Test valid block sizes
+    valid_block_sizes = [64, 128, 256, 512]
+    for block_size in valid_block_sizes:
+        cache_config = CacheConfig(block_size=block_size)
+
+        compilation_config = CompilationConfig(custom_ops=["all"])
+
+        vllm_config = VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            compilation_config=compilation_config,
+        )
+        kv_cache_spec = AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=2,
+            head_size=128,
+            dtype=torch.float16,
+        )
+        builder = SpyreAttentionMetadataBuilder(
+            kv_cache_spec=kv_cache_spec,
+            layer_names=["test"],
+            vllm_config=vllm_config,
+            device=torch.device("cpu"),
+        )
+        assert builder.block_size == block_size

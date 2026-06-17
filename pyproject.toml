@@ -118,10 +118,10 @@ members = ["tests/plugin"]
 # vllm from source for the cpu backend.
 # NB: This section CANNOT be used to override dependencies to a conflicting version. For example,
 # you cannot add torch==2.10.0 if vllm's build dependencies already specify torch>=2.11.0
-# [tool.uv.extra-build-dependencies]
-# vllm = [
-#     "ninja",
-# ]
+[tool.uv.extra-build-dependencies]
+vllm = [
+    "ninja",
+]
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set

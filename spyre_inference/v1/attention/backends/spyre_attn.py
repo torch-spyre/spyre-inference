@@ -714,15 +714,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Spyre slicing corrupts memory, so
-        # bring q/k/v to CPU once for all slicing below; per-token slices get
-        # transferred to Spyre individually inside the scatter and attention paths.
-        # EXCEPTION: For decode phase with query_len=1, we use unbind() on Spyre
-        # to avoid CPU transfer (unbind creates proper tensors, not strided views).
+        # bring k/v to CPU for slicing in _reshape_and_cache.
+        # Queries stay on Spyre for list-based access via unbind().
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        # Keep query on Spyre for unbind optimization in _online_softmax_attention
+        # Keep query on Spyre for list-based optimization
         query_dev = query
-        query_cpu = convert(query, "cpu")
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -737,8 +734,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query_cpu[:num_actual_tokens],
-            query_dev[:num_actual_tokens] if query_dev.device.type == "spyre" else None,
+            query_dev[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata,
@@ -777,8 +773,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _online_softmax_attention(
         self,
-        query_cpu: torch.Tensor,
-        query_dev: torch.Tensor | None,
+        query_dev: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -794,8 +789,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         Writes results directly into the caller's output buffer in-place.
         
         Args:
-            query_cpu: Query tensor on CPU (for fallback/slicing)
-            query_dev: Query tensor on Spyre (for unbind optimization, may be None)
+            query_dev: Query tensor on Spyre device
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -813,12 +807,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Optimization: Use unbind() + cat() on Spyre to avoid CPU transfer for queries
-        # unbind() creates list of per-token tensors, cat() reassembles for prefill
-        # Both operations work on Spyre (unlike slice/strided views)
-        query_dev_unbound: list[torch.Tensor] | None = None
-        if query_dev is not None:
-            query_dev_unbound = query_dev.unbind(dim=0)  # List of [num_heads, head_size] on Spyre
+        # Optimization: Use unbind() on Spyre to create list of per-token queries
+        # unbind() works on Spyre (unlike slice which creates strided views)
+        query_dev_unbound = query_dev.unbind(dim=0)  # List of [num_heads, head_size] on Spyre
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -828,30 +819,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            if query_dev_unbound is not None:
-                # List-based query optimization (works for both decode and prefill)
-                # Pass list + indices to attention kernel, which handles cat internally
-                q_token_indices = list(range(q_start, q_end))
-                q_seq = query_dev_unbound  # Pass entire list
-                # No padding/cat here - attention kernel handles it via indirect matmul
-            else:
-                # Fallback: use CPU slicing (original behavior)
-                q_seq = query_cpu[q_start:q_end]
-                q_token_indices = None
-
-                # Pad query to global aligned_max_query_len (uniform for all seqs)
-                if aligned_max_query_len > query_len:
-                    q_seq = torch.nn.functional.pad(
-                        q_seq,
-                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                        mode="constant",
-                        value=0.0,
-                    )
-
-                # Reshape: [padded_query_len, num_heads, head_size]
-                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+            # List-based query optimization (works for both decode and prefill)
+            # Pass list + indices to attention kernel, which handles cat internally
+            q_token_indices = list(range(q_start, q_end))
+            q_seq = query_dev_unbound  # Pass entire list
+            # No padding/cat here - attention kernel handles it via indirect matmul
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -865,16 +837,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
             mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
-            # Run attention on target device
-            # For list-based opt, q is already on Spyre as list; otherwise transfer from CPU
-            if query_dev_unbound is not None:
-                # Pass list + indices - attention kernel uses indirect matmul
-                attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-                result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale, q_token_indices)
-            else:
-                q_dev = convert(q, device=_target_device)
-                attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-                result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
+            # Run attention on target device with list-based queries
+            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+            result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale, q_token_indices)
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]

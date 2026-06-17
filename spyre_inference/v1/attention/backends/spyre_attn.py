@@ -95,9 +95,9 @@ def _overwrite(
 
 def _indirect_matmul_mock(
     a: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_a: int | torch.Tensor | None,
+    address_or_index_of_a: int | torch.Tensor | list[int] | None,
     b: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_b: int | torch.Tensor | None,
+    address_or_index_of_b: int | torch.Tensor | list[int] | None,
     # we need the option to transform a and/or b, after the indirect access
     transform_a: Callable | None = None,
     transform_b: Callable | None = None,
@@ -107,22 +107,21 @@ def _indirect_matmul_mock(
     address_or_index_of_ : this can be both: index if running on the CPU or if
                            the outer-dimension of the tensors are lists. Or then
                            absolute addresses if it is supported on Spyre.
-                           The semantic is always to access ONE slice of the outer-most
-                           dimension: I.e. if we have a 2D tensor like [8, 32, 32], then
-                           the address_or_index_of would access the first dimension here
-                           (which has the size of 8) and return one element of shape
-                           [1, 32, 32]. Same example for a 3D tensor: if tensor a
-                           would be e.g. [8, 32, 8, 128], and the
-                           address_or_index_of_a is 5, then this matmul would
-                           access the 5th slice of Tensor a and return a slice of
-                           shape [1, 32, 8, 128].
+                           
+                           Single index: accesses ONE slice (returns same shape as that slice)
+                           List of indices: accesses MULTIPLE slices and concatenates along dim 0
+                           
+                           Example for list access: if a is a list of [num_tokens] tensors each
+                           [num_heads, head_size], and address_or_index_of_a is [2, 3, 4], then
+                           the result is torch.cat([a[2], a[3], a[4]], dim=0) with shape
+                           [3, num_heads, head_size].
 
     transform_ : This is an optional torch-compilable function to transform (e.g.
                  transpose/rotate) the tensor-slice after it was loaded via
                  the indirect access before the matmul happens.
 
     """
-    current_device = a[0].device.type  # works with tensors and lists (?)
+    current_device = a[0].device.type if isinstance(a, list) else a.device.type
     if current_device == "spyre":
         # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
@@ -137,26 +136,42 @@ def _indirect_matmul_mock(
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
     if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
-        if isinstance(address_or_index_of_a, torch.Tensor):
+        if isinstance(address_or_index_of_a, list):
+            # Multiple indices - cat the results (for prefill with list-based queries)
+            a_slices = [a[idx] for idx in address_or_index_of_a]
+            a = torch.cat(a_slices, dim=0)
+            if transform_a:
+                a = transform_a(a)
+        elif isinstance(address_or_index_of_a, torch.Tensor):
             assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
             idx_a = int(address_or_index_of_a.item())
+            a = a[idx_a]
+            if transform_a:
+                a = transform_a(a)
         else:
             assert address_or_index_of_a is not None
-            idx_a = address_or_index_of_a
-        # pytorch syntax is the same like for python lists here
-        a = a[idx_a]
-        if transform_a:
-            a = transform_a(a)
+            a = a[address_or_index_of_a]
+            if transform_a:
+                a = transform_a(a)
+                
     if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
-        if isinstance(address_or_index_of_b, torch.Tensor):
+        if isinstance(address_or_index_of_b, list):
+            # Multiple indices - cat the results (for prefill with list-based queries)
+            b_slices = [b[idx] for idx in address_or_index_of_b]
+            b = torch.cat(b_slices, dim=0)
+            if transform_b:
+                b = transform_b(b)
+        elif isinstance(address_or_index_of_b, torch.Tensor):
             assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
             idx_b = int(address_or_index_of_b.item())
+            b = b[idx_b]
+            if transform_b:
+                b = transform_b(b)
         else:
             assert address_or_index_of_b is not None
-            idx_b = address_or_index_of_b
-        b = b[idx_b]
-        if transform_b:
-            b = transform_b(b)
+            b = b[address_or_index_of_b]
+            if transform_b:
+                b = transform_b(b)
 
     # do the actual matmul
     output = torch.matmul(a, b)
@@ -215,7 +230,7 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
     Dynamo unrolls the loop because num_blocks and padded_query_len are closure constants.
     """
 
-    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale, q_token_indices=None):
         """
         This kernels specializes for num_blocks and padded_query_len.
 
@@ -224,6 +239,9 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
             mask_tiles: [num_blocks]
+            q: either [num_kv_heads, num_queries_per_kv, padded_query_len, head_size] (tensor)
+               or list of [num_heads, head_size] (list-based, with q_token_indices)
+            q_token_indices: list of int indices into q list (optional, for list-based queries)
         """
 
         tile_max = None
@@ -242,11 +260,18 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             mask_tile = mask_tiles[i]
 
             # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            # NOTE: for true "varlen" layout, q would be
-            # an indirect access too (avoided here for simplicity...)
-            scores = _indirect_matmul_mock(
-                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
-            )
+            # For list-based queries, use indirect matmul with q_token_indices
+            if q_token_indices is not None:
+                # List-based query: use indirect matmul with indices
+                scores = _indirect_matmul_mock(
+                    q, q_token_indices, k_pages, page_idx,
+                    transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+                )
+            else:
+                # Tensor query: original behavior
+                scores = _indirect_matmul_mock(
+                    q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+                )
             scores *= scale
             scores = scores + mask_tile
             scores_max = scores.max(dim=-1, keepdim=True)[0]
@@ -255,9 +280,15 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
                 # tile_output = torch.matmul(tile_probs, v_page_4d)
-                tile_output = _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
+                if q_token_indices is not None:
+                    tile_output = _indirect_matmul_mock(
+                        tile_probs, q_token_indices, v_pages, page_idx,
+                        transform_b=lambda t: t.unsqueeze(1)
+                    )
+                else:
+                    tile_output = _indirect_matmul_mock(
+                        tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                    )
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 # i > 0 only reachable after the i == 0 branch initialized these.
@@ -270,9 +301,15 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
                 # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                tile_output += _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
+                if q_token_indices is not None:
+                    tile_output += _indirect_matmul_mock(
+                        tile_probs, q_token_indices, v_pages, page_idx,
+                        transform_b=lambda t: t.unsqueeze(1)
+                    )
+                else:
+                    tile_output += _indirect_matmul_mock(
+                        tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                    )
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
@@ -679,8 +716,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Spyre slicing corrupts memory, so
         # bring q/k/v to CPU once for all slicing below; per-token slices get
         # transferred to Spyre individually inside the scatter and attention paths.
+        # EXCEPTION: For decode phase with query_len=1, we use unbind() on Spyre
+        # to avoid CPU transfer (unbind creates proper tensors, not strided views).
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
+        # Keep query on Spyre for unbind optimization in _online_softmax_attention
+        query_dev = query
         query_cpu = convert(query, "cpu")
 
         # Step 1: Reshape and cache — write new tokens into pages
@@ -697,6 +738,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
             query_cpu[:num_actual_tokens],
+            query_dev[:num_actual_tokens] if query_dev.device.type == "spyre" else None,
             k_pages,
             v_pages,
             attn_metadata,
@@ -736,6 +778,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _online_softmax_attention(
         self,
         query_cpu: torch.Tensor,
+        query_dev: torch.Tensor | None,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -749,6 +792,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         tensor on Spyre, passed to bmm directly without slicing.
 
         Writes results directly into the caller's output buffer in-place.
+        
+        Args:
+            query_cpu: Query tensor on CPU (for fallback/slicing)
+            query_dev: Query tensor on Spyre (for unbind optimization, may be None)
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -766,6 +813,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
+        # Optimization: Use unbind() + cat() on Spyre to avoid CPU transfer for queries
+        # unbind() creates list of per-token tensors, cat() reassembles for prefill
+        # Both operations work on Spyre (unlike slice/strided views)
+        query_dev_unbound: list[torch.Tensor] | None = None
+        if query_dev is not None:
+            query_dev_unbound = query_dev.unbind(dim=0)  # List of [num_heads, head_size] on Spyre
+
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
@@ -774,21 +828,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            q_seq = query_cpu[q_start:q_end]
+            if query_dev_unbound is not None:
+                # List-based query optimization (works for both decode and prefill)
+                # Pass list + indices to attention kernel, which handles cat internally
+                q_token_indices = list(range(q_start, q_end))
+                q_seq = query_dev_unbound  # Pass entire list
+                # No padding/cat here - attention kernel handles it via indirect matmul
+            else:
+                # Fallback: use CPU slicing (original behavior)
+                q_seq = query_cpu[q_start:q_end]
+                q_token_indices = None
 
-            # Pad query to global aligned_max_query_len (uniform for all seqs)
-            if aligned_max_query_len > query_len:
-                q_seq = torch.nn.functional.pad(
-                    q_seq,
-                    (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                    mode="constant",
-                    value=0.0,
-                )
+                # Pad query to global aligned_max_query_len (uniform for all seqs)
+                if aligned_max_query_len > query_len:
+                    q_seq = torch.nn.functional.pad(
+                        q_seq,
+                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
+                        mode="constant",
+                        value=0.0,
+                    )
 
-            # Reshape: [padded_query_len, num_heads, head_size]
-            #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-            q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+                # Reshape: [padded_query_len, num_heads, head_size]
+                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -803,9 +866,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
             # Run attention on target device
-            q_dev = convert(q, device=_target_device)
-            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-            result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
+            # For list-based opt, q is already on Spyre as list; otherwise transfer from CPU
+            if query_dev_unbound is not None:
+                # Pass list + indices - attention kernel uses indirect matmul
+                attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+                result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale, q_token_indices)
+            else:
+                q_dev = convert(q, device=_target_device)
+                attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+                result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]

@@ -118,10 +118,10 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
         monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot_with_residual)
         out_x, out_residual = layer.forward(dummy_tensor, residual)
 
-        assert torch.allclose(out_x, 2 * dummy_tensor)
+        assert torch.allclose(out_x.cpu(), 2 * dummy_tensor.cpu())
 
         # The residual is modified in-place
-        assert torch.allclose(out_residual, 2 * residual)
+        assert torch.allclose(out_residual.cpu(), 2 * residual.cpu())
     else:
         monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
         out_x = layer.forward(dummy_tensor, residual)

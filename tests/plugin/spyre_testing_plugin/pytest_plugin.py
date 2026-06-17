@@ -882,6 +882,9 @@ def patch_backend_list(request, monkeypatch):
     ):
         if "AttentionBackendEnum.FLEX_ATTENTION" in str(backend_to_test):
             return
+        # Force block_size=64 for list-based attention
+        # This overrides the test's default block_size=16
+        kwargs["block_size"] = 64
         return orig_tbc(batch_spec, model, backend_to_test, *args, **kwargs)
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)

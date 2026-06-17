@@ -267,8 +267,9 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
+                # tile_probs is a tensor (not a list), so pass None for indices
                 tile_output = _indirect_matmul_mock(
-                    tile_probs, q_token_indices, v_pages, page_idx,
+                    tile_probs, None, v_pages, page_idx,
                     transform_b=lambda t: t.unsqueeze(1)
                 )
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
@@ -282,8 +283,9 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
+                # tile_probs is a tensor (not a list), so pass None for indices
                 tile_output += _indirect_matmul_mock(
-                    tile_probs, q_token_indices, v_pages, page_idx,
+                    tile_probs, None, v_pages, page_idx,
                     transform_b=lambda t: t.unsqueeze(1)
                 )
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
@@ -695,8 +697,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Queries stay on Spyre for list-based access via unbind().
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        # Keep query on Spyre for list-based optimization
-        query_dev = query
+        # Query stays on Spyre - no rename needed
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -711,12 +712,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query_dev[:num_actual_tokens],
+            query,
             k_pages,
             v_pages,
             attn_metadata,
             output,
             _target_device,
+            num_actual_tokens,
         )
 
         return output
@@ -750,12 +752,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor,
+        query: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
         _target_device: torch.device,
+        num_actual_tokens: int,
     ) -> torch.Tensor:
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
@@ -784,9 +787,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Optimization: Use unbind() on Spyre to create list of per-token queries
+        # Unbind query on Spyre to create list of per-token tensors
         # unbind() works on Spyre (unlike slice which creates strided views)
-        query_dev_unbound = query_dev.unbind(dim=0)  # List of [num_heads, head_size] on Spyre
+        # Only unbind the actual tokens (avoid padding tokens)
+        query_full = query.unbind(dim=0)
+        # TODO: necessary? 
+        query_dev_unbound = query_full[:num_actual_tokens]  # List of [num_heads, head_size]
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization

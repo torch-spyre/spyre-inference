@@ -712,13 +712,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
+            # we pass teh full query here and use the tokens we need via indirect access
             query,
             k_pages,
             v_pages,
             attn_metadata,
             output,
             _target_device,
-            num_actual_tokens,
         )
 
         return output
@@ -758,7 +758,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
         _target_device: torch.device,
-        num_actual_tokens: int,
     ) -> torch.Tensor:
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
@@ -789,10 +788,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Unbind query on Spyre to create list of per-token tensors
         # unbind() works on Spyre (unlike slice which creates strided views)
-        # Only unbind the actual tokens (avoid padding tokens)
-        query_full = query.unbind(dim=0)
-        # TODO: necessary? 
-        query_dev_unbound = query_full[:num_actual_tokens]  # List of [num_heads, head_size]
+        query_dev_unbound = query.unbind(dim=0)  # List of [num_heads, head_size]
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -803,7 +799,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             kv_len = int(seq_lens[seq_idx].item())
 
             # List-based query optimization (works for both decode and prefill)
-            # Slice the unbound list to get tokens for this sequence
+            # Slice the list to get tokens for this sequence (list slicing is fine on Spyre)
             q_seq = query_dev_unbound[q_start:q_end]
             num_query_tokens = len(q_seq)  # query_len for this sequence
 

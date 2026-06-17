@@ -74,15 +74,21 @@ tests:
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
         - test: "test_causal_backend_correctness"
+          # The platform override ensures block_size is a multiple of 64.
           mode: mandatory_pass
           tags: [attention, upstream]
           params:
-            allow:  # We only support TP=1, BS=1
+            allow:
               tensor_parallel_size:
               - 1
+              - 2
+              - 4
               batch_spec_name:
               - single_decode
               - single_prefill
+              - small_decode
+              - small_prefill
+              - mixed_small
           fixture_names:
           - "patch_backend_list"
 

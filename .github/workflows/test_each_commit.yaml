@@ -105,7 +105,6 @@ jobs:
           uv sync \
             --frozen \
             --verbose \
-            --refresh \
             --group dev
           # Print the resolved torch install for log visibility.
           uv pip show torch

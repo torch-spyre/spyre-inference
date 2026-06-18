@@ -90,13 +90,13 @@ def _rotary_cpu_op_func(
     cpu_key = key.to("cpu") if key.numel() > 0 else None
 
     out_q, out_k = RotaryEmbedding.forward_static(
-        cpu_positions,
-        cpu_query,
-        cpu_key,
-        layer.head_size,
-        layer.rotary_dim,
-        layer.cos_sin_cache,
-        layer.is_neox_style,
+        positions=cpu_positions,
+        query=cpu_query,
+        key=cpu_key,
+        head_size=layer.head_size,
+        rotary_dim=layer.rotary_dim,
+        cos_sin_cache=layer.cos_sin_cache,
+        is_neox_style=layer.is_neox_style,
     )
 
     out_q = out_q.to(device=target_device, dtype=target_dtype)

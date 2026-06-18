@@ -228,7 +228,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     return specialized_reshape_and_cache_kernel
 
 
-def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
+def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_queries_per_kv: int):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks and num_query_tokens are closure constants.
@@ -248,6 +248,11 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
             mask_tiles: list of num_blocks tensors, each [num_query_tokens, block_size]
         """
         num_query_tokens = len(q)
+        num_heads = q[0].shape[0]
+        num_kv_heads = k_pages[0].shape[0]
+        head_size = q[0].shape[1]
+        block_size = k_pages[0].shape[1]
+        
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -256,26 +261,55 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
             page_idx = page_indices[i]
             mask_tile = mask_tiles[i]  # [num_query_tokens, block_size]
 
-            # Use indirect matmul for Q @ K^T
-            # q is a list, so we pass indices [0, 1, ..., num_query_tokens-1]
-            q_indices = list(range(num_query_tokens))
-            scores = _indirect_matmul_mock(
-                q, q_indices, k_pages, page_idx,
-                transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
-            )
+            # Concatenate query tokens: [num_query_tokens, num_heads, head_size]
+            q_cat = torch.cat([q[idx] for idx in range(num_query_tokens)], dim=0)
+            
+            # For GQA, reshape Q to group by KV head (following reference implementation pattern)
+            # [N, H, D] -> [N, KV, QPK, D] -> [KV, QPK, N, D] -> [KV, QPK*N, D]
+            q_reshaped = q_cat.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
+            q_reshaped = q_reshaped.transpose(0, 1).contiguous()  # [KV, QPK, N, D]
+            q_for_matmul = q_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, head_size)
+            
+            # Get K/V page: [KV, B, D]
+            k_page = k_pages[page_idx]
+            v_page = v_pages[page_idx]
+            
+            # k_page: [KV, B, D] -> [KV, D, B] for matmul
+            k_transposed = k_page.transpose(-2, -1)
+            
+            # scores: [KV, QPK*N, D] @ [KV, D, B] = [KV, QPK*N, B]
+            scores = torch.bmm(q_for_matmul, k_transposed)
+            
+            # Reshape scores: [KV, QPK*N, B] -> [KV, QPK, N, B] -> [N, KV, QPK, B] -> [N, H, B]
+            scores = scores.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, block_size)
+            scores = scores.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, B]
+            scores = scores.reshape(num_query_tokens, num_heads, block_size)
+            
             scores *= scale
-            scores = scores + mask_tile
+            # Mask: [N, B] -> [N, 1, B] for broadcasting
+            mask_expanded = mask_tile.unsqueeze(1)
+            scores = scores + mask_expanded
             scores_max = scores.max(dim=-1, keepdim=True)[0]
 
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                # Use indirect matmul for attention_probs @ V
-                # tile_probs is a tensor (not a list), so pass None for indices
-                tile_output = _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx,
-                    transform_b=lambda t: t.unsqueeze(1)
-                )
+                
+                # Output: probs @ V
+                # probs: [N, H, B] -> [KV, QPK*N, B]
+                probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
+                probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
+                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, block_size)
+                
+                # v_page: [KV, B, D]
+                # output: [KV, QPK*N, B] @ [KV, B, D] = [KV, QPK*N, D]
+                tile_output_flat = torch.bmm(probs_for_matmul, v_page)
+                
+                # Reshape output: [KV, QPK*N, D] -> [KV, QPK, N, D] -> [N, KV, QPK, D] -> [N, H, D]
+                tile_output = tile_output_flat.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, head_size)
+                tile_output = tile_output.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, D]
+                tile_output = tile_output.reshape(num_query_tokens, num_heads, head_size)
+                
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 assert tile_max is not None
@@ -286,10 +320,17 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int):
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                tile_output += _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx,
-                    transform_b=lambda t: t.unsqueeze(1)
-                )
+                
+                probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
+                probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
+                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, block_size)
+                
+                tile_output_new_flat = torch.bmm(probs_for_matmul, v_page)
+                tile_output_new = tile_output_new_flat.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, head_size)
+                tile_output_new = tile_output_new.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, D]
+                tile_output_new = tile_output_new.reshape(num_query_tokens, num_heads, head_size)
+                
+                tile_output += tile_output_new
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
@@ -653,11 +694,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._reshape_fns[num_tokens]
 
-    def _get_attn_fn(self, num_blocks: int, num_query_tokens: int):
-        key = (num_blocks, num_query_tokens)
+    def _get_attn_fn(self, num_blocks: int, num_query_tokens: int, num_queries_per_kv: int):
+        key = (num_blocks, num_query_tokens, num_queries_per_kv)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, num_query_tokens)
+                _create_compilable_page_attn(num_blocks, num_query_tokens, num_queries_per_kv)
             )
         return self._attn_fns[key]
 
@@ -810,12 +851,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
             # Run attention on target device with list-based queries
-            # Kernel is specialized for (num_blocks, num_query_tokens)
-            attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens)
+            # Kernel is specialized for (num_blocks, num_query_tokens, num_queries_per_kv)
+            attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens, num_queries_per_kv)
             result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
-            # Result from kernel is [num_kv_heads, num_query_tokens, head_size] after indirect matmul
-            # Reshape to [num_query_tokens, num_heads, head_size]
+            # Result from kernel is [num_query_tokens, num_heads, head_size] after indirect matmul
             # Pull result to CPU before slicing (Spyre slicing is broken)
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = result_cpu.reshape(num_query_tokens, num_heads, head_size)

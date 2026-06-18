@@ -36,8 +36,8 @@ def _spyre_device_count() -> int:
         return 0
 
 
-@pytest.mark.spyre
 @pytest.mark.uses_subprocess
+@pytest.mark.distributed
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",

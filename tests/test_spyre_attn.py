@@ -178,7 +178,7 @@ def assert_close_outliers(
                 raise AssertionError(
                     f"{n_outliers} outlier(s) exceed base tolerances, "
                     f"and at least one outlier also exceeds the relaxed bound "
-                    f"(worst diff={worst:.4g}). {msg}"
+                    f"(worst diff={worst:.4g})."
                 )
         if n_outliers > 0:
             print(

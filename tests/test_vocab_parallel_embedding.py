@@ -66,12 +66,13 @@ def test_tp1_forward_matches_reference(tp_group, num_tokens, vocab_size, embeddi
 
     torch.manual_seed(1)
     input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
-
-    actual = layer(input_ids)
     expected = F.embedding(input_ids, layer.weight)
 
+    layer = layer.to("spyre")
+    actual = layer(input_ids.to("spyre"))
+
     assert actual.shape == (num_tokens, embedding_dim)
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.vocab_parallel_embedding
@@ -116,13 +117,14 @@ def test_fake_tp2_forward_matches_reference(
         end = layer.shard_indices.org_vocab_end_index
         layer.weight.data.zero_()
         layer.weight.data[: end - start].copy_(full_weight[start:end])
-        return layer
+        return layer.to("spyre")
 
     rank0 = _build_rank(0, 2)
     rank1 = _build_rank(1, 2)
 
-    summed = rank0(input_ids) + rank1(input_ids)
-    torch.testing.assert_close(summed.float(), expected.float(), atol=1e-3, rtol=1e-3)
+    spyre_input_ids = input_ids.to("spyre")
+    summed = rank0(spyre_input_ids) + rank1(spyre_input_ids)
+    torch.testing.assert_close(summed.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
 # --- int64 comparison tripwire ---------------------------------------------

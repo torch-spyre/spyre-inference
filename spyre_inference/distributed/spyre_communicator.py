@@ -14,17 +14,18 @@
 
 """DeviceCommunicator override for IBM Spyre devices.
 
-The currently-installed `libspyre_comms.so` only has `barrier`, `broadcast`,
-single-tensor `allgather(Tensor&,Tensor&)`, and pairwise `send`/`recv`
-actually implemented. The list-form `allgather`, `allreduce`, `gather`,
-and `reduce` overrides on `SpyreCommsContext` are throw-stubs. The
-`_allgather_base` entry point on the torch-spyre side is also stubbed
-regardless of the comms lib.
+libspyre_comms natively implements: `barrier`, `broadcast`, `send`/`recv`,
+list-form `allgather`, and `gather`. The `allreduce` and `reduce` overrides
+on `SpyreCommsContext` are still throw-stubs. The `_allgather_base` entry
+point on the torch-spyre spyreccl backend side is also still stubbed,
+so `dist.all_gather_into_tensor` does not work.
 
-That means the base `DeviceCommunicatorBase` collectives that route through
-`dist.all_reduce`, `dist.all_gather_into_tensor`, `dist.all_gather` (list),
-and `dist.gather` will all throw at runtime when the device_group's backend
-is `spyreccl`.
+This class supplies:
+  - A hand-rolled `all_reduce` for TP=2 using send/recv + broadcast (native
+    allreduce is not yet available).
+  - An `all_gather` that uses native list-form `dist.all_gather` because
+    the base class routes through `dist.all_gather_into_tensor` (blocked
+    by the `_allgather_base` stub).
 
 This class supplies a hand-rolled fallback for `all_reduce` that works for
 TP=2 by using send/recv + broadcast (all of which ARE implemented), so the
@@ -32,22 +33,11 @@ TP forward path can run end-to-end on two ranks without waiting for the
 upstream comms-side implementations to land. Other collectives raise a
 clear NotImplementedError describing what's needed to unblock them.
 
-REPLACE-WITH-NATIVE markers below identify each fallback that should be
-removed once libspyre_comms gains the corresponding native impl. The
-intent is that when the comms library catches up, this whole file can
-be deleted (or reduced to a couple of overrides for ops we genuinely
-want to do differently for perf), and the platform's
-`get_device_communicator_cls` can revert to the base class.
-
-Per-op blockers:
-  - all_reduce        : libspyre_comms native allreduce.
-  - gather            : libspyre_comms native gather.
-  - all_gather (list) : libspyre_comms list-form allgather. The single-
-                        tensor `allgather(Tensor&,Tensor&)` IS implemented
-                        in libspyre_comms but is not exposed via
-                        torch-spyre's spyreccl backend.
-  - reduce            : libspyre_comms native reduce. Not on the standard
-                        TP forward path; we don't need it for #137.
+Remaining per-op blockers (REPLACE-WITH-NATIVE markers below):
+  - all_reduce : libspyre_comms native allreduce.
+  - all_gather : torch-spyre spyreccl `_allgather_base` (so the base class
+                 can use `dist.all_gather_into_tensor` directly).
+  - reduce     : libspyre_comms native reduce (not on the TP forward path).
 
 The companion test file `tests/test_spyre_comms_native_probes.py` runs
 each native collective on a real spyreccl device_group and is xfail-strict.
@@ -157,41 +147,18 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # CPU tensors dispatch through the gloo half of the multi-backend
-        # `cpu:gloo,spyre:spyreccl` device_group, which implements allgather
-        # fine. Only spyre tensors hit the spyreccl gap, so guard on device.
-        # REPLACE-WITH-NATIVE: when libspyre_comms exposes the list-form
-        # SpyreCommsContext::allgather (and torch-spyre's spyreccl backend
-        # wires up `_allgather_base`), delete this override and let the
-        # base class use `dist.all_gather_into_tensor`.
+        # The base class uses dist.all_gather_into_tensor which needs
+        # _allgather_base in spyreccl is still stubbed. Use list-form
+        # dist.all_gather instead (natively supported).
+        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
+        # delete this override and let the base class handle it.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        raise NotImplementedError(
-            _spyre_collective_unsupported_message(
-                "allgather",
-                self.world_size,
-                blocker="libspyre_comms list-form allgather + torch-spyre _allgather_base",
-            )
-        )
-
-    def gather(self, input_: torch.Tensor, dst: int = 0, dim: int = -1) -> torch.Tensor | None:
-        # CPU tensors dispatch through gloo on the multi-backend device_group;
-        # only spyre tensors need the spyreccl native gather we don't have yet.
-        # REPLACE-WITH-NATIVE: when libspyre_comms supports gather natively,
-        # delete this override.
-        if self.world_size == 1:
-            return input_
-        if input_.device.type == "cpu":
-            return super().gather(input_, dst, dim)
-        raise NotImplementedError(
-            _spyre_collective_unsupported_message(
-                "gather",
-                self.world_size,
-                blocker="libspyre_comms native gather impl",
-            )
-        )
+        output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+        dist.all_gather(output_list, input_, group=self.device_group)
+        return torch.cat(output_list, dim=dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

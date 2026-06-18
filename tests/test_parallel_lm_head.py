@@ -59,12 +59,18 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
     layer.quant_method.process_weights_after_loading(layer)
 
     x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
-
     expected = reference_lm_head(x, layer.weight.data)
+
+    # In production weights live on Spyre after `model.to(spyre_device)`;
+    # mirror that here so forward_oot's H2D + Spyre F.linear actually run.
+    layer = layer.to("spyre")
     actual = layer.forward_oot(x)
 
     assert actual.shape == (num_tokens, layer.weight.shape[0])
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    # Spyre matmul accumulation order diverges from the CPU reference in fp16;
+    # see the "expect numerical differences" warning in
+    # SpyreUnquantizedLMHeadMethod.process_weights_after_loading.
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------

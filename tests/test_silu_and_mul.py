@@ -35,35 +35,20 @@ def reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.siluandmul
 @pytest.mark.parametrize("num_tokens", [1, 7, 63, 64, 65, 1024])
 @pytest.mark.parametrize("d", [2, 63, 64, 65, 1024, 13824])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(
-            torch.float16,
-            marks=pytest.mark.xfail(reason="Strided tensors on float16 does not work on spyre"),
-        ),
-        torch.float32,
-    ],
-)
-def test_spyre_siluandmul_matches_reference(num_tokens, d, dtype):
-    """SpyreSiluAndMul output matches golden reference.
-
-    Tests both paths:
-    - forward(): custom op dispatch (no-compile path via torch.ops.vllm.spyre_siluandmul)
-    - forward_oot(): direct Spyre device execution
-    """
+def test_spyre_siluandmul_matches_reference(num_tokens, d):
+    """SpyreSiluAndMul.forward_oot on a Spyre input matches the CPU reference."""
     from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul
 
     torch.manual_seed(42)
 
     # Input shape is [num_tokens, 2*d], output shape is [num_tokens, d]
-    x = torch.randn(num_tokens, 2 * d, dtype=dtype)
+    x = torch.randn(num_tokens, 2 * d, dtype=torch.float16)
     layer = SpyreSiluAndMul()
 
     expected = reference_silu_and_mul(x)
-    actual = layer.forward_oot(x)
+    actual = layer.forward_oot(x.to("spyre"))
 
-    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.siluandmul

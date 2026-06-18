@@ -36,6 +36,44 @@ def register():
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 
+_kv_connector_registered = False
+
+
+def register_kv_connector() -> None:
+    """Register the Spyre KV connector with vLLM's connector factory.
+
+    Registration only stores a module path, but it must run after
+    vllm.config is fully loaded (the factory imports vllm.config).
+    Called from TorchSpyrePlatform.check_and_update_config on the
+    scheduler side and TorchSpyreWorker.init_device on the worker side,
+    not at module import time.
+    """
+    global _kv_connector_registered
+    if _kv_connector_registered:
+        return
+
+    import logging
+
+    logger = logging.getLogger(__name__)
+    try:
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        KVConnectorFactory.register_connector(
+            "InMemorySpyreConnector",
+            "spyre_inference.distributed.kv_transfer.kv_connector.v1.inmemory_spyre_connector",
+            "InMemorySpyreConnector",
+        )
+        _kv_connector_registered = True
+        logger.info("Registered InMemorySpyreConnector")
+    except ValueError:
+        # Another import path registered it first.
+        _kv_connector_registered = True
+    except (ImportError, ModuleNotFoundError, AttributeError) as exc:
+        logger.error("Failed to register InMemorySpyreConnector: %s", exc)
+
+
 def register_ops():
     """Register OOT custom ops for Spyre."""
     from spyre_inference.custom_ops import register_all

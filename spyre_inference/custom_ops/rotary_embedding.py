@@ -44,13 +44,12 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Hold a CPU-side reference to cos_sin_cache. torch-spyre's patched
+        # nn.Module.to walks _buffers directly and rebinds each entry to a
+        # Spyre copy, bypassing _apply; this regular attribute (not in
+        # _buffers) keeps the original CPU tensor alive for the CPU op body.
+        self._cpu_cos_sin_cache = self.cos_sin_cache
         self._spyre_layer_name = register_layer(self, "spyre_rotary")
-
-    def _apply(self, fn, recurse=True):
-        # Keep cos_sin_cache (and any other buffers/params) on CPU. Spyre's
-        # fp16 differs from CPU's bit-for-bit; round-tripping the cache
-        # through Spyre corrupts it and produces wrong tokens.
-        return self
 
     def forward(
         self,
@@ -80,7 +79,9 @@ def _rotary_cpu_op_func(
     key: torch.Tensor,
     layer_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # cos_sin_cache currently stays CPU permanently (see SpyreRotaryEmbedding._apply)
+    # cos_sin_cache is fetched from layer._cpu_cos_sin_cache (a CPU-pinned
+    # reference saved in __init__), since the registered buffer gets DMA'd
+    # to Spyre by torch_spyre.model_utils.load_model_to_spyre.
     layer = get_layer(layer_name)
     target_device = positions.device
     target_dtype = query.dtype
@@ -95,7 +96,7 @@ def _rotary_cpu_op_func(
         key=cpu_key,
         head_size=layer.head_size,
         rotary_dim=layer.rotary_dim,
-        cos_sin_cache=layer.cos_sin_cache,
+        cos_sin_cache=layer._cpu_cos_sin_cache,
         is_neox_style=layer.is_neox_style,
     )
 

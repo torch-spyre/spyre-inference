@@ -910,11 +910,11 @@ def patch_backend_list(request, monkeypatch):
         sliding_window=None,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
-            # [2, num_blocks, block_size, num_kv_heads, head_size]
+            # [num_blocks, 2, block_size, num_kv_heads, head_size]
             #   -> per-side [num_blocks, num_kv_heads, block_size, head_size]
             #   -> list of num_blocks tensors of [num_kv_heads, block_size, head_size]
-            k_blocks = kv_cache[0].transpose(1, 2).contiguous()
-            v_blocks = kv_cache[1].transpose(1, 2).contiguous()
+            k_blocks = kv_cache[:, 0].transpose(1, 2).contiguous()
+            v_blocks = kv_cache[:, 1].transpose(1, 2).contiguous()
             kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
         return orig_run_attention_backend(
             backend,

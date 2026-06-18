@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm",
+    "vllm>=0.23.0,<0.24",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -134,9 +134,6 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.ty.rules]
-possibly-missing-attribute = "ignore"
-# TODO: re-enable once vllm/torch-spyre imports resolve in CI.
-unresolved-import = "ignore"
 # TODO: re-enable after fixing subclass attribute lookups in custom_ops/linear.py.
 unresolved-attribute = "ignore"
 

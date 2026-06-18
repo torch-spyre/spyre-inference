@@ -128,11 +128,11 @@ jobs:
 
       - name: Build spyre-inference
         env:
-          INPUT_REF: "${{ inputs.torch_spyre_ref }}"
+          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          if [[ -n "$INPUT_REF" ]]; then
+          if [[ -n "$TORCH_SPYRE_REF" ]]; then
             uv add torch-spyre /home/senuser/torch-spyre
             uv sync --verbose --group dev
           else

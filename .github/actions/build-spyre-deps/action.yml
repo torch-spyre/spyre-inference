@@ -71,15 +71,15 @@ runs:
       shell: bash
       working-directory: /home/senuser
       env:
-        INPUT_REF: "${{ inputs.torch_spyre_ref }}"
+        TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
         git config --global --add safe.directory '*'
-        if [[ -n "$INPUT_REF" ]]; then
+        if [[ -n "$TORCH_SPYRE_REF" ]]; then
           cd /home/senuser/torch-spyre
-          TARGET_SHA="$INPUT_REF"
-          TARGET_REF="$INPUT_REF"
+          TARGET_SHA="$TORCH_SPYRE_REF"
+          TARGET_REF="$TORCH_SPYRE_REF"
           echo "TARGET_REF=${TARGET_REF}"
           echo "TARGET_SHA=${TARGET_SHA}"
           git fetch --tags --force origin "+${TARGET_SHA}" || \

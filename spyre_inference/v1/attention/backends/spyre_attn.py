@@ -733,7 +733,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Queries stay on Spyre for list-based access via unbind().
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        # Query stays on Spyre - no rename needed
+        # TODO: Ensure query is on Spyre device (may be on CPU in tests)
+        query = convert(query, _target_device)
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(

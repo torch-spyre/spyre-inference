@@ -146,6 +146,7 @@ def assert_close_outliers(
     *,
     outlier_atol: float | None = None,
     outlier_rtol: float | None = None,
+    msg: str = "",
 ) -> None:
     """Assert tensors are close, allowing up to *max_outliers* elements to exceed tolerance.
 

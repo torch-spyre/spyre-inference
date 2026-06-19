@@ -107,10 +107,10 @@ def _indirect_matmul_mock(
     address_or_index_of_ : this can be both: index if running on the CPU or if
                            the outer-dimension of the tensors are lists. Or then
                            absolute addresses if it is supported on Spyre.
-                           
+
                            Single index: accesses ONE slice (returns same shape as that slice)
                            List of indices: accesses MULTIPLE slices and concatenates along dim 0
-                           
+
                            Example for list access: if a is a list of [num_tokens] tensors each
                            [num_heads, head_size], and address_or_index_of_a is [2, 3, 4], then
                            the result is torch.cat([a[2], a[3], a[4]], dim=0) with shape
@@ -124,17 +124,13 @@ def _indirect_matmul_mock(
     # Handle both list and tuple (torch.unbind returns tuple)
     is_a_list = isinstance(a, (list, tuple))
     is_b_list = isinstance(b, (list, tuple))
-    
+
     current_device = a[0].device.type if is_a_list else a.device.type
     if current_device == "spyre":
         # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
-        assert is_a_list or address_or_index_of_a is None, (
-            "here needs to be true indirect access"
-        )
-        assert is_b_list or address_or_index_of_b is None, (
-            "here needs to be true indirect access"
-        )
+        assert is_a_list or address_or_index_of_a is None, "here needs to be true indirect access"
+        assert is_b_list or address_or_index_of_b is None, "here needs to be true indirect access"
 
     # resolving indirect access
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
@@ -157,7 +153,7 @@ def _indirect_matmul_mock(
             a = a[address_or_index_of_a]
             if transform_a:
                 a = transform_a(a)
-                
+
     if is_b_list or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
         if isinstance(address_or_index_of_b, list):
             # Multiple indices - cat the results (for prefill with list-based queries)
@@ -178,6 +174,7 @@ def _indirect_matmul_mock(
                 b = transform_b(b)
 
     # do the actual matmul
+    assert isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
     output = torch.matmul(a, b)
     return output
 
@@ -232,10 +229,13 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks and num_query_tokens are closure constants.
-    The kernel is specialized for a fixed number of query tokens (e.g., 1 for decode, 4 for prefill).
+    The kernel is specialized for a fixed number of query tokens
+    (e.g., 1 for decode, 4 for prefill).
     """
 
-    def specialized_paged_attn_kernel(q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, scale):
+    def specialized_paged_attn_kernel(
+        q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, scale
+    ):
         """
         This kernel specializes for num_blocks and num_query_tokens.
 
@@ -450,8 +450,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             kv_valid = kv_pos < kv_len_s  # [aligned_max_seq_len]
             attend = q_valid & kv_valid.unsqueeze(0)  # [query_len, aligned_max_seq_len]
 
-
-
             # Causal mask for this sequence
             if apply_causal_mask:
                 context_len_s = kv_len_s - query_len_s
@@ -467,8 +465,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 torch.tensor(0.0, dtype=self.model_dtype, device=device),
             )
 
-
-
             # Tile along KV dimension
             seq_tiles: list[torch.Tensor] = []
             for b in range(num_blocks_s):
@@ -480,8 +476,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # TODO: think of reuse of mask tiles
                 if tile.shape[1] < block_size:
                     tile = torch.nn.functional.pad(
-                        tile, (0, block_size - tile.shape[1]),
-                        mode='constant', value=-65504.0
+                        tile, (0, block_size - tile.shape[1]), mode="constant", value=-65504.0
                     )
                 seq_tiles.append(tile.contiguous())
 
@@ -644,7 +639,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Compiled function caches (keyed by iteration count for reshape, and
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
-        self._attn_fns: dict[tuple[int, int], object] = {}
+        self._attn_fns: dict[tuple[int, int, int], object] = {}
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
@@ -836,8 +831,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 assert query_cpu is not None
                 q_slice = query_cpu[q_start:q_end]  # [N, H, D]
                 q_for_matmul = (
-                    q_slice
-                    .reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
+                    q_slice.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
                     .permute(1, 0, 2, 3)
                     .contiguous()
                     .reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
@@ -873,8 +867,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # (transpose on Spyre would corrupt; CPU reshape is safe)
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = (
-                result_cpu
-                .reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
+                result_cpu.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
                 .permute(1, 0, 2, 3)
                 .contiguous()
                 .reshape(num_query_tokens, num_heads, head_size)

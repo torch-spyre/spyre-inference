@@ -27,7 +27,9 @@ os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
 from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
 from vllm.logger import DEFAULT_LOGGING_CONFIG
+from vllm.logger import init_logger
 
+logger = init_logger(__name__)
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -41,6 +43,20 @@ def register_ops():
     from spyre_inference.custom_ops import register_all
 
     register_all()
+
+
+def register_hf_adapters():
+    # Override the Transformers backend model class so that
+    # ``model_impl="transformers"`` uses hf-adapters'
+    try:
+        from vllm.model_executor.models import ModelRegistry
+
+        ModelRegistry.register_model(
+            "TransformersForCausalLM",
+            "spyre_inference.hf_adapters:HfAdaptersForCausalLM",
+        )
+    except Exception:
+        logger.warning("Failed to register hf-adapters Transformers backend", exc_info=True)
 
 
 def _init_logging():

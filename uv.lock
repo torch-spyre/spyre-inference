@@ -40,16 +40,13 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -72,7 +69,9 @@ overrides = [
     { name = "requests", specifier = ">=2.32.4" },
     { name = "setuptools", specifier = ">=82" },
     { name = "torch", marker = "platform_machine not in 's390x, ppc64le'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torchaudio", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "transformers", specifier = ">=5.10.2" },
     { name = "triton", marker = "sys_platform == 'never'" },
     { name = "vllm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'", index = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" },
     { name = "vllm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
@@ -317,14 +316,14 @@ name = "anthropic"
 version = "0.112.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
-    { name = "docstring-parser" },
-    { name = "httpx" },
-    { name = "jiter" },
-    { name = "pydantic" },
-    { name = "sniffio" },
-    { name = "typing-extensions" },
+    { name = "anyio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "distro", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "docstring-parser", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jiter", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "sniffio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7b/dd/808c144d4a883fcfd12fe0d7689b1d86bbbea6666c1cc957ad19f1017c22/anthropic-0.112.0.tar.gz", hash = "sha256:e180cd91aa5b9b32e4007fe69892ab128d8a86b9f90825103b1903fbc977d0af", size = 937460, upload-time = "2026-06-24T18:45:56.844Z" }
 wheels = [
@@ -349,7 +348,7 @@ name = "apache-tvm-ffi"
 version = "0.1.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ff/95/ef83880657e89a0ce0f1ad79cbff11698286d00522dbc290d34a8458e9c2/apache_tvm_ffi-0.1.12.tar.gz", hash = "sha256:2aa5c8ece3144dad11afd6d0f10191d03cdb368bbcd9c92f9fb919f35906223d", size = 2843816, upload-time = "2026-06-09T18:17:31.68Z" }
 wheels = [
@@ -587,12 +586,12 @@ name = "black"
 version = "26.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "mypy-extensions" },
-    { name = "packaging" },
-    { name = "pathspec" },
-    { name = "platformdirs" },
-    { name = "pytokens" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "mypy-extensions", marker = "sys_platform != 'emscripten'" },
+    { name = "packaging", marker = "sys_platform != 'emscripten'" },
+    { name = "pathspec", marker = "sys_platform != 'emscripten'" },
+    { name = "platformdirs", marker = "sys_platform != 'emscripten'" },
+    { name = "pytokens", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/37/5628dd55bf2b34257fc7603f0fe97c40e3aaf24265f416a9c85c95ca1436/black-26.5.1.tar.gz", hash = "sha256:dd321f668053961824bcc1be1cc1df748b2d7e4fa28086b08331e577b0100a73", size = 679439, upload-time = "2026-05-18T16:53:36.107Z" }
 wheels = [
@@ -624,7 +623,7 @@ name = "blake3"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.12' and platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/26/6a/4cc5a9dd40fd8a6d283fd3761e5f59c490109571ef8e3c73245417e5a305/blake3-1.0.9.tar.gz", hash = "sha256:5fa374fa5070ca084368776c19b420157eb0f2d3f091343d6bc59189929d62e2", size = 116872, upload-time = "2026-06-22T18:02:25.366Z" }
 wheels = [
@@ -1025,7 +1024,7 @@ name = "chz"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3a/6c/09c8ca50c40e18be211f25ad6dcdb81f8110ba2d611cd0375f5fb65fb762/chz-0.4.0.tar.gz", hash = "sha256:5380039e6970a1056c2140288aafa41a33f26d5e4c685117be80f7e260c8d679", size = 82473, upload-time = "2025-11-24T00:55:10.634Z" }
 wheels = [
@@ -1079,11 +1078,11 @@ name = "compressed-tensors"
 version = "0.17.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "loguru" },
-    { name = "pydantic" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 'aarch64' or sys_platform != 'darwin'" },
-    { name = "transformers" },
+    { name = "loguru", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "transformers", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2c/9e/d7f18bd9a0354088abc11a0c1f2c7698f7c49e5a709faedf6a46e388f693/compressed_tensors-0.17.0.tar.gz", hash = "sha256:15c20d06bdbcf35b51fc99fd125e7b9be1e1855567c33b7a46dfac26ad6fb126", size = 257091, upload-time = "2026-06-03T16:49:17.208Z" }
 wheels = [
@@ -1485,7 +1484,7 @@ name = "decord"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "platform_machine != 'aarch64' or platform_machine in 's390x, ppc64le'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
@@ -1497,8 +1496,8 @@ name = "depyf"
 version = "0.20.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "astor" },
-    { name = "dill" },
+    { name = "astor", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "dill", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/88/35/83fb0178212279aa0af031031905804c6de5618435d229f41ed21bb9ad2c/depyf-0.20.0.tar.gz", hash = "sha256:fb7683bd72c44f67b56029df2c47721e9a02ffa4d7b19095f1c54c4ebf797a98", size = 6168761, upload-time = "2025-10-13T12:33:38.589Z" }
 wheels = [
@@ -1555,9 +1554,9 @@ name = "docker"
 version = "7.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pywin32", marker = "sys_platform == 'win32'" },
-    { name = "requests" },
-    { name = "urllib3" },
+    { name = "pywin32", marker = "python_full_version >= '3.12' and sys_platform == 'win32'" },
+    { name = "requests", marker = "python_full_version >= '3.12'" },
+    { name = "urllib3", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/91/9b/4a2ea29aeba62471211598dac5d96825bb49348fa07e906ea930394a83ce/docker-7.1.0.tar.gz", hash = "sha256:ad8c70e6e3f8926cb8a92619b832b4ea5299e2831c14284663184e200546fa6c", size = 117834, upload-time = "2024-05-23T11:13:57.216Z" }
 wheels = [
@@ -1607,8 +1606,8 @@ name = "email-validator"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "dnspython" },
-    { name = "idna" },
+    { name = "dnspython", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "idna", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f5/22/900cb125c76b7aaa450ce02fd727f452243f2e91a61af068b40adba60ea9/email_validator-2.3.0.tar.gz", hash = "sha256:9fc05c37f2f6cf439ff414f8fc46d917929974a82244c20eb10231ba60c54426", size = 51238, upload-time = "2025-08-26T13:09:06.831Z" }
 wheels = [
@@ -1624,7 +1623,7 @@ dependencies = [
     { name = "numpy" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
-    { name = "torchaudio" },
+    { name = "torchaudio", marker = "sys_platform == 'never'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/62/59/e47bbd0542d0e6f4ce9983d5eb458a01d4b42c81e5c410cb9e159b1061ae/encodec-0.1.1.tar.gz", hash = "sha256:36dde98ccfe6c51a15576476cadfcb3b35a63507b8b8555abd69889a6fba6772", size = 3736037, upload-time = "2022-10-25T16:13:21.471Z" }
 
@@ -1664,11 +1663,11 @@ name = "fastapi"
 version = "0.136.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "annotated-doc" },
-    { name = "pydantic" },
-    { name = "starlette" },
-    { name = "typing-extensions" },
-    { name = "typing-inspection" },
+    { name = "annotated-doc", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
+    { name = "starlette", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-inspection", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/81/2d/ff8d91d7b564d464629a0fd50a4489c97fcb836ac230bf3a7269232a9b1f/fastapi-0.136.3.tar.gz", hash = "sha256:e487fae93ad408e6f47641ee4dfe389864fd7bec92e547ea8498fc13f43e83ab", size = 396410, upload-time = "2026-05-23T18:53:15.192Z" }
 wheels = [
@@ -1677,15 +1676,15 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "email-validator" },
-    { name = "fastapi-cli", extra = ["standard"] },
-    { name = "fastar" },
-    { name = "httpx" },
-    { name = "jinja2" },
-    { name = "pydantic-extra-types" },
-    { name = "pydantic-settings" },
-    { name = "python-multipart" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "email-validator", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "fastapi-cli", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "fastar", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jinja2", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic-extra-types", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic-settings", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "python-multipart", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvicorn", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 
 [[package]]
@@ -1693,9 +1692,9 @@ name = "fastapi-cli"
 version = "0.0.27"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "rich-toolkit" },
-    { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "rich-toolkit", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typer", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvicorn", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/37/d0/ee5678346811967b8d096d5d5604e71b50d6bf5a2abfbdb331157e2bbaa9/fastapi_cli-0.0.27.tar.gz", hash = "sha256:1dffb1e40c0c88f2e0171a8a252a2b615c1e63ff8c05626649e4badd6a84336a", size = 23630, upload-time = "2026-06-18T14:48:43.421Z" }
 wheels = [
@@ -1704,8 +1703,8 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "fastapi-cloud-cli" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "fastapi-cloud-cli", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvicorn", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 
 [[package]]
@@ -1713,15 +1712,15 @@ name = "fastapi-cloud-cli"
 version = "0.21.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "detect-installer" },
-    { name = "fastar" },
-    { name = "httpx" },
-    { name = "pydantic", extra = ["email"] },
-    { name = "rich-toolkit" },
-    { name = "rignore" },
-    { name = "sentry-sdk" },
-    { name = "typer" },
-    { name = "uvicorn", extra = ["standard"] },
+    { name = "detect-installer", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "fastar", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", extra = ["email"], marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "rich-toolkit", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "rignore", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "sentry-sdk", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typer", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvicorn", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/60/c3/5cd0b824ca4b4fd073ce998321881ed68b8e0b85d441653eb1bd997c6fc0/fastapi_cloud_cli-0.21.0.tar.gz", hash = "sha256:463350dcbdcbb9b3baa32a99a3db0610f34a3ae143dd1d35a71173aec5dd245d", size = 93804, upload-time = "2026-06-24T15:23:07.554Z" }
 wheels = [
@@ -2149,6 +2148,24 @@ wheels = [
 ]
 
 [[package]]
+<<<<<<< HEAD
+=======
+name = "gguf"
+version = "0.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "requests", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "tqdm", marker = "platform_machine not in 's390x, ppc64le'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/48/ae/17f1308ae45cd7b08ebb521747d5b23f4efc4d172038a4e228dd5106c3ff/gguf-0.19.0.tar.gz", hash = "sha256:dbadcd6cc7ccd44256f2229fe7c2dff5e8aa5cf0612ab987fd2b1a57e428923f", size = 111220, upload-time = "2026-05-06T13:04:03.667Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/bb/d71d6da82763528c2c2ed6b59a9d6142c6595545a4c448e2085d155e88c2/gguf-0.19.0-py3-none-any.whl", hash = "sha256:70bcd10edfe697fb2dad6e40af2234b9d8ece9a41a99761405121ebda1c3c1cd", size = 118475, upload-time = "2026-05-06T13:04:02.588Z" },
+]
+
+[[package]]
+>>>>>>> 23de35b (Add model_impl=transformers support via hf-adapters)
 name = "google-api-core"
 version = "2.31.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2266,21 +2283,21 @@ name = "gpt-oss"
 version = "0.0.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "aiohttp" },
-    { name = "chz" },
-    { name = "docker" },
-    { name = "fastapi" },
-    { name = "html2text" },
-    { name = "jupyter-client" },
-    { name = "lxml" },
-    { name = "openai-harmony" },
-    { name = "pydantic" },
-    { name = "requests" },
-    { name = "structlog" },
-    { name = "tenacity" },
-    { name = "termcolor" },
-    { name = "tiktoken" },
-    { name = "uvicorn" },
+    { name = "aiohttp", marker = "python_full_version >= '3.12'" },
+    { name = "chz", marker = "python_full_version >= '3.12'" },
+    { name = "docker", marker = "python_full_version >= '3.12'" },
+    { name = "fastapi", marker = "python_full_version >= '3.12'" },
+    { name = "html2text", marker = "python_full_version >= '3.12'" },
+    { name = "jupyter-client", marker = "python_full_version >= '3.12'" },
+    { name = "lxml", marker = "python_full_version >= '3.12'" },
+    { name = "openai-harmony", marker = "python_full_version >= '3.12'" },
+    { name = "pydantic", marker = "python_full_version >= '3.12'" },
+    { name = "requests", marker = "python_full_version >= '3.12'" },
+    { name = "structlog", marker = "python_full_version >= '3.12'" },
+    { name = "tenacity", marker = "python_full_version >= '3.12'" },
+    { name = "termcolor", marker = "python_full_version >= '3.12'" },
+    { name = "tiktoken", marker = "python_full_version >= '3.12'" },
+    { name = "uvicorn", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8d/20/bbeeb1261188a5f1ac7dbc04c6b8e49bc27e9b2643a5cf29a961ea988c43/gpt_oss-0.0.9.tar.gz", hash = "sha256:f8cce0186e31752fb94ccbd61dcca5fd39603b6d22b9779656a7b20749a6330c", size = 103702, upload-time = "2026-01-13T19:03:58.149Z" }
 wheels = [
@@ -2452,6 +2469,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/8a/0e/ffbb98cd1910f1f898ddc62d649dbf0e3d68026ee9313d3cff035206b727/harfile-0.5.0.tar.gz", hash = "sha256:c1524b8f0a39dd9f19365760aefb3adbba951818310d17b2eaa293de1f4c170a", size = 10293, upload-time = "2026-05-29T11:50:03.358Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/21/949c004d730d610dac63bcf5964f2585e98aa7bd44ff570ef8844472e76b/harfile-0.5.0-py3-none-any.whl", hash = "sha256:ab8a01d0d21d3b7f5ad57e7dc56b8b829f6a8855c1fa143aad464e7e8169f5e3", size = 7172, upload-time = "2026-05-29T11:50:02.206Z" },
+]
+
+[[package]]
+name = "hf-adapters-spyre"
+version = "0.1.0"
+source = { git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4#a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "sentence-transformers" },
+    { name = "sentencepiece" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "transformers" },
 ]
 
 [[package]]
@@ -2876,8 +2906,8 @@ name = "instanttensor"
 version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/37/69/a4dc4e0f0018a0e558b716e90bcb19cb6a8c7506f68e89a1493608cf5e62/instanttensor-0.1.9.tar.gz", hash = "sha256:d8692b97991c1a5fb2db7905b9a6ae90a7f967c7ddd853d35e41caa146750c02", size = 9618304, upload-time = "2026-05-27T21:33:46.45Z" }
 wheels = [
@@ -3135,12 +3165,12 @@ name = "jupyter-client"
 version = "8.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "jupyter-core" },
-    { name = "python-dateutil" },
-    { name = "pyzmq" },
-    { name = "tornado" },
-    { name = "traitlets" },
-    { name = "typing-extensions" },
+    { name = "jupyter-core", marker = "python_full_version >= '3.12'" },
+    { name = "python-dateutil", marker = "python_full_version >= '3.12'" },
+    { name = "pyzmq", marker = "python_full_version >= '3.12'" },
+    { name = "tornado", marker = "python_full_version >= '3.12'" },
+    { name = "traitlets", marker = "python_full_version >= '3.12'" },
+    { name = "typing-extensions", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7d/dc/5512503b088997c2250b8bf18258fba9d9ce5ead641183700960d3c9d342/jupyter_client-8.9.1.tar.gz", hash = "sha256:a58f730dd9e728ba16ba1d62ebccf7ffe1ebbdbce4e95cfae941b7321ae1f4fa", size = 359256, upload-time = "2026-06-09T13:15:01.033Z" }
 wheels = [
@@ -3152,8 +3182,8 @@ name = "jupyter-core"
 version = "5.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "platformdirs" },
-    { name = "traitlets" },
+    { name = "platformdirs", marker = "python_full_version >= '3.12'" },
+    { name = "traitlets", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/02/49/9d1284d0dc65e2c757b74c6687b6d319b02f822ad039e5c512df9194d9dd/jupyter_core-5.9.1.tar.gz", hash = "sha256:4d09aaff303b9566c3ce657f580bd089ff5c91f5f89cf7d8846c3cdf465b5508", size = 89814, upload-time = "2025-10-16T19:19:18.444Z" }
 wheels = [
@@ -3454,10 +3484,10 @@ name = "lm-format-enforcer"
 version = "0.11.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "interegular" },
-    { name = "packaging" },
-    { name = "pydantic" },
-    { name = "pyyaml" },
+    { name = "interegular", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "packaging", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/84/d5/41cd417ba7dfdbbcfe46cebf81fb3dfd7c591b89897560ad05bb410a465d/lm_format_enforcer-0.11.3.tar.gz", hash = "sha256:e68081c108719cce284a9bcc889709b26ffb085a1945b5eba3a12cfa96d528da", size = 40258, upload-time = "2025-08-24T19:37:47.527Z" }
 wheels = [
@@ -3478,8 +3508,8 @@ name = "loguru"
 version = "0.7.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
-    { name = "win32-setctime", marker = "sys_platform == 'win32'" },
+    { name = "colorama", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'" },
+    { name = "win32-setctime", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3a/05/a1dae3dffd1116099471c643b8924f5aa6524411dc6c63fdae648c4f1aca/loguru-0.7.3.tar.gz", hash = "sha256:19480589e77d47b8d85b2c827ad95d49bf31b0dcde16593892eb51dd18706eb6", size = 63559, upload-time = "2024-12-06T11:20:56.608Z" }
 wheels = [
@@ -3767,20 +3797,20 @@ name = "mcp"
 version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
-    { name = "httpx" },
-    { name = "httpx-sse" },
-    { name = "jsonschema" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "pyjwt", extra = ["crypto"] },
-    { name = "python-multipart" },
-    { name = "pywin32", marker = "sys_platform == 'win32'" },
-    { name = "sse-starlette" },
-    { name = "starlette" },
-    { name = "typing-extensions" },
-    { name = "typing-inspection" },
-    { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
+    { name = "anyio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx-sse", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jsonschema", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic-settings", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pyjwt", extra = ["crypto"], marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "python-multipart", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pywin32", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'" },
+    { name = "sse-starlette", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "starlette", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-inspection", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvicorn", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c1/ee/94c6c50ffc5b5cf4737052275d11b57367f32d1a8516e31dcd60591b3916/mcp-1.28.0.tar.gz", hash = "sha256:559d3f9943674cafbe5744c5d3794f3237e8b47f9bbc58e20c0fad680d8487c2", size = 636040, upload-time = "2026-06-16T21:37:17.996Z" }
 wheels = [
@@ -3829,13 +3859,13 @@ name = "model-hosting-container-standards"
 version = "0.1.16"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "jmespath" },
-    { name = "pydantic" },
-    { name = "setuptools" },
-    { name = "starlette" },
-    { name = "supervisor" },
+    { name = "fastapi", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jmespath", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "setuptools", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "starlette", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "supervisor", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2d/5f/bc0d0fce1bd0a35378696aa13b21feffa18d9cda837f4e1be124e45ee090/model_hosting_container_standards-0.1.16.tar.gz", hash = "sha256:d34589633900e53c3ee5f7c78280a7cf7e4f6532c35e763341a262fc85cbe84a", size = 94130, upload-time = "2026-06-15T21:29:34.771Z" }
 wheels = [
@@ -4335,7 +4365,8 @@ dependencies = [
     { name = "timm" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version < '3.12' and sys_platform == 'never') or (platform_machine not in 's390x, ppc64le' and sys_platform == 'never')" },
     { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6d/7b/fd38dfd522968135dce71d0b543c2ae776f9c8e27df6ad46b63bab09eef7/open_clip_torch-2.32.0.tar.gz", hash = "sha256:0220bc111162527eb738c1fe20dbfd6ea45dfe44726b54a4de18d3945d8f2f00", size = 1491248, upload-time = "2025-04-05T21:55:24.51Z" }
@@ -4348,14 +4379,14 @@ name = "openai"
 version = "2.44.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
-    { name = "httpx" },
-    { name = "jiter" },
-    { name = "pydantic" },
-    { name = "sniffio" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
+    { name = "anyio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "distro", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "httpx", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jiter", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "sniffio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "tqdm", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/49/f5/7c7cb955305cb41f7f3c5fd7e0e38bf6bbf2658468863d4b7b868a5cb8df/openai-2.44.0.tar.gz", hash = "sha256:68a5a5ffad82b8ff7d451c437529fb64f7c3b8123aaf0c021966a882d9e3947d", size = 988753, upload-time = "2026-06-24T20:56:02.293Z" }
 wheels = [
@@ -4367,7 +4398,7 @@ name = "openai-harmony"
 version = "0.0.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pydantic" },
+    { name = "pydantic", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3e/92/2d038d096f29179c7c9571b431f9e739f87a487121901725e23fe338dd9d/openai_harmony-0.0.8.tar.gz", hash = "sha256:6e43f98e6c242fa2de6f8ea12eab24af63fa2ed3e89c06341fb9d92632c5cbdf", size = 284777, upload-time = "2025-11-05T19:07:06.727Z" }
 wheels = [
@@ -4419,7 +4450,7 @@ name = "opentelemetry-api"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ae/cc/e4c9584181f86494df0f6bdec1a4f3280c50db44704dc2a407e994fc87bb/opentelemetry_api-1.43.0.tar.gz", hash = "sha256:107d0d03857ea8fc7c5fcbbbd83f800c281f0d560553d61c1d675fccfd1761c1", size = 73476, upload-time = "2026-06-24T15:19:55.323Z" }
 wheels = [
@@ -4431,8 +4462,8 @@ name = "opentelemetry-exporter-otlp"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-exporter-otlp-proto-grpc" },
-    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-exporter-otlp-proto-grpc", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ee/47/b77366bcbe719373a8cac2b4e8ad01f8ff3c9f2c223374d77ece280aae6f/opentelemetry_exporter_otlp-1.43.0.tar.gz", hash = "sha256:65aded6c50ee7dd2b9948c9d0e59ddb4ed4eea6e8532fba95cbe6a4a64a566ba", size = 6086, upload-time = "2026-06-24T15:19:58.003Z" }
 wheels = [
@@ -4444,7 +4475,7 @@ name = "opentelemetry-exporter-otlp-proto-common"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-proto" },
+    { name = "opentelemetry-proto", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/55/c1/e8098490ab15abf116dcaf9fa89ededcb35547c7d08d4b5a62f573dc1e63/opentelemetry_exporter_otlp_proto_common-1.43.0.tar.gz", hash = "sha256:c4e32ba6d6b13bdb2b8f6764c4fd28d00192826561aa04f6d14eedfce7ac076f", size = 20197, upload-time = "2026-06-24T15:20:00.247Z" }
 wheels = [
@@ -4456,13 +4487,13 @@ name = "opentelemetry-exporter-otlp-proto-grpc"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "googleapis-common-protos" },
-    { name = "grpcio" },
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-exporter-otlp-proto-common" },
-    { name = "opentelemetry-proto" },
-    { name = "opentelemetry-sdk" },
-    { name = "typing-extensions" },
+    { name = "googleapis-common-protos", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "grpcio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-exporter-otlp-proto-common", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-proto", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-sdk", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e2/1d/6336453716ca0a240d4417d19e6d5b77a5e7163e5670ec4f7ec4d3ede7bf/opentelemetry_exporter_otlp_proto_grpc-1.43.0.tar.gz", hash = "sha256:1b3e0627daa9bc21884d4a13946807c255eb558bfe5bdd543dffb6f4c9faee0d", size = 27213, upload-time = "2026-06-24T15:20:00.907Z" }
 wheels = [
@@ -4474,13 +4505,13 @@ name = "opentelemetry-exporter-otlp-proto-http"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "googleapis-common-protos" },
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-exporter-otlp-proto-common" },
-    { name = "opentelemetry-proto" },
-    { name = "opentelemetry-sdk" },
-    { name = "requests" },
-    { name = "typing-extensions" },
+    { name = "googleapis-common-protos", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-exporter-otlp-proto-common", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-proto", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-sdk", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "requests", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/fc/92/0b9f56412483a8891d4843890294796c9df8ab42417bd9bad8035d840cb3/opentelemetry_exporter_otlp_proto_http-1.43.0.tar.gz", hash = "sha256:fa8a42bb7d00ee5391f4c0b04d8e6a46c03caa437903296ab73a81dc11ba118f", size = 25406, upload-time = "2026-06-24T15:20:01.515Z" }
 wheels = [
@@ -4492,7 +4523,7 @@ name = "opentelemetry-proto"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "protobuf" },
+    { name = "protobuf", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/e0/b9/d357faefb40bda1d4799913e6af611171ff22a2dedcb93576bc92242d056/opentelemetry_proto-1.43.0.tar.gz", hash = "sha256:224778df17e1f3fafeaaa21d874236ca5f6ffc2f86e0899298ec7351aac27924", size = 46481, upload-time = "2026-06-24T15:20:07.625Z" }
 wheels = [
@@ -4504,9 +4535,9 @@ name = "opentelemetry-sdk"
 version = "1.43.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-semantic-conventions" },
-    { name = "typing-extensions" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-semantic-conventions", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3e/eb/5041074274ac0956b03637cc039d434569112468e875eddfcc9a0674ce06/opentelemetry_sdk-1.43.0.tar.gz", hash = "sha256:d8187c81c162df9913e4003dd6485f7390d9a24fc17026ec7387b8b8218b08e9", size = 254744, upload-time = "2026-06-24T15:20:08.467Z" }
 wheels = [
@@ -4518,8 +4549,8 @@ name = "opentelemetry-semantic-conventions"
 version = "0.64b0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-api" },
-    { name = "typing-extensions" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5a/30/5f26df29509eccd86b99b481ac9ffa39da49ba9577cc69071c552ae30447/opentelemetry_semantic_conventions-0.64b0.tar.gz", hash = "sha256:72f76fb2d1582d9d033dd1fcd84532e961e6ff3d90d24ba6fabc72975a83864c", size = 148340, upload-time = "2026-06-24T15:20:09.267Z" }
 wheels = [
@@ -4531,8 +4562,8 @@ name = "opentelemetry-semantic-conventions-ai"
 version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "opentelemetry-sdk" },
-    { name = "opentelemetry-semantic-conventions" },
+    { name = "opentelemetry-sdk", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "opentelemetry-semantic-conventions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/24/02/10aeacc37a38a3a8fa16ff67bec1ae3bf882539f6f9efb0f70acf802ca2d/opentelemetry_semantic_conventions_ai-0.5.1.tar.gz", hash = "sha256:153906200d8c1d2f8e09bd78dbef526916023de85ac3dab35912bfafb69ff04c", size = 26533, upload-time = "2026-03-26T14:20:38.73Z" }
 wheels = [
@@ -5016,8 +5047,8 @@ name = "prometheus-fastapi-instrumentator"
 version = "8.0.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "prometheus-client" },
-    { name = "starlette" },
+    { name = "prometheus-client", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "starlette", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/1b/e9/2065686d1dfa62296fdc158b6e8fd25b0cb3dca09b0632cabeb5ae81fe4d/prometheus_fastapi_instrumentator-8.0.2.tar.gz", hash = "sha256:3c252e748151768a7aefd66824a04a870144f71de48a67aed211749a9ca2a548", size = 21342, upload-time = "2026-06-23T09:39:31.611Z" }
 wheels = [
@@ -5492,7 +5523,7 @@ wheels = [
 
 [package.optional-dependencies]
 email = [
-    { name = "email-validator" },
+    { name = "email-validator", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 
 [[package]]
@@ -5620,9 +5651,9 @@ name = "pydantic-settings"
 version = "2.14.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pydantic" },
-    { name = "python-dotenv" },
-    { name = "typing-inspection" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "python-dotenv", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-inspection", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5c/b5/8f48e906c3e0205276e8bd8cb7512217a87b2685304d64be27cad5b3019f/pydantic_settings-2.14.2.tar.gz", hash = "sha256:c19dd64b19097f1de80184f0cc7b0272a13ae6e170cbf240a3e27e381ed14a5f", size = 237700, upload-time = "2026-06-19T13:44:56.324Z" }
 wheels = [
@@ -6158,7 +6189,7 @@ name = "pyzmq"
 version = "27.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cffi", marker = "implementation_name == 'pypy'" },
+    { name = "cffi", marker = "(python_full_version >= '3.12' and implementation_name == 'pypy') or (implementation_name == 'pypy' and platform_machine not in 's390x, ppc64le')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/04/0b/3c9baedbdf613ecaa7aa07027780b8867f57b6293b6ee50de316c9f3222b/pyzmq-27.1.0.tar.gz", hash = "sha256:ac0765e3d44455adb6ddbf4417dcce460fc40a05978c08efdf2948072f6db540", size = 281750, upload-time = "2025-09-08T23:10:18.157Z" }
 wheels = [
@@ -6295,14 +6326,14 @@ name = "ray"
 version = "2.55.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "filelock" },
-    { name = "jsonschema" },
-    { name = "msgpack" },
-    { name = "packaging" },
-    { name = "protobuf" },
-    { name = "pyyaml" },
-    { name = "requests" },
+    { name = "click", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "filelock", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "jsonschema", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "msgpack", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "packaging", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "protobuf", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "requests", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/88/7d/48ba2f49b40a34b0071ee27c0144a2573d8836094eaca213d59cef12c271/ray-2.55.1-cp311-cp311-macosx_12_0_arm64.whl", hash = "sha256:0053fd5b400f7ac56263aa1bbd3d68fb79341b08b8dc697c88782d5aca7b3ed4", size = 65835271, upload-time = "2026-04-22T20:09:34.984Z" },
@@ -6498,9 +6529,9 @@ name = "rich-toolkit"
 version = "0.20.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "rich" },
-    { name = "typing-extensions" },
+    { name = "click", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "rich", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/29/63/3e427c62f1992945c997d4ec31e2fcb37d26aadbe5aa44ae5b29f7f64d26/rich_toolkit-0.20.1.tar.gz", hash = "sha256:c7336ae281f435c785acecaedc4b71d4b663dc73d9c8079fea96372527e822a4", size = 203473, upload-time = "2026-06-05T08:56:57.679Z" }
 wheels = [
@@ -6962,7 +6993,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "python_full_version < '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz", hash = "sha256:95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0", size = 30573822, upload-time = "2026-02-23T00:26:24.851Z" }
 wheels = [
@@ -7062,19 +7093,16 @@ resolution-markers = [
     "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a7/25/c2700dfaf6442b4effaa91af24ebce5dc9d31bb4a69706313aae70d72cd0/scipy-1.18.0.tar.gz", hash = "sha256:67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378", size = 30774447, upload-time = "2026-06-19T15:01:43.456Z" }
 wheels = [
@@ -7132,7 +7160,8 @@ dependencies = [
     { name = "timm" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version < '3.12' and sys_platform == 'never') or (platform_machine not in 's390x, ppc64le' and sys_platform == 'never')" },
     { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/15/fa/d5a29d49240fb10bdead608b4d0c6805684a8f63b1f65863502be65b1ca4/segmentation_models_pytorch-0.5.0.tar.gz", hash = "sha256:cabba8aced6ef7bdcd6288dd9e1dc2840848aa819d539c455bd07aeceb2fdf96", size = 105150, upload-time = "2025-04-17T10:43:45.755Z" }
@@ -7222,8 +7251,8 @@ name = "sentry-sdk"
 version = "2.63.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "certifi" },
-    { name = "urllib3" },
+    { name = "certifi", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "urllib3", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/ba/c8/b3c970a5b186722d276cd40a05b3254e03bccc0208560aff20f612e018e8/sentry_sdk-2.63.0.tar.gz", hash = "sha256:2a1502bf864769275dbc8c2c9fc7a0f7f5e18358180b615d262d13a31ffba216", size = 912449, upload-time = "2026-06-16T12:45:57.553Z" }
 wheels = [
@@ -7523,6 +7552,7 @@ wheels = [
 name = "spyre-inference"
 source = { editable = "." }
 dependencies = [
+    { name = "hf-adapters-spyre" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
     { name = "torch-spyre" },
@@ -7539,10 +7569,21 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
+<<<<<<< HEAD
     { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=864104b378f691d55c21c98a4dc0fccd4b391954" },
+=======
+<<<<<<< HEAD
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=0bd9ce797b120f01aa4d80926273a9595ce7f66d" },
+>>>>>>> ce4a4bd (Add model_impl=transformers support via hf-adapters)
     { name = "vllm", marker = "sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
     { name = "vllm", marker = "sys_platform == 'linux'", specifier = ">=0.24.0,<0.25", index = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" },
+=======
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=ad5902f9ce75be9f5a2383e7828db1f041909a28" },
+    { name = "vllm", marker = "sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.23.0" },
+    { name = "vllm", marker = "sys_platform == 'linux'", specifier = ">=0.23.0,<0.24", index = "https://wheels.vllm.ai/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/cpu" },
+>>>>>>> 23de35b (Add model_impl=transformers support via hf-adapters)
 ]
 
 [package.metadata.requires-dev]
@@ -7613,8 +7654,14 @@ dependencies = [
     { name = "tokenizers" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+<<<<<<< HEAD
     { name = "torchaudio" },
+    { name = "torchvision", version = "0.27.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version < '3.12' and sys_platform == 'never') or (platform_machine not in 's390x, ppc64le' and sys_platform == 'never')" },
+=======
+    { name = "torchaudio", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
+>>>>>>> 3e27cf4 (Add model_impl=transformers support via hf-adapters)
     { name = "transformers" },
     { name = "transformers-stream-generator" },
     { name = "tritonclient" },
@@ -7756,8 +7803,8 @@ name = "sse-starlette"
 version = "3.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
-    { name = "starlette" },
+    { name = "anyio", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "starlette", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d2/1b/bc9e3e7a72dcdad7dc7888758f5d00f56f8909ed5cfdff822bd72bb4c520/sse_starlette-3.4.5.tar.gz", hash = "sha256:83072538bc211a2f68b7b0422226c4af3e9b62e106e07034664b832ca019842a", size = 35249, upload-time = "2026-06-20T17:36:58.322Z" }
 wheels = [
@@ -7769,8 +7816,8 @@ name = "standard-aifc"
 version = "3.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "audioop-lts" },
-    { name = "standard-chunk" },
+    { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
+    { name = "standard-chunk", marker = "python_full_version >= '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/53/6050dc3dde1671eb3db592c13b55a8005e5040131f7509cef0215212cb84/standard_aifc-3.13.0.tar.gz", hash = "sha256:64e249c7cb4b3daf2fdba4e95721f811bde8bdfc43ad9f936589b7bb2fae2e43", size = 15240, upload-time = "2024-10-30T16:01:31.772Z" }
 wheels = [
@@ -7791,7 +7838,7 @@ name = "standard-sunau"
 version = "3.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "audioop-lts" },
+    { name = "audioop-lts", marker = "python_full_version >= '3.13'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/66/e3/ce8d38cb2d70e05ffeddc28bb09bad77cfef979eb0a299c9117f7ed4e6a9/standard_sunau-3.13.0.tar.gz", hash = "sha256:b319a1ac95a09a2378a8442f403c66f4fd4b36616d6df6ae82b8e536ee790908", size = 9368, upload-time = "2024-10-30T16:01:41.626Z" }
 wheels = [
@@ -8115,7 +8162,8 @@ dependencies = [
     { name = "safetensors" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(python_full_version < '3.12' and sys_platform == 'never') or (platform_machine not in 's390x, ppc64le' and sys_platform == 'never')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/08/54/ece85b0eef3700c90db8271a43669b05a0ebbe2edb1962329c34374a297e/timm-1.0.27.tar.gz", hash = "sha256:315dfe63186ca9fb7ff941268941231fd5be259f2b4bb4afa28560ae1015cb9a", size = 2439861, upload-time = "2026-05-08T19:38:36.844Z" }
 wheels = [
@@ -8213,13 +8261,13 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "fsspec", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "jinja2", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "networkx", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "setuptools", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "sympy", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "typing-extensions", marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:d75eadcd97fe0dc7cd0eedc4d72152484c19cb2cfe46ce55766c8e129116425f", upload-time = "2026-03-23T15:16:54Z" },
@@ -8269,13 +8317,13 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "filelock" },
-    { name = "fsspec" },
-    { name = "jinja2" },
-    { name = "networkx" },
-    { name = "setuptools" },
-    { name = "sympy" },
-    { name = "typing-extensions" },
+    { name = "filelock", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "fsspec", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "jinja2", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "networkx", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "setuptools", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "sympy", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "typing-extensions", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
 ]
 wheels = [
     { url = "https://download-r2.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp311-cp311-linux_s390x.whl", hash = "sha256:5214b203ee187f8746c66f1378b72611b7c1e15c5cb325037541899e705ea24e", upload-time = "2026-04-27T21:55:40Z" },
@@ -8307,7 +8355,15 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
+<<<<<<< HEAD
 source = { git = "https://github.com/torch-spyre/torch-spyre?rev=864104b378f691d55c21c98a4dc0fccd4b391954#864104b378f691d55c21c98a4dc0fccd4b391954" }
+=======
+<<<<<<< HEAD
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=0bd9ce797b120f01aa4d80926273a9595ce7f66d#0bd9ce797b120f01aa4d80926273a9595ce7f66d" }
+=======
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=ad5902f9ce75be9f5a2383e7828db1f041909a28#ad5902f9ce75be9f5a2383e7828db1f041909a28" }
+>>>>>>> 23de35b (Add model_impl=transformers support via hf-adapters)
+>>>>>>> ce4a4bd (Add model_impl=transformers support via hf-adapters)
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },
@@ -8320,41 +8376,40 @@ dependencies = [
 name = "torchaudio"
 version = "2.11.0"
 source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/94/77/0eec7f175d88f312296bd5b11c23bd58da37c1021f53da3db4df449ce3ee/torchaudio-2.11.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:492dd64645e9d0bb843e94f1d9a4d1e31426262ffc594fafecc1697df9df5eb9", size = 684142, upload-time = "2026-03-23T18:13:36.805Z" },
-    { url = "https://files.pythonhosted.org/packages/b3/f9/6f7ebe071b44592c85269762b55b63ab0a091b5f479f73544738f7564a1e/torchaudio-2.11.0-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:73dab4841f94d888bc7c2aed7b5547c643edc974306919fe1adfb65d57cccf4b", size = 1626527, upload-time = "2026-03-23T18:13:39.011Z" },
-    { url = "https://files.pythonhosted.org/packages/ac/70/17408e0d154d0c894537a88dcbadc48e8ad3b6e1ef4a1dabda5d40245ee0/torchaudio-2.11.0-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:1a07ec72fd6f26a588c39b5f029e0130d16bb40bc4221635580bf8fb18fcbc80", size = 1771930, upload-time = "2026-03-23T18:13:37.963Z" },
-    { url = "https://files.pythonhosted.org/packages/c9/75/b6d03fc75b409bdaec597274d1bdd4213db716ed16f6801386b31d59c551/torchaudio-2.11.0-cp311-cp311-win_amd64.whl", hash = "sha256:bb59ba4452bbbe95d75ad3ef18df9824955625f36698ce9a5998a4a9f3c1ba1d", size = 328658, upload-time = "2026-03-23T18:13:44.545Z" },
-    { url = "https://files.pythonhosted.org/packages/f1/b1/77658817acacd01a72b714440c62f419efc4d90170e704e8e7a2c0918988/torchaudio-2.11.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:a1cf1acc883bee9cb906a933572fed6a8a933f86ef34e9ea7d803f72317e8c1b", size = 684226, upload-time = "2026-03-23T18:13:40.023Z" },
-    { url = "https://files.pythonhosted.org/packages/78/28/c7adc053039f286c2aca0038b766cbe3294e66fec6b29a820e95128f9ede/torchaudio-2.11.0-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:bc653defca1c16154398517a1adc98d0fb7f1dd08e58ced217558d213c2c6e29", size = 1626670, upload-time = "2026-03-23T18:13:42.162Z" },
-    { url = "https://files.pythonhosted.org/packages/88/d8/d6d0f896e064aa67377484efef4911cdcc07bce2929474e1417cc0af18c2/torchaudio-2.11.0-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:6503c0bdb29daf2e6281bb70ea2dfe2c3553b782b619eb5d73bdadd8a3f7cecf", size = 1771992, upload-time = "2026-03-23T18:13:33.188Z" },
-    { url = "https://files.pythonhosted.org/packages/23/a8/941277ecc39f7a0a169d554302a1f1afd87c1d94a8aec828891916cea59a/torchaudio-2.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:478110f981e5d40a8d82221732c57a56c85a1d5895fb8fe646e86ee15eded3bd", size = 328663, upload-time = "2026-03-23T18:13:19.218Z" },
-    { url = "https://files.pythonhosted.org/packages/fb/9e/f76fcd9877c8c78f258ee34e0fb8291fdb91e6218d582d9ca66b1e4bd4ae/torchaudio-2.11.0-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:e3f9696a9ef1d49acc452159b052370c636406d072e9d8f10895fda87b591ea9", size = 679904, upload-time = "2026-03-23T18:13:28.329Z" },
-    { url = "https://files.pythonhosted.org/packages/85/70/249c1498ebdad3e7752866635ec0855fc0dcf898beccda5a9d2b9df8e4d0/torchaudio-2.11.0-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:b034d7672f1c415434f48ef17807f2cce47f29e8795338c751d4e596c9fbe8b5", size = 1618523, upload-time = "2026-03-23T18:13:15.703Z" },
-    { url = "https://files.pythonhosted.org/packages/4f/98/be13fe35d9aa5c26381c0e453c828a789d15c007f8f7d08c95341d19974d/torchaudio-2.11.0-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:1c1101c1243ef0e4063ec63298977e2d3655c15cf88d9eb0a1bd4fe2db9f47ea", size = 1771992, upload-time = "2026-03-23T18:13:35.343Z" },
-    { url = "https://files.pythonhosted.org/packages/e2/8b/2bbb3dca6ff28cba0de250874d5ef4fc2822c47a934b59b3974cff3219ef/torchaudio-2.11.0-cp313-cp313-win_amd64.whl", hash = "sha256:986f4df5ed17b003dc52489468601720090e65f964f8bebccf90eb45bba75744", size = 328662, upload-time = "2026-03-23T18:13:18.308Z" },
-    { url = "https://files.pythonhosted.org/packages/fe/ce/52c652d30af7d6e96c8f1735d26131e94708e3f38d852b8fa97958804dd8/torchaudio-2.11.0-cp313-cp313t-macosx_12_0_arm64.whl", hash = "sha256:bda09ea630ae7207384fb0f28c35e4f8c0d82dd6eba020b6b335ad0caa9fed49", size = 680814, upload-time = "2026-03-23T18:13:17.08Z" },
-    { url = "https://files.pythonhosted.org/packages/06/95/1ad1507482e7263e556709a3f5f87fecd375a0742cdaf238806c8e72eaad/torchaudio-2.11.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:9fe3083c62e035646483a14e180d33561bdc2eed436c9ab1259c137fb7120b4a", size = 1618546, upload-time = "2026-03-23T18:13:29.686Z" },
-    { url = "https://files.pythonhosted.org/packages/98/4c/480328ba07487eb9890406720304d0d460dd7a6a64098614f5aa53b662ca/torchaudio-2.11.0-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:13cff988697ccbad539987599f9dc672f40c417bed67570b365e4e5002bbd096", size = 1771991, upload-time = "2026-03-23T18:13:30.843Z" },
-    { url = "https://files.pythonhosted.org/packages/3e/98/5d4790e2d6548768999acd34999d5aeefce8bcc23a07afaa5f03e723f557/torchaudio-2.11.0-cp313-cp313t-win_amd64.whl", hash = "sha256:ed404c4399ad7f172c86a47c1b25293d322d1d58e26b10b0456a86cf67d37d84", size = 328661, upload-time = "2026-03-23T18:13:34.359Z" },
-    { url = "https://files.pythonhosted.org/packages/39/fe/ffa618b4f0d9732d7df7a2fa2bd48657d896599bc224e5af3c70d46c546b/torchaudio-2.11.0-cp314-cp314-macosx_12_0_arm64.whl", hash = "sha256:cc09cd1f6015b8549e7fe255fb1be5346b57e7fee06541d3f3dbb012d8c4715f", size = 679901, upload-time = "2026-03-23T18:13:25.472Z" },
-    { url = "https://files.pythonhosted.org/packages/5c/54/f414d7b92dd0b3094a2409c95a97bd6c49aa0620da722a0e55462f9bd9cb/torchaudio-2.11.0-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:79fb3cb99169fd41bd9719647261402a164da0d105a4d81f42a3260844ec5e79", size = 1618527, upload-time = "2026-03-23T18:13:26.68Z" },
-    { url = "https://files.pythonhosted.org/packages/a8/a8/bf2e1f6ce24c990192400ae49b4acc1a0d0295b6c6a06bceecdc46ce08de/torchaudio-2.11.0-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:00e9f71ab9c656f0abdb40c515bd65d4658ab0ad380dee27a2efd7d51dabd3d6", size = 1771995, upload-time = "2026-03-23T18:13:23.373Z" },
-    { url = "https://files.pythonhosted.org/packages/83/6f/b0efb44e0bfe8dd4d78d76ae3be280354e1fb5c8631c782785d74cd8a7b1/torchaudio-2.11.0-cp314-cp314-win_amd64.whl", hash = "sha256:1424638adb8bb40087bc7b6eb103e8e4fe398210f09076f33b7b5e61501b5d66", size = 328662, upload-time = "2026-03-23T18:13:32.243Z" },
-    { url = "https://files.pythonhosted.org/packages/60/84/1c792b0b700eac9a96772cfd9f96c097b17bca3234a2fde3c64b8063660d/torchaudio-2.11.0-cp314-cp314t-macosx_12_0_arm64.whl", hash = "sha256:da2725e250866da42a12934c9a6552f65a18b7187fd7a6221387f0e605fb3b96", size = 679926, upload-time = "2026-03-23T18:13:24.452Z" },
-    { url = "https://files.pythonhosted.org/packages/9a/a0/62a5842062f739239691f2e57523e0570dd06704ad987755f7644a3afa23/torchaudio-2.11.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:1be3767064364ae82705bdf2b15c1e8b41fea82c4cd04d47428a8684b634b6ed", size = 1618552, upload-time = "2026-03-23T18:13:21.09Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/89/c293d818f9f899db93bf291b42401c05ae29acfb2e53d5341c30ea703e62/torchaudio-2.11.0-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:67f6edac29ed004652c11db5c19d9debb5d835695930574f564efc8bdd061bba", size = 1771986, upload-time = "2026-03-23T18:13:22.153Z" },
-    { url = "https://files.pythonhosted.org/packages/93/f7/ee5da8c03f1a3c7662c6c6a119f24a4b3e646da94be56dce3201e3a6ee9b/torchaudio-2.11.0-cp314-cp314t-win_amd64.whl", hash = "sha256:88fb5e29f670a33d9bac6aabb1d2734460cf6e461bde5cdc352826035851b16d", size = 328661, upload-time = "2026-03-23T18:13:20.1Z" },
+
+[[package]]
+name = "torchvision"
+version = "0.27.1"
+source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+]
+dependencies = [
+    { name = "numpy", marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pillow", marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 
 [[package]]
 name = "torchvision"
-version = "0.27.1+cpu"
+version = "0.27.1+df56172"
 source = { registry = "https://download.pytorch.org/whl/cpu" }
+resolution-markers = [
+    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
+    "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+]
 dependencies = [
-    { name = "numpy" },
-    { name = "pillow" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "numpy", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "pillow", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
 ]
 
 [[package]]
@@ -8397,7 +8452,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.5.3"
+version = "5.12.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -8410,9 +8465,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/af/35/cd5b0d1288e65d2c12db4ce84c1ec1074f7ee9bced040de6c9d69e70d620/transformers-5.5.3.tar.gz", hash = "sha256:3f60128e840b40d352655903552e1eed4f94ed49369a4d43e1bc067bd32d3f50", size = 8226047, upload-time = "2026-04-09T15:52:56.231Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/7c/8240f612819718100a9346dc28dea6a11370c3ca9c8c6eabadd3dea4ef29/transformers-5.12.1.tar.gz", hash = "sha256:679ee731c8225347889ad4fb3b2c926a62e9da3b7d284e9d12c791da7272466b", size = 8924054, upload-time = "2026-06-15T17:27:50.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a1/0b/f8524551ab2d896dfaca74ddb70a4453d515bbf4ab5451c100c7788ae155/transformers-5.5.3-py3-none-any.whl", hash = "sha256:e48f3ec31dd96505e96e66b63a1e43e1ad7a65749e108d9227caaf51051cdb02", size = 10236257, upload-time = "2026-04-09T15:52:52.866Z" },
+    { url = "https://files.pythonhosted.org/packages/df/56/bbd60dd8668055803bf8ba55a81f9b8a8b31497f620109a9671d26a2076d/transformers-5.12.1-py3-none-any.whl", hash = "sha256:2a5e109d2021265df7098ffbb738295acaf5ad256f12cbc586db2ea4dcbb1a8a", size = 11150587, upload-time = "2026-06-15T17:27:46.679Z" },
 ]
 
 [[package]]
@@ -8532,8 +8587,8 @@ name = "uvicorn"
 version = "0.49.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
+    { name = "h11", marker = "python_full_version >= '3.12' or platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/1f/fa18009dea8469069cca78a4e877a008ab78f08b064bfc9ab891579077ff/uvicorn-0.49.0.tar.gz", hash = "sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3", size = 91284, upload-time = "2026-06-03T22:01:30.448Z" }
 wheels = [
@@ -8542,13 +8597,13 @@ wheels = [
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
-    { name = "httptools" },
-    { name = "python-dotenv" },
-    { name = "pyyaml" },
-    { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
-    { name = "watchfiles" },
-    { name = "websockets" },
+    { name = "colorama", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'" },
+    { name = "httptools", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "python-dotenv", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "uvloop", marker = "platform_machine not in 's390x, ppc64le' and platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
+    { name = "watchfiles", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "websockets", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 
 [[package]]
@@ -8619,6 +8674,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
 ]
 dependencies = [
+<<<<<<< HEAD
     { name = "aiohttp" },
     { name = "anthropic" },
     { name = "blake3" },
@@ -8681,6 +8737,77 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchfiles" },
     { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
+=======
+    { name = "aiohttp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "anthropic", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "blake3", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "cachetools", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "cbor2", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "cloudpickle", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "compressed-tensors", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "depyf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "diskcache", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "einops", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "fastapi", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "filelock", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "gguf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "ijson", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "intel-openmp", marker = "platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "lark", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "llguidance", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'arm64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux')" },
+    { name = "lm-format-enforcer", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "mcp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "mistral-common", extra = ["image"], marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "model-hosting-container-standards", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "msgspec", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "ninja", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "numba", marker = "platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "numpy", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "openai", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "openai-harmony", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "opencv-python-headless", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "opentelemetry-exporter-otlp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "opentelemetry-sdk", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "opentelemetry-semantic-conventions-ai", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "outlines-core", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "partial-json-parser", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "pillow", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "prometheus-client", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "prometheus-fastapi-instrumentator", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "protobuf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "psutil", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "py-cpuinfo", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "pybase64", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "python-json-logger", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "pyzmq", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "regex", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "requests", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "safetensors", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "sentencepiece", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "setproctitle", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "setuptools", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "six", marker = "python_full_version >= '3.12' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "tiktoken", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "tokenizers", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+<<<<<<< HEAD
+    { name = "torchaudio", marker = "platform_machine != 'riscv64' and platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "tqdm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "transformers", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "watchfiles", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
+    { name = "xgrammar", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'arm64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux')" },
+=======
+    { name = "tqdm", marker = "(platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+    { name = "transformers", marker = "(platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+    { name = "typing-extensions", marker = "(platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+    { name = "watchfiles", marker = "(platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+    { name = "xgrammar", marker = "(platform_machine == 'arm64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'aarch64' and sys_platform == 'linux')" },
+>>>>>>> 3e27cf4 (Add model_impl=transformers support via hf-adapters)
+>>>>>>> 23de35b (Add model_impl=transformers support via hf-adapters)
 ]
 wheels = [
     { url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcpu-cp38-abi3-manylinux_2_34_aarch64.whl" },
@@ -8722,6 +8849,7 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 dependencies = [
+<<<<<<< HEAD
     { name = "aiohttp" },
     { name = "anthropic" },
     { name = "blake3" },
@@ -8780,12 +8908,81 @@ dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 'aarch64' or sys_platform != 'darwin'" },
     { name = "torchaudio", marker = "platform_machine != 'riscv64' and platform_machine != 's390x'" },
+=======
+    { name = "aiohttp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "anthropic", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "blake3", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "cachetools", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "cbor2", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "cloudpickle", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "compressed-tensors", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "depyf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "diskcache", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "einops", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "fastapi", extra = ["standard"], marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "filelock", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "gguf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "ijson", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "intel-openmp", marker = "platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "lark", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "llguidance", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'arm64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux')" },
+    { name = "lm-format-enforcer", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "mcp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "mistral-common", extra = ["image"], marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "model-hosting-container-standards", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "msgspec", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "ninja", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "numba", marker = "platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "numpy", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "openai", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "openai-harmony", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "opencv-python-headless", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "opentelemetry-api", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "opentelemetry-exporter-otlp", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "opentelemetry-sdk", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "opentelemetry-semantic-conventions-ai", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "outlines-core", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "partial-json-parser", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "pillow", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "prometheus-client", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "prometheus-fastapi-instrumentator", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "protobuf", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "psutil", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "py-cpuinfo", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "pybase64", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "python-json-logger", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "pyyaml", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "pyzmq", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "regex", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "requests", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "safetensors", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "sentencepiece", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "setproctitle", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "setuptools", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "six", marker = "python_full_version >= '3.12' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "tiktoken", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "tokenizers", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
+<<<<<<< HEAD
+    { name = "torchaudio", marker = "platform_machine != 'riscv64' and platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "tqdm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "transformers", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "watchfiles", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "xgrammar", marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'arm64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux') or (platform_machine == 'x86_64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux')" },
+=======
+    { name = "torchaudio", marker = "sys_platform == 'never'" },
+>>>>>>> 23de35b (Add model_impl=transformers support via hf-adapters)
     { name = "torchvision", marker = "sys_platform == 'never'" },
-    { name = "tqdm" },
-    { name = "transformers" },
-    { name = "typing-extensions" },
-    { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
+    { name = "tqdm", marker = "sys_platform != 'linux'" },
+    { name = "transformers", marker = "sys_platform != 'linux'" },
+    { name = "typing-extensions", marker = "sys_platform != 'linux'" },
+    { name = "watchfiles", marker = "sys_platform != 'linux'" },
+    { name = "xgrammar", marker = "(platform_machine == 'aarch64' and sys_platform != 'linux') or (platform_machine == 'arm64' and sys_platform != 'linux') or (platform_machine == 'ppc64le' and sys_platform != 'linux') or (platform_machine == 's390x' and sys_platform != 'linux') or (platform_machine == 'x86_64' and sys_platform != 'linux')" },
+>>>>>>> 3e27cf4 (Add model_impl=transformers support via hf-adapters)
 ]
 
 [[package]]
@@ -8802,7 +8999,7 @@ dependencies = [
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
-    { name = "torchaudio" },
+    { name = "torchaudio", marker = "sys_platform == 'never'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/db/48/1e4d3a4a97292e47ebaa18e3eae6ecb2f57bde47693ccab0e7acb23f9ffe/vocos-0.1.0.tar.gz", hash = "sha256:b488224dbe398ff7d4790a027ad659478b4bc02e465db992c62c12b32ca043d8", size = 21107, upload-time = "2023-10-14T00:57:29.631Z" }
 wheels = [
@@ -8814,7 +9011,7 @@ name = "watchfiles"
 version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "anyio" },
+    { name = "anyio", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/cd/41/5e1a4bb12aac5f1493fa1bdc11154eca3b258ca4eba65d39c473fe19d8e9/watchfiles-1.2.0.tar.gz", hash = "sha256:c995fba777f1ea992f090f9236e9284cf7a5d1a0130dd5a3d82c598cacd76838", size = 108252, upload-time = "2026-05-18T04:32:04.251Z" }
 wheels = [
@@ -9013,14 +9210,14 @@ name = "xgrammar"
 version = "0.2.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "apache-tvm-ffi" },
-    { name = "numpy" },
-    { name = "pydantic" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'ppc64le' and sys_platform == 'darwin') or (platform_machine == 's390x' and sys_platform == 'darwin') or (platform_machine == 'x86_64' and sys_platform == 'darwin')" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'arm64' and platform_machine != 'ppc64le' and platform_machine != 's390x' and platform_machine != 'x86_64') or sys_platform != 'darwin'" },
-    { name = "transformers" },
-    { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "typing-extensions" },
+    { name = "apache-tvm-ffi", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "numpy", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "pydantic", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "transformers", marker = "platform_machine not in 's390x, ppc64le'" },
+    { name = "triton", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'never'" },
+    { name = "typing-extensions", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/fe/b7/86178b241be0b29ce9ee991a44d4b7eddb0f0c98310c0067fe83afc897d1/xgrammar-0.2.2.tar.gz", hash = "sha256:42bcc5c4187ff9cb6edc44ff5f56030d8b69d62c7576f674a5a074f71b68b1fa", size = 2430492, upload-time = "2026-06-11T19:02:49.624Z" }
 wheels = [

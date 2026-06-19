@@ -81,6 +81,24 @@ tests:
               # input embeddings not yet supported on spyre
               use_prompt_embeds: [true]
 
+    - rel_path: tests/models/test_transformers.py
+      allow_list:
+        - test: "test_models"
+          mode: mandatory_pass
+          tags: [transformers, upstream, uses_subprocess]
+          params:
+            override:
+              "model,model_impl":
+              - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "transformers"]
+        - test: "test_distributed"
+          mode: mandatory_pass
+          tags: [transformers, upstream, uses_subprocess, distributed]
+      block_list:
+        - test: "test_quantization"
+        - test: "test_embed_loading"
+        - test: "test_hybrid_attention"
+        - test: "test_pooling"
+
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
         - test: "test_causal_backend_correctness"

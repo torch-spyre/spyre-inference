@@ -698,12 +698,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Spyre slicing corrupts memory, so
         # bring k/v to CPU for slicing in _reshape_and_cache.
-        # Query also stays on CPU — _online_softmax_attention builds
-        # q_for_matmul on CPU (reshape/permute are unsafe on Spyre) and
-        # transfers the final contiguous tensor to device.
+        # Query needs both device and CPU copies:
+        #   - On-device (Spyre): used for decode via unbind (avoids CPU round-trip)
+        #   - CPU: only needed for prefill/mixed batches where GQA reshape
+        #     requires transpose, which corrupts data on Spyre when both
+        #     transposed dims are > 1.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        query_cpu = convert(query, "cpu")
+        query_dev = convert(query, _target_device)
+        query_cpu = convert(query, "cpu") if attn_metadata.max_query_len > 1 else None
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -718,6 +721,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
+            query_dev,
             query_cpu,
             k_pages,
             v_pages,
@@ -757,7 +761,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _online_softmax_attention(
         self,
-        query_cpu: torch.Tensor,
+        query_dev: torch.Tensor,
+        query_cpu: torch.Tensor | None,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -772,10 +777,26 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
+        The kernel operates in [KV, N*QPK, D] format to avoid any
+        transpose/permute on Spyre (which corrupts data when both transposed
+        dimensions are > 1). How q_for_matmul is built differs by path:
+
+        - **Decode (query_len=1)**: stays entirely on device. unbind() gives a
+          single [H, D] tensor; reshaping to [KV, QPK, D] is a contiguous view
+          (the "transpose" is trivial since N=1). No CPU round-trip.
+
+        - **Prefill (query_len>1)**: requires a CPU round-trip. Going from N
+          separate [H, D] tokens to one [KV, N*QPK, D] tensor requires
+          reordering data across the token (N) and KV-group (KV) dimensions —
+          a true transpose. Spyre's transpose+contiguous silently corrupts
+          when both dims > 1, so we build q_for_matmul on CPU and transfer
+          the final contiguous result. This is acceptable because prefill is a
+          one-time cost per sequence; decode (the steady-state) stays on device.
+
         Args:
-            query_cpu: Query tensor on CPU [total_tokens, num_heads, head_size].
-                All reshaping/permuting for GQA happens on CPU (safe), then the
-                final contiguous tensor is transferred to the target device.
+            query_dev: Query tensor on target device [total_tokens, H, D].
+            query_cpu: Same query on CPU (for prefill GQA reshape), or None
+                for pure decode batches where the on-device path suffices.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -792,6 +813,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
+        # Unbind on device for the decode fast-path (list-based indirect access)
+        query_dev_unbound = query_dev.unbind(dim=0)  # Tuple of [H, D]
+
         for seq_idx in range(num_seqs):
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
@@ -799,18 +823,26 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             kv_len = int(seq_lens[seq_idx].item())
             num_query_tokens = query_len
 
-            # Build q_for_matmul on CPU: [N, H, D] -> [KV, N*QPK, D]
-            # All reshape/permute happens on CPU where it's safe, then transfer
-            # the final contiguous result to Spyre in one shot.
-            q_slice = query_cpu[q_start:q_end]  # [N, H, D] — CPU slice is safe
-            q_for_matmul = (
-                q_slice
-                .reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
-                .permute(1, 0, 2, 3)
-                .contiguous()
-                .reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
-            )
-            q_for_matmul = convert(q_for_matmul, _target_device)
+            if num_query_tokens == 1:
+                # --- Decode path: on-device, no CPU round-trip ---
+                # reshape [H, D] -> [KV, QPK, D] is a contiguous view (safe)
+                q_for_matmul = query_dev_unbound[q_start].reshape(
+                    num_kv_heads, num_queries_per_kv, head_size
+                )
+            else:
+                # --- Prefill path: CPU round-trip required ---
+                # transpose+contiguous on Spyre corrupts data when both dims > 1.
+                # Build [KV, N*QPK, D] on CPU and transfer the contiguous result.
+                assert query_cpu is not None
+                q_slice = query_cpu[q_start:q_end]  # [N, H, D]
+                q_for_matmul = (
+                    q_slice
+                    .reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
+                    .permute(1, 0, 2, 3)
+                    .contiguous()
+                    .reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
+                )
+                q_for_matmul = convert(q_for_matmul, _target_device)
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -823,7 +855,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
             # Expand mask tiles for GQA on CPU: [N, B] -> [N*QPK, B]
             # (repeat each query token's mask row for all query heads in its KV group)
-            # then transfer to Spyre. This avoids transpose/permute on device.
+            # then transfer to device.
             mask_tiles = [
                 convert(
                     torch.repeat_interleave(m, num_queries_per_kv, dim=0),
@@ -837,7 +869,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens, num_queries_per_kv)
             result = attn_fn(q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
-            # Result from kernel is [KV, N*QPK, D] — convert to [N, H, D] on CPU
+            # Result is [KV, N*QPK, D] — convert to [N, H, D] on CPU
+            # (transpose on Spyre would corrupt; CPU reshape is safe)
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = (
                 result_cpu

@@ -235,41 +235,29 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
     The kernel is specialized for a fixed number of query tokens (e.g., 1 for decode, 4 for prefill).
     """
 
-    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+    def specialized_paged_attn_kernel(q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, scale):
         """
         This kernel specializes for num_blocks and num_query_tokens.
-        All inputs are lists for indirect access pattern.
+
+        All intermediate tensors stay in [KV, N*QPK, ...] format to avoid
+        transpose/permute+contiguous on Spyre (which silently corrupts data).
+        The caller builds q_for_matmul and converts the result on CPU.
 
         Expected shapes:
-            q: list of num_query_tokens tensors, each [num_heads, head_size]
+            q_for_matmul: [num_kv_heads, N*QPK, head_size] — pre-built on CPU, contiguous
             k_pages: list of [num_kv_heads, block_size, head_size]
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
-            mask_tiles: list of num_blocks tensors, each [num_query_tokens, block_size]
+            mask_tiles: list of num_blocks tensors, each [N*QPK, block_size]
+                (pre-expanded: each query token's mask repeated QPK times)
         """
-        num_query_tokens = len(q)
-        num_heads = q[0].shape[0]
-        num_kv_heads = k_pages[0].shape[0]
-        head_size = q[0].shape[1]
-        block_size = k_pages[0].shape[1]
-
         tile_max = None
         tile_sum = None
         tile_output = None
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            mask_tile = mask_tiles[i]  # [num_query_tokens, block_size]
-
-            # Stack query tokens: [num_query_tokens, num_heads, head_size]
-            q_cat = torch.stack([q[idx] for idx in range(num_query_tokens)], dim=0)
-
-            # For GQA, reshape Q to group by KV head:
-            # [N, H, D] -> [N, KV, QPK, D] -> [KV, N, QPK, D] -> [KV, N*QPK, D]
-            # N (query tokens) is the outer/slow dim, QPK is the inner/fast dim
-            q_reshaped = q_cat.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
-            q_reshaped = q_reshaped.transpose(0, 1).contiguous()  # [KV, N, QPK, D]
-            q_for_matmul = q_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
+            mask_tile = mask_tiles[i]  # [N*QPK, block_size]
 
             # Get K/V page: [KV, B, D]
             k_page = k_pages[page_idx]
@@ -282,35 +270,18 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
             scores = torch.bmm(q_for_matmul, k_transposed)
             scores *= scale
 
-            # Reshape scores back: [KV, N*QPK, B] -> [KV, N, QPK, B] -> [N, KV, QPK, B] -> [N, H, B]
-            scores = scores.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, block_size)
-            scores = scores.permute(1, 0, 2, 3).contiguous()  # [N, KV, QPK, B]
-            scores = scores.reshape(num_query_tokens, num_heads, block_size)
+            # Mask: [N*QPK, B] -> [1, N*QPK, B] for broadcasting with [KV, N*QPK, B]
+            scores = scores + mask_tile.unsqueeze(0)
 
-            # Mask: [N, B] -> [N, 1, B] for broadcasting with [N, H, B]
-            mask_expanded = mask_tile.unsqueeze(1)
-            scores = scores + mask_expanded
-
-            scores_max = scores.max(dim=-1, keepdim=True)[0]
+            scores_max = scores.max(dim=-1, keepdim=True)[0]  # [KV, N*QPK, 1]
 
             if i == 0:
                 tile_max = scores_max
-                tile_probs = torch.exp(scores - tile_max)
+                tile_probs = torch.exp(scores - tile_max)  # [KV, N*QPK, B]
 
-                # Output: probs @ V
-                # [N, H, B] -> [N, KV, QPK, B] -> [KV, N, QPK, B] -> [KV, N*QPK, B]
-                probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
-                probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
-                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, block_size)
-
-                # [KV, N*QPK, B] @ [KV, B, D] = [KV, N*QPK, D]
-                tile_output_flat = torch.bmm(probs_for_matmul, v_page)
-                # [KV, N*QPK, D] -> [KV, N, QPK, D] -> [N, KV, QPK, D] -> [N, H, D]
-                tile_output = tile_output_flat.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
-                tile_output = tile_output.permute(1, 0, 2, 3).contiguous()
-                tile_output = tile_output.reshape(num_query_tokens, num_heads, head_size)
-
-                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+                # probs @ V: [KV, N*QPK, B] @ [KV, B, D] = [KV, N*QPK, D]
+                tile_output = torch.bmm(tile_probs, v_page)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)  # [KV, N*QPK, 1]
             else:
                 assert tile_max is not None
                 assert tile_sum is not None
@@ -321,20 +292,12 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
 
-                probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
-                probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
-                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, block_size)
-
-                tile_output_new_flat = torch.bmm(probs_for_matmul, v_page)
-                tile_output_new = tile_output_new_flat.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
-                tile_output_new = tile_output_new.permute(1, 0, 2, 3).contiguous()
-                tile_output_new = tile_output_new.reshape(num_query_tokens, num_heads, head_size)
-
-                tile_output += tile_output_new
+                tile_output = tile_output + torch.bmm(tile_probs, v_page)
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
+        # Returns [KV, N*QPK, D]; caller reshapes to [N, H, D] on CPU
         return tile_output / tile_sum
 
     return specialized_paged_attn_kernel
@@ -735,11 +698,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Spyre slicing corrupts memory, so
         # bring k/v to CPU for slicing in _reshape_and_cache.
-        # Queries stay on Spyre for list-based access via unbind().
+        # Query also stays on CPU — _online_softmax_attention builds
+        # q_for_matmul on CPU (reshape/permute are unsafe on Spyre) and
+        # transfers the final contiguous tensor to device.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        # TODO: Ensure query is on Spyre device (may be on CPU in tests)
-        query = convert(query, _target_device)
+        query_cpu = convert(query, "cpu")
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -754,8 +718,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            # we pass teh full query here and use the tokens we need via indirect access
-            query,
+            query_cpu,
             k_pages,
             v_pages,
             attn_metadata,
@@ -794,7 +757,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _online_softmax_attention(
         self,
-        query: torch.Tensor,
+        query_cpu: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -808,9 +771,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         tensor on Spyre, passed to bmm directly without slicing.
 
         Writes results directly into the caller's output buffer in-place.
-        
+
         Args:
-            query_dev: Query tensor on Spyre device
+            query_cpu: Query tensor on CPU [total_tokens, num_heads, head_size].
+                All reshaping/permuting for GQA happens on CPU (safe), then the
+                final contiguous tensor is transferred to the target device.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -823,26 +788,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
-        aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Unbind query on Spyre to create list of per-token tensors
-        # unbind() works on Spyre (unlike slice which creates strided views)
-        query_dev_unbound = query.unbind(dim=0)  # Tuple of [num_heads, head_size]
-
         for seq_idx in range(num_seqs):
-            # Most-naive implementation: no parallelization
-            # over sequences or GQA optimization
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
+            num_query_tokens = query_len
 
-            # List-based query: slice the tuple to get tokens for this sequence
-            q_seq = query_dev_unbound[q_start:q_end]  # Tuple of [num_heads, head_size]
-            num_query_tokens = len(q_seq)
+            # Build q_for_matmul on CPU: [N, H, D] -> [KV, N*QPK, D]
+            # All reshape/permute happens on CPU where it's safe, then transfer
+            # the final contiguous result to Spyre in one shot.
+            q_slice = query_cpu[q_start:q_end]  # [N, H, D] — CPU slice is safe
+            q_for_matmul = (
+                q_slice
+                .reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
+            )
+            q_for_matmul = convert(q_for_matmul, _target_device)
 
             # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
             # bug in layout propagation through transpose operations. The compiler's
@@ -853,18 +821,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            # Transfer mask tiles to Spyre (already correct shape from metadata builder)
-            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+            # Expand mask tiles for GQA on CPU: [N, B] -> [N*QPK, B]
+            # (repeat each query token's mask row for all query heads in its KV group)
+            # then transfer to Spyre. This avoids transpose/permute on device.
+            mask_tiles = [
+                convert(
+                    torch.repeat_interleave(m, num_queries_per_kv, dim=0),
+                    device=_target_device,
+                )
+                for m in mask_tiles_all[seq_idx]
+            ]
 
-            # Run attention on target device with list-based queries
+            # Run attention on target device
             # Kernel is specialized for (num_blocks, num_query_tokens, num_queries_per_kv)
             attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens, num_queries_per_kv)
-            result = attn_fn(q_seq, k_pages, v_pages, page_indices, mask_tiles, self.scale)
+            result = attn_fn(q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
-            # Result from kernel is [num_query_tokens, num_heads, head_size] after indirect matmul
-            # Pull result to CPU before slicing (Spyre slicing is broken)
+            # Result from kernel is [KV, N*QPK, D] — convert to [N, H, D] on CPU
             result_cpu = convert(result, "cpu", output.dtype)
-            result_cpu = result_cpu.reshape(num_query_tokens, num_heads, head_size)
+            result_cpu = (
+                result_cpu
+                .reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
+                .permute(1, 0, 2, 3)
+                .contiguous()
+                .reshape(num_query_tokens, num_heads, head_size)
+            )
             for i in range(query_len):
                 tok = convert(
                     result_cpu[i : i + 1].contiguous(),

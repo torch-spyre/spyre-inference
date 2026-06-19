@@ -252,7 +252,7 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
         num_kv_heads = k_pages[0].shape[0]
         head_size = q[0].shape[1]
         block_size = k_pages[0].shape[1]
-        
+
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -261,55 +261,55 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
             page_idx = page_indices[i]
             mask_tile = mask_tiles[i]  # [num_query_tokens, block_size]
 
-            # Concatenate query tokens: [num_query_tokens, num_heads, head_size]
-            q_cat = torch.cat([q[idx] for idx in range(num_query_tokens)], dim=0)
-            
-            # For GQA, reshape Q to group by KV head (following reference implementation pattern)
-            # [N, H, D] -> [N, KV, QPK, D] -> [KV, QPK, N, D] -> [KV, QPK*N, D]
+            # Stack query tokens: [num_query_tokens, num_heads, head_size]
+            q_cat = torch.stack([q[idx] for idx in range(num_query_tokens)], dim=0)
+
+            # For GQA, reshape Q to group by KV head:
+            # [N, H, D] -> [N, KV, QPK, D] -> [KV, N, QPK, D] -> [KV, N*QPK, D]
+            # N (query tokens) is the outer/slow dim, QPK is the inner/fast dim
             q_reshaped = q_cat.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
-            q_reshaped = q_reshaped.transpose(0, 1).contiguous()  # [KV, QPK, N, D]
-            q_for_matmul = q_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, head_size)
-            
+            q_reshaped = q_reshaped.transpose(0, 1).contiguous()  # [KV, N, QPK, D]
+            q_for_matmul = q_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
+
             # Get K/V page: [KV, B, D]
             k_page = k_pages[page_idx]
             v_page = v_pages[page_idx]
-            
+
             # k_page: [KV, B, D] -> [KV, D, B] for matmul
             k_transposed = k_page.transpose(-2, -1)
-            
-            # scores: [KV, QPK*N, D] @ [KV, D, B] = [KV, QPK*N, B]
+
+            # scores: [KV, N*QPK, D] @ [KV, D, B] = [KV, N*QPK, B]
             scores = torch.bmm(q_for_matmul, k_transposed)
-            
-            # Reshape scores: [KV, QPK*N, B] -> [KV, QPK, N, B] -> [N, KV, QPK, B] -> [N, H, B]
-            scores = scores.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, block_size)
-            scores = scores.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, B]
-            scores = scores.reshape(num_query_tokens, num_heads, block_size)
-            
             scores *= scale
-            # Mask: [N, B] -> [N, 1, B] for broadcasting
+
+            # Reshape scores back: [KV, N*QPK, B] -> [KV, N, QPK, B] -> [N, KV, QPK, B] -> [N, H, B]
+            scores = scores.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, block_size)
+            scores = scores.permute(1, 0, 2, 3).contiguous()  # [N, KV, QPK, B]
+            scores = scores.reshape(num_query_tokens, num_heads, block_size)
+
+            # Mask: [N, B] -> [N, 1, B] for broadcasting with [N, H, B]
             mask_expanded = mask_tile.unsqueeze(1)
             scores = scores + mask_expanded
+
             scores_max = scores.max(dim=-1, keepdim=True)[0]
 
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                
+
                 # Output: probs @ V
-                # probs: [N, H, B] -> [KV, QPK*N, B]
+                # [N, H, B] -> [N, KV, QPK, B] -> [KV, N, QPK, B] -> [KV, N*QPK, B]
                 probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
                 probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
-                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, block_size)
-                
-                # v_page: [KV, B, D]
-                # output: [KV, QPK*N, B] @ [KV, B, D] = [KV, QPK*N, D]
+                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, block_size)
+
+                # [KV, N*QPK, B] @ [KV, B, D] = [KV, N*QPK, D]
                 tile_output_flat = torch.bmm(probs_for_matmul, v_page)
-                
-                # Reshape output: [KV, QPK*N, D] -> [KV, QPK, N, D] -> [N, KV, QPK, D] -> [N, H, D]
-                tile_output = tile_output_flat.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, head_size)
-                tile_output = tile_output.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, D]
+                # [KV, N*QPK, D] -> [KV, N, QPK, D] -> [N, KV, QPK, D] -> [N, H, D]
+                tile_output = tile_output_flat.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
+                tile_output = tile_output.permute(1, 0, 2, 3).contiguous()
                 tile_output = tile_output.reshape(num_query_tokens, num_heads, head_size)
-                
+
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 assert tile_max is not None
@@ -320,16 +320,16 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                
+
                 probs_reshaped = tile_probs.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, block_size)
                 probs_reshaped = probs_reshaped.transpose(0, 1).contiguous()
-                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_queries_per_kv * num_query_tokens, block_size)
-                
+                probs_for_matmul = probs_reshaped.reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, block_size)
+
                 tile_output_new_flat = torch.bmm(probs_for_matmul, v_page)
-                tile_output_new = tile_output_new_flat.reshape(num_kv_heads, num_queries_per_kv, num_query_tokens, head_size)
-                tile_output_new = tile_output_new.permute(2, 0, 1, 3).contiguous()  # [N, KV, QPK, D]
+                tile_output_new = tile_output_new_flat.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
+                tile_output_new = tile_output_new.permute(1, 0, 2, 3).contiguous()
                 tile_output_new = tile_output_new.reshape(num_query_tokens, num_heads, head_size)
-                
+
                 tile_output += tile_output_new
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
@@ -487,6 +487,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             kv_valid = kv_pos < kv_len_s  # [aligned_max_seq_len]
             attend = q_valid & kv_valid.unsqueeze(0)  # [query_len, aligned_max_seq_len]
 
+
+
             # Causal mask for this sequence
             if apply_causal_mask:
                 context_len_s = kv_len_s - query_len_s
@@ -502,12 +504,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 torch.tensor(0.0, dtype=self.model_dtype, device=device),
             )
 
+
+
             # Tile along KV dimension
             seq_tiles: list[torch.Tensor] = []
             for b in range(num_blocks_s):
                 col_start = b * block_size
                 col_end = min(col_start + block_size, kv_len_s)
                 tile = mask_additive[:, col_start:col_end]
+
                 # Pad tile to block_size if needed
                 # TODO: think of reuse of mask tiles
                 if tile.shape[1] < block_size:

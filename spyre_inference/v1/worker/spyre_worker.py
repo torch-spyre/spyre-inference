@@ -46,6 +46,12 @@ class TorchSpyreWorker(CPUWorker):
     """
 
     def init_device(self) -> None:
+        # Register the Spyre KV connector in this worker process before
+        # the model runner initializes the KV transfer group.
+        from spyre_inference import register_kv_connector
+
+        register_kv_connector()
+
         # Populate the env vars that `libspyre_comms.so` reads at dlopen
         # time. `setdefault` leaves torchrun-supplied values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,

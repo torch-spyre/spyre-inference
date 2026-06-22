@@ -49,7 +49,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+              - image_spyre_inference_shadow
             flags: >-
               -m "not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -57,7 +57,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+              - image_spyre_inference_shadow
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -65,7 +65,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+              - image_spyre_inference_shadow
             flags: >-
               -m upstream
     runs-on: ${{ matrix.runs_on }}

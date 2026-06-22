@@ -14,7 +14,7 @@ description: |
   library versions CI ran against and replicate the environment locally.
 
   Pair with `astral-sh/setup-uv@v5` set to `enable-cache: true` and
-  `cache-key: ${{ steps.<id>.outputs.image-hash }}`.
+  `cache-suffix` set to this action's `image-hash` output.
 
 outputs:
   image-hash:

@@ -88,10 +88,14 @@ jobs:
         uses: ./.github/actions/spyre-uv-cache
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
           cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
+          # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
+          # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
+          prune-cache: false
 
       - uses: ./.github/actions/build-spyre-deps
         if: ${{ inputs.torch_spyre_ref != '' }}

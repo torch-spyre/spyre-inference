@@ -125,6 +125,10 @@ jobs:
           ls -lart
           echo "---"
 
+      - name: Dump UV cache info
+        run: |
+          find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
+
       - name: Build spyre-inference
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"

@@ -22,17 +22,13 @@ inputs:
     description: 'Persistent root for uv caches (one subdir per image hash).'
     required: false
     default: '/storage-1/spyre-inference/.cache'
-  manifest-path:
-    description: 'Spyre image component manifest used as the cache key.'
-    required: false
-    default: '/opt/ibm/spyre/components.txt'
 
 outputs:
   uv-cache-dir:
     description: 'The image-versioned UV_CACHE_DIR that was exported.'
     value: ${{ steps.compute.outputs.uv-cache-dir }}
   image-hash:
-    description: 'Short hash of the Spyre image component manifest.'
+    description: 'Short hash of the installed ibm-* RPM manifest.'
     value: ${{ steps.compute.outputs.image-hash }}
 
 runs:
@@ -42,12 +38,17 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        manifest="${{ inputs.manifest-path }}"
-        if [[ ! -f "$manifest" ]]; then
-          echo "::error::Spyre component manifest not found at $manifest"
+        manifest_file="/tmp/ibm-components.txt"
+        rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' \
+            | grep '^ibm-' \
+            | sort > "${manifest_file}" || true
+        if [[ ! -s "${manifest_file}" ]]; then
+          echo "::error::no ibm-* RPMs found in the image; refusing to build a uv cache key from an empty manifest"
           exit 1
         fi
-        image_hash=$(sha256sum "$manifest" | cut -c1-12)
+        echo "# Installed ibm-* RPMs:"
+        cat "${manifest_file}"
+        image_hash=$(sha256sum "${manifest_file}" | cut -c1-12)
         cache_dir="${{ inputs.cache-root }}/uv-${image_hash}"
         echo "UV_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"
         # The PVC backing the cache does not support hardlinks across to the

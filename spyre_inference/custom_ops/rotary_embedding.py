@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for RotaryEmbedding (CPU fallback).
+"""Spyre OOT replacement for RotaryEmbedding.
 
-Remove this file once Spyre natively supports rotary embedding ops.
+The CPU body is wrapped in a `direct_register_custom_op` so torch.compile does
+NOT trace into RotaryEmbedding.forward_native.
 """
+
+from functools import lru_cache
 
 import torch
 
@@ -24,23 +27,29 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
     RotaryEmbeddingBase,
 )
-from functools import lru_cache
+from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .utils import get_layer, register_layer
 
 logger = init_logger(__name__)
 
 
 @RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
 class SpyreRotaryEmbedding(RotaryEmbedding):
-    """OOT RotaryEmbedding that falls back to CPU execution.
+    """OOT RotaryEmbedding: opaque CPU fallback wrapped as a custom op.
 
-    Keeps cos_sin_cache on CPU via an _apply no-op. Inputs are moved to
-    CPU for computation, and outputs are copied back to the original device.
+    Inductor sees one FallbackKernel returning (query, key); the entire
+    rotary computation including index_select runs eagerly on CPU.
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spyre_layer_name = register_layer(self, "spyre_rotary")
+
     def _apply(self, fn, recurse=True):
-        # Keep cos_sin_cache on CPU so forward_native can use it directly.
+        # Keep cos_sin_cache (and any other buffers/params) on CPU. Spyre's
+        # fp16 differs from CPU's bit-for-bit; round-tripping the cache
+        # through Spyre corrupts it and produces wrong tokens.
         return self
 
     def forward(
@@ -49,35 +58,74 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # positions arrive on Spyre
-        target_device = positions.device
-        target_dtype = query.dtype
-
-        cpu_positions = convert(positions, device="cpu")
-        cpu_query = convert(query, device="cpu")
-        cpu_key = convert(key, device="cpu")
-
-        result_query, result_key = RotaryEmbedding.forward_native(
-            self,
-            cpu_positions,
-            cpu_query,
-            cpu_key,
+        # infer_schema rejects Optional[Tensor] returns, so use an empty
+        # tensor sentinel across the op boundary.
+        key_in = key if key is not None else torch.empty(0, device=query.device, dtype=query.dtype)
+        # cos_sin_cache is fetched inside the op via get_layer(layer_name);
+        # torch.ops dispatcher signature is opaque to the type checker (resolves to `...`).
+        out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
+            positions,  # ty: ignore[invalid-argument-type]
+            query,  # ty: ignore[invalid-argument-type]
+            key_in,  # ty: ignore[invalid-argument-type]
+            self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
         )
+        if key is None:
+            return out_q, None
+        return out_q, out_k
 
-        out_query = convert(result_query, device=target_device, dtype=target_dtype)
-        out_key = (
-            convert(result_key, device=target_device, dtype=target_dtype)
-            if result_key is not None
-            else None
-        )
-        return out_query, out_key
+
+def _rotary_cpu_op_func(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # cos_sin_cache currently stays CPU permanently (see SpyreRotaryEmbedding._apply)
+    layer = get_layer(layer_name)
+    target_device = positions.device
+    target_dtype = query.dtype
+
+    cpu_positions = positions.to("cpu")
+    cpu_query = query.to("cpu")
+    cpu_key = key.to("cpu") if key.numel() > 0 else None
+
+    out_q, out_k = RotaryEmbedding.forward_static(
+        cpu_positions,
+        cpu_query,
+        cpu_key,
+        layer.head_size,
+        layer.rotary_dim,
+        layer.cos_sin_cache,
+        layer.is_neox_style,
+    )
+
+    out_q = out_q.to(device=target_device, dtype=target_dtype)
+    if out_k is None:
+        out_k = torch.empty(0, device=target_device, dtype=target_dtype)
+    else:
+        out_k = out_k.to(device=target_device, dtype=target_dtype)
+    return out_q, out_k
+
+
+def _rotary_cpu_op_fake(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_q = torch.empty(query.shape, dtype=query.dtype, device=positions.device)
+    out_k = torch.empty(key.shape, dtype=query.dtype, device=positions.device)
+    return out_q, out_k
 
 
 @lru_cache(maxsize=1)
 def register():
-    # No-op: RotaryEmbedding doesn't require custom op registration.
-
-    # Unlike other Spyre layers (RMSNorm, SiluAndMul, etc.), RotaryEmbedding
-    # only needs a class replacement that overrides _apply() to keep weights on CPU.
-    # This replacement happens at import time via @RotaryEmbedding.register_oot().
-    pass
+    """Register the spyre_rotary_cpu custom op with vLLM."""
+    direct_register_custom_op(
+        op_name="spyre_rotary_cpu",
+        op_func=_rotary_cpu_op_func,
+        fake_impl=_rotary_cpu_op_fake,
+        mutates_args=[],
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_rotary_cpu")

@@ -217,7 +217,8 @@ def _extract_vllm_commit_from_pyproject() -> str:
         vllm_source = data["tool"]["uv"]["sources"]["vllm"]
     except KeyError as e:
         raise KeyError(
-            f"Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]: missing key {e}"
+            "Ensure vllm is specified with 'rev' in pyproject.toml"
+            f" [tool.uv.sources]: missing key {e}"
         ) from e
 
     # Handle both a single source dict and a list of sources (e.g. index + git fallback)

@@ -57,12 +57,7 @@ class TorchSpyrePlatform(CpuPlatform):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
-    # Primary dispatch key for direct_register_custom_op. Kept as CPU
-    # because some custom ops receive CPU-only tensors (e.g. rotary_embedding).
-    # All ops are ALSO registered for PrivateUse1 (Spyre) via
-    # register_spyre_dispatch() in each module's register() function,
-    # so dispatch works regardless of tensor device.
-    dispatch_key: str = "CPU"
+    dispatch_key: str = "PrivateUse1"
 
     # Multi-backend init string consumed by both vllm's
     # `init_distributed_environment` and `torch.distributed.new_group`.
@@ -80,18 +75,6 @@ class TorchSpyrePlatform(CpuPlatform):
         _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
 
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
-
-    @classmethod
-    def opaque_attention_op(cls) -> bool:
-        # This is required to keep the output tensor of attention on Spyre.
-        # Inherited from CpuPlatform as True, which would route attention through
-        # torch.ops.vllm.unified_attention_with_output.
-        # This override disables the opaque-op boundary and vLLM then calls the
-        # Attention.forward directly.
-        #
-        # This has though implications for torch.compile, because if
-        # enforce_eager=False, the attention implementation is also traced and compiled.
-        return False
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

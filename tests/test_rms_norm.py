@@ -65,17 +65,19 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
     expected = reference_rms_norm(x, layer.weight.data, eps, residual)
 
     # Test forward_oot (Spyre device execution via custom op)
-    actual = layer.forward_oot(x, residual)
+    actual = layer.forward_oot(x.to("spyre"), residual.to("spyre") if use_residual else None)
 
     if use_residual:
         expected_norm, expected_resid = expected
         actual_norm, actual_resid = actual
-        torch.testing.assert_close(actual_norm.float(), expected_norm.float(), atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(
-            actual_resid.float(), expected_resid.float(), atol=1e-2, rtol=1e-2
+            actual_norm.cpu().float(), expected_norm.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            actual_resid.cpu().float(), expected_resid.float(), atol=1e-2, rtol=1e-2
         )
     else:
-        torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.fixture
@@ -108,22 +110,23 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
     # dispatch_forward should have selected forward_oot
     assert layer._forward_method == layer.forward_oot
 
-    residual = torch.randn(4, 128, dtype=torch.float32) if use_residual else None
+    dummy_tensor = dummy_tensor.to(device="spyre")
+    residual = torch.randn(4, 128, dtype=torch.float32, device="spyre") if use_residual else None
 
     # Mock _forward_spyre_impl (called by the custom op) with a known transform
     if residual is not None:
         monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot_with_residual)
         out_x, out_residual = layer.forward(dummy_tensor, residual)
 
-        assert torch.allclose(out_x, 2 * dummy_tensor)
+        assert torch.allclose(out_x.cpu(), 2 * dummy_tensor.cpu())
 
         # The residual is modified in-place
-        assert torch.allclose(out_residual, 2 * residual)
+        assert torch.allclose(out_residual.cpu(), 2 * residual.cpu())
     else:
         monkeypatch.setattr(layer, "_forward_spyre_impl", mock_forward_oot)
         out_x = layer.forward(dummy_tensor, residual)
 
-        assert torch.allclose(out_x, dummy_tensor + 1)
+        assert torch.allclose(out_x.cpu(), dummy_tensor.cpu() + 1)
 
 
 if __name__ == "__main__":

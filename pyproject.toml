@@ -101,10 +101,8 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu", CMAKE_ARGS = "--f
 vllm = [
   # Pre-built CPU wheel — avoids ~30 min C++ kernel compilation on x86_64 Linux CI runners.
   # manylinux_2_35 requires glibc >= 2.35; RHEL 10.2 ships 2.39 so this is compatible.
-  { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.1/vllm-0.20.1%2Bcpu-cp38-abi3-manylinux_2_35_x86_64.whl",
-    marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1",
-    marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" },
+  { url = "https://github.com/vllm-project/vllm/releases/download/v0.20.1/vllm-0.20.1%2Bcpu-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1", marker = "sys_platform != 'linux' or platform_machine != 'x86_64'" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a6baa9c73b2de0f1b199c2c567d8609720bcf5a8" }
 torch = [

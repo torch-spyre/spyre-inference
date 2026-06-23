@@ -1,38 +1,24 @@
-name: 'Spyre image-versioned UV cache'
+name: 'Spyre image-versioned UV cache key'
 description: |
-  Exports UV_CACHE_DIR pointed at a path keyed by the Spyre image's
-  component manifest hash. torch-spyre links against runtime binaries
-  carried by the image. Those binaries are upgraded in place when the 
-  image is rolled, but uv keys its built-wheel cache only by source URL
-  + commit — so without this action a wheel built on image v_N can be 
-  reused against image v_{N+1} and crash at import.
+  Computes a short hash of the installed ibm-* RPMs and outputs it as
+  `image-hash`. Pass this to `astral-sh/setup-uv` as `cache-key` so the
+  GHA cache is invalidated whenever the Spyre image changes.
 
-  Each image version gets its own UV_CACHE_DIR subdirectory under the
-  PVC, which means:
-    * No cross-image contamination — image bumps see an empty cache
-      and rebuild once, then warm-cache for every subsequent run.
-    * No mid-run mutation, no race conditions: jobs on the same image
-      hit the same dir, jobs on different images never touch the same
-      files.
+  torch-spyre links against runtime binaries carried by the image. Those
+  binaries are upgraded in place when the image is rolled, but uv keys its
+  built-wheel cache only by source URL + commit — so without this, a wheel
+  built on image v_N would be reused against image v_{N+1} and crash at
+  import.
 
-  Pair with `astral-sh/setup-uv@v5` set to `enable-cache: false`
+  Also prints the full ibm-* RPM list so developers can see exactly which
+  library versions CI ran against and replicate the environment locally.
 
-inputs:
-  cache-root:
-    description: 'Persistent root for uv caches (one subdir per image hash).'
-    required: false
-    default: '/storage-1/spyre-inference/.cache'
-  manifest-path:
-    description: 'Spyre image component manifest used as the cache key.'
-    required: false
-    default: '/opt/ibm/spyre/components.txt'
+  Pair with `astral-sh/setup-uv@v5` set to `enable-cache: true` and
+  `cache-suffix` set to this action's `image-hash` output.
 
 outputs:
-  uv-cache-dir:
-    description: 'The image-versioned UV_CACHE_DIR that was exported.'
-    value: ${{ steps.compute.outputs.uv-cache-dir }}
   image-hash:
-    description: 'Short hash of the Spyre image component manifest.'
+    description: 'Short hash of the installed ibm-* RPM manifest.'
     value: ${{ steps.compute.outputs.image-hash }}
 
 runs:
@@ -42,18 +28,16 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        manifest="${{ inputs.manifest-path }}"
-        if [[ ! -f "$manifest" ]]; then
-          echo "::error::Spyre component manifest not found at $manifest"
+        manifest_file="/tmp/ibm-components.txt"
+        rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' \
+            | grep '^ibm-' \
+            | sort > "${manifest_file}" || true
+        if [[ ! -s "${manifest_file}" ]]; then
+          echo "::error::no ibm-* RPMs found in the image; refusing to build a uv cache key from an empty manifest"
           exit 1
         fi
-        image_hash=$(sha256sum "$manifest" | cut -c1-12)
-        cache_dir="${{ inputs.cache-root }}/uv-${image_hash}"
-        echo "UV_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"
-        # The PVC backing the cache does not support hardlinks across to the
-        # venv filesystem, so force uv to copy. Without this, uv emits a
-        # warning per package on every sync and falls back to copy anyway.
-        echo "UV_LINK_MODE=copy" >> "$GITHUB_ENV"
-        echo "uv-cache-dir=${cache_dir}" >> "$GITHUB_OUTPUT"
+        echo "# Installed ibm-* RPMs:"
+        cat "${manifest_file}"
+        image_hash=$(sha256sum "${manifest_file}" | cut -c1-12)
         echo "image-hash=${image_hash}" >> "$GITHUB_OUTPUT"
-        echo "::notice::Using UV cache ${cache_dir} (image hash ${image_hash})"
+        echo "::notice::Spyre image hash ${image_hash}"

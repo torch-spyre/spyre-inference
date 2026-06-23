@@ -40,11 +40,10 @@ jobs:
     # `ty` needs the real torch/vllm/torch-spyre deps to type check imports,
     # which need the spyre runtime libs (carried by `image_spyre_inference`)
     # to install. The check itself does not exercise the Spyre device, so it
-    # runs on `spyre_pf_x0` (no cards). The `__pvc_1tb_x1` suffix gives us a
-    # persistent volume so we can cache `uv` artifacts across runs.
+    # runs on `spyre_pf_x0` (no cards).
     runs-on:
       - x86_64
-      - spyre_pf_x0__pvc_1tb_x1
+      - spyre_pf_x0
       - linux
       - image_spyre_inference
     timeout-minutes: 30
@@ -55,17 +54,19 @@ jobs:
       name: "Compute Spyre image hash"
       uses: ./.github/actions/spyre-uv-cache
 
-    - name: "Set up Python 3.12"
+    - name: "Set up Python"
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
-        python-version: "3.12"
         enable-cache: true
         cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+        cache-local-path: ${{ runner.temp }}/setup-uv-cache
         prune-cache: false
+
     - name: "Install dependencies"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uv sync --frozen --no-dev -v
+
     - name: "Run ty via prek"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh

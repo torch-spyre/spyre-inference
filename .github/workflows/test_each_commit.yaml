@@ -92,6 +92,8 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          # Use local runner temp to avoid ownership/permission issues on $HOME.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
           # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
           # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
           # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.

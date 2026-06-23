@@ -27,6 +27,15 @@ The plugin registers via two entry points:
 | `vllm.platform_plugins` | Registers `TorchSpyrePlatform` — sets dtype, worker class, and attention backend |
 | `vllm.general_plugins` | Calls `register_all()` — registers all custom ops before model loading |
 
+## FP8 Quantization Support
+
+FP8 (float8) quantization is **not currently supported** in spyre-inference. The hardware
+supports FP8 natively, but the software stack (torch-spyre backend and spyre-inference
+plugin) lacks the necessary kernels and quantization method implementations.
+
+For details on current gaps, blockers, and required work, see
+[FP8 Support Gaps](fp8-support-gaps.md).
+
 ## Component view of a Granite model
 
 <figure markdown="span">

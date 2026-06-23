@@ -226,6 +226,7 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
+    "fp8: Tests for FP8 quantization support (xfail until implemented)",
 ]
 # --8<-- [end:test-markers-definition]
 

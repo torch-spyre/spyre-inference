@@ -1673,10 +1673,6 @@ without any compact-gather step:</p>
 </tr>
 </tbody>
 </table>
-<p>A second backend selectable via <code>SPYRE_ATTN_IMPL=exp</code> (file
-<code>spyre_attn_exp.py</code>) keeps the older "gather compact KV → single 4D attention call →
-trim padding" pipeline. It is gated on <code>max_num_seqs=1</code> and an explicit
-<code>num_gpu_blocks_override</code>, and is preserved for benchmarking the on-device-cache path.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length alignment</strong>: 256 tokens (avoids per-step recompilation on Spyre)</li>

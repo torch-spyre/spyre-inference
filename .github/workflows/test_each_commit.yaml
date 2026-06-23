@@ -8,6 +8,23 @@ on:
     branches: [main]
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      torch_spyre_ref:
+        description: Branch, tag, or SHA of torch-spyre to check out and test
+        required: false
+        type: string
+        default: ""
+      rpm_location:
+        description: The Artifactory location where to download the RPM from
+        required: false
+        type: string
+        default: ""
+      rpm_names:
+        description: A space separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -77,6 +94,17 @@ jobs:
       - name: Configure image-versioned UV cache
         uses: ./.github/actions/spyre-uv-cache
 
+      - uses: ./.github/actions/build-spyre-deps
+        if: ${{ inputs.torch_spyre_ref != '' }}
+        with:
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+
       - name: Gather runner info
         run: |
           source "$HOME/.bashrc"
@@ -99,14 +127,17 @@ jobs:
           echo "---"
 
       - name: Build spyre-inference
+        env:
+          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          uv sync \
-            --frozen \
-            --verbose \
-            --refresh \
-            --group dev
+          if [[ -n "$TORCH_SPYRE_REF" ]]; then
+            uv add torch-spyre /home/senuser/torch-spyre
+            uv sync --verbose --group dev
+          else
+            uv sync --frozen --verbose --group dev
+          fi
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze

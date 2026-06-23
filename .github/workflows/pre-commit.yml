@@ -55,17 +55,18 @@ jobs:
       name: "Compute Spyre image hash"
       uses: ./.github/actions/spyre-uv-cache
 
-    - name: "Set up Python 3.12"
+    - name: "Set up Python"
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
-        python-version: "3.12"
         enable-cache: true
         cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
         prune-cache: false
+
     - name: "Install dependencies"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uv sync --frozen --no-dev -v
+
     - name: "Run ty via prek"
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh

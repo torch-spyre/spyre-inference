@@ -545,6 +545,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="param skipped"))
             continue
 
+        if allow_entry.mode == "skip":
+            item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
+            continue
+
         if allow_entry.mode == "xfail":
             item.add_marker(pytest.mark.xfail(strict=False))
         elif allow_entry.mode == "xfail_strict":

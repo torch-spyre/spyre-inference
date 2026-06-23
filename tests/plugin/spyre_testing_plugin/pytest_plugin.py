@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import torch.distributed as dist
 import torch.testing
 
@@ -204,21 +205,28 @@ def _extract_vllm_commit_from_pyproject() -> str:
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    # Look for pyproject.toml at repo root
     repo_root_dir = Path(__file__).parent.parent.parent.parent
     pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
         raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
 
-    content = pyproject_path.read_text()
-    # Look for vllm source with git and rev
-    # Pattern: vllm = { git = "...", rev = "commit_sha_or_semver_tag" }
-    match = re.search(
-        r'vllm\s*=\s*\{\s*git\s*=\s*"[^"]+"\s*,\s*rev\s*=\s*"([0-9a-f]{7,40}|v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?)"\s*\}',
-        content,
-    )
-    if match:
-        return match.group(1)
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    try:
+        vllm_source = data["tool"]["uv"]["sources"]["vllm"]
+    except KeyError as e:
+        raise KeyError(
+            f"Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]: missing key {e}"
+        ) from e
+
+    # Handle both a single source dict and a list of sources (e.g. index + git fallback)
+    if isinstance(vllm_source, list):
+        for source in vllm_source:
+            if isinstance(source, dict) and "git" in source and "rev" in source:
+                return source["rev"]
+    elif isinstance(vllm_source, dict) and "git" in vllm_source and "rev" in vllm_source:
+        return vllm_source["rev"]
 
     raise KeyError("Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]")
 

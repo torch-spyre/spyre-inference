@@ -53,11 +53,12 @@ def test_merged_column_matches_reference(
 
     torch.manual_seed(1)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-
-    actual, _ = layer(x)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    layer = layer.to("spyre")
+    actual, _ = layer(x.to("spyre"))
+
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.mlp
@@ -105,10 +106,13 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
 
     torch.manual_seed(1)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-
-    actual, _ = layer(x)
     expected = F.linear(x, layer.weight, layer.bias)
 
+    layer = layer.to("spyre")
+    actual, _ = layer(x.to("spyre"))
+
+    # SpyreQKVParallelLinear.forward() does a D2H on the result before returning.
+    assert actual.device.type == "cpu"
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
@@ -148,11 +152,14 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
 
     torch.manual_seed(1)
     x = torch.randn(num_tokens, input_size, dtype=dtype)
-
-    actual, _ = layer(x)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    # CPU input + Spyre weight: SpyreRowParallelLinear.forward() H2Ds the input
+    # to match the weight device.
+    layer = layer.to("spyre")
+    actual, _ = layer(x)
+
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.xfail(

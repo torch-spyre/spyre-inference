@@ -8,7 +8,7 @@
 # Fields:
 #   rel_path          Path relative to upstream vLLM repo root
 #   allow_list[].test fnmatch glob matched against test function name
-#   allow_list[].mode mandatory_pass (default) | xfail | xfail_strict
+#   allow_list[].mode mandatory_pass (default) | skip | skip | skip_strict
 #   allow_list[].tags Labels applied as pytest markers (filterable via -m)
 #   allow_list[].params.skip
 #                     Parameter name -> list of values to skip
@@ -27,19 +27,20 @@ tests:
   files:
     # RMSNorm tests require either https://github.com/vllm-project/vllm/pull/36246 or vLLM IR
     # changes to merge in order to pass
-    # - rel_path: tests/kernels/core/test_layernorm.py
-    #   allow_list:
-    #     - test: "test_rms_norm"
-    #       mode: mandatory_pass
-    #       tags: [rmsnorm, upstream]
-    #       params:
-    #         skip:
-    #           strided_input: [true]
-    #         override:
-    #           num_tokens: [1, 16]
-    #           hidden_size: [64]
-    #   block_list:
-    #     - test: "test_fused_rms_norm_quant"
+    - rel_path: tests/kernels/core/test_layernorm.py
+      allow_list:
+        - test: "test_rms_norm"
+          mode: skip
+          tags: [rmsnorm, upstream]
+          params:
+            skip:
+              strided_input: [true]
+            override:
+              num_tokens: [1, 16]
+              hidden_size: [64]
+      block_list:
+        - test: "test_fused_rms_norm_quant"
+
     - rel_path: tests/kernels/core/test_activation.py
       allow_list:
         - test: "test_act_and_mul"
@@ -58,13 +59,11 @@ tests:
             atol: 1e-2
             rtol: 1e-2
 
-    # Model tests are now failing too :(
+    # separate fb passing test
     - rel_path: tests/models/language/generation/test_common.py
       allow_list:
         - test: "test_models"
           mode: mandatory_pass
-          # uses_subprocess marker is added to make these tests run first.
-          # This must be added for any sets of tests that use `vllm.LLM`
           tags: [model, upstream, uses_subprocess]
           params:
             allow:  # skip every model except facebook/opt-125m
@@ -76,23 +75,98 @@ tests:
           fixture_names:
           - "constrain_vllm_runner_kv_cache"
 
+    # Model tests are now failing too :(
+    - rel_path: tests/models/language/generation/test_common.py
+      allow_list:
+        - test: "test_models"
+          mode: skip
+          # uses_subprocess marker is added to make these tests run first.
+          # This must be added for any sets of tests that use `vllm.LLM`
+          tags: [model, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - facebook/opt-125m
+                - ibm-granite/granite-3.3-2b-instruct
+                - Qwen/Qwen3-0.6B
+
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
         - test: "test_causal_backend_correctness"
+          # The platform override ensures block_size is a multiple of 64.
           mode: mandatory_pass
           tags: [attention, upstream]
           params:
             allow:
               tensor_parallel_size:
-              - 1
-              - 2
-              - 4
+                - 1
+                - 2
+                - 4
               batch_spec_name:
-              - single_decode
-              - single_prefill
-              - small_decode
-              - small_prefill
-              - mixed_small
+                - single_decode
+                - single_prefill
+                - small_decode
+                - small_prefill
+                - mixed_small
           fixture_names:
-          - "patch_backend_list"
+            - "patch_backend_list"
 
+    - rel_path: tests/models/language/generation/test_granite.py
+      allow_list:
+        - test: "test_models"
+          mode: skip # RAS::VFIO::MapDMAFailed - VFIO kernel module unable to map DMA memory region (errno: No space left on device)
+          tags: [granite, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - ibm-granite/granite-3.3-2b-instruct
+              dtype: [torch.float32]
+
+    - rel_path: tests/models/language/generation_ppl_test/test_qwen.py
+      allow_list:
+        - test: "test_ppl"
+          mode: skip # model_info0 (Qwen3-0.6B): RAS::VFIO::MapDMAFailed; model_info1 (Qwen3-0.6B-FP8): KeyError PlatformEnum.OOT - FP8 quant not supported on Spyre; model_info2 (Qwen3.5-0.8B): Qwen3_5ForConditionalGeneration not in vLLM registry
+          tags: [model, generation, upstream, uses_subprocess]
+
+    - rel_path: tests/models/language/pooling/test_embedding.py
+      allow_list:
+        - test: "test_models"
+          mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
+          tags: [model, embedding, upstream, uses_subprocess]
+          params:
+            allow:
+              model:
+                - BAAI/bge-base-en-v1.5
+
+    - rel_path: tests/models/language/pooling/test_auto_prefix_cache_support.py
+      allow_list:
+        - test: "test_embed_models"
+          mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
+          tags: [model, embedding, upstream, uses_subprocess]
+          params:
+            override:
+              model: ["BAAI/bge-m3"]
+
+    - rel_path: tests/basic_correctness/test_basic_correctness.py
+      allow_list:
+        - test: "test_models"
+          mode: skip # RAS::VFIO::MapDMAFailed - VFIO kernel module unable to map DMA memory region (errno: No space left on device) on all models
+          tags: [model, basic_correctness, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - Qwen/Qwen3-0.6B
+                - ibm-granite/granite-3.3-2b-instruct
+              backend: ["CUSTOM"]
+              enforce_eager: [true]
+        - test: "test_models_distributed"
+          mode: skip
+          tags:
+            [model, basic_correctness, upstream, uses_subprocess, distributed]
+          params:
+            override:
+              model:
+                - Qwen/Qwen3-0.6B
+                - ibm-granite/granite-3.3-2b-instruct
+              distributed_executor_backend: ["external_launcher"]
+              attention_backend: ["CUSTOM"]

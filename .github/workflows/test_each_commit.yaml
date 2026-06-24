@@ -8,6 +8,23 @@ on:
     branches: [main]
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
+    inputs:
+      torch_spyre_ref:
+        description: Branch, tag, or SHA of torch-spyre to check out and test
+        required: false
+        type: string
+        default: ""
+      rpm_location:
+        description: The Artifactory location where to download the RPM from
+        required: false
+        type: string
+        default: ""
+      rpm_names:
+        description: A space separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -50,7 +67,15 @@ jobs:
               - linux
               - image_spyre_inference
             flags: >-
-              -m upstream
+              -m "upstream and not distributed"
+          - cfg: Upstream distributed vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x2__pvc_1tb_x1
+              - linux
+              - image_spyre_inference
+            flags: >-
+              -m "upstream and distributed"
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 720
     env:
@@ -62,20 +87,36 @@ jobs:
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      # UV_CACHE_DIR is exported by the spyre-uv-cache action below, keyed by
-      # the Spyre image's component manifest hash so torch-spyre wheels built
-      # against one runtime cannot be reused after an image bump.
-      # uv serializes builds of the same package via a per-distribution lock.
-      # On a fresh image-versioned cache dir, several concurrent jobs all try
-      # to build torch-spyre (~50s) and the late arrivals time out at the
-      # default 300s. Bump generously — late jobs just wait, no work is lost.
-      UV_LOCK_TIMEOUT: '1800'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Configure image-versioned UV cache
+      - name: Compute Spyre image hash
+        id: spyre-uv-cache
         uses: ./.github/actions/spyre-uv-cache
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          # Use local runner temp to avoid ownership/permission issues on $HOME.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
+          # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
+          # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
+          prune-cache: false
+
+      - uses: ./.github/actions/build-spyre-deps
+        if: ${{ inputs.torch_spyre_ref != '' }}
+        with:
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
       - name: Gather runner info
         run: |
@@ -98,15 +139,22 @@ jobs:
           ls -lart
           echo "---"
 
+      - name: Dump UV cache info
+        run: |
+          find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
+
       - name: Build spyre-inference
+        env:
+          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          uv sync \
-            --frozen \
-            --verbose \
-            --refresh \
-            --group dev
+          if [[ -n "$TORCH_SPYRE_REF" ]]; then
+            uv add torch-spyre /home/senuser/torch-spyre
+            uv sync --verbose --group dev
+          else
+            uv sync --frozen --verbose --group dev
+          fi
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze

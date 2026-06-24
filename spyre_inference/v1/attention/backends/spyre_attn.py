@@ -385,6 +385,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.block_size = kv_cache_spec.block_size
         self.head_size = kv_cache_spec.head_size
 
+        # Validate block_size alignment: Spyre stick size is 128 bytes (64 fp16 elements).
+        # block_size must be a multiple of 64 to avoid restickification errors during
+        # torch.compile.
+        if self.block_size % 64 != 0:
+            raise ValueError(
+                f"block_size must be a multiple of 64 for the list-based attention "
+                f"backend. Got block_size={self.block_size}, head_size={self.head_size}. "
+            )
+
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
@@ -546,12 +555,9 @@ class SpyreAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        # Spyre's matmul kernel requires the reduction dim (here: KV block_size)
-        # to fit on the 64-element device "stick"; smaller K cannot be
-        # restickified and the inductor layout pass aborts with
-        # `cannot restickify ... y_var=d2` deep inside torch-spyre. Advertise
-        # MultipleOf(64) so vLLM picks/validates a compatible block_size up
-        # front instead.
+        # Spyre stick size is 128 bytes; tensors are transferred as float16 (2 bytes),
+        # so block_size must be a multiple of 64 (= 128 / 2) to satisfy stick alignment.
+        # This matches the constraint on head_size in supports_head_size().
         return [MultipleOf(64)]
 
     @staticmethod

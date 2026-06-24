@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.metadata
+import math
 import multiprocessing
 import os
 import sys
@@ -20,8 +21,6 @@ from string import Template
 from typing import TYPE_CHECKING
 
 import torch
-
-from spyre_inference import envs
 
 
 # When running this plugin on a Mac, we assume it's for local development
@@ -56,12 +55,7 @@ class TorchSpyrePlatform(CpuPlatform):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
-    # Primary dispatch key for direct_register_custom_op. Kept as CPU
-    # because some custom ops receive CPU-only tensors (e.g. rotary_embedding).
-    # All ops are ALSO registered for PrivateUse1 (Spyre) via
-    # register_spyre_dispatch() in each module's register() function,
-    # so dispatch works regardless of tensor device.
-    dispatch_key: str = "CPU"
+    dispatch_key: str = "PrivateUse1"
 
     # Multi-backend init string consumed by both vllm's
     # `init_distributed_environment` and `torch.distributed.new_group`.
@@ -72,25 +66,8 @@ class TorchSpyrePlatform(CpuPlatform):
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
-    # SPYRE_ATTN_IMPL=exp selects spyre_attn_exp.py; anything else uses spyre_attn.py.
-    if envs.SPYRE_ATTN_IMPL == "exp":
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn_exp.SpyreAttentionBackend"
-    else:
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
-
+    _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
-
-    @classmethod
-    def opaque_attention_op(cls) -> bool:
-        # This is required to keep the output tensor of attention on Spyre.
-        # Inherited from CpuPlatform as True, which would route attention through
-        # torch.ops.vllm.unified_attention_with_output.
-        # This override disables the opaque-op boundary and vLLM then calls the
-        # Attention.forward directly.
-        #
-        # This has though implications for torch.compile, because if
-        # enforce_eager=False, the attention implementation is also traced and compiled.
-        return False
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -176,6 +153,23 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
+        # The list-based attention backend requires 64-element stick alignment for
+        # torch.compile. Only override default (non-user-specified) values.
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            original_block_size = cache_config.block_size
+            if original_block_size % 64 != 0:
+                # Round up to nearest multiple of 64
+                new_block_size = ((original_block_size + 63) // 64) * 64
+                logger.warning(
+                    "Block size must be a multiple of 64 for the list-based attention "
+                    "backend. Overriding block_size from %d to %d.",
+                    original_block_size,
+                    new_block_size,
+                )
+                cache_config.block_size = new_block_size
+
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's
@@ -231,3 +225,20 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+
+        # Pin the on-device KV cache to exactly what's needed to fill the
+        # configured batch area: max_num_seqs sequences × ceil(max_model_len /
+        # block_size) blocks each. Anything more is over-allocation while
+        # the attention op is still unoptimized.
+        cache_config = vllm_config.cache_config
+        if cache_config.num_gpu_blocks_override is None:
+            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+            max_model_len = vllm_config.model_config.max_model_len
+            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+            logger.info(
+                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                cache_config.num_gpu_blocks_override,
+                max_num_seqs,
+                blocks_per_seq,
+            )

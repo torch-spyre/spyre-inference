@@ -59,12 +59,18 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
     layer.quant_method.process_weights_after_loading(layer)
 
     x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
-
     expected = reference_lm_head(x, layer.weight.data)
+
+    # In production weights live on Spyre after `model.to(spyre_device)`;
+    # mirror that here so forward_oot's H2D + Spyre F.linear actually run.
+    layer = layer.to("spyre")
     actual = layer.forward_oot(x)
 
     assert actual.shape == (num_tokens, layer.weight.shape[0])
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+    # Spyre matmul accumulation order diverges from the CPU reference in fp16;
+    # see the "expect numerical differences" warning in
+    # SpyreUnquantizedLMHeadMethod.process_weights_after_loading.
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -157,21 +163,30 @@ def test_lm_head_oot_dispatch(tp_group):
 
 @pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
-def test_invalid_weight_shape_raises(tp_group):
-    """process_weights_after_loading rejects weight rows not divisible by 64.
+def test_non_aligned_weight_is_padded(tp_group):
+    """process_weights_after_loading pads weight rows not divisible by ALIGN.
 
     Part of the padding workaround — remove together with the other
     `padding_workaround` tests once torch-spyre lifts the shape restriction.
     """
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
-    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
-    # Force a weight whose leading dim is not a multiple of 64 to exercise
-    # the Spyre-specific validation (upstream vocab padding normally prevents this).
-    layer.weight = torch.nn.Parameter(torch.empty(63, 64, dtype=torch.float16), requires_grad=False)
+    ALIGN = 64 * 32
 
-    with pytest.raises(ValueError, match="multiple of 64"):
-        layer.quant_method.process_weights_after_loading(layer)
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+
+    original = torch.randn(63, 64, dtype=torch.float16)
+    layer.weight = torch.nn.Parameter(original.clone(), requires_grad=False)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    expected_padded_rows = ALIGN  # ceil(63 / ALIGN) * ALIGN
+    assert layer.padded_weight.shape[0] == expected_padded_rows
+    assert layer.padding == expected_padded_rows - 63
+    # Original values preserved in the top rows
+    torch.testing.assert_close(layer.padded_weight[:63], original, atol=0.0, rtol=0.0)
+    # Padding rows are zeros
+    assert torch.all(layer.padded_weight[63:] == 0)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,6 @@
-direction: down
+grid-rows: 2
+grid-columns: 2
+grid-gap: 60
 
 api: "n >= 1 API server procs" {
   style.fill: "#e0e0e0"
@@ -49,6 +51,31 @@ engine: "1 engine core proc" {
   EngineCore -> KVCacheManager
 }
 
+platform: "Platform API (used in all processes)" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  CpuPlatform: CpuPlatform {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyrePlatform: "TorchSpyrePlatform\n(forces float16, eager,\nCompilationMode.NONE)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  CudaPlatform: CudaPlatform {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+
+  CpuPlatform -> SpyrePlatform: "▷" {style.stroke-dash: 3}
+}
+
 worker: "n == num devices worker procs (TP, DP)" {
   style.fill: "#e0e0e0"
   style.stroke: "#9e9e9e"
@@ -60,6 +87,18 @@ worker: "n == num devices worker procs (TP, DP)" {
     style.font-color: "#ffffff"
   }
   SpyreWorker: TorchSpyreWorker {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+
+  DeviceCommBase: DeviceCommunicatorBase {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  SpyreComm: "SpyreCommunicator\n(manual TP=2 all_reduce\nover spyreccl)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -123,6 +162,7 @@ worker: "n == num devices worker procs (TP, DP)" {
   CPUWorker -> SpyreWorker: "▷" {style.stroke-dash: 3}
   GPUModelRunner -> SpyreModelRunner: "▷" {style.stroke-dash: 3}
   AttentionBackend -> SpyreAttnBackend: "▷" {style.stroke-dash: 3}
+  DeviceCommBase -> SpyreComm: "▷" {style.stroke-dash: 3}
 
   SpyreWorker -> SpyreModelRunner: has-a
   SpyreModelRunner -> SpyreWrapper: creates
@@ -133,30 +173,6 @@ worker: "n == num devices worker procs (TP, DP)" {
   SpyreAttnBackend -> SpyreMetaBuilder: creates
 }
 
-platform: "Platform API (used in all processes)" {
-  style.fill: "#e0e0e0"
-  style.stroke: "#9e9e9e"
-  style.font-color: "#212121"
-
-  CpuPlatform: CpuPlatform {
-    style.fill: "#37474f"
-    style.stroke: "#263238"
-    style.font-color: "#ffffff"
-  }
-  SpyrePlatform: TorchSpyrePlatform {
-    style.fill: "#1565c0"
-    style.stroke: "#0d47a1"
-    style.font-color: "#ffffff"
-    style.bold: true
-  }
-  CudaPlatform: CudaPlatform {
-    style.fill: "#37474f"
-    style.stroke: "#263238"
-    style.font-color: "#ffffff"
-  }
-
-  CpuPlatform -> SpyrePlatform: "▷" {style.stroke-dash: 3}
-}
-
 api.EngineClient -> engine.EngineCore: {style.stroke-dash: 3}
 engine.EngineCore -> worker.CPUWorker: "executes via"
+platform.SpyrePlatform -> worker.SpyreComm: "selects via\nget_device_communicator_cls"

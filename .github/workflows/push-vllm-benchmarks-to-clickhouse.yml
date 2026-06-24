@@ -1,0 +1,150 @@
+name: push-vllm-benchmarks-to-clickhouse
+
+# Runs automatically after vLLM Benchmark workflow completes.
+# Also supports manual dispatch for re-ingesting a specific run.
+on:
+  workflow_run:
+    workflows:
+      - vLLM Benchmark
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to re-ingest (leave blank to skip)
+        required: false
+        default: ''
+
+concurrency:
+  group: ingest-vllm-${{ github.event.workflow_run.id || inputs.gha_run_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  ingest:
+    name: Ingest vLLM benchmarks -> ClickHouse
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_spyre_inference
+    timeout-minutes: 15
+    # Skip only if the triggering workflow was cancelled
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion != 'cancelled'
+    env:
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - name: Print triggering info
+        run: |
+          echo "Triggering run ID: ${TRIGGERING_RUN_ID}"
+          echo "Branch: ${TRIGGERING_BRANCH}"
+          echo "SHA: ${TRIGGERING_SHA}"
+
+      - name: Checkout (for ingest script)
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts/ingest_vllm_benchmarks.py
+            .github/scripts/requirements-benchmark.txt
+
+      - name: Install Python dependencies
+        run: |
+          source /home/senuser/spyre-inference/.venv/bin/activate 2>/dev/null || true
+          pip install -r .github/scripts/requirements-benchmark.txt
+
+      - name: Install gh CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            wget -q https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz
+            tar -xzf gh_2.92.0_linux_amd64.tar.gz
+            echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          fi
+
+      - name: Download benchmark artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          mkdir -p benchmark_results
+
+          # List artifacts from the triggering run
+          ARTIFACTS=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name | startswith("benchmark-results--")) | {id: .id, name: .name}]')
+
+          echo "Found artifacts:"
+          echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' -', a['name']) for a in json.load(sys.stdin)]"
+
+          # Download and extract each artifact
+          echo "$ARTIFACTS" | python3 -c "
+          import json, os, subprocess, sys
+          artifacts = json.loads(sys.stdin.read())
+          repo = os.environ['GITHUB_REPOSITORY']
+          for a in artifacts:
+              print(f'Downloading: {a[\"name\"]} (id={a[\"id\"]})')
+              result = subprocess.run([
+                  'gh', 'api',
+                  f'/repos/{repo}/actions/artifacts/{a[\"id\"]}/zip',
+              ], check=True, capture_output=True)
+              zip_path = f'benchmark_results/{a[\"name\"]}.zip'
+              with open(zip_path, 'wb') as f:
+                  f.write(result.stdout)
+              subprocess.run([
+                  'unzip', '-o', zip_path, '-d', 'benchmark_results/'
+              ], check=True)
+          "
+
+          echo "Downloaded result files:"
+          find benchmark_results -name "*.json" || echo "(none)"
+
+      - name: Resolve PR number
+        id: resolve-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=$(gh api \
+            "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+            --jq '.[0].number // 0' 2>/dev/null || echo 0)
+          echo "Resolved PR number: ${PR}"
+          echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Ingest into ClickHouse
+        run: |
+          source /home/senuser/spyre-inference/.venv/bin/activate 2>/dev/null || true
+
+          python3 .github/scripts/ingest_vllm_benchmarks.py \
+            --results-dir benchmark_results \
+            --workflow "vLLM Benchmark" \
+            --branch "${TRIGGERING_BRANCH}" \
+            --sha "${TRIGGERING_SHA}" \
+            --run-id "${TRIGGERING_RUN_ID}" \
+            --pr-number "${{ steps.resolve-pr.outputs.pr_number }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          JSON_COUNT=$(find benchmark_results -name "*.json" 2>/dev/null | wc -l || echo 0)
+
+          {
+            echo "### vLLM Benchmark ClickHouse Ingest"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering run ID | ${TRIGGERING_RUN_ID} |"
+            echo "| PR number | ${{ steps.resolve-pr.outputs.pr_number }} |"
+            echo "| Branch | ${TRIGGERING_BRANCH} |"
+            echo "| Commit SHA | ${TRIGGERING_SHA:0:12} |"
+            echo "| JSON files ingested | ${JSON_COUNT} |"
+          } >> "$GITHUB_STEP_SUMMARY"

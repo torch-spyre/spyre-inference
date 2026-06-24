@@ -1,0 +1,16 @@
+# Latency benchmarks for Spyre devices
+- test_name: latency_granite8B_tp1_in128_out128
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 16
+    DTLOG_LEVEL: error
+  parameters:
+    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 128
+    output-len: 128
+    batch-size: 1
+    num-iters-warmup: 3
+    num-iters: 10
+    max-model-len: 2048

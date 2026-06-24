@@ -31,19 +31,17 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
-from functools import lru_cache
 
 from .utils import get_layer, register_layer
 
 logger = init_logger(__name__)
 
 
-@RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
-class SpyreRotaryEmbedding(RotaryEmbedding):
-    """OOT RotaryEmbedding: opaque CPU fallback wrapped as a custom op.
+class _SpyreRotaryMixin:
+    """Adds Spyre CPU-fallback wiring to a RotaryEmbedding subclass.
 
-    Inductor sees one FallbackKernel returning (query, key); the entire
-    rotary computation including index_select runs eagerly on CPU.
+    Linear inheritance avoids the diamond MRO that arises when combining
+    SpyreRotaryEmbedding and another RotaryEmbedding subclass.
     """
 
     def __init__(self, *args, **kwargs):
@@ -67,14 +65,25 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # cos_sin_cache is fetched inside the op via get_layer(layer_name);
         # torch.ops dispatcher signature is opaque to the type checker (resolves to `...`).
         out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
-            positions,  # ty: ignore[invalid-argument-type]
-            query,  # ty: ignore[invalid-argument-type]
-            key_in,  # ty: ignore[invalid-argument-type]
-            self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
+            positions,
+            query,
+            key_in,
+            self._spyre_layer_name,
         )
         if key is None:
             return out_q, None
         return out_q, out_k
+
+
+@RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
+class SpyreRotaryEmbedding(_SpyreRotaryMixin, RotaryEmbedding):
+    """OOT RotaryEmbedding: opaque CPU fallback wrapped as a custom op.
+
+    Inductor sees one FallbackKernel returning (query, key); the entire
+    rotary computation including index_select runs eagerly on CPU.
+    """
+
+    pass
 
 
 def _rotary_cpu_op_func(
@@ -124,7 +133,7 @@ def _rotary_cpu_op_fake(
 
 
 @RotaryEmbeddingBase.register_oot(name="Llama3RotaryEmbedding")
-class SpyreLlama3RotaryEmbedding(Llama3RotaryEmbedding, SpyreRotaryEmbedding):
+class SpyreLlama3RotaryEmbedding(_SpyreRotaryMixin, Llama3RotaryEmbedding):
     """OOT Llama3RotaryEmbedding that runs rotary computation on CPU."""
 
     pass

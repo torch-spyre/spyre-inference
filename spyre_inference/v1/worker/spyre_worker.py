@@ -81,7 +81,7 @@ class TorchSpyreWorker(CPUWorker):
         # `set_device(local_rank)` above; tensors created on
         # `torch.device("spyre")` will land on that card.
         original = cpu_worker_module.CPUModelRunner
-        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(  # ty: ignore[invalid-assignment]
+        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )

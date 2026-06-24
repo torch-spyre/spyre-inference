@@ -946,7 +946,6 @@ def constrain_vllm_runner_kv_cache(request, monkeypatch):
     This fixture wraps `VllmRunner.__init__` to set defaults that fit on Spyre.
     Callers can still override them by passing the same kwargs explicitly.
     """
-    test_module = request.node.module
     # The upstream `test_models` test imports `VllmRunner` indirectly via the
     # `vllm_runner` session fixture, which returns the class itself.
     runner_fixture = request.getfixturevalue("vllm_runner")
@@ -954,9 +953,7 @@ def constrain_vllm_runner_kv_cache(request, monkeypatch):
     orig_init = runner_fixture.__init__
 
     def patched_init(self, model_name, *args, **kwargs):
-        # Cap KV cache to a tiny budget so it fits in Spyre's DMA region.
-        # block_size=16 * num_gpu_blocks_override=16 = 256 tokens,
-        # which covers max_num_seqs=2 * max_model_len=128.
+        # Cap KV cache to a tiny budget so it fits in Spyre's memory
         kwargs.setdefault("max_model_len", 128)
         kwargs.setdefault("num_gpu_blocks_override", 16)
         return orig_init(self, model_name, *args, **kwargs)

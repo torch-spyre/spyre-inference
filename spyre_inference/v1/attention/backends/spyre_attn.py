@@ -80,13 +80,23 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place)."""
+    """Write input into output at the specified position (in-place).
+
+    Spyre quirk: every available scatter primitive on a spyre-resident tensor
+    misbehaves on the outer (dim=0) axis — `torch.ops.spyre.overwrite`,
+    `output[i:j] = input`, and `narrow(output, 0, ...).copy_(input)` all
+    silently smear writes across the whole buffer. Writes along the inner
+    block-size axis (dim=1) survive on the deprecated `torch.ops.spyre.overwrite`
+    path. So this function uses the deprecated op (which only handles dim=1
+    correctly) on spyre and standard slicing on cpu. **Callers that need to
+    scatter along dim=0 of a spyre tensor must build the full result on CPU
+    and copy it back in one shot** (see `_online_softmax_attention`).
+    """
     if output.device.type == "spyre":
-        # `torch.ops.spyre.overwrite` is dynamically registered, so its
-        # signature is opaque to the type checker (ParamSpec resolves to `...`).
+        # `torch.ops.spyre.overwrite` is dynamically registered; its signature
+        # is opaque to the type checker (ParamSpec resolves to `...`).
         torch.ops.spyre.overwrite(input, output, dims, offsets)  # ty: ignore[invalid-argument-type]
     else:
-        # intended behaviour on cpu
         sliced_t = output
         for i, dim in enumerate(dims):
             sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
@@ -536,7 +546,13 @@ class SpyreAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(1)]
+        # Spyre's matmul kernel requires the reduction dim (here: KV block_size)
+        # to fit on the 64-element device "stick"; smaller K cannot be
+        # restickified and the inductor layout pass aborts with
+        # `cannot restickify ... y_var=d2` deep inside torch-spyre. Advertise
+        # MultipleOf(64) so vLLM picks/validates a compatible block_size up
+        # front instead.
+        return [MultipleOf(64)]
 
     @staticmethod
     def get_name() -> str:
@@ -745,6 +761,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
+        num_actual_tokens = attn_metadata.num_actual_tokens
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
@@ -752,6 +769,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
+        )
+
+        # Spyre's narrow / `tensor[i:j] =` / `torch.ops.spyre.overwrite`
+        # primitives all silently misbehave: an in-place sliced write on a
+        # spyre-resident tensor smears the source across the whole buffer
+        # (writes always hit row 0). Building per-token results into a CPU
+        # tensor and copying the full result back in one shot is the only
+        # pattern that survives. Keep this all-CPU until the final copy_.
+        output_cpu = torch.zeros(
+            num_actual_tokens, num_heads, head_size, dtype=output.dtype, device="cpu"
         )
 
         for seq_idx in range(num_seqs):
@@ -802,12 +829,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
             result_cpu = result_cpu.transpose(1, 2).contiguous()
-            for i in range(query_len):
-                tok = convert(
-                    result_cpu[0, i : i + 1, :, :].contiguous(),
-                    _target_device,
-                    output.dtype,
-                )
-                _overwrite(tok, output, [0], [q_start + i])
+            # CPU-side slice assign — works correctly here; we'll copy the
+            # full output back to spyre once at the end.
+            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
 
+        # Single full-tensor write to the caller's spyre output buffer.
+        output.copy_(convert(output_cpu, device=_target_device))
         return output

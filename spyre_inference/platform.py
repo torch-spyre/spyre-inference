@@ -217,5 +217,17 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
+        # SpyreAttentionImpl.get_supported_kernel_block_sizes returns
+        # `[MultipleOf(64)]` because Spyre's matmul reduction dim must fit on
+        # the device's 64-element stick. vLLM's framework-level block_size
+        # default is 16, and `prepare_kv_cache_block_size` only falls back via
+        # `int`-format sizes (`MultipleOf` alone won't trigger Case 2 in
+        # `vllm/v1/worker/utils.py:301-326`). Force the framework block_size
+        # to a multiple of 64 so vLLM's Case 1 path matches and the kv-cache
+        # manager's block size aligns with what the kernel needs.
+        cache_config = vllm_config.cache_config
+        if cache_config.block_size is None or cache_config.block_size % 64 != 0:
+            cache_config.block_size = 64
+
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)

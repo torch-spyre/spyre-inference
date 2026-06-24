@@ -19,6 +19,17 @@ Inherits vocab sharding and weight loading from upstream. Overrides
 does int64 comparisons against Python int constants, which the Spyre
 inductor backend rejects with `unexpected argument Constant(value=N,
 dtype=torch.int64) to greaterequal`.
+
+Also overrides `quant_method.apply` for the tied-weight lm_head path
+(`config.tie_word_embeddings=True`, e.g. OPT). When the model assigns
+`self.lm_head = self.model.decoder.embed_tokens`, the LogitsProcessor
+calls `lm_head.quant_method.apply(layer, x, bias)` on this embedding.
+The Spyre model wrapper has by then moved hidden_states to CPU while
+the embedding weight stays on Spyre, so the upstream
+`F.linear(x_cpu, weight_spyre, bias)` hits torch-spyre's decomposition
+wrapper with mixed devices. The Spyre apply below converts x to the
+weight device, runs the linear on Spyre, and returns the result on the
+original input device — matching `SpyreParallelLMHead.forward_oot`.
 """
 
 import torch
@@ -31,7 +42,40 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
+from .utils import convert
+
 logger = init_logger(__name__)
+
+
+class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
+    """quant_method for SpyreVocabParallelEmbedding.
+
+    Inherits the upstream embedding lookup unchanged (reached via
+    `SpyreVocabParallelEmbedding.forward`). Overrides `apply` only —
+    that is the tied-weight lm_head gemm path, where x arrives on CPU
+    (from `_SpyreModelWrapper`) and the embedding weight is on Spyre.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_device = x.device
+        weight_device = layer.weight.device
+        if x_device == weight_device:
+            # Both already on the same device — nothing for us to do.
+            return torch.nn.functional.linear(x, layer.weight, bias)
+        # Move x to where the weight lives (Spyre), run the linear there,
+        # bring the result back to where x came from (CPU for the upstream
+        # logits-processor path).
+        out = torch.nn.functional.linear(
+            convert(x, device=weight_device),
+            layer.weight,
+            bias,
+        )
+        return convert(out, device=x_device)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
@@ -50,6 +94,10 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # Replace the apply() path so the tied-weight lm_head case (lm_head
+        # is this same VocabParallelEmbedding) handles cpu-x / spyre-weight
+        # device conversion. forward (embedding lookup) is unaffected.
+        self.quant_method = SpyreUnquantizedEmbeddingMethod()
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:

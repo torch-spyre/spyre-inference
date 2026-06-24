@@ -28,6 +28,10 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbeddingBase,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
+    Llama3RotaryEmbedding,
+)
+from functools import lru_cache
 
 from .utils import get_layer, register_layer
 
@@ -51,7 +55,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         self._cpu_cos_sin_cache = self.cos_sin_cache
         self._spyre_layer_name = register_layer(self, "spyre_rotary")
 
-    def forward(
+    def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -117,6 +121,13 @@ def _rotary_cpu_op_fake(
     out_q = torch.empty(query.shape, dtype=query.dtype, device=positions.device)
     out_k = torch.empty(key.shape, dtype=query.dtype, device=positions.device)
     return out_q, out_k
+
+
+@RotaryEmbeddingBase.register_oot(name="Llama3RotaryEmbedding")
+class SpyreLlama3RotaryEmbedding(Llama3RotaryEmbedding, SpyreRotaryEmbedding):
+    """OOT Llama3RotaryEmbedding that runs rotary computation on CPU."""
+
+    pass
 
 
 @lru_cache(maxsize=1)

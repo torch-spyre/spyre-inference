@@ -56,16 +56,19 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     eps = 1e-6
+    device = "spyre"
+    dtype = torch.float16
     torch.manual_seed(42)
 
-    x = torch.randn(batch_size, hidden_size, dtype=torch.float16)
-    layer = SpyreRMSNorm(hidden_size, eps=eps)
-    residual = torch.randn(batch_size, hidden_size, dtype=torch.float32) if use_residual else None
+    x = torch.randn(batch_size, hidden_size, dtype=dtype)
+    layer = SpyreRMSNorm(hidden_size, eps=eps).to(dtype)
+    residual = torch.randn(batch_size, hidden_size, dtype=dtype) if use_residual else None
 
     expected = reference_rms_norm(x, layer.weight.data, eps, residual)
 
     # Test forward_oot (Spyre device execution via custom op)
-    actual = layer.forward_oot(x.to("spyre"), residual.to("spyre") if use_residual else None)
+    layer.to(device)
+    actual = layer.forward_oot(x.to(device), residual.to(device) if use_residual else None)
 
     if use_residual:
         expected_norm, expected_resid = expected

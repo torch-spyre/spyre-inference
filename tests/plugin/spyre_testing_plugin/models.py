@@ -67,7 +67,7 @@ class AllowEntry:
 
     Attributes:
         test:            fnmatch glob matched against the test function name.
-        mode:            mandatory_pass | xfail | xfail_strict.
+        mode:            mandatory_pass | skip | xfail | xfail_strict.
         tags:            Free-form labels for traceability (no runtime effect).
         param_skips:     Parameter combinations to skip within this test.
         param_allows:    Parameter combinations to allow (whitelist). If specified,

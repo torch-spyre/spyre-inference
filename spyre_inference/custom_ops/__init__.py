@@ -16,6 +16,7 @@
 
 from functools import lru_cache
 
+from . import attention_dispatch
 from . import parallel_lm_head
 from . import rms_norm
 from . import rotary_embedding
@@ -32,3 +33,4 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
     rms_norm.register()
+    attention_dispatch.register()

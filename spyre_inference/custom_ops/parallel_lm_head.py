@@ -124,9 +124,9 @@ class SpyreParallelLMHead(ParallelLMHead):
         """OOT forward pass — lm_head matmul on Spyre.
 
         Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Runs the compiled F.linear on spyre,
-        performs the tensor slicing operation on CPU and converts back
-        to the original x device (spyre).
+        LogitsProcessor._get_logits(). Converts x (arriving on cpu)
+        to the weight device (residing on spyre), runs the compiled F.linear on spyre
+        and converts back to the x device (cpu).
 
         At TP>1: Each rank computes logits for its vocabulary shard. The weight
         matrix is [num_embeddings_per_partition, hidden_dim], producing logits
@@ -142,10 +142,13 @@ class SpyreParallelLMHead(ParallelLMHead):
         """
         x_device = x.device
 
-        # Due to a limitation of torch-spyre regarding sizes that can be used
+        # Due to indexing operations inside the ModelRunner, which have
+        # to be carried out on cpu due to a torch-spyre limitation,
+        # the input to the SpyreParallelLMHead resides on CPU.
+        # Due to a second limitation of torch-spyre regarding sizes that can be used
         # in a F.linear layer, the original weights need to be padded
         out = F.linear(
-            x,
+            convert(x, device=self.weight.device),
             self.padded_weight.data,
             bias,
         )

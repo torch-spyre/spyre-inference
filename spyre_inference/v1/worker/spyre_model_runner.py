@@ -38,6 +38,7 @@ the SpyreCpuFallbackMixin will be obsolete and most operations will be performed
 
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 
 import torch
@@ -156,12 +157,19 @@ class _SpyreModelWrapper:
             val = kwargs.get(key)
             kwargs_converted[key] = _convert_int(val)
 
+        t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
         def _to_cpu(x):
             return convert(x, device="cpu")
 
-        return tree_map(_to_cpu, result)
+        result = tree_map(_to_cpu, result)
+
+        input_ids = kwargs_converted.get("input_ids")
+        num_tokens = input_ids.shape[0] if input_ids is not None else -1
+        logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
+
+        return result
 
     def __getattr__(self, name):
         return getattr(self._model, name)

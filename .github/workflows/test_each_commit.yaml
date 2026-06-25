@@ -87,7 +87,15 @@ jobs:
               - linux
             image_label: image_spyre_inference
             flags: >-
-              -m "not (distributed or upstream)"
+              -m "not (distributed or upstream or attention)"
+          - cfg: Spyre attention tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+            image_label: image_spyre_inference
+            flags: >-
+              -m "attention and not (distributed or upstream)"
           - cfg: Distributed spyre tests
             runs_on:
               - x86_64

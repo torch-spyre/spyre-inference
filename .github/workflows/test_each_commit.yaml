@@ -134,6 +134,9 @@ jobs:
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
+      # against a gated repo 401s even when the model is on the PVC.
+      HF_HUB_OFFLINE: '1'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

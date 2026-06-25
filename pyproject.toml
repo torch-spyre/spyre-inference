@@ -98,7 +98,12 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu", CMAKE_ARGS = "--f
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
-vllm = { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1" }
+vllm = [
+  # Pre-built CPU wheels (x86_64 + aarch64) — avoids ~30 min C++ kernel compilation on Linux CI.
+  # manylinux_2_35 requires glibc >= 2.35; RHEL 10.2 ships 2.39 so this is compatible.
+  { index = "vllm-cpu", marker = "sys_platform == 'linux'" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1", marker = "sys_platform != 'linux'" },
+]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a6baa9c73b2de0f1b199c2c567d8609720bcf5a8" }
 torch = [
   { index = "pytorch-cpu" },
@@ -124,9 +129,17 @@ members = ["tests/plugin"]
 #     "ninja",
 # ]
 
+# Pre-built vllm CPU wheels (x86_64 + aarch64 Linux). The path component is the git commit SHA
+# for the pinned rev (v0.20.1 = 132765e3560659ff63ebd236203672e991b70e08). Update both this hash
+# and the rev in tool.uv.sources together when bumping vllm.
+[[tool.uv.index]]
+name = "vllm-cpu"
+url = "https://wheels.vllm.ai/132765e3560659ff63ebd236203672e991b70e08/cpu"
+explicit = true
+
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set
-# it for in `tool.uv.sources`. This is important to avoid requiring the use of 
+# it for in `tool.uv.sources`. This is important to avoid requiring the use of
 # `--index-strategy unsafe-best-match`
 [[tool.uv.index]]
 name = "pytorch-cpu"

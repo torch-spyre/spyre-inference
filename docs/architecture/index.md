@@ -70,11 +70,6 @@ without any compact-gather step:
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ` → `+ tile_mask` → online softmax → `@ V` |
 | 5. Per-token write-back | Spyre | `spyre.overwrite` each result token into the output buffer |
 
-A second backend selectable via `SPYRE_ATTN_IMPL=exp` (file
-`spyre_attn_exp.py`) keeps the older "gather compact KV → single 4D attention call →
-trim padding" pipeline. It is gated on `max_num_seqs=1` and an explicit
-`num_gpu_blocks_override`, and is preserved for benchmarking the on-device-cache path.
-
 Key constraints:
 
 - **KV length alignment**: 256 tokens (avoids per-step recompilation on Spyre)

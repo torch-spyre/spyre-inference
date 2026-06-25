@@ -224,6 +224,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load model and compile for Spyre."""
         logger.info("Loading model %s...", self.model_config.model)
+        t0 = time.time()
 
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -261,6 +262,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # their weights moved.
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
+        logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
@@ -271,8 +273,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # indexing (logits_indices), lm_head (CPU weights), and sampling all
         # receive CPU tensors without needing per-call-site overrides.
         self.model = _SpyreModelWrapper(self.model, self._spyre_device)
-
-        logger.info("Model loaded and compiled for Spyre.")
 
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
@@ -304,13 +304,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Custom ops (spyre_rmsnorm, spyre_cpu_fallback, etc.) are opaque
         # to dynamo but don't cause graph breaks — fullgraph=True is safe.
         # dynamic=False ensures static shapes (Spyre can't handle SymInt).
+        t0 = time.time()
         self.model = torch.compile(
             self.model,
             backend="inductor",
             fullgraph=True,
             dynamic=False,
         )
-        logger.info("Model compiled for Spyre (backend=inductor)")
+        logger.info("Model compiled for Spyre (backend=inductor) in %.3fs.", time.time() - t0)
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up the model.
@@ -323,13 +324,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         When enforce_eager=False, this also triggers torch.compile.
         """
         logger.info("Warming up model...")
+        t0 = time.time()
         num_tokens = min(
             max(16, self.max_num_reqs),
             self.scheduler_config.max_num_batched_tokens,
         )
         with _set_spyre_compilation_settings(self.vllm_config):
             self._dummy_run(num_tokens)
-        logger.info("Warmup done.")
+        logger.info("Warmup done in %.3fs.", time.time() - t0)
 
     # --- KV cache allocation ---
 

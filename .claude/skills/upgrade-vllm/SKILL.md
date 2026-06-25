@@ -9,6 +9,29 @@ description: Bump the pinned vLLM version in `pyproject.toml`, re-sync the upstr
 
 This skill runs the bump, then debugs the failures in a fixed order so you don't waste a 50s vllm rebuild on a fix that turns out to be in test-infra.
 
+## The OOT platform trap
+
+Read this before doing anything else — this pitfall can appear in any test category.
+
+Our platform sets `_enum = PlatformEnum.OOT`. This means `current_platform.is_cpu()` returns `False`, even though we inherit from `CpuPlatform` and set `device_type = "cpu"`. Every release, upstream adds new wrappers to `Worker` or `Platform` methods that call `is_cpu()` (or `is_cuda_alike()`, or similar predicates) to short-circuit to a no-op, and raise `RuntimeError` for anything else. We fall through to the raise.
+
+**Don't** fix this by overriding `is_cpu()` to return `True`. `vllm/model_executor/custom_op.py` checks `is_cpu()` *before* `is_out_of_tree()` in its `forward_*` dispatch, and we rely on `forward_oot` for our custom-op overrides. Forcing `is_cpu()` reroutes every `CustomOp` to `forward_cpu`.
+
+**Do** add a surgical override on `TorchSpyreWorker` (or `TorchSpyrePlatform` if the wrapper is on `Platform`). The fix is always the same shape: return whatever no-op the CPU branch would have returned (usually `nullcontext()` or `None`), and leave a comment explaining why you're not fixing `is_cpu()`. For example, the v0.23.0 bump introduced a memory-pool context wrapper in `Worker.load_model`:
+
+```python
+def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+    # gpu_worker.Worker wraps weight loading in a memory-pool context that
+    # short-circuits to nullcontext() when current_platform.is_cpu() is True.
+    # Our platform reports OOT (so custom-op forward_oot dispatch works), so
+    # the upstream check falls through and raises. Spyre weights live
+    # on-device, not in a host-side cumem allocator, so a nullcontext is the
+    # correct behaviour.
+    return nullcontext()
+```
+
+The specific methods that need overrides change with every release — **read the upstream diff** rather than assuming the same set as last time. Search `gpu_worker.py` and `platform.py` in the new rev for `is_cpu()` / `is_cuda_alike()` / `is_out_of_tree()` guards that weren't there before.
+
 ## When to use
 
 User-facing triggers: "bump vllm", "upgrade vllm", "update to the latest vllm release", "pull up the lower bound", "track vllm <commit>", "rebase onto vllm main".
@@ -129,26 +152,9 @@ uv run --no-sync pytest tests/test_spyre_attn.py -m "not upstream" --no-header
 uv run --no-sync pytest tests/test_vllm_spyre_next.py -m "not upstream" --no-header
 ```
 
-This is where the **`_enum = PlatformEnum.OOT` traps** live. The pattern: `vllm.v1.worker.gpu_worker.Worker.<some method>` adds a new wrapper that calls `current_platform.is_cpu()` (or `is_cuda_alike()`, etc.) to short-circuit, raises a `RuntimeError` otherwise. Our platform reports `is_cpu() == False` because `_enum = OOT`, so we hit the raise.
+This is the most common place to hit OOT platform traps (see above). Fix those with surgical `TorchSpyreWorker` overrides as described.
 
-**Don't** override `is_cpu()` to return True — `vllm/model_executor/custom_op.py` checks `is_cpu()` *before* `is_out_of_tree()` in its `forward_*` dispatch, and we rely on `forward_oot` for our custom-op overrides. Forcing `is_cpu()` reroutes every CustomOp to `forward_cpu`.
-
-**Do** add a surgical override in `TorchSpyreWorker` (`spyre_inference/v1/worker/spyre_worker.py`). For example, when v0.23.0 added the sleep-mode allocator pool context to `Worker.load_model`:
-
-```python
-def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
-    # gpu_worker.Worker wraps weight loading in a memory-pool context that
-    # short-circuits to nullcontext() when current_platform.is_cpu() is True.
-    # Our platform reports OOT (so custom-op forward_oot dispatch works), so
-    # the upstream check falls through and raises. Spyre weights live
-    # on-device, not in a host-side cumem allocator, so a nullcontext is the
-    # correct behaviour.
-    return nullcontext()
-```
-
-Look for analogous wrappers added to `Worker.init_device`, `Worker.compile_or_warm_up_model`, `Worker.execute_model`, etc. The pattern is always: import `nullcontext` (or whatever no-op the CPU branch returns), override the method in `TorchSpyreWorker`, leave a comment that explains why we're not just fixing `is_cpu()`.
-
-If the new wrapper is on `Platform` rather than `Worker`, override on `TorchSpyrePlatform` instead — same principle, same comment.
+Not all failures here are OOT traps — also watch for constructor or method signature changes on classes we instantiate or inherit from, new abstract methods on base classes, and import path moves (symbol relocated to a different vLLM module).
 
 ### 3d. Distributed
 
@@ -164,19 +170,13 @@ uv run --no-sync pytest -m "distributed" --no-header
 uv run --no-sync pytest -m "upstream" --no-header
 ```
 
-These run upstream vLLM test files against our backend, filtered by `tests/plugin/spyre_testing_plugin/upstream_tests.yaml`. The most common failure mode is **upstream test infra refactoring** — the test file changes shape, our `patch_backend_list` fixture (in `tests/plugin/spyre_testing_plugin/pytest_plugin.py`) no longer matches. Read the upstream test file at:
-
-```text
-~/.cache/vllm-upstream-tests/worktree-<rev>/tests/v1/attention/test_attention_backends.py
-```
-
-…and diff its assumptions against what `patch_backend_list` does. The recurring trap is the **KV-cache tensor layout**: upstream has flipped between `(2, num_blocks, …)` and `(num_blocks, 2, …)` layouts more than once. Our fixture has to slice this tensor into `(k_pages, v_pages)` lists for `SpyreAttentionImpl.forward`. Check the slicing dim against `create_and_prepopulate_kv_cache` in the upstream test file.
+These run upstream vLLM test files against our backend, filtered by `tests/plugin/spyre_testing_plugin/upstream_tests.yaml`. The most common failure mode is **upstream test infra refactoring** — the test file changes shape, our `patch_backend_list` fixture (in `tests/plugin/spyre_testing_plugin/pytest_plugin.py`) no longer matches. Read the upstream test file — check `upstream_tests.yaml` for the canonical path, or find it under `~/.cache/vllm-upstream-tests/worktree-<rev>/` (the subpath like `tests/v1/attention/test_attention_backends.py` may have moved between releases) — and diff its assumptions against what `patch_backend_list` does. The recurring trap is the **KV-cache tensor layout**: upstream has flipped between `(2, num_blocks, …)` and `(num_blocks, 2, …)` layouts more than once. Our fixture has to slice this tensor into `(k_pages, v_pages)` lists for `SpyreAttentionImpl.forward`. Check the slicing dim against wherever the upstream test constructs the KV cache (e.g. a function like `create_and_prepopulate_kv_cache` — name may differ in the new rev).
 
 Other upstream-side patterns to watch for:
 
-- New `BatchSpec` entries that don't fit our block_size=64 / max_model_len=1024 defaults — extend `params.allow` in `upstream_tests.yaml` or skip the new variant.
-- New `BACKENDS_TO_TEST` defaults (we patch `BACKENDS_TO_TEST` to `[CUSTOM]` only; if the variable name moves, the patch silently no-ops and every backend runs).
-- `_test_backend_correctness` signature changes — our wrapper forwards `*args, **kwargs` but pins `block_size=64`; if a new positional arg lands before `block_size`, that pin lands in the wrong slot.
+- New batch-spec entries that don't fit our block_size=64 / max_model_len=1024 defaults — extend `params.allow` in `upstream_tests.yaml` or skip the new variant.
+- The list of backends the upstream test iterates over (e.g. a module-level `BACKENDS_TO_TEST` constant — name may differ): we patch it to `[CUSTOM]` only; if the variable name or location moves, the patch silently no-ops and every backend runs.
+- Signature changes on the inner correctness-checking function that `patch_backend_list` wraps (e.g. `_test_backend_correctness` — name may differ): our wrapper forwards `*args, **kwargs` but pins `block_size=64`; if a new positional arg lands before `block_size`, that pin lands in the wrong slot.
 
 If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kernel-specific behaviour), block-list it in `upstream_tests.yaml` rather than papering over with a tolerance bump.
 

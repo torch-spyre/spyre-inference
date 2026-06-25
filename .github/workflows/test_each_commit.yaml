@@ -140,6 +140,7 @@ jobs:
         with:
           # Avoid using single or double quotes for multiline patterns.
           files: |
+            .github/workflows/test_each_commit.yaml
             .github/actions/build-spyre-deps/action.yml
             .github/actions/spyre-uv-cache/action.yml
             pyproject.toml

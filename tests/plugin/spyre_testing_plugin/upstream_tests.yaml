@@ -93,6 +93,9 @@ tests:
         - test: "test_distributed"
           mode: mandatory_pass
           tags: [transformers, upstream, uses_subprocess, distributed]
+          params:
+            override:
+              model: ["ibm-ai-platform/micro-g3.3-8b-instruct-1b"]
       block_list:
         - test: "test_quantization"
         - test: "test_embed_loading"

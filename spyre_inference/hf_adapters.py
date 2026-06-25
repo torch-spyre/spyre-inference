@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-safe drop-in for vLLM's TransformersForCausalLM.
+"""Drop-in replacement for vLLM's TransformersForCausalLM using hf-adapters.
 
 Registers as a drop-in replacement for vLLM's TransformersForCausalLM when
 the Spyre platform is active.  vLLM's stock Transformers backend handles
-model creation, weight loading, attention routing, KV cache, scheduling,
-and forward execution.  Spyre OOT layers (SpyreRMSNorm, SpyreSiluAndMul,
+model creation, weight loading, attention routing, KV cache, scheduling, and
+forward execution.  Spyre OOT layers (SpyreRMSNorm, SpyreSiluAndMul,
 SpyreLinears, etc.) are applied automatically at instantiation time.
 
-Activated when ``model_impl="transformers"`` on the Spyre platform.
+Activated when ``model_impl="transformers"`` on the Spyre platform via
+``register_hf_adapters()``.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
+from hf_adapters.hf_common import PrecomputedRotaryEmbedding, apply_rope_matmul
 from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
-from spyre_inference.custom_ops.utils import convert
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -43,47 +44,35 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _cpu_safe_apply_rotary(original_fn):
-    """Wrap apply_rotary_pos_emb so rotate_half slicing runs on CPU."""
+class _SpyreRotaryEmbedding(nn.Module):
+    """Drop-in for HF RotaryEmbedding using the same approach followed by hf-adapters.
 
-    @torch.no_grad()
-    def wrapper(q, k, cos, sin, *args, **kwargs):
-        device = q.device
-        if device.type == "cpu":
-            return original_fn(q, k, cos, sin, *args, **kwargs)
-        q_r, k_r = original_fn(
-            convert(q, "cpu"),
-            convert(k, "cpu"),
-            convert(cos, "cpu"),
-            convert(sin, "cpu"),
-            *args,
-            **kwargs,
-        )
-        return convert(q_r, device), convert(k_r, device)
+    Returns ``(rotation_matrices, None)`` matching HF's ``(cos, sin)`` API.
+    The patched ``apply_rotary_pos_emb`` uses ``apply_rope_matmul`` with the
+    rotation matrices and ignores the second element.
+    """
 
-    wrapper._spyre_patched = True  # type: ignore[attr-defined]
-    return wrapper
-
-
-class _CpuSafeRotaryEmbedding(nn.Module):
-    """Wraps HF RotaryEmbedding to run RoPE computation on CPU."""
-
-    def __init__(self, original: nn.Module):
+    def __init__(self, original: nn.Module, head_dim: int):
         super().__init__()
-        self.original = original
+        self._pre = PrecomputedRotaryEmbedding(original, padded_head_dim=head_dim)
 
     def _apply(self, fn, recurse=True):
         return self
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor):
-        device, dtype = x.device, x.dtype
-        cpu_x = convert(x, "cpu") if device.type != "cpu" else x
-        cpu_pos = (
-            convert(position_ids, "cpu") if position_ids.device.type != "cpu" else position_ids
-        )
-        cos, sin = self.original(cpu_x, cpu_pos)
-        return convert(cos, device, dtype), convert(sin, device, dtype)
+        return self._pre(x, position_ids), None
+
+
+def _make_spyre_apply_rotary(original_fn):
+    """Replace apply_rotary_pos_emb with the same approach followed by hf-adapters."""
+
+    @torch.no_grad()
+    def wrapper(q, k, cos, sin=None, *args, **kwargs):
+        return apply_rope_matmul(q, cos), apply_rope_matmul(k, cos)
+
+    wrapper._spyre_patched = True  # type: ignore[attr-defined]
+    return wrapper
 
 
 class HfAdaptersForCausalLM(TransformersForCausalLM):
@@ -131,14 +120,19 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
         )
 
     def _patch_rope(self):
-        """Wrap RotaryEmbedding modules and patch apply_rotary_pos_emb."""
+        """Replace RotaryEmbedding with the same approach followed by hf-adapters."""
+        text_config = self.config.get_text_config()
+        head_dim = getattr(text_config, "head_dim", None) or (
+            text_config.hidden_size // text_config.num_attention_heads
+        )
+
         for name, module in self.model.named_modules():
             if module.__class__.__name__.endswith("RotaryEmbedding") and not isinstance(
-                module, _CpuSafeRotaryEmbedding
+                module, _SpyreRotaryEmbedding
             ):
                 pname, _, attr = name.rpartition(".")
                 parent = self.model.get_submodule(pname) if pname else self.model
-                setattr(parent, attr, _CpuSafeRotaryEmbedding(module))
+                setattr(parent, attr, _SpyreRotaryEmbedding(module, head_dim))
 
         patched: set[int] = set()
         for _, module in self.model.named_modules():
@@ -151,5 +145,11 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
             orig = getattr(mod, "apply_rotary_pos_emb", None)
             if orig is None or getattr(orig, "_spyre_patched", False):
                 continue
-            mod.apply_rotary_pos_emb = _cpu_safe_apply_rotary(orig)
+            mod.apply_rotary_pos_emb = _make_spyre_apply_rotary(orig)
             patched.add(id(mod))
+
+
+# vLLM's Transformers backend test checks ModelConfig.using_transformers_backend()
+# compares _ModelInfo.architecture (set to model_cls.__name__) against "TransformersForCausalLM".
+# Without this, the subclass name "HfAdaptersForCausalLM" causes that check to return False.
+HfAdaptersForCausalLM.__name__ = "TransformersForCausalLM"

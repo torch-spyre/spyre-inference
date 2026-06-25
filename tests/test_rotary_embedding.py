@@ -71,9 +71,9 @@ def test_llama3_rotary_forward_matches_reference(default_vllm_config):
         dtype=torch.float16,
     )
 
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
-    query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
-    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long, device="spyre")
+    query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device="spyre")
+    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device="spyre")
 
     # Spyre path (forward_oot bounces to CPU)
     actual_query, actual_key = rope.forward_oot(positions, query, key)
@@ -83,8 +83,10 @@ def test_llama3_rotary_forward_matches_reference(default_vllm_config):
         rope, positions.cpu(), query.cpu(), key.cpu()
     )
 
-    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.rotary
@@ -107,9 +109,9 @@ def test_base_rotary_forward_matches_reference(default_vllm_config):
         dtype=torch.float16,
     )
 
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
-    query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
-    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long, device="spyre")
+    query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device="spyre")
+    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16, device="spyre")
 
     actual_query, actual_key = rope.forward_oot(positions, query, key)
 
@@ -117,5 +119,7 @@ def test_base_rotary_forward_matches_reference(default_vllm_config):
         rope, positions.cpu(), query.cpu(), key.cpu()
     )
 
-    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)

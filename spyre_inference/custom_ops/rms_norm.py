@@ -14,14 +14,8 @@
 
 """Spyre OOT replacement for RMSNorm.
 
-Inputs and outputs both reside on Spyre, so forward_oot is fully traceable
-by Dynamo and no custom op boundary is needed. The kernel itself is wrapped
-in _maybe_compile so it is compiled independently when called eagerly.
-
 Spyre constraints:
-    - Computation is performed in torch.float16.
-    - No dtype promotion to float32 (not yet supported in torch-spyre), so
-      numerical results may differ slightly from upstream vLLM.
+    - No dtype promotion to float32 (not yet supported in torch-spyre)
     - variance_epsilon is materialized as a tensor (scalar broadcast unsupported).
 
 References:
@@ -83,13 +77,13 @@ class SpyreRMSNorm(RMSNorm):
         if x.shape[-1] != hidden_size:
             raise ValueError(f"Expected hidden_size to be {hidden_size}, but found: {x.shape[-1]}")
 
-        variance_epsilon_t = torch.full(
-            x.shape, variance_epsilon, dtype=torch.float16, device=x.device
-        )
+        # variance_epsilon_t = torch.full(
+        #     x.shape, variance_epsilon, dtype=torch.float16, device=x.device
+        # )
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
-        x = x * torch.rsqrt(variance + variance_epsilon_t)
+        x = x * torch.rsqrt(variance + variance_epsilon)
 
         if weight is not None:
             x = x * weight

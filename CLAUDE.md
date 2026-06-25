@@ -26,7 +26,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Custom Operations (OOT - Out-of-Tree):**
 
 - `spyre_inference/custom_ops/` - Device-specific layer implementations:
-    - `linear.py` - `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`
+    - `linear.py` - `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`
     - `rms_norm.py`, `rotary_embedding.py`, `silu_and_mul.py`, `vocab_parallel_embedding.py`, `parallel_lm_head.py`
 
 **Attention Implementation:**

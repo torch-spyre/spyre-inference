@@ -22,6 +22,7 @@ from functools import lru_cache
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
@@ -38,18 +39,11 @@ logger = init_logger(__name__)
 
 
 class _SpyreRotaryMixin:
-    """Adds Spyre CPU-fallback wiring to a RotaryEmbedding subclass.
-
-    Linear inheritance avoids the diamond MRO that arises when combining
-    SpyreRotaryEmbedding and another RotaryEmbedding subclass.
-    """
+    """Adds Spyre CPU-fallback wiring to a RotaryEmbedding subclass."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Hold a CPU-side reference to cos_sin_cache. torch-spyre's patched
-        # nn.Module.to walks _buffers directly and rebinds each entry to a
-        # Spyre copy, bypassing _apply; this regular attribute (not in
-        # _buffers) keeps the original CPU tensor alive for the CPU op body.
+        # Hold a CPU-side reference to cos_sin_cache.
         self._cpu_cos_sin_cache = self.cos_sin_cache
         self._spyre_layer_name = register_layer(self, "spyre_rotary")
 
@@ -147,6 +141,6 @@ def register():
         op_func=_rotary_cpu_op_func,
         fake_impl=_rotary_cpu_op_fake,
         mutates_args=[],
-        dispatch_key="CompositeExplicitAutograd",
+        dispatch_key=current_platform.dispatch_key,
     )
     logger.debug_once("Registered custom op: spyre_rotary_cpu")

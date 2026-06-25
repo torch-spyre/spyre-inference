@@ -16,25 +16,10 @@
 
 Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
 
-Architecture:
-    - OOT Registration: @ParallelLMHead.register_oot() replaces upstream
-      at instantiation
-    - forward_oot(): Entry point for OOT dispatch, handles device conversion
-      and runs the compiled F.linear on Spyre
-    - Separate Compilation: forward_spyre is compiled independently via
-      maybe_compile (no opaque custom-op boundary)
-    - quant_method override: SpyreUnquantizedLMHeadMethod.apply() calls
-      forward_oot() so that LogitsProcessor._get_logits() routes through
-      the Spyre path
-
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
     - No quantization support: only UnquantizedEmbeddingMethod is replaced
-
-References:
-    - Upstream ParallelLMHead:
-      vllm/model_executor/layers/vocab_parallel_embedding.py
 """
 
 import torch
@@ -85,17 +70,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
-    """OOT ParallelLMHead that executes the lm_head matmul on Spyre.
-
-    Weights reside on Spyre after model.to(spyre_device).
-    The quant_method is replaced so that LogitsProcessor._get_logits()
-    routes through forward_oot, which handles device conversion
-    and runs F.linear on Spyre.
-
-    Supports TP>=1: With TP>1, the vocabulary is sharded across ranks.
-    Each rank computes logits for its vocabulary partition
-    [vocab_size/tp_size, hidden_dim]. The sampler gathers logits when needed.
-    """
+    """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device."""
 
     padding: int
     padded_weight: torch.Tensor
@@ -121,17 +96,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        """OOT forward pass — lm_head matmul on Spyre.
-
-        Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Runs the compiled F.linear on spyre,
-        performs the tensor slicing operation on CPU and converts back
-        to the original x device (spyre).
-
-        At TP>1: Each rank computes logits for its vocabulary shard. The weight
-        matrix is [num_embeddings_per_partition, hidden_dim], producing logits
-        [num_tokens, num_embeddings_per_partition]. The sampler gathers these
-        sharded logits across ranks when needed.
+        """OOT forward pass.
 
         Args:
             x: Hidden states tensor [num_tokens, hidden_dim]

@@ -15,6 +15,7 @@
 """A Torch Spyre worker class."""
 
 import os
+from contextlib import AbstractContextManager, nullcontext
 
 import torch
 
@@ -44,6 +45,16 @@ class TorchSpyreWorker(CPUWorker):
     Inherits from CPUWorker but extends init_device to:
     - Create a TorchSpyreModelRunner with torch.device("spyre")
     """
+
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        # vllm.v1.worker.gpu_worker.Worker.load_model wraps weight loading in
+        # a memory pool context that calls get_mem_allocator_instance(). That
+        # only short-circuits to nullcontext() when current_platform.is_cpu()
+        # returns True; our platform reports OOT (so custom-op forward_oot
+        # dispatch works), so the upstream check falls through and raises.
+        # Spyre weights live on-device, not in a host-side cumem allocator,
+        # so a nullcontext is the correct behaviour here.
+        return nullcontext()
 
     def init_device(self) -> None:
         # Populate the env vars that `libspyre_comms.so` reads at dlopen

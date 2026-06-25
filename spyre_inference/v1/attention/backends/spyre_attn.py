@@ -84,7 +84,12 @@ def _overwrite(
     if output.device.type == "spyre":
         # `torch.ops.spyre.overwrite` is dynamically registered, so its
         # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(input, output, dims, offsets)
+        torch.ops.spyre.overwrite(
+            input,  # ty: ignore[invalid-argument-type]
+            output,  # ty: ignore[invalid-argument-type]
+            dims,  # ty: ignore[invalid-argument-type]
+            offsets,  # ty: ignore[invalid-argument-type]
+        )
     else:
         # intended behaviour on cpu
         sliced_t = output
@@ -655,7 +660,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
-    def forward(
+    def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]

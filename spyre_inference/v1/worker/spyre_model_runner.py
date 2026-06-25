@@ -397,7 +397,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             kv_caches[layer_name] = kv_caches[target]
 
         bind_kv_cache(
-            kv_caches,
+            kv_caches,  # ty: ignore[invalid-argument-type]
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )

@@ -65,10 +65,10 @@ class _SpyreRotaryMixin:
         # cos_sin_cache is fetched inside the op via get_layer(layer_name);
         # torch.ops dispatcher signature is opaque to the type checker (resolves to `...`).
         out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
-            positions,
-            query,
-            key_in,
-            self._spyre_layer_name,
+            positions,  # ty: ignore[invalid-argument-type]
+            query,  # ty: ignore[invalid-argument-type]
+            key_in,  # ty: ignore[invalid-argument-type]
+            self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
         )
         if key is None:
             return out_q, None

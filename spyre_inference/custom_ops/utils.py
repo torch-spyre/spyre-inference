@@ -120,7 +120,11 @@ def convert(tensor, device=None, dtype=None):
         return None
     if isinstance(device, str):
         device = torch.device(device)
-    return torch.ops.vllm.spyre_convert(tensor, device, dtype)
+    return torch.ops.vllm.spyre_convert(
+        tensor,
+        device,  # ty: ignore[invalid-argument-type]
+        dtype,  # ty: ignore[invalid-argument-type]
+    )
 
 
 @lru_cache(maxsize=1)

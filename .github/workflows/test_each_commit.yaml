@@ -103,7 +103,7 @@ jobs:
               - linux
             image_label: image_spyre_inference
             flags: >-
-              -m "upstream and not distributed"
+              -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
             runs_on:
               - x86_64
@@ -111,7 +111,15 @@ jobs:
               - linux
             image_label: image_spyre_inference
             flags: >-
-              -m "upstream and distributed"
+              -m "upstream and distributed and not model"
+          - cfg: Upstream model vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+            image_label: image_spyre_inference
+            flags: >-
+              -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.

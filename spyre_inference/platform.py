@@ -22,8 +22,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from spyre_inference import envs
-
 
 # When running this plugin on a Mac, we assume it's for local development
 # purposes. However, due to a compatibility issue with vLLM, which overrides
@@ -68,12 +66,7 @@ class TorchSpyrePlatform(CpuPlatform):
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
-    # SPYRE_ATTN_IMPL=exp selects spyre_attn_exp.py; anything else uses spyre_attn.py.
-    if envs.SPYRE_ATTN_IMPL == "exp":
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn_exp.SpyreAttentionBackend"
-    else:
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
-
+    _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     @classmethod

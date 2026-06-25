@@ -25,6 +25,42 @@ on:
         required: false
         type: string
         default: ""
+      ref:
+        description: Branch, tag, or SHA of spyre-inference to check out and test
+        required: false
+        type: string
+        default: ""
+      repository:
+        description: |
+          Full clone URL/owner-name of the spyre-inference fork to check out
+          (e.g. "myuser/spyre-inference"); leave empty for the base repo. Used by
+          the cross-repo Test-With: flow to test a companion fork/branch.
+        required: false
+        type: string
+        default: ""
+      pr_url_hash:
+        description: |
+          Hash of the full URL of the PR that triggered this run.
+          Sent by the internal integration pipeline; unused on push/PR/merge_group.
+        required: false
+        type: string
+        default: ""
+      build_torch_spyre:
+        description: Accepted for dispatch-contract parity with torch-spyre; unused here.
+        required: false
+        type: boolean
+        default: true
+      runner_label:
+        description: |
+          Per-PR ephemeral runner-set IMAGE label to select for runs-on
+          (image_spyre_inference_pr_<component>_<sha12>, e.g.
+          image_spyre_inference_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
+          passes that PR's set label so jobs land on the per-PR image (the changed
+          RPM is baked in -> no runtime sudo). Empty keeps push/PR/merge_group runs
+          on the standing image_spyre_inference set (today's behaviour).
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -49,7 +85,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+            image_label: image_spyre_inference
             flags: >-
               -m "not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -57,7 +93,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+            image_label: image_spyre_inference
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -65,10 +101,21 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-              - image_spyre_inference
+            image_label: image_spyre_inference
             flags: >-
-              -m upstream
-    runs-on: ${{ matrix.runs_on }}
+              -m "upstream and not distributed"
+          - cfg: Upstream distributed vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x2__pvc_1tb_x1
+              - linux
+            image_label: image_spyre_inference
+            flags: >-
+              -m "upstream and distributed"
+    # Compose runner labels from matrix.runs_on and the image label.
+    # When inputs.runner_label is set (per-PR dispatch flow), it replaces
+    # the standing image label with the per-PR image label.
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
     timeout-minutes: 720
     env:
       # The CI env var is very important.
@@ -79,20 +126,29 @@ jobs:
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      # UV_CACHE_DIR is exported by the spyre-uv-cache action below, keyed by
-      # the Spyre image's component manifest hash so torch-spyre wheels built
-      # against one runtime cannot be reused after an image bump.
-      # uv serializes builds of the same package via a per-distribution lock.
-      # On a fresh image-versioned cache dir, several concurrent jobs all try
-      # to build torch-spyre (~50s) and the late arrivals time out at the
-      # default 300s. Bump generously — late jobs just wait, no work is lost.
-      UV_LOCK_TIMEOUT: '1800'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Cross-repo Test-With: companion fork/branch (empty = base repo / dispatched ref).
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
 
-      - name: Configure image-versioned UV cache
+      - name: Compute Spyre image hash
+        id: spyre-uv-cache
         uses: ./.github/actions/spyre-uv-cache
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          # Use local runner temp to avoid ownership/permission issues on $HOME.
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
+          # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
+          # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
+          prune-cache: false
 
       - uses: ./.github/actions/build-spyre-deps
         if: ${{ inputs.torch_spyre_ref != '' }}
@@ -125,6 +181,10 @@ jobs:
           echo "--- repo listing ---"
           ls -lart
           echo "---"
+
+      - name: Dump UV cache info
+        run: |
+          find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
       - name: Build spyre-inference
         env:

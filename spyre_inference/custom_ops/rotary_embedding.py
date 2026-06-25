@@ -24,6 +24,9 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
     RotaryEmbeddingBase,
 )
+from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
+    Llama3RotaryEmbedding,
+)
 from functools import lru_cache
 
 from .utils import convert
@@ -43,7 +46,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # Keep cos_sin_cache on CPU so forward_native can use it directly.
         return self
 
-    def forward(
+    def forward_oot(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -71,6 +74,13 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             else None
         )
         return out_query, out_key
+
+
+@RotaryEmbeddingBase.register_oot(name="Llama3RotaryEmbedding")
+class SpyreLlama3RotaryEmbedding(Llama3RotaryEmbedding, SpyreRotaryEmbedding):
+    """OOT Llama3RotaryEmbedding that runs rotary computation on CPU."""
+
+    pass
 
 
 @lru_cache(maxsize=1)

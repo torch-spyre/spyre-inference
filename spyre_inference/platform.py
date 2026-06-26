@@ -56,12 +56,7 @@ class TorchSpyrePlatform(CpuPlatform):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
-    # Primary dispatch key for direct_register_custom_op. Kept as CPU
-    # because some custom ops receive CPU-only tensors (e.g. rotary_embedding).
-    # All ops are ALSO registered for PrivateUse1 (Spyre) via
-    # register_spyre_dispatch() in each module's register() function,
-    # so dispatch works regardless of tensor device.
-    dispatch_key: str = "CPU"
+    dispatch_key: str = "PrivateUse1"
 
     # Multi-backend init string consumed by both vllm's
     # `init_distributed_environment` and `torch.distributed.new_group`.
@@ -79,18 +74,6 @@ class TorchSpyrePlatform(CpuPlatform):
         _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
 
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
-
-    @classmethod
-    def opaque_attention_op(cls) -> bool:
-        # This is required to keep the output tensor of attention on Spyre.
-        # Inherited from CpuPlatform as True, which would route attention through
-        # torch.ops.vllm.unified_attention_with_output.
-        # This override disables the opaque-op boundary and vLLM then calls the
-        # Attention.forward directly.
-        #
-        # This has though implications for torch.compile, because if
-        # enforce_eager=False, the attention implementation is also traced and compiled.
-        return False
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -137,13 +120,6 @@ class TorchSpyrePlatform(CpuPlatform):
         from vllm.config import CompilationMode
 
         vllm_config.compilation_config.mode = CompilationMode.NONE
-
-        # Force eager execution. torch.compile with the Spyre inductor
-        # backend requires ALL graph tensors on Spyre, but our CPU fallback
-        # ops (embedding, linear, rotary, attention) create intermediate
-        # CPU tensors that the Spyre backend cannot codegen. Once all layers
-        # run natively on Spyre, this can be removed to enable compilation.
-        vllm_config.model_config.enforce_eager = True
 
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would

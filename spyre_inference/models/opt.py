@@ -34,5 +34,5 @@ def _spyre_forward(self, positions: torch.Tensor) -> torch.Tensor:
 
 
 def register() -> None:
-    opt.OPTLearnedPositionalEmbedding.forward = _spyre_forward
+    opt.OPTLearnedPositionalEmbedding.forward = _spyre_forward  # ty: ignore[invalid-assignment]
     logger.info("Patched OPTLearnedPositionalEmbedding.forward for Spyre")

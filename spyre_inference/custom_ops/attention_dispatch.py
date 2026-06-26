@@ -52,11 +52,11 @@ def _cpu_unified_attention_with_output(
         convert(query, device="spyre"),
         convert(key, device="spyre"),
         convert(value, device="spyre"),
-        out,
+        out,  # ty: ignore[invalid-argument-type]
         layer_name,
         output_scale=convert(output_scale, device="spyre"),
         output_block_scale=obs_spyre,
-        kv_cache_dummy_dep=kv_cache_dummy_dep,
+        kv_cache_dummy_dep=kv_cache_dummy_dep,  # ty: ignore[invalid-argument-type]
     )
 
     # mutates_args=["output", "output_block_scale"] in vllm's schema.

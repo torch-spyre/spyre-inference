@@ -44,7 +44,9 @@ class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out = torch.nn.functional.linear(
-            convert(x, device=layer.weight.device), layer.weight, bias
+            convert(x, device=layer.weight.device),
+            layer.weight,  # ty: ignore[invalid-argument-type]
+            bias,
         )
         return convert(out, device=x.device)
 

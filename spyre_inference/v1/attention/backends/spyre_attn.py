@@ -757,6 +757,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
+        num_actual_tokens = attn_metadata.num_actual_tokens
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
@@ -764,6 +765,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
+        )
+
+        # Per-token scatter into a spyre-resident `output` is unworkable today:
+        #   - `output[i:j] = ...` / `narrow(...).copy_(...)` silently smear the
+        #     source across the whole buffer on dim=0 (writes hit row 0).
+        #   - `torch.ops.spyre.overwrite(..., dims=[0], offsets=[q_start+i])`
+        #     does write to the right row, but its compile_once wrapper traces
+        #     once per unique (shape, offset) under `specialize_int=True`. Each
+        #     trace consumes a slot in dynamo's accumulated_cache_size_limit
+        #     (default 256, untouched by torch_spyre._autoload's per-fn 1024
+        #     bump). vLLM's model compile already fills most of that budget;
+        #     these calls tip it over, dynamo bails out to the eager kernel —
+        #     which is the same compile_once wrapper — and we recurse until
+        #     Python's recursion limit (granite repro). Bumping the limit
+        #     unblocks short tests but doesn't scale: with chunked prefill
+        #     disabled, query_len reaches the full prompt length, so a 128K
+        #     context would compile 128K SDSC binaries (hours of compile +
+        #     several GB of cache). Build the full result on CPU and write
+        #     `output` in one bulk copy instead. Revisit when torch-spyre
+        #     lands symbolic-offset overwrite (issues #220 / #1371-3) — one
+        #     compiled binary for any offset would let us scatter on-device.
+        output_cpu = torch.zeros(
+            num_actual_tokens, num_heads, head_size, dtype=output.dtype, device="cpu"
         )
 
         for seq_idx in range(num_seqs):
@@ -809,17 +833,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]
-            # Pull result to CPU before slicing (Spyre slicing is broken),
-            # then transfer each per-token contiguous slice back for scatter.
+            # Pull result to CPU (Spyre transpose+contiguous on the head axes
+            # is broken) and write into the CPU staging buffer; one bulk H2D
+            # at the end of the loop replaces the per-token writes.
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
             result_cpu = result_cpu.transpose(1, 2).contiguous()
-            for i in range(query_len):
-                tok = convert(
-                    result_cpu[0, i : i + 1, :, :].contiguous(),
-                    _target_device,
-                    output.dtype,
-                )
-                _overwrite(tok, output, [0], [q_start + i])
+            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
 
+        output.copy_(convert(output_cpu, device=_target_device))
         return output

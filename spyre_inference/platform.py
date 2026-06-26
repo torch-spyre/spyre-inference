@@ -79,6 +79,15 @@ class TorchSpyrePlatform(CpuPlatform):
         return "torch-spyre"
 
     @classmethod
+    def device_count(cls) -> int:
+        # CpuPlatform returns 1 (CPU = single device); for TP>1 we need the
+        # actual Spyre card count so upstream gates like
+        # `@multi_gpu_test(num_gpus=2)` don't skip on multi-card hosts.
+        import torch
+
+        return torch.spyre.device_count()
+
+    @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:
         # Only log in main process (not in TP workers)
         if multiprocessing.current_process().name != "MainProcess":

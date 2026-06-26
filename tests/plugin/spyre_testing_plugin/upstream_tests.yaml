@@ -108,10 +108,8 @@ tests:
           tags: [granite, upstream, uses_subprocess]
           params:
             override:
-              model: []
-              # - ibm-ai-platform/micro-g3.3-8b-instruct-1b
-              # fails with RecursionError, needs softmax fix
-
+              model:
+                - ibm-ai-platform/micro-g3.3-8b-instruct-1b
               dtype: [torch.float16]
               max_tokens: [2] # one prefill and one decode
 
@@ -143,23 +141,26 @@ tests:
     - rel_path: tests/basic_correctness/test_basic_correctness.py
       allow_list:
         - test: "test_models"
-          mode: skip # (all models still fail)
+          # hardcoded prompt is ~5042 tokens; doesn't fit MAX_MODEL_LEN_CAP=128.
+          # Re-enable once the on-device KV cache cap is raised.
+          mode: skip
           tags: [model, basic_correctness, upstream, uses_subprocess]
           params:
             override:
               model:
-                - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
-                - ibm-ai-platform/micro-g3.3-8b-instruct-1b # needs softmax fix
+                # - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
+                - ibm-ai-platform/micro-g3.3-8b-instruct-1b
               backend: ["CUSTOM"]
               enforce_eager: [true]
         - test: "test_models_distributed"
-          mode: skip
+          mode: mandatory_pass
           tags:
             [model, basic_correctness, upstream, uses_subprocess, distributed]
           params:
             override:
-              model:
-                - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
-                - ibm-granite/granite-3.3-2b-instruct # needs softmax fix
-              distributed_executor_backend: ["external_launcher"]
-              attention_backend: ["CUSTOM"]
+              # Upstream uses a single tuple parametrize keyed
+              # `(model, distributed_executor_backend, attention_backend, test_suite, extra_env)`;
+              # supply the full tuple per row.
+              "model, distributed_executor_backend, attention_backend, test_suite, extra_env":
+                - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "mp", "CUSTOM", "L4", {}]
+              enable_prompt_embeds: [false]

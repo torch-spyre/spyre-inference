@@ -16,11 +16,7 @@
 
 from functools import lru_cache
 
-from vllm.logger import init_logger
-
 from . import opt
-
-logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)

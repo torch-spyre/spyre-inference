@@ -20,6 +20,8 @@ registered for PrivateUse1. Move inputs back to Spyre, re-dispatch, and
 mirror the mutated outputs to the caller's CPU buffers.
 """
 
+from functools import lru_cache
+
 import torch
 
 # Force vllm::unified_attention_with_output to be defined before we add an impl.
@@ -30,8 +32,6 @@ from vllm.utils.torch_utils import vllm_lib
 from .utils import convert
 
 logger = init_logger(__name__)
-
-_SPYRE = "spyre"
 
 
 def _cpu_unified_attention_with_output(
@@ -44,42 +44,32 @@ def _cpu_unified_attention_with_output(
     output_block_scale: torch.Tensor | None = None,
     kv_cache_dummy_dep: torch.Tensor | None = None,
 ) -> None:
-    q = convert(query, device=_SPYRE)
-    k = convert(key, device=_SPYRE)
-    v = convert(value, device=_SPYRE)
     # `output` arrives uninitialized; allocate fresh on Spyre.
-    out = torch.empty_like(output, device=_SPYRE)
-    os_ = convert(output_scale, device=_SPYRE)
-    obs_ = convert(output_block_scale, device=_SPYRE)
+    out = torch.empty_like(output, device="spyre")
+    obs_spyre = convert(output_block_scale, device="spyre")
 
     torch.ops.vllm.unified_attention_with_output(
-        q,
-        k,
-        v,
+        convert(query, device="spyre"),
+        convert(key, device="spyre"),
+        convert(value, device="spyre"),
         out,
         layer_name,
-        output_scale=os_,
-        output_block_scale=obs_,
+        output_scale=convert(output_scale, device="spyre"),
+        output_block_scale=obs_spyre,
         kv_cache_dummy_dep=kv_cache_dummy_dep,
     )
 
     # mutates_args=["output", "output_block_scale"] in vllm's schema.
     output.copy_(out)
     if output_block_scale is not None:
-        output_block_scale.copy_(obs_)
+        output_block_scale.copy_(obs_spyre)
 
 
-_REGISTERED = False
-
-
+@lru_cache(maxsize=1)
 def register() -> None:
-    global _REGISTERED
-    if _REGISTERED:
-        return
     vllm_lib.impl(
         "unified_attention_with_output",
         _cpu_unified_attention_with_output,
         dispatch_key="CPU",
     )
-    _REGISTERED = True
     logger.info("Registered CPU dispatch impl for vllm::unified_attention_with_output")

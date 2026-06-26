@@ -168,7 +168,7 @@ This makes the build boundary reproducible — the next person bumping can tell 
 
 ### 7. Write the PR description
 
-Write to `PR_torch_spyre_bump.md` (do **not** overwrite `PR.md` — it's often holding an unrelated in-flight PR description). Follow `.github/pull_request_template.md`:
+Write to `PR_torch_spyre_bump.md`. Follow `.github/pull_request_template.md`:
 
 ```markdown
 ## Description

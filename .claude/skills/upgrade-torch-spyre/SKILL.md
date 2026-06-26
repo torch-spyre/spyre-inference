@@ -10,6 +10,7 @@ description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, binary-s
 ## When to use
 
 Trigger phrases:
+
 - "bump torch-spyre", "upgrade torch-spyre", "update torch-spyre"
 - "torch-spyre is out of date", "new ibm libs landed"
 - "we should pull up torch-spyre"
@@ -109,7 +110,7 @@ Each invocation writes the full output to `/tmp/spyre-bisect/<short-sha>.log` so
 
 If the tip fails, binary-search:
 
-```
+```text
 low  = -1      # known good (current pin)
 high = N - 1   # known bad (tip)
 while high - low > 1:
@@ -170,7 +171,7 @@ This makes the build boundary reproducible — the next person bumping can tell 
 
 Write to `PR_torch_spyre_bump.md`. Follow `.github/pull_request_template.md`:
 
-```markdown
+````markdown
 ## Description
 
 Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream commits since the previous pin. The remaining <N-K> commits (starting with <#FIRST-FAILING> "<first-failing-title>") need matching `ibm-*` updates and fail the torch-spyre C++ extension build against the currently-installed RPMs.
@@ -202,7 +203,8 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 - [x] <note about inductor cache, if it bit you>
 
 **Reviewer note:** when pulling this branch onto an existing checkout, `rm -rf /tmp/torchinductor_*` before running tests — the cache bakes in references to internals that were renamed/removed across the bump.
-```
+
+````
 
 ## Files touched (typical)
 

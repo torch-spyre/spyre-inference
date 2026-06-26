@@ -163,4 +163,6 @@ tests:
               # supply the full tuple per row.
               "model, distributed_executor_backend, attention_backend, test_suite, extra_env":
                 - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "mp", "CUSTOM", "L4", {}]
-              enable_prompt_embeds: [false]
+            skip:
+              # input embeddings not yet supported on spyre
+              enable_prompt_embeds: [true]

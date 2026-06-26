@@ -83,8 +83,6 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform returns 1 (CPU = single device); for TP>1 we need the
         # actual Spyre card count so upstream gates like
         # `@multi_gpu_test(num_gpus=2)` don't skip on multi-card hosts.
-        import torch
-
         return torch.spyre.device_count()
 
     @classmethod

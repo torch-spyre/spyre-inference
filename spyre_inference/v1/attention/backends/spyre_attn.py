@@ -767,25 +767,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Per-token scatter into a spyre-resident `output` is unworkable today:
-        #   - `output[i:j] = ...` / `narrow(...).copy_(...)` silently smear the
-        #     source across the whole buffer on dim=0 (writes hit row 0).
-        #   - `torch.ops.spyre.overwrite(..., dims=[0], offsets=[q_start+i])`
-        #     does write to the right row, but its compile_once wrapper traces
-        #     once per unique (shape, offset) under `specialize_int=True`. Each
-        #     trace consumes a slot in dynamo's accumulated_cache_size_limit
-        #     (default 256, untouched by torch_spyre._autoload's per-fn 1024
-        #     bump). vLLM's model compile already fills most of that budget;
-        #     these calls tip it over, dynamo bails out to the eager kernel —
-        #     which is the same compile_once wrapper — and we recurse until
-        #     Python's recursion limit (granite repro). Bumping the limit
-        #     unblocks short tests but doesn't scale: with chunked prefill
-        #     disabled, query_len reaches the full prompt length, so a 128K
-        #     context would compile 128K SDSC binaries (hours of compile +
-        #     several GB of cache). Build the full result on CPU and write
-        #     `output` in one bulk copy instead. Revisit when torch-spyre
-        #     lands symbolic-offset overwrite (issues #220 / #1371-3) — one
-        #     compiled binary for any offset would let us scatter on-device.
+        # Scattering into `output` on Spyre dim=0 has no working primitive:
+        # `output[i:j] = ...` and `narrow().copy_(...)` silently write to row 0;
+        # `torch.ops.spyre.overwrite` is deprecated and its compile_once wrapper
+        # compiles one SDSC binary per unique offset, which recurses past the
+        # dynamo cache limit once vLLM's model compile has filled it. Raising
+        # the limit unblocks short tests but compiles N binaries for a
+        # query_len=N prefill, which doesn't scale to long contexts. Stage the
+        # result on CPU and bulk-copy at the end of the per-sequence loop.
+        # Revisit when torch-spyre lands symbolic-offset overwrite
+        # (torch-spyre#220 / #1371-3).
         output_cpu = torch.zeros(
             num_actual_tokens, num_heads, head_size, dtype=output.dtype, device="cpu"
         )

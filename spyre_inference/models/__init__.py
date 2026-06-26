@@ -12,27 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""This module contains all custom ops for spyre"""
+"""Spyre patches for vLLM model code that hits Spyre op gaps."""
 
 from functools import lru_cache
 
-from . import attention_dispatch
-from . import parallel_lm_head
-from . import rms_norm
-from . import rotary_embedding
-from . import linear
-from . import silu_and_mul
-from . import utils
-from . import vocab_parallel_embedding  # noqa: F401
 from vllm.logger import init_logger
+
+from . import opt
 
 logger = init_logger(__name__)
 
 
 @lru_cache(maxsize=1)
-def register_all():
-    logger.info("Registering custom ops for spyre_inference")
-    rotary_embedding.register()
-    rms_norm.register()
-    utils.register()
-    attention_dispatch.register()
+def register_all() -> None:
+    opt.register()

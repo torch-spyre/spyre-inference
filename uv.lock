@@ -584,12 +584,12 @@ name = "black"
 version = "26.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "mypy-extensions" },
-    { name = "packaging" },
-    { name = "pathspec" },
-    { name = "platformdirs" },
-    { name = "pytokens" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "mypy-extensions", marker = "sys_platform != 'emscripten'" },
+    { name = "packaging", marker = "sys_platform != 'emscripten'" },
+    { name = "pathspec", marker = "sys_platform != 'emscripten'" },
+    { name = "platformdirs", marker = "sys_platform != 'emscripten'" },
+    { name = "pytokens", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c0/37/5628dd55bf2b34257fc7603f0fe97c40e3aaf24265f416a9c85c95ca1436/black-26.5.1.tar.gz", hash = "sha256:dd321f668053961824bcc1be1cc1df748b2d7e4fa28086b08331e577b0100a73", size = 679439, upload-time = "2026-05-18T16:53:36.107Z" }
 wheels = [
@@ -1482,7 +1482,7 @@ name = "decord"
 version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy" },
+    { name = "numpy", marker = "platform_machine != 'aarch64' or platform_machine in 's390x, ppc64le'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl", hash = "sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976", size = 13602299, upload-time = "2021-06-14T21:30:55.486Z" },
@@ -2889,7 +2889,7 @@ version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/37/69/a4dc4e0f0018a0e558b716e90bcb19cb6a8c7506f68e89a1493608cf5e62/instanttensor-0.1.9.tar.gz", hash = "sha256:d8692b97991c1a5fb2db7905b9a6ae90a7f967c7ddd853d35e41caa146750c02", size = 9618304, upload-time = "2026-05-27T21:33:46.45Z" }
 wheels = [
@@ -7551,7 +7551,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=a6baa9c73b2de0f1b199c2c567d8609720bcf5a8" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=ad5902f9ce75be9f5a2383e7828db1f041909a28" },
     { name = "vllm", marker = "sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.23.0" },
     { name = "vllm", marker = "sys_platform == 'linux'", specifier = ">=0.23.0,<0.24", index = "https://wheels.vllm.ai/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/cpu" },
 ]
@@ -8320,7 +8320,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=a6baa9c73b2de0f1b199c2c567d8609720bcf5a8#a6baa9c73b2de0f1b199c2c567d8609720bcf5a8" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=ad5902f9ce75be9f5a2383e7828db1f041909a28#ad5902f9ce75be9f5a2383e7828db1f041909a28" }
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },
@@ -8370,9 +8370,8 @@ resolution-markers = [
     "python_full_version == '3.12.*' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'darwin') or (platform_machine in 's390x, ppc64le' and sys_platform == 'darwin')" },
-    { name = "pillow", marker = "(python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin') or (platform_machine != 'aarch64' and sys_platform == 'darwin') or (platform_machine in 's390x, ppc64le' and sys_platform == 'darwin')" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
+    { name = "numpy", marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "pillow", marker = "python_full_version >= '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 
 [[package]]
@@ -8391,9 +8390,9 @@ resolution-markers = [
     "python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 dependencies = [
-    { name = "numpy", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "pillow", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
+    { name = "numpy", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "pillow", marker = "(python_full_version < '3.12' and platform_machine in 's390x, ppc64le' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32') or (platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
+    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32')" },
 ]
 
 [[package]]
@@ -8817,7 +8816,6 @@ dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "torchaudio", marker = "platform_machine != 'riscv64' and platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
-    { name = "torchvision", version = "0.27.1", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "python_version < '0'" },
     { name = "torchvision", version = "0.27.1+df56172", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'never'" },
     { name = "tqdm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
     { name = "transformers", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },

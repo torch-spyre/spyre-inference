@@ -103,7 +103,7 @@ jobs:
               - linux
             image_label: image_spyre_inference
             flags: >-
-              -m "upstream and not distributed"
+              -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
             runs_on:
               - x86_64
@@ -112,6 +112,14 @@ jobs:
             image_label: image_spyre_inference
             flags: >-
               -m "upstream and distributed"
+          - cfg: Upstream model vLLM tests
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+            image_label: image_spyre_inference
+            flags: >-
+              -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.
@@ -126,6 +134,9 @@ jobs:
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
+      # against a gated repo 401s even when the model is on the PVC.
+      HF_HUB_OFFLINE: '1'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

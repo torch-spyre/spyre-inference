@@ -59,20 +59,26 @@ tests:
             atol: 1e-2
             rtol: 1e-2
 
-    # Model tests are now failing too :(
     - rel_path: tests/models/language/generation/test_common.py
       allow_list:
         - test: "test_models"
-          mode: skip
+          mode: mandatory_pass
           # uses_subprocess marker is added to make these tests run first.
           # This must be added for any sets of tests that use `vllm.LLM`
           tags: [model, upstream, uses_subprocess]
           params:
-            override:
+            allow:
               model:
-                - facebook/opt-125m
-                - ibm-granite/granite-3.3-2b-instruct
-                - Qwen/Qwen3-0.6B
+                # - openai-community/gpt2 # needs opaque-attention CPU dispatch + tied-weight lm_head fix
+                # - facebook/opt-125m # requires a torch-spyre fix for int adds
+                - meta-llama/Llama-3.2-1B-Instruct
+                # - Qwen/Qwen2.5-0.5B-Instruct # needs tied-weight lm_head fix (compute_logits hits cpu/spyre mixed-device decomposition)
+                # - TitanML/tiny-mixtral # needs swa support
+            override:
+              max_tokens: [2] # one prefill and one decode for speed
+            skip:
+              # input embeddings not yet supported on spyre
+              use_prompt_embeds: [true]
 
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
@@ -98,13 +104,16 @@ tests:
     - rel_path: tests/models/language/generation/test_granite.py
       allow_list:
         - test: "test_models"
-          mode: skip # RAS::VFIO::MapDMAFailed - VFIO kernel module unable to map DMA memory region (errno: No space left on device)
+          mode: mandatory_pass
           tags: [granite, upstream, uses_subprocess]
           params:
             override:
-              model:
-                - ibm-granite/granite-3.3-2b-instruct
-              dtype: [torch.float32]
+              model: []
+              # - ibm-ai-platform/micro-g3.3-8b-instruct-1b
+              # fails with RecursionError, needs softmax fix
+
+              dtype: [torch.float16]
+              max_tokens: [2] # one prefill and one decode
 
     - rel_path: tests/models/language/generation_ppl_test/test_qwen.py
       allow_list:
@@ -134,13 +143,13 @@ tests:
     - rel_path: tests/basic_correctness/test_basic_correctness.py
       allow_list:
         - test: "test_models"
-          mode: skip # RAS::VFIO::MapDMAFailed - VFIO kernel module unable to map DMA memory region (errno: No space left on device) on all models
+          mode: skip # (all models still fail)
           tags: [model, basic_correctness, upstream, uses_subprocess]
           params:
             override:
               model:
-                - Qwen/Qwen3-0.6B
-                - ibm-granite/granite-3.3-2b-instruct
+                - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
+                - ibm-ai-platform/micro-g3.3-8b-instruct-1b # needs softmax fix
               backend: ["CUSTOM"]
               enforce_eager: [true]
         - test: "test_models_distributed"
@@ -150,7 +159,7 @@ tests:
           params:
             override:
               model:
-                - Qwen/Qwen3-0.6B
-                - ibm-granite/granite-3.3-2b-instruct
+                - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
+                - ibm-granite/granite-3.3-2b-instruct # needs softmax fix
               distributed_executor_backend: ["external_launcher"]
               attention_backend: ["CUSTOM"]

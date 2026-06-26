@@ -110,11 +110,12 @@ def test_block_size_override_non_default_value():
     assert vllm_config.cache_config.block_size == 128
 
 
-def test_block_size_no_override_user_specified():
-    """Test that user-specified block_size is NOT overridden.
+def test_block_size_override_user_specified():
+    """Test that even user-specified block_size is overridden when invalid.
 
-    When user_specified_block_size is True, the platform should leave
-    block_size as-is. Invalid values will be caught by the backend ValueError.
+    Spyre has a hard requirement for block_size to be a multiple of 64.
+    Even when the user (or test harness) explicitly passes an invalid value,
+    the platform must correct it to avoid a later ValueError.
     """
     from spyre_inference.platform import TorchSpyrePlatform
 
@@ -138,9 +139,9 @@ def test_block_size_no_override_user_specified():
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
-    assert vllm_config.cache_config.block_size == 16, (
-        f"User-specified block_size should not be overridden, "
-        f"expected 16, got {vllm_config.cache_config.block_size}"
+    assert vllm_config.cache_config.block_size == 64, (
+        f"User-specified block_size=16 should be overridden to 64, "
+        f"got {vllm_config.cache_config.block_size}"
     )
 
 

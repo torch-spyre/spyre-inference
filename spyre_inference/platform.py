@@ -65,6 +65,11 @@ class TorchSpyrePlatform(CpuPlatform):
     # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
+    # Hard caps for the on-device KV cache. Large batch volumes trigger
+    # `RAS::VFIO::MapDMAFailed` during `_initialize_kv_caches`.
+    MAX_MODEL_LEN_CAP: int = 128
+    MAX_NUM_SEQS_CAP: int = 8
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -153,22 +158,43 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Clamp the user-facing KV-cache knobs so the auto-derived
+        # `num_gpu_blocks_override` below fits in Spyre's DMA region. Done
+        # before super() because CpuPlatform's logic also reads max_model_len.
+        model_config = vllm_config.model_config
+        if model_config.max_model_len > cls.MAX_MODEL_LEN_CAP:
+            logger.warning(
+                "Spyre's on-device KV cache cannot fit max_model_len=%d; "
+                "clamping to MAX_MODEL_LEN_CAP=%d.",
+                model_config.max_model_len,
+                cls.MAX_MODEL_LEN_CAP,
+            )
+            model_config.max_model_len = cls.MAX_MODEL_LEN_CAP
+
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config.max_num_seqs > cls.MAX_NUM_SEQS_CAP:
+            logger.warning(
+                "Spyre's on-device KV cache cannot fit max_num_seqs=%d; "
+                "clamping to MAX_NUM_SEQS_CAP=%d.",
+                scheduler_config.max_num_seqs,
+                cls.MAX_NUM_SEQS_CAP,
+            )
+            scheduler_config.max_num_seqs = cls.MAX_NUM_SEQS_CAP
+
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The list-based attention backend requires 64-element stick alignment for
-        # torch.compile. Only override default (non-user-specified) values.
+        # torch.compile.
         cache_config = vllm_config.cache_config
-        if not cache_config.user_specified_block_size:
-            original_block_size = cache_config.block_size
-            if original_block_size % 64 != 0:
-                # Round up to nearest multiple of 64
-                new_block_size = ((original_block_size + 63) // 64) * 64
-                logger.warning(
-                    "Block size must be a multiple of 64 for the list-based attention "
-                    "backend. Overriding block_size from %d to %d.",
-                    original_block_size,
-                    new_block_size,
-                )
-                cache_config.block_size = new_block_size
+        original_block_size = cache_config.block_size
+        if original_block_size % 64 != 0:
+            new_block_size = ((original_block_size + 63) // 64) * 64
+            logger.warning(
+                "Block size must be a multiple of 64 for the list-based attention "
+                "backend. Overriding block_size from %d to %d.",
+                original_block_size,
+                new_block_size,
+            )
+            cache_config.block_size = new_block_size
 
         parallel_config = vllm_config.parallel_config
 

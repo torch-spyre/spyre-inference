@@ -16,7 +16,6 @@
 
 Spyre constraints:
     - No dtype promotion to float32 (not yet supported in torch-spyre)
-    - variance_epsilon is materialized as a tensor (scalar broadcast unsupported).
 
 References:
     - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py

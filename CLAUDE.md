@@ -133,7 +133,7 @@ When editing `./torch-spyre/` (or any sibling checkout) and reinstalling via `uv
 ## Spyre-Specific Constraints
 
 - **Device alignment**: Head size must be multiple of 64 (128-byte stick size / 2 bytes for float16)
-- **No tensor parallelism**: Custom linear layers assume TP=1
+- **Tensor parallelism**: TP≥1 supported (custom linear layers handle weight sharding + `all_reduce` via `SpyreCommunicator` — see `docs/architecture/index.md` "Distributed (TP)"). **DP>1 is rejected** in `TorchSpyrePlatform.check_and_update_config`; the spyre-comms global rank space hasn't been validated for DP×TP.
 - **dtype**: float16 only (model_config.dtype check in platform.py)
 - **Compilation**: Platform-level compile is set to `CompilationMode.NONE` due to CPU fallback ops creating intermediates. **Caveat**: under the pytest `default_vllm_config` fixture, `cfg.mode` is Python `None` (not the `NONE=0` enum), so per-module gates like `_maybe_compile` in `spyre_attn.py` may still wrap kernels with `torch.compile(..., dynamic=False)`. Don't assume "eager in tests" when comparing pytest behavior to a plain script.
 - **Single accelerator**: Spyre is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/`xdist`, no parallel `uv run pytest` invocations, no backgrounding one Spyre test while starting another. Parallel invocations hang, produce undefined device state, or corrupt the compile cache.

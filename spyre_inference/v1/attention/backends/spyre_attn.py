@@ -777,9 +777,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # result on CPU and bulk-copy at the end of the per-sequence loop.
         # Revisit when torch-spyre lands symbolic-offset overwrite
         # (torch-spyre#220 / #1371-3).
-        output_cpu = torch.zeros(
-            num_actual_tokens, num_heads, head_size, dtype=output.dtype, device="cpu"
-        )
+        output_cpu = torch.zeros_like(output, device="cpu")
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization

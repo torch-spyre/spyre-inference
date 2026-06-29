@@ -757,7 +757,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
-        num_actual_tokens = attn_metadata.num_actual_tokens
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table

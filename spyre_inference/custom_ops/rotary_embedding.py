@@ -96,6 +96,9 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             and (self.rotary_dim // 2) % _SPYRE_STICK == 0
         )
         self._rotation_cache: torch.Tensor | None = None
+        # Per-forward-pass caching of the gathered+transferred rotation slice
+        self._rotation_cache_slice: torch.Tensor | None = None
+        self._rotation_cache_key: tuple | None = None
 
     def _apply(self, fn, recurse=True):
         # Keep cos_sin_cache on CPU so forward_native can use it directly.
@@ -109,6 +112,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         cos_sin_cache is [max_pos, rotary_dim] = cat((cos, sin)); reshape into
         [max_pos, 2, 2, rotary_dim//2] rotation matrices [[cos, -sin], [sin, cos]].
         """
+        # ToDO ysc: need to make sure to trigger this in model warmup before serving a model.
         if self._rotation_cache is None:
             cpu_cache = convert(self.cos_sin_cache, device="cpu", dtype=torch.float32)
             assert cpu_cache is not None
@@ -148,24 +152,33 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
                 else None,
             )
 
-        # new implemenation: do rotation on Spyre, but keep cache on CPU:
+        # new implementation: do rotation on Spyre, but keep cache on CPU.
         # Gather the per-token rotation matrices on CPU (Spyre has no eager
-        # index_select), then move to Spyre and apply rotation on device.
+        # index_select) and move the slice to Spyre for the first attention layer.
+        # Keep the slice on device and reuse for later attention layers as positions
+        # are shared accross the layers (detection via cache_key below).
         cpu_positions = convert(positions, device="cpu")
         assert cpu_positions is not None
-        selected = self._get_rotation_cache().index_select(0, cpu_positions.flatten())
-        sel = convert(selected, device=target_device, dtype=target_dtype)
+        cpu_positions = cpu_positions.flatten()
+        cache_key = (hash(tuple(cpu_positions.tolist())), target_device, target_dtype)
+        if self._rotation_cache_slice is not None and self._rotation_cache_key == cache_key:
+            rot = self._rotation_cache_slice
+        else:
+            selected = self._get_rotation_cache().index_select(0, cpu_positions)
+            rot = convert(selected, device=target_device, dtype=target_dtype)
+            self._rotation_cache_slice = rot
+            self._rotation_cache_key = cache_key
         # move q/k to the device (a real transfer only on the first layer;
         # later layers already have them on Spyre)
         q = convert(query, device=target_device, dtype=target_dtype)
         k = convert(key, device=target_device, dtype=target_dtype) if key is not None else None
 
         out_query = convert(
-            _rotate_neox_2x2(q, sel, self.head_size), device=target_device, dtype=target_dtype
+            _rotate_neox_2x2(q, rot, self.head_size), device=target_device, dtype=target_dtype
         )
         out_key = (
             convert(
-                _rotate_neox_2x2(k, sel, self.head_size), device=target_device, dtype=target_dtype
+                _rotate_neox_2x2(k, rot, self.head_size), device=target_device, dtype=target_dtype
             )
             if k is not None
             else None

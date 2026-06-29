@@ -40,9 +40,11 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 
 import numpy as np
@@ -58,6 +60,66 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
+
+# Observed Spyre DMA failure threshold for encoder-only dummy batches with
+# multiple sequences.  Pooling warmup stays below this limit.
+SPYRE_ENCODER_DMA_TOKEN_LIMIT = 30
+# Token count for pooling warmup (single sequence), kept under the DMA limit.
+SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
+
+
+# Cache of dynamically created CPU-embedding subclasses, keyed by the original
+# embedding class, so ``__class__`` reassignment stays cheap and idempotent.
+_CPU_EMBEDDING_SUBCLASSES: dict[type, type] = {}
+
+
+class _CpuEmbeddingMixin:
+    """``nn.Embedding`` forward that gathers on CPU and returns on the table's device.
+
+    torch-spyre has no embedding kernel, so the gather runs on CPU and the
+    result is moved back to the (Spyre) weight device. Installed via
+    ``__class__`` reassignment so dispatch goes through ``nn.Module.__call__``.
+    """
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        weight = cast(torch.Tensor, self.weight.data)
+        weight_cpu = weight.cpu()
+        out = F.embedding(
+            input.cpu(),
+            weight_cpu,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scale_grad_by_freq,
+            self.sparse,
+        )
+        return convert(out, device=weight.device)
+
+
+def _cpu_embedding_subclass(base: type) -> type:
+    """Return (and cache) a ``base`` subclass mixing in the CPU-gather forward."""
+    cls = _CPU_EMBEDDING_SUBCLASSES.get(base)
+    if cls is None:
+        cls = type(f"SpyreCpu{base.__name__}", (_CpuEmbeddingMixin, base), {})
+        _CPU_EMBEDDING_SUBCLASSES[base] = cls
+    return cls
+
+
+def _patch_encoder_embeddings_cpu(model: nn.Module) -> None:
+    """Retype each ``nn.Embedding`` in a pooling model to gather on CPU.
+
+    The table stays on Spyre (moved with the rest of the model); the retyped
+    forward copies it to CPU, gathers, and returns the result on the table's
+    device. ``VocabParallelEmbedding`` handles this in its own ``forward``.
+    """
+    patched = 0
+    for module in model.modules():
+        if not isinstance(module, nn.Embedding) or isinstance(module, _CpuEmbeddingMixin):
+            continue
+        module.__class__ = _cpu_embedding_subclass(type(module))
+        patched += 1
+
+    logger.info("Patched %d nn.Embedding layer(s) to gather on CPU", patched)
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -114,37 +176,36 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
 
 
 class _SpyreModelWrapper:
-    """Transparent wrapper that converts model inputs/outputs at the boundary.
+    """Converts model inputs/outputs at the device boundary, for every call site.
 
-    Input conversion (CPU → Spyre):
-        For example, input_ids and positions arrive as CPU tensors (int32/int64) because
-        self.device=CPU in the runner and buffer scatter ops run on CPU.
-        Convert them to int64 and provide them to the model.
-
-    Output conversion (Spyre → CPU):
-        The model's final hidden_states come out on Spyre. Downstream
-        operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
-
-    Wrapping at the model level ensures ALL call sites get the right
-    device — both execute_model (via _model_forward) and _dummy_run
-    (which calls self.model(...) directly).
+    Integer inputs move to Spyre int64, except under ``keep_int_inputs_on_cpu``
+    (pooling/encoder) where they stay on CPU. Outputs move to CPU.
     """
 
-    def __init__(self, model: nn.Module, spyre_device: torch.device):
+    def __init__(
+        self,
+        model: nn.Module,
+        spyre_device: torch.device,
+        *,
+        keep_int_inputs_on_cpu: bool = False,
+    ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
+        object.__setattr__(self, "_keep_int_inputs_on_cpu", keep_int_inputs_on_cpu)
 
     def __call__(self, *args, **kwargs):
-        # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
             if (
                 t is not None
                 and isinstance(t, torch.Tensor)
                 and t.dtype in (torch.int32, torch.int64)
             ):
+                if self._keep_int_inputs_on_cpu:
+                    # Pooling path: normalize to int64 on CPU (no Spyre H2D).
+                    if t.dtype != torch.int64:
+                        return t.to(dtype=torch.int64)
+                    return t
                 return convert(t, dtype=torch.int64, device=self._spyre_device)
             return t
 
@@ -203,9 +264,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             super().__init__(vllm_config, torch.device("cpu"))
 
         # Keep self.device as CPU so buffer management (scatter, copy) stays
-        # on CPU. _SpyreModelWrapper converts input_ids/positions to Spyre
-        # int64 at the model call boundary, so the embedding takes the Spyre
-        # fast-path and hidden_states flow on Spyre between decoder layers.
+        # on CPU.  For generative models, _SpyreModelWrapper converts
+        # input_ids/positions to Spyre int64 at the model boundary.  For
+        # pooling/encoder models, integers stay on CPU and the embeddings
+        # gather word vectors on CPU before activations go to Spyre.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
 
@@ -222,7 +284,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         vllm.v1.worker.block_table._compute_slot_mapping_kernel = cpu_tl.compute_slot_mapping_kernel
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
-        """Load model and compile for Spyre."""
+        """Load weights on CPU, move Spyre layers to device, compile, and wrap.
+
+        For pooling models, patches nn.Embedding to gather on CPU (tables stay
+        on Spyre) and enables CPU integer inputs at the boundary.
+        """
         logger.info("Loading model %s...", self.model_config.model)
         t0 = time.time()
 
@@ -246,33 +312,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-        # Attention is nn.Module (not PluggableLayer) so OOT registration is
-        # not possible. Patch _apply to no-op before model.to("spyre") so
-        # the CPU attention backend can access scale buffers without device
-        # mismatch.
+        # Pin Attention buffers (_k_scale, _v_scale, ...) to CPU before
+        # model.to("spyre") via an _apply no-op so the CPU attention backend
+        # reads them without a device mismatch (these are nn.Module, not
+        # PluggableLayer, so OOT registration isn't possible).
+        is_pooling = self.model_config.runner_type == "pooling"
         for module in self.model.modules():
             if isinstance(module, Attention):
                 module._apply = lambda fn, recurse=True, _m=module: _m
 
-        # Move layer weights to Spyre device.
-        # SpyreCpuFallbackMixin._apply() no-op keeps CPU fallback layer
-        # weights on CPU (linear, embedding, rotary).
-        # Spyre-native layers (RMSNorm, SiluAndMul, ParallelLMHead) get
-        # their weights moved.
+        # Move all weights to Spyre (embeddings included; the gather still runs
+        # on CPU — torch-spyre has no embedding kernel yet).
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
+        if is_pooling:
+            _patch_encoder_embeddings_cpu(self.model)
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
-        # Wrap model so ALL forward() calls to the entire model,
-        # for example in execute_model, _dummy_run, etc.,
-        # automatically convert Spyre outputs to CPU. This ensures downstream
-        # indexing (logits_indices), lm_head (CPU weights), and sampling all
-        # receive CPU tensors without needing per-call-site overrides.
-        self.model = _SpyreModelWrapper(self.model, self._spyre_device)
+        # Device boundary: generative models move ints to Spyre; pooling models
+        # keep ints on CPU.  All model outputs are returned on CPU.
+        self.model = _SpyreModelWrapper(
+            self.model,
+            self._spyre_device,
+            keep_int_inputs_on_cpu=is_pooling,
+        )
+        if is_pooling:
+            logger.info("Encoder pooling model: keeping input_ids/positions on CPU")
 
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
@@ -314,14 +383,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Model compiled for Spyre (backend=inductor) in %.3fs.", time.time() - t0)
 
     def warming_up_model(self) -> None:
-        """Run a dummy forward pass to warm up the model.
+        """Run a dummy forward pass to warm up kernels and optional compile.
 
-        _dummy_run creates CPU int inputs, but _SpyreModelWrapper converts
-        input_ids/positions to Spyre int64 at the model boundary. The
-        embedding thus runs on Spyre and hidden_states flow on Spyre.
-        _SpyreModelWrapper also converts final outputs back to CPU.
+        Generative models: ``_SpyreModelWrapper`` moves integer inputs to Spyre
+        int64; activations run on Spyre and outputs return on CPU.
 
-        When enforce_eager=False, this also triggers torch.compile.
+        Pooling models: integers stay on CPU, encoder SDPA metadata must match
+        a single-sequence embed pass, and token count is capped (see
+        ``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) to stay under the Spyre DMA limit
+        for encoder dummy batches.
         """
         logger.info("Warming up model...")
         t0 = time.time()
@@ -330,7 +400,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.scheduler_config.max_num_batched_tokens,
         )
         with _set_spyre_compilation_settings(self.vllm_config):
-            self._dummy_run(num_tokens)
+            if self.model_config.runner_type == "pooling":
+                # Match single-sequence embed metadata; cap tokens for DMA.
+                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+                saved_max_num_seqs = self.scheduler_config.max_num_seqs
+                try:
+                    self.scheduler_config.max_num_seqs = 1
+                    logger.info(
+                        "Pooling warmup: %d tokens, max_num_seqs=1 (was %d)",
+                        num_tokens,
+                        saved_max_num_seqs,
+                    )
+                    self._dummy_run(num_tokens)
+                finally:
+                    self.scheduler_config.max_num_seqs = saved_max_num_seqs
+            else:
+                self._dummy_run(num_tokens)
         logger.info("Warmup done in %.3fs.", time.time() - t0)
 
     # --- KV cache allocation ---

@@ -409,7 +409,10 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Pre-populate KV cache with historical context (on CPU)
+    # Populate KV cache and build slot mapping. New tokens use key/value so that
+    # ref_attn sees the same data _reshape_and_cache writes to the device pages.
+    slot_mapping = []
+    q_offset = 0
     for seq_idx in range(num_seqs):
         query_len = query_lens[seq_idx]
         kv_len = kv_lens[seq_idx]
@@ -418,40 +421,27 @@ def test_spyre_attn(
             historical_keys = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
             historical_values = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
             for token_idx in range(historical_len):
-                block_idx = token_idx // block_size
+                actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                actual_block = block_tables[seq_idx, block_idx].item()
                 k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
                 v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
-
-    # Mirror the new tokens' K/V into k_pages_cpu so the reference sees what
-    # _reshape_and_cache writes to the device pages.
-    q_offset = 0
-    for seq_idx in range(num_seqs):
-        query_len = query_lens[seq_idx]
-        kv_len = kv_lens[seq_idx]
-        for token_idx in range(query_len):
-            pos = kv_len - query_len + token_idx
-            actual_block = block_tables[seq_idx, pos // block_size].item()
-            block_offset = pos % block_size
-            k_pages_cpu[actual_block][:, block_offset, :] = key[q_offset + token_idx]
-            v_pages_cpu[actual_block][:, block_offset, :] = value[q_offset + token_idx]
+        for token_idx in range(historical_len, kv_len):
+            block_idx = token_idx // block_size
+            block_offset = token_idx % block_size
+            actual_block = block_tables[seq_idx, block_idx].item()
+            k_pages_cpu[actual_block][:, block_offset, :] = key[
+                q_offset + token_idx - historical_len
+            ]
+            v_pages_cpu[actual_block][:, block_offset, :] = value[
+                q_offset + token_idx - historical_len
+            ]
+            slot_mapping.append(actual_block * block_size + block_offset)
         q_offset += query_len
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
     # Transfer populated pages to device
     k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
     v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
-
-    # Create slot mapping for new query tokens
-    slot_mapping = []
-    for seq_idx in range(num_seqs):
-        query_len = query_lens[seq_idx]
-        kv_len = kv_lens[seq_idx]
-        for token_idx in range(query_len):
-            pos = kv_len - query_len + token_idx
-            actual_block = block_tables[seq_idx, pos // block_size].item()
-            slot_mapping.append(actual_block * block_size + pos % block_size)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,

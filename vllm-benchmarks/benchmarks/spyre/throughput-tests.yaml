@@ -8,7 +8,7 @@
     tensor_parallel_size: 1
     dtype: float16
     load_format: auto
-    input-len: 64
-    output-len: 64
+    random-input-len: 64
+    random-output-len: 64
     num-prompts: 50
     max-model-len: 2048

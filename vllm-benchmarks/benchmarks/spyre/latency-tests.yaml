@@ -11,6 +11,6 @@
     input-len: 64
     output-len: 64
     batch-size: 1
-    num-iters-warmup: 3
-    num-iters: 10
+    num-iters-warmup: 1
+    num-iters: 3
     max-model-len: 2048

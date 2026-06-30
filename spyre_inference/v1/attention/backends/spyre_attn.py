@@ -39,6 +39,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# When True, wraps _create_compilable_page_attn with torch.compile(dynamic=False) directly.
+# When False (default), uses _maybe_compile which is a no-op on Spyre (CompilationMode.NONE).
+_FORCE_COMPILE_ATTN = False
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -645,8 +649,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, padded_query_len)
+            fn = _create_compilable_page_attn(num_blocks, padded_query_len)
+            self._attn_fns[key] = (
+                torch.compile(fn, dynamic=False) if _FORCE_COMPILE_ATTN else _maybe_compile(fn)
             )
         return self._attn_fns[key]
 

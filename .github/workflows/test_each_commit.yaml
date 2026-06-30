@@ -53,11 +53,11 @@ on:
       runner_label:
         description: |
           Per-PR ephemeral runner-set IMAGE label to select for runs-on
-          (image_spyre_inference_pr_<component>_<sha12>, e.g.
-          image_spyre_inference_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
+          (image_torch_spyre_pr_<component>_<sha12>, e.g.
+          image_torch_spyre_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
           passes that PR's set label so jobs land on the per-PR image (the changed
           RPM is baked in -> no runtime sudo). Empty keeps push/PR/merge_group runs
-          on the standing image_spyre_inference set (today's behaviour).
+          on the standing image_torch_spyre set (today's behaviour).
         required: false
         type: string
         default: ""
@@ -85,7 +85,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "not (distributed or upstream or attention)"
           - cfg: Spyre attention tests
@@ -93,7 +93,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "attention and not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -101,7 +101,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -109,7 +109,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
@@ -117,7 +117,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and distributed"
           - cfg: Upstream model vLLM tests
@@ -125,7 +125,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.

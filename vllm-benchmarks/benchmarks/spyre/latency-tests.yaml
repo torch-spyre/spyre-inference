@@ -1,5 +1,5 @@
 # Latency benchmarks for Spyre devices
-- test_name: latency_granite8B_tp1_in128_out128
+- test_name: latency_granite8B_tp1_in64_out64
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 16
     DTLOG_LEVEL: error
@@ -8,8 +8,8 @@
     tensor_parallel_size: 1
     dtype: float16
     load_format: auto
-    input-len: 128
-    output-len: 128
+    input-len: 64
+    output-len: 64
     batch-size: 1
     num-iters-warmup: 3
     num-iters: 10

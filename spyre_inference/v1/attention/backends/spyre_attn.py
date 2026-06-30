@@ -47,6 +47,7 @@ _ATTN_PROFILING = False
 
 def _record_function(name: str):
     """Decorator that wraps a method in a profiler span when _ATTN_PROFILING is set."""
+
     def decorator(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -54,7 +55,9 @@ def _record_function(name: str):
                 with torch.profiler.record_function(name):
                     return fn(*args, **kwargs)
             return fn(*args, **kwargs)
+
         return wrapper
+
     return decorator
 
 

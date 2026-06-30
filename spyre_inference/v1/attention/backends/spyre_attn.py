@@ -14,6 +14,7 @@
 
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
+import functools
 from dataclasses import dataclass
 from typing import Callable, ClassVar, NamedTuple
 
@@ -38,6 +39,27 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+# When set, wraps forward(), _reshape_and_cache(), and _online_softmax_attention()
+# in torch.profiler.record_function spans for kineto trace capture.
+_ATTN_PROFILING = False
+
+
+def _record_function(name: str):
+    """Decorator that wraps a method in a profiler span when _ATTN_PROFILING is set."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if _ATTN_PROFILING:
+                with torch.profiler.record_function(name):
+                    return fn(*args, **kwargs)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -655,6 +677,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
+    @_record_function("spyre_attn::forward")
     def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
@@ -706,6 +729,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         return output
 
+    @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
         key_cpu: torch.Tensor,
@@ -733,6 +757,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         fn = self._get_reshape_fn(num_tokens)
         fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
 
+    @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
         query_cpu: torch.Tensor,

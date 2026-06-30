@@ -643,14 +643,25 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         return
 
     for po in allow_entry.param_overrides:
-        if po.param_name not in metafunc.fixturenames:
+        # Support both single-name keys and comma-joined tuple-parametrize keys
+        # (e.g. `@pytest.mark.parametrize("a, b, c", [(1, 2, 3), ...])`).
+        sub_names = [n.strip() for n in po.param_name.split(",")]
+        if any(n not in metafunc.fixturenames for n in sub_names):
             continue
         for i, marker in enumerate(metafunc.definition.own_markers):
-            if marker.name == "parametrize" and marker.args[0] == po.param_name:
-                metafunc.definition.own_markers[i] = pytest.mark.parametrize(
-                    po.param_name, [_convert_yaml_value(v) for v in po.values]
-                ).mark
-                break
+            if marker.name != "parametrize":
+                continue
+            marker_names = [n.strip() for n in marker.args[0].split(",")]
+            if marker_names != sub_names:
+                continue
+            if len(sub_names) > 1:
+                new_values = [tuple(_convert_yaml_value(v) for v in row) for row in po.values]
+            else:
+                new_values = [_convert_yaml_value(v) for v in po.values]
+            metafunc.definition.own_markers[i] = pytest.mark.parametrize(
+                po.param_name, new_values
+            ).mark
+            break
 
 
 # ---------------------------------------------------------------------------

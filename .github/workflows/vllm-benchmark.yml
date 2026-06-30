@@ -68,7 +68,7 @@ jobs:
       fail-fast: false
     runs-on:
       - x86_64
-      - spyre_pf_x2__pvc_1tb_x1
+      - spyre_pf_x4__pvc_1tb_x1
       - linux
       - image_spyre_inference
     timeout-minutes: 240

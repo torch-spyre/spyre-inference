@@ -8,4 +8,5 @@ self-hosted-runner:
     - spyre_pf_x1__pvc_1tb_x1
     - image_torch_spyre
     - spyre_pf_x2__pvc_1tb_x1
+    - spyre_pf_x4__pvc_1tb_x1
     - image_spyre_inference

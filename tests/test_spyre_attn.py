@@ -26,6 +26,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
 )
 
+pytestmark = pytest.mark.attention
+
 
 def _spyre_available() -> bool:
     try:

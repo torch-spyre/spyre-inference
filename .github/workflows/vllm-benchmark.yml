@@ -143,11 +143,18 @@ jobs:
             --benchmark-results benchmark-results \
             --strict
 
+      - name: Set artifact name
+        id: artifact-name
+        run: |
+          SAFE_NAME="${{ matrix.models }}"
+          SAFE_NAME="${SAFE_NAME//\//--}"
+          echo "artifact_name=benchmark-results--${SAFE_NAME}" >> "$GITHUB_OUTPUT"
+
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results--${{ matrix.models }}
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
           path: benchmark-results/
           if-no-files-found: warn
           retention-days: 30

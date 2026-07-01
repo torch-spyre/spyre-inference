@@ -21,6 +21,7 @@ from . import rms_norm
 from . import rotary_embedding
 from . import linear
 from . import silu_and_mul
+from . import utils
 from . import vocab_parallel_embedding  # noqa: F401
 from vllm.logger import init_logger
 
@@ -32,3 +33,4 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
     rms_norm.register()
+    utils.register()

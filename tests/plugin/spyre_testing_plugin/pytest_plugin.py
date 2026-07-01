@@ -643,14 +643,25 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         return
 
     for po in allow_entry.param_overrides:
-        if po.param_name not in metafunc.fixturenames:
+        # Support both single-name keys and comma-joined tuple-parametrize keys
+        # (e.g. `@pytest.mark.parametrize("a, b, c", [(1, 2, 3), ...])`).
+        sub_names = [n.strip() for n in po.param_name.split(",")]
+        if any(n not in metafunc.fixturenames for n in sub_names):
             continue
         for i, marker in enumerate(metafunc.definition.own_markers):
-            if marker.name == "parametrize" and marker.args[0] == po.param_name:
-                metafunc.definition.own_markers[i] = pytest.mark.parametrize(
-                    po.param_name, [_convert_yaml_value(v) for v in po.values]
-                ).mark
-                break
+            if marker.name != "parametrize":
+                continue
+            marker_names = [n.strip() for n in marker.args[0].split(",")]
+            if marker_names != sub_names:
+                continue
+            if len(sub_names) > 1:
+                new_values = [tuple(_convert_yaml_value(v) for v in row) for row in po.values]
+            else:
+                new_values = [_convert_yaml_value(v) for v in po.values]
+            metafunc.definition.own_markers[i] = pytest.mark.parametrize(
+                po.param_name, new_values
+            ).mark
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -923,11 +934,11 @@ def patch_backend_list(request, monkeypatch):
         sliding_window=None,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
-            # [2, num_blocks, block_size, num_kv_heads, head_size]
+            # [num_blocks, 2, block_size, num_kv_heads, head_size]
             #   -> per-side [num_blocks, num_kv_heads, block_size, head_size]
             #   -> list of num_blocks tensors of [num_kv_heads, block_size, head_size]
-            k_blocks = kv_cache[0].transpose(1, 2).contiguous()
-            v_blocks = kv_cache[1].transpose(1, 2).contiguous()
+            k_blocks = kv_cache[:, 0].transpose(1, 2).contiguous()
+            v_blocks = kv_cache[:, 1].transpose(1, 2).contiguous()
             kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
         return orig_run_attention_backend(
             backend,

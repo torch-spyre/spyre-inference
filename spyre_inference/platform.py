@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib.metadata
-import math
 import multiprocessing
 import os
 import sys
@@ -36,6 +36,7 @@ if sys.platform.startswith("darwin"):
 from vllm.logger import init_logger
 from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 if TYPE_CHECKING:
@@ -65,14 +66,102 @@ class TorchSpyrePlatform(CpuPlatform):
     # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
-    # Hard caps for the on-device KV cache. Large batch volumes trigger
-    # `RAS::VFIO::MapDMAFailed` during `_initialize_kv_caches`.
-    MAX_MODEL_LEN_CAP: int = 128
-    MAX_NUM_SEQS_CAP: int = 8
+    # KV-cache init calls `torch.zeros(page_shape, device="spyre")` per
+    # page × 2 (K/V) × num_layers; torch-spyre's `aten::zero_` H2Ds each
+    # via a pinned host buffer, so the in-flight VFIO IOMMU entries scale
+    # with num_blocks and overflow the kernel table (default 65535 in
+    # /sys/module/vfio_iommu_type1/parameters/dma_entry_limit), surfaced
+    # as `RAS::VFIO::MapDMAFailed`. Envs: `SPYRE_KV_DMA_BLOCK_FACTOR`
+    # (raise past the empirical 0.5 boundary), `SPYRE_VFIO_DMA_ENTRY_LIMIT`
+    # (override the sysfs read). Root fix is on-device `aten::zero_` in
+    # torch-spyre (`spyre__zero_` TODO).
+    _DEFAULT_VFIO_DMA_ENTRY_LIMIT = 65535
+    # Empirical: `2 × num_blocks × num_layers ≤ 0.5 × limit` boots on
+    # 4-layer Granite-1b; `≥ 2.0 × limit` fails with MapDMAFailed.
+    _DEFAULT_KV_DMA_BLOCK_FACTOR = 0.5
+
+    # Cap applied to `max_model_len` only when the user didn't pass one —
+    # `check_max_model_len` runs only in vLLM's model-derived branch.
+    _DEFAULT_DERIVED_MAX_MODEL_LEN = 2048
+
+    # Applied only when the user didn't pass `--max-num-seqs`; vLLM's own
+    # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
+    # `pre_register_and_update`.
+    _DEFAULT_MAX_NUM_SEQS = 4
+
+    # Cache for the sysfs read below; the kernel module parameter can't
+    # change during the process lifetime, so read it once.
+    _cached_sysfs_vfio_limit: "int | None" = None
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    @classmethod
+    def _vfio_dma_entry_limit(cls) -> int:
+        env_override = os.environ.get("SPYRE_VFIO_DMA_ENTRY_LIMIT")
+        if env_override is not None:
+            try:
+                return int(env_override)
+            except ValueError:
+                logger.warning("Ignoring non-integer SPYRE_VFIO_DMA_ENTRY_LIMIT=%r", env_override)
+        if cls._cached_sysfs_vfio_limit is None:
+            try:
+                with open("/sys/module/vfio_iommu_type1/parameters/dma_entry_limit") as f:
+                    cls._cached_sysfs_vfio_limit = int(f.read().strip())
+            except (OSError, ValueError):
+                cls._cached_sysfs_vfio_limit = cls._DEFAULT_VFIO_DMA_ENTRY_LIMIT
+        return cls._cached_sysfs_vfio_limit
+
+    @classmethod
+    def check_max_model_len(cls, max_model_len: int) -> int:
+        # vLLM only calls this on the user-didn't-specify branch of
+        # `_get_and_verify_max_len`, so user-supplied values are untouched.
+        return min(max_model_len, cls._DEFAULT_DERIVED_MAX_MODEL_LEN)
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        # Runs at the top of `EngineArgs.create_engine_config`, before
+        # `_set_default_max_num_seqs_and_batched_tokens_args`. This is the
+        # earliest safe seam to monkey-patch `EngineArgs`: doing it from
+        # `register()` cyclically re-imports arg_utils during platform
+        # discovery, and the swallowed ImportError silently downgrades us
+        # to CpuPlatform.
+        from vllm.engine.arg_utils import EngineArgs
+
+        original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+        if getattr(original, "_spyre_patched", False):
+            return
+
+        @functools.wraps(original)
+        def _spyre_patched(self, usage_context, model_config, parallel_config):
+            user_supplied = self.max_num_seqs is not None
+            original(self, usage_context, model_config, parallel_config)
+            if not user_supplied and self.max_num_seqs is not None:
+                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+
+        _spyre_patched._spyre_patched = True
+        # Signature intentionally unannotated (matches original at runtime); ty
+        # can't verify the type-erased match.
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+
+    @classmethod
+    def _max_kv_blocks_for_dma_budget(cls, vllm_config: VllmConfig) -> int:
+        # `get_total_num_hidden_layers` is a public no-arg method that avoids
+        # the parallel_config-signature mismatch with mocks in
+        # tests/v1/attention/utils.py. It returns the total (not per-PP-rank)
+        # count; Spyre does not currently support pipeline parallelism so
+        # they are equal.
+        num_layers = max(1, vllm_config.model_config.get_total_num_hidden_layers())
+        mappings_per_block = 2 * num_layers
+        try:
+            multiplier = float(
+                os.environ.get("SPYRE_KV_DMA_BLOCK_FACTOR", str(cls._DEFAULT_KV_DMA_BLOCK_FACTOR))
+            )
+        except ValueError:
+            multiplier = cls._DEFAULT_KV_DMA_BLOCK_FACTOR
+        budget = int(cls._vfio_dma_entry_limit() * multiplier)
+        return max(1, budget // mappings_per_block)
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -165,43 +254,64 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
-        # Clamp the user-facing KV-cache knobs so the auto-derived
-        # `num_gpu_blocks_override` below fits in Spyre's DMA region. Done
-        # before super() because CpuPlatform's logic also reads max_model_len.
+        # Normalize block_size upfront so the DMA-budget math and the
+        # `num_gpu_blocks_override` math below agree on the final value.
+        # Mirrors `CpuPlatform.check_and_update_config` (sets 128 when the
+        # user didn't specify) and Spyre's own 64-multiple requirement for
+        # the list-based attention backend.
         model_config = vllm_config.model_config
-        if model_config.max_model_len > cls.MAX_MODEL_LEN_CAP:
-            logger.warning(
-                "Spyre's on-device KV cache cannot fit max_model_len=%d; "
-                "clamping to MAX_MODEL_LEN_CAP=%d.",
-                model_config.max_model_len,
-                cls.MAX_MODEL_LEN_CAP,
-            )
-            model_config.max_model_len = cls.MAX_MODEL_LEN_CAP
-
         scheduler_config = vllm_config.scheduler_config
-        if scheduler_config.max_num_seqs > cls.MAX_NUM_SEQS_CAP:
-            logger.warning(
-                "Spyre's on-device KV cache cannot fit max_num_seqs=%d; "
-                "clamping to MAX_NUM_SEQS_CAP=%d.",
-                scheduler_config.max_num_seqs,
-                cls.MAX_NUM_SEQS_CAP,
-            )
-            scheduler_config.max_num_seqs = cls.MAX_NUM_SEQS_CAP
-
-        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The list-based attention backend requires 64-element stick alignment for
-        # torch.compile.
         cache_config = vllm_config.cache_config
-        original_block_size = cache_config.block_size
-        if original_block_size % 64 != 0:
-            new_block_size = ((original_block_size + 63) // 64) * 64
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 128
+        elif cache_config.block_size % 64 != 0:
+            new_block_size = round_up(cache_config.block_size, 64)
             logger.warning(
                 "Block size must be a multiple of 64 for the list-based attention "
                 "backend. Overriding block_size from %d to %d.",
-                original_block_size,
+                cache_config.block_size,
                 new_block_size,
             )
             cache_config.block_size = new_block_size
+
+        # Cap KV-cache shape to fit the VFIO DMA-entry budget. Runs before
+        # super() because CpuPlatform's logic also reads max_model_len.
+        # Prefer shrinking max_num_seqs; fall back to clamping max_model_len
+        # only if a single sequence wouldn't fit.
+        max_kv_blocks = cls._max_kv_blocks_for_dma_budget(vllm_config)
+        blocks_per_seq = cdiv(model_config.max_model_len, cache_config.block_size)
+        desired_blocks = scheduler_config.max_num_seqs * blocks_per_seq
+        if desired_blocks > max_kv_blocks:
+            new_max_num_seqs = max_kv_blocks // blocks_per_seq
+            if new_max_num_seqs >= 1:
+                logger.warning(
+                    "KV cache would need %d blocks (max_num_seqs=%d × "
+                    "blocks_per_seq=%d) but the VFIO DMA-entry budget "
+                    "allows only %d. Reducing max_num_seqs from %d to %d. "
+                    "Raise SPYRE_KV_DMA_BLOCK_FACTOR or the kernel's "
+                    "vfio_iommu_type1.dma_entry_limit to relax.",
+                    desired_blocks,
+                    scheduler_config.max_num_seqs,
+                    blocks_per_seq,
+                    max_kv_blocks,
+                    scheduler_config.max_num_seqs,
+                    new_max_num_seqs,
+                )
+                scheduler_config.max_num_seqs = new_max_num_seqs
+            else:
+                new_max_model_len = max_kv_blocks * cache_config.block_size
+                logger.warning(
+                    "VFIO DMA-entry budget (%d blocks) cannot fit one "
+                    "sequence at max_model_len=%d. Clamping max_model_len "
+                    "to %d and max_num_seqs to 1. Raise "
+                    "SPYRE_KV_DMA_BLOCK_FACTOR or the kernel's "
+                    "vfio_iommu_type1.dma_entry_limit to relax.",
+                    max_kv_blocks,
+                    model_config.max_model_len,
+                    new_max_model_len,
+                )
+                model_config.max_model_len = new_max_model_len
+                scheduler_config.max_num_seqs = 1
 
         parallel_config = vllm_config.parallel_config
 
@@ -255,7 +365,7 @@ class TorchSpyrePlatform(CpuPlatform):
         if cache_config.num_gpu_blocks_override is None:
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             max_model_len = vllm_config.model_config.max_model_len
-            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+            blocks_per_seq = cdiv(max_model_len, cache_config.block_size)
             cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
             logger.info(
                 "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",

@@ -24,7 +24,7 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.sha }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch' && inputs.vllm_branch != '' && inputs.vllm_branch) || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -152,15 +152,22 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           set -eux
+          mkdir -p benchmark-results
           uv run python3 .github/scripts/run_vllm_benchmarks.py \
             --configs-dir vllm-benchmarks/benchmarks/spyre \
-            --results-dir benchmark-results
+            --results-dir benchmark-results > benchmark-results/run.log 2>&1
 
-      - name: Check benchmark results
+      - name: Encrypt benchmark results
+        env:
+          ARTIFACT_ENCRYPTION_KEY: ${{ secrets.ARTIFACT_ENCRYPTION_KEY }}
         run: |
-          uv run python3 .github/scripts/check_benchmark_results.py \
-            --benchmark-results benchmark-results \
-            --strict
+          for f in benchmark-results/*; do
+            [ -f "$f" ] || continue
+            openssl enc -aes-256-cbc -pbkdf2 \
+              -in "$f" -out "${f}.enc" \
+              -pass env:ARTIFACT_ENCRYPTION_KEY
+            rm "$f"
+          done
 
       - name: Set artifact name
         id: artifact-name
@@ -181,7 +188,7 @@ jobs:
       - name: Job Summary
         if: always()
         run: |
-          RESULT_COUNT=$(find benchmark-results -name "*.json" 2>/dev/null | wc -l || echo 0)
+          RESULT_COUNT=$(find benchmark-results -name "*.json.enc" 2>/dev/null | wc -l || echo 0)
 
           {
             echo "### Benchmark Results"

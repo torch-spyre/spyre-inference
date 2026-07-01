@@ -27,10 +27,11 @@ import os
 import sys
 import time
 from argparse import ArgumentParser
-from json.decoder import JSONDecodeError
 from typing import Any
 
 import clickhouse_connect
+
+from utils import read_benchmark_results
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -60,30 +61,6 @@ def parse_args() -> Any:
     )
 
     return parser.parse_args()
-
-
-def read_benchmark_results(filepath: str) -> list[dict[str, Any]]:
-    """Read benchmark results from a JSON file (standard or JSONEachRow format)."""
-    results = []
-    with open(filepath) as f:
-        try:
-            r = json.load(f)
-            if isinstance(r, dict):
-                results.append(r)
-            elif isinstance(r, list):
-                results = r
-        except JSONDecodeError:
-            f.seek(0)
-            for line in f:
-                try:
-                    r = json.loads(line)
-                    if isinstance(r, dict):
-                        results.append(r)
-                    elif isinstance(r, list):
-                        results.extend(r)
-                except JSONDecodeError:
-                    pass
-    return results
 
 
 def extract_rows(
@@ -155,11 +132,21 @@ def extract_rows(
 
 def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
     """Insert rows into ClickHouse using environment-configured connection."""
-    host = os.environ["CLICKHOUSE_HOST"]
+    clickhouse_env_vars = {
+        "CLICKHOUSE_HOST": os.environ.get("CLICKHOUSE_HOST"),
+        "CLICKHOUSE_USER": os.environ.get("CLICKHOUSE_USER"),
+        "CLICKHOUSE_PASS": os.environ.get("CLICKHOUSE_PASS"),
+        "CLICKHOUSE_DB": os.environ.get("CLICKHOUSE_DB"),
+    }
+    missing = [k for k, v in clickhouse_env_vars.items() if v is None]
+    if missing:
+        raise OSError(f"Missing required environment variables: {', '.join(missing)}")
+
+    host = clickhouse_env_vars["CLICKHOUSE_HOST"]
     port = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
-    user = os.environ["CLICKHOUSE_USER"]
-    password = os.environ["CLICKHOUSE_PASS"]
-    database = os.environ["CLICKHOUSE_DB"]
+    user = clickhouse_env_vars["CLICKHOUSE_USER"]
+    password = clickhouse_env_vars["CLICKHOUSE_PASS"]
+    database = clickhouse_env_vars["CLICKHOUSE_DB"]
 
     client = clickhouse_connect.get_client(
         host=host,

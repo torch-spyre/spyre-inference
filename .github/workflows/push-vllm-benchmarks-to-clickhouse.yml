@@ -106,8 +106,16 @@ jobs:
               ], check=True)
           "
 
-          echo "Downloaded result files:"
-          find benchmark_results -name "*.json" || echo "(none)"
+      - name: Decrypt benchmark results
+        env:
+          ARTIFACT_ENCRYPTION_KEY: ${{ secrets.ARTIFACT_ENCRYPTION_KEY }}
+        run: |
+          for f in benchmark_results/*.enc; do
+            openssl enc -aes-256-cbc -pbkdf2 -d \
+              -in "$f" -out "${f%.enc}" \
+              -pass env:ARTIFACT_ENCRYPTION_KEY
+            rm "$f"
+          done
 
       - name: Resolve PR number
         id: resolve-pr

@@ -106,7 +106,13 @@ def generate_benchmark_matrix(benchmark_configs_dir: str, models: list[str]) -> 
             if not param:
                 warning("No recognized parameter key in config: %s", config)
                 continue
-
+            if len(param) > 1:
+                warning(
+                    "Multiple parameter keys found in config %s: %s; using %s",
+                    config,
+                    param,
+                    param[0],
+                )
             benchmark_config = config[param[0]]
             if "model" not in benchmark_config:
                 warning("Model name not set in %s, skipping...", benchmark_config)

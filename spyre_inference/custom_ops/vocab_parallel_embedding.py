@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for VocabParallelEmbedding.
+"""Spyre OOT VocabParallelEmbedding.
 
-Inherits vocab sharding and weight loading from upstream. Overrides
-`forward` only to compute the TP shard mask on CPU: the upstream helper
-does int64 comparisons against Python int constants, which the Spyre
-inductor backend rejects with `unexpected argument Constant(value=N,
-dtype=torch.int64) to greaterequal`.
+Two overrides:
+- forward(): runs the TP shard-mask helper on CPU; upstream uses int64
+  comparisons that the Spyre inductor backend rejects.
+- quant_method.apply(): handles the tied-weight lm_head linear, where x
+  arrives on CPU (from `_SpyreModelWrapper`) while weight is on Spyre.
 """
 
 import torch
@@ -31,7 +31,24 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
+from .utils import convert
+
 logger = init_logger(__name__)
+
+
+class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        out = torch.nn.functional.linear(
+            convert(x, device=layer.weight.device),
+            layer.weight,  # ty: ignore[invalid-argument-type]
+            bias,
+        )
+        return convert(out, device=x.device)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
@@ -50,6 +67,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        self.quant_method = SpyreUnquantizedEmbeddingMethod()
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:

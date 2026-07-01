@@ -37,10 +37,12 @@ def register():
 
 
 def register_ops():
-    """Register OOT custom ops for Spyre."""
-    from spyre_inference.custom_ops import register_all
+    """Register OOT custom ops and model patches for Spyre."""
+    from spyre_inference.custom_ops import register_all as register_custom_ops
+    from spyre_inference.models import register_all as register_model_patches
 
-    register_all()
+    register_custom_ops()
+    register_model_patches()
 
 
 def _init_logging():

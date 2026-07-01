@@ -20,31 +20,6 @@ from vllm.config import VllmConfig, ModelConfig, CacheConfig
 from vllm.config.compilation import CompilationConfig
 
 
-def _round_up_to_multiple_of_64(value: int) -> int:
-    """Helper: the exact rounding formula used in platform.py."""
-    return ((value + 63) // 64) * 64
-
-
-def test_block_size_override_formula():
-    """Test the round-up formula used for block_size override.
-
-    This isolates the core logic: ((value + 63) // 64) * 64
-    """
-    # Values that need rounding up
-    assert _round_up_to_multiple_of_64(1) == 64
-    assert _round_up_to_multiple_of_64(16) == 64
-    assert _round_up_to_multiple_of_64(32) == 64
-    assert _round_up_to_multiple_of_64(63) == 64
-    assert _round_up_to_multiple_of_64(65) == 128
-    assert _round_up_to_multiple_of_64(100) == 128
-    assert _round_up_to_multiple_of_64(127) == 128
-
-    # Values already aligned (should stay the same)
-    assert _round_up_to_multiple_of_64(64) == 64
-    assert _round_up_to_multiple_of_64(128) == 128
-    assert _round_up_to_multiple_of_64(256) == 256
-
-
 def test_block_size_override_default():
     """Test that check_and_update_config overrides block_size when not user-specified.
 
@@ -203,9 +178,10 @@ def test_pre_register_and_update_installs_and_is_idempotent():
     original_attr_name = "_set_default_max_num_seqs_and_batched_tokens_args"
     pristine = getattr(EngineArgs, original_attr_name)
     try:
-        # Reset to pristine so this test is order-independent.
-        pristine_original = getattr(pristine, "__wrapped_original__", pristine)
-        setattr(EngineArgs, original_attr_name, pristine_original)
+        # If a previous test already installed our wrapper, `functools.wraps`
+        # stashed the true original on `__wrapped__`; reset to that so this
+        # test observes a fresh install.
+        setattr(EngineArgs, original_attr_name, getattr(pristine, "__wrapped__", pristine))
 
         TorchSpyrePlatform.pre_register_and_update()
         first = getattr(EngineArgs, original_attr_name)
@@ -317,10 +293,11 @@ def test_max_kv_blocks_returns_at_least_one(monkeypatch):
     assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == 1
 
 
-def test_max_kv_blocks_handles_mocked_get_num_layers(monkeypatch):
-    """Upstream test fixtures monkey-patch `get_num_layers` with a zero-arg
-    lambda (see `tests/v1/attention/utils.py`); we must fall back cleanly
-    instead of raising `TypeError`.
+def test_max_kv_blocks_survives_mocked_get_num_layers(monkeypatch):
+    """Upstream `tests/v1/attention/utils.py` monkey-patches `get_num_layers`
+    with a zero-arg lambda; our budget math must not depend on
+    `get_num_layers` (we use the public `get_total_num_hidden_layers`
+    instead), so mocking it out has no effect on the returned budget.
     """
     import types
 
@@ -340,12 +317,13 @@ def test_max_kv_blocks_handles_mocked_get_num_layers(monkeypatch):
         cache_config=CacheConfig(block_size=64),
         compilation_config=CompilationConfig(custom_ops=["all"]),
     )
-    # Mirror the upstream mock: bind a bound-method that takes only `self`.
+    baseline = TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config)
+
+    # Install the upstream mock; the budget must not change.
     vllm_config.model_config.get_num_layers = types.MethodType(
         lambda self: 1, vllm_config.model_config
     )
-
-    assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == 800 // 2
+    assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == baseline
 
 
 # ---------------------------------------------------------------------------

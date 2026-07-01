@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib.metadata
-import math
 import multiprocessing
 import os
 import sys
@@ -36,6 +36,7 @@ if sys.platform.startswith("darwin"):
 from vllm.logger import init_logger
 from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
 if TYPE_CHECKING:
@@ -88,6 +89,10 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # Cache for the sysfs read below; the kernel module parameter can't
+    # change during the process lifetime, so read it once.
+    _cached_sysfs_vfio_limit: "int | None" = None
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -100,11 +105,13 @@ class TorchSpyrePlatform(CpuPlatform):
                 return int(env_override)
             except ValueError:
                 logger.warning("Ignoring non-integer SPYRE_VFIO_DMA_ENTRY_LIMIT=%r", env_override)
-        try:
-            with open("/sys/module/vfio_iommu_type1/parameters/dma_entry_limit") as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
-            return cls._DEFAULT_VFIO_DMA_ENTRY_LIMIT
+        if cls._cached_sysfs_vfio_limit is None:
+            try:
+                with open("/sys/module/vfio_iommu_type1/parameters/dma_entry_limit") as f:
+                    cls._cached_sysfs_vfio_limit = int(f.read().strip())
+            except (OSError, ValueError):
+                cls._cached_sysfs_vfio_limit = cls._DEFAULT_VFIO_DMA_ENTRY_LIMIT
+        return cls._cached_sysfs_vfio_limit
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -126,13 +133,12 @@ class TorchSpyrePlatform(CpuPlatform):
         if getattr(original, "_spyre_patched", False):
             return
 
-        default_max_num_seqs = cls._DEFAULT_MAX_NUM_SEQS
-
+        @functools.wraps(original)
         def _spyre_patched(self, usage_context, model_config, parallel_config):
             user_supplied = self.max_num_seqs is not None
             original(self, usage_context, model_config, parallel_config)
-            if not user_supplied:
-                self.max_num_seqs = min(self.max_num_seqs, default_max_num_seqs)
+            if not user_supplied and self.max_num_seqs is not None:
+                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
         _spyre_patched._spyre_patched = True
         # Signature intentionally unannotated (matches original at runtime); ty
@@ -141,13 +147,12 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _max_kv_blocks_for_dma_budget(cls, vllm_config: VllmConfig) -> int:
-        model_config = vllm_config.model_config
-        try:
-            num_layers = model_config.get_num_layers(vllm_config.parallel_config)
-        except TypeError:
-            # Real signature requires parallel_config;
-            # tests/v1/attention/utils.py mocks this with a no-arg lambda
-            num_layers = model_config.get_num_layers()  # ty: ignore[missing-argument]
+        # `get_total_num_hidden_layers` is a public no-arg method that avoids
+        # the parallel_config-signature mismatch with mocks in
+        # tests/v1/attention/utils.py. It returns the total (not per-PP-rank)
+        # count; Spyre does not currently support pipeline parallelism so
+        # they are equal.
+        num_layers = max(1, vllm_config.model_config.get_total_num_hidden_layers())
         mappings_per_block = 2 * num_layers
         try:
             multiplier = float(
@@ -249,20 +254,32 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Normalize block_size upfront so the DMA-budget math and the
+        # `num_gpu_blocks_override` math below agree on the final value.
+        # Mirrors `CpuPlatform.check_and_update_config` (sets 128 when the
+        # user didn't specify) and Spyre's own 64-multiple requirement for
+        # the list-based attention backend.
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 128
+        elif cache_config.block_size % 64 != 0:
+            new_block_size = round_up(cache_config.block_size, 64)
+            logger.warning(
+                "Block size must be a multiple of 64 for the list-based attention "
+                "backend. Overriding block_size from %d to %d.",
+                cache_config.block_size,
+                new_block_size,
+            )
+            cache_config.block_size = new_block_size
+
         # Cap KV-cache shape to fit the VFIO DMA-entry budget. Runs before
         # super() because CpuPlatform's logic also reads max_model_len.
         # Prefer shrinking max_num_seqs; fall back to clamping max_model_len
         # only if a single sequence wouldn't fit.
-        model_config = vllm_config.model_config
-        scheduler_config = vllm_config.scheduler_config
-        cache_config = vllm_config.cache_config
         max_kv_blocks = cls._max_kv_blocks_for_dma_budget(vllm_config)
-        # Match the block_size rounding applied below so we cap against the
-        # same value that ultimately sizes num_gpu_blocks.
-        effective_block_size = cache_config.block_size
-        if effective_block_size % 64 != 0:
-            effective_block_size = ((effective_block_size + 63) // 64) * 64
-        blocks_per_seq = math.ceil(model_config.max_model_len / effective_block_size)
+        blocks_per_seq = cdiv(model_config.max_model_len, cache_config.block_size)
         desired_blocks = scheduler_config.max_num_seqs * blocks_per_seq
         if desired_blocks > max_kv_blocks:
             new_max_num_seqs = max_kv_blocks // blocks_per_seq
@@ -282,7 +299,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
                 scheduler_config.max_num_seqs = new_max_num_seqs
             else:
-                new_max_model_len = max_kv_blocks * effective_block_size
+                new_max_model_len = max_kv_blocks * cache_config.block_size
                 logger.warning(
                     "VFIO DMA-entry budget (%d blocks) cannot fit one "
                     "sequence at max_model_len=%d. Clamping max_model_len "
@@ -295,20 +312,6 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
                 model_config.max_model_len = new_max_model_len
                 scheduler_config.max_num_seqs = 1
-
-        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The list-based attention backend requires 64-element stick alignment for
-        # torch.compile.
-        original_block_size = cache_config.block_size
-        if original_block_size % 64 != 0:
-            new_block_size = ((original_block_size + 63) // 64) * 64
-            logger.warning(
-                "Block size must be a multiple of 64 for the list-based attention "
-                "backend. Overriding block_size from %d to %d.",
-                original_block_size,
-                new_block_size,
-            )
-            cache_config.block_size = new_block_size
 
         parallel_config = vllm_config.parallel_config
 
@@ -362,7 +365,7 @@ class TorchSpyrePlatform(CpuPlatform):
         if cache_config.num_gpu_blocks_override is None:
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             max_model_len = vllm_config.model_config.max_model_len
-            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+            blocks_per_seq = cdiv(max_model_len, cache_config.block_size)
             cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
             logger.info(
                 "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",

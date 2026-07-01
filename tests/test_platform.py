@@ -168,3 +168,255 @@ def test_block_size_valid_no_override():
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.block_size == 128
+
+
+# ---------------------------------------------------------------------------
+# max_model_len / max_num_seqs defaulting hooks
+# ---------------------------------------------------------------------------
+
+
+def test_check_max_model_len_caps_large_derived_value():
+    """The hook returns the smaller of the derived value and the Spyre cap."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    cap = TorchSpyrePlatform._DEFAULT_DERIVED_MAX_MODEL_LEN
+    assert TorchSpyrePlatform.check_max_model_len(131072) == cap
+    assert TorchSpyrePlatform.check_max_model_len(cap + 1) == cap
+
+
+def test_check_max_model_len_passes_through_small_values():
+    """A model whose max_position_embeddings is already ≤ cap is untouched."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    cap = TorchSpyrePlatform._DEFAULT_DERIVED_MAX_MODEL_LEN
+    assert TorchSpyrePlatform.check_max_model_len(cap) == cap
+    assert TorchSpyrePlatform.check_max_model_len(512) == 512
+
+
+def test_pre_register_and_update_installs_and_is_idempotent():
+    """`pre_register_and_update` should wrap `_set_default_max_num_seqs_...`
+    exactly once and mark the wrapper so subsequent calls are no-ops."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    original_attr_name = "_set_default_max_num_seqs_and_batched_tokens_args"
+    pristine = getattr(EngineArgs, original_attr_name)
+    try:
+        # Reset to pristine so this test is order-independent.
+        pristine_original = getattr(pristine, "__wrapped_original__", pristine)
+        setattr(EngineArgs, original_attr_name, pristine_original)
+
+        TorchSpyrePlatform.pre_register_and_update()
+        first = getattr(EngineArgs, original_attr_name)
+        assert getattr(first, "_spyre_patched", False)
+
+        TorchSpyrePlatform.pre_register_and_update()
+        second = getattr(EngineArgs, original_attr_name)
+        assert second is first, "second call should be a no-op"
+    finally:
+        setattr(EngineArgs, original_attr_name, pristine)
+
+
+def test_pre_register_and_update_lowers_default_max_num_seqs():
+    """The wrapper lowers `max_num_seqs` only when the user didn't supply it."""
+    from types import SimpleNamespace
+
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    original_attr_name = "_set_default_max_num_seqs_and_batched_tokens_args"
+    pristine = getattr(EngineArgs, original_attr_name)
+
+    def fake_original(self, usage_context, model_config, parallel_config):
+        # Simulate vLLM's own defaulter filling `None` with 256.
+        if self.max_num_seqs is None:
+            self.max_num_seqs = 256
+
+    try:
+        setattr(EngineArgs, original_attr_name, fake_original)
+        TorchSpyrePlatform.pre_register_and_update()
+        patched = getattr(EngineArgs, original_attr_name)
+
+        unset = SimpleNamespace(max_num_seqs=None)
+        patched(unset, None, None, None)
+        assert unset.max_num_seqs == TorchSpyrePlatform._DEFAULT_MAX_NUM_SEQS
+
+        user_set = SimpleNamespace(max_num_seqs=64)
+        patched(user_set, None, None, None)
+        assert user_set.max_num_seqs == 64
+    finally:
+        setattr(EngineArgs, original_attr_name, pristine)
+
+
+# ---------------------------------------------------------------------------
+# VFIO DMA-entry budget
+# ---------------------------------------------------------------------------
+
+
+def test_vfio_dma_entry_limit_env_override(monkeypatch):
+    """SPYRE_VFIO_DMA_ENTRY_LIMIT wins over sysfs / fallback."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "1234")
+    assert TorchSpyrePlatform._vfio_dma_entry_limit() == 1234
+
+
+def test_vfio_dma_entry_limit_bad_env_ignored(monkeypatch):
+    """Non-integer env var falls through to sysfs / default."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "not-a-number")
+    result = TorchSpyrePlatform._vfio_dma_entry_limit()
+    assert isinstance(result, int) and result > 0
+
+
+def test_max_kv_blocks_scales_with_budget_and_layers(monkeypatch):
+    """Budget/(2*num_layers) with a fixed limit and multiplier."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "800")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "1.0")
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    num_layers = model_config.get_num_layers(vllm_config.parallel_config)
+
+    expected = 800 // (2 * num_layers)
+    assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == expected
+
+
+def test_max_kv_blocks_returns_at_least_one(monkeypatch):
+    """A tiny budget still yields a usable (>= 1) num_blocks cap."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "1")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "0.001")
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == 1
+
+
+def test_max_kv_blocks_handles_mocked_get_num_layers(monkeypatch):
+    """Upstream test fixtures monkey-patch `get_num_layers` with a zero-arg
+    lambda (see `tests/v1/attention/utils.py`); we must fall back cleanly
+    instead of raising `TypeError`.
+    """
+    import types
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "800")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "1.0")
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    # Mirror the upstream mock: bind a bound-method that takes only `self`.
+    vllm_config.model_config.get_num_layers = types.MethodType(
+        lambda self: 1, vllm_config.model_config
+    )
+
+    assert TorchSpyrePlatform._max_kv_blocks_for_dma_budget(vllm_config) == 800 // 2
+
+
+# ---------------------------------------------------------------------------
+# DMA-budget clamp in check_and_update_config
+# ---------------------------------------------------------------------------
+
+
+def _make_config(max_model_len: int, max_num_seqs: int):
+    """Minimal VllmConfig where max_num_seqs is settable post-hoc."""
+    from vllm.config.scheduler import SchedulerConfig
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=max_model_len,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        is_encoder_decoder=False,
+        max_num_batched_tokens=max(max_num_seqs, 8),
+    )
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        scheduler_config=scheduler_config,
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+
+# `VllmConfig.__post_init__` (vllm/config/vllm.py:1335) already calls
+# `check_and_update_config`, so the assertions below observe the resolved
+# state after a single implicit pass — no explicit call is needed.
+
+
+def test_dma_budget_no_clamp_when_under_budget(monkeypatch):
+    """When desired num_blocks fits the DMA budget, both knobs stay put."""
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "1_000_000")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "1.0")
+
+    vllm_config = _make_config(max_model_len=512, max_num_seqs=8)
+
+    assert vllm_config.model_config.max_model_len == 512
+    assert vllm_config.scheduler_config.max_num_seqs == 8
+
+
+def test_dma_budget_clamps_max_num_seqs_first(monkeypatch):
+    """Over-budget with room for ≥1 seq: max_num_seqs shrinks, max_model_len untouched."""
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "800")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "1.0")
+
+    # max_model_len=512, block_size=64 → blocks_per_seq=8. 32 seqs → 256
+    # blocks; well over 800/(2×num_layers) for any real num_layers ≥ 2.
+    vllm_config = _make_config(max_model_len=512, max_num_seqs=32)
+
+    assert vllm_config.model_config.max_model_len == 512
+    assert vllm_config.scheduler_config.max_num_seqs < 32
+    assert vllm_config.scheduler_config.max_num_seqs >= 1
+
+
+def test_dma_budget_clamps_max_model_len_when_single_seq_too_big(monkeypatch):
+    """Budget so small that even one seq can't fit: max_model_len is clamped and seqs=1."""
+    # Budget=1 block; whatever block_size CpuPlatform picks, max_model_len
+    # collapses to that single block and max_num_seqs drops to 1.
+    monkeypatch.setenv("SPYRE_VFIO_DMA_ENTRY_LIMIT", "10")
+    monkeypatch.setenv("SPYRE_KV_DMA_BLOCK_FACTOR", "1.0")
+
+    vllm_config = _make_config(max_model_len=8192, max_num_seqs=4)
+
+    assert vllm_config.scheduler_config.max_num_seqs == 1
+    assert vllm_config.model_config.max_model_len < 8192
+    # Post-clamp max_model_len is exactly one block's worth of tokens.
+    assert vllm_config.model_config.max_model_len % vllm_config.cache_config.block_size == 0

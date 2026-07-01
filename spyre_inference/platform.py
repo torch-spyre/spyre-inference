@@ -141,8 +141,13 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _max_kv_blocks_for_dma_budget(cls, vllm_config: VllmConfig) -> int:
-        parallel_config = vllm_config.parallel_config
-        num_layers = vllm_config.model_config.get_num_layers(parallel_config)
+        model_config = vllm_config.model_config
+        try:
+            num_layers = model_config.get_num_layers(vllm_config.parallel_config)
+        except TypeError:
+            # Real signature requires parallel_config;
+            # tests/v1/attention/utils.py mocks this with a no-arg lambda
+            num_layers = model_config.get_num_layers()  # ty: ignore[missing-argument]
         mappings_per_block = 2 * num_layers
         try:
             multiplier = float(

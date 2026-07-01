@@ -151,7 +151,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Encoder backend path returned for ENCODER/ENCODER_ONLY layers.
     _encoder_backend_path = (
-        "spyre_inference.v1.attention.backends.spyre_attn.SpyreEncoderAttentionBackend"
+        "spyre_inference.v1.attention.backends.spyre_encoder_attn.SpyreEncoderAttentionBackend"
     )
 
     @classmethod

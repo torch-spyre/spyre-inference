@@ -22,8 +22,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
-    SpyreEncoderAttentionImpl,
     SpyrePagedKVCache,
+)
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    SpyreEncoderAttentionImpl,
 )
 
 pytestmark = pytest.mark.attention

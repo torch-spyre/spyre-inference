@@ -1,14 +1,15 @@
 # Throughput benchmarks for Spyre devices
 - test_name: throughput_granite8B_tp1_in64_out64
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 16
+    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    tensor_parallel_size: 1
+    tensor_parallel_size: 1 # TP is not supported; SpyreCommunicator: allreduce is not natively available
     dtype: float16
     load_format: auto
     random-input-len: 64
     random-output-len: 64
-    num-prompts: 10
-    max-model-len: 2048
+    num-prompts: 5
+    max-model-len: 128

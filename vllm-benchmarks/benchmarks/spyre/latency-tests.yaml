@@ -1,16 +1,17 @@
 # Latency benchmarks for Spyre devices
 - test_name: latency_granite8B_tp1_in64_out64
   environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 16
+    VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    tensor_parallel_size: 1
+    tensor_parallel_size: 1 # TP is not supported; SpyreCommunicator: allreduce is not natively available
     dtype: float16
     load_format: auto
     input-len: 64
     output-len: 64
     batch-size: 1
     num-iters-warmup: 1
-    num-iters: 3
-    max-model-len: 2048
+    num-iters: 2
+    max-model-len: 128

@@ -38,14 +38,14 @@ jobs:
   type-check:
     name: 'ty type check'
     # `ty` needs the real torch/vllm/torch-spyre deps to type check imports,
-    # which need the spyre runtime libs (carried by `image_spyre_inference`)
+    # which need the spyre runtime libs (carried by `image_torch_spyre`)
     # to install. The check itself does not exercise the Spyre device, so it
     # runs on `spyre_pf_x0` (no cards).
     runs-on:
       - x86_64
       - spyre_pf_x0
       - linux
-      - image_spyre_inference
+      - image_torch_spyre
     timeout-minutes: 30
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

@@ -70,7 +70,7 @@ jobs:
       - x86_64
       - spyre_pf_x4__pvc_1tb_x1
       - linux
-      - image_spyre_inference
+      - image_torch_spyre
     timeout-minutes: 240
     env:
       CI: ''
@@ -106,7 +106,7 @@ jobs:
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
-          uv sync --frozen
+          uv sync --frozen --verbose --group dev
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 

@@ -145,11 +145,20 @@ Upstream `NixlConnector.initialize_host_xfer_buffer` reads `kv_cache.shape` / `k
 
 The subclass is registered under the factory name `"SpyreNixlConnector"` (see §5.7 for why a Spyre-specific name rather than re-registering `"NixlConnector"`). Operators on Spyre type that name in `kv_transfer_config`; CUDA / TPU deployments are unaffected and continue to use `"NixlConnector"`.
 
-### 3.6 PR #266's `SpyrePagedKVCacheAccessor`
+### 3.6 PR #266's `SpyrePagedKVCacheAccessor` — device page layout vs canonical block layout
 
-PR #266 introduces `SpyrePagedKVCacheAccessor` — a uniform abstraction over the Spyre paged-cache layout that exposes geometry (`num_pages`, `num_kv_heads`, `block_size`, `head_dim`, `dtype`) and per-page read/write. `InMemorySpyreConnector` (PR #264) uses it to bridge between page-list and contiguous-block views.
+PR #266 introduces `SpyrePagedKVCacheAccessor` — a uniform abstraction over the Spyre paged-cache layout that exposes geometry (`num_pages`, `num_kv_heads`, `block_size`, `head_dim`, `dtype`) and per-page read/write.
 
-**This RFC reuses the accessor directly.** The plugin-side `SpyrePdNixlWorker` subclass (§5.2; subclasses upstream `NixlPullConnectorWorker`) calls `SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)` to derive the host-buffer shape and uses `read_block` / `write_block` inside the `CopyBlocksOp`. No duplication between this RFC and PR #266 — same accessor, two consumers.
+Two layouts matter here and must not be conflated (this is precisely where the prior internal prototype found bugs, and it's what §5.2/§5.3 must be consistent about):
+
+| Layout | Shape | Where it lives | Who produces / consumes it |
+|---|---|---|---|
+| **Device page layout** | `[num_kv_heads, block_size, head_size]` per page | Individual page tensors inside `SpyrePagedKVCache(k_pages, v_pages)` on the Spyre device. This is what `spyre_attn.py` allocates and what the attention kernel reads. | Spyre attention backend. Not surfaced to the connector directly. |
+| **Canonical block layout** | `[block_size, num_kv_heads, head_size]` per block | The CPU-side representation the accessor exposes. `read_block(...)` returns this shape; `write_block(..., values=...)` expects this shape. | `SpyrePagedKVCacheAccessor.read_block` / `write_block`, and everything downstream on the CPU side (our host xfer buffer, NIXL registration, the peer's host buffer). |
+
+The two differ by a `(num_kv_heads, block_size) → (block_size, num_kv_heads)` transpose on the first two dims. The accessor absorbs this permutation so the connector layer only ever deals with the canonical block layout.
+
+**This RFC reuses the accessor directly.** The plugin-side `SpyrePdNixlWorker` subclass (§5.2; subclasses upstream `NixlPullConnectorWorker`) calls `SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)` to derive the host-buffer shape and uses `read_block` / `write_block` inside the `CopyBlocksOp` (§5.3). No duplication between this RFC and PR #266 — same accessor, two consumers.
 
 ### 3.7 The two-track relationship to PR #264
 
@@ -209,7 +218,7 @@ Migration from one to the other is a config change (§7).
 │        acc = SpyrePagedKVCacheAccessor.try_from_kv_caches(kv_caches)             │
 │        self.host_xfer_buffers = {                                                │
 │          layer: torch.empty(                                                     │
-│            (2, acc.num_pages, acc.num_kv_heads, acc.block_size, acc.head_dim),   │
+│            (2, acc.num_pages, acc.block_size, acc.num_kv_heads, acc.head_dim),   │
 │            dtype=acc.dtype, device='cpu')                                        │
 │          for layer in acc.layer_names                                            │
 │        }                                                                         │
@@ -299,14 +308,18 @@ class SpyrePdNixlWorker(NixlPullConnectorWorker):
             # later, fall through to upstream's default behavior.
             return super().initialize_host_xfer_buffer(kv_caches)
 
-        # Per layer, allocate a contiguous host mirror of the right total
-        # shape. Block IDs index into [num_pages]; the (k|v) dimension is
-        # leading for slicing convenience in the CopyBlocksOp.
+        # Per layer, allocate a contiguous host mirror in the accessor's
+        # CANONICAL BLOCK LAYOUT (§3.6): [block_size, num_kv_heads, head_size]
+        # per block. Concretely, per layer:
+        #   [2 (k|v), num_pages, block_size, num_kv_heads, head_size]
+        # The (k|v) dimension is leading so a single page slice
+        # host_buf[k|v, page_id] has the exact shape returned by
+        # accessor.read_block(...) — see §5.3.
         host_buffers: dict[str, torch.Tensor] = {}
         for layer_name in accessor.layer_names:
             host_buffers[layer_name] = torch.empty(
                 (2, accessor.num_pages,
-                 accessor.num_kv_heads, accessor.block_size, accessor.head_dim),
+                 accessor.block_size, accessor.num_kv_heads, accessor.head_dim),
                 dtype=accessor.dtype, device="cpu",
             )
 
@@ -335,7 +348,15 @@ Spyre's attention backend's `SpyrePagedKVCache(k_pages, v_pages)` layout is **no
 
 ### 5.3 The `CopyBlocksOp`
 
-The CopyBlocksOp uses `SpyrePagedKVCacheAccessor.read_block` / `write_block` for the device side (which knows how to read/write Spyre pages) and plain Tensor slicing for the host-mirror side:
+The CopyBlocksOp bridges the device side (via `SpyrePagedKVCacheAccessor.read_block` / `write_block`, which absorbs the page → block transpose from §3.6) and the host-mirror side (plain Tensor slicing).
+
+**Shape contract at each seam** — this is the check the reviewer specifically called out:
+
+- `accessor.read_block(layer_name, kv_kind, page_id)` returns a CPU tensor of shape `[block_size, num_kv_heads, head_size]` and dtype `accessor.dtype`.
+- A single-block slice of the host mirror `host_buf[kind_idx, page_id]` has shape `[block_size, num_kv_heads, head_size]` (from §5.2: full shape `[2, num_pages, block_size, num_kv_heads, head_size]`; slicing two leading dims removes them).
+- `accessor.write_block(..., values=...)` expects `values` of shape `[block_size, num_kv_heads, head_size]`.
+
+All three match. Both `copy_()` (d2h) and `write_block(values=...)` (h2d) operate on identically-shaped tensors — no permute, no reshape, no fallback path.
 
 ```python
 # spyre_inference/distributed/kv_transfer/kv_connector/v1/copy_blocks.py
@@ -362,15 +383,22 @@ def make_spyre_copy_blocks(
         direction: Literal["h2d", "d2h"],
     ) -> None:
         for layer_name in accessor.layer_names:
-            host_kv = host_buffers[layer_name]   # [2, num_pages, num_kv_heads, block_size, head_size]
+            # host_kv shape: [2 (k|v), num_pages, block_size, num_kv_heads, head_size]
+            # (see §5.2 — canonical block layout, matching accessor.read_block)
+            host_kv = host_buffers[layer_name]
             for kind_idx, kind in enumerate(("k", "v")):
                 for src, dst in zip(src_block_ids, dst_block_ids):
                     if direction == "d2h":
+                        # device page → CPU canonical block → host mirror slot
                         block = accessor.read_block(
                             layer_name=layer_name, kv_kind=kind, page_id=src,
                         )
+                        # LHS slice: [block_size, num_kv_heads, head_size]
+                        # RHS block: [block_size, num_kv_heads, head_size]  ✓
                         host_kv[kind_idx, dst].copy_(block)
                     else:  # "h2d"
+                        # host mirror slot → CPU canonical block → device page
+                        # values shape: [block_size, num_kv_heads, head_size]  ✓
                         block = host_kv[kind_idx, src]
                         accessor.write_block(
                             layer_name=layer_name, kv_kind=kind, page_id=dst,
@@ -380,7 +408,32 @@ def make_spyre_copy_blocks(
     return copy_blocks
 ```
 
-`SpyrePagedKVCacheAccessor.read_block` / `write_block` already use `tensor.to('cpu')` / `tensor.copy_()` against the underlying page tensors. `SpyreKvDmaCopier` is consumed transitively when those page tensors are device-resident.
+`SpyrePagedKVCacheAccessor.read_block` / `write_block` already handle the device-side DMA and page-vs-block transpose. `SpyreKvDmaCopier` is consumed transitively when those page tensors are device-resident.
+
+### 5.3.1 Host-buffer size estimate
+
+The per-layer host mirror is `[2, num_pages, block_size, num_kv_heads, head_size]` in `accessor.dtype`, so:
+
+```
+bytes_per_layer = 2 * num_pages * block_size * num_kv_heads * head_size * dtype_bytes
+bytes_total     = num_layers * bytes_per_layer
+```
+
+Two representative sizings:
+
+| Model shape                      | num_layers | num_kv_heads | head_size | block_size | num_pages | dtype  | per-layer  | total     |
+|----------------------------------|-----------:|-------------:|----------:|-----------:|----------:|--------|-----------:|----------:|
+| GQA-8 8B-ish (e.g. Llama-3-8B)   | 32         | 8            | 128       | 64         | 2048      | fp16   | **512 MiB**| **16 GiB**|
+| MHA 8B-ish, moderate pool        | 32         | 32           | 128       | 64         |  512      | fp16   | **512 MiB**| **16 GiB**|
+| GQA-2 dense small (micro-g3.3-8B)| 40         | 2            | 128       | 64         | 1024      | fp16   |  64 MiB    |  2.5 GiB  |
+| Same, larger pool                | 40         | 2            | 128       | 64         | 4096      | fp16   | 256 MiB    | 10 GiB    |
+
+The host buffer scales linearly with `num_pages` (i.e. the KV-cache pool size), which is a deployment-time knob. For a Spyre worker with 32 Gi allocatable, 16 GiB of NIXL-registerable host mirror is comfortable but not free — deployment YAMLs (§6 M1.5) should either size the pool with this in mind or expose it as a config knob.
+
+Two notes on where this can be reduced later, tracked as follow-ups:
+
+- **HMPM-backed host buffer** (§10 out-of-scope, dependent on wangchen615/vllm PR #51): the host mirror moves from process-local `torch.empty` into a shared mmap region, so intra-host prefill+decode pairs share the buffer instead of allocating one each.
+- **Windowed / streaming buffer**: allocate only the working set of pages that PD actively transfers at any moment, rather than mirroring the full pool. Requires connector-lifecycle changes; not in this RFC.
 
 ### 5.4 Worker-side wiring of `set_host_xfer_buffer_ops`
 
@@ -469,7 +522,7 @@ If unifying the user-facing name across platforms becomes important later, it ca
 
 | File | Coverage |
 |---|---|
-| `tests/v1/kv_transfer/test_spyre_pd_copy_blocks.py` | Unit: `make_spyre_copy_blocks` round-trip d2h → h2d → d2h preserves bytes. **Crucially asserts the CopyBlocksOp shape against `SpyrePagedKVCacheAccessor`'s canonical block layout** (`[block_size, num_kv_heads, head_size]` on CPU side vs `[num_kv_heads, block_size, head_size]` per page on device side, with the accessor's read/write permutation). Page-vs-block layout was where the prior internal prototype found bugs; this test pins the contract. CPU-only. |
+| `tests/v1/kv_transfer/test_spyre_pd_copy_blocks.py` | Unit: `make_spyre_copy_blocks` round-trip d2h → h2d → d2h preserves bytes. **Pins the shape contract from §3.6 / §5.3**: the host-mirror slot `host_buf[kind_idx, page_id]` and `accessor.read_block(...)` return / `accessor.write_block(values=...)` accept must all be `[block_size, num_kv_heads, head_size]` (canonical block layout, not the device page layout `[num_kv_heads, block_size, head_size]`). Test uses a fake `SpyrePagedKVCacheAccessor` that returns/accepts the canonical block layout and asserts (a) the tensor shapes at both seams match, (b) a synthetic pattern round-trips byte-for-byte through the device-side page transpose. Page-vs-block layout was where the prior internal prototype found bugs; this test pins the contract. CPU-only. |
 | `tests/v1/kv_transfer/test_spyre_pd_init_buffer.py` | Unit: `SpyrePdNixlWorker.initialize_host_xfer_buffer` over a fake page-list `kv_caches` produces correctly-shaped host buffers; falls through to `super().initialize_host_xfer_buffer` for non-page-list inputs. CPU-only, mocks the upstream worker base where needed. |
 | `tests/v1/kv_transfer/test_spyre_pd_factory.py` | Unit: `KVConnectorFactory.create_connector_v1("SpyreNixlConnector", ...)` resolves to `SpyrePdNixlConnector` when `spyre_inference` is loaded. CPU-only. |
 | `tests/v1/kv_transfer/test_pd_intra_host.py` | Integration: spawn two `vllm serve` subprocesses on one host (one prefill, one decode) with `kv_connector: SpyreNixlConnector`, submit a request, verify generated text matches a single-process baseline. Spyre runner. |
@@ -548,10 +601,7 @@ The acceptance criteria (§11) include a same-workload, same-output verification
 ## 9. Out of scope (filed as follow-ups)
 
 - **Async DMA on Spyre.** Depends on torch-spyre exposing a stream/event API. Until then, PD throughput is bounded by single-stream sync DMA (~3 GB/s per PR #240 §4.1). Same dependency as PR #240 and PR #264.
-- **Direct Spyre-to-Spyre P2P transfer.** Future torch-spyre primitive. Slots in as a new handler bypassing CPU staging on intra-host. Filed separately.
-- **HMPM integration.** When [wangchen615/vllm PR #51](https://github.com/wangchen615/vllm/pull/51) lands, the host buffer that backs `register_memory()` could mmap from an HMPM region instead of being a fresh `torch.empty`. Filed as a separate RFC; would also propose adding a `host_buffer_source` field to the upstream compatibility hash so standalone and HMPM-backed deployments can't silently mix.
 - **Stable on-device KV descriptor.** Shared with PR #240 and PR #264. Until torch-spyre exposes a stable kv-region descriptor, all three depend on `flit_offset` from `perfdsc` artifacts.
-- **Default-connector recommendation between `SpyreNixlConnector` and `InMemorySpyreConnector`.** Out of scope. Decision deferred until both have operational track records.
 - **Asymmetric TP between prefill and decode on Spyre.** Filed as M2 work, dependent on `SpyreCommunicator` evolution.
 - **Cross-connector composition beyond `MultiConnector`.** PD + offload + tiering + LMCache stacking is supported through `MultiConnector` already; bespoke composition logic is out of scope.
 

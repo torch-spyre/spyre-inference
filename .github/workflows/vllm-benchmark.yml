@@ -110,6 +110,23 @@ jobs:
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 
+      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
+      # against libnuma.so.1. Extract the RPM into a userspace dir and add
+      # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
+      # ships numactl-libs.
+      - name: Provide libnuma userspace
+        run: |
+          set -euo pipefail
+          NUMA_DIR="$RUNNER_TEMP/numa-libs"
+          mkdir -p "$NUMA_DIR"
+          cd "$NUMA_DIR"
+          curl -fsSL -o numactl-libs.rpm \
+            'https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/Packages/n/numactl-libs-2.0.19-3.el10.x86_64.rpm'
+          rpm2cpio numactl-libs.rpm | cpio -idmv
+          ls -la usr/lib64/
+          echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+
       - name: Resolve vLLM commit
         run: |
           set -eux
@@ -128,11 +145,13 @@ jobs:
       - name: Run vLLM benchmarks
         run: |
           unset _IBM_AIU_SETUP
-          rm -f /tmp/etc/ibm/spyre/topo.json
+          rm /tmp/etc/ibm/spyre/topo.json
+          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
+          # fails on image_torch_spyre; env vars are already exported by then.
+          set +e
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           set -eux
-
           uv run python3 .github/scripts/run_vllm_benchmarks.py \
             --configs-dir vllm-benchmarks/benchmarks/spyre \
             --results-dir benchmark-results

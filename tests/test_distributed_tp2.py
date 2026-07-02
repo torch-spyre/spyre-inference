@@ -110,3 +110,53 @@ def test_tp2_llm_generate_matches_tp1() -> None:
             f"prompt {i}: tp1 and tp2 diverged at token {n} "
             f"(expected >=2 matching tokens). tp1={a} tp2={b}"
         )
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    _spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+def test_tp2_transformers_generate_matches_tp1() -> None:
+    """TP=1 vs TP=2 greedy-decode prefix-match test using model_impl='transformers'.
+
+    Same structure as test_tp2_llm_generate_matches_tp1 but exercises the
+    HuggingFace Transformers backend (hf-adapters path) instead of the
+    default vLLM model implementation.
+    """
+    from vllm import LLM, SamplingParams
+
+    prompts = ["Hello, world!", "The capital of France is"]
+    sp = SamplingParams(max_tokens=8, temperature=0.0)
+
+    def run(tp: int) -> list[list[int]]:
+        llm = LLM(
+            model="meta-llama/Llama-3.2-1B-Instruct",
+            tensor_parallel_size=tp,
+            dtype="float16",
+            enforce_eager=False,
+            max_model_len=128,
+            max_num_seqs=2,
+            model_impl="transformers",
+        )
+        outs = llm.generate(prompts, sp)
+        result = [list(o.outputs[0].token_ids) for o in outs]
+        del llm
+        gc.collect()
+        return result
+
+    def _matching_prefix_len(a: list[int], b: list[int]) -> int:
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                return i
+        return min(len(a), len(b))
+
+    tp1 = run(tp=1)
+    tp2 = run(tp=2)
+    for i, (a, b) in enumerate(zip(tp1, tp2)):
+        n = _matching_prefix_len(a, b)
+        assert n >= 2, (
+            f"prompt {i}: tp1 and tp2 diverged at token {n} "
+            f"(expected >=2 matching tokens). tp1={a} tp2={b}"
+        )

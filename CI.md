@@ -36,7 +36,7 @@ The runner set is selected using a set of labels in the `runs-on` field in each 
       - x86_64 # Intel CPU Architecture
       - spyre_pf_x1 # 1 Spyre card in PF mode
       - linux # Linux OS - Usually RHEL 9/10
-      - image_spyre_inference # The spyre-inference container image
+      - image_torch_spyre # The torch-spyre container image
 ```
 
 The workflow will only get picked up by a runner set that matches ALL of the labels specified in the `runs-on` field.

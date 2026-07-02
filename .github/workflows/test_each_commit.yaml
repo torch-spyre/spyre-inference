@@ -53,11 +53,11 @@ on:
       runner_label:
         description: |
           Per-PR ephemeral runner-set IMAGE label to select for runs-on
-          (image_spyre_inference_pr_<component>_<sha12>, e.g.
-          image_spyre_inference_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
+          (image_torch_spyre_pr_<component>_<sha12>, e.g.
+          image_torch_spyre_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
           passes that PR's set label so jobs land on the per-PR image (the changed
           RPM is baked in -> no runtime sudo). Empty keeps push/PR/merge_group runs
-          on the standing image_spyre_inference set (today's behaviour).
+          on the standing image_torch_spyre set (today's behaviour).
         required: false
         type: string
         default: ""
@@ -85,7 +85,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "not (distributed or upstream or attention)"
           - cfg: Spyre attention tests
@@ -93,7 +93,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "attention and not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -101,7 +101,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -109,7 +109,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
@@ -117,7 +117,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and distributed"
           - cfg: Upstream model vLLM tests
@@ -125,7 +125,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_spyre_inference
+            image_label: image_torch_spyre
             flags: >-
               -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.
@@ -241,13 +241,34 @@ jobs:
           uv pip show torch
           uv pip freeze
 
+      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
+      # against libnuma.so.1. Extract the RPM into a userspace dir and add
+      # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
+      # ships numactl-libs.
+      - name: Provide libnuma userspace
+        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
+        run: |
+          set -euo pipefail
+          NUMA_DIR="$RUNNER_TEMP/numa-libs"
+          mkdir -p "$NUMA_DIR"
+          cd "$NUMA_DIR"
+          curl -fsSL -o numactl-libs.rpm \
+            'https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/Packages/n/numactl-libs-2.0.19-3.el10.x86_64.rpm'
+          rpm2cpio numactl-libs.rpm | cpio -idmv
+          ls -la usr/lib64/
+          echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
       - name: Run tests
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
         run: |
           unset _IBM_AIU_SETUP
           rm /tmp/etc/ibm/spyre/topo.json
+          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
+          # fails on image_torch_spyre; env vars are already exported by then.
+          set +e
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+          set -e
           echo "Running tests for config: ${{ matrix.cfg }}..."
           uv run pytest -s -vvv ${{ matrix.flags }}
           echo "tests done"

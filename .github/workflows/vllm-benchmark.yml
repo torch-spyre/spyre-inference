@@ -1,0 +1,203 @@
+name: vLLM Benchmark
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      vllm_branch:
+        description: >
+          vLLM branch to benchmark (main, or refs/pull/PR_NUMBER/head for
+          pre-merge check)
+        required: true
+        type: string
+        default: main
+      vllm_commit:
+        description: >
+          vLLM commit SHA (optional, defaults to latest on the branch)
+        required: false
+        type: string
+      models:
+        description: >
+          Comma-separated list of models to benchmark (optional, default all)
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch' && inputs.vllm_branch != '' && inputs.vllm_branch) || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  # ─── Generate benchmark matrix from spyre config files ───
+  set-parameters:
+    runs-on: ubuntu-latest
+    outputs:
+      benchmark_matrix: ${{ steps.set-parameters.outputs.benchmark_matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate benchmark matrix
+        id: set-parameters
+        env:
+          MODELS: ${{ inputs.models || '' }}
+        run: |
+          set -eux
+          pip install pyyaml
+          python .github/scripts/generate_vllm_benchmark_matrix.py \
+            --benchmark-configs-dir vllm-benchmarks/benchmarks \
+            --models "${MODELS}"
+
+  # ─── Run vLLM benchmarks on Spyre hardware ───
+  benchmarks:
+    name: Run vLLM benchmarks (${{ matrix.models }})
+    needs: set-parameters
+    strategy:
+      matrix: ${{ fromJson(needs.set-parameters.outputs.benchmark_matrix) }}
+      fail-fast: false
+    runs-on:
+      - x86_64
+      - spyre_pf_x4__pvc_1tb_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 240
+    env:
+      CI: ''
+      VLLM_CPU_KVCACHE_SPACE: '16'
+      DTLOG_LEVEL: error
+      FLEX_COMPUTE: SENTIENT
+      FLEX_DEVICE: PF
+      AIU_SETUP_MULTI_AIU: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
+      VLLM_PLUGINS: spyre_inference
+      DEVICE_NAME: spyre
+      DEVICE_TYPE: IBM_Spyre
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Compute Spyre image hash
+        id: spyre-uv-cache
+        uses: ./.github/actions/spyre-uv-cache
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          prune-cache: false
+
+      - name: Install spyre-inference
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          uv sync --frozen --verbose --group dev
+          echo "=== Installed versions ==="
+          uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
+
+      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
+      # against libnuma.so.1. Extract the RPM into a userspace dir and add
+      # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
+      # ships numactl-libs.
+      - name: Provide libnuma userspace
+        run: |
+          set -euo pipefail
+          NUMA_DIR="$RUNNER_TEMP/numa-libs"
+          mkdir -p "$NUMA_DIR"
+          cd "$NUMA_DIR"
+          curl -fsSL -o numactl-libs.rpm \
+            'https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/Packages/n/numactl-libs-2.0.19-3.el10.x86_64.rpm'
+          rpm2cpio numactl-libs.rpm | cpio -idmv
+          ls -la usr/lib64/
+          echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+
+      - name: Resolve vLLM commit
+        run: |
+          set -eux
+          VLLM_BRANCH="${{ inputs.vllm_branch || 'main' }}"
+          VLLM_COMMIT="${{ inputs.vllm_commit || '' }}"
+
+          if [[ -n "${VLLM_COMMIT}" ]]; then
+            HEAD_SHA="${VLLM_COMMIT}"
+          else
+            HEAD_SHA=$(git ls-remote https://github.com/vllm-project/vllm.git "${VLLM_BRANCH}" | awk '{print $1}')
+          fi
+
+          echo "HEAD_SHA=${HEAD_SHA}" >> "$GITHUB_ENV"
+          echo "### Benchmarking vLLM [${HEAD_SHA}](https://github.com/vllm-project/vllm/commit/${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run vLLM benchmarks
+        run: |
+          unset _IBM_AIU_SETUP
+          rm /tmp/etc/ibm/spyre/topo.json
+          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
+          # fails on image_torch_spyre; env vars are already exported by then.
+          set +e
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          set -eux
+          mkdir -p benchmark-results
+          uv run python3 .github/scripts/run_vllm_benchmarks.py \
+            --configs-dir vllm-benchmarks/benchmarks/spyre \
+            --results-dir benchmark-results > benchmark-results/run.log 2>&1
+
+      - name: Encrypt benchmark results
+        env:
+          ARTIFACT_ENCRYPTION_KEY: ${{ secrets.ARTIFACT_ENCRYPTION_KEY }}
+        run: |
+          for f in benchmark-results/*; do
+            [ -f "$f" ] || continue
+            openssl enc -aes-256-cbc -pbkdf2 \
+              -in "$f" -out "${f}.enc" \
+              -pass env:ARTIFACT_ENCRYPTION_KEY
+            rm "$f"
+          done
+
+      - name: Set artifact name
+        id: artifact-name
+        run: |
+          SAFE_NAME="${{ matrix.models }}"
+          SAFE_NAME="${SAFE_NAME//\//--}"
+          echo "artifact_name=benchmark-results--${SAFE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          path: benchmark-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Job Summary
+        if: always()
+        run: |
+          RESULT_COUNT=$(find benchmark-results -name "*.json.enc" 2>/dev/null | wc -l || echo 0)
+
+          {
+            echo "### Benchmark Results"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| vLLM Branch | ${{ inputs.vllm_branch || 'main' }} |"
+            echo "| vLLM Commit | ${HEAD_SHA:-unknown} |"
+            echo "| Models | ${{ matrix.models }} |"
+            echo "| Result Files | ${RESULT_COUNT} |"
+            echo "| Run ID | ${{ github.run_id }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

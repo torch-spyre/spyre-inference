@@ -48,6 +48,7 @@ from torch.utils._pytree import tree_map
 import numpy as np
 
 from vllm.config import VllmConfig, CompilationMode
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
@@ -55,6 +56,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference.custom_ops.rotary_embedding import SpyreRotaryEmbedding
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -127,17 +129,46 @@ class _SpyreModelWrapper:
         The lm_head matmul runs on Spyre via SpyreParallelLMHead,
         which handles H2D/D2H for the sample_hidden_states subset.
 
+    RoPE priming (per forward pass):
+        Before converting positions to Spyre, gather each RoPE module's per-token
+        rotation slice on the host (positions are still CPU here, so no D2H) and
+        stash it in the vLLM forward context. SpyreRotaryEmbedding.forward_oot
+        reads it back (via the opaque spyre_rope_rot op), shared across all
+        attention layers.
+
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
     (which calls self.model(...) directly).
     """
 
-    def __init__(self, model: nn.Module, spyre_device: torch.device):
+    def __init__(
+        self,
+        model: nn.Module,
+        spyre_device: torch.device,
+        rope_modules: list[SpyreRotaryEmbedding] | None = None,
+    ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
+        object.__setattr__(self, "_rope_modules", rope_modules or [])
 
     def __call__(self, *args, **kwargs):
+        # Prime the per-forward RoPE rotation slice(s) once, before positions are
+        # converted to Spyre. The slices are stashed in theforward context and read
+        # by SpyreRotaryEmbedding.forward_oot (via the opaque spyre_rope_rot op).
+        positions = kwargs.get("positions")
+
+        # Note if all layers share the same RoPE configuration self._rope_modules has
+        # length 1 and there is only a single rotation in forward context.
+        if positions is not None and self._rope_modules and is_forward_context_available():
+            rope_rot = {}
+            for rope in self._rope_modules:
+                rot = rope.gather_rotation(positions, self._spyre_device)
+                if rot is not None:
+                    rope_rot[rope._layer_name] = rot
+            if rope_rot:
+                get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
+
         # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
             if (
@@ -264,6 +295,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
+        # Collect the (shared) RoPE modules before compiling so _SpyreModelWrapper
+        # can prime their per-forward rotation slice. modules() dedupes by identity,
+        # so a shared instance appears once.
+        rope_modules = [m for m in self.model.modules() if isinstance(m, SpyreRotaryEmbedding)]
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
@@ -272,7 +308,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # automatically convert Spyre outputs to CPU. This ensures downstream
         # indexing (logits_indices), lm_head (CPU weights), and sampling all
         # receive CPU tensors without needing per-call-site overrides.
-        self.model = _SpyreModelWrapper(self.model, self._spyre_device)
+        self.model = _SpyreModelWrapper(self.model, self._spyre_device, rope_modules)
 
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.

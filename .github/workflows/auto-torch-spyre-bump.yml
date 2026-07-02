@@ -1,0 +1,93 @@
+name: Auto bump torch-spyre
+
+on:
+  schedule:
+    - cron: '0 14 * * 1-5'  # 8am US Mountain (MDT, UTC-6)
+  workflow_dispatch: {}
+  push:
+    branches: ['temp-test-torch-spyre-bump']
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Get latest torch-spyre commit
+        id: latest
+        run: |
+          SHA=$(gh api repos/torch-spyre/torch-spyre/commits/main --jq '.sha')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current torch-spyre commit
+        id: current
+        run: |
+          SHA=$(grep 'torch-spyre = ' pyproject.toml | grep -oP 'rev = "\K[^"]+')
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Check if bump is needed
+        id: check
+        run: |
+          if [ "${{ steps.latest.outputs.sha }}" = "${{ steps.current.outputs.sha }}" ]; then
+            echo "Already at latest, skipping"
+            echo "needed=false" >> $GITHUB_OUTPUT
+          else
+            echo "needed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: astral-sh/setup-uv@v5
+        if: steps.check.outputs.needed == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Update pyproject.toml rev
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          NEW_SHA="${{ steps.latest.outputs.sha }}"
+          sed -i "s/rev = \"${{ steps.current.outputs.sha }}\"/rev = \"$NEW_SHA\"/" pyproject.toml
+
+      - name: Re-lock
+        if: steps.check.outputs.needed == 'true'
+        run: uv lock
+
+      - name: Commit, push, and open PR
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          OLD="${{ steps.current.outputs.sha }}"
+          NEW="${{ steps.latest.outputs.sha }}"
+          SHORT_NEW="${NEW:0:8}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b auto/torch-spyre-bump
+          git add pyproject.toml uv.lock
+          git commit -m "auto: bump torch-spyre to ${SHORT_NEW}"
+          git push --force origin auto/torch-spyre-bump
+
+          EXISTING=$(gh pr list --state open --head auto/torch-spyre-bump --json number --jq '.[0].number // empty')
+          if [ -z "$EXISTING" ]; then
+            printf '%s\n\n%s\n\n%s\n%s\n%s\n' \
+              "Bumps \`torch-spyre\` from \`${OLD:0:8}\` to \`${NEW:0:8}\`." \
+              "**Compare:** https://github.com/torch-spyre/torch-spyre/compare/${OLD}...${NEW}" \
+              "> [!NOTE]" \
+              "> If testing this branch locally, clear the inductor cache first:" \
+              "> \`rm -rf /tmp/torchinductor_*\`" \
+              > /tmp/pr-body.md
+            gh pr create \
+              --title "auto: bump torch-spyre to ${SHORT_NEW}" \
+              --base main \
+              --head auto/torch-spyre-bump \
+              --body-file /tmp/pr-body.md
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

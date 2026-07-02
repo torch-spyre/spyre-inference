@@ -57,7 +57,7 @@ on:
           image_torch_spyre_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
           passes that PR's set label so jobs land on the per-PR image (the changed
           RPM is baked in -> no runtime sudo). Empty keeps push/PR/merge_group runs
-          on the standing image_torch_spyre set (today's behaviour).
+          on the standing image_torch_spyre_shadow set (today's behaviour).
         required: false
         type: string
         default: ""
@@ -85,7 +85,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m "not (distributed or upstream or attention)"
           - cfg: Spyre attention tests
@@ -93,7 +93,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m "attention and not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -101,7 +101,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -109,7 +109,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
@@ -117,7 +117,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m "upstream and distributed"
           - cfg: Upstream model vLLM tests
@@ -125,7 +125,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             flags: >-
               -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.
@@ -241,7 +241,7 @@ jobs:
           uv pip show torch
           uv pip freeze
 
-      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
+      # image_torch_spyre_shadow doesn't ship numactl-libs, but vllm/_C is linked
       # against libnuma.so.1. Extract the RPM into a userspace dir and add
       # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
       # ships numactl-libs.
@@ -264,7 +264,7 @@ jobs:
           unset _IBM_AIU_SETUP
           rm /tmp/etc/ibm/spyre/topo.json
           # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
+          # fails on image_torch_spyre_shadow; env vars are already exported by then.
           set +e
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh

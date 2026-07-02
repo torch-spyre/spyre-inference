@@ -70,7 +70,7 @@ jobs:
       - x86_64
       - spyre_pf_x4__pvc_1tb_x1
       - linux
-      - image_torch_spyre
+      - image_torch_spyre_shadow
     timeout-minutes: 240
     env:
       CI: ''
@@ -110,7 +110,7 @@ jobs:
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 
-      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
+      # image_torch_spyre_shadow doesn't ship numactl-libs, but vllm/_C is linked
       # against libnuma.so.1. Extract the RPM into a userspace dir and add
       # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
       # ships numactl-libs.
@@ -147,7 +147,7 @@ jobs:
           unset _IBM_AIU_SETUP
           rm /tmp/etc/ibm/spyre/topo.json
           # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
+          # fails on image_torch_spyre_shadow; env vars are already exported by then.
           set +e
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh

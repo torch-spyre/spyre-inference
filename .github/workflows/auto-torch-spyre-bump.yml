@@ -70,7 +70,7 @@ jobs:
           SHORT_NEW="${NEW:0:8}"
 
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b auto/torch-spyre-bump
           git add pyproject.toml uv.lock
           git commit -m "auto: bump torch-spyre to ${SHORT_NEW}"

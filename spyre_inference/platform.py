@@ -149,9 +149,35 @@ class TorchSpyrePlatform(CpuPlatform):
         # See `spyre_inference/distributed/spyre_communicator.py`.
         return "spyre_inference.distributed.spyre_communicator.SpyreCommunicator"
 
+    # Encoder backend path returned for ENCODER/ENCODER_ONLY layers.
+    _encoder_backend_path = (
+        "spyre_inference.v1.attention.backends.spyre_encoder_attn.SpyreEncoderAttentionBackend"
+    )
+
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
+        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
+        # decoders use the paged backend. vLLM passes attn_type via the selector
+        # config, so the choice lives here rather than as a branch in the impl.
+        from vllm.v1.attention.backend import AttentionType
+
+        attn_selector_config = kwargs.get("attn_selector_config") or (args[0] if args else None)
+        attn_type = getattr(attn_selector_config, "attn_type", None)
+        if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+            return cls._encoder_backend_path
         return AttentionBackendEnum.CUSTOM.get_path()
+
+    @classmethod
+    def opaque_attention_op(cls) -> bool:
+        """Invoke ``SpyreAttentionImpl.forward`` directly, not via the dispatched op.
+
+        ``True`` (CpuPlatform's default) routes attention through
+        ``torch.ops.vllm.unified_attention_with_output``, which dispatches by
+        tensor device. Q/K/V arrive on CPU, so the PrivateUse1-only kernel isn't
+        found. Returning ``False`` sets ``use_direct_call=True`` so the impl owns
+        device placement for both the encoder and decoder paths.
+        """
+        return False
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

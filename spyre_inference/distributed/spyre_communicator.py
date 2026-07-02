@@ -147,18 +147,20 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # The base class uses dist.all_gather_into_tensor which needs
-        # _allgather_base in spyreccl is still stubbed. Use list-form
-        # dist.all_gather instead (natively supported).
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
-        # delete this override and let the base class handle it.
+        # The base class uses dist.all_gather_into_tensor; spyreccl's
+        # _allgather_base is intentionally unimplemented, so use list-form
+        # dist.all_gather instead.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
         output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
         dist.all_gather(output_list, input_, group=self.device_group)
-        return torch.cat(output_list, dim=dim)
+        # torch.cat on Spyre shifts the second operand by -(|A| mod 64) slots
+        # along the concat dim when |A| is not stick-aligned; round-trip
+        # through CPU until the upstream kernel is fixed.
+        output_list_cpu = [t.to("cpu") for t in output_list]
+        return torch.cat(output_list_cpu, dim=dim).to(input_.device)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

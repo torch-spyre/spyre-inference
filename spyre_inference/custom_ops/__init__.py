@@ -16,6 +16,7 @@
 
 from functools import lru_cache
 
+from . import logits_processor  # noqa: F401
 from . import parallel_lm_head
 from . import rms_norm
 from . import rotary_embedding

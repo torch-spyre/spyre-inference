@@ -27,9 +27,9 @@ class SpyreLogitsProcessor(LogitsProcessor):
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
         logits = super()._get_logits(hidden_states, lm_head, embedding_bias)
-        # if logits is not None:
-        #     # In-place aten ops on non-contig Spyre tensors infinite-loop
-        #     # through torch-spyre's compile_once wrapper; downstream
-        #     # `logits *= self.scale` would trigger it on the sliced view.
-        #     logits = logits.contiguous()
+        if logits is not None:
+            # In-place aten ops on non-contig Spyre tensors infinite-loop
+            # through torch-spyre's compile_once wrapper; downstream
+            # `logits *= self.scale` would trigger it on the sliced view.
+            logits = logits.contiguous()
         return logits

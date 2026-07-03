@@ -183,9 +183,11 @@ class _SpyreModelWrapper:
         if hidden_states is not None:
             hidden_states = hidden_states.contiguous()
         hidden_states = convert(hidden_states, device=self._spyre_device)
-        # if hidden_states is not None:
-        #     hidden_states = hidden_states.contiguous()
+        if hidden_states is not None:
+            hidden_states = hidden_states.contiguous()
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+        if logits is not None:
+            logits = logits.contiguous()
         return convert(logits, device="cpu")
 
     def __getattr__(self, name):

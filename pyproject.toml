@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm>=0.23.0,<0.24",
+    "vllm>=0.24.0,<0.25",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -102,7 +102,7 @@ vllm = [
   # Pre-built CPU wheels (x86_64 + aarch64) — avoids ~30 min C++ kernel compilation on Linux CI.
   # manylinux_2_35 requires glibc >= 2.35; RHEL 10.2 ships 2.39 so this is compatible.
   { index = "vllm-cpu", marker = "sys_platform == 'linux'" },
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.23.0", marker = "sys_platform != 'linux'" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0", marker = "sys_platform != 'linux'" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f539107ded5ac76cf7d3175e7e37532a3b7f058c" }
 torch = [
@@ -130,11 +130,11 @@ members = ["tests/plugin"]
 # ]
 
 # Pre-built vllm CPU wheels (x86_64 + aarch64 Linux). The path component is the git commit SHA
-# for the pinned rev (v0.23.0 = 0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665). Update both this hash
+# for the pinned rev (v0.24.0 = ee0da84ab9e04ac7610e28580af62c365e898389). Update both this hash
 # and the rev in tool.uv.sources together when bumping vllm.
 [[tool.uv.index]]
 name = "vllm-cpu"
-url = "https://wheels.vllm.ai/0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665/cpu"
+url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu"
 explicit = true
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere

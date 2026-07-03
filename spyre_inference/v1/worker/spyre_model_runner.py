@@ -180,7 +180,7 @@ class _SpyreModelWrapper:
         then convert the resulting logits back to CPU
         for downstream sampling.
         """
-        hidden_states = convert(hidden_states, device=self._spyre_device)
+        hidden_states = convert(hidden_states, device=self._spyre_device).contiguous()
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
         return convert(logits, device="cpu")
 

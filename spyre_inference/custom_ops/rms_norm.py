@@ -31,7 +31,7 @@ logger = init_logger(__name__)
 
 @RMSNorm.register_oot(name="RMSNorm")
 class SpyreRMSNorm(RMSNorm):
-    """OOT RMSNorm for IBM's Spyre device."""
+    """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
     _dynamic_arg_dims = {"x": [], "residual": []}
 

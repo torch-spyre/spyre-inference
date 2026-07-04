@@ -14,8 +14,6 @@
 
 """Spyre OOT replacement for ParallelLMHead.
 
-Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
-
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
@@ -105,16 +103,9 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
-        x_device = x.device
-
-        # Due to a limitation of torch-spyre regarding sizes that can be used
-        # in a F.linear layer, the original weights need to be padded
-        out = F.linear(
-            x,
-            self.padded_weight.data,
-            bias,
-        )
-
-        out_cpu = convert(out, device="cpu")
-        out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        return convert(out_cpu_no_pad, device=x_device)
+        out = F.linear(x, self.padded_weight.data, bias)
+        # padding columns are sliced off the logits afterwards
+        # .contiguous() is applied, so the slice is a fresh tensor, not a strided Spyre view).
+        if self.padding > 0:
+            out = out[:, : -self.padding].contiguous()
+        return convert(out, device=x.device)

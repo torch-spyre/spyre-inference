@@ -55,6 +55,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -264,6 +265,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError(
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
+
+        # Un-fuse QKV / gate-up projections.
+        analyze_and_unfuse(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Attention is nn.Module (not PluggableLayer) so OOT registration is

@@ -33,28 +33,22 @@ class SpyreSiluAndMul(SiluAndMul):
         """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
 
-    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        """Spyre-optimized SiLU and multiply activation (SwiGLU).
+    def forward_oot(self, x) -> torch.Tensor:
+        """SwiGLU: silu(gate) * up, output shape [..., d].
 
-        Args:
-            x: Input tensor of shape [..., 2*d] containing concatenated gate halves.
-
-        Returns:
-            Activated output tensor of shape [..., d] with same device and dtype as input.
+        `x` is either a `[gate, up]` list of already-split tensors (from an
+        un-fused gate_up_proj, see unfuse.py) or a fused [..., 2*d] tensor.
+        The fused path only runs for layers unfuse left alone (e.g. quantized).
         """
-        original_device = x.device
-
-        # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
-        x = convert(x, device="cpu")
-
-        # Slice and make contiguous before transferring to Spyre.
-        # Non-contiguous slices get corrupted during transfer to Spyre!
-        d = x.shape[-1] // 2
-        x1 = x[..., :d].contiguous()
-        x2 = x[..., d:].contiguous()
-
-        # Transfer contiguous slices back to original device.
-        x1 = convert(x1, device=original_device)
-        x2 = convert(x2, device=original_device)
-
+        if isinstance(x, (list, tuple)):
+            # Fast path: halves already split, both contiguous on device.
+            x1, x2 = x
+        else:
+            # Fused path: slice on CPU — slicing a Spyre tensor corrupts memory,
+            # and non-contiguous slices corrupt again on transfer back.
+            original_device = x.device
+            x = convert(x, device="cpu")
+            d = x.shape[-1] // 2
+            x1 = convert(x[..., :d].contiguous(), device=original_device)
+            x2 = convert(x[..., d:].contiguous(), device=original_device)
         return F.silu(x1) * x2

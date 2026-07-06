@@ -153,21 +153,9 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_rope_modules", rope_modules or [])
 
     def __call__(self, *args, **kwargs):
-        # Prime the per-forward RoPE rotation slice(s) once, before positions are
-        # converted to Spyre. The slices are stashed in theforward context and read
-        # by SpyreRotaryEmbedding.forward_oot (via the opaque spyre_rope_rot op).
-        positions = kwargs.get("positions")
-
-        # Note if all layers share the same RoPE configuration self._rope_modules has
-        # length 1 and there is only a single rotation in forward context.
-        if positions is not None and self._rope_modules and is_forward_context_available():
-            rope_rot = {}
-            for rope in self._rope_modules:
-                rot = rope.gather_rotation(positions, self._spyre_device)
-                if rot is not None:
-                    rope_rot[rope._rope_key] = rot
-            if rope_rot:
-                get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
+        # Prime the per-forward RoPE rotation slice(s) before positions are
+        # converted to Spyre (they are still on the host here, so no D2H).
+        self._prime_rope_rotation(kwargs.get("positions"))
 
         # Convert integer tensor inputs to Spyre int64
         def _convert_int(t):
@@ -201,6 +189,25 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    def _prime_rope_rotation(self, positions: torch.Tensor | None) -> None:
+        """Pre-gather each RoPE module's per-token rotation slice into the forward context.
+
+        Runs once per forward pass while positions are still on the host, so the gather
+        has no D2H; SpyreRotaryEmbedding.forward_oot then fetches the shared slice via the
+        opaque spyre_rope_rot op. When all layers share one RoPE config, self._rope_modules
+        has length 1 and a single rotation is stashed. Configs on the CPU fallback return
+        None from gather_rotation and contribute nothing.
+        """
+        if positions is None or not self._rope_modules or not is_forward_context_available():
+            return
+        rope_rot = {}
+        for rope in self._rope_modules:
+            rot = rope.gather_rotation(positions, self._spyre_device)
+            if rot is not None:
+                rope_rot[rope._rope_key] = rot
+        if rope_rot:
+            get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 
     def __getattr__(self, name):
         return getattr(self._model, name)

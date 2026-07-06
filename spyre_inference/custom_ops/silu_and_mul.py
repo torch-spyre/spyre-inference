@@ -44,7 +44,8 @@ class SpyreSiluAndMul(SiluAndMul):
         """
         original_device = x.device
 
-        # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
+        # Slicing must run on CPU (slicing Spyre tensors causes corruption);
+        # convert is a no-op when x is already on CPU.
         x = convert(x, device="cpu")
 
         # Slice and make contiguous before transferring to Spyre.

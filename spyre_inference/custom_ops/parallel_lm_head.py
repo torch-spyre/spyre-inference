@@ -49,8 +49,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         # torch-spyre currently has a limitation with the work division of larger
         # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
         # an integer.
-
-        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size
+        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size.
         ALIGN = 64 * 32
         size = layer.weight.shape[0]
         layer.padding = (-size) % ALIGN
@@ -107,8 +106,9 @@ class SpyreParallelLMHead(ParallelLMHead):
         """
         x_device = x.device
 
-        # Due to a limitation of torch-spyre regarding sizes that can be used
-        # in a F.linear layer, the original weights need to be padded
+        # x already resides on Spyre (moved in _SpyreModelWrapper.compute_logits),
+        # so no conversion is needed here. Due to a limitation of torch-spyre
+        # regarding sizes usable in F.linear, the weights are padded.
         out = F.linear(
             x,
             self.padded_weight.data,

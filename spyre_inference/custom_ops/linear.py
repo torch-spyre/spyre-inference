@@ -22,9 +22,9 @@ layer classes used inside MLP blocks:
     - SpyreRowParallelLinear          — replaces RowParallelLinear
       (vllm/model_executor/layers/linear.py)
 
-MergedColumnParallelLinear is left unmodified: its upstream forward() reduces
-to SpyreUnquantizedLinearMethod.apply() (via the SpyreLinearBase swap) plus
-bias handling, with no Spyre-specific device transfers needed.
+MergedColumnParallelLinear is left unmodified: upstream UnquantizedLinearMethod
+already dispatches to F.linear on the Spyre platform, and no Spyre-specific
+device transfers are needed.
 
 Spyre Device Constraints:
     - Computations performed in torch.float16.

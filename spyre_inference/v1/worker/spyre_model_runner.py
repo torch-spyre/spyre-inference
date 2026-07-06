@@ -181,8 +181,9 @@ class _SpyreModelWrapper:
         for downstream sampling.
         """
         hidden_states = convert(hidden_states, device=self._spyre_device)
+        # logits are returned on cpu
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
-        return convert(logits, device="cpu")
+        return logits
 
     def __getattr__(self, name):
         return getattr(self._model, name)

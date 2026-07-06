@@ -117,4 +117,5 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         out_cpu = convert(out, device="cpu")
         out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        return convert(out_cpu_no_pad, device=x_device)
+        # Currently output has to remain on CPU because of all_gather in case of TP > 1
+        return out_cpu_no_pad

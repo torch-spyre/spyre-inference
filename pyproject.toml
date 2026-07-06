@@ -105,8 +105,14 @@ vllm = [
   { git = "https://github.com/vllm-project/vllm", rev = "v0.23.0", marker = "sys_platform != 'linux'" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f539107ded5ac76cf7d3175e7e37532a3b7f058c" }
+# TEMPORARY: pin x86_64 linux wheels via CloudFront while download-r2.pytorch.org
+# (Cloudflare R2) rejects TLS handshakes from non-browser clients. Revert to a
+# plain index entry once upstream fixes the zone config.
+# https://dev-discuss.pytorch.org/t/heads-up-libtorch-downloads-now-redirect-to-download-r2-pytorch-org-by-default-use-curl-l/3395
 torch = [
-  { index = "pytorch-cpu" },
+  { url = "https://download.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.12'" },
+  { url = "https://download.pytorch.org/whl/cpu/torch-2.11.0%2Bcpu-cp311-cp311-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64' and python_version == '3.11'" },
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux' or platform_machine != 'x86_64' or (python_version != '3.11' and python_version != '3.12')" },
 ]
 torchvision = [
   { index = "pytorch-cpu" },

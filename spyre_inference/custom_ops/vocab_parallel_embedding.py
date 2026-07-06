@@ -21,7 +21,10 @@ inductor backend rejects with `unexpected argument Constant(value=N,
 dtype=torch.int64) to greaterequal`.
 """
 
+from typing import cast
+
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
@@ -31,16 +34,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
+from .utils import convert
+
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
-    """Spyre OOT VocabParallelEmbedding.
+    """Spyre OOT ``VocabParallelEmbedding``.
 
-    Mirrors upstream forward, but runs the mask helper on CPU (see module
-    docstring) and zeroes out-of-shard rows by multiplication since
-    torch-spyre lacks `masked_fill_`.
+    torch-spyre has no embedding kernel, so the table stays on Spyre with the
+    rest of the weights and the gather runs on CPU. The TP shard mask and
+    ``tensor_model_parallel_all_reduce`` also run on CPU: tensors from
+    ``convert()`` H2D cannot be the target of in-place Spyre ops (the manual
+    TP=2 ``all_reduce`` does ``input_.add_(scratch)``).
     """
 
     def __init__(self, *args, **kwargs):
@@ -52,6 +59,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        weight = cast(torch.Tensor, self.weight.data)
+        weight_cpu = weight.cpu()
         if self.tp_size > 1:
             masked_input, input_mask = get_masked_input_and_mask(
                 input_.cpu(),
@@ -61,14 +70,13 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
-            masked_input = masked_input.to(input_.device)
         else:
-            masked_input = input_
+            masked_input = input_.cpu()
 
-        output_parallel = self.quant_method.embedding(self, masked_input.long())
-
+        output_cpu = F.embedding(masked_input.long(), weight_cpu)
         if self.tp_size > 1:
-            keep = (~input_mask).to(output_parallel.dtype).unsqueeze(-1)
-            output_parallel = output_parallel * keep.to(output_parallel.device)
+            keep = (~input_mask).to(output_cpu.dtype).unsqueeze(-1)
+            output_cpu = output_cpu * keep
+            output_cpu = tensor_model_parallel_all_reduce(output_cpu)
 
-        return tensor_model_parallel_all_reduce(output_parallel)
+        return convert(output_cpu, device=weight.device)

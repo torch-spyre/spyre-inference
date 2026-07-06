@@ -45,7 +45,7 @@ def requires_spyre():
 
 def _prime_rope(rope, positions):
     """Mimic _SpyreModelWrapper: pre-gather the rotation slice for ``positions`` and
-    stash it in the forward context (keyed by the module's ``_layer_name``) so a
+    stash it in the forward context (keyed by the module's ``_rope_key``) so a
     subsequent ``forward_oot`` can fetch it via the ``spyre_rope_rot`` op.
 
     Direct ``forward_oot`` calls don't go through the wrapper, so tests must prime
@@ -58,7 +58,7 @@ def _prime_rope(rope, positions):
     rot = rope.gather_rotation(positions, positions.device)
     if rot is not None:
         cache = get_forward_context().additional_kwargs.setdefault("spyre_rope_rot", {})
-        cache[rope._layer_name] = rot
+        cache[rope._rope_key] = rot
     return rot
 
 

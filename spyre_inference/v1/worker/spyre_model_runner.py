@@ -165,7 +165,7 @@ class _SpyreModelWrapper:
             for rope in self._rope_modules:
                 rot = rope.gather_rotation(positions, self._spyre_device)
                 if rot is not None:
-                    rope_rot[rope._layer_name] = rot
+                    rope_rot[rope._rope_key] = rot
             if rope_rot:
                 get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
 

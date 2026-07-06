@@ -27,6 +27,7 @@ Set ``SPYRE_INFERENCE_ROPE_DEVICE=cpu`` to fall back to the previous CPU
 implementation ``RotaryEmbedding.forward_native``.
 """
 
+import itertools
 import os
 
 import torch
@@ -43,7 +44,7 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.utils.torch_utils import direct_register_custom_op
 from functools import lru_cache
 
-from .utils import convert, register_layer
+from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -87,6 +88,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
     The 2x2 rotation-matrix cache is derived from the base ``cos_sin_cache`` (so
     all rope-scaling variants are inherited) and kept on CPU. It is built lazily.
     """
+    _key_counter = itertools.count()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -101,8 +103,9 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
             and (self.rotary_dim // 2) % _SPYRE_STICK == 0
         )
         self._rotation_cache: torch.Tensor | None = None
-        # Stable key so the opaque spyre_rope_rot op can recover this instance
-        self._layer_name = register_layer(self, "spyre_rope")
+        # Stable per-instance (== per rope-config) key for the forward-context
+        # rotation dict, passed through the opaque spyre_rope_rot op.
+        self._rope_key = f"spyre_rope_{next(self._key_counter)}"
 
     def _apply(self, fn, recurse=True):
         # Keep cos_sin_cache on CPU so forward_native can use it directly.
@@ -188,7 +191,7 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # out of the torch.compile graph — the slice enters the graph as an op output
         # rather than a baked constant.
         rot = torch.ops.vllm.spyre_rope_rot(  # ty: ignore[invalid-argument-type]
-            positions, self._layer_name, self.head_size
+            positions, self._rope_key, self.head_size
         )
         q = convert(query, device=target_device, dtype=target_dtype)
         out_query = _rotate_neox_2x2(q, rot, self.head_size)
@@ -206,22 +209,22 @@ class SpyreLlama3RotaryEmbedding(Llama3RotaryEmbedding, SpyreRotaryEmbedding):
     pass
 
 
-def _rope_rot_op_func(positions: torch.Tensor, layer_name: str, head_size: int) -> torch.Tensor:
+def _rope_rot_op_func(positions: torch.Tensor, rope_key: str, head_size: int) -> torch.Tensor:
     """Opaque-op body: return this forward pass's 2x2 rotation slice on Spyre.
 
     ``_SpyreModelWrapper`` pre-gathers the slice and stashes it in the forward
-    context (keyed by ``layer_name``) before every model forward, so this is a pure
+    context (keyed by ``rope_key``) before every model forward, so this is a pure
     lookup. Hidden behind ``torch.ops.vllm.spyre_rope_rot`` so the forward-context
     read is not traced into outer torch.compile graphs. ``positions``/``head_size``
     are unused here but define the output shape for the fake impl below.
     """
     rope_rot = get_forward_context().additional_kwargs.get("spyre_rope_rot", {})
-    if layer_name not in rope_rot:
-        raise RuntimeError(f"SpyreRoPE: rotation slice for '{layer_name}' not primed")
-    return rope_rot[layer_name]
+    if rope_key not in rope_rot:
+        raise RuntimeError(f"SpyreRoPE: rotation slice for '{rope_key}' not primed")
+    return rope_rot[rope_key]
 
 
-def _rope_rot_op_fake(positions: torch.Tensor, layer_name: str, head_size: int) -> torch.Tensor:
+def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) -> torch.Tensor:
     return torch.empty(
         (positions.shape[0], 2, 2, head_size // 2),
         dtype=torch.float16,

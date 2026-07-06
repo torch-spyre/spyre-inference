@@ -104,8 +104,6 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
-        x_device = x.device
-
         # x already resides on Spyre (moved in _SpyreModelWrapper.compute_logits),
         # so no conversion is needed here. Due to a limitation of torch-spyre
         # regarding sizes usable in F.linear, the weights are padded.

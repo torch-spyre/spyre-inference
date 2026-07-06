@@ -37,6 +37,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 RESULTS_TABLE = "results_v3"
+METADATA_TABLE = "run_metadata"
 
 
 def parse_args() -> Any:
@@ -77,6 +78,8 @@ def extract_rows(
     ts = int(time.time() * 1000)
 
     for file in glob.glob(f"{results_dir}/*.json"):
+        if file.endswith(".pytorch.json"):
+            continue
         filename = os.path.basename(file)
         records = read_benchmark_results(file)
 
@@ -92,7 +95,11 @@ def extract_rows(
             metric = record["metric"]
 
             test_name = benchmark.get("test_name", filename)
-            model = benchmark.get("model", "unknown")
+            model = (
+                benchmark.get("model")
+                or benchmark.get("model_name")
+                or filename.replace(".json", "")
+            )
             metric_name = metric.get("name", "unknown")
             benchmark_values = metric.get("benchmark_values", [])
 
@@ -114,7 +121,7 @@ def extract_rows(
                     {
                         "timestamp": ts,
                         "schema_version": "v3",
-                        "name": workflow,
+                        "name": "spyre_e2e_benchmark",
                         "metric": metric_name,
                         "actual": float(value),
                         "target": 0.0,
@@ -168,7 +175,37 @@ def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
         data,
         column_names=columns,
     )
-    log.info("Inserted %d rows", len(rows))
+    log.info("Inserted %d rows into %s", len(rows), RESULTS_TABLE)
+
+    # Insert metadata rows (required for dashboard commit picker)
+    metadata_rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str, str]] = set()
+    for row in rows:
+        extra_data = json.loads(row["extra"])
+        key = (row["workflow_id"], row["metric"], extra_data.get("model", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        metadata_rows.append(
+            {
+                "timestamp": row["timestamp"],
+                "repo": row["repo"],
+                "head_branch": row["head_branch"],
+                "head_sha": extra_data.get("head_sha", ""),
+                "workflow_id": row["workflow_id"],
+                "benchmark_name": row["name"],
+                "model_name": extra_data.get("model", ""),
+                "metric_name": row["metric"],
+                "device": extra_data.get("device", "spyre"),
+                "arch": extra_data.get("arch", "x86_64"),
+            }
+        )
+
+    if metadata_rows:
+        meta_columns = list(metadata_rows[0].keys())
+        meta_data = [[r[col] for col in meta_columns] for r in metadata_rows]
+        client.insert(METADATA_TABLE, meta_data, column_names=meta_columns)
+        log.info("Inserted %d rows into %s", len(metadata_rows), METADATA_TABLE)
 
 
 def main() -> None:

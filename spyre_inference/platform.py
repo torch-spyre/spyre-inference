@@ -125,14 +125,21 @@ class TorchSpyrePlatform(CpuPlatform):
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
 
-        vllm_config.compilation_config.mode = CompilationMode.NONE
+        # When enforce_eager is set, vLLM has already reset the mode to NONE; 
+        # preserve that so eager stays eager.
+        if vllm_config.model_config is not None and vllm_config.model_config.enforce_eager:
+            vllm_config.compilation_config.mode = CompilationMode.NONE
+        else:
+            vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
 
-        # Force eager execution. torch.compile with the Spyre inductor
-        # backend requires ALL graph tensors on Spyre, but our CPU fallback
-        # ops (embedding, linear, rotary, attention) create intermediate
-        # CPU tensors that the Spyre backend cannot codegen. Once all layers
-        # run natively on Spyre, this can be removed to enable compilation.
-        vllm_config.model_config.enforce_eager = True
+            # Keep vLLM's CustomOp dispatch for the OOT path.
+            # vLLM defaults custom_ops to "none" whenever backend=="inductor" and
+            # mode!=NONE.
+            if all(
+                s not in vllm_config.compilation_config.custom_ops
+                for s in ("all", "none")
+            ):
+                vllm_config.compilation_config.custom_ops.append("all")
 
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would

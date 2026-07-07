@@ -33,11 +33,8 @@ logger = init_logger(__name__)
 class SpyreRMSNorm(RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
-    _dynamic_arg_dims = {"x": [], "residual": []}
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._compiled_forward_spyre = self.maybe_compile(self._forward_spyre_impl)
 
         logger.warning_once(
             "SpyreRMSNorm: no dtype promotion is performed, "
@@ -52,7 +49,7 @@ class SpyreRMSNorm(RMSNorm):
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        return self._compiled_forward_spyre(
+        return self._forward_spyre_impl(
             x,
             self.variance_epsilon,
             self.hidden_size,
@@ -68,7 +65,7 @@ class SpyreRMSNorm(RMSNorm):
         weight: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """RMSNorm kernel for Spyre. Compiled separately via maybe_compile."""
+        """RMSNorm kernel for Spyre."""
         if residual is not None:
             x = x + residual
             residual = x

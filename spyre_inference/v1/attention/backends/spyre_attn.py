@@ -169,20 +169,10 @@ def _indirect_matmul_mock(
 
 
 def _maybe_compile(fn):
-    """Compile fn unless vLLM's compilation config disables it.
-
-    Mirrors the gating in CustomOp.maybe_compile.
+    """Return fn unchanged: attention kernels always run eager for now.
+    
     """
-    from vllm.config import get_current_vllm_config_or_none
-    from vllm.config.compilation import CompilationMode
-
-    config = get_current_vllm_config_or_none()
-    if config is None:
-        return fn
-    cfg = config.compilation_config
-    if cfg.mode == CompilationMode.NONE or cfg.backend == "eager":
-        return fn
-    return torch.compile(fn, dynamic=False)
+    return fn
 
 
 # ---------------------------------------------------------------------------

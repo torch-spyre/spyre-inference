@@ -73,19 +73,27 @@ def extract_rows(
     workflow: str,
     pr_number: int,
 ) -> list[dict[str, Any]]:
-    """Extract rows from benchmark JSON files."""
+    """Extract rows from PyTorch benchmark JSON files."""
     rows = []
     ts = int(time.time() * 1000)
 
-    for file in glob.glob(f"{results_dir}/*.json"):
-        if file.endswith(".pytorch.json"):
-            continue
+    files = sorted(glob.glob(f"{results_dir}/*.pytorch.json"))
+    log.info("Found %d PyTorch benchmark JSON files in %s", len(files), results_dir)
+
+    for file in files:
         filename = os.path.basename(file)
-        records = read_benchmark_results(file)
+
+        try:
+            records = read_benchmark_results(file)
+        except Exception:
+            log.exception("Failed to read benchmark results from %s", filename)
+            continue
 
         if not records:
             log.warning("No results in %s", filename)
             continue
+
+        before_rows = len(rows)
 
         for record in records:
             if "benchmark" not in record or "metric" not in record:
@@ -95,13 +103,24 @@ def extract_rows(
             metric = record["metric"]
 
             test_name = benchmark.get("test_name", filename)
+
+            model_info = record.get("model", {})
+            if not isinstance(model_info, dict):
+                model_info = {}
+
             model = (
                 benchmark.get("model")
                 or benchmark.get("model_name")
+                or model_info.get("name")
                 or filename.replace(".json", "")
             )
+
             metric_name = metric.get("name", "unknown")
             benchmark_values = metric.get("benchmark_values", [])
+
+            if not benchmark_values:
+                log.warning("No benchmark_values in %s", filename)
+                continue
 
             for value in benchmark_values:
                 extra = json.dumps(
@@ -134,6 +153,11 @@ def extract_rows(
                     }
                 )
 
+        extracted = len(rows) - before_rows
+        if extracted:
+            log.info("Extracted %d rows from %s", extracted, filename)
+
+    log.info("Total rows extracted: %d", len(rows))
     return rows
 
 
@@ -145,12 +169,12 @@ def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
         "CLICKHOUSE_PASS": os.environ.get("CLICKHOUSE_PASS"),
         "CLICKHOUSE_DB": os.environ.get("CLICKHOUSE_DB"),
     }
-    missing = [k for k, v in clickhouse_env_vars.items() if v is None]
+    missing = [k for k, v in clickhouse_env_vars.items() if not v]
     if missing:
         raise OSError(f"Missing required environment variables: {', '.join(missing)}")
 
     host = clickhouse_env_vars["CLICKHOUSE_HOST"]
-    port = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+    port = int(os.environ.get("CLICKHOUSE_PORT") or "8123")
     user = clickhouse_env_vars["CLICKHOUSE_USER"]
     password = clickhouse_env_vars["CLICKHOUSE_PASS"]
     database = clickhouse_env_vars["CLICKHOUSE_DB"]

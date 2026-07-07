@@ -121,15 +121,11 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         cos_sin_cache is [max_pos, rotary_dim] = cat((cos, sin)); reshape into
         [max_pos, 2, 2, rotary_dim//2] rotation matrices [[cos, -sin], [sin, cos]].
         """
-        # Built lazily on the first gather_rotation() call during warmup
+        # Built lazily on the first gather_rotation() call during warmup.
         if self._rotation_cache is None:
-            cpu_cache = convert(self.cos_sin_cache, device="cpu", dtype=torch.float32)
-            assert cpu_cache is not None
-            cos, sin = cpu_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
-            self._rotation_cache = (
-                torch.stack([cos, -sin, sin, cos], dim=1)
-                .view(cpu_cache.shape[0], 2, 2, self.rotary_dim // 2)
-                .to(self.dtype)
+            cos, sin = self.cos_sin_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
+            self._rotation_cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
+                self.cos_sin_cache.shape[0], 2, 2, self.rotary_dim // 2
             )
         return self._rotation_cache
 

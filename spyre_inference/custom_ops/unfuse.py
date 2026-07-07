@@ -14,14 +14,16 @@
 
 """Model-agnostic weight-unfusing pass for the Spyre backend.
 
-The weight-fusing is done to avoid the Spyre->CPU->Spyre roundtrip.
-The unfusing is implemented in a model-agnostic way for:
+Fused projections force a Spyre->CPU->Spyre roundtrip: splitting a fused
+weight's output on Spyre yields strided views that corrupt on transfer. This
+pass splits the fused weight into contiguous per-projection Parameters at load
+time (on CPU) and rebinds forward to run one F.linear per slab, so no split of
+a Spyre tensor ever happens. It handles, model-agnostically:
 
   * QKVParallelLinear -> QKVSplit(q, k, v):
-    used in Attention through `qkv.split(...)` pr torch.chunk(qkv).
+    consumed by Attention via `qkv.split(...)` or `qkv.chunk(3)`.
   * MergedColumnParallelLinear -> [gate, up]:
-    used in SiluAndMul.
-
+    consumed by SpyreSiluAndMul, which accepts the pre-split list directly.
 """
 
 import types
@@ -32,12 +34,13 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     UnquantizedLinearMethod,
 )
+
+from .silu_and_mul import SpyreSiluAndMul
 
 logger = init_logger(__name__)
 
@@ -46,6 +49,9 @@ class QKVSplit:
     """Holds pre-split (q, k, v) and mimics `Tensor.split`/`Tensor.chunk`.
 
     NOTE: Exposes ONLY split/chunk: any other access raises AttributeError.
+    Both entry points fail closed if the caller's request does not match the
+    (q, k, v) partition we pre-split, so a mismatched idiom can never silently
+    return the wrong tensors.
     """
 
     __slots__ = ("_q", "_k", "_v")
@@ -56,12 +62,24 @@ class QKVSplit:
         self._v = v
 
     def split(self, sizes, dim=-1):
+        # We only pre-split along the last (feature) dim; anything else is not
+        # the qkv idiom we assumed.
+        assert dim in (-1, self._q.ndim - 1), f"QKVSplit.split expected the last dim, got dim={dim}"
+        expected = [self._q.shape[-1], self._k.shape[-1], self._v.shape[-1]]
+        assert list(sizes) == expected, (
+            f"QKVSplit.split expected q/k/v sizes {expected}, got {list(sizes)}"
+        )
         return self._q, self._k, self._v
 
     def chunk(self, chunks, dim=-1):
-        # Only a 3-way chunk maps onto (q, k, v); anything else is not the
-        # idiom we assumed, so fail closed.
+        # Only a 3-way chunk maps onto (q, k, v), and only when q/k/v are
+        # equal-sized (non-GQA); anything else is not the idiom, so fail closed.
         assert chunks == 3, f"QKVSplit.chunk expected chunks=3 (q/k/v), got {chunks}"
+        assert dim in (-1, self._q.ndim - 1), f"QKVSplit.chunk expected the last dim, got dim={dim}"
+        assert self._q.shape[-1] == self._k.shape[-1] == self._v.shape[-1], (
+            "QKVSplit.chunk(3) requires equal-sized q/k/v (non-GQA); "
+            f"got {self._q.shape[-1]}/{self._k.shape[-1]}/{self._v.shape[-1]}"
+        )
         return self._q, self._k, self._v
 
 
@@ -155,8 +173,8 @@ def _unfuse_merged(module: MergedColumnParallelLinear) -> None:
 
 
 def _has_silu_and_mul_sibling(parent: nn.Module) -> bool:
-    """True if `parent` has a direct SiluAndMul child (the MLP act_fn)."""
-    return any(isinstance(child, SiluAndMul) for child in parent.children())
+    """True if `parent` has a direct SpyreSiluAndMul child (the MLP act_fn)."""
+    return any(isinstance(child, SpyreSiluAndMul) for child in parent.children())
 
 
 def analyze_and_unfuse(model: nn.Module) -> None:
@@ -177,7 +195,6 @@ def analyze_and_unfuse(model: nn.Module) -> None:
             continue
 
         if isinstance(module, QKVParallelLinear):
-            # unfuse QKV
             if not _is_unquantized(module):
                 n_skipped_quant += 1
                 continue
@@ -185,7 +202,7 @@ def analyze_and_unfuse(model: nn.Module) -> None:
             n_qkv += 1
 
         elif isinstance(module, MergedColumnParallelLinear):
-            # unfuse for SiluAndMul
+            # Only a 2-slab gate/up projection feeding SiluAndMul is in scope.
             if len(module.output_partition_sizes) != 2:
                 continue
             if not _is_unquantized(module):

@@ -33,7 +33,7 @@ Data flow in the current WIP version:
 As the TorchSpyreModelRunner is evolving, more layers will natively support inputs
 arriving as a Spyre tensor and perform their operations on Spyre.
 Thus, in the final state of the runner minimal D2H and H2D transfers will be necessary,
-the SpyreCpuFallbackMixin will be obsolete and most operations will be performed on Spyre.
+the CPU fallbacks will be obsolete and most operations will be performed on Spyre.
 """
 
 from __future__ import annotations
@@ -273,11 +273,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if isinstance(module, Attention):
                 module._apply = lambda fn, recurse=True, _m=module: _m
 
-        # Move layer weights to Spyre device.
-        # SpyreCpuFallbackMixin._apply() no-op keeps CPU fallback layer
-        # weights on CPU (linear, embedding, rotary).
-        # Spyre-native layers (RMSNorm, SiluAndMul, ParallelLMHead) get
-        # their weights moved.
+        # Move layer weights to Spyre device. The Attention._apply no-op
+        # patched above keeps attention scale buffers on CPU; every other
+        # module (linear, embedding, RMSNorm, SiluAndMul, ParallelLMHead)
+        # has its weights moved to Spyre.
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)

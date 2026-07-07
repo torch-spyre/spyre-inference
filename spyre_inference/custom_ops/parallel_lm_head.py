@@ -103,10 +103,11 @@ class SpyreParallelLMHead(ParallelLMHead):
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
         out = F.linear(x, self.padded_weight.data, bias)
-        # padding columns are sliced off the logits afterwards
-        # .contiguous() is applied, so the slice is a fresh tensor, not a strided Spyre view).
+        # Slice off the padding rows that process_weights_after_loading added
+        # (they appear as trailing logit columns).
         if self.padding > 0:
-            out = out[:, : -self.padding].contiguous()
-        # We explicitly have to put the logits onto CPU
-        # because the subsequent all_gather operation would crash.
+            # out = out[:, : -self.padding].contiguous()
+            out = out[:, : -self.padding]
+        # Logits must land on CPU: the subsequent all_gather (TP > 1) would
+        # crash on a Spyre tensor.
         return convert(out, device="cpu")

@@ -104,7 +104,7 @@ def test_qkv_split_returns_correct_slabs(tp_group, num_heads, num_kv_heads, head
     qkv, bias = attn.qkv_proj(x)
     assert bias is None
     assert isinstance(qkv, QKVSplit)
-    q, k, v = qkv.split([0, 0, 0], dim=-1)  # sizes ignored by design
+    q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
     actual = torch.cat([q, k, v], dim=-1)
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
@@ -124,7 +124,7 @@ def test_qkv_split_ignores_bias_folding(tp_group):
 
     analyze_and_unfuse(attn)
     assert not hasattr(attn.qkv_proj, "bias")
-    q, k, v = attn.qkv_proj(x)[0].split([0, 0, 0])
+    q, k, v = attn.qkv_proj(x)[0].split([attn.q_size, attn.kv_size, attn.kv_size])
     actual = torch.cat([q, k, v], dim=-1)
     torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
@@ -161,15 +161,34 @@ def test_qkv_chunk_returns_correct_slabs(tp_group, num_heads, num_kv_heads, head
 
 @pytest.mark.mlp
 def test_qkv_split_fails_closed_on_other_access(tp_group):
-    """QKVSplit exposes only .split()/.chunk(); other access raises (fail-closed)."""
+    """QKVSplit exposes only .split()/.chunk(); every other or mismatched
+    access raises (fail-closed) so a wrong idiom can never silently return the
+    wrong tensors."""
     from spyre_inference.custom_ops.unfuse import QKVSplit
 
-    c = QKVSplit(torch.zeros(2), torch.zeros(2), torch.zeros(2))
-    assert len(c.split([0, 0, 0])) == 3
-    assert len(c.chunk(chunks=3, dim=-1)) == 3
-    # A non-3-way chunk is not the qkv idiom we assume: fail closed.
+    # q/k/v feature sizes 4/2/2 (GQA-like) on a 2-D [rows, features] tensor.
+    q, k, v = torch.zeros(3, 4), torch.zeros(3, 2), torch.zeros(3, 2)
+    c = QKVSplit(q, k, v)
+
+    # Correct idioms return the three slabs.
+    assert len(c.split([4, 2, 2], dim=-1)) == 3
+    assert len(c.split([4, 2, 2])) == 3  # default dim=-1
+    sym = QKVSplit(torch.zeros(3, 2), torch.zeros(3, 2), torch.zeros(3, 2))
+    assert len(sym.chunk(chunks=3, dim=-1)) == 3
+
+    # Mismatched split sizes are not our (q, k, v) partition: fail closed.
+    with pytest.raises(AssertionError):
+        c.split([8, 0, 0])
+    # Splitting on a non-last dim is not the qkv idiom.
+    with pytest.raises(AssertionError):
+        c.split([4, 2, 2], dim=0)
+    # A non-3-way chunk is not the qkv idiom.
     with pytest.raises(AssertionError):
         c.chunk(chunks=2, dim=-1)
+    # chunk(3) on unequal q/k/v (GQA) cannot map onto equal chunks.
+    with pytest.raises(AssertionError):
+        c.chunk(chunks=3, dim=-1)
+    # Anything beyond split/chunk is unavailable.
     with pytest.raises(AttributeError):
         c.view(-1)
     with pytest.raises(AttributeError):
@@ -196,6 +215,73 @@ def test_merged_unfused_only_with_silu_sibling(tp_group):
     # GeluAndMul sibling → left fused (out of scope).
     assert hasattr(without_silu.gate_up_proj, "weight")
     assert not hasattr(without_silu.gate_up_proj, "gate_weight")
+
+
+@pytest.mark.mlp
+def test_quantized_layers_are_left_fused(tp_group):
+    """A non-UnquantizedLinearMethod quant_method makes the pass skip the layer.
+
+    Spyre only supports the unquantized path; a quantized QKV/gate-up must be
+    left fused (weight untouched, forward unchanged) rather than split apart.
+    """
+    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
+
+    torch.manual_seed(0)
+    attn = _make_attention_module(8, 2, 64)
+    mlp = _make_mlp_module(64, 128, with_silu=True)
+
+    # Simulate a quantized layer: any object that is not an
+    # UnquantizedLinearMethod trips the `_is_unquantized` guard.
+    attn.qkv_proj.quant_method = object()
+    mlp.gate_up_proj.quant_method = object()
+
+    analyze_and_unfuse(attn)
+    analyze_and_unfuse(mlp)
+
+    # Left fully fused: original weight kept, no per-slab params, forward intact.
+    assert hasattr(attn.qkv_proj, "weight")
+    assert not hasattr(attn.qkv_proj, "q_weight")
+    assert hasattr(mlp.gate_up_proj, "weight")
+    assert not hasattr(mlp.gate_up_proj, "gate_weight")
+
+
+@pytest.mark.mlp
+def test_merged_with_non_two_slabs_is_left_fused(tp_group):
+    """A MergedColumnParallelLinear with != 2 output slabs is out of scope.
+
+    The gate/up un-fuse only handles the 2-slab (gate, up) case; a 3-slab
+    merged projection must be left fused.
+    """
+    import torch.nn as nn
+
+    from vllm.model_executor.layers.activation import SiluAndMul
+    from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
+
+    torch.manual_seed(0)
+
+    class MLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=64,
+                output_sizes=[128, 128, 128],  # three slabs, not (gate, up)
+                bias=False,
+                params_dtype=torch.float16,
+                quant_config=None,
+                disable_tp=True,
+                prefix="gate_up_proj",
+            )
+            self.act_fn = SiluAndMul()
+
+    mlp = MLP()
+    assert len(mlp.gate_up_proj.output_partition_sizes) == 3
+
+    analyze_and_unfuse(mlp)
+
+    # Left fused: 3-slab projection is not the (gate, up) idiom.
+    assert hasattr(mlp.gate_up_proj, "weight")
+    assert not hasattr(mlp.gate_up_proj, "gate_weight")
 
 
 @pytest.mark.mlp

@@ -92,10 +92,6 @@ class TorchSpyreWorker(CPUWorker):
         # `set_device(local_rank)` above; tensors created on
         # `torch.device("spyre")` will land on that card.
         original = cpu_worker_module.CPUModelRunner
-        # Monkey-patching `CPUModelRunner` (a class attribute) with a factory
-        # function widens its declared class type; `cpu_worker_module` does
-        # not type-annotate the attribute so we cannot avoid the assignment
-        # error from ty without a suppression here.
         cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(  # ty: ignore[invalid-assignment]
             self.vllm_config,
             torch.device("spyre"),

@@ -141,10 +141,9 @@ def main():
     print("=============== GENERATE")
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
-    print(
-        "Time elapsed for %d tokens is %.2f sec"
-        % (len(outputs[0].outputs[0].token_ids), time.time() - t0)
-    )
+    elapsed = time.time() - t0
+    total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
+    print(f"Time elapsed for {total_tokens} generated tokens is {elapsed:.2f} sec")
     print("===============")
     for output in outputs:
         print(output.outputs[0])
@@ -161,26 +160,33 @@ def main():
         print("===============")
         any_differ = False
 
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(args.model)
-        model = AutoModelForCausalLM.from_pretrained(args.model)
+        # Match the Spyre run's float16 weights so the greedy paths are
+        # comparable (float32 vs float16 alone can flip tokens).
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float16)
 
         for i in range(args.num_prompts):
             prompt = prompts[i]
 
             hf_input_tokens = tokenizer(prompt, return_tensors="pt").input_ids
+            # vLLM uses ignore_eos=True, so force HF to emit exactly max_tokens
+            # too (min_new_tokens == max_new_tokens) instead of stopping at EOS.
             hf_output = model.generate(
                 hf_input_tokens,
                 do_sample=False,
+                min_new_tokens=max_tokens[i],
                 max_new_tokens=max_tokens[i],
                 return_dict_in_generate=True,
-                output_scores=True,
             )
 
-            # decode output tokens after first removing input tokens (prompt)
+            # decode output tokens after first removing input tokens (prompt);
+            # skip_special_tokens to match vLLM's RequestOutput.text
             hf_generated_text = tokenizer.batch_decode(
-                hf_output.sequences[:, len(hf_input_tokens[0]) :]
+                hf_output.sequences[:, len(hf_input_tokens[0]) :],
+                skip_special_tokens=True,
             )[0]
 
             if hf_generated_text != outputs[i].outputs[0].text:

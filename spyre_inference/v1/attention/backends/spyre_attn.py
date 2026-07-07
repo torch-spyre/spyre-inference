@@ -88,7 +88,12 @@ def _overwrite(
     if output.device.type == "spyre":
         # `torch.ops.spyre.overwrite` is dynamically registered, so its
         # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(input, output, dims, offsets)  # ty: ignore[invalid-argument-type]
+        torch.ops.spyre.overwrite(
+            input,  # ty: ignore[invalid-argument-type]
+            output,  # ty: ignore[invalid-argument-type]
+            dims,  # ty: ignore[invalid-argument-type]
+            offsets,  # ty: ignore[invalid-argument-type]
+        )
     else:
         # intended behaviour on cpu
         sliced_t = output
@@ -378,6 +383,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self.head_size = kv_cache_spec.head_size
+        self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
 
         # Validate block_size alignment: Spyre stick size is 128 bytes (64 fp16 elements).
         # block_size must be a multiple of 64 to avoid restickification errors during
@@ -435,7 +443,24 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             causal_ok = kv_pos_exp <= causal_limit
             attend = attend & causal_ok
 
-        # Convert to additive mask: -65504 for masked, 0 for valid (float16 min)
+        # Sliding window mask: limit attention to recent tokens
+        # For query at absolute position p, attend to [max(0, p - sliding_window + 1), p]
+        # Example: p=5, window=4 → attend to [2,3,4,5] (4 tokens)
+        # Note: computed on max_query_len; padding applied after (lines 454-462)
+        if self.sliding_window is not None:
+            context_lens = seq_lens - query_lens  # [num_seqs]
+            # Absolute query position: context_len + q_pos
+            # Window start: max(0, absolute_pos - sliding_window + 1)
+            window_start = (
+                context_lens.unsqueeze(1) + q_pos.unsqueeze(0) - self.sliding_window + 1
+            ).clamp(min=0)
+            kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, aligned_max_seq_len]
+            window_ok = kv_pos_exp >= window_start.unsqueeze(
+                2
+            )  # [num_seqs, max_query_len, aligned_max_seq_len]
+            attend = attend & window_ok
+
+        # Convert to additive mask: finfo.min for masked positions, 0 for valid
         mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
 
         if aligned_max_query_len > max_query_len:
@@ -450,7 +475,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         mask_additive = torch.where(
             mask_bool,
-            torch.tensor(-65504.0, dtype=self.model_dtype, device=device),
+            torch.tensor(torch.finfo(self.model_dtype).min, dtype=self.model_dtype, device=device),
             torch.tensor(0.0, dtype=self.model_dtype, device=device),
         )
 
@@ -634,8 +659,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         if alibi_slopes is not None:
             raise NotImplementedError("ALiBi slopes not supported yet")
-        if sliding_window is not None:
-            raise NotImplementedError("Sliding window not supported yet")
         if logits_soft_cap is not None:
             raise NotImplementedError("Logits soft cap not supported yet")
 

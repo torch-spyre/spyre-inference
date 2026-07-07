@@ -64,7 +64,7 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
     # In production weights live on Spyre after `model.to(spyre_device)`;
     # mirror that here so forward_oot's H2D + Spyre F.linear actually run.
     layer = layer.to("spyre")
-    actual = layer.forward_oot(x)
+    actual = layer.forward_oot(x.to("spyre"))
 
     assert actual.shape == (num_tokens, layer.weight.shape[0])
     # Spyre matmul accumulation order diverges from the CPU reference in fp16;

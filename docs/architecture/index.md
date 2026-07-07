@@ -50,7 +50,7 @@ decorator intercepts and returns the Spyre implementation instead.
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre + CPU | TP shard mask runs on CPU (Spyre inductor rejects int64 constants); embedding lookup on Spyre |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre + CPU | TP≥1, `F.linear()` on Spyre, D2H after for downstream `.split()` |
 | `RowParallelLinear` | `SpyreRowParallelLinear` | Spyre | TP≥1, `F.linear()` + `all_reduce` when `reduce_results=True` |
-| `MergedColumnParallelLinear` | `SpyreMergedColumnParallelLinear` | Spyre | TP≥1, `F.linear()` |
+| `MergedColumnParallelLinear` | _(unchanged)_ | Spyre | Upstream class with `SpyreUnquantizedLinearMethod` swapped in |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | Slicing done on CPU (Spyre limitation) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1; vocab partition padded up to a multiple of 64×32 |
 

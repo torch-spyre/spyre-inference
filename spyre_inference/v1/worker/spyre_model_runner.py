@@ -171,6 +171,20 @@ class _SpyreModelWrapper:
 
         return result
 
+    def compute_logits(self, hidden_states, *args, **kwargs):
+        """Move hidden_states onto Spyre for the lm_head custom op.
+
+        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
+        on CPU (Spyre cannot slice), so the tensor handed to compute_logits
+        is on CPU. Thus, convert here, perform the lm_head operation and
+        then convert the resulting logits back to CPU
+        for downstream sampling.
+        """
+        hidden_states = convert(hidden_states, device=self._spyre_device)
+        # logits are returned on cpu
+        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+        return logits
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 

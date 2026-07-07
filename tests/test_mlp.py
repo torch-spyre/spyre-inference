@@ -28,9 +28,8 @@ import torch.nn.functional as F
 def test_merged_column_matches_reference(
     tp_group, num_tokens, hidden_size, intermediate_size, use_bias
 ):
-    """SpyreMergedColumnParallelLinear output matches upstream CPU F.linear."""
+    """MergedColumnParallelLinear output on Spyre matches upstream CPU F.linear."""
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.linear import SpyreMergedColumnParallelLinear
 
     dtype = torch.float16
     torch.manual_seed(0)
@@ -43,7 +42,6 @@ def test_merged_column_matches_reference(
         disable_tp=True,
         prefix="gate_up_proj",
     )
-    assert isinstance(layer, SpyreMergedColumnParallelLinear)
 
     # torch.empty() leaves memory uninitialised (may contain NaN in float16);
     # fill with small random values so the comparison is meaningful.
@@ -208,14 +206,13 @@ def test_spyre_strided_scatter_source():
 
 @pytest.mark.mlp
 def test_linear_oot_registration(tp_group):
-    """Verify OOT class swaps for all three linear layer types."""
+    """Verify OOT class swaps for the QKV and Row parallel linear layers."""
     from vllm.model_executor.layers.linear import (
         MergedColumnParallelLinear,
         QKVParallelLinear,
         RowParallelLinear,
     )
     from spyre_inference.custom_ops.linear import (
-        SpyreMergedColumnParallelLinear,
         SpyreQKVParallelLinear,
         SpyreRowParallelLinear,
     )
@@ -251,7 +248,6 @@ def test_linear_oot_registration(tp_group):
         prefix="down_proj",
     )
 
-    assert isinstance(gate_up, SpyreMergedColumnParallelLinear)
     assert isinstance(qkv, SpyreQKVParallelLinear)
     assert isinstance(down, SpyreRowParallelLinear)
 

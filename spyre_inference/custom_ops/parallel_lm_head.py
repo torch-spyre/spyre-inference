@@ -16,25 +16,10 @@
 
 Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
 
-Architecture:
-    - OOT Registration: @ParallelLMHead.register_oot() replaces upstream
-      at instantiation
-    - forward_oot(): Entry point for OOT dispatch, handles device conversion
-      and runs the compiled F.linear on Spyre
-    - Separate Compilation: forward_spyre is compiled independently via
-      maybe_compile (no opaque custom-op boundary)
-    - quant_method override: SpyreUnquantizedLMHeadMethod.apply() calls
-      forward_oot() so that LogitsProcessor._get_logits() routes through
-      the Spyre path
-
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
     - No quantization support: only UnquantizedEmbeddingMethod is replaced
-
-References:
-    - Upstream ParallelLMHead:
-      vllm/model_executor/layers/vocab_parallel_embedding.py
 """
 
 import torch
@@ -64,8 +49,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         # torch-spyre currently has a limitation with the work division of larger
         # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
         # an integer.
-
-        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size
+        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size.
         ALIGN = 64 * 32
         size = layer.weight.shape[0]
         layer.padding = (-size) % ALIGN
@@ -85,17 +69,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
-    """OOT ParallelLMHead that executes the lm_head matmul on Spyre.
-
-    Weights reside on Spyre after model.to(spyre_device).
-    The quant_method is replaced so that LogitsProcessor._get_logits()
-    routes through forward_oot, which handles device conversion
-    and runs F.linear on Spyre.
-
-    Supports TP>=1: With TP>1, the vocabulary is sharded across ranks.
-    Each rank computes logits for its vocabulary partition
-    [vocab_size/tp_size, hidden_dim]. The sampler gathers logits when needed.
-    """
+    """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device."""
 
     padding: int
     padded_weight: torch.Tensor
@@ -121,17 +95,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        """OOT forward pass — lm_head matmul on Spyre.
-
-        Called by SpyreUnquantizedLMHeadMethod.apply() from within
-        LogitsProcessor._get_logits(). Converts x (arriving on cpu)
-        to the weight device (residing on spyre), runs the compiled F.linear on spyre
-        and converts back to the x device (cpu).
-
-        At TP>1: Each rank computes logits for its vocabulary shard. The weight
-        matrix is [num_embeddings_per_partition, hidden_dim], producing logits
-        [num_tokens, num_embeddings_per_partition]. The sampler gathers these
-        sharded logits across ranks when needed.
+        """OOT forward pass.
 
         Args:
             x: Hidden states tensor [num_tokens, hidden_dim]
@@ -140,19 +104,16 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
-        x_device = x.device
-
-        # Due to indexing operations inside the ModelRunner, which have
-        # to be carried out on cpu due to a torch-spyre limitation,
-        # the input to the SpyreParallelLMHead resides on CPU.
-        # Due to a second limitation of torch-spyre regarding sizes that can be used
-        # in a F.linear layer, the original weights need to be padded
+        # x already resides on Spyre (moved in _SpyreModelWrapper.compute_logits),
+        # so no conversion is needed here. Due to a limitation of torch-spyre
+        # regarding sizes usable in F.linear, the weights are padded.
         out = F.linear(
-            convert(x, device=self.weight.device),
+            x,
             self.padded_weight.data,
             bias,
         )
 
         out_cpu = convert(out, device="cpu")
         out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        return convert(out_cpu_no_pad, device=x_device)
+        # Currently output has to remain on CPU because of all_gather in case of TP > 1
+        return out_cpu_no_pad

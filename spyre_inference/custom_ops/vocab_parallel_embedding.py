@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for VocabParallelEmbedding.
-
-Inherits vocab sharding and weight loading from upstream. Overrides
-`forward` only to compute the TP shard mask on CPU: the upstream helper
-does int64 comparisons against Python int constants, which the Spyre
-inductor backend rejects with `unexpected argument Constant(value=N,
-dtype=torch.int64) to greaterequal`.
-"""
+"""Spyre OOT replacement for VocabParallelEmbedding."""
 
 import torch
 
@@ -31,17 +24,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 
+from .utils import convert
+
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
-    """Spyre OOT VocabParallelEmbedding.
-
-    Mirrors upstream forward, but runs the mask helper on CPU (see module
-    docstring) and zeroes out-of-shard rows by multiplication since
-    torch-spyre lacks `masked_fill_`.
-    """
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -54,14 +44,14 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
             masked_input, input_mask = get_masked_input_and_mask(
-                input_.cpu(),
+                convert(input_, device="cpu"),
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
                 self.shard_indices.num_org_vocab_padding,
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
-            masked_input = masked_input.to(input_.device)
+            masked_input = convert(masked_input, device=input_.device)
         else:
             masked_input = input_
 

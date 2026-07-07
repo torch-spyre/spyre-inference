@@ -16,6 +16,7 @@
 
 from functools import lru_cache
 
+from . import logits_processor  # noqa: F401
 from . import parallel_lm_head
 from . import rms_norm
 from . import rotary_embedding
@@ -32,5 +33,4 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
-    rms_norm.register()
     utils.register()

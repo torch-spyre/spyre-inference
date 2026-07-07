@@ -17,26 +17,19 @@
 This module provides Spyre-device-specific replacements for the parallel linear
 layer classes used inside MLP blocks:
 
-    - SpyreMergedColumnParallelLinear  — replaces MergedColumnParallelLinear
-      (vllm/model_executor/layers/linear.py)
     - SpyreQKVParallelLinear          — replaces QKVParallelLinear
       (vllm/model_executor/layers/linear.py)
     - SpyreRowParallelLinear          — replaces RowParallelLinear
       (vllm/model_executor/layers/linear.py)
 
-At TP=1, the upstream forward() methods reduce to quant_method.apply() + bias
-handling.  We inject a custom quant_method (SpyreUnquantizedLinearMethod) that
-performs F.linear directly, QKV and RowParallel still override forward()
-for device placement (D2H after GEMM, H2D before GEMM).
+MergedColumnParallelLinear is left unmodified: upstream UnquantizedLinearMethod
+already dispatches to F.linear on the Spyre platform, and no Spyre-specific
+device transfers are needed.
 
 Spyre Device Constraints:
-    - Computations performed in torch.float16:
-      Input (dtype defined by model / user) converted to torch.float16 for
-      operations on spyre and then converted back to original dtype for cpu.
+    - Computations performed in torch.float16.
     - Tensor parallelism: TP>=1 supported with all_reduce collectives
 
-References:
-    - Upstream linear layers:   vllm/model_executor/layers/linear.py
 """
 
 import torch.nn.functional as F
@@ -44,7 +37,6 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
@@ -56,15 +48,7 @@ logger = init_logger(__name__)
 
 
 class SpyreUnquantizedLinearMethod(UnquantizedLinearMethod):
-    """Spyre-specific linear method: F.linear without platform GEMM dispatch.
-
-    Replaces the default UnquantizedLinearMethod so that upstream forward()
-    methods work unchanged on Spyre at any TP size.
-
-    - create_weights() is inherited — standard ModelWeightParameter works.
-    - apply() does F.linear directly (no platform-specific GEMM dispatch).
-    - process_weights_after_loading() is a no-op (skips CPU GEMM dispatch).
-    """
+    """Spyre-specific linear method: F.linear without platform GEMM dispatch."""
 
     def apply(self, layer, x, bias=None):
         return F.linear(x, layer.weight.data, bias)
@@ -88,15 +72,6 @@ class SpyreLinearBase:
             self.tp_size,
             self.tp_rank,
         )
-
-
-@MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
-class SpyreMergedColumnParallelLinear(SpyreLinearBase, MergedColumnParallelLinear):
-    """Spyre MergedColumnParallelLinear with TP support.
-
-    Supports TP>=1 with weight sharding along output dimension. Inherits
-    forward() unchanged; the SpyreLinearBase mixin swaps in SpyreUnquantizedLinearMethod.
-    """
 
 
 @QKVParallelLinear.register_oot(name="QKVParallelLinear")
@@ -130,14 +105,7 @@ class SpyreQKVParallelLinear(SpyreLinearBase, QKVParallelLinear):
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
 class SpyreRowParallelLinear(SpyreLinearBase, RowParallelLinear):
-    """Spyre RowParallelLinear with TP support.
-
-    Supports TP>=1 with weight sharding along input dimension and
-    all_reduce for aggregating results across ranks when reduce_results=True.
-
-    RowParallelLinear is invoked from GraniteAttention (input on cpu) and
-    GraniteMLP (input on spyre); H2D is a no-op in the latter case.
-    """
+    """Spyre RowParallelLinear with TP support."""
 
     def forward(self, input_):
         return super().forward(convert(input_, device=self.weight.device))

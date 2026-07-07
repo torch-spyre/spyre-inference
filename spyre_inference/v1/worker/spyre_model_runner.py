@@ -56,7 +56,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
-from spyre_inference.custom_ops.rotary_embedding import SpyreRotaryEmbedding
+from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -145,7 +145,7 @@ class _SpyreModelWrapper:
         self,
         model: nn.Module,
         spyre_device: torch.device,
-        rope_modules: list[SpyreRotaryEmbedding] | None = None,
+        rope_modules: list[_SpyreRotaryMixin] | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -208,6 +208,20 @@ class _SpyreModelWrapper:
                 rope_rot[rope._rope_key] = rot
         if rope_rot:
             get_forward_context().additional_kwargs["spyre_rope_rot"] = rope_rot
+
+    def compute_logits(self, hidden_states, *args, **kwargs):
+        """Move hidden_states onto Spyre for the lm_head custom op.
+
+        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
+        on CPU (Spyre cannot slice), so the tensor handed to compute_logits
+        is on CPU. Thus, convert here, perform the lm_head operation and
+        then convert the resulting logits back to CPU
+        for downstream sampling.
+        """
+        hidden_states = convert(hidden_states, device=self._spyre_device)
+        # logits are returned on cpu
+        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+        return logits
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -305,7 +319,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Collect the (shared) RoPE modules before compiling so _SpyreModelWrapper
         # can prime their per-forward rotation slice. modules() dedupes by identity,
         # so a shared instance appears once.
-        rope_modules = [m for m in self.model.modules() if isinstance(m, SpyreRotaryEmbedding)]
+        rope_modules = [m for m in self.model.modules() if isinstance(m, _SpyreRotaryMixin)]
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()

@@ -23,12 +23,15 @@ slice to Spyre, and stashes it in the vLLM forward context. ``forward_oot``
 fetches that shared slice through the opaque ``spyre_rope_rot`` op (keeping
 the forward-context read out of torch.compile graphs) and applies the rotation.
 
-Set ``SPYRE_INFERENCE_ROPE_DEVICE=cpu`` to fall back to the previous CPU
-implementation ``RotaryEmbedding.forward_native``.
+Configs without an on-device path (gptj/interleaved, partial rotary, unaligned
+head_size) and ``SPYRE_INFERENCE_ROPE_DEVICE=cpu`` fall back to a CPU
+implementation wrapped in the opaque ``spyre_rotary_cpu`` op so torch.compile
+does not trace into ``RotaryEmbedding.forward_static``.
 """
 
 import itertools
 import os
+from functools import lru_cache
 
 import torch
 
@@ -43,9 +46,8 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
-from functools import lru_cache
 
-from .utils import convert
+from .utils import convert, get_layer, register_layer
 
 logger = init_logger(__name__)
 
@@ -83,13 +85,16 @@ def _rotate_neox_2x2(
     return out.flatten(-2).view(x.shape)  # [T, H, D] -> original shape
 
 
-@RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
-class SpyreRotaryEmbedding(RotaryEmbedding):
-    """OOT RotaryEmbedding that applies the rotation on Spyre.
+class _SpyreRotaryMixin:
+    """Spyre RoPE wiring shared by the base and llama3 OOT classes.
 
-    The 2x2 rotation-matrix cache is derived from the base ``cos_sin_cache`` (so
-    all rope-scaling variants are inherited) and kept on CPU. It is built lazily.
+    Supported configs (neox, full rotary, stick-aligned inner dim) run the 2x2
+    rotation on the Spyre device; everything else falls back to the opaque
+    ``spyre_rotary_cpu`` op. The 2x2 rotation-matrix cache is derived from the
+    base ``cos_sin_cache`` (so all rope-scaling variants are inherited) and kept
+    on CPU. It is built lazily.
     """
+
     _key_counter = itertools.count()
 
     def __init__(self, *args, **kwargs):
@@ -108,12 +113,12 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         # Stable per-instance (== per rope-config) key for the forward-context
         # rotation dict, passed through the opaque spyre_rope_rot op.
         self._rope_key = f"spyre_rope_{next(self._key_counter)}"
-
-    def _apply(self, fn, recurse=True):
-        # Keep cos_sin_cache on CPU so forward_native can use it directly.
-        # rotation_cache (spyre implementation) is a plain CPU attribute and is
-        # not a registered buffer, hence so it is unaffected here.
-        return self
+        # CPU-pinned reference to cos_sin_cache: the registered buffer gets DMA'd
+        # to Spyre by torch_spyre.model_utils.load_model_to_spyre, but the 2x2
+        # rotation cache and the CPU-fallback op both index it on the host.
+        self._cpu_cos_sin_cache = self.cos_sin_cache
+        # Registry key so the spyre_rotary_cpu fallback op can recover this instance.
+        self._spyre_layer_name = register_layer(self, "spyre_rotary")
 
     def _get_rotation_cache(self) -> torch.Tensor:
         """Lazily build the CPU 2x2 rotation cache from cos_sin_cache.
@@ -123,9 +128,9 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         """
         # Built lazily on the first gather_rotation() call during warmup.
         if self._rotation_cache is None:
-            cos, sin = self.cos_sin_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
+            cos, sin = self._cpu_cos_sin_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
             self._rotation_cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
-                self.cos_sin_cache.shape[0], 2, 2, self.rotary_dim // 2
+                self._cpu_cos_sin_cache.shape[0], 2, 2, self.rotary_dim // 2
             )
         return self._rotation_cache
 
@@ -164,29 +169,35 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         target_device = positions.device
         target_dtype = query.dtype
 
-        # old CPU implementation (set SPYRE_INFERENCE_ROPE_DEVICE="cpu")
+        # CPU fallback (SPYRE_INFERENCE_ROPE_DEVICE="cpu" or an unsupported config):
+        # route through the opaque spyre_rotary_cpu op so torch.compile does not trace
+        # into RotaryEmbedding.forward_static.
         if not (
             self._spyre_rope_supported
             and os.environ.get("SPYRE_INFERENCE_ROPE_DEVICE", "spyre") == "spyre"
         ):
-            result_query, result_key = RotaryEmbedding.forward_native(
-                self,
-                convert(positions, device="cpu"),
-                convert(query, device="cpu"),
-                convert(key, device="cpu"),
+            # infer_schema rejects Optional[Tensor] returns, so use an empty
+            # tensor sentinel across the op boundary.
+            key_in = (
+                key if key is not None else torch.empty(0, device=query.device, dtype=query.dtype)
             )
-            return (
-                convert(result_query, device=target_device, dtype=target_dtype),
-                convert(result_key, device=target_device, dtype=target_dtype)
-                if result_key is not None
-                else None,
+            # cos_sin_cache is fetched inside the op via get_layer(layer_name);
+            # torch.ops dispatcher signature is opaque to the type checker.
+            out_q, out_k = torch.ops.vllm.spyre_rotary_cpu(
+                positions,  # ty: ignore[invalid-argument-type]
+                query,  # ty: ignore[invalid-argument-type]
+                key_in,  # ty: ignore[invalid-argument-type]
+                self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
             )
+            if key is None:
+                return out_q, None
+            return out_q, out_k
 
-        # new implementation: the per-token rotation slice is gathered ONCE before
-        # the model forward (in _SpyreModelWrapper) and stashed in the forward
-        # context; here we only fetch it and apply the rotation on Spyre. The fetch
-        # goes through the opaque spyre_rope_rot op so the forward-context read stays
-        # out of the torch.compile graph — the slice enters the graph as an op output
+        # On-Spyre path: the per-token rotation slice is gathered ONCE before the
+        # model forward (in _SpyreModelWrapper) and stashed in the forward context;
+        # here we only fetch it and apply the rotation on Spyre. The fetch goes
+        # through the opaque spyre_rope_rot op so the forward-context read stays out
+        # of the torch.compile graph — the slice enters the graph as an op output
         # rather than a baked constant.
         rot = torch.ops.vllm.spyre_rope_rot(  # ty: ignore[invalid-argument-type]
             positions, self._rope_key, self.head_size
@@ -200,8 +211,19 @@ class SpyreRotaryEmbedding(RotaryEmbedding):
         return out_query, out_key
 
 
+@RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
+class SpyreRotaryEmbedding(_SpyreRotaryMixin, RotaryEmbedding):
+    """OOT RotaryEmbedding that applies the rotation on Spyre.
+
+    Supported configs run the 2x2 rotation on-device; unsupported configs and
+    SPYRE_INFERENCE_ROPE_DEVICE=cpu fall back to the opaque spyre_rotary_cpu op.
+    """
+
+    pass
+
+
 @RotaryEmbeddingBase.register_oot(name="Llama3RotaryEmbedding")
-class SpyreLlama3RotaryEmbedding(Llama3RotaryEmbedding, SpyreRotaryEmbedding):
+class SpyreLlama3RotaryEmbedding(_SpyreRotaryMixin, Llama3RotaryEmbedding):
     """OOT Llama3RotaryEmbedding that runs rotary computation on Spyre."""
 
     pass
@@ -230,14 +252,68 @@ def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) ->
     )
 
 
+def _rotary_cpu_op_func(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # cos_sin_cache is fetched from layer._cpu_cos_sin_cache (a CPU-pinned
+    # reference saved in __init__), since the registered buffer gets DMA'd
+    # to Spyre by torch_spyre.model_utils.load_model_to_spyre.
+    layer = get_layer(layer_name)
+    target_device = positions.device
+    target_dtype = query.dtype
+
+    cpu_positions = positions.to("cpu")
+    cpu_query = query.to("cpu")
+    cpu_key = key.to("cpu") if key.numel() > 0 else None
+
+    out_q, out_k = RotaryEmbedding.forward_static(
+        positions=cpu_positions,
+        query=cpu_query,
+        key=cpu_key,
+        head_size=layer.head_size,
+        rotary_dim=layer.rotary_dim,
+        cos_sin_cache=layer._cpu_cos_sin_cache,
+        is_neox_style=layer.is_neox_style,
+    )
+
+    out_q = out_q.to(device=target_device, dtype=target_dtype)
+    if out_k is None:
+        out_k = torch.empty(0, device=target_device, dtype=target_dtype)
+    else:
+        out_k = out_k.to(device=target_device, dtype=target_dtype)
+    return out_q, out_k
+
+
+def _rotary_cpu_op_fake(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    layer_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out_q = torch.empty(query.shape, dtype=query.dtype, device=positions.device)
+    out_k = torch.empty(key.shape, dtype=query.dtype, device=positions.device)
+    return out_q, out_k
+
+
 @lru_cache(maxsize=1)
 def register():
-    """Register the spyre_rope_rot custom op only. The OOT class replacement happens at
-    import time via``@RotaryEmbeddingBase.register_oot()``"""
+    """Register both the on-device (spyre_rope_rot) and CPU-fallback (spyre_rotary_cpu)
+    custom ops. The OOT class replacement happens at import time via
+    ``@RotaryEmbeddingBase.register_oot()``."""
     direct_register_custom_op(
         op_name="spyre_rope_rot",
         op_func=_rope_rot_op_func,
         fake_impl=_rope_rot_op_fake,
         dispatch_key=current_platform.dispatch_key,
     )
-    logger.debug_once("Registered custom op: spyre_rope_rot")
+    direct_register_custom_op(
+        op_name="spyre_rotary_cpu",
+        op_func=_rotary_cpu_op_func,
+        fake_impl=_rotary_cpu_op_fake,
+        mutates_args=[],
+        dispatch_key=current_platform.dispatch_key,
+    )
+    logger.debug_once("Registered custom ops: spyre_rope_rot, spyre_rotary_cpu")

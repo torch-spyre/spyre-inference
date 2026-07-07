@@ -120,9 +120,7 @@ def test_llama3_rotary_forward_matches_reference(requires_spyre, default_vllm_co
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
-    torch.testing.assert_close(
-        actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.rotary
@@ -159,9 +157,7 @@ def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_conf
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
-    torch.testing.assert_close(
-        actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
@@ -297,39 +293,6 @@ def test_rotary_forward_oot_key_none_on_spyre(requires_spyre, default_vllm_confi
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
-
-
-@pytest.mark.rotary
-@pytest.mark.parametrize("device", ["spyre", "cpu"])
-def test_rope_device_toggle_parity(requires_spyre, default_vllm_config, monkeypatch, device):
-    """SPYRE_INFERENCE_ROPE_DEVICE=spyre and =cpu both match forward_native.
-
-    Proves the toggle dispatches correctly and the on-device 2x2 path is
-    numerically equivalent to the CPU round-trip.
-    """
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
-
-    monkeypatch.setenv("SPYRE_INFERENCE_ROPE_DEVICE", device)
-
-    torch.manual_seed(7)
-    head_size, max_position, num_tokens, num_heads = 128, 2048, 32, 8
-    rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
-
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
-    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
-    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
-
-    _prime_rope(rope, positions)  # no-op when device="cpu" (gather_rotation returns None)
-    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
-    expected_query, expected_key = RotaryEmbedding.forward_native(
-        rope, positions.cpu(), query.cpu(), key.cpu()
-    )
-
-    torch.testing.assert_close(
-        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.rotary

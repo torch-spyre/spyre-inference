@@ -24,13 +24,12 @@ fetches that shared slice through the opaque ``spyre_rope_rot`` op (keeping
 the forward-context read out of torch.compile graphs) and applies the rotation.
 
 Configs without an on-device path (gptj/interleaved, partial rotary, unaligned
-head_size) and ``SPYRE_INFERENCE_ROPE_DEVICE=cpu`` fall back to a CPU
-implementation wrapped in the opaque ``spyre_rotary_cpu`` op so torch.compile
-does not trace into ``RotaryEmbedding.forward_static``.
+head_size) fall back to a CPU implementation wrapped in the opaque
+``spyre_rotary_cpu`` op so torch.compile does not trace into
+``RotaryEmbedding.forward_static``.
 """
 
 import itertools
-import os
 from functools import lru_cache
 
 import torch
@@ -145,10 +144,7 @@ class _SpyreRotaryMixin:
         ``None`` for configs that use the CPU fallback (nothing is stashed, and
         ``forward_oot`` takes its fallback branch instead).
         """
-        if not (
-            self._spyre_rope_supported
-            and os.environ.get("SPYRE_INFERENCE_ROPE_DEVICE", "spyre") == "spyre"
-        ):
+        if not self._spyre_rope_supported:
             return None
         cpu_positions = convert(positions, device="cpu")
         assert cpu_positions is not None
@@ -169,13 +165,10 @@ class _SpyreRotaryMixin:
         target_device = positions.device
         target_dtype = query.dtype
 
-        # CPU fallback (SPYRE_INFERENCE_ROPE_DEVICE="cpu" or an unsupported config):
-        # route through the opaque spyre_rotary_cpu op so torch.compile does not trace
-        # into RotaryEmbedding.forward_static.
-        if not (
-            self._spyre_rope_supported
-            and os.environ.get("SPYRE_INFERENCE_ROPE_DEVICE", "spyre") == "spyre"
-        ):
+        # CPU fallback for unsupported configs: route through the opaque
+        # spyre_rotary_cpu op so torch.compile does not trace into
+        # RotaryEmbedding.forward_static.
+        if not self._spyre_rope_supported:
             # infer_schema rejects Optional[Tensor] returns, so use an empty
             # tensor sentinel across the op boundary.
             key_in = (
@@ -215,8 +208,8 @@ class _SpyreRotaryMixin:
 class SpyreRotaryEmbedding(_SpyreRotaryMixin, RotaryEmbedding):
     """OOT RotaryEmbedding that applies the rotation on Spyre.
 
-    Supported configs run the 2x2 rotation on-device; unsupported configs and
-    SPYRE_INFERENCE_ROPE_DEVICE=cpu fall back to the opaque spyre_rotary_cpu op.
+    Supported configs run the 2x2 rotation on-device; unsupported configs fall
+    back to the opaque spyre_rotary_cpu op.
     """
 
     pass

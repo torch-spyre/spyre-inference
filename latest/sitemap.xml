@@ -2,30 +2,30 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/index.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/architecture/index.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/contributing/index.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/examples/experimental/spyre_online_softmax_check.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/examples/offline_inference/torch_spyre_inference.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/getting_started/installation.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
     <url>
          <loc>https://torch-spyre.github.io/spyre-inference/latest/user_guide/configuration.html</loc>
-         <lastmod>2026-06-30</lastmod>
+         <lastmod>2026-07-07</lastmod>
     </url>
 </urlset>

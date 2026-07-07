@@ -47,8 +47,7 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         # torch-spyre currently has a limitation with the work division of larger
         # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
         # an integer.
-
-        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size
+        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size.
         ALIGN = 64 * 32
         size = layer.weight.shape[0]
         layer.padding = (-size) % ALIGN
@@ -108,4 +107,6 @@ class SpyreParallelLMHead(ParallelLMHead):
         # .contiguous() is applied, so the slice is a fresh tensor, not a strided Spyre view).
         if self.padding > 0:
             out = out[:, : -self.padding].contiguous()
-        return convert(out, device=x.device)
+        # We explicitly have to put the logits onto CPU
+        # because the subsequent all_gather operation would crash.
+        return convert(out, device="cpu")

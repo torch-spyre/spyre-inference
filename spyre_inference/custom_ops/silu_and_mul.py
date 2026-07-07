@@ -41,7 +41,7 @@ class SpyreSiluAndMul(SiluAndMul):
         The fused path only runs for layers unfuse left alone (e.g. quantized).
         """
         if isinstance(x, (list, tuple)):
-            # Fast path: halves already split, both contiguous on device.
+            # Unfused path: halves already split, both contiguous on device.
             x1, x2 = x
         else:
             # Fused path: slice on CPU — slicing a Spyre tensor corrupts memory,

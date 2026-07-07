@@ -181,15 +181,10 @@ class _SpyreModelWrapper:
         then convert the resulting logits back to CPU
         for downstream sampling.
         """
-        # if hidden_states is not None:
-        #     hidden_states = hidden_states.contiguous()
         hidden_states = convert(hidden_states, device=self._spyre_device)
-        # if hidden_states is not None:
-        #     hidden_states = hidden_states.contiguous()
+        # logits are returned on cpu
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
-        # if logits is not None:
-        #     logits = logits.contiguous()
-        return convert(logits, device="cpu")
+        return logits
 
     def __getattr__(self, name):
         return getattr(self._model, name)

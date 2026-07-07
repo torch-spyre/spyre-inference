@@ -41,6 +41,7 @@ from vllm.model_executor.layers.rotary_embedding.base import (
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 from functools import lru_cache
 
@@ -240,6 +241,6 @@ def register():
         op_name="spyre_rope_rot",
         op_func=_rope_rot_op_func,
         fake_impl=_rope_rot_op_fake,
-        dispatch_key="CompositeExplicitAutograd",
+        dispatch_key=current_platform.dispatch_key,
     )
     logger.debug_once("Registered custom op: spyre_rope_rot")

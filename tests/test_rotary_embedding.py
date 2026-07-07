@@ -82,11 +82,11 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 
 
 @pytest.mark.rotary
-def test_llama3_rotary_forward_matches_reference(default_vllm_config):
+def test_llama3_rotary_forward_matches_reference(requires_spyre, default_vllm_config):
     """forward_oot output matches Llama3RotaryEmbedding.forward_native reference.
 
-    Runs on CPU (default-toggle eager 2x2 path); validates the copied rotation
-    math against the vLLM reference without hardware.
+    Runs the on-device 2x2 path (spyre_rope_rot dispatches under the platform
+    device key) and validates the copied rotation math against the vLLM reference.
     """
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.llama3_rope import Llama3RotaryEmbedding
@@ -106,24 +106,28 @@ def test_llama3_rotary_forward_matches_reference(default_vllm_config):
         dtype=torch.float16,
     )
 
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
     key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
 
     _prime_rope(rope, positions)
-    actual_query, actual_key = rope.forward_oot(positions, query, key)
+    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
 
     expected_query, expected_key = Llama3RotaryEmbedding.forward_native(
         rope, positions.cpu(), query.cpu(), key.cpu()
     )
 
-    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.rotary
-def test_base_rotary_forward_matches_reference(default_vllm_config):
-    """SpyreRotaryEmbedding.forward_oot matches RotaryEmbedding.forward_native (CPU)."""
+def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_config):
+    """SpyreRotaryEmbedding.forward_oot (on-device 2x2 path) matches forward_native."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -141,19 +145,23 @@ def test_base_rotary_forward_matches_reference(default_vllm_config):
         dtype=torch.float16,
     )
 
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
     key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
 
     _prime_rope(rope, positions)
-    actual_query, actual_key = rope.forward_oot(positions, query, key)
+    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
 
     expected_query, expected_key = RotaryEmbedding.forward_native(
         rope, positions.cpu(), query.cpu(), key.cpu()
     )
 
-    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):

@@ -75,6 +75,7 @@ def _rotate_neox_2x2(
         Rotated tensor with the same shape as ``x``.
     """
     num_tokens = x.shape[0]
+    # ToDo boh, ysc: maybe need .contiguous() here? Not present in fms either though
     # Split-half pairing: x_pairs[..., 0, :] = first half, [..., 1, :] = second half.
     x_pairs = x.view(num_tokens, -1, 2, head_size // 2)  # [T, H, 2, D/2]
     # out[..., a, :] = sum_b rot[..., a, b, :] * x_pairs[..., b, :]

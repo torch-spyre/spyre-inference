@@ -299,10 +299,13 @@ contract:
 2. `get_finished() -> list[TransferResult]` — return `TransferResult(job_id, success=...)` records; synchronous today, so every submitted job is already done.
 3. `shutdown()` clears references to the registered tensors.
 
-Host-side block tensors are a single `torch.empty(num_cpu_blocks, page_bytes, int8)` per attention
-group when `mmap_region is None` (M1); when a region is supplied (M2), they are views over that
-shared, DMA-registered pool (§6.8). We do **not** pin via `cudaHostRegister` — no equivalent on Spyre;
-M2 pins the pool once via `register_dmable_host_buffer` (§6.7).
+Host-side block tensors follow upstream `CpuGpuOffloadingHandlers` exactly (verified at v0.24.0): when
+`mmap_region is None` (M1), a `torch.zeros(num_cpu_blocks, cpu_page_bytes, int8)` per attention group;
+when a region is supplied (M2), `mmap_region.create_next_view(cpu_page_bytes)` over the shared pool
+(§6.8). The one Spyre-specific change is pinning: upstream calls `pin_mmap_region()` →
+`cudaHostRegister(region._base.data_ptr(), region.total_size_bytes)` (which already no-ops off CUDA);
+the Spyre handlers call `register_dmable_host_buffer` on that same base+size instead (§6.7). No
+`cudaHostRegister` on Spyre — there is no equivalent.
 
 ### 6.3 `SpyreOffloadingSpec`
 
@@ -418,9 +421,18 @@ gate are exactly what upstream's `CPUPrimaryTierOffloadingManager` (wrapped by
 therefore **subclasses `TieringOffloadingSpec`** and — exactly as M1 (§6.3) — overrides only
 `create_handlers()` (and drops the CUDA gate), inheriting `get_manager` unchanged:
 
+The seam matches how upstream `TieringOffloadingSpec` itself works (verified at v0.24.0): its
+`get_manager` (scheduler process) builds a `SharedOffloadRegion` with `rank=None` for the primary
+tier, and its `create_handlers` (worker process) builds a **second** `SharedOffloadRegion` with the
+worker's `rank` — both attach the *same* named POSIX-SHM segment (keyed by `instance_id` + geometry),
+which is how the two processes share it. We copy that `create_handlers` verbatim, swapping only the
+handler class:
+
 ```python
 # spyre_inference/v1/kv_offload/shm_spec.py
+import torch
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 class SpyreShmOffloadingSpec(TieringOffloadingSpec):
     """Cross-instance shared host-RAM KV pool on Spyre.
@@ -428,33 +440,42 @@ class SpyreShmOffloadingSpec(TieringOffloadingSpec):
     get_manager is inherited verbatim: TieringOffloadingManager over a
     CPUPrimaryTierOffloadingManager + its SharedOffloadRegion (the shared
     pool + directory + RESERVED→VALID gate + eviction). The ONLY override is
-    create_handlers: return Spyre handlers that DMA into that shared region.
+    create_handlers: build the worker-side SharedOffloadRegion exactly as the
+    parent does, then hand it to Spyre handlers instead of the CUDA ones.
     """
     def __init__(self, vllm_config, kv_cache_config):
         super().__init__(vllm_config, kv_cache_config)
         self._copier = SpyreKvDmaCopier()
 
-    def create_handlers(self, kv_caches):
-        shared_region = self.get_manager().primary_tier.mmap_region   # the SharedOffloadRegion
+    def create_handlers(self, kv_caches):        # mirrors TieringOffloadingSpec.create_handlers
+        worker_mmap = SharedOffloadRegion(
+            instance_id=self.vllm_config.instance_id,
+            num_blocks=self.num_blocks,
+            rank=torch.accelerator.current_device_index(),
+            kv_bytes_per_block=self.kv_bytes_per_offloaded_block,
+            cpu_page_size=self.cpu_page_size_per_worker,
+        )
         return SpyreCpuOffloadingHandlers(
             kv_caches=kv_caches, block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks, copier=self._copier,
-            mmap_region=shared_region,        # DMA into the shared pool, not a private buffer
+            mmap_region=worker_mmap,             # host slots come from this shared region
         )
-    def get_handlers(self, kv_caches):        # inherited yield structure, minus the CUDA gate
-        if not self._handlers:
-            self._handlers = self.create_handlers(kv_caches)
-        yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
-        yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
+    # get_handlers: inherited from SpyreOffloadingSpec (§6.3) — drops the CUDA gate,
+    # yields (GPULoadStoreSpec, CPULoadStoreSpec, gpu_to_cpu_handler) + the reverse.
 ```
 
-Because the *entire* cross-process framework (manager, directory, gate, eviction, tiering config) is
-the upstream one, this is a small, honest change — and the async-DMA correctness question below is
-answerable *because* we stress the real upstream gate, not a reimplementation. The handler's store
-path orders the RESERVED→VALID flip **after** the D2H `copy_tensor_raw` DMA has synchronized, and the
-load path reads only after observing VALID (flex `copyRaw` exposes the completion callback /
-`synchronize()` to do this). Validating that this holds under concurrent multi-instance load is the
-A2.2 acceptance test — and the primary risk M2 must retire.
+`SpyreCpuOffloadingHandlers` uses the `mmap_region` exactly as upstream `CpuGpuOffloadingHandlers`
+does — host slots are `mmap_region.create_next_view(cpu_page_bytes)` rather than a private
+`torch.empty`. The only Spyre-specific difference from upstream is the pinning call: upstream's
+`pin_mmap_region()` runs `cudaHostRegister(region._base.data_ptr(), region.total_size_bytes)` (and
+already **no-ops on non-CUDA**); the Spyre handlers instead call `register_dmable_host_buffer` on that
+same base+size (§6.7). Because the *entire* cross-process framework (manager, directory, gate,
+eviction, tiering config) is the upstream one, this is a small, honest change — and the async-DMA
+correctness question below is answerable *because* we stress the real upstream gate, not a
+reimplementation. The store path orders the RESERVED→VALID flip **after** the D2H `copy_tensor_raw`
+DMA has synchronized, and the load path reads only after observing VALID (flex `copyRaw` exposes the
+completion callback / `synchronize()`). Validating that under concurrent multi-instance load is the
+A2.2 acceptance test — the primary risk M2 must retire.
 
 **Comparison arm — hmlib.** [hmlib](https://github.com/…) is a shared-memory KV runtime that offers a
 *different* concurrency model for the same shared pool: instead of the manager's RESERVED→VALID lock,

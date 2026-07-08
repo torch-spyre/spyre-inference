@@ -176,7 +176,7 @@ def _unfuse_qkv(module: QKVParallelLinear) -> None:
         module.num_kv_heads * module.v_head_size,
     ]
     _split_into_params(module, ["q", "k", "v"], sizes)
-    module.forward = types.MethodType(_qkv_forward, module)
+    module.forward = types.MethodType(_qkv_forward, module)  # ty: ignore[invalid-assignment]
 
 
 def _silu_and_mul_forward(self, x: torch.Tensor):
@@ -192,7 +192,9 @@ def _unfuse_silu_and_mul(module: MergedColumnParallelLinear) -> None:
     _assert_cpu(module, "gate_up_proj")
     sizes = list(module.output_partition_sizes)  # per-rank, TP-correct
     _split_into_params(module, ["gate", "up"], sizes)
-    module.forward = types.MethodType(_silu_and_mul_forward, module)
+    module.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+        _silu_and_mul_forward, module
+    )
 
 
 def _gate_up_sibling(act_fn: nn.Module, parent_of: dict[int, nn.Module]):

@@ -438,6 +438,50 @@ dependency or the out-of-family spec is unacceptable for the milestone.
 Because both use the same §6.7 flex + torch-spyre surface, the lower layers are not wasted regardless
 of which shape ships.
 
+Shape A at a glance — two co-located instances sharing one node-local SHM KV pool, each DMA-ing into
+it via `copy_tensor_raw`, with hmlib owning the directory + publish gate + seqlock copy→validate:
+
+<!-- Source: figures/spyre-shm-pool-m2.{mmd,d2}. Regenerate with:
+       npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/architecture/rfcs/figures/spyre-shm-pool-m2.mmd \
+         -o docs/architecture/rfcs/figures/spyre-shm-pool-m2.svg -b transparent
+       d2 docs/architecture/rfcs/figures/spyre-shm-pool-m2.d2 docs/architecture/rfcs/figures/spyre-shm-pool-m2.d2.svg -->
+
+![M2 Shape A: two Spyre instances share one POSIX-SHM KV pool; each offloads/reloads via copy_tensor_raw, hmlib owns the directory and publish gate](figures/spyre-shm-pool-m2.svg)
+
+<details>
+<summary>Diagram sources (Mermaid at <code>figures/spyre-shm-pool-m2.mmd</code>; D2 at <code>figures/spyre-shm-pool-m2.d2</code>, rendered to <code>spyre-shm-pool-m2.d2.svg</code>)</summary>
+
+```mermaid
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+    subgraph instA["<b>Spyre instance A</b>"]
+        direction TB
+        OA["OffloadingConnector + SpyreShmOffloadingSpec"]
+        HA["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        OA --> HA
+    end
+    subgraph instB["<b>Spyre instance B</b>"]
+        direction TB
+        OB["OffloadingConnector + SpyreShmOffloadingSpec"]
+        HB["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        OB --> HB
+    end
+    RAW["<b>torch_spyre._C.copy_tensor_raw</b> / register_dmable_host_buffer<br/>(flex copyRaw + external-pointer pin)"]
+    subgraph pool["<b>shared host-RAM KV pool</b> (POSIX-SHM, one per node)"]
+        direction TB
+        HM["hmlib KVBlockStore: block-hash→slot directory,<br/>single-writer publish gate, seqlock copy→validate"]
+        SLOTS[("slots: raw KV page images<br/>host DRAM, DMA-registered")]
+        HM --- SLOTS
+    end
+    HA -->|"D2H offload / H2D reload"| RAW
+    HB -->|"D2H offload / H2D reload"| RAW
+    RAW <-->|"raw DMA into slot"| SLOTS
+    HA -. "lookup / publish" .-> HM
+    HB -. "lookup (peer hit)" .-> HM
+```
+
+</details>
+
 ## 7. File-by-file plan
 
 ### M1 files

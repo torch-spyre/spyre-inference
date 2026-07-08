@@ -1,0 +1,38 @@
+direction: down
+
+instA: Spyre instance A {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  OA: "OffloadingConnector + SpyreShmOffloadingSpec"
+  HA: "SpyreShmOffloadingHandlers -> SpyreKvDmaCopier"
+  OA -> HA
+}
+
+instB: Spyre instance B {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  OB: "OffloadingConnector + SpyreShmOffloadingSpec"
+  HB: "SpyreShmOffloadingHandlers -> SpyreKvDmaCopier"
+  OB -> HB
+}
+
+RAW: "torch_spyre._C.copy_tensor_raw / register_dmable_host_buffer\n(flex copyRaw + external-pointer pin)" {
+  style.fill: "#ffe4e1"
+  style.stroke: "#a83232"
+}
+
+pool: shared host-RAM KV pool (POSIX-SHM, one per node) {
+  style.fill: "#fff4e6"
+  style.stroke: "#c1620a"
+  HM: "hmlib KVBlockStore: block-hash->slot directory,\nsingle-writer publish gate, seqlock copy->validate"
+  SLOTS: "slots: raw KV page images\nhost DRAM, DMA-registered" {
+    shape: cylinder
+  }
+  HM -- SLOTS
+}
+
+instA.HA -> RAW: "D2H offload / H2D reload"
+instB.HB -> RAW: "D2H offload / H2D reload"
+RAW <-> pool.SLOTS: "raw DMA into slot"
+instA.HA -> pool.HM: "lookup / publish" { style.stroke-dash: 3 }
+instB.HB -> pool.HM: "lookup (peer hit)" { style.stroke-dash: 3 }

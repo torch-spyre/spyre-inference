@@ -5,7 +5,7 @@
 | Status | Draft |
 | Authors | Chen Wang ([@wangchen615](https://github.com/wangchen615)), Yue Zhu ([@yuezhu1](https://github.com/yuezhu1)), Pravein Govindan Kannan ([@praveingk](https://github.com/praveingk)), Hubertus Franke ([@frankeh](https://github.com/frankeh)) |
 | Created | 2026-06-05 |
-| Updated | 2026-06-08 — rebased on the upstream multi-tier framework (`TieringOffloadingSpec`, `SecondaryTierManager`, `tiering/fs`, `tiering/obj`); incorporated review feedback from [@yuezhu1](https://github.com/yuezhu1). 2026-07-07 — added Milestone 2: cross-instance shared host-memory KV pool (hmlib-backed primary tier, recommended; `SharedOffloadRegion`+DMA alternative), built on the flex raw-copy + shared-host-DMA primitives. Dropped the former M1.5 (filesystem/object `SecondaryTier`) milestone: the intended fast second tier is hillock (a byte-addressable, DMA-able memory pool), which is reached through the M2 shared-pool DMA path, **not** through an fs/obj `SecondaryTierManager` — so a tiering milestone would be a detour. The upstream tiering framework is retained as background only (§3.5). |
+| Updated | 2026-06-08 — rebased on the upstream multi-tier framework (`TieringOffloadingSpec`, `SecondaryTierManager`, `tiering/fs`, `tiering/obj`); incorporated review feedback from [@yuezhu1](https://github.com/yuezhu1). 2026-07-07 — added Milestone 2: cross-instance shared host-memory KV pool, built on the flex raw-copy + shared-host-DMA primitives. Two shapes: Shape B (upstream `SharedOffloadRegion` + DMA) is the starting point and is built/tested first; Shape A (hmlib-backed, post-copy seqlock validate) is adopted only if the upstream RESERVED→VALID gate proves insufficient under async-DMA stores (§6.8). Dropped the former M1.5 (filesystem/object `SecondaryTier`) milestone: the intended fast second tier is hillock (a byte-addressable, DMA-able memory pool), which is reached through the M2 shared-pool DMA path, **not** through an fs/obj `SecondaryTierManager` — so a tiering milestone would be a detour. The upstream tiering framework is retained as background only (§3.5). |
 | Tracking | First design doc for [#76 — \[Epic\] Develop KVCacheConnector for Spyre](https://github.com/torch-spyre/spyre-inference/issues/76) |
 | Related | vLLM `OffloadingConnector`, vLLM `TieringOffloadingSpec` (PR #40020), vLLM `tiering/fs` (PR #41735), vLLM `tiering/obj` (PR #41968), prior internal Spyre PD-disaggregation prototype |
 
@@ -147,7 +147,7 @@ This is the only device↔host primitive M1 uses. Earlier internal Spyre prototy
 | Path | Milestone | Compose how | Notes |
 |---|---|---|---|
 | Spyre device ↔ host RAM (single tier) | **M1** | `OffloadingConnector` + `SpyreOffloadingSpec` | Single-tier offload; survives across requests. |
-| Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreShmOffloadingSpec` (hmlib-backed primary tier) | Multiple co-located instances share one POSIX-SHM primary pool; a block offloaded by one instance is reloaded by another with one raw DMA and seqlock copy→validate — no serialization, no disk. Uses `copy_tensor_raw` + `register_dmable_host_buffer` (§6.6). See §6.7. |
+| Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreShmOffloadingSpec` | Multiple co-located instances share one POSIX-SHM primary pool; a block offloaded by one instance is reloaded by another with one raw DMA — no serialization, no disk. Built on `SharedOffloadRegion` + DMA first (Shape B); hmlib post-copy validate (Shape A) if the upstream gate proves insufficient. Uses `copy_tensor_raw` + `register_dmable_host_buffer` (§6.6). See §6.7–6.8. |
 | Direct Spyre device ↔ filesystem / object store | Out of scope | n/a | Would require a Spyre-side analogue of NVIDIA GDS so a secondary tier can DMA without a host bounce. Not provided by torch-spyre today, and the upstream `SecondaryTierManager` contract assumes the `primary_kv_view` is over CPU memory; supporting this would change both. Filed as a future-work item in §11. |
 
 M1 and M2 reuse the same device↔host copy path (§4/§6.1, §6.7); M2 only changes the host side from a
@@ -382,14 +382,25 @@ tail and corrupts reload (flex RFC §5). The M2 `SpyreKvDmaCopier` gains a `copy
 pool_ptr)` / `copy_h2d_raw(pool_ptr, dev_tensor)` pair alongside the M1 tensor-to-tensor methods; the
 handler picks the raw pair when the destination is a shared-pool slot rather than a torch CPU tensor.
 
-### 6.8 M2 — `SpyreShmOffloadingSpec`: two shapes, recommend hmlib-backed
+### 6.8 M2 — `SpyreShmOffloadingSpec`: two shapes, test upstream first
 
 M2 registers a `SpyreShmOffloadingSpec` whose primary tier is a **single POSIX-SHM pool shared by
 every co-located instance**, instead of M1's per-instance `torch.empty` host blocks. There are two
 ways to build the pool + its cross-process directory; both ride the identical §6.7 primitive and
 differ only in who owns the pool and the block-hash→slot bookkeeping.
 
-**Shape A (recommended) — hmlib-backed.** Use the [hmlib](https://github.com/…) shared-memory KV
+**The decision is not "shared memory or not."** A shared, DMA-registered host buffer is enough to make
+cross-instance sharing *work*, and vLLM's `SharedOffloadRegion` already provides one (Shape B). The
+real question is **which concurrency model governs a slot that is written and read by asynchronous
+DMAs from different processes** — because that is the one thing neither the upstream manager nor the
+prior CPU-offload design was built for. Upstream's slot coherence assumes the primary tier is written
+by a **CPU `memcpy` the manager sequences end-to-end**; on Spyre a slot is filled by an out-of-band
+device DMA that *completes later*, and read by another process's DMA into the same segment. So the
+choice below is really: **is the upstream RESERVED→VALID gate robust when the data mover is an async
+DMA the lock-holder does not directly control, or do we want copy→validate that is correct by
+construction regardless?**
+
+**Shape A (the escalation) — hmlib-backed.** Use the [hmlib](https://github.com/…) shared-memory KV
 runtime as the primary tier. hmlib already owns a POSIX-SHM payload pool, a block-hash→slot directory,
 a single-writer publish gate, seqlock **copy→validate**, and eviction — i.e. it is exactly the
 "plugin layer" the flex RFC §6 hands the DMA to. The Spyre port of hmlib is a narrow two-operation
@@ -398,48 +409,81 @@ swap (pin via `register_dmable_host_buffer` instead of `cudaHostRegister`; per-p
 handler drives an owner-role `HmlibKVBlockStore` for this rank, and peer ranks/instances attach the
 pool read-only.
 
-Why recommend it: a cross-instance cache hit collapses to `index probe + one raw DMA + seqlock
-validate` — no RPC, no lock handoff, no serialization, and a concurrent overwrite surfaces as a miss,
-never corruption. Data-parallel multi-owner maps onto hmlib's existing per-rank owner region +
-read-only peer attach. This is the shape that delivers the actual shared-KV value on-node.
+Why recommend it — it targets exactly the async-DMA concurrency problem above. A reader copies (DMAs)
+a slot and *then* validates a seqlock/generation stamp; if the owner reused that slot mid-copy, the
+reader's validation fails and the read is reported as a **miss, never as torn/corrupt bytes** — and
+that safety does not depend on a cross-process lock being honored across the DMA-completion boundary,
+only on a post-copy version check. A hit collapses to `index probe (local SHM read) + one raw DMA +
+validate`: no RPC, no lock handoff on the hot path, no serialization. Single-writer-per-region + peer
+read-only attach maps directly onto Spyre data-parallel ranks (one owner region per rank), and
+generation/incarnation stamping degrades a producer restart to a miss rather than a stale read. In
+short, hmlib is not here for "shared memory" (Shape B has that) — it is here for the peer-hit path,
+which is the whole point of M2.
+
+The spec skeleton is shared; only the pool-ownership line differs between the shapes (Shape B uses an
+upstream `SharedOffloadRegion`, Shape A an hmlib region):
 
 ```python
-# spyre_inference/v1/kv_offload/shm_spec.py  (Shape A)
+# spyre_inference/v1/kv_offload/shm_spec.py
 class SpyreShmOffloadingSpec(SpyreOffloadingSpec):
-    """Primary tier = one cross-instance POSIX-SHM KV pool (hmlib-backed).
+    """Primary tier = one cross-instance POSIX-SHM KV pool.
 
-    Reuses M1's device↔host copy path, but the host side is a shared pool
-    owned by hmlib (directory + publish gate + seqlock copy-validate),
-    DMA'd via copy_tensor_raw into hmlib slots. Peers attach the same
-    named pool read-only for cross-instance hits.
+    Reuses M1's device↔host copy path; the host side is a shared pool that
+    every co-located instance maps, DMA'd via copy_tensor_raw. The pool
+    owner/directory is the swap point between the two shapes:
+      Shape B: vLLM SharedOffloadRegion + its RESERVED→VALID gate (build first)
+      Shape A: hmlib region + directory + seqlock copy→validate (escalation)
     """
     def __init__(self, vllm_config, kv_cache_config):
         super().__init__(vllm_config, kv_cache_config)
         self.pool_name = self.extra_config["shm_pool_name"]        # shared across instances
         # num_slots derived from cpu_bytes_to_use / page total_size()
-    def get_manager(self):  # hmlib owns bookkeeping; manager is a thin adapter over its directory
+    def get_manager(self):   # Shape B: adapt SharedOffloadRegion's manager; Shape A: hmlib directory
         ...
     def get_handlers(self, kv_caches):
-        # SpyreShmOffloadingHandlers: register the hmlib pool window once
-        # (register_dmable_host_buffer), then copy_tensor_raw per page.
+        # SpyreShmOffloadingHandlers: register_dmable_host_buffer once on the
+        # pool window, then copy_tensor_raw per page (ordering the VALID flip
+        # after DMA completion on Shape B).
         ...
 ```
 
-**Shape B (lighter alternative) — upstream `SharedOffloadRegion` + DMA.** Keep vLLM's upstream
+**Shape B (the starting point) — upstream `SharedOffloadRegion` + DMA.** Keep vLLM's upstream
 `SharedOffloadRegion` (`mmap` + `multiprocessing.shared_memory`) as the pool and its cross-process
 directory, and only make its buffer a DMA endpoint: `register_dmable_host_buffer` over the region
 once, `copy_tensor_raw` into `region_base + slot_offset`. No hmlib dependency; stays on the upstream
-`OffloadingSpec` family. Trade-off: no seqlock copy→validate (torn-read safety leans on the
-upstream RESERVED→VALID gate + lock), eviction and directory are upstream's, and the hit path goes
-through the upstream manager rather than the collapsed probe+copy+validate. Choose B if the hmlib
-dependency or the out-of-family spec is unacceptable for the milestone.
+`OffloadingSpec` family; smallest diff. This is **not** an unsafe or degraded path — it *does* have
+concurrency correctness, via the upstream RESERVED→VALID publish gate + process-shared lock, and it
+reuses upstream's eviction and directory as-is. The one thing to validate is the async-DMA ordering
+framed above: because the store is now an async `copy_tensor_raw` DMA that completes after the CPU
+bookkeeping runs, the owner must flip a slot to VALID only *after* its D2H DMA has synchronized, and a
+reader must not begin its H2D DMA until it has observed VALID. flex `copyRaw` exposes the hooks to do
+this (a completion callback / `synchronize()`); it just has to be wired to the gate and shown to hold
+under concurrent load.
 
-**Recommendation:** target Shape A (hmlib-backed) for M2; keep Shape B documented as the fallback.
-Because both use the same §6.7 flex + torch-spyre surface, the lower layers are not wasted regardless
-of which shape ships.
+**Recommendation: build and test Shape B first.** It is the smallest change, adds no dependency, and
+stays on the upstream `OffloadingSpec` family — and whether it is *sufficient* is an empirical
+question, not a settled one. Stand it up, then hammer the async-DMA torn-read case directly (A2.2:
+one process reading a slot while the owner evicts and re-DMAs it) under concurrent multi-instance
+load. Two outcomes:
 
-Shape A at a glance — two co-located instances sharing one node-local SHM KV pool, each DMA-ing into
-it via `copy_tensor_raw`, with hmlib owning the directory + publish gate + seqlock copy→validate:
+- **If the RESERVED→VALID gate holds** once the VALID flip is ordered after DMA completion (and the
+  read after observing VALID), Shape B *is* M2 — ship it. hmlib is not needed.
+- **If it does not hold cleanly** — torn reads slip through, or the ordering only works with a lock so
+  coarse it serializes the hot path — then adopt Shape A (hmlib), whose post-copy seqlock validate
+  gives the same guarantee by construction: a reader that copies a reused slot simply gets a miss, no
+  cross-process lock has to be correct across the DMA boundary.
+
+Because both shapes ride the identical §6.7 flex + torch-spyre surface (`copy_tensor_raw` +
+`register_dmable_host_buffer`), starting with B costs nothing if we later move to A — the lower layers
+are unchanged, and only the pool-ownership/directory layer swaps. So M2's first deliverable is Shape B
+plus the A2.2 stress test; hmlib is the fallback that the test result decides, not a prerequisite.
+
+The shared-pool topology both shapes share — two co-located instances mapping one node-local SHM KV
+pool, each DMA-ing into it via `copy_tensor_raw` after a one-time `register_dmable_host_buffer`. The
+only per-shape difference is the pool-ownership/directory box: Shape B uses vLLM's `SharedOffloadRegion`
++ its RESERVED→VALID gate; Shape A (drawn here) swaps in hmlib, adding the directory + publish gate +
+seqlock copy→validate. We build Shape B first (§6.8 recommendation); the figure shows the Shape-A
+escalation:
 
 <!-- Source: figures/spyre-shm-pool-m2.{mmd,d2}. Regenerate with:
        npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/architecture/rfcs/figures/spyre-shm-pool-m2.mmd \
@@ -512,21 +556,27 @@ New tests in `tests/v1/kv_offload/`:
 
 ### M2 files (cross-instance shared pool — gated on §6.7 upstream deps)
 
-Shape A (recommended, hmlib-backed). Depends on `torch_spyre._C.copy_tensor_raw` /
-`register_dmable_host_buffer` (torch-spyre design doc) and the hmlib Spyre port
-(*TODO.spyre_shm_dma.md*), neither of which exists yet.
+Both shapes depend on `torch_spyre._C.copy_tensor_raw` / `register_dmable_host_buffer` (torch-spyre
+design doc), which does not exist yet.
+
+**Shape B — the first deliverable** (upstream `SharedOffloadRegion` + DMA; no hmlib dependency):
 
 | File | Purpose | Approx LOC |
 |---|---|---|
 | `spyre_inference/v1/kv_offload/copier.py` | Extend `SpyreKvDmaCopier` with `copy_d2h_raw` / `copy_h2d_raw` (wrap `copy_tensor_raw`); M1 methods unchanged. | +30 |
-| `spyre_inference/v1/kv_offload/shm_pool.py` | Attach/own the shared POSIX-SHM KV pool (hmlib owner/subscriber region + directory); register the window for DMA once via `register_dmable_host_buffer`. | ~120 |
-| `spyre_inference/v1/kv_offload/shm_spec.py` | `SpyreShmOffloadingSpec` + `SpyreShmOffloadingHandlers`; `get_manager` adapts hmlib's directory, `get_handlers` drives the raw copier into pool slots. | ~150 |
+| `spyre_inference/v1/kv_offload/shm_spec.py` | `SpyreShmOffloadingSpec` + `SpyreShmOffloadingHandlers` over an upstream `SharedOffloadRegion`; `register_dmable_host_buffer` on the region once, `copy_tensor_raw` into `region_base + slot_offset`. Order the VALID flip after DMA completion. | ~100 |
 | `spyre_inference/__init__.py` | Add a third `OffloadingSpecFactory.register_spec(...)` for `SpyreShmOffloadingSpec`. | +5 |
-| `pyproject.toml` | Add the `hmlib` dependency (Shape A only) and bump the torch-spyre pin to one that exposes `copy_tensor_raw`. | +2 |
-| `tests/v1/kv_offload/test_shm_spec.py` | Two-process test: process A offloads a known-pattern block into the shared pool, process B reloads it and asserts content + a seqlock-validated hit; torn-write test asserts a stale slot degrades to a miss. | ~180 |
+| `pyproject.toml` | Bump the torch-spyre pin to one that exposes `copy_tensor_raw`. | +1 |
+| `tests/v1/kv_offload/test_shm_spec.py` | Two-process test: A offloads a known-pattern block, B reloads and asserts content + a cross-instance hit. **A2.2 torn-write stress test** under concurrent load: reader mid-DMA while owner evicts+re-DMAs the slot — assert no torn read slips through the RESERVED→VALID gate. This test is the decision point for whether Shape A is needed. | ~180 |
 
-Shape B (lighter alternative) drops `shm_pool.py` and the hmlib dependency; `shm_spec.py` instead
-wraps upstream `SharedOffloadRegion` and registers its buffer for DMA (~80 LOC total on top of M1).
+**Shape A — the escalation** (only if the A2.2 stress test shows the upstream gate is insufficient):
+adopt hmlib as the pool owner. Delta on top of Shape B:
+
+| File | Purpose | Approx LOC |
+|---|---|---|
+| `spyre_inference/v1/kv_offload/shm_pool.py` | Attach/own the shared pool as an hmlib owner/subscriber region + directory instead of `SharedOffloadRegion`; register the window for DMA once. | ~120 |
+| `spyre_inference/v1/kv_offload/shm_spec.py` | Repoint `get_manager` at hmlib's directory and `get_handlers` at hmlib slots (post-copy seqlock validate). | ±60 |
+| `pyproject.toml` | Add the `hmlib` dependency. | +1 |
 
 ## 8. Compatibility with existing connectors and tiers
 

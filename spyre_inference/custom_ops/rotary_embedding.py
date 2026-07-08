@@ -171,8 +171,8 @@ class _SpyreRotaryMixin:
         # opaque spyre_rope_rot op so the forward-context read stays out of the
         # torch.compile graph — the slice enters the graph as an op output rather
         # than a baked constant.
-        rot = torch.ops.vllm.spyre_rope_rot(  # ty: ignore[invalid-argument-type]
-            positions, self._rope_key, self.head_size
+        rot = torch.ops.vllm.spyre_rope_rot(
+            positions, self._rope_key, self.head_size  # ty: ignore[invalid-argument-type]
         )
         q = convert(query, device=target_device, dtype=target_dtype)
         out_query = _rotate_neox_2x2(q, rot, self.head_size)

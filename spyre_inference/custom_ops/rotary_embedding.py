@@ -172,7 +172,9 @@ class _SpyreRotaryMixin:
         # torch.compile graph — the slice enters the graph as an op output rather
         # than a baked constant.
         rot = torch.ops.vllm.spyre_rope_rot(
-            positions, self._rope_key, self.head_size  # ty: ignore[invalid-argument-type]
+            positions,  # ty: ignore[invalid-argument-type]
+            self._rope_key,  # ty: ignore[invalid-argument-type]
+            self.head_size,
         )
         q = convert(query, device=target_device, dtype=target_dtype)
         out_query = _rotate_neox_2x2(q, rot, self.head_size)

@@ -5,7 +5,7 @@
 | Status | Draft |
 | Authors | Chen Wang ([@wangchen615](https://github.com/wangchen615)), Yue Zhu ([@yuezhu1](https://github.com/yuezhu1)), Pravein Govindan Kannan ([@praveingk](https://github.com/praveingk)), Hubertus Franke ([@frankeh](https://github.com/frankeh)) |
 | Created | 2026-06-05 |
-| Updated | 2026-06-08 — rebased on the upstream multi-tier framework (`TieringOffloadingSpec`, `SecondaryTierManager`, `tiering/fs`, `tiering/obj`); incorporated review feedback from [@yuezhu1](https://github.com/yuezhu1). 2026-07-07 — added Milestone 2: cross-instance shared host-memory KV pool, built on the flex raw-copy + shared-host-DMA primitives. Two shapes: Shape B (upstream `SharedOffloadRegion` + DMA) is the starting point and is built/tested first; Shape A (hmlib-backed, post-copy seqlock validate) is adopted only if the upstream RESERVED→VALID gate proves insufficient under async-DMA stores (§6.8). Dropped the former M1.5 (filesystem/object `SecondaryTier`) milestone: the intended fast second tier is hillock (a byte-addressable, DMA-able memory pool), which is reached through the M2 shared-pool DMA path, **not** through an fs/obj `SecondaryTierManager` — so a tiering milestone would be a detour. The upstream tiering framework is retained as background only (§3.5). |
+| Updated | 2026-06-08 — rebased on the upstream multi-tier framework (`TieringOffloadingSpec`, `SecondaryTierManager`, `tiering/fs`, `tiering/obj`); incorporated review feedback from [@yuezhu1](https://github.com/yuezhu1). 2026-07-07 — added Milestone 2: cross-instance shared host-memory KV pool, built on the flex raw-copy + shared-host-DMA primitives. `SpyreShmOffloadingSpec` subclasses upstream `TieringOffloadingSpec` and overrides only `create_handlers`, reusing `TieringOffloadingManager` + `SharedOffloadRegion` verbatim. The **upstream** shared-region backend is primary (build + ship); **hmlib** (post-copy seqlock validate) is a swappable comparison-arm backend built to benchmark head-to-head — no presumption it wins (§6.8). Verified against the pinned vLLM `v0.24.0` `get_handlers` API. Dropped the former M1.5 (filesystem/object `SecondaryTier`) milestone: the intended fast second tier is hillock (a byte-addressable, DMA-able memory pool), which is reached through the M2 shared-pool DMA path, **not** through an fs/obj `SecondaryTierManager` — so a tiering milestone would be a detour. The upstream tiering framework is retained as background only (§3.5). |
 | Tracking | First design doc for [#76 — \[Epic\] Develop KVCacheConnector for Spyre](https://github.com/torch-spyre/spyre-inference/issues/76) |
 | Related | vLLM `OffloadingConnector`, vLLM `TieringOffloadingSpec` (PR #40020), vLLM `tiering/fs` (PR #41735), vLLM `tiering/obj` (PR #41968), prior internal Spyre PD-disaggregation prototype |
 
@@ -81,21 +81,31 @@ Three abstraction points matter on the worker side. References are to vLLM `main
 
 Constructed once per role (`SCHEDULER`/`WORKER`) and delegates to `OffloadingConnectorScheduler` or `OffloadingConnectorWorker`. The worker side calls `connector_worker.register_kv_caches(kv_caches)` with the `dict[str, torch.Tensor]` that the runner has already allocated. **This is the only ingestion point for the on-device KV cache** — everything downstream operates on tensors handed in here.
 
-### 3.2 `OffloadingSpec` (`vllm/v1/kv_offload/base.py:319`)
+### 3.2 `OffloadingSpec` (`vllm/v1/kv_offload/base.py`, verified at the pinned vLLM `v0.24.0`)
 
-The contract a platform implements:
+The contract a platform implements is two abstract methods (this is the `get_handlers`-based API of
+`v0.24.0` — the vLLM version this plugin pins; note it is **not** the `get_worker` API on vLLM `main`):
 
 - `get_manager() -> OffloadingManager` — scheduler-side bookkeeping (which blocks are where, eviction policy).
-- `get_handlers(kv_caches) -> Iterator[(src_type, dst_type, OffloadingHandler)]` — worker-side transfer dispatch. The handler is asked to move a list of `(src_block_ids, dst_block_ids)` pairs and to expose a `get_finished()` poll for completion.
+- `get_handlers(kv_caches) -> Iterator[tuple[type[LoadStoreSpec], type[LoadStoreSpec], OffloadingHandler]]` — yields `(src_type, dst_type, handler)`. An `OffloadingHandler` exposes `transfer_async(job_id, transfer_spec) -> bool` and `get_finished() -> list[TransferResult]`; `TransferResult(job_id, success, ...)` is the completion record.
 
-### 3.3 `CpuGpuOffloadingHandlers` (`vllm/v1/kv_offload/cpu/gpu_worker.py:375`)
+### 3.3 `CPUOffloadingSpec` / `CpuGpuOffloadingHandlers` (`vllm/v1/kv_offload/cpu/{spec,gpu_worker}.py`, v0.24.0)
 
-The reference CUDA implementation. It is **not directly reusable on Spyre** because:
+The reference CUDA implementation, and the class we subclass. Two facts (verified) shape the whole
+plugin design:
 
-- It allocates `torch.cuda.Stream` per transfer (`spyre` has no public stream API; `_sync_device` in `TorchSpyreModelRunner` is a stub).
-- It asserts `gpu_tensor.is_cuda` on every registered KV tensor.
-- It calls `ops.swap_blocks_batch`, a custom CUDA op.
-- Optional `cudaHostRegister` pinning via `cudart()`.
+- **The CUDA gate is in `CPUOffloadingSpec.get_handlers`**, which raises "CPU Offloading is currently
+  only supported on CUDA-alike and XPU GPUs" unless `current_platform.is_cuda_alike() or .is_xpu()`.
+  It then builds handlers via an **overridable `create_handlers()`** hook and yields
+  `(GPULoadStoreSpec, CPULoadStoreSpec, handlers.gpu_to_cpu_handler)` + the reverse.
+- **`CpuGpuOffloadingHandlers` is not directly reusable on Spyre** — its handlers move bytes with
+  `torch.cuda.Stream` per transfer, assert `gpu_tensor.is_cuda`, call `ops.swap_blocks_batch` (a CUDA
+  op), and optionally `cudaHostRegister`-pin.
+
+So the reuse seam is clean: **override `create_handlers()`** (and drop the platform check) to return
+Spyre handlers, while inheriting `get_handlers`' yield structure, `get_manager`, and the `num_blocks`
+math. `TieringOffloadingSpec(CPUOffloadingSpec)` reuses that same inherited `get_handlers` for its
+GPU↔CPU hop — which is what lets M2 reuse the tiering manager and change only the handlers (§6.8).
 
 ### 3.4 Dynamic spec loading (`vllm/v1/kv_offload/factory.py:21`)
 
@@ -147,7 +157,7 @@ This is the only device↔host primitive M1 uses. Earlier internal Spyre prototy
 | Path | Milestone | Compose how | Notes |
 |---|---|---|---|
 | Spyre device ↔ host RAM (single tier) | **M1** | `OffloadingConnector` + `SpyreOffloadingSpec` | Single-tier offload; survives across requests. |
-| Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreShmOffloadingSpec` | Multiple co-located instances share one POSIX-SHM primary pool; a block offloaded by one instance is reloaded by another with one raw DMA — no serialization, no disk. Built on `SharedOffloadRegion` + DMA first (Shape B); hmlib post-copy validate (Shape A) if the upstream gate proves insufficient. Uses `copy_tensor_raw` + `register_dmable_host_buffer` (§6.6). See §6.7–6.8. |
+| Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreShmOffloadingSpec` | Multiple co-located instances share one POSIX-SHM primary pool; a block offloaded by one instance is reloaded by another with one raw DMA — no serialization, no disk. Primary backend = upstream `TieringOffloadingManager` + `SharedOffloadRegion`; hmlib (post-copy seqlock validate) is a swappable comparison-arm backend, benchmarked head-to-head. Uses `copy_tensor_raw` + `register_dmable_host_buffer` (§6.6). See §6.7–6.8. |
 | Direct Spyre device ↔ filesystem / object store | Out of scope | n/a | Would require a Spyre-side analogue of NVIDIA GDS so a secondary tier can DMA without a host bounce. Not provided by torch-spyre today, and the upstream `SecondaryTierManager` contract assumes the `primary_kv_view` is over CPU memory; supporting this would change both. Filed as a future-work item in §11. |
 
 M1 and M2 reuse the same device↔host copy path (§4/§6.1, §6.7); M2 only changes the host side from a
@@ -157,17 +167,17 @@ wants a disk/object tier can still stack an upstream fs/obj `SecondaryTierManage
 
 ## 5. Proposed architecture
 
-<!-- Source: figures/spyre-offloading-arch.mmd. Regenerate the SVG with:
+<!-- Source: figures/spyre-offloading-arch.{mmd,d2}. Regenerate with:
        npx -y -p @mermaid-js/mermaid-cli@10 mmdc \
          -i docs/architecture/rfcs/figures/spyre-offloading-arch.mmd \
-         -o docs/architecture/rfcs/figures/spyre-offloading-arch.svg \
-         -b transparent
+         -o docs/architecture/rfcs/figures/spyre-offloading-arch.svg -b transparent
+       d2 docs/architecture/rfcs/figures/spyre-offloading-arch.d2 docs/architecture/rfcs/figures/spyre-offloading-arch.d2.svg
 -->
 
 ![Spyre KV offloading architecture](figures/spyre-offloading-arch.svg)
 
 <details>
-<summary>Mermaid source for the diagram above (also at <code>figures/spyre-offloading-arch.mmd</code>)</summary>
+<summary>Diagram sources (Mermaid at <code>figures/spyre-offloading-arch.mmd</code>; D2 at <code>figures/spyre-offloading-arch.d2</code>, rendered to <code>spyre-offloading-arch.d2.svg</code>)</summary>
 
 ```mermaid
 %%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
@@ -184,11 +194,11 @@ flowchart TB
 
     subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
         direction TB
-        Spec["SpyreOffloadingSpec"]
+        Spec["SpyreOffloadingSpec<br/>(subclasses CPUOffloadingSpec)"]
         Mgr["get_manager() → CPUOffloadingManager<br/><i>reused verbatim from upstream</i>"]
-        Handlers["get_handlers() → SpyreCpuOffloadingHandlers"]
-        D2H["device_to_host_handler<br/>(Spyre → host RAM block tensor)"]
-        H2D["host_to_device_handler<br/>(host RAM block tensor → Spyre)"]
+        Handlers["create_handlers() → SpyreCpuOffloadingHandlers<br/><i>overrides the hook; get_handlers drops the CUDA gate</i>"]
+        D2H["gpu_to_cpu_handler<br/>(store: Spyre → host RAM block)"]
+        H2D["cpu_to_gpu_handler<br/>(load: host RAM block → Spyre)"]
         Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around torch_spyre._C.copy_tensor<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
         Backend["<b>torch_spyre._C.copy_tensor(src, dst, non_blocking=False)</b><br/>SpyreStream.copyAsync → flex runtime DMA<br/>(direction auto-detected from src.is_cpu/.is_privateuseone)"]
 
@@ -202,8 +212,8 @@ flowchart TB
     end
 
     Factory -. "resolves to" .-> Spec
-    OCW -- "run handlers" --> D2H
-    OCW -- "run handlers" --> H2D
+    OCW -- "transfer_async" --> D2H
+    OCW -- "transfer_async" --> H2D
 
     classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
     classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
@@ -263,6 +273,9 @@ Why a class at all instead of inlining `_C.copy_tensor` into the handler? Two re
 
 ### 6.2 `SpyreCpuOffloadingHandlers`
 
+Mirrors upstream `CpuGpuOffloadingHandlers`' shape (same `gpu_to_cpu_handler` / `cpu_to_gpu_handler`
+attribute names, so `get_handlers` yields them exactly as the parent does):
+
 ```python
 # spyre_inference/v1/kv_offload/handlers.py
 class SpyreCpuOffloadingHandlers:
@@ -270,54 +283,63 @@ class SpyreCpuOffloadingHandlers:
                  kv_caches: CanonicalKVCaches,
                  block_size_factor: int,
                  num_cpu_blocks: int,
-                 copier: SpyreKvDmaCopier): ...
+                 copier: SpyreKvDmaCopier,
+                 mmap_region=None): ...      # M2 passes the shared pool region; M1 leaves None
 
     @property
-    def device_to_host_handler(self) -> OffloadingHandler: ...
+    def gpu_to_cpu_handler(self) -> OffloadingHandler: ...   # store: Spyre → host
     @property
-    def host_to_device_handler(self) -> OffloadingHandler: ...
+    def cpu_to_gpu_handler(self) -> OffloadingHandler: ...   # load:  host → Spyre
 ```
 
-Each direction is a `_SingleDirectionSpyreHandler(OffloadingHandler)` that:
+Each direction is a `_SingleDirectionSpyreHandler(OffloadingHandler)` implementing the v0.24.0
+contract:
 
-1. On `transfer(spec)`, walks the `(src_block_ids, dst_block_ids)` pairs and calls `copier.copy_{d2h,h2d}` for each pair.
-2. Returns a synchronous `TransferResult` with a job id, byte count, and elapsed time measured by `time.perf_counter()` (no CUDA events).
-3. `get_finished()` drains the in-flight queue (which is always already done because every transfer is sync).
-4. `shutdown()` clears references to the registered tensors.
+1. `transfer_async(job_id, transfer_spec) -> bool` — walk the block-id pairs in `transfer_spec` and call `copier.copy_{d2h,h2d}` for each.
+2. `get_finished() -> list[TransferResult]` — return `TransferResult(job_id, success=...)` records; synchronous today, so every submitted job is already done.
+3. `shutdown()` clears references to the registered tensors.
 
-Block tensors on the host side are a single `torch.empty(num_cpu_blocks, page_size_bytes, dtype=torch.int8)` per attention group, allocated at `__init__` time. We do **not** pin via `cudaHostRegister` — there is no equivalent on Spyre.
+Host-side block tensors are a single `torch.empty(num_cpu_blocks, page_bytes, int8)` per attention
+group when `mmap_region is None` (M1); when a region is supplied (M2), they are views over that
+shared, DMA-registered pool (§6.8). We do **not** pin via `cudaHostRegister` — no equivalent on Spyre;
+M2 pins the pool once via `register_dmable_host_buffer` (§6.7).
 
 ### 6.3 `SpyreOffloadingSpec`
 
+Subclass `CPUOffloadingSpec` and override the two things that are CUDA-coupled: the `create_handlers()`
+hook (return Spyre handlers) and the platform gate in `get_handlers`. Everything else — the
+`num_blocks`-from-`cpu_bytes_to_use` `__init__` math and `get_manager` (the upstream
+`CPUOffloadingManager`) — is inherited unchanged.
+
 ```python
 # spyre_inference/v1/kv_offload/spec.py
-class SpyreOffloadingSpec(OffloadingSpec):
+class SpyreOffloadingSpec(CPUOffloadingSpec):
     def __init__(self, vllm_config, kv_cache_config):
-        super().__init__(vllm_config, kv_cache_config)
-        cpu_bytes = self.extra_config.get("cpu_bytes_to_use")
-        if not cpu_bytes:
-            raise ValueError("cpu_bytes_to_use must be set ...")
-        # ... compute self.num_blocks identically to CPUOffloadingSpec
+        super().__init__(vllm_config, kv_cache_config)   # computes self.num_blocks, block_size_factor
         self._copier = SpyreKvDmaCopier()
-        self._manager = None
-        self._handlers = None
 
-    def get_manager(self) -> OffloadingManager:
-        # Identical to CPUOffloadingSpec.get_manager (reuse upstream class).
+    # get_manager: inherited from CPUOffloadingSpec (reuse the upstream manager verbatim).
+
+    def create_handlers(self, kv_caches):                # the overridable hook CPUOffloadingSpec exposes
+        return SpyreCpuOffloadingHandlers(
+            kv_caches=kv_caches,
+            block_size_factor=self.block_size_factor,
+            num_cpu_blocks=self.num_blocks,
+            copier=self._copier,
+        )
 
     def get_handlers(self, kv_caches):
+        # Same as the parent, minus the is_cuda_alike()/is_xpu() gate.
         if not self._handlers:
-            self._handlers = SpyreCpuOffloadingHandlers(
-                kv_caches=kv_caches,
-                block_size_factor=self.block_size_factor,
-                num_cpu_blocks=self.num_blocks,
-                copier=self._copier,
-            )
-        yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.device_to_host_handler
-        yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.host_to_device_handler
+            self._handlers = self.create_handlers(kv_caches)
+        yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
+        yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
 ```
 
-`GPULoadStoreSpec` is the upstream "device-side" type — it is a tag, not CUDA-specific, so we use it for Spyre. (The upstream class is named `GPULoadStoreSpec` for historical reasons; the tag is platform-agnostic.)
+`GPULoadStoreSpec` is the upstream "device-side" type — a tag, not CUDA-specific (named so for
+historical reasons), so we use it for Spyre. Subclassing `CPUOffloadingSpec` (not `OffloadingSpec`
+directly) is also what lets M2's spec subclass `TieringOffloadingSpec` — itself a `CPUOffloadingSpec`
+— and reuse its tiering `get_manager` while overriding the same `create_handlers` hook (§6.8).
 
 ### 6.4 Filesystem/object tiering — not a milestone
 
@@ -382,115 +404,90 @@ tail and corrupts reload (flex RFC §5). The M2 `SpyreKvDmaCopier` gains a `copy
 pool_ptr)` / `copy_h2d_raw(pool_ptr, dev_tensor)` pair alongside the M1 tensor-to-tensor methods; the
 handler picks the raw pair when the destination is a shared-pool slot rather than a torch CPU tensor.
 
-### 6.8 M2 — `SpyreShmOffloadingSpec`: two shapes, test upstream first
+### 6.8 M2 — `SpyreShmOffloadingSpec`: upstream shared pool is primary; hmlib is the comparison arm
 
-M2 registers a `SpyreShmOffloadingSpec` whose primary tier is a **single POSIX-SHM pool shared by
-every co-located instance**, instead of M1's per-instance `torch.empty` host blocks. There are two
-ways to build the pool + its cross-process directory; both ride the identical §6.7 primitive and
-differ only in who owns the pool and the block-hash→slot bookkeeping.
+M2 makes the host tier a **single POSIX-SHM pool shared by every co-located instance**, instead of
+M1's per-instance `torch.empty` host blocks. **The upstream implementation is the primary one we
+build and ship; hmlib is a comparison arm we build only to benchmark against it.** We do not assume
+hmlib is faster — the point of building both is to measure.
 
-**The decision is not "shared memory or not."** A shared, DMA-registered host buffer is enough to make
-cross-instance sharing *work*, and vLLM's `SharedOffloadRegion` already provides one (Shape B). The
-real question is **which concurrency model governs a slot that is written and read by asynchronous
-DMAs from different processes** — because that is the one thing neither the upstream manager nor the
-prior CPU-offload design was built for. Upstream's slot coherence assumes the primary tier is written
-by a **CPU `memcpy` the manager sequences end-to-end**; on Spyre a slot is filled by an out-of-band
-device DMA that *completes later*, and read by another process's DMA into the same segment. So the
-choice below is really: **is the upstream RESERVED→VALID gate robust when the data mover is an async
-DMA the lock-holder does not directly control, or do we want copy→validate that is correct by
-construction regardless?**
-
-**Shape A (the escalation) — hmlib-backed.** Use the [hmlib](https://github.com/…) shared-memory KV
-runtime as the primary tier. hmlib already owns a POSIX-SHM payload pool, a block-hash→slot directory,
-a single-writer publish gate, seqlock **copy→validate**, and eviction — i.e. it is exactly the
-"plugin layer" the flex RFC §6 hands the DMA to. The Spyre port of hmlib is a narrow two-operation
-swap (pin via `register_dmable_host_buffer` instead of `cudaHostRegister`; per-page copy via
-`copy_tensor_raw` instead of `cudaMemcpyAsync`); see the hmlib design *TODO.spyre_shm_dma.md*. The
-handler drives an owner-role `HmlibKVBlockStore` for this rank, and peer ranks/instances attach the
-pool read-only.
-
-Why recommend it — it targets exactly the async-DMA concurrency problem above. A reader copies (DMAs)
-a slot and *then* validates a seqlock/generation stamp; if the owner reused that slot mid-copy, the
-reader's validation fails and the read is reported as a **miss, never as torn/corrupt bytes** — and
-that safety does not depend on a cross-process lock being honored across the DMA-completion boundary,
-only on a post-copy version check. A hit collapses to `index probe (local SHM read) + one raw DMA +
-validate`: no RPC, no lock handoff on the hot path, no serialization. Single-writer-per-region + peer
-read-only attach maps directly onto Spyre data-parallel ranks (one owner region per rank), and
-generation/incarnation stamping degrades a producer restart to a miss rather than a stale read. In
-short, hmlib is not here for "shared memory" (Shape B has that) — it is here for the peer-hit path,
-which is the whole point of M2.
-
-The spec skeleton is shared; only the pool-ownership line differs between the shapes (Shape B uses an
-upstream `SharedOffloadRegion`, Shape A an hmlib region):
+**Primary — reuse `TieringOffloadingManager` (this is also what makes M2 testable).** The shared pool,
+its cross-process directory, block-hash→slot bookkeeping, eviction, and the RESERVED→VALID publish
+gate are exactly what upstream's `CPUPrimaryTierOffloadingManager` (wrapped by
+`TieringOffloadingManager`, §3.5) already implements over a `SharedOffloadRegion`. `SpyreShmOffloadingSpec`
+therefore **subclasses `TieringOffloadingSpec`** and — exactly as M1 (§6.3) — overrides only
+`create_handlers()` (and drops the CUDA gate), inheriting `get_manager` unchanged:
 
 ```python
 # spyre_inference/v1/kv_offload/shm_spec.py
-class SpyreShmOffloadingSpec(SpyreOffloadingSpec):
-    """Primary tier = one cross-instance POSIX-SHM KV pool.
+from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
-    Reuses M1's device↔host copy path; the host side is a shared pool that
-    every co-located instance maps, DMA'd via copy_tensor_raw. The pool
-    owner/directory is the swap point between the two shapes:
-      Shape B: vLLM SharedOffloadRegion + its RESERVED→VALID gate (build first)
-      Shape A: hmlib region + directory + seqlock copy→validate (escalation)
+class SpyreShmOffloadingSpec(TieringOffloadingSpec):
+    """Cross-instance shared host-RAM KV pool on Spyre.
+
+    get_manager is inherited verbatim: TieringOffloadingManager over a
+    CPUPrimaryTierOffloadingManager + its SharedOffloadRegion (the shared
+    pool + directory + RESERVED→VALID gate + eviction). The ONLY override is
+    create_handlers: return Spyre handlers that DMA into that shared region.
     """
     def __init__(self, vllm_config, kv_cache_config):
         super().__init__(vllm_config, kv_cache_config)
-        self.pool_name = self.extra_config["shm_pool_name"]        # shared across instances
-        # num_slots derived from cpu_bytes_to_use / page total_size()
-    def get_manager(self):   # Shape B: adapt SharedOffloadRegion's manager; Shape A: hmlib directory
-        ...
-    def get_handlers(self, kv_caches):
-        # SpyreShmOffloadingHandlers: register_dmable_host_buffer once on the
-        # pool window, then copy_tensor_raw per page (ordering the VALID flip
-        # after DMA completion on Shape B).
-        ...
+        self._copier = SpyreKvDmaCopier()
+
+    def create_handlers(self, kv_caches):
+        shared_region = self.get_manager().primary_tier.mmap_region   # the SharedOffloadRegion
+        return SpyreCpuOffloadingHandlers(
+            kv_caches=kv_caches, block_size_factor=self.block_size_factor,
+            num_cpu_blocks=self.num_blocks, copier=self._copier,
+            mmap_region=shared_region,        # DMA into the shared pool, not a private buffer
+        )
+    def get_handlers(self, kv_caches):        # inherited yield structure, minus the CUDA gate
+        if not self._handlers:
+            self._handlers = self.create_handlers(kv_caches)
+        yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
+        yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
 ```
 
-**Shape B (the starting point) — upstream `SharedOffloadRegion` + DMA.** Keep vLLM's upstream
-`SharedOffloadRegion` (`mmap` + `multiprocessing.shared_memory`) as the pool and its cross-process
-directory, and only make its buffer a DMA endpoint: `register_dmable_host_buffer` over the region
-once, `copy_tensor_raw` into `region_base + slot_offset`. No hmlib dependency; stays on the upstream
-`OffloadingSpec` family; smallest diff. This is **not** an unsafe or degraded path — it *does* have
-concurrency correctness, via the upstream RESERVED→VALID publish gate + process-shared lock, and it
-reuses upstream's eviction and directory as-is. The one thing to validate is the async-DMA ordering
-framed above: because the store is now an async `copy_tensor_raw` DMA that completes after the CPU
-bookkeeping runs, the owner must flip a slot to VALID only *after* its D2H DMA has synchronized, and a
-reader must not begin its H2D DMA until it has observed VALID. flex `copyRaw` exposes the hooks to do
-this (a completion callback / `synchronize()`); it just has to be wired to the gate and shown to hold
-under concurrent load.
+Because the *entire* cross-process framework (manager, directory, gate, eviction, tiering config) is
+the upstream one, this is a small, honest change — and the async-DMA correctness question below is
+answerable *because* we stress the real upstream gate, not a reimplementation. The handler's store
+path orders the RESERVED→VALID flip **after** the D2H `copy_tensor_raw` DMA has synchronized, and the
+load path reads only after observing VALID (flex `copyRaw` exposes the completion callback /
+`synchronize()` to do this). Validating that this holds under concurrent multi-instance load is the
+A2.2 acceptance test — and the primary risk M2 must retire.
 
-**Recommendation: build and test Shape B first.** It is the smallest change, adds no dependency, and
-stays on the upstream `OffloadingSpec` family — and whether it is *sufficient* is an empirical
-question, not a settled one. Stand it up, then hammer the async-DMA torn-read case directly (A2.2:
-one process reading a slot while the owner evicts and re-DMAs it) under concurrent multi-instance
-load. Two outcomes:
+**Comparison arm — hmlib.** [hmlib](https://github.com/…) is a shared-memory KV runtime that offers a
+*different* concurrency model for the same shared pool: instead of the manager's RESERVED→VALID lock,
+a reader DMAs a slot and **then** validates a seqlock/generation stamp, so a slot reused mid-copy
+surfaces as a **miss, never torn bytes** — without a cross-process lock on the hot path. Its Spyre port
+is the same two-op swap as everything else (pin via `register_dmable_host_buffer`, copy via
+`copy_tensor_raw`; see hmlib *TODO.spyre_shm_dma.md*), and it plugs in the same way — `SpyreShmOffloadingSpec`
+would additionally override `get_manager` to build the pool + directory with hmlib instead of
+`CPUPrimaryTierOffloadingManager`. **Whether that model is actually faster or more robust than the
+upstream gate is unknown until measured** — hmlib avoids a hot-path lock but adds a dependency and its
+own bookkeeping. So we build it as a second, swappable backend behind the *same* `SpyreShmOffloadingSpec`
+seam and benchmark the two head-to-head (throughput, tail latency, and the A2.2 torn-read behavior).
 
-- **If the RESERVED→VALID gate holds** once the VALID flip is ordered after DMA completion (and the
-  read after observing VALID), Shape B *is* M2 — ship it. hmlib is not needed.
-- **If it does not hold cleanly** — torn reads slip through, or the ordering only works with a lock so
-  coarse it serializes the hot path — then adopt Shape A (hmlib), whose post-copy seqlock validate
-  gives the same guarantee by construction: a reader that copies a reused slot simply gets a miss, no
-  cross-process lock has to be correct across the DMA boundary.
+**Plan:** ship the upstream `SharedOffloadRegion` path as M2. Build the hmlib backend alongside it as a
+comparison, gated behind config (e.g. `shm_backend: "upstream" | "hmlib"`), and let measured
+throughput / latency / correctness under concurrent load decide whether hmlib ever becomes the
+default. Both ride the identical §6.7 flex + torch-spyre surface, so the comparison is apples-to-apples
+and neither backend is wasted work — the lower layers are shared, only the pool owner/directory swaps.
 
-Because both shapes ride the identical §6.7 flex + torch-spyre surface (`copy_tensor_raw` +
-`register_dmable_host_buffer`), starting with B costs nothing if we later move to A — the lower layers
-are unchanged, and only the pool-ownership/directory layer swaps. So M2's first deliverable is Shape B
-plus the A2.2 stress test; hmlib is the fallback that the test result decides, not a prerequisite.
-
-The shared-pool topology both shapes share — two co-located instances mapping one node-local SHM KV
-pool, each DMA-ing into it via `copy_tensor_raw` after a one-time `register_dmable_host_buffer`. The
-only per-shape difference is the pool-ownership/directory box: Shape B uses vLLM's `SharedOffloadRegion`
-+ its RESERVED→VALID gate; Shape A (drawn here) swaps in hmlib, adding the directory + publish gate +
-seqlock copy→validate. We build Shape B first (§6.8 recommendation); the figure shows the Shape-A
-escalation:
+The shared-pool topology (identical for both backends) — two co-located instances mapping one
+node-local SHM KV pool via `SpyreShmOffloadingSpec` (subclassing `TieringOffloadingSpec`), each
+DMA-ing into it with `copy_tensor_raw` after a one-time `register_dmable_host_buffer`. The instance /
+spec / handler side is the same regardless of backend; the *only* swap is the pool-owner/directory
+box: **upstream (primary)** = `CPUPrimaryTierOffloadingManager` + `SharedOffloadRegion` +
+RESERVED→VALID gate; **hmlib (comparison arm)** = hmlib directory + seqlock copy→validate. The figure
+shows the pool box with both options:
 
 <!-- Source: figures/spyre-shm-pool-m2.{mmd,d2}. Regenerate with:
        npx -y -p @mermaid-js/mermaid-cli@10 mmdc -i docs/architecture/rfcs/figures/spyre-shm-pool-m2.mmd \
          -o docs/architecture/rfcs/figures/spyre-shm-pool-m2.svg -b transparent
        d2 docs/architecture/rfcs/figures/spyre-shm-pool-m2.d2 docs/architecture/rfcs/figures/spyre-shm-pool-m2.d2.svg -->
 
-![M2 Shape A: two Spyre instances share one POSIX-SHM KV pool; each offloads/reloads via copy_tensor_raw, hmlib owns the directory and publish gate](figures/spyre-shm-pool-m2.svg)
+![M2: two Spyre instances share one POSIX-SHM KV pool via SpyreShmOffloadingSpec (subclassing TieringOffloadingSpec) + SpyreCpuOffloadingHandlers; each offloads/reloads with copy_tensor_raw. The pool owner is a swappable backend — upstream CPUPrimaryTierOffloadingManager + SharedOffloadRegion (primary) or hmlib (comparison arm)](figures/spyre-shm-pool-m2.svg)
 
 <details>
 <summary>Diagram sources (Mermaid at <code>figures/spyre-shm-pool-m2.mmd</code>; D2 at <code>figures/spyre-shm-pool-m2.d2</code>, rendered to <code>spyre-shm-pool-m2.d2.svg</code>)</summary>
@@ -552,31 +549,34 @@ New tests in `tests/v1/kv_offload/`:
 |---|---|
 | `test_copier_round_trip.py` | Allocate a Spyre tensor with a known fp16 pattern, copy d2h, mutate host copy, copy h2d, assert content. Skipped if `device("spyre")` not available (CI gating already exists for other Spyre tests). |
 | `test_spec_registration.py` | Import `spyre_inference`, then `OffloadingSpecFactory.create_spec(...)` resolves. Pure-CPU test — no Spyre device required. |
-| `test_handler_dispatch.py` | Exercise `device_to_host_handler` / `host_to_device_handler` against `(src, dst)` tuples and assert the correct content lands. |
+| `test_handler_dispatch.py` | Exercise the handlers' `transfer_async` (`gpu_to_cpu_handler` / `cpu_to_gpu_handler`) against block-id specs and assert the correct content lands and `get_finished` reports success. |
 
 ### M2 files (cross-instance shared pool — gated on §6.7 upstream deps)
 
-Both shapes depend on `torch_spyre._C.copy_tensor_raw` / `register_dmable_host_buffer` (torch-spyre
+Both backends depend on `torch_spyre._C.copy_tensor_raw` / `register_dmable_host_buffer` (torch-spyre
 design doc), which does not exist yet.
 
-**Shape B — the first deliverable** (upstream `SharedOffloadRegion` + DMA; no hmlib dependency):
+**Primary — the upstream shared-region backend** (subclass `TieringOffloadingSpec`, reuse its manager;
+no hmlib dependency). This is what M2 ships:
 
 | File | Purpose | Approx LOC |
 |---|---|---|
 | `spyre_inference/v1/kv_offload/copier.py` | Extend `SpyreKvDmaCopier` with `copy_d2h_raw` / `copy_h2d_raw` (wrap `copy_tensor_raw`); M1 methods unchanged. | +30 |
-| `spyre_inference/v1/kv_offload/shm_spec.py` | `SpyreShmOffloadingSpec` + `SpyreShmOffloadingHandlers` over an upstream `SharedOffloadRegion`; `register_dmable_host_buffer` on the region once, `copy_tensor_raw` into `region_base + slot_offset`. Order the VALID flip after DMA completion. | ~100 |
+| `spyre_inference/v1/kv_offload/handlers.py` | Teach `SpyreCpuOffloadingHandlers` to accept `mmap_region` (the primary tier's `SharedOffloadRegion`): `register_dmable_host_buffer` on it once, `copy_tensor_raw` into `region_base + slot_offset`, order the RESERVED→VALID flip after the D2H DMA syncs / read after VALID. | +60 |
+| `spyre_inference/v1/kv_offload/shm_spec.py` | `SpyreShmOffloadingSpec(TieringOffloadingSpec)` — inherit `get_manager` (real `TieringOffloadingManager` + `SharedOffloadRegion`), override only `create_handlers` to return the Spyre handlers pointed at that region; drop the CUDA gate. | ~40 |
 | `spyre_inference/__init__.py` | Add a third `OffloadingSpecFactory.register_spec(...)` for `SpyreShmOffloadingSpec`. | +5 |
 | `pyproject.toml` | Bump the torch-spyre pin to one that exposes `copy_tensor_raw`. | +1 |
-| `tests/v1/kv_offload/test_shm_spec.py` | Two-process test: A offloads a known-pattern block, B reloads and asserts content + a cross-instance hit. **A2.2 torn-write stress test** under concurrent load: reader mid-DMA while owner evicts+re-DMAs the slot — assert no torn read slips through the RESERVED→VALID gate. This test is the decision point for whether Shape A is needed. | ~180 |
+| `tests/v1/kv_offload/test_shm_spec.py` | Two-process test: A offloads a known-pattern block, B reloads and asserts content + a cross-instance hit. **A2.2 torn-write stress test** under concurrent load: reader mid-DMA while owner evicts+re-DMAs the slot — assert no torn read slips through the RESERVED→VALID gate. | ~180 |
 
-**Shape A — the escalation** (only if the A2.2 stress test shows the upstream gate is insufficient):
-adopt hmlib as the pool owner. Delta on top of Shape B:
+**Comparison arm — the hmlib backend** (built alongside, selected by config `shm_backend: "hmlib"`, to
+benchmark head-to-head — not a fallback, a measurement). Delta on top of the primary:
 
 | File | Purpose | Approx LOC |
 |---|---|---|
 | `spyre_inference/v1/kv_offload/shm_pool.py` | Attach/own the shared pool as an hmlib owner/subscriber region + directory instead of `SharedOffloadRegion`; register the window for DMA once. | ~120 |
-| `spyre_inference/v1/kv_offload/shm_spec.py` | Repoint `get_manager` at hmlib's directory and `get_handlers` at hmlib slots (post-copy seqlock validate). | ±60 |
-| `pyproject.toml` | Add the `hmlib` dependency. | +1 |
+| `spyre_inference/v1/kv_offload/shm_spec.py` | When `shm_backend == "hmlib"`, also override `get_manager` to build the pool + directory with hmlib (post-copy seqlock validate); `create_handlers` points at the hmlib region. | ±60 |
+| `pyproject.toml` | Add the `hmlib` dependency (comparison arm only). | +1 |
+| `tests/v1/kv_offload/test_shm_backends_bench.py` | Head-to-head benchmark: upstream vs hmlib backend under the same offload/reload + concurrent-hit workload; compare throughput, tail latency, and A2.2 behavior. | ~120 |
 
 ## 8. Compatibility with existing connectors and tiers
 
@@ -614,7 +614,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
 4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
 5. **`SpyreOffloadingSpec` parent class.** Two viable bases: subclass `OffloadingSpec` directly (clean, but we duplicate the ~30 lines of `__init__` math from `CPUOffloadingSpec` that compute `num_blocks` from `cpu_bytes_to_use`); or subclass `CPUOffloadingSpec` and override `get_handlers` to skip the `is_cuda_alike()` gate (less duplication, but inherits a parent that documents itself as CUDA-only). The implementation will pick one once we see how much of `CPUOffloadingSpec` is genuinely CUDA-coupled vs. just gated. M2's `SpyreShmOffloadingSpec` subclasses whichever we picked, so the choice cascades.
-6. **Host block allocation for M2.** M1 builds host-side block tensors with `torch.empty` (per-instance, unshared). M2 instead sources them from a shared, DMA-registered pool — Shape A from an hmlib-owned SHM region, Shape B from an upstream `SharedOffloadRegion` (`vllm/v1/kv_offload/cpu/shared_offload_region.py`, plain `mmap` + `multiprocessing.shared_memory`). Worth noting up front so M1's `SpyreCpuOffloadingHandlers` accepts an optional pre-built region rather than always self-allocating.
+6. **Host block allocation for M2.** M1's `SpyreCpuOffloadingHandlers` builds host-side block tensors with `torch.empty` (per-instance, unshared) when `mmap_region is None`. M2 instead passes the handlers a shared, DMA-registered region — the primary backend from the upstream `CPUPrimaryTierOffloadingManager`'s `SharedOffloadRegion` (`vllm/v1/kv_offload/cpu/shared_offload_region.py`, `mmap` + `multiprocessing.shared_memory`), the hmlib comparison arm from an hmlib region. The handlers' `mmap_region` parameter (§6.2) is the seam; they self-allocate only when it is `None`.
 
 ## 11. Out of scope (filed as follow-ups)
 
@@ -662,9 +662,10 @@ vllm serve <model> --kv-transfer-config '{
 
 ### M2 acceptance
 
-M2 is gated on the §6.7 upstream dependencies (flex `copyRaw`/`registerHostBuffer`, torch-spyre
-`copy_tensor_raw`/`register_dmable_host_buffer`, and — Shape A — the hmlib Spyre port). Acceptance
-below assumes those have landed on the pinned dev image.
+M2 is gated on the §6.7 dependencies (flex `copyRaw`/`registerHostBuffer`, torch-spyre
+`copy_tensor_raw`/`register_dmable_host_buffer`; the hmlib comparison arm additionally needs the hmlib
+Spyre port). Acceptance below assumes those have landed on the pinned dev image. A2.1–A2.3 apply to the
+primary (upstream) backend; A2.4 is the head-to-head benchmark that positions hmlib.
 
 **A2.1 — cross-instance shared-pool hit runs end-to-end.**
 
@@ -694,9 +695,10 @@ vllm serve <model> --kv-transfer-config '{
 - [ ] Raw round-trip: a device KV page snapshotted D2H into a pool slot and restored H2D into a
       different same-`(shape,dtype)` page reproduces the pattern byte-for-byte (the flex RFC §9 test,
       driven from the plugin). Slot size is derived from `total_size()`, not `numel*itemsize`.
-- [ ] (Shape A) Torn-write test: while a reader copies a slot, the owner overwrites it; the reader's
-      post-copy seqlock validation fails and the block is reported as a **miss**, never as corrupt
-      content. (Shape B: the analogous RESERVED→VALID-gate test.)
+- [ ] Torn-write test (primary/upstream backend): while a reader copies a slot, the owner evicts and
+      re-DMAs it; assert no torn read is consumed — the RESERVED→VALID gate, with the VALID flip
+      ordered after the D2H DMA syncs and the read gated on observing VALID, holds under concurrent
+      multi-instance load. (The hmlib backend's analogue is post-copy seqlock validation → miss.)
 
 **A2.3 — no regression, dependency honesty.**
 
@@ -704,9 +706,18 @@ vllm serve <model> --kv-transfer-config '{
 - [ ] `SpyreShmOffloadingSpec` registration is inert when not selected (importing `spyre_inference`
       on a build without the M2 torch-spyre pin must not error — the spec import is lazy via the
       factory, as in §3.4).
-- [ ] Shape A only: `hmlib` is an explicit, pinned dependency; the Spyre port swaps exactly the two
-      device ops documented in *TODO.spyre_shm_dma.md* (pin + raw copy) and touches no hmlib runtime,
-      directory, or seqlock code.
+- [ ] The primary backend adds **no** new runtime dependency (subclasses `TieringOffloadingSpec`,
+      reuses its manager); `hmlib` is pulled in **only** when the comparison arm is built, and the
+      Spyre port swaps exactly the two device ops in *TODO.spyre_shm_dma.md* (pin + raw copy),
+      touching no hmlib runtime, directory, or seqlock code.
+
+**A2.4 — head-to-head backend benchmark (positions hmlib; does not gate M2 shipping).**
+
+- [ ] Under one workload (offload a shared prefix, then N instances reload it concurrently), run
+      `shm_backend: "upstream"` vs `"hmlib"` and report throughput, TTFT/tail latency, and A2.2
+      torn-read behavior for each. The upstream backend ships as M2 regardless; hmlib becomes the
+      default **only** if this benchmark shows it materially wins on the metrics that matter (e.g.
+      hot-path latency under contention) without correctness regressions. No presumption either way.
 
 ## 13. References
 

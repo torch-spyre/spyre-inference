@@ -2,14 +2,14 @@
 flowchart TB
     subgraph instA["<b>Spyre instance A</b>"]
         direction TB
-        OA["OffloadingConnector + SpyreShmOffloadingSpec"]
-        HA["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        OA["OffloadingConnector + SpyreShmOffloadingSpec<br/>(subclasses TieringOffloadingSpec)"]
+        HA["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
         OA --> HA
     end
     subgraph instB["<b>Spyre instance B</b>"]
         direction TB
         OB["OffloadingConnector + SpyreShmOffloadingSpec"]
-        HB["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        HB["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
         OB --> HB
     end
 
@@ -17,13 +17,13 @@ flowchart TB
 
     subgraph pool["<b>shared host-RAM KV pool</b> (POSIX-SHM, one per node)"]
         direction TB
-        HM["hmlib KVBlockStore: block-hash→slot directory,<br/>single-writer publish gate, seqlock copy→validate"]
+        HM["pool owner + directory (swappable backend):<br/><b>upstream (primary)</b> — CPUPrimaryTierOffloadingManager<br/>+ SharedOffloadRegion + RESERVED→VALID gate;<br/><b>hmlib (comparison arm)</b> — directory + seqlock copy→validate"]
         SLOTS[("slots: raw KV page images<br/>host DRAM, DMA-registered")]
         HM --- SLOTS
     end
 
-    HA -->|"D2H offload / H2D reload"| RAW
-    HB -->|"D2H offload / H2D reload"| RAW
+    HA -->|"store (D2H) / load (H2D)"| RAW
+    HB -->|"store (D2H) / load (H2D)"| RAW
     RAW <-->|"raw DMA into slot"| SLOTS
     HA -. "lookup / publish" .-> HM
     HB -. "lookup (peer hit)" .-> HM

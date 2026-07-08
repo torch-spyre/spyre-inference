@@ -106,8 +106,8 @@ class SpyreParallelLMHead(ParallelLMHead):
         # Slice off the padding rows that process_weights_after_loading added
         # (they appear as trailing logit columns).
         if self.padding > 0:
-            # out = out[:, : -self.padding].contiguous()
-            out = out[:, : -self.padding]
+            # .contiguous() kept for safety
+            out = out[:, : -self.padding].contiguous()
         # Logits must land on CPU: the subsequent all_gather (TP > 1) would
         # crash on a Spyre tensor.
         return convert(out, device="cpu")

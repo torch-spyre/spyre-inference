@@ -28,11 +28,11 @@ import torch.nn.functional as F
 def test_merged_column_matches_reference(
     tp_group, num_tokens, hidden_size, intermediate_size, use_bias
 ):
-    """An un-fused gate_up_proj returns [gate, up] whose concatenation
+    """An un-fused gate_up_proj returns a (gate, up) pair whose concatenation
     matches the fused upstream F.linear.
 
     The model-agnostic pass (analyze_and_unfuse) splits the fused weight on
-    CPU and rebinds forward to return the two slabs as a list; a
+    CPU and rebinds forward to return the two parts as a SplitSiluAndMul; a
     MergedColumnParallelLinear is only un-fused when it has a SiluAndMul
     sibling, so we wrap it in a minimal MLP parent.
     """
@@ -40,7 +40,7 @@ def test_merged_column_matches_reference(
 
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
+    from spyre_inference.custom_ops.unfuse import SplitSiluAndMul, analyze_and_unfuse
 
     dtype = torch.float16
     torch.manual_seed(0)
@@ -75,14 +75,15 @@ def test_merged_column_matches_reference(
 
     # Run the model-agnostic un-fusing pass (weights still on CPU).
     analyze_and_unfuse(mlp)
-    assert not hasattr(layer, "weight"), "fused weight should be removed"
+    assert layer.weight is None, "fused weight should be cleared to None"
     assert hasattr(layer, "gate_weight") and hasattr(layer, "up_weight")
 
     mlp = mlp.to("spyre")
     gate_up, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(gate_up, list) and len(gate_up) == 2
-    actual = torch.cat(gate_up, dim=-1)
+    assert isinstance(gate_up, SplitSiluAndMul)
+    gate, up = gate_up
+    actual = torch.cat([gate, up], dim=-1)
     assert actual.shape == (num_tokens, 2 * intermediate_size)
 
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
@@ -100,16 +101,16 @@ def test_merged_column_matches_reference(
 )
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, head_size, use_bias):
-    """An un-fused qkv_proj returns a QKVSplit whose (q, k, v) match the
+    """An un-fused qkv_proj returns a SplitQKV whose (q, k, v) match the
     fused upstream F.linear.
 
     analyze_and_unfuse splits the fused weight on CPU and rebinds forward to
-    return a QKVSplit container; the unmodified `qkv.split(...)` idiom then
+    return a SplitQKV container; the unmodified `qkv.split(...)` idiom then
     yields three contiguous tensors — no slice on a Spyre tensor.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
-    from spyre_inference.custom_ops.unfuse import QKVSplit, analyze_and_unfuse
+    from spyre_inference.custom_ops.unfuse import SplitQKV, analyze_and_unfuse
 
     dtype = torch.float16
     hidden_size = num_heads * head_size
@@ -141,14 +142,14 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     # A bare QKV layer (no parent) still gets un-fused — QKV detection does
     # not require a sibling.
     analyze_and_unfuse(layer)
-    assert not hasattr(layer, "weight"), "fused weight should be removed"
+    assert layer.weight is None, "fused weight should be cleared to None"
     for attr in ("q_weight", "k_weight", "v_weight"):
         assert hasattr(layer, attr), f"missing unfused param {attr}"
 
     layer = layer.to("spyre")
     qkv, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(qkv, QKVSplit)
+    assert isinstance(qkv, SplitQKV)
     # Exercise the unmodified downstream idiom.
     q_size = num_heads * head_size
     kv_size = num_kv_heads * head_size
@@ -158,7 +159,7 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     assert q.shape == (num_tokens, q_size)
     assert k.shape == (num_tokens, kv_size)
     assert v.shape == (num_tokens, kv_size)
-    # Each slab is contiguous on Spyre — no view, no D2H workaround needed.
+    # Each part is contiguous on Spyre — no view, no D2H workaround needed.
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
 
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)

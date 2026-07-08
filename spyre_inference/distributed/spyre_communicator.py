@@ -139,17 +139,11 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         other = 1 - self.rank_in_group
         if self.rank_in_group == 0:
             scratch = torch.empty_like(input_)
-            dist.recv(  # ty: ignore[possibly-missing-attribute]
-                scratch, src=self.ranks[other], group=self.device_group
-            )
+            dist.recv(scratch, src=self.ranks[other], group=self.device_group)
             input_.add_(scratch)
         else:
-            dist.send(  # ty: ignore[possibly-missing-attribute]
-                input_, dst=self.ranks[other], group=self.device_group
-            )
-        dist.broadcast(  # ty: ignore[possibly-missing-attribute]
-            input_, src=self.ranks[0], group=self.device_group
-        )
+            dist.send(input_, dst=self.ranks[other], group=self.device_group)
+        dist.broadcast(input_, src=self.ranks[0], group=self.device_group)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -163,9 +157,7 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
         output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
-        dist.all_gather(  # ty: ignore[possibly-missing-attribute]
-            output_list, input_, group=self.device_group
-        )
+        dist.all_gather(output_list, input_, group=self.device_group)
         return torch.cat(output_list, dim=dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:

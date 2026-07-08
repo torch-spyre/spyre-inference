@@ -198,7 +198,6 @@ def test_rotary_forward_oot_on_spyre(
         is_neox_style=True,
         dtype=torch.float16,
     )
-    assert rope._spyre_rope_supported  # confirms the on-device path is taken
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten)
@@ -226,50 +225,29 @@ def test_rotary_forward_oot_on_spyre(
     [
         (64, 1.0),  # full but unaligned: rotary_dim=64 -> inner dim 32
         (128, 0.5),  # partial AND unaligned: rotary_dim=64 -> inner dim 32
-        (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> gated off for being partial
+        (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> rejected for being partial
     ],
 )
-def test_rotary_unsupported_falls_back_to_cpu(
-    requires_spyre, default_vllm_config, head_size, partial_rotary_factor
-):
-    """Configs the on-device path can't handle use the CPU fallback and still
-    return correct results on the requested device. Covers an unaligned inner
-    dim (head_size 64) and partial rotary (rotary_dim < head_size) -- whose
-    slicing has no Spyre kernel -- including a partial case whose inner dim IS
-    stick-aligned (256, 0.5 -> rotary_dim 128), to confirm partial is gated off
-    regardless of alignment."""
+def test_rotary_unsupported_config_raises(default_vllm_config, head_size, partial_rotary_factor):
+    """Configs the on-device path can't handle raise NotImplementedError at
+    construction (no CPU fallback). Covers an unaligned inner dim (head_size 64)
+    and partial rotary (rotary_dim < head_size) -- whose slicing has no Spyre
+    kernel -- including a partial case whose inner dim IS stick-aligned
+    (256, 0.5 -> rotary_dim 128), to confirm partial is rejected regardless of
+    alignment."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
-    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
-    torch.manual_seed(3)
-    max_position, num_tokens, num_heads = 2048, 32, 4
     rope_parameters = (
         None if partial_rotary_factor == 1.0 else {"partial_rotary_factor": partial_rotary_factor}
     )
-    rope = get_rope(
-        head_size=head_size,
-        max_position=max_position,
-        is_neox_style=True,
-        rope_parameters=rope_parameters,
-        dtype=torch.float16,
-    )
-    assert not rope._spyre_rope_supported  # gated off -> CPU fallback
-
-    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
-    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
-    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
-
-    actual_query, actual_key = rope.forward_oot(
-        positions.to("spyre"), query.to("spyre"), key.to("spyre")
-    )
-    expected_query, expected_key = RotaryEmbedding.forward_native(
-        rope, positions.cpu(), query.cpu(), key.cpu()
-    )
-    assert actual_query.device.type == "spyre"  # result still on the device
-    torch.testing.assert_close(
-        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+    with pytest.raises(NotImplementedError):
+        get_rope(
+            head_size=head_size,
+            max_position=2048,
+            is_neox_style=True,
+            rope_parameters=rope_parameters,
+            dtype=torch.float16,
+        )
 
 
 @pytest.mark.rotary
@@ -346,7 +324,6 @@ def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_conf
     torch.manual_seed(1)
     head_size, max_position, num_tokens, nh = 128, 2048, 32, 4
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
-    assert rope._spyre_rope_supported
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     q1 = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
@@ -376,20 +353,14 @@ def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_conf
 @pytest.mark.rotary
 def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config):
     """gather_rotation returns the per-token [T, 2, 2, rotary_dim//2] slice on
-    Spyre for a supported config, and None for a config on the CPU fallback."""
+    Spyre for a supported config."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     head_size, max_position, num_tokens = 128, 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
-    assert rope._spyre_rope_supported
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
     rot = rope.gather_rotation(positions, torch.device("spyre"))
     assert rot is not None
     assert rot.device.type == "spyre"
     assert tuple(rot.shape) == (num_tokens, 2, 2, rope.rotary_dim // 2)
-
-    # Unaligned head_size=64 is gated off -> CPU fallback -> gather_rotation is a no-op.
-    rope_unsupported = get_rope(64, max_position, is_neox_style=True, dtype=torch.float16)
-    assert not rope_unsupported._spyre_rope_supported
-    assert rope_unsupported.gather_rotation(positions, torch.device("spyre")) is None

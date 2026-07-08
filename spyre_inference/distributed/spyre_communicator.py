@@ -117,10 +117,12 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         # removes the world_size==2-only restriction the manual reduce had.
         if input_.device.type == "spyre":
             cpu_input = input_.cpu()
-            dist.all_reduce(cpu_input, group=self.device_group)
+            dist.all_reduce(  # ty: ignore[possibly-missing-attribute]
+                cpu_input, group=self.device_group
+            )
             input_.copy_(cpu_input)
             return input_
-        dist.all_reduce(input_, group=self.device_group)
+        dist.all_reduce(input_, group=self.device_group)  # ty: ignore[possibly-missing-attribute]
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -132,7 +134,9 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
         output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
-        dist.all_gather(output_list, input_, group=self.device_group)
+        dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+            output_list, input_, group=self.device_group
+        )
         # torch.cat on Spyre shifts the second operand by -(|A| mod 64) slots
         # along the concat dim when |A| is not stick-aligned; round-trip
         # through CPU until the upstream kernel is fixed.

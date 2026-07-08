@@ -29,6 +29,7 @@ The subclass matches its downstream consumer:
 """
 
 import types
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -120,7 +121,7 @@ def _split_into_params(module: nn.Module, names: list[str], sizes: list[int]) ->
     Adds `<name>_weight`/`<name>_bias` Parameters (contiguous, on CPU) and then
     clears the fused `weight`/`bias` to None.
     """
-    w = module.weight.data
+    w = cast(torch.Tensor, module.weight.data)
     assert sum(sizes) == w.shape[0], (
         f"analyze_and_unfuse: part sizes {sizes} != fused weight rows "
         f"{w.shape[0]}; refusing to split."
@@ -130,7 +131,8 @@ def _split_into_params(module: nn.Module, names: list[str], sizes: list[int]) ->
         setattr(module, f"{name}_weight", Parameter(part.contiguous(), requires_grad=False))
 
     if getattr(module, "bias", None) is not None:
-        for name, part in zip(names, torch.split(module.bias.data, sizes, dim=0)):
+        bias_data = cast(torch.Tensor, module.bias.data)
+        for name, part in zip(names, torch.split(bias_data, sizes, dim=0)):
             setattr(module, f"{name}_bias", Parameter(part.contiguous(), requires_grad=False))
         module.bias = None
 
@@ -145,7 +147,7 @@ def _fused_bias(module: nn.Module, names: list[str]):
     parts = [getattr(module, f"{n}_bias", None) for n in names]
     if any(p is None for p in parts):
         return None
-    return torch.cat([p.data for p in parts])
+    return torch.cat([cast(torch.Tensor, p).data for p in parts])
 
 
 def _split_forward(output, module: nn.Module, names: list[str]):

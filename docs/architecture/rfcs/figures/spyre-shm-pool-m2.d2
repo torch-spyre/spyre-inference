@@ -3,8 +3,8 @@ direction: down
 instA: Spyre instance A {
   style.fill: "#eef5ff"
   style.stroke: "#3b6fb3"
-  OA: "OffloadingConnector + SpyreShmOffloadingSpec"
-  HA: "SpyreShmOffloadingHandlers -> SpyreKvDmaCopier"
+  OA: "OffloadingConnector + SpyreShmOffloadingSpec\n(subclasses TieringOffloadingSpec)"
+  HA: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
   OA -> HA
 }
 
@@ -12,7 +12,7 @@ instB: Spyre instance B {
   style.fill: "#eef5ff"
   style.stroke: "#3b6fb3"
   OB: "OffloadingConnector + SpyreShmOffloadingSpec"
-  HB: "SpyreShmOffloadingHandlers -> SpyreKvDmaCopier"
+  HB: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
   OB -> HB
 }
 
@@ -24,7 +24,7 @@ RAW: "torch_spyre._C.copy_tensor_raw / register_dmable_host_buffer\n(flex copyRa
 pool: shared host-RAM KV pool (POSIX-SHM, one per node) {
   style.fill: "#fff4e6"
   style.stroke: "#c1620a"
-  HM: "hmlib KVBlockStore: block-hash->slot directory,\nsingle-writer publish gate, seqlock copy->validate"
+  HM: "pool owner + directory:\nShape B - upstream CPUPrimaryTierOffloadingManager + SharedOffloadRegion + RESERVED->VALID gate;\nShape A - hmlib + seqlock copy->validate"
   SLOTS: "slots: raw KV page images\nhost DRAM, DMA-registered" {
     shape: cylinder
   }

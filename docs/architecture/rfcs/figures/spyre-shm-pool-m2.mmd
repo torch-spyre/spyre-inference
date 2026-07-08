@@ -2,14 +2,14 @@
 flowchart TB
     subgraph instA["<b>Spyre instance A</b>"]
         direction TB
-        OA["OffloadingConnector + SpyreShmOffloadingSpec"]
-        HA["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        OA["OffloadingConnector + SpyreShmOffloadingSpec<br/>(subclasses TieringOffloadingSpec)"]
+        HA["SpyreOffloadingWorker → SpyreKvDmaCopier"]
         OA --> HA
     end
     subgraph instB["<b>Spyre instance B</b>"]
         direction TB
         OB["OffloadingConnector + SpyreShmOffloadingSpec"]
-        HB["SpyreShmOffloadingHandlers → SpyreKvDmaCopier"]
+        HB["SpyreOffloadingWorker → SpyreKvDmaCopier"]
         OB --> HB
     end
 
@@ -17,7 +17,7 @@ flowchart TB
 
     subgraph pool["<b>shared host-RAM KV pool</b> (POSIX-SHM, one per node)"]
         direction TB
-        HM["hmlib KVBlockStore: block-hash→slot directory,<br/>single-writer publish gate, seqlock copy→validate"]
+        HM["pool owner + directory:<br/>Shape B — upstream CPUPrimaryTierOffloadingManager<br/>+ SharedOffloadRegion + RESERVED→VALID gate;<br/>Shape A — hmlib + seqlock copy→validate"]
         SLOTS[("slots: raw KV page images<br/>host DRAM, DMA-registered")]
         HM --- SLOTS
     end

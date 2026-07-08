@@ -85,7 +85,8 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m "not (distributed or upstream or attention)"
           - cfg: Spyre attention tests
@@ -93,7 +94,8 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m "attention and not (distributed or upstream)"
           - cfg: Distributed spyre tests
@@ -101,7 +103,8 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m distributed
           - cfg: Upstream vLLM tests
@@ -109,7 +112,8 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m "upstream and not distributed and not model"
           - cfg: Upstream distributed vLLM tests
@@ -117,7 +121,8 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m "upstream and distributed"
           - cfg: Upstream model vLLM tests
@@ -125,7 +130,8 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned_shadow
             flags: >-
               -m "upstream and model and not distributed"
     # Compose runner labels from matrix.runs_on and the image label.

@@ -7,36 +7,35 @@ flowchart TB
         OCW["OffloadingConnectorWorker"]
         Factory["OffloadingSpecFactory<br/>.create_spec(&quot;SpyreOffloadingSpec&quot;)"]
         OC -- "register_kv_caches" --> OCW
-        OC -- "get_handlers (via factory)" --> Factory
+        OC -- "get_worker / get_manager (via factory)" --> Factory
     end
 
     subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
         direction TB
-        Spec["SpyreOffloadingSpec"]
-        Mgr["get_manager() → CPUOffloadingManager<br/><i>reused verbatim from upstream</i>"]
-        Handlers["get_handlers() → SpyreCpuOffloadingHandlers"]
-        D2H["device_to_host_handler<br/>(Spyre → host RAM block tensor)"]
-        H2D["host_to_device_handler<br/>(host RAM block tensor → Spyre)"]
+        Spec["SpyreOffloadingSpec<br/>(subclasses CPUOffloadingSpec)"]
+        Mgr["get_manager() → upstream OffloadingManager<br/><i>reused verbatim</i>"]
+        Worker["get_worker() → <b>SpyreOffloadingWorker</b><br/><i>overrides the CUDA-gated parent</i>"]
+        SS["submit_store (device → host)"]
+        SL["submit_load (host → device)"]
         Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around torch_spyre._C.copy_tensor<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
         Backend["<b>torch_spyre._C.copy_tensor(src, dst, non_blocking=False)</b><br/>SpyreStream.copyAsync → flex runtime DMA<br/>(direction auto-detected from src.is_cpu/.is_privateuseone)"]
 
         Spec --> Mgr
-        Spec --> Handlers
-        Handlers --> D2H
-        Handlers --> H2D
-        D2H --> Copier
-        H2D --> Copier
+        Spec --> Worker
+        Worker --> SS
+        Worker --> SL
+        SS --> Copier
+        SL --> Copier
         Copier --> Backend
     end
 
     Factory -. "resolves to" .-> Spec
-    OCW -- "run handlers" --> D2H
-    OCW -- "run handlers" --> H2D
+    OCW -- "submit_store / submit_load" --> Worker
 
     classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
     classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
     classDef hot fill:#ffe4e1,stroke:#a83232,color:#3a0000
 
     class OC,OCW,Factory upstream
-    class Spec,Mgr,Handlers,D2H,H2D plugin
+    class Spec,Mgr,Worker,SS,SL plugin
     class Copier,Backend hot

@@ -10,7 +10,7 @@ on:
   # Pre-populate on every push to main so PRs that don't touch the lock
   # file get a cache hit on their first run.
   push:
-    branches: [main]
+    branches: [main, rpm-caching-test]
     paths:
       - spyre-rpms.lock
   workflow_dispatch:
@@ -25,12 +25,10 @@ defaults:
 jobs:
   populate:
     name: Download and cache Spyre RPMs
-    # Needs dnf and Artifactory network access; no Spyre hardware required.
-    # TODO: switch to a lighter runner label once one is available (this
-    # unnecessarily occupies a hardware slot for a pure file-download job).
+    # Needs curl and Artifactory network access; no Spyre hardware required.
     runs-on:
       - x86_64
-      - spyre_pf_x1__pvc_1tb_x1
+      - spyre_pf_x0__pvc_1tb_x1
       - linux
       - image_torch_spyre_pinned_shadow
 
@@ -58,11 +56,22 @@ jobs:
           key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
           lookup-only: true
 
+      - name: List Artifactory RPMs
+        if: steps.rpm-cache.outputs.cache-hit != 'true'
+        env:
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+        run: |
+          curl -fSL \
+            -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
+            "${ARTIFACTORY_BASE_URL}/artifactory/api/storage/${ARTIFACTORY_RPM_PATH}/x86_64?list&deep=0" \
+            | jq -r '.files[].uri'
+
       - name: Download RPMs
         if: steps.rpm-cache.outputs.cache-hit != 'true'
         env:
-          ARTIFACTORY_USER: ${{ secrets.ARTIFACTORY_USER }}
-          ARTIFACTORY_API_KEY: ${{ secrets.ARTIFACTORY_API_KEY }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           RPM_NAMES_TXT: spyre-rpms.lock

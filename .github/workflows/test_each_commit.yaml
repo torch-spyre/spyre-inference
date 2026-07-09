@@ -167,25 +167,28 @@ jobs:
           files: |
             .github/workflows/test_each_commit.yaml
             .github/actions/build-spyre-deps/action.yml
-            .github/actions/spyre-uv-cache/action.yml
+            .github/actions/spyre-rpm-install/action.yml
             pyproject.toml
             uv.lock
+            spyre-rpms.lock
             tests/**/*.py
             tests/**/*.yaml
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 
-      - name: Compute Spyre image hash
+      - name: Install Spyre RPMs
+        id: spyre-rpms
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        id: spyre-uv-cache
-        uses: ./.github/actions/spyre-uv-cache
+        uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
-          cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          # Key the uv wheel cache on the RPM lock file: different library
+          # versions may require torch-spyre to be recompiled.
+          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
           # Use local runner temp to avoid ownership/permission issues on $HOME.
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
@@ -200,7 +203,7 @@ jobs:
           rpm_location: ${{ inputs.rpm_location }}
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_API_KEY }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 

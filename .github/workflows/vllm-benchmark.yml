@@ -71,7 +71,7 @@ jobs:
       - spyre_pf_x4__pvc_1tb_x1
       - linux
       # - image_torch_spyre
-      - image_torch_spyre_pinned_shadow
+      - image_torch_spyre_pinned
     timeout-minutes: 240
     env:
       CI: ''

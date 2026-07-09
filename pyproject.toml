@@ -104,7 +104,7 @@ vllm = [
   { index = "vllm-cpu", marker = "sys_platform == 'linux'" },
   { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0", marker = "sys_platform != 'linux'" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "0bd9ce797b120f01aa4d80926273a9595ce7f66d" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "864104b378f691d55c21c98a4dc0fccd4b391954" }
 torch = [
   { index = "pytorch-cpu" },
 ]

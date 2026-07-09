@@ -32,10 +32,9 @@ if [[ -z "$RPM_ARCH" ]] ; then
     echo "RPM_ARCH set to $RPM_ARCH"
 fi
 
-check_command_exists dnf
+check_command_exists curl
 
-check_env_var ARTIFACTORY_USER
-check_env_var ARTIFACTORY_API_KEY
+check_env_var ARTIFACTORY_TOKEN
 
 RPM_NAMES_TXT="${RPM_NAMES_TXT:-rpms.txt}"
 
@@ -55,41 +54,23 @@ if [[ -z "$ARTIFACTORY_LOCATION" ]] ; then
     echo 'ARTIFACTORY_LOCATION is empty, looking for ARTIFACTORY_BASE_URL and ARTIFACTORY_RPM_PATH'
     check_env_var ARTIFACTORY_BASE_URL
     check_env_var ARTIFACTORY_RPM_PATH
-    ARTIFACTORY_LOCATION="${ARTIFACTORY_BASE_URL}/${ARTIFACTORY_RPM_PATH}"
+    ARTIFACTORY_LOCATION="${ARTIFACTORY_BASE_URL}/artifactory/${ARTIFACTORY_RPM_PATH}"
 fi
 
 RPMS_DOWNLOAD_DIR="${RPMS_DOWNLOAD_DIR:-rpms}"
 
-DNF_REPO_CONFIG_DIR='dnf_repo_config'
-DNF_REPO_NAME='artifactory'
+mkdir -p "$RPMS_DOWNLOAD_DIR" || exit 1
 
-mkdir -p "$DNF_REPO_CONFIG_DIR" || exit 1
+echo "downloading rpm(s) for arch '${RPM_ARCH}' from '${ARTIFACTORY_LOCATION}' to '${RPMS_DOWNLOAD_DIR}'..."
 
-cat <<EOF > "${DNF_REPO_CONFIG_DIR}/artifactory.repo"
-[${DNF_REPO_NAME}]
-name=artifactory
-baseurl=${ARTIFACTORY_LOCATION}
-username=${ARTIFACTORY_USER}
-password=${ARTIFACTORY_API_KEY}
-enabled=1
-gpgcheck=0
-sslverify=1
-EOF
-
-echo "downloading rpm(s) '${RPM_NAMES}' for arch '${RPM_ARCH}' from Artifactory location '${ARTIFACTORY_LOCATION}' to directory '${RPMS_DOWNLOAD_DIR}'..."
-
-echo dnf download \
-    --setopt="reposdir=${DNF_REPO_CONFIG_DIR}" \
-    --repo="$DNF_REPO_NAME" \
-    --arch="$RPM_ARCH" \
-    --destdir="$RPMS_DOWNLOAD_DIR" \
-    $RPM_NAMES || exit 1
-
-dnf download \
-    --setopt="reposdir=${DNF_REPO_CONFIG_DIR}" \
-    --repo="$DNF_REPO_NAME" \
-    --arch="$RPM_ARCH" \
-    --destdir="$RPMS_DOWNLOAD_DIR" \
-    $RPM_NAMES || exit 1
+for rpm_name in $RPM_NAMES; do
+    filename="${rpm_name}.${RPM_ARCH}.rpm"
+    url="${ARTIFACTORY_LOCATION}/${RPM_ARCH}/${filename}"
+    echo "  ${url}"
+    curl -fSL \
+        -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
+        -o "${RPMS_DOWNLOAD_DIR}/${filename}" \
+        "${url}" || exit 1
+done
 
 echo 'done'

@@ -171,6 +171,7 @@ jobs:
             pyproject.toml
             uv.lock
             tests/**/*.py
+            tests/**/*.yaml
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 

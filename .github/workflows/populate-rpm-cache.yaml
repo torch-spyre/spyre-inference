@@ -4,15 +4,11 @@ on:
   # Runs with base-repo secrets so it can reach Artifactory.
   # Checks out the PR head to get its version of the lock file,
   # so the cache key matches what the pull_request test job will look for.
+  # No paths filter: GHA cache has a 10-day TTL and a 10GB cap, so evictions
+  # happen. Running on every PR ensures the cache is always warm.
   pull_request_target:
-    paths:
-      - spyre-rpms.lock
-  # Pre-populate on every push to main so PRs that don't touch the lock
-  # file get a cache hit on their first run.
   push:
     branches: [main]
-    paths:
-      - spyre-rpms.lock
   workflow_dispatch:
 
 permissions:

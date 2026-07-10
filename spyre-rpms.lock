@@ -4,7 +4,7 @@
 # The cache key is derived from this file's hash. Changing any entry
 # invalidates the GHA RPM cache and triggers a fresh download.
 #
-ibm-aiu-toolbox-e2e-1.2.5_rc.1-1_91.el10
+ibm-aiu-toolbox-e2e-2.0.0-0.main.1+26.7160202_42.el10
 ibm-deeptools-2.0.0-0.main.1+1332.34778f9_189.el10
 ibm-deeptools-devel-1.2.0-1_76.el10
 ibm-flex-2.0.0-0.main.1+369.541cfe8_133.el10

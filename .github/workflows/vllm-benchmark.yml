@@ -33,6 +33,7 @@ defaults:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   # ─── Generate benchmark matrix from spyre config files ───

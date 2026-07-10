@@ -1,15 +1,45 @@
 name: populate-rpm-cache
 
 on:
-  # Runs with base-repo secrets so it can reach Artifactory.
-  # Checks out the PR head to get its version of the lock file,
-  # so the cache key matches what the pull_request test job will look for.
-  # No paths filter: GHA cache has a 10-day TTL and a 10GB cap, so evictions
-  # happen. Running on every PR ensures the cache is always warm.
-  pull_request_target:
+  # For fork PRs: fires almost immediately when pre-commit is queued (types: requested),
+  # giving populate maximum time before test jobs check the cache. workflow_run runs in
+  # base-repo context with secrets (ARTIFACTORY_TOKEN et al.) and writes to
+  # refs/heads/main scope. Test jobs (pull_request) fall back from refs/pull/N/merge to
+  # refs/heads/main and find the entry.
+  #
+  # pre-commit also triggers on push to main — we skip those here (handled by the push
+  # trigger below so we don't double-populate).
+  #
+  # Timing note: test jobs start at the same time as pre-commit. First push with a new
+  # lock file hash will see a cache miss and fail; a re-run after this workflow completes
+  # will succeed.
+  workflow_run:
+    workflows: [pre-commit]
+    types: [requested]
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      head_sha:
+        description: >
+          PR commit SHA to fetch spyre-rpms.lock from (simulates
+          workflow_run.head_sha). Use to test this workflow from a branch before
+          merging to main, since workflow_run only fires from the default branch.
+        required: false
+        type: string
+        default: ""
+      head_repository:
+        description: >
+          Fork repo containing the commit above (simulates
+          workflow_run.head_repository.full_name), e.g. torch-spyre/spyre-inference.
+          Leave empty to use the base repo.
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: populate-rpm-cache-${{ github.event.workflow_run.head_sha || github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -21,6 +51,9 @@ defaults:
 jobs:
   populate:
     name: Download and cache Spyre RPMs
+    # Skip workflow_run events from pre-commit's push-to-main trigger — those are
+    # covered by the push trigger above.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
     # Needs curl and Artifactory network access; no Spyre hardware required.
     runs-on:
       - x86_64
@@ -29,23 +62,20 @@ jobs:
       - image_torch_spyre_pinned_shadow
 
     steps:
-      # Always check out the base branch so the download script comes from
-      # trusted code. pull_request_target's default ref is already the base.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # For PRs: overwrite the lock file with the PR head's version so the
-      # cache key matches what the pull_request test job will compute.
-      # Fetching a single data file via API is safe — no code is executed.
-      - name: Fetch lock file from PR head
-        if: github.event_name == 'pull_request_target'
+      # For workflow_run events (fork PRs): overwrite the checked-out (main branch)
+      # lock file with the PR's version fetched directly from the fork commit. Only
+      # spyre-rpms.lock is fetched — the download script comes from the trusted base
+      # repo checkout above.
+      - name: Fetch PR's spyre-rpms.lock
+        if: github.event_name == 'workflow_run' || inputs.head_sha != ''
         env:
-          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || inputs.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name || inputs.head_repository || github.repository }}
         run: |
-          curl -fsSL \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/contents/spyre-rpms.lock?ref=${{ github.event.pull_request.head.sha }}" \
-            | jq -r '.content' | base64 -d > spyre-rpms.lock
+          git fetch "${GITHUB_SERVER_URL}/${HEAD_REPO}.git" "${HEAD_SHA}"
+          git show FETCH_HEAD:spyre-rpms.lock > spyre-rpms.lock
 
       - name: Check RPM cache
         id: rpm-cache

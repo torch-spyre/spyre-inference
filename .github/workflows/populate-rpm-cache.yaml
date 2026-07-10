@@ -1,44 +1,35 @@
 name: populate-rpm-cache
 
 on:
-  # For fork PRs: fires almost immediately when pre-commit is queued (types: requested),
-  # giving populate maximum time before test jobs check the cache. workflow_run runs in
-  # base-repo context with secrets (ARTIFACTORY_TOKEN et al.) and writes to
-  # refs/heads/main scope. Test jobs (pull_request) fall back from refs/pull/N/merge to
-  # refs/heads/main and find the entry.
-  #
-  # pre-commit also triggers on push to main — we skip those here (handled by the push
-  # trigger below so we don't double-populate).
-  #
-  # Timing note: test jobs start at the same time as pre-commit. First push with a new
-  # lock file hash will see a cache miss and fail; a re-run after this workflow completes
-  # will succeed.
-  workflow_run:
-    workflows: [pre-commit]
-    types: [requested]
+  # For fork PRs: the dispatch-for-pr job below cannot write cache (GitHub
+  # June 2026 read-only cache restriction for untrusted triggers). Instead it
+  # fires a workflow_dispatch event via the GitHub API — a brand-new trusted
+  # event with full cache write access. Only fires when spyre-rpms.lock changes.
+  pull_request:
+    paths:
+      - spyre-rpms.lock
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
       head_sha:
         description: >
-          PR commit SHA to fetch spyre-rpms.lock from (simulates
-          workflow_run.head_sha). Use to test this workflow from a branch before
-          merging to main, since workflow_run only fires from the default branch.
+          PR commit SHA to fetch spyre-rpms.lock from. Leave empty to use the
+          checked-out lock file (push to main).
         required: false
         type: string
         default: ""
       head_repository:
         description: >
-          Fork repo containing the commit above (simulates
-          workflow_run.head_repository.full_name), e.g. torch-spyre/spyre-inference.
-          Leave empty to use the base repo.
+          Fork repo containing the commit above, e.g. torch-spyre/spyre-inference.
+          Leave empty to use the base repo. Used together with head_sha to fetch
+          the lock file from a fork PR (github.event.pull_request.head.repo.full_name).
         required: false
         type: string
         default: ""
 
 concurrency:
-  group: populate-rpm-cache-${{ github.event.workflow_run.head_sha || github.sha }}
+  group: populate-rpm-cache-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: false
 
 permissions:
@@ -49,25 +40,41 @@ defaults:
     shell: bash
 
 jobs:
+  # Relay job: fork pull_request events cannot write the GHA cache (GitHub's
+  # June 2026 security restriction). This job fires a workflow_dispatch via the
+  # GitHub API. That event is trusted and runs with full cache write access.
+  dispatch-for-pr:
+    name: Dispatch populate for PR
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run populate-rpm-cache.yaml \
+            --repo "${{ github.repository }}" \
+            --field "head_sha=${{ github.event.pull_request.head.sha }}" \
+            --field "head_repository=${{ github.event.pull_request.head.repo.full_name }}"
+
   populate:
     name: Download and cache Spyre RPMs
-    # Skip workflow_run events from pre-commit's push-to-main trigger — those are
-    # covered by the push trigger above.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'pull_request'
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # For workflow_run events (fork PRs): overwrite the checked-out (main branch)
-      # lock file with the PR's version fetched directly from the fork commit. Only
-      # spyre-rpms.lock is fetched — the download script comes from the trusted base
-      # repo checkout above.
+      # For workflow_dispatch events relayed from fork PRs: overwrite the
+      # checked-out (main branch) lock file with the PR's version. Only
+      # spyre-rpms.lock is fetched — the download script comes from the
+      # trusted base repo checkout above.
       - name: Fetch PR's spyre-rpms.lock
-        if: github.event_name == 'workflow_run' || inputs.head_sha != ''
+        if: inputs.head_sha != ''
         env:
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha || inputs.head_sha }}
-          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name || inputs.head_repository || github.repository }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          HEAD_REPO: ${{ inputs.head_repository || github.repository }}
         run: |
           git fetch "${GITHUB_SERVER_URL}/${HEAD_REPO}.git" "${HEAD_SHA}"
           git show FETCH_HEAD:spyre-rpms.lock > spyre-rpms.lock

@@ -156,6 +156,7 @@ jobs:
           source /etc/profile.d/ibm-aiu-setup.sh
           set -eux
           mkdir -p benchmark-results
+
           uv run python3 .github/scripts/run_vllm_benchmarks.py \
             --configs-dir vllm-benchmarks/benchmarks/spyre \
             --results-dir benchmark-results > benchmark-results/run.log 2>&1
@@ -217,3 +218,4 @@ jobs:
             echo "| Result Files | ${RESULT_COUNT} |"
             echo "| Run ID | ${RUN_ID} |"
           } >> "$GITHUB_STEP_SUMMARY"
+

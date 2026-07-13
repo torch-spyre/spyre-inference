@@ -55,37 +55,32 @@ jobs:
     - name: RPM cache diagnostics
       run: |
         set -euo pipefail
-        LOCK_HASH="${{ hashFiles('spyre-rpms.lock') }}"
-        echo "Lock file hash:  ${LOCK_HASH}"
-        echo "Cache key:       spyre-rpms-${LOCK_HASH}"
-        echo ""
-        echo "=== Cache-relevant env vars ==="
-        echo "ACTIONS_CACHE_URL=${ACTIONS_CACHE_URL:-<not set>}"
-        echo "ACTIONS_RESULTS_URL=${ACTIONS_RESULTS_URL:-<not set>}"
-        echo "ACTIONS_RUNTIME_URL=${ACTIONS_RUNTIME_URL:-<not set>}"
-        echo "ACTIONS_RUNTIME_TOKEN present: $([[ -n "${ACTIONS_RUNTIME_TOKEN:-}" ]] && echo yes || echo no)"
-        echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:-<not set>}"
-        echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN present: $([[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] && echo yes || echo no)"
-        echo ""
-        echo "=== Runner info ==="
         echo "RUNNER_TEMP=${RUNNER_TEMP:-<not set>}"
-        echo "GITHUB_REF=${GITHUB_REF:-<not set>}"
-        echo "GITHUB_EVENT_NAME=${GITHUB_EVENT_NAME:-<not set>}"
+        echo "Cache path: /tmp/spyre-rpms"
+        if command -v zstd >/dev/null 2>&1; then
+          COMP="zstd-without-long"
+          echo "zstd: $(zstd --version | head -1)"
+        else
+          COMP="gzip"
+          echo "zstd: not found, will use gzip"
+        fi
+        VER=$(python3 -c "import hashlib,sys; s=f'/tmp/spyre-rpms|{sys.argv[1]}|1.0'; print(hashlib.sha256(s.encode()).hexdigest())" "$COMP")
+        echo "Version input:    /tmp/spyre-rpms|${COMP}|1.0"
+        echo "Expected version: ${VER}"
 
     - name: Restore RPM cache
       id: rpm-cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ runner.temp }}/rpms
+        path: /tmp/spyre-rpms
         key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
         enableCrossOsArchive: true
 
     - name: RPM cache result
       run: |
         echo "cache-hit=${{ steps.rpm-cache.outputs.cache-hit }}"
-        echo "cache-primary-key=${{ steps.rpm-cache.outputs.cache-primary-key }}"
         echo "cache-matched-key=${{ steps.rpm-cache.outputs.cache-matched-key }}"
-        ls -la "${{ runner.temp }}/rpms" 2>/dev/null || echo "rpms dir does not exist"
+        ls -la /tmp/spyre-rpms 2>/dev/null || echo "rpms dir does not exist"
 
     - name: Fail on RPM cache miss
       if: steps.rpm-cache.outputs.cache-hit != 'true'
@@ -99,7 +94,7 @@ jobs:
         set -euo pipefail
         SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
         mkdir -p "$SPYRE_LIBS"
-        for rpm in "${RUNNER_TEMP}/rpms/"*.rpm; do
+        for rpm in /tmp/spyre-rpms/*.rpm; do
           echo "Extracting $(basename "$rpm")..."
           rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
         done

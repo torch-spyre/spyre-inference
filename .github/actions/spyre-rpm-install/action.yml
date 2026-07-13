@@ -18,7 +18,7 @@ runs:
       id: rpm-cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ runner.temp }}/rpms
+        path: /tmp/spyre-rpms
         key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
         enableCrossOsArchive: true
 
@@ -35,7 +35,7 @@ runs:
         set -euo pipefail
         SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
         mkdir -p "$SPYRE_LIBS"
-        for rpm in "${RUNNER_TEMP}/rpms/"*.rpm; do
+        for rpm in /tmp/spyre-rpms/*.rpm; do
           echo "Extracting $(basename "$rpm")..."
           rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
         done

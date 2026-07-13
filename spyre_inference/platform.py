@@ -75,6 +75,12 @@ class TorchSpyrePlatform(CpuPlatform):
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     @classmethod
+    def import_kernels(cls) -> None:
+        # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
+        # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
+        pass
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 
@@ -217,8 +223,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
-            # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
-            # Override with TorchSpyreWorker for Spyre-specific functionality
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
@@ -232,15 +236,12 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        # CPUWorker derives its KV-cache budget from host RAM, but on Spyre
-        # the cache lives on-device — the host-RAM math is meaningless and
-        # `gpu_memory_utilization * total_RAM` typically exceeds available
-        # RAM on Spyre boxes, tripping CPUWorker.__init__'s preflight check.
+        # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
+        # math in CpuPlatform.check_and_update_config is meaningless for us.
         # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
-        # populate `cache_config.kv_cache_memory_bytes` below, which both
-        # bypasses the preflight check and short-circuits the host-RSS math
-        # in CPUWorker.determine_available_memory. Skip when the user has
-        # explicitly supplied --kv-cache-memory-bytes so we don't clobber it.
+        # populate `cache_config.kv_cache_memory_bytes`, which
+        # TorchSpyreWorker.determine_available_memory returns directly.
+        # Skip when the user has explicitly supplied --kv-cache-memory-bytes.
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 

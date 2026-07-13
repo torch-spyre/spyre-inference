@@ -385,6 +385,29 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
         f.write(content)
 
 
+def _register_vllm_C_op_stubs():
+    """Register stub op schemas in the torch.ops._C namespace.
+
+    With VLLM_TARGET_DEVICE=empty, the _C shared library is not built, so
+    torch.ops._C.* attributes don't exist. Upstream vLLM test files reference
+    some of these ops at module scope (e.g. in @pytest.mark.parametrize
+    decorators), causing collection failures. Defining the schemas (without
+    implementations) makes attribute access succeed. Tests that actually *call*
+    these ops are gated by our YAML allow_list and will error with
+    "no kernel found" if they somehow run.
+    """
+    import torch
+
+    if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "gelu_fast"):
+        return
+
+    lib = torch.library.Library("_C", "DEF")
+    for name in ("gelu_fast", "gelu_new", "gelu_quick"):
+        lib.define(f"{name}(Tensor! out, Tensor input) -> ()")
+    # Keep the library object alive for the process lifetime.
+    _register_vllm_C_op_stubs._lib = lib
+
+
 # ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
@@ -404,6 +427,14 @@ def pytest_configure(config):
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    # With VLLM_TARGET_DEVICE=empty, the _C.abi3.so extension is not built, so
+    # torch.ops._C has no registered ops. Some upstream test files reference
+    # torch.ops._C.* in @pytest.mark.parametrize decorators (module-level), which
+    # causes AttributeError during collection. Register stub schemas so the
+    # attributes resolve. The actual test functions that *call* these ops are
+    # blocked in our YAML config.
+    _register_vllm_C_op_stubs()
 
     # Detect local vLLM repo or clone it
     rootdir = Path(config.rootdir)

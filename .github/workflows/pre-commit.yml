@@ -11,7 +11,6 @@ concurrency:
 
 permissions:
   contents: read
-  actions: read
 
 jobs:
   pre-commit:
@@ -52,63 +51,15 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-    - name: RPM cache diagnostics
-      run: |
-        set -euo pipefail
-        echo "RUNNER_TEMP=${RUNNER_TEMP:-<not set>}"
-        echo "Cache path: /tmp/spyre-rpms"
-        if command -v zstd >/dev/null 2>&1; then
-          COMP="zstd-without-long"
-          echo "zstd: $(zstd --version | head -1)"
-        else
-          COMP="gzip"
-          echo "zstd: not found, will use gzip"
-        fi
-        VER=$(python3 -c "import hashlib,sys; s=f'/tmp/spyre-rpms|{sys.argv[1]}|1.0'; print(hashlib.sha256(s.encode()).hexdigest())" "$COMP")
-        echo "Version input:    /tmp/spyre-rpms|${COMP}|1.0"
-        echo "Expected version: ${VER}"
-
-    - name: Restore RPM cache
-      id: rpm-cache
-      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-      with:
-        path: /tmp/spyre-rpms
-        key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
-
-    - name: RPM cache result
-      run: |
-        echo "cache-hit=${{ steps.rpm-cache.outputs.cache-hit }}"
-        echo "cache-matched-key=${{ steps.rpm-cache.outputs.cache-matched-key }}"
-        ls -la /tmp/spyre-rpms 2>/dev/null || echo "rpms dir does not exist"
-
-    - name: Fail on RPM cache miss
-      if: steps.rpm-cache.outputs.cache-hit != 'true'
-      run: |
-        echo "::error::RPM cache miss for spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}. Trigger the populate-rpm-cache workflow to populate it."
-        exit 1
-      shell: bash
-
-    - name: Extract RPMs
-      run: |
-        set -euo pipefail
-        SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
-        mkdir -p "$SPYRE_LIBS"
-        for rpm in /tmp/spyre-rpms/*.rpm; do
-          echo "Extracting $(basename "$rpm")..."
-          rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
-        done
-        echo "Extracted .so files:"
-        find "$SPYRE_LIBS" -name "*.so*" -type f | sort
-        NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
-        echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
-      shell: bash
+    - name: Install Spyre RPMs
+      id: spyre-rpms
+      uses: ./.github/actions/spyre-rpm-install
 
     - name: "Set up Python"
-      id: setup-uv
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         enable-cache: true
-        cache-suffix: ${{ hashFiles('spyre-rpms.lock') }}
+        cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
         cache-local-path: ${{ runner.temp }}/setup-uv-cache
         prune-cache: false
 

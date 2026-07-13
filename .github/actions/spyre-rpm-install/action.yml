@@ -33,13 +33,17 @@ runs:
       run: |
         set -euo pipefail
         SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
+        ARCH="$(arch)"
         mkdir -p "$SPYRE_LIBS"
-        for rpm in /tmp/spyre-rpms/*.rpm; do
+        while IFS= read -r name; do
+          rpm="/tmp/spyre-rpms/${name}.${ARCH}.rpm"
+          if [[ ! -f "$rpm" ]]; then
+            echo "::error::Expected RPM not found: $rpm"
+            exit 1
+          fi
           echo "Extracting $(basename "$rpm")..."
           rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
-        done
-        echo "Extracted .so files:"
-        find "$SPYRE_LIBS" -name "*.so*" -type f | sort
+        done < <(grep -v '^[[:space:]]*#' spyre-rpms.lock | grep -v '^[[:space:]]*$')
         NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
         echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
 

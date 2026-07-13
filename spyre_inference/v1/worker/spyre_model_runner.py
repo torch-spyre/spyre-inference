@@ -130,11 +130,9 @@ class _SpyreModelWrapper:
         which handles H2D/D2H for the sample_hidden_states subset.
 
     RoPE priming (per forward pass):
-        Before converting positions to Spyre, gather each RoPE module's per-token
-        rotation slice on the host (positions are still CPU here, so no D2H) and
-        stash it in the vLLM forward context. SpyreRotaryEmbedding.forward_oot
-        reads it back (via the opaque spyre_rope_rot op), shared across all
-        attention layers.
+        Gather each RoPE module's per-token rotation slice on the host (no D2H)
+        and stash it in the forward context; forward_oot reads it back, shared
+        across all attention layers.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -153,8 +151,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_rope_modules", rope_modules or [])
 
     def __call__(self, *args, **kwargs):
-        # Prime the per-forward RoPE rotation slice(s) before positions are
-        # converted to Spyre (they are still on the host here, so no D2H).
+        # Prime RoPE while positions are still on the host (no D2H).
         self._prime_rope_rotation(kwargs.get("positions"))
 
         # Convert integer tensor inputs to Spyre int64
@@ -191,14 +188,8 @@ class _SpyreModelWrapper:
         return result
 
     def _prime_rope_rotation(self, positions: torch.Tensor | None) -> None:
-        """Pre-gather each RoPE module's per-token rotation slice into the forward context.
-
-        Runs once per forward pass while positions are still on the host, so the gather
-        has no D2H; SpyreRotaryEmbedding.forward_oot then fetches the shared slice via the
-        opaque spyre_rope_rot op. When all layers share one RoPE config, self._rope_modules
-        has length 1 and a single rotation is stashed. Configs on the CPU fallback return
-        None from gather_rotation and contribute nothing.
-        """
+        """Pre-gather each RoPE module's per-token rotation slice into the forward
+        context. Modules with no Spyre path return None from gather_rotation."""
         if positions is None or not self._rope_modules or not is_forward_context_available():
             return
         rope_rot = {}
@@ -316,9 +307,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
-        # Collect the (shared) RoPE modules before compiling so _SpyreModelWrapper
-        # can prime their per-forward rotation slice. modules() dedupes by identity,
-        # so a shared instance appears once.
+        # Collect RoPE modules for _SpyreModelWrapper to prime (modules() dedupes
+        # a shared instance by identity).
         rope_modules = [m for m in self.model.modules() if isinstance(m, _SpyreRotaryMixin)]
 
         # Compile for Spyre (no-op if enforce_eager=True)

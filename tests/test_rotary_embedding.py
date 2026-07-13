@@ -34,25 +34,16 @@ def _spyre_available() -> bool:
 
 @pytest.fixture()
 def requires_spyre():
-    """Lazily skip when no Spyre device is present.
-
-    Checked inside the fixture (not at import time) to avoid claiming the
-    single-tenant device during collection.
-    """
+    """Skip when no Spyre device is present (checked in-fixture, not at import, to
+    avoid claiming the single-tenant device during collection)."""
     if not _spyre_available():
         pytest.skip("Spyre device unavailable")
 
 
 def _prime_rope(rope, positions):
-    """Mimic _SpyreModelWrapper: pre-gather the rotation slice for ``positions`` and
-    stash it in the forward context (keyed by the module's ``_rope_key``) so a
-    subsequent ``forward_oot`` can fetch it via the ``spyre_rope_rot`` op.
-
-    Direct ``forward_oot`` calls don't go through the wrapper, so tests must prime
-    first (the op requires the slice to be present). No-op for CPU-fallback configs
-    (``gather_rotation`` returns None). ``default_vllm_config`` already provides an
-    active forward context. Returns the gathered slice (or None).
-    """
+    """Mimic _SpyreModelWrapper: pre-gather the rotation slice and stash it in the
+    forward context so a direct forward_oot can fetch it. Returns the slice (or None
+    for CPU-fallback configs)."""
     from vllm.forward_context import get_forward_context
 
     rot = rope.gather_rotation(positions, positions.device)
@@ -162,12 +153,8 @@ def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_conf
 
 @pytest.mark.rotary
 def test_rotary_head_size_64_matches_reference(requires_spyre, default_vllm_config):
-    """head_size=64 (llama-3.2-1B) runs on Spyre via the pad-to-stick path.
-
-    rotary_dim=64 -> 2x2 inner dim 32 (not stick-aligned) -> zero-padded to 64 for the
-    on-device rotation, then sliced back. Regression guard: this config used to require
-    a CPU fallback and now raises at construction if the padding path is missing.
-    """
+    """head_size=64 (llama-3.2-1B): inner dim 32 is not stick-aligned, so it runs on
+    Spyre via the pad-to-stick path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -213,13 +200,8 @@ def test_rotary_forward_oot_on_spyre(
     num_kv_heads,
     flatten,
 ):
-    """forward_oot runs the 2x2 rotation on Spyre and matches forward_native.
-
-    head_size=128 (rotary_dim=128, stick-aligned) is the granite/llama-3.1 target;
-    head_size=64 (inner dim 32) exercises the pad-to-stick path (llama-3.2-1B).
-    Exercises GQA (MHA + grouped) and both the 2D [T, H*D] and 3D [T, H, D]
-    layouts.
-    """
+    """forward_oot runs the 2x2 rotation on Spyre and matches forward_native across
+    head_size (aligned 128 / pad-to-stick 64), GQA, and 2D/3D layouts."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -244,8 +226,7 @@ def test_rotary_forward_oot_on_spyre(
     )
 
     assert actual_query.device.type == "spyre"
-    # The 2x2 rotation cache stays on CPU (Spyre has no eager index_select); only
-    # the gathered per-token slice (built during priming) is moved to Spyre.
+    # The rotation cache stays on CPU (no eager index_select); only the slice moves.
     assert rope._rotation_cache is not None and rope._rotation_cache.device.type == "cpu"
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
@@ -262,12 +243,8 @@ def test_rotary_forward_oot_on_spyre(
     ],
 )
 def test_rotary_unsupported_config_raises(default_vllm_config, head_size, partial_rotary_factor):
-    """Configs the on-device path can't handle raise NotImplementedError at
-    construction (no CPU fallback). Covers partial rotary (rotary_dim < head_size)
-    -- whose slicing has no Spyre kernel -- including a partial case whose inner dim
-    IS stick-aligned (256, 0.5 -> rotary_dim 128), to confirm partial is rejected
-    regardless of alignment. (Full rotary with an unaligned inner dim, e.g.
-    head_size=64, is now supported via padding -- see the forward tests.)"""
+    """Partial rotary raises NotImplementedError at construction (no CPU fallback),
+    whether or not its inner dim is stick-aligned."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     rope_parameters = (
@@ -308,10 +285,8 @@ def test_rotary_forward_oot_key_none_on_spyre(requires_spyre, default_vllm_confi
 
 @pytest.mark.rotary
 def test_llama3_rotary_forward_oot_on_spyre(requires_spyre, default_vllm_config):
-    """Llama3 (scaled) rotation runs on Spyre and matches forward_native.
-
-    Confirms the 2x2 cache inherits llama3 frequency scaling via the MRO.
-    """
+    """Llama3 (scaled) rotation runs on Spyre and matches forward_native, confirming
+    the 2x2 cache inherits llama3 frequency scaling via the MRO."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.llama3_rope import Llama3RotaryEmbedding
 
@@ -343,14 +318,8 @@ def test_llama3_rotary_forward_oot_on_spyre(requires_spyre, default_vllm_config)
 
 @pytest.mark.rotary
 def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_config):
-    """The rotation slice is gathered once (pre-forward) and stashed in the forward
-    context; every attention layer fetches that shared slice via forward_oot, which
-    stays correct for the differing q each layer passes.
-
-    Mirrors what _SpyreModelWrapper does: prime once, then forward_oot reads the
-    slice back through spyre_rope_rot. (default_vllm_config already runs the body
-    inside a set_forward_context scope.)
-    """
+    """The slice is gathered once and shared: two layers fetch it via forward_oot and
+    each stays correct for its own q."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
@@ -362,7 +331,6 @@ def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_conf
     q1 = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
     q2 = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
 
-    # Prime once (pre-forward); two attention layers then reuse the shared slice.
     rot = _prime_rope(rope, positions)
     assert rot is not None and rot.device.type == "spyre"
 
@@ -386,9 +354,8 @@ def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_conf
 @pytest.mark.rotary
 @pytest.mark.parametrize("head_size", [128, 64])
 def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config, head_size):
-    """gather_rotation returns the per-token [T, 2, 2, padded] slice on Spyre for a
-    supported config, where padded = round_up(rotary_dim//2, 64) (== rotary_dim//2 for
-    head_size=128; padded 32->64 for head_size=64)."""
+    """gather_rotation returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice
+    on Spyre for a supported config."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from spyre_inference.custom_ops.rotary_embedding import round_up
 

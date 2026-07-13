@@ -67,7 +67,7 @@ dependencies = [
     "torch==2.11.0",
     "torchaudio==2.11.0",
     "torchvision==0.26.0",
-    "transformers==5.5.3",
+    "transformers==5.12.1",
     "transformers-stream-generator>=0.0.5",
     "tritonclient>=2.51.0",
     "vector-quantize-pytorch>=1.29.1",

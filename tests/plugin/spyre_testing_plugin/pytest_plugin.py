@@ -397,7 +397,7 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     # Load plugins early to register custom ops before test modules import RMSNorm
@@ -683,7 +683,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins

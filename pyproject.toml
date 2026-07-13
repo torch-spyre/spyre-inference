@@ -123,8 +123,7 @@ members = ["tests/plugin"]
 
 # vllm specifies "common" build dependencies in pyproject.toml, while specific requirements for
 # building from source are specified here. The empty backend has minimal build deps.
-# NB: This section CANNOT be used to override dependencies to a conflicting version. For example,
-# you cannot add torch==2.11.0 if vllm's build dependencies already specify torch>=2.12.0
+# NB: This section CANNOT be used to override dependencies to a conflicting version.
 # [tool.uv.extra-build-dependencies]
 # vllm = [
 #     "ninja",

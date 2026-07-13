@@ -59,11 +59,8 @@ from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
-# --- Pure-PyTorch slot mapping kernel (replaces vllm.utils.cpu_triton_utils) ---
-# The upstream C++ kernel (torch.ops._C.compute_slot_mapping_kernel_impl) is
-# unavailable when vLLM is built with VLLM_TARGET_DEVICE=empty. This
-# implementation covers the TOTAL_CP_WORLD_SIZE == 1 case (no context
-# parallelism), which is all Spyre needs.
+# Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
+# (unavailable with VLLM_TARGET_DEVICE=empty).
 
 _PAD_SLOT_ID = -1
 
@@ -107,7 +104,7 @@ class _FuncWrapper:
     def __init__(self, func):
         self.func = func
 
-    def __getitem__(self, *args, **kwargs):
+    def __getitem__(self, grid):
         return self.func
 
 

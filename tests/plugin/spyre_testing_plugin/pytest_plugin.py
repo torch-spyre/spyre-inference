@@ -428,12 +428,6 @@ def pytest_configure(config):
 
     load_general_plugins()
 
-    # With VLLM_TARGET_DEVICE=empty, the _C.abi3.so extension is not built, so
-    # torch.ops._C has no registered ops. Some upstream test files reference
-    # torch.ops._C.* in @pytest.mark.parametrize decorators (module-level), which
-    # causes AttributeError during collection. Register stub schemas so the
-    # attributes resolve. The actual test functions that *call* these ops are
-    # blocked in our YAML config.
     _register_vllm_C_op_stubs()
 
     # Detect local vLLM repo or clone it

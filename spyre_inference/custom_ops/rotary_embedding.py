@@ -27,10 +27,10 @@ Configs without an on-device path (gptj/interleaved, partial rotary) have no
 Spyre RoPE kernel and raise ``NotImplementedError`` at construction rather than
 silently running on CPU. Full neox rotary is supported for any head_size: when
 the 2x2 layout's inner dim (``rotary_dim // 2``) is stick-aligned (e.g.
-head_size=128 -> 64) the whole rotation runs on Spyre; when it is not (e.g.
-head_size=64 -> 32) the split-half reshape has a sub-stick stride that the Spyre
-inductor rejects, so the split+zero-pad-to-stick is done on the host and the
-padded, stick-aligned tensor is moved back for the on-device rotation.
+head_size=128 -> 64) the whole rotation runs on Spyre with a pure view; when it is
+not (e.g. head_size=64 -> 32) the split-half reshape has a sub-stick stride that the
+Spyre inductor rejects, so each half is zero-padded up to the next stick multiple
+on-device with a constant ``{0, 1}`` matmul (no host round-trip) before the rotation.
 """
 
 import itertools
@@ -57,14 +57,35 @@ logger = init_logger(__name__)
 # Spyre stick size is 128 bytes = 64 float16 elements. The 2x2 layout's innermost
 # dim is rotary_dim // 2. When it is not a multiple of 64 (e.g. head_size=64 -> 32),
 # the split-half reshape has a sub-stick pairing-axis stride that torch-spyre cannot
-# read on device; the split+zero-pad-to-stick is then done on the host (see
-# _rotate_neox_2x2) and the padded, stick-aligned tensor is moved back for the rotation.
+# read on device; each half is then zero-padded up to the next stick multiple on-device
+# with a constant {0,1} matmul (see _get_expand_matrix / _rotate_neox_2x2).
 _SPYRE_STICK = 64
 
 
 def round_up(n: int, m: int = _SPYRE_STICK) -> int:
     """Round ``n`` up to the nearest multiple of ``m`` (the Spyre stick size)."""
     return ((n + m - 1) // m) * m
+
+
+@lru_cache
+def _get_expand_matrix(
+    inner: int, padded: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Constant ``{0, 1}`` matrix ``E`` of shape ``[2*inner, 2*padded]`` that zero-pads each
+    neox half up to the stick-aligned ``padded`` **on-device**, via ``x @ E``.
+
+    ``x @ E`` maps ``x[:inner] -> out[:inner]`` and ``x[inner:] -> out[padded:padded+inner]``
+    with zeros in the pad lanes, i.e. the flattened ``[T, H, 2, padded]`` pad layout. Doing
+    the pad this way (instead of ``x.view(T, H, 2, inner)`` + host round-trip) never
+    materializes the sub-stick ``[.,2,inner]`` view: ``E``'s output is a fresh contiguous
+    ``[.,2*padded]`` whose ``view(.,2,padded)`` has a stick-aligned pairing stride. Cached
+    per ``(inner, padded, device, dtype)``.
+    """
+    e = torch.zeros(2 * inner, 2 * padded, dtype=dtype)
+    idx = torch.arange(inner)
+    e[idx, idx] = 1  # first half:  x[:inner]      -> out[:inner]
+    e[inner + idx, padded + idx] = 1  # second half: x[inner:] -> out[padded:padded+inner]
+    return convert(e, device=device, dtype=dtype)
 
 
 def _rotate_neox_2x2(
@@ -82,14 +103,14 @@ def _rotate_neox_2x2(
     and everything runs on Spyre. When it is not (e.g. head_size=64 -> 32), the
     split-half view ``x.view(T, H, 2, inner)`` has a sub-stick pairing-axis stride
     (``inner`` = head_size/2, not a multiple of 64), which torch-spyre's inductor
-    rejects (``Unexpected stick expression`` on any read of that view). So for the
-    unaligned case the split-and-pad is done on the HOST -- ``x`` is moved to CPU,
-    reshaped to ``[T, H, 2, inner]`` and zero-padded (at the END) to ``rot.shape[-1]``
-    (the next stick multiple), then the clean *contiguous* ``[T, H, 2, padded]`` (whose
-    pairing-axis stride is now ``padded``, stick-aligned) is moved back to Spyre. The
-    rotation, the padding strip (an offset-0 ``[..., :inner]`` slice -- Spyre supports
-    ``0:x`` but not ``x:y``), and the reconstruction all run on-device from there.
-    Padded lane values are irrelevant: the rotation cache is zero in the padded region.
+    rejects (``Unexpected stick expression`` on any read of that view). For the unaligned
+    case the pad-to-stick is therefore done **on-device with a constant matmul**: ``x @ E``
+    (``E`` a ``{0, 1}`` matrix, see ``_get_expand_matrix``) writes a fresh contiguous
+    ``[T, H, 2*padded]`` holding each neox half zero-padded to ``padded``; ``view(.,2,padded)``
+    then has a stick-aligned pairing stride. The sub-stick ``[.,2,inner]`` view never
+    exists, so nothing (matmul, rotation, or the offset-0 ``[..., :inner]`` padding strip)
+    hits the stick rejection. Padded lane values are irrelevant: the rotation cache is zero
+    in the padded region.
 
     Args:
         x: query or key, shape ``[T, H*head_size]`` or ``[T, H, head_size]``.
@@ -105,14 +126,12 @@ def _rotate_neox_2x2(
     inner = head_size // 2
     padded = rot.shape[-1]
     if padded != inner:
-        # Sub-stick pairing-axis stride: the [T, H, 2, inner] split view is unreadable
-        # on Spyre, so do the split+pad on the host and move back the clean contiguous
-        # [T, H, 2, padded] (pairing-axis stride == padded, now stick-aligned).
-        x_cpu = convert(x, device="cpu")
-        assert x_cpu is not None
-        x_pairs = x_cpu.view(num_tokens, -1, 2, inner)
-        pad = torch.zeros(*x_pairs.shape[:-1], padded - inner, dtype=x_pairs.dtype)
-        x_pairs = convert(torch.cat([x_pairs, pad], dim=-1), device=x.device)
+        # Sub-stick pairing-axis stride: the [T, H, 2, inner] split view is unreadable on
+        # Spyre. Pad each half up to the stick-aligned `padded` on-device via a constant
+        # {0,1} matmul (x @ E), yielding a contiguous [T, H, 2*padded] whose view has a
+        # stick-aligned pairing stride -- the [.,2,inner] layout is never materialized.
+        e = _get_expand_matrix(inner, padded, x.device, x.dtype)
+        x_pairs = (x.view(num_tokens, -1, head_size) @ e).view(num_tokens, -1, 2, padded)
     else:
         # Split-half pairing via a pure view: x_pairs[..., 0, :] = first half,
         # [..., 1, :] = second half. The view keeps the neox halves without slicing.

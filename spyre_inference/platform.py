@@ -125,7 +125,7 @@ class TorchSpyrePlatform(CpuPlatform):
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
 
-        # When enforce_eager is set, vLLM has already reset the mode to NONE; 
+        # When enforce_eager is set, vLLM has already reset the mode to NONE;
         # preserve that so eager stays eager.
         if vllm_config.model_config is not None and vllm_config.model_config.enforce_eager:
             vllm_config.compilation_config.mode = CompilationMode.NONE
@@ -135,10 +135,7 @@ class TorchSpyrePlatform(CpuPlatform):
             # Keep vLLM's CustomOp dispatch for the OOT path.
             # vLLM defaults custom_ops to "none" whenever backend=="inductor" and
             # mode!=NONE.
-            if all(
-                s not in vllm_config.compilation_config.custom_ops
-                for s in ("all", "none")
-            ):
+            if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
         # In check_and_update_config we assert this must be float16 for spyre.

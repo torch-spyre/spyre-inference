@@ -82,29 +82,12 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
-        self._spyre_layer_name = register_layer(
-            self, "spyre_vocab_parallel_embedding"
-        )
-
-    def _apply(self, fn, recurse: bool = True):
-        # No-op: keep all parameters and buffers (notably `self.weight`) on
-        # the device they were initialized on (CPU). Mirrors the Attention
-        # CPU-stay pattern at spyre_model_runner.py:269. This makes
-        # `self.model.to("spyre")` skip this module entirely, so embedding
-        # never goes through Spyre's `_copy_from` for its weight.
-        #
-        # NB: when the weight is TIED to lm_head (tie_word_embeddings=True),
-        # this override is bypassed and the shared storage is moved to Spyre
-        # anyway; the `_spyre_keep_on_cpu` marker + the model runner's
-        # post-`.to()` sweep corrects that.
-        return self
+        self._spyre_layer_name = register_layer(self, "spyre_vocab_parallel_embedding")
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         # The whole forward is one opaque FallbackKernel as far as Inductor
         # is concerned. See module docstring for the why.
-        return torch.ops.vllm.spyre_vocab_parallel_embedding_native(
-            input_, self._spyre_layer_name
-        )
+        return torch.ops.vllm.spyre_vocab_parallel_embedding_native(input_, self._spyre_layer_name)
 
     def _forward_impl(self, input_: torch.Tensor) -> torch.Tensor:
         """Inner body called by the opaque-wrapping custom op.
@@ -124,27 +107,17 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
+            masked_input = convert(masked_input, device=self.weight.data.device)
         else:
-            masked_input = input_cpu
+            masked_input = input_
             input_mask = None
 
-        # Weight is on CPU (kept there by the `_apply` override above plus the
-        # model runner's post-`.to()` CPU sweep for tied weights).
-        # Run the lookup directly via aten.embedding on CPU — no Spyre
-        # device dispatch, so the unstable Spyre CPU-fallback path in
-        # torch_spyre/ops/fallbacks.py:245 never runs.
-        output_cpu = torch.nn.functional.embedding(
-            masked_input.long(), self.weight.data
-        )
+        output = torch.nn.functional.embedding(masked_input, self.weight.data)
 
         if self.tp_size > 1 and input_mask is not None:
-            keep = (~input_mask).to(output_cpu.dtype).unsqueeze(-1)
-            output_cpu = output_cpu * keep
-
-        # Route the (only) H2D copy through the existing opaque
-        # spyre_convert custom op so Inductor sees one FallbackKernel
-        # boundary, not a bare `.to(spyre_device)`.
-        output = convert(output_cpu, device=input_.device, dtype=output_cpu.dtype)
+            input_mask = convert(~input_mask, device=self.weight.data.device, dtype=output.dtype)
+            keep = input_mask.unsqueeze(-1)
+            output = output * keep
 
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
@@ -182,6 +155,4 @@ def register():
         mutates_args=[],
         dispatch_key="CompositeExplicitAutograd",
     )
-    logger.debug_once(
-        "Registered custom op: spyre_vocab_parallel_embedding_native"
-    )
+    logger.debug_once("Registered custom op: spyre_vocab_parallel_embedding_native")

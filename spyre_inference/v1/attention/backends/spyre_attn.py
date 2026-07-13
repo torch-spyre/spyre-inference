@@ -169,9 +169,7 @@ def _indirect_matmul_mock(
 
 
 def _maybe_compile(fn):
-    """Return fn unchanged: attention kernels always run eager for now.
-    
-    """
+    """Return fn unchanged: attention kernels always run eager for now."""
     return fn
 
 

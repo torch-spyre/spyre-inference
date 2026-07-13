@@ -254,7 +254,7 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             )
             scores *= scale
             scores = scores + mask_tile
-            scores_max = scores.max(dim=-1, keepdim=True)[0]
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
             if i == 0:
                 tile_max = scores_max

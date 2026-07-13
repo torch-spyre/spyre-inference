@@ -160,6 +160,37 @@ def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_conf
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.rotary
+def test_rotary_head_size_64_matches_reference(requires_spyre, default_vllm_config):
+    """head_size=64 (llama-3.2-1B) runs on Spyre via the pad-to-stick path.
+
+    rotary_dim=64 -> 2x2 inner dim 32 (not stick-aligned) -> zero-padded to 64 for the
+    on-device rotation, then sliced back. Regression guard: this config used to require
+    a CPU fallback and now raises at construction if the padding path is missing.
+    """
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(7)
+    head_size, max_position, num_tokens, num_heads = 64, 2048, 32, 4
+    rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
+    query = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
+    key = torch.randn(num_tokens, num_heads, head_size, dtype=torch.float16)
+
+    _prime_rope(rope, positions)
+    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(
+        rope, positions.cpu(), query.cpu(), key.cpu()
+    )
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
     """Build (query, key) on CPU as 2D [T, H*D] (production) or 3D [T, H, D]."""
     query = torch.randn(num_tokens, num_q_heads, head_size, dtype=torch.float16)
@@ -171,18 +202,21 @@ def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
 
 
 @pytest.mark.rotary
+@pytest.mark.parametrize("head_size", [128, 64])
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("flatten", [True, False])
 def test_rotary_forward_oot_on_spyre(
     requires_spyre,
     default_vllm_config,
+    head_size,
     num_q_heads,
     num_kv_heads,
     flatten,
 ):
     """forward_oot runs the 2x2 rotation on Spyre and matches forward_native.
 
-    head_size=128 (rotary_dim=128, stick-aligned) is the granite/llama target.
+    head_size=128 (rotary_dim=128, stick-aligned) is the granite/llama-3.1 target;
+    head_size=64 (inner dim 32) exercises the pad-to-stick path (llama-3.2-1B).
     Exercises GQA (MHA + grouped) and both the 2D [T, H*D] and 3D [T, H, D]
     layouts.
     """
@@ -190,7 +224,7 @@ def test_rotary_forward_oot_on_spyre(
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 
     torch.manual_seed(42)
-    head_size, max_position, num_tokens = 128, 2048, 32
+    max_position, num_tokens = 2048, 32
 
     rope = get_rope(
         head_size=head_size,
@@ -223,18 +257,17 @@ def test_rotary_forward_oot_on_spyre(
 @pytest.mark.parametrize(
     "head_size,partial_rotary_factor",
     [
-        (64, 1.0),  # full but unaligned: rotary_dim=64 -> inner dim 32
         (128, 0.5),  # partial AND unaligned: rotary_dim=64 -> inner dim 32
         (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> rejected for being partial
     ],
 )
 def test_rotary_unsupported_config_raises(default_vllm_config, head_size, partial_rotary_factor):
     """Configs the on-device path can't handle raise NotImplementedError at
-    construction (no CPU fallback). Covers an unaligned inner dim (head_size 64)
-    and partial rotary (rotary_dim < head_size) -- whose slicing has no Spyre
-    kernel -- including a partial case whose inner dim IS stick-aligned
-    (256, 0.5 -> rotary_dim 128), to confirm partial is rejected regardless of
-    alignment."""
+    construction (no CPU fallback). Covers partial rotary (rotary_dim < head_size)
+    -- whose slicing has no Spyre kernel -- including a partial case whose inner dim
+    IS stick-aligned (256, 0.5 -> rotary_dim 128), to confirm partial is rejected
+    regardless of alignment. (Full rotary with an unaligned inner dim, e.g.
+    head_size=64, is now supported via padding -- see the forward tests.)"""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     rope_parameters = (
@@ -351,16 +384,19 @@ def test_rotary_sel_cache_shared_across_layers(requires_spyre, default_vllm_conf
 
 
 @pytest.mark.rotary
-def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config):
-    """gather_rotation returns the per-token [T, 2, 2, rotary_dim//2] slice on
-    Spyre for a supported config."""
+@pytest.mark.parametrize("head_size", [128, 64])
+def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config, head_size):
+    """gather_rotation returns the per-token [T, 2, 2, padded] slice on Spyre for a
+    supported config, where padded = round_up(rotary_dim//2, 64) (== rotary_dim//2 for
+    head_size=128; padded 32->64 for head_size=64)."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
+    from spyre_inference.custom_ops.rotary_embedding import round_up
 
-    head_size, max_position, num_tokens = 128, 2048, 32
+    max_position, num_tokens = 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
     rot = rope.gather_rotation(positions, torch.device("spyre"))
     assert rot is not None
     assert rot.device.type == "spyre"
-    assert tuple(rot.shape) == (num_tokens, 2, 2, rope.rotary_dim // 2)
+    assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2))

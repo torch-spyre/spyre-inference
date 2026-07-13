@@ -23,9 +23,14 @@ slice to Spyre, and stashes it in the vLLM forward context. ``forward_oot``
 fetches that shared slice through the opaque ``spyre_rope_rot`` op (keeping
 the forward-context read out of torch.compile graphs) and applies the rotation.
 
-Configs without an on-device path (gptj/interleaved, partial rotary, unaligned
-head_size) have no Spyre RoPE kernel and raise ``NotImplementedError`` at
-construction rather than silently running on CPU.
+Configs without an on-device path (gptj/interleaved, partial rotary) have no
+Spyre RoPE kernel and raise ``NotImplementedError`` at construction rather than
+silently running on CPU. Full neox rotary is supported for any head_size: when
+the 2x2 layout's inner dim (``rotary_dim // 2``) is stick-aligned (e.g.
+head_size=128 -> 64) the whole rotation runs on Spyre; when it is not (e.g.
+head_size=64 -> 32) the split-half reshape has a sub-stick stride that the Spyre
+inductor rejects, so the split+zero-pad-to-stick is done on the host and the
+padded, stick-aligned tensor is moved back for the on-device rotation.
 """
 
 import itertools
@@ -50,9 +55,16 @@ from .utils import convert
 logger = init_logger(__name__)
 
 # Spyre stick size is 128 bytes = 64 float16 elements. The 2x2 layout's innermost
-# dim is rotary_dim // 2; torch-spyre  can only stick it when it is a multiple of 64, i.e.
-# rotary_dim % 128 == 0. Otherwise RoPE has no Spyre kernel and the config is rejected.
+# dim is rotary_dim // 2. When it is not a multiple of 64 (e.g. head_size=64 -> 32),
+# the split-half reshape has a sub-stick pairing-axis stride that torch-spyre cannot
+# read on device; the split+zero-pad-to-stick is then done on the host (see
+# _rotate_neox_2x2) and the padded, stick-aligned tensor is moved back for the rotation.
 _SPYRE_STICK = 64
+
+
+def round_up(n: int, m: int = _SPYRE_STICK) -> int:
+    """Round ``n`` up to the nearest multiple of ``m`` (the Spyre stick size)."""
+    return ((n + m - 1) // m) * m
 
 
 def _rotate_neox_2x2(
@@ -63,23 +75,54 @@ def _rotate_neox_2x2(
     """Apply full RoPE via 2x2 rotation matrices (neox / split-half pairing).
 
     Full rotary only (rotary_dim == head_size). Partial rotary needs a slicing,
-    so it is routed to the CPU fallback and never reaches this function.
+    so it has no Spyre kernel and never reaches this function.
+
+    The 2x2 layout's inner (stick) dim is ``head_size // 2``. When that is a stick
+    multiple (e.g. head_size=128 -> 64), ``x`` is reshaped directly with a pure view
+    and everything runs on Spyre. When it is not (e.g. head_size=64 -> 32), the
+    split-half view ``x.view(T, H, 2, inner)`` has a sub-stick pairing-axis stride
+    (``inner`` = head_size/2, not a multiple of 64), which torch-spyre's inductor
+    rejects (``Unexpected stick expression`` on any read of that view). So for the
+    unaligned case the split-and-pad is done on the HOST -- ``x`` is moved to CPU,
+    reshaped to ``[T, H, 2, inner]`` and zero-padded (at the END) to ``rot.shape[-1]``
+    (the next stick multiple), then the clean *contiguous* ``[T, H, 2, padded]`` (whose
+    pairing-axis stride is now ``padded``, stick-aligned) is moved back to Spyre. The
+    rotation, the padding strip (an offset-0 ``[..., :inner]`` slice -- Spyre supports
+    ``0:x`` but not ``x:y``), and the reconstruction all run on-device from there.
+    Padded lane values are irrelevant: the rotation cache is zero in the padded region.
 
     Args:
         x: query or key, shape ``[T, H*head_size]`` or ``[T, H, head_size]``.
-        rot: per-token rotation matrices, shape ``[T, 2, 2, head_size//2]``,
-            ``[[cos, -sin], [sin, cos]]`` on the leading 2x2 axes.
+        rot: per-token rotation matrices, shape ``[T, 2, 2, padded]`` where
+            ``padded >= head_size//2``, ``[[cos, -sin], [sin, cos]]`` on the leading
+            2x2 axes with zeros in the padded tail.
         head_size: per-head dim (== rotary_dim).
 
     Returns:
         Rotated tensor with the same shape as ``x``.
     """
     num_tokens = x.shape[0]
-    # ToDo boh, ysc: maybe need .contiguous() here? Not present in fms either though
-    # Split-half pairing: x_pairs[..., 0, :] = first half, [..., 1, :] = second half.
-    x_pairs = x.view(num_tokens, -1, 2, head_size // 2)  # [T, H, 2, D/2]
+    inner = head_size // 2
+    padded = rot.shape[-1]
+    if padded != inner:
+        # Sub-stick pairing-axis stride: the [T, H, 2, inner] split view is unreadable
+        # on Spyre, so do the split+pad on the host and move back the clean contiguous
+        # [T, H, 2, padded] (pairing-axis stride == padded, now stick-aligned).
+        x_cpu = convert(x, device="cpu")
+        assert x_cpu is not None
+        x_pairs = x_cpu.view(num_tokens, -1, 2, inner)
+        pad = torch.zeros(*x_pairs.shape[:-1], padded - inner, dtype=x_pairs.dtype)
+        x_pairs = convert(torch.cat([x_pairs, pad], dim=-1), device=x.device)
+    else:
+        # Split-half pairing via a pure view: x_pairs[..., 0, :] = first half,
+        # [..., 1, :] = second half. The view keeps the neox halves without slicing.
+        x_pairs = x.view(num_tokens, -1, 2, inner)  # [T, H, 2, inner]
     # out[..., a, :] = sum_b rot[..., a, b, :] * x_pairs[..., b, :]
-    out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)  # [T, H, 2, D/2]
+    out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)  # [T, H, 2, padded]
+    if padded != inner:
+        # Strip the padding (offset-0 slice) before reconstructing the head. The slice
+        # is non-contiguous, so make the reshape explicit with .contiguous().
+        out = out[..., :inner].contiguous()  # [T, H, 2, inner]
     return out.flatten(-2).view(x.shape)  # [T, H, D] -> original shape
 
 
@@ -87,32 +130,30 @@ class _SpyreRotaryMixin:
     """Spyre RoPE wiring shared by the base and llama3 OOT classes.
 
     Runs the 2x2 rotation on the Spyre device for supported configs (neox, full
-    rotary, stick-aligned inner dim); unsupported configs raise
-    ``NotImplementedError`` at construction. The 2x2 rotation-matrix cache is
-    derived from the base ``cos_sin_cache`` (so all rope-scaling variants are
-    inherited) and kept on CPU. It is built lazily.
+    rotary); unsupported configs raise ``NotImplementedError`` at construction. A
+    non-stick-aligned inner dim is handled by zero-padding it up to the next stick
+    multiple for the rotation. The 2x2 rotation-matrix cache is derived from the
+    base ``cos_sin_cache`` (so all rope-scaling variants are inherited) and kept on
+    CPU. It is built lazily.
     """
 
     _key_counter = itertools.count()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # On-device rotation needs neox (split-half) pairing, FULL rotary
-        # (rotary_dim == head_size; partial-rotary slicing has no Spyre kernel),
-        # and a stick-aligned inner dim (rotary_dim % 128 == 0). Anything else
-        # (gptj/interleaved, partial rotary, unaligned head_size like 64) has no
-        # Spyre RoPE kernel and is rejected here rather than run on CPU.
-        if not (
-            self.is_neox_style
-            and self.rotary_dim == self.head_size
-            and (self.rotary_dim // 2) % _SPYRE_STICK == 0
-        ):
+        # On-device rotation needs neox (split-half) pairing and FULL rotary
+        # (rotary_dim == head_size; partial-rotary slicing has no Spyre kernel).
+        # gptj/interleaved and partial rotary have no Spyre RoPE kernel and are
+        # rejected here rather than run on CPU. An unaligned inner dim (e.g.
+        # head_size=64 -> inner 32) is supported via padding in _rotate_neox_2x2.
+        if not (self.is_neox_style and self.rotary_dim == self.head_size):
             raise NotImplementedError(
-                "SpyreRoPE supports only neox-style full rotary with a stick-aligned "
-                f"inner dim (rotary_dim % {2 * _SPYRE_STICK} == 0); got "
-                f"is_neox_style={self.is_neox_style}, rotary_dim={self.rotary_dim}, "
-                f"head_size={self.head_size}."
+                "SpyreRoPE supports only neox-style full rotary (rotary_dim == "
+                f"head_size); got is_neox_style={self.is_neox_style}, "
+                f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
+        # Inner (stick) dim of the 2x2 layout, padded up to the next stick multiple.
+        self._padded_inner = round_up(self.rotary_dim // 2)
         self._rotation_cache: torch.Tensor | None = None
         # Stable per-instance (== per rope-config) key for the forward-context
         # rotation dict, passed through the opaque spyre_rope_rot op.
@@ -127,13 +168,20 @@ class _SpyreRotaryMixin:
 
         cos_sin_cache is [max_pos, rotary_dim] = cat((cos, sin)); reshape into
         [max_pos, 2, 2, rotary_dim//2] rotation matrices [[cos, -sin], [sin, cos]].
+        The inner dim is zero-padded (at the end) up to the next stick multiple so
+        the on-device rotation runs stick-aligned; when already aligned this is a
+        no-op. All CPU work, so the padding op is unconstrained.
         """
         # Built lazily on the first gather_rotation() call during warmup.
         if self._rotation_cache is None:
-            cos, sin = self._cpu_cos_sin_cache.chunk(2, dim=-1)  # [max_pos, Dr/2]
-            self._rotation_cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
-                self._cpu_cos_sin_cache.shape[0], 2, 2, self.rotary_dim // 2
+            inner = self.rotary_dim // 2
+            cos, sin = self._cpu_cos_sin_cache.chunk(2, dim=-1)  # [max_pos, inner]
+            cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
+                self._cpu_cos_sin_cache.shape[0], 2, 2, inner
             )
+            if self._padded_inner != inner:
+                cache = torch.nn.functional.pad(cache, (0, self._padded_inner - inner))
+            self._rotation_cache = cache
         return self._rotation_cache
 
     def gather_rotation(
@@ -219,8 +267,10 @@ def _rope_rot_op_func(positions: torch.Tensor, rope_key: str, head_size: int) ->
 
 
 def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) -> torch.Tensor:
+    # Inner dim is padded up to the next stick multiple (see _rotate_neox_2x2), so the
+    # fake/meta shape must match the padded rotation slice torch.compile sees.
     return torch.empty(
-        (positions.shape[0], 2, 2, head_size // 2),
+        (positions.shape[0], 2, 2, round_up(head_size // 2)),
         dtype=torch.float16,
         device=positions.device,
     )

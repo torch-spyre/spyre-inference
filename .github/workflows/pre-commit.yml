@@ -78,6 +78,7 @@ jobs:
       with:
         path: ${{ runner.temp }}/rpms
         key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+        enableCrossOsArchive: true
 
     - name: RPM cache result
       run: |

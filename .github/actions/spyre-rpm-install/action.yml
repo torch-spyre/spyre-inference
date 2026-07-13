@@ -20,6 +20,7 @@ runs:
       with:
         path: ${{ runner.temp }}/rpms
         key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+        enableCrossOsArchive: true
 
     - name: Fail on RPM cache miss
       if: steps.rpm-cache.outputs.cache-hit != 'true'

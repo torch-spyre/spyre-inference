@@ -64,11 +64,15 @@ jobs:
         prune-cache: false
 
     - name: "Install dependencies"
+      env:
+        AIU_SETUP_MULTI_AIU: '0'
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uv sync --frozen --no-dev -v
 
     - name: "Run ty via prek"
+      env:
+        AIU_SETUP_MULTI_AIU: '0'
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uvx prek@v0.4.4 run ty --all-files --stage pre-commit

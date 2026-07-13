@@ -63,7 +63,11 @@ jobs:
   populate:
     name: Download and cache Spyre RPMs
     if: github.event_name != 'pull_request_target'
-    runs-on: ubuntu-latest
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+      - image_torch_spyre_pinned
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -83,9 +87,9 @@ jobs:
 
       - name: Check RPM cache
         id: rpm-cache
-        uses: actions/cache/restore@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/rpms
+          path: /tmp/spyre-rpms
           key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
           lookup-only: true
 
@@ -108,12 +112,12 @@ jobs:
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
           RPM_NAMES_TXT: spyre-rpms.lock
-          RPMS_DOWNLOAD_DIR: ${{ runner.temp }}/rpms
+          RPMS_DOWNLOAD_DIR: /tmp/spyre-rpms
         run: bash .github/scripts/download_rpms.sh
 
       - name: Save RPM cache
         if: steps.rpm-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/rpms
+          path: /tmp/spyre-rpms
           key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}

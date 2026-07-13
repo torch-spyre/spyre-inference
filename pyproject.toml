@@ -17,6 +17,7 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
+    "hf-adapters-spyre"
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -32,6 +33,7 @@ spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
 spyre_inference_ops = "spyre_inference:register_ops"
+spyre_inference_hf_adaptor = "spyre_inference:register_hf_adapters"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -61,6 +63,9 @@ override-dependencies = [
     # Skipping torch-vision temporarily
     # TODO: This will be required in the future for VLM support via vllm
     "torchvision; sys_platform == 'never'",
+
+    # (transformers imports it at module level via loss_rnnt.py)
+    "torchaudio; sys_platform == 'never'",
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "vllm ; platform_machine not in 's390x, ppc64le'",
@@ -105,6 +110,7 @@ vllm = [
   { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0", marker = "sys_platform != 'linux'" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "864104b378f691d55c21c98a4dc0fccd4b391954" }
+hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },
 ]

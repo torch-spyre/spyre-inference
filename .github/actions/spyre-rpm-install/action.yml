@@ -46,6 +46,9 @@ runs:
         done < <(grep -v '^[[:space:]]*#' spyre-rpms.lock | grep -v '^[[:space:]]*$')
         NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
         echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+        # Override the base install dir so ibm-aiu-setup.sh derives include
+        # paths from our extracted RPMs instead of the image-baked /opt/ibm/spyre.
+        echo "SENTIENT_BASE_INSTALL_DIR=${SPYRE_LIBS}/opt/ibm/spyre" >> "$GITHUB_ENV"
 
     - name: Output RPM hash
       id: hash

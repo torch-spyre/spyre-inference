@@ -12,40 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for VocabParallelEmbedding.
-
-The embedding layer is kept ENTIRELY ON CPU. Rationale: the Spyre backend
-registers `aten.embedding.default` as a `register_fallback`-based CPU
-fallback (see `torch_spyre/ops/fallbacks.py:245`). That fallback wrapper
-moves the embedding inputs to CPU, runs `torch.embedding` there, and
-copies the result back to Spyre via `spyre_copy_from`. When this happens
-inside an Inductor-compiled forward graph, the H2D copy violates Inductor's
-view-tracking and corrupts the heap — Granite-3.3-8B crashes with
-`malloc_consolidate(): invalid chunk size` at the first forward call
-(see `embedding_heap_corruption_findings.md`).
-
-Two-part fix here:
-
-1. Override `_apply` so the embedding weight tensor never moves to Spyre
-   in the first place (mirrors the Attention pattern at
-   `spyre_model_runner.py:269`). The weight stays on CPU as a normal
-   `nn.Parameter`. No per-call D2H of a 4 GB weight tensor; no Spyre↔
-   CPU traffic for the weight ever.
-
-2. Wrap `forward` as a `direct_register_custom_op`
-   (`torch.ops.vllm.spyre_vocab_parallel_embedding_native`). The
-   embedding op then appears as a single opaque FallbackKernel to
-   Inductor — invisible to the compile pipeline. Only the
-   already-on-CPU `F.embedding(input_cpu, weight_cpu)` runs in the op
-   body; the only Spyre↔CPU traffic per call is the small input_ids
-   tensor (D2H) and the resulting hidden_states (H2D), both routed
-   through the existing opaque `spyre_convert` custom op.
-"""
+"""Spyre OOT replacement for VocabParallelEmbedding."""
 
 from functools import lru_cache
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -62,18 +35,7 @@ logger = init_logger(__name__)
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
-    """Out-of-tree (OOT) VocabParallelEmbedding implementation for Spyre.
-
-    Embedding weight stays on CPU; the entire layer's forward runs on CPU
-    and only the result is moved to Spyre via `spyre_convert`.
-    """
-
-    # Marker read by the model runner after `model.to(spyre)`: force this
-    # module's params/buffers back to CPU. Necessary because when the weight
-    # is TIED to a Spyre-native layer (lm_head with tie_word_embeddings), the
-    # `_apply` no-op below is bypassed and the shared storage gets moved to
-    # Spyre in place. See spyre_model_runner.load_model.
-    _spyre_keep_on_cpu = True
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for Spyre."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -153,6 +115,7 @@ def register():
         op_func=_vocab_parallel_embedding_native_op_func,
         fake_impl=_vocab_parallel_embedding_native_op_fake,
         mutates_args=[],
-        dispatch_key="CompositeExplicitAutograd",
+        # dispatch_key="CompositeExplicitAutograd",
+        dispatch_key=current_platform.dispatch_key,
     )
     logger.debug_once("Registered custom op: spyre_vocab_parallel_embedding_native")

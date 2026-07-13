@@ -97,15 +97,6 @@ def test_native_all_gather_into_tensor_works(run_tp_probe) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "list-form allgather is wired up but leaves a zero-size device "
-        "output on the current build: a D2H copy of the gathered tensor "
-        "fails with 'device_address size must be greater than zero'. When "
-        "this flips to passing, delete SpyreCommunicator.all_gather."
-    ),
-)
 def test_native_all_gather_list_works(run_tp_probe) -> None:
     run_tp_probe("native_all_gather_list", world_size=2)
 
@@ -115,15 +106,6 @@ def test_native_all_gather_list_works(run_tp_probe) -> None:
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "gather is wired up but leaves a zero-size device output on the "
-        "current build: a D2H copy of a gathered tensor fails with "
-        "'device_address size must be greater than zero'. When this flips "
-        "to passing, the native gather path can replace the manual fallback."
-    ),
 )
 def test_native_gather_works(run_tp_probe) -> None:
     run_tp_probe("native_gather", world_size=2)

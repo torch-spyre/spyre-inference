@@ -419,7 +419,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tile_shape: tuple[int, int] = (0, 0)
 
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
-        """Return (or create) the shared all-zero mask tile for interior blocks."""
+        """Return (or create) the shared all-zero mask tile for interior blocks.
+
+        The returned tensor is reused by reference across all interior blocks
+        and sequences in a batch. Callers must treat it as read-only: any
+        in-place mutation would corrupt every interior tile simultaneously.
+        This is safe today because attention kernels only read mask tiles.
+        """
         shape = (aligned_max_query_len, self.block_size)
         if self._zero_tile is None or self._zero_tile_shape != shape:
             self._zero_tile = torch.zeros(shape, dtype=self.model_dtype)
@@ -436,15 +442,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         aligned_max_seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Build additive attention mask on Spyre.
+        """Build additive attention mask on Spyre for the non-sliding-window path.
 
         All sequences share the same aligned_max_query_len so every mask tile
         has a uniform query dimension — this avoids per-sequence kernel
         specializations.
 
+        Sliding-window sequences take a different path: see
+        _build_active_tiles_with_skip.
+
         Returns:
             - mask: [num_seqs, aligned_max_query_len, aligned_max_seq_len] additive mask
         """
+        assert self.sliding_window is None
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         num_seqs = len(seq_lens)
 
@@ -463,23 +473,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)
             causal_ok = kv_pos_exp <= causal_limit
             attend = attend & causal_ok
-
-        # Sliding window mask: limit attention to recent tokens
-        # For query at absolute position p, attend to [max(0, p - sliding_window + 1), p]
-        # Example: p=5, window=4 → attend to [2,3,4,5] (4 tokens)
-        # Note: computed on max_query_len; padding applied after (lines 454-462)
-        if self.sliding_window is not None:
-            context_lens = seq_lens - query_lens  # [num_seqs]
-            # Absolute query position: context_len + q_pos
-            # Window start: max(0, absolute_pos - sliding_window + 1)
-            window_start = (
-                context_lens.unsqueeze(1) + q_pos.unsqueeze(0) - self.sliding_window + 1
-            ).clamp(min=0)
-            kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, aligned_max_seq_len]
-            window_ok = kv_pos_exp >= window_start.unsqueeze(
-                2
-            )  # [num_seqs, max_query_len, aligned_max_seq_len]
-            attend = attend & window_ok
 
         # Convert to additive mask: finfo.min for masked positions, 0 for valid
         mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
@@ -504,7 +497,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
     def _build_single_tile(
         self,
-        seq_idx: int,
         block_idx: int,
         kv_len: int,
         query_len: int,
@@ -561,7 +553,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
     def _build_active_tiles_with_skip(
         self,
-        seq_idx: int,
         kv_len: int,
         query_len: int,
         context_len: int,
@@ -582,16 +573,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 lower-boundary blocks — the window cutoff falls inside them
                 for at least one query. Real tile with per-query-row cutoffs.
                 In decode (query_len == 1) this collapses to a single block.
-          - (last_lower_boundary, last_block):
-                interior blocks — fully inside every query's window with no
-                padding. Their mask is all-zeros; share one zero tile.
+          - (last_lower_boundary, last_causal_interior]:
+                interior blocks — fully inside every query's window AND fully
+                below the earliest query's causal limit. Mask is all-zero.
+          - (last_causal_interior, last_block):
+                causal-boundary blocks — inside every window, but early
+                queries have causal cutoffs falling inside them (prefill
+                only). Real tile.
           - last_block:
                 upper-boundary block — always has KV padding (and causal
                 cutoffs during prefill). Real tile.
 
-        When the lower/upper boundary ranges overlap (short kv_len,
-        single-block sequence, etc.) real tiles are built for the union —
-        never zero tiles.
+        When any of the boundary ranges overlap (short kv_len, single-block
+        sequence, etc.) real tiles are built for the union — never zero tiles.
         """
         assert self.sliding_window is not None
         block_size = self.block_size
@@ -615,6 +609,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Every block from first_active up to the block containing the
         # latest window start can have a per-query cutoff falling inside it.
         last_lower_boundary = latest_window_start // block_size
+        # A block is fully below the earliest query's causal limit
+        # (abs_pos = context_len) iff (b + 1) * block_size - 1 <= context_len.
+        # For decode (no causal mask) all blocks satisfy this trivially.
+        if apply_causal_mask:
+            last_causal_interior = (context_len + 1) // block_size - 1
+        else:
+            last_causal_interior = num_blocks - 1
         last_block = num_blocks - 1
 
         active_bs = list(range(first_active, num_blocks))
@@ -627,10 +628,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for b in active_bs:
             is_lower_boundary = b <= last_lower_boundary
             is_upper_boundary = (b == last_block) and not is_lower_boundary
-            if is_lower_boundary or is_upper_boundary:
+            is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
+            if is_lower_boundary or is_upper_boundary or is_causal_boundary:
                 tiles.append(
                     self._build_single_tile(
-                        seq_idx,
                         b,
                         kv_len,
                         query_len,
@@ -640,8 +641,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     )
                 )
             else:
-                # Interior block: entirely within every query's window and
-                # entirely filled with valid KV tokens. Mask is all-zero.
+                # Interior block: entirely within every query's window,
+                # entirely filled with valid KV tokens, and (for prefill)
+                # entirely below the earliest query's causal limit.
+                # Mask is all-zero.
                 tiles.append(zero_tile)
 
         return active_bs, tiles
@@ -664,6 +667,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         causal = common_attn_metadata.causal
         if isinstance(causal, torch.Tensor):
             causal = bool(causal.item())
+        # Batch-level flag: True iff the batch contains at least one prefill
+        # sequence (max_query_len > 1). For decode sequences (query_len == 1)
+        # in a mixed batch, the causal constraint is subsumed by the KV
+        # validity mask (the single query at position context_len can only
+        # attend to KV positions [0, kv_len) = [0, context_len]), so applying
+        # the causal mask to them is a correct no-op.
         apply_causal_mask = causal and max_query_len > 1
 
         aligned_max_query_len = (
@@ -718,7 +727,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 context_len_s = kv_len_s - query_len_s
 
                 active_bs, tiles = self._build_active_tiles_with_skip(
-                    s,
                     kv_len_s,
                     query_len_s,
                     context_len_s,

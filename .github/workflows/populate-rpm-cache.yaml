@@ -88,6 +88,7 @@ jobs:
           path: ${{ runner.temp }}/rpms
           key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
           lookup-only: true
+          enableCrossOsArchive: true
 
       - name: List Artifactory RPMs
         if: steps.rpm-cache.outputs.cache-hit != 'true'
@@ -117,3 +118,4 @@ jobs:
         with:
           path: ${{ runner.temp }}/rpms
           key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+          enableCrossOsArchive: true

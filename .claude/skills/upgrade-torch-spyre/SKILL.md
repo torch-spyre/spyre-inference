@@ -33,9 +33,10 @@ ARTIFACTORY_TOKEN     # Bearer token (rotate via Artifactory UI → Access Token
 ARTIFACTORY_RPM_REPO  # RPM repository name
 ```
 
-Validate before starting:
+Validate before starting (note: strip trailing slash from `ARTIFACTORY_URL` to avoid double-slash in API paths — some Artifactory endpoints silently 404 on `//artifactory/...`):
 
 ```bash
+ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
 curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
   "$ARTIFACTORY_URL/artifactory/api/repositories/$ARTIFACTORY_RPM_REPO" \
   | jq .key
@@ -205,6 +206,9 @@ This gives us the package names, versions, and commit SHAs — but with `_0` as 
 Query the Artifactory API directly to list all RPMs in the x86_64 directory, then match against the installed versions:
 
 ```bash
+# Normalize URL (trailing slash causes //artifactory/ double-slash 404s)
+ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
+
 # Fetch the full x86_64 RPM listing from Artifactory
 curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
   "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_RPM_REPO/x86_64" \

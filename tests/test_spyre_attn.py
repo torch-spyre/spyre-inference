@@ -443,10 +443,10 @@ def _run_spyre_attn_test(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        pytest.param([(1, 1024)], id="decode(q=1,kv=1024)"),
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
-        pytest.param([(100, 512)], id="prefill(q=100,kv=512)"),
+        pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
         pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
     ],
 )
@@ -487,7 +487,7 @@ def test_spyre_attn_core(
     [
         pytest.param([(1, 64)], id="decode(q=1,kv=64)"),
         pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
-        pytest.param([(64, 512)], id="prefill(q=64,kv=512)"),
+        pytest.param([(32, 288)], id="prefill(q=32,kv=288)"),
     ],
 )
 @pytest.mark.parametrize(

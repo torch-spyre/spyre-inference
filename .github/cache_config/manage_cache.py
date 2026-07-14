@@ -39,12 +39,12 @@ def main():
     with open(config_file, encoding="utf-8") as f:
         try:
             config = yaml.safe_load(f)
-            models = config.get("models", [])
+            models = config.get("gated_models", [])
         except Exception as e:
             print(f"❌ Error parsing {config_file}: {e}")
             sys.exit(1)
     if not models:
-        print(f"⚠️ Warning: No models defined in {config_file}.")
+        print(f"⚠️ Warning: No gated_models defined in {config_file}.")
         sys.exit(0)
     print(f"📋 Found {len(models)} model(s) to cache:", models)
     failed_models = []

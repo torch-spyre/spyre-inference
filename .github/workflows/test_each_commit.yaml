@@ -265,6 +265,34 @@ jobs:
           ls -la usr/lib64/
           echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
 
+      - name: Ensure public HF models cached
+        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
+        env:
+          HF_HUB_OFFLINE: '0'
+        run: |
+          # Offline check first; download on cache miss.
+          uv run python -c "
+          import yaml
+          from huggingface_hub import snapshot_download
+          from huggingface_hub.utils import LocalEntryNotFoundError
+
+          with open('.github/cache_config/hf_models_and_datasets.yaml') as f:
+              cfg = yaml.safe_load(f)
+
+          for repo_id in cfg.get('public_models', []):
+              try:
+                  snapshot_download(repo_id, local_files_only=True, ignore_patterns=['*.pt', '*.bin'])
+                  print(f'{repo_id}: already cached')
+                  continue
+              except LocalEntryNotFoundError:
+                  pass
+              try:
+                  snapshot_download(repo_id, local_files_only=False, ignore_patterns=['*.pt', '*.bin'])
+                  print(f'{repo_id}: downloaded and cached')
+              except Exception as e:
+                  print(f'{repo_id}: WARNING failed to cache ({e})')
+          "
+
       - name: Run tests
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
         run: |

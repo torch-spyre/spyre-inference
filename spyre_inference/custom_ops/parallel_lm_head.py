@@ -14,8 +14,6 @@
 
 """Spyre OOT replacement for ParallelLMHead.
 
-Executes the lm_head matmul (hidden_states @ weight.T) on Spyre.
-
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
@@ -104,16 +102,12 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
-        # x already resides on Spyre (moved in _SpyreModelWrapper.compute_logits),
-        # so no conversion is needed here. Due to a limitation of torch-spyre
-        # regarding sizes usable in F.linear, the weights are padded.
-        out = F.linear(
-            x,
-            self.padded_weight.data,
-            bias,
-        )
-
-        out_cpu = convert(out, device="cpu")
-        out_cpu_no_pad = out_cpu[:, : -self.padding] if self.padding > 0 else out_cpu
-        # Currently output has to remain on CPU because of all_gather in case of TP > 1
-        return out_cpu_no_pad
+        out = F.linear(x, self.padded_weight.data, bias)
+        # Slice off the padding rows that process_weights_after_loading added
+        # (they appear as trailing logit columns).
+        if self.padding > 0:
+            # .contiguous() kept for safety
+            out = out[:, : -self.padding].contiguous()
+        # Logits must land on CPU: the subsequent all_gather (TP > 1) would
+        # crash on a Spyre tensor.
+        return convert(out, device="cpu")

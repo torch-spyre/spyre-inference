@@ -1,0 +1,59 @@
+name: Install locked Spyre RPMs
+description: >
+  Restores the GHA RPM cache for the current spyre-rpms.lock, extracts
+  RPMs into user-space via rpm2cpio, wires LD_LIBRARY_PATH, and outputs
+  the lock-file hash for use as the uv wheel-cache suffix.
+
+outputs:
+  rpms-hash:
+    description: >
+      Hash of spyre-rpms.lock. Pass as uv cache-suffix so the wheel cache
+      is invalidated when RPM versions change.
+    value: ${{ steps.hash.outputs.rpms-hash }}
+
+runs:
+  using: composite
+  steps:
+    - name: Restore RPM cache
+      id: rpm-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: /tmp/spyre-rpms
+        key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+
+    - name: Fail on RPM cache miss
+      if: steps.rpm-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        echo "::error::RPM cache miss for spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}. Trigger the populate-rpm-cache workflow to populate it."
+        exit 1
+
+    - name: Extract RPMs
+      shell: bash
+      run: |
+        set -euo pipefail
+        SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
+        ARCH="$(arch)"
+        mkdir -p "$SPYRE_LIBS"
+        while IFS= read -r name; do
+          rpm="/tmp/spyre-rpms/${name}.${ARCH}.rpm"
+          if [[ ! -f "$rpm" ]]; then
+            echo "::error::Expected RPM not found: $rpm"
+            exit 1
+          fi
+          echo "Extracting $(basename "$rpm")..."
+          rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
+        done < <(grep -v '^[[:space:]]*#' spyre-rpms.lock | grep -v '^[[:space:]]*$')
+        NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
+        echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
+        # Point SENTIENT_BASE_INSTALL_DIR at our extracted RPMs and clear the
+        # _IBM_AIU_SETUP guard so that ibm-aiu-setup.sh re-derives all install
+        # paths (RUNTIME_INSTALL_DIR, DEEPTOOLS_INSTALL_DIR, etc.) from it in
+        # subsequent steps rather than using the stale image-baked /opt/ibm/spyre.
+        echo "SENTIENT_BASE_INSTALL_DIR=${SPYRE_LIBS}/opt/ibm/spyre" >> "$GITHUB_ENV"
+        echo "_IBM_AIU_SETUP=" >> "$GITHUB_ENV"
+
+    - name: Output RPM hash
+      id: hash
+      shell: bash
+      run: echo "rpms-hash=${{ hashFiles('spyre-rpms.lock') }}" >> "$GITHUB_OUTPUT"

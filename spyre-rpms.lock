@@ -1,17 +1,17 @@
 # Pinned Spyre RPM package names, one per line.
 # Lines starting with # are ignored.
 # Specify exact versions to pin (e.g. ibm-deeptools-1.2.3-1.el8).
-# The cache key is derived from this file's hash — changing any entry
+# The cache key is derived from this file's hash. Changing any entry
 # invalidates the GHA RPM cache and triggers a fresh download.
 #
-ibm-aiu-toolbox-e2e-1.2.5_rc.1-1_91.el10
-ibm-deeptools-2.0.0-0.main.1+1332.34778f9_189.el10
-ibm-deeptools-devel-1.2.0-1_76.el10
-ibm-flex-2.0.0-0.main.1+369.541cfe8_133.el10
-ibm-flex-devel-1.2.0-1_89.el10
-ibm-libaiupti-2.0.0-0.main.1+14.9695403_0.el10
-ibm-senlib-core-2.0.0-0.main.1+190.348d7be_104.el10
-ibm-senlib-dd2-2.0.0-0.main.1+190.348d7be_104.el10
-ibm-senlib-headers-2.0.0-0.main.1+190.348d7be_104.el10
-ibm-spyre-comms-1.0.0-0.main.1+69.52c4cdd_44.el10
-ibm-spyre-comms-devel-0.1.0-1_92.el10
+ibm-aiu-toolbox-e2e-2.0.0-0.main.1+26.7160202_46.el10
+ibm-deeptools-2.0.0-0.main.1+1401.ee2f97a_198.el10
+ibm-deeptools-devel-2.0.0-0.main.1+1401.ee2f97a_198.el10
+ibm-flex-2.0.0-0.main.1+389.527f231_157.el10
+ibm-flex-devel-2.0.0-0.main.1+389.527f231_157.el10
+ibm-senlib-core-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-senlib-dd2-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-senlib-headers-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-spyre-comms-1.0.0-0.main.1+79.bafbbc4_60.el10
+ibm-spyre-comms-devel-1.0.0-0.main.1+79.bafbbc4_60.el10
+ibm-spyre-comms-test-1.0.0-0.main.1+79.bafbbc4_60.el10

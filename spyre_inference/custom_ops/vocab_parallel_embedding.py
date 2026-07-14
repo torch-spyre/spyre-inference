@@ -14,6 +14,8 @@
 
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
+from typing import cast
+
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -58,7 +60,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
             input_mask = None
 
-        output = torch.nn.functional.embedding(masked_input, self.weight.data)
+        weight = cast(torch.Tensor, self.weight.data)
+        output = torch.nn.functional.embedding(masked_input, weight)
 
         if self.tp_size > 1 and input_mask is not None:
             input_mask = convert(~input_mask, device=self.weight.data.device, dtype=output.dtype)

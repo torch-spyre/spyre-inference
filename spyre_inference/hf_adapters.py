@@ -92,6 +92,7 @@ def _make_spyre_apply_rotary(original_fn, qk_expand=None):
     @torch.no_grad()
     def wrapper(q, k, cos, sin=None, *args, **kwargs):
         if qk_expand is not None:
+            assert qk_contract is not None
             dev = q.device
             if dev not in _cached:
                 _cached[dev] = (
@@ -110,7 +111,7 @@ def _make_spyre_apply_rotary(original_fn, qk_expand=None):
 
         return q, k
 
-    wrapper._spyre_patched = True  # type: ignore[attr-defined]
+    wrapper._spyre_patched = True
     return wrapper
 
 

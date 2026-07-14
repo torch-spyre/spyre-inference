@@ -4,14 +4,14 @@
 # The cache key is derived from this file's hash. Changing any entry
 # invalidates the GHA RPM cache and triggers a fresh download.
 #
-ibm-aiu-toolbox-e2e-2.0.0-0.main.1+26.7160202_45.el10
-ibm-deeptools-2.0.0-0.main.1+1401.ee2f97a_197.el10
-ibm-deeptools-devel-2.0.0-0.main.1+1401.ee2f97a_197.el10
-ibm-flex-2.0.0-0.main.1+388.81385a4_155.el10
-ibm-flex-devel-2.0.0-0.main.1+388.81385a4_155.el10
-ibm-senlib-core-2.0.0-0.main.1+194.951e4c4_113.el10
-ibm-senlib-dd2-2.0.0-0.main.1+194.951e4c4_113.el10
-ibm-senlib-headers-2.0.0-0.main.1+194.951e4c4_113.el10
-ibm-spyre-comms-1.0.0-0.main.1+78.596563f_58.el10
-ibm-spyre-comms-devel-1.0.0-0.main.1+78.596563f_58.el10
-ibm-spyre-comms-test-1.0.0-0.main.1+78.596563f_58.el10
+ibm-aiu-toolbox-e2e-2.0.0-0.main.1+26.7160202_46.el10
+ibm-deeptools-2.0.0-0.main.1+1401.ee2f97a_198.el10
+ibm-deeptools-devel-2.0.0-0.main.1+1401.ee2f97a_198.el10
+ibm-flex-2.0.0-0.main.1+389.527f231_157.el10
+ibm-flex-devel-2.0.0-0.main.1+389.527f231_157.el10
+ibm-senlib-core-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-senlib-dd2-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-senlib-headers-2.0.0-0.main.1+194.951e4c4_114.el10
+ibm-spyre-comms-1.0.0-0.main.1+79.bafbbc4_60.el10
+ibm-spyre-comms-devel-1.0.0-0.main.1+79.bafbbc4_60.el10
+ibm-spyre-comms-test-1.0.0-0.main.1+79.bafbbc4_60.el10

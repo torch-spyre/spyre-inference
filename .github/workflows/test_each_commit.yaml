@@ -150,7 +150,7 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
       # against a gated repo 401s even when the model is on the PVC.
-      # HF_HUB_OFFLINE: '1'
+      HF_HUB_OFFLINE: '1'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -264,6 +264,27 @@ jobs:
           rpm2cpio numactl-libs.rpm | cpio -idmv
           ls -la usr/lib64/
           echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - name: Cache public HF models (download if not already on PVC)
+        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
+        env:
+          HF_HUB_OFFLINE: '0'
+        run: |
+          # Downloads every model listed under public_models in hf_models_and_datasets.yaml.
+          # HF_HUB_OFFLINE is overridden to '0' for this step only so the download can
+          # reach the Hub; the job-level '1' still protects all other steps from 401s
+          # on gated models. snapshot_download is idempotent: already-cached models
+          # return instantly. To add a new public model, just append it to public_models
+          # in .github/cache_config/hf_models_and_datasets.yaml.
+          uv run python -c "
+          import yaml
+          from huggingface_hub import snapshot_download
+          with open('.github/cache_config/hf_models_and_datasets.yaml') as f:
+              cfg = yaml.safe_load(f)
+          for repo_id in cfg.get('public_models', []):
+              snapshot_download(repo_id, ignore_patterns=['*.pt', '*.bin'])
+              print(f'{repo_id}: cached')
+          "
 
       - name: Run tests
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}

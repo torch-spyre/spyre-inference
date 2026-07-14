@@ -33,6 +33,7 @@ defaults:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   # ─── Generate benchmark matrix from spyre config files ───
@@ -91,15 +92,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Compute Spyre image hash
-        id: spyre-uv-cache
-        uses: ./.github/actions/spyre-uv-cache
+      - name: Install Spyre RPMs
+        id: spyre-rpms
+        uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-          cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           prune-cache: false
 

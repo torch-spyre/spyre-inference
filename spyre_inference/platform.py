@@ -127,7 +127,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # When enforce_eager is set, vLLM has already reset the mode to NONE;
         # preserve that so eager stays eager.
-        if vllm_config.model_config is not None and vllm_config.model_config.enforce_eager:
+        if vllm_config.model_config.enforce_eager:
             vllm_config.compilation_config.mode = CompilationMode.NONE
         else:
             vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE

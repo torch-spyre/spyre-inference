@@ -64,7 +64,7 @@ class SpyreRMSNorm(RMSNorm):
 
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
-        if self.weight.data is not None:
+        if self.has_weight:
             x = x * self.weight
         if residual is None:
             return x

@@ -351,7 +351,11 @@ def ref_attn(
     "num_blocks",
     [
         # pytest.param(2048, id="num_blocks(2048)"),
-        pytest.param(256, id="num_blocks(256)"),
+        # 64 blocks is 2× the max needed by any seq_lens config in this sweep
+        # (max kv_len=1024, block_size=64 → 16 blocks per seq; batch=2 → 32).
+        # Prior value of 256 stressed the Spyre VFIO DMA-mapping table across
+        # accumulated tests in a single pytest process.
+        pytest.param(64, id="num_blocks(64)"),
     ],
 )
 @torch.inference_mode()
@@ -511,6 +515,16 @@ def test_spyre_attn(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+    # Release Spyre DMA mappings eagerly. Python doesn't free the KV-page
+    # tensors between tests until GC runs, but the Spyre VFIO driver keeps
+    # DMA regions mapped until the storage is actually released. Accumulated
+    # mappings across many tests in one pytest process can exhaust the VFIO
+    # address-space table (RAS::VFIO::MapDMAFailed).
+    if configure_device == "spyre":
+        del k_pages, v_pages, kv_cache, output
+        import gc
+        gc.collect()
 
 
 def test_block_size_validation():

@@ -14,11 +14,8 @@
 
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
-from functools import lru_cache
-
 import torch
 
-from vllm.platforms import current_platform
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -26,16 +23,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert, get_layer, register_layer
+from .utils import convert
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
-    """Out-of-tree (OOT) VocabParallelEmbedding implementation for Spyre."""
+    """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -44,20 +40,8 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
-        self._spyre_layer_name = register_layer(self, "spyre_vocab_parallel_embedding")
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        # The whole forward is one opaque FallbackKernel as far as Inductor
-        # is concerned. See module docstring for the why.
-        return torch.ops.vllm.spyre_vocab_parallel_embedding_native(input_, self._spyre_layer_name)
-
-    def _forward_impl(self, input_: torch.Tensor) -> torch.Tensor:
-        """Inner body called by the opaque-wrapping custom op.
-
-        The weight is already CPU-resident (see `_apply` override). We
-        just need to land `input_` on CPU and send the result back to
-        whatever device the caller provided.
-        """
         input_cpu = convert(input_, device="cpu")
 
         if self.tp_size > 1:
@@ -84,38 +68,3 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output
-
-
-def _vocab_parallel_embedding_native_op_func(
-    input_: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    layer = get_layer(layer_name)
-    out = layer._forward_impl(input_)
-    # Custom-op contract: fresh, non-aliasing storage for each returned tensor.
-    return out.contiguous()
-
-
-def _vocab_parallel_embedding_native_op_fake(
-    input_: torch.Tensor,
-    layer_name: str,
-) -> torch.Tensor:
-    layer = get_layer(layer_name)
-    embed_weight = layer.weight
-    hidden_size = embed_weight.shape[1]
-    out_shape = list(input_.shape) + [hidden_size]
-    return torch.empty(out_shape, dtype=embed_weight.dtype, device=input_.device)
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register the spyre_vocab_parallel_embedding_native custom op."""
-    direct_register_custom_op(
-        op_name="spyre_vocab_parallel_embedding_native",
-        op_func=_vocab_parallel_embedding_native_op_func,
-        fake_impl=_vocab_parallel_embedding_native_op_fake,
-        mutates_args=[],
-        # dispatch_key="CompositeExplicitAutograd",
-        dispatch_key=current_platform.dispatch_key,
-    )
-    logger.debug_once("Registered custom op: spyre_vocab_parallel_embedding_native")

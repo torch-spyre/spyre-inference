@@ -34,4 +34,3 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     rotary_embedding.register()
     utils.register()
-    vocab_parallel_embedding.register()

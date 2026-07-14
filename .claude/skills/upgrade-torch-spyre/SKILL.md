@@ -23,6 +23,26 @@ When the user pins torch-spyre to a SHA, `uv sync --frozen` rebuilds the torch-s
 
 **Treat compile failure as an expected outcome, not an error.** It's the signal that the supporting libs need a bump; until that happens, the right move is to find the newest torch-spyre commit that still builds.
 
+## Prerequisites
+
+Three environment variables must be set for Artifactory access:
+
+```bash
+ARTIFACTORY_URL       # Base URL of the Artifactory instance
+ARTIFACTORY_TOKEN     # Bearer token (rotate via Artifactory UI → Access Tokens)
+ARTIFACTORY_RPM_REPO  # RPM repository name
+```
+
+Validate before starting:
+
+```bash
+curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+  "$ARTIFACTORY_URL/artifactory/api/repositories/$ARTIFACTORY_RPM_REPO" \
+  | jq .key
+```
+
+If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §6. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
+
 ## Workflow
 
 ### 1. Read current pin and latest main
@@ -180,32 +200,26 @@ rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 'ibm-*' \
 
 This gives us the package names, versions, and commit SHAs — but with `_0` as the build suffix. We need to resolve the real build numbers from artifactory.
 
-#### Step 2: Get the correct build numbers from a `populate-rpm-cache` job
+#### Step 2: Resolve correct build numbers from Artifactory (primary method)
 
-The `populate-rpm-cache` workflow's "List Artifactory RPMs" step dumps all available filenames. Find a recent run that had a cache miss (so it actually listed the RPMs):
+Query the Artifactory API directly to list all RPMs in the x86_64 directory, then match against the installed versions:
 
 ```bash
-# List recent runs
-gh run list --repo torch-spyre/spyre-inference \
-  --workflow populate-rpm-cache.yaml --limit 15 \
-  --json databaseId,status,conclusion,createdAt
-
-# Check each run's logs for the listing (cache-hit runs won't have it)
-# Look for one that downloaded rather than hit cache:
-gh run view <RUN_ID> --log 2>/dev/null | grep -c "ibm-deeptools"
-# If > 0, this run listed the RPMs
+# Fetch the full x86_64 RPM listing from Artifactory
+curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+  "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_RPM_REPO/x86_64" \
+  | jq -r '.children[].uri' | sed 's|^/||' > /tmp/artifactory-rpms.txt
 ```
 
-Once you find a run with the listing, extract the highest build number for each installed package version:
+Then resolve each installed package to its real artifactory filename:
 
 ```bash
-LOGS=$(gh run view <RUN_ID> --log 2>/dev/null)
-
 while IFS= read -r host_line; do
   # Strip the _0.el10 suffix to get the version prefix for matching
   prefix=$(echo "$host_line" | sed 's/_[0-9]*\.el10$//')
   # Find the highest build number for this prefix in artifactory
-  build_num=$(echo "$LOGS" | grep -F "$prefix" | grep -oP '_\K[0-9]+(?=\.el10)' | sort -n | tail -1)
+  build_num=$(grep -F "$prefix" /tmp/artifactory-rpms.txt \
+    | grep -oP '_\K[0-9]+(?=\.el10\.x86_64\.rpm)' | sort -n | tail -1)
   if [[ -n "$build_num" ]]; then
     echo "${prefix}_${build_num}.el10"
   else
@@ -214,7 +228,23 @@ while IFS= read -r host_line; do
 done < /tmp/host-rpms.txt > /tmp/resolved-rpms.txt
 ```
 
-If any packages show "NOT FOUND IN ARTIFACTORY", it means the version installed on the host hasn't been published yet. This can happen if packages were installed from a local build. Ask the user how to proceed.
+If any packages show "NOT FOUND IN ARTIFACTORY", it means the version installed on the host hasn't been published yet (e.g. installed from a local build). Ask the user how to proceed.
+
+#### Fallback: Artifactory unavailable
+
+If the token is expired/missing and the user can't provide one immediately, fall back to scraping a recent `populate-rpm-cache` CI run's logs:
+
+```bash
+gh run list --repo torch-spyre/spyre-inference \
+  --workflow populate-rpm-cache.yaml --limit 15 \
+  --json databaseId,status,conclusion,createdAt
+
+# Find a run that had a cache miss (actually listed RPMs):
+gh run view <RUN_ID> --log 2>/dev/null | grep -c "ibm-deeptools"
+# If > 0, extract filenames from its output and resolve as above.
+```
+
+This is less reliable — cache-hit runs won't have the listing, and you may need to trigger a fresh run with a dummy lock-file change.
 
 #### Step 3: Sanity-check — no accidental downgrades
 
@@ -270,21 +300,7 @@ HEADER
 cat /tmp/resolved-rpms.txt >> spyre-rpms.lock
 ```
 
-#### Fallback: no recent populate-rpm-cache listing available
-
-If all recent `populate-rpm-cache` runs were cache hits (no RPM listing in logs), ask the user for one of:
-
-1. **Trigger a fresh run** with a dummy lock-file change to force a cache miss
-2. **Provide artifactory credentials** so you can query the API directly:
-
-   ```bash
-   curl -fSL \
-     -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
-     "${ARTIFACTORY_BASE_URL}/artifactory/api/storage/${ARTIFACTORY_RPM_PATH}/x86_64?list&deep=0" \
-     | jq -r '.files[].uri'
-   ```
-
-Do **not** guess build numbers. If no authoritative source is available, stop and ask the user.
+Do **not** guess build numbers. If no authoritative source is available (Artifactory API or CI logs), stop and ask the user.
 
 #### Cache population
 

@@ -87,9 +87,6 @@ class TorchSpyreWorker(Worker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-        # Disable custom all-reduce (not applicable for Spyre).
-        self.parallel_config.disable_custom_all_reduce = True
-
         # Unique identifier for creating allreduce shared memory.
         os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
 

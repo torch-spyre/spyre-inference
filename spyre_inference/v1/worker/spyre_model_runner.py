@@ -33,7 +33,7 @@ Data flow in the current WIP version:
 As the TorchSpyreModelRunner is evolving, more layers will natively support inputs
 arriving as a Spyre tensor and perform their operations on Spyre.
 Thus, in the final state of the runner minimal D2H and H2D transfers will be necessary,
-the SpyreCpuFallbackMixin will be obsolete and most operations will be performed on Spyre.
+the CPU fallbacks will be obsolete and most operations will be performed on Spyre.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
+from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -289,6 +290,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
+        # Un-fuse QKV / gate-up projections.
+        analyze_and_unfuse(self.model)
+
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Attention is nn.Module (not PluggableLayer) so OOT registration is
         # not possible. Patch _apply to no-op before model.to("spyre") so
@@ -298,11 +302,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if isinstance(module, Attention):
                 module._apply = lambda fn, recurse=True, _m=module: _m
 
-        # Move layer weights to Spyre device.
-        # SpyreCpuFallbackMixin._apply() no-op keeps CPU fallback layer
-        # weights on CPU (linear, embedding, rotary).
-        # Spyre-native layers (RMSNorm, SiluAndMul, ParallelLMHead) get
-        # their weights moved.
+        # Move layer weights to Spyre device. The Attention._apply no-op
+        # patched above keeps attention scale buffers on CPU; every other
+        # module (linear, embedding, RMSNorm, SiluAndMul, ParallelLMHead)
+        # has its weights moved to Spyre.
         self.model.to(device=self._spyre_device)
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)

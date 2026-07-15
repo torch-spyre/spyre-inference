@@ -452,7 +452,7 @@ The monitor may be started before or after the workload; it will emit
 
 Sample output:
 
-```
+```text
 #ID Date      Time      hostcpu hostmem  pwr  gtemp busy  rdmem  wrmem  rxpci  txpci  rdrdma  wrrdma  rsvmem
 #   YYYYMMDD  HH:MM:SS        %       %    W      C    %   GB/s   GB/s   GB/s   GB/s    GB/s    GB/s      MB
   0 20260715  11:45:28    828.3     5.2   75     42   87    4.2    3.1    0.8    0.2     1.2     0.9     512

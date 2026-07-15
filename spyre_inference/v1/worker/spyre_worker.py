@@ -87,9 +87,6 @@ class TorchSpyreWorker(Worker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-        # Unique identifier for creating allreduce shared memory.
-        os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
-
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
 

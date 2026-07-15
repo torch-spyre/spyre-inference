@@ -7623,7 +7623,7 @@ dev = [
 requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=864104b378f691d55c21c98a4dc0fccd4b391954" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=85e077c41c5f8617ce0ee0d06ab94c071c254c9e" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
 ]
 
@@ -8389,7 +8389,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=864104b378f691d55c21c98a4dc0fccd4b391954#864104b378f691d55c21c98a4dc0fccd4b391954" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=85e077c41c5f8617ce0ee0d06ab94c071c254c9e#85e077c41c5f8617ce0ee0d06ab94c071c254c9e" }
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },

@@ -714,7 +714,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # be part of the cache key.
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-
             self._attn_fns[key] = _maybe_compile_attn(
                 _create_compilable_page_attn(
                     num_blocks,

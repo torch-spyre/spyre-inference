@@ -51,24 +51,28 @@ jobs:
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-    - id: spyre-uv-cache
-      name: "Compute Spyre image hash"
-      uses: ./.github/actions/spyre-uv-cache
+    - name: Install Spyre RPMs
+      id: spyre-rpms
+      uses: ./.github/actions/spyre-rpm-install
 
     - name: "Set up Python"
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         enable-cache: true
-        cache-suffix: ${{ steps.spyre-uv-cache.outputs.image-hash }}
+        cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
         cache-local-path: ${{ runner.temp }}/setup-uv-cache
         prune-cache: false
 
     - name: "Install dependencies"
+      env:
+        AIU_SETUP_MULTI_AIU: '0'
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uv sync --frozen --no-dev -v
 
     - name: "Run ty via prek"
+      env:
+        AIU_SETUP_MULTI_AIU: '0'
       run: |
         source /etc/profile.d/ibm-aiu-setup.sh
         uvx prek@v0.4.4 run ty --all-files --stage pre-commit

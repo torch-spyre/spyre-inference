@@ -55,7 +55,6 @@ class TorchSpyrePlatform(CpuPlatform):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
-    # dispatch_key: str = "PrivateUse1"
     dispatch_key: str = "CompositeExplicitAutograd"
 
     # Multi-backend init string consumed by both vllm's
@@ -125,8 +124,6 @@ class TorchSpyrePlatform(CpuPlatform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
-
-        # vllm_config.model_config.enforce_eager = True
 
         # When enforce_eager is set, vLLM has already reset the mode to NONE;
         # preserve that so eager stays eager.

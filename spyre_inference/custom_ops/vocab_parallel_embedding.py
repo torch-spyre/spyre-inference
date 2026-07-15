@@ -45,16 +45,13 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
-            # Opaque: mask computed on CPU, results returned on `input_`'s
-            # device (see module docstring). `keep` is shaped [..., 1] and
-            # matches the embedding output dtype, ready to broadcast-multiply.
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
                 input_,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
+                self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.added_vocab_start_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
             )
         else:
@@ -87,9 +84,6 @@ def _vocab_mask_op_func(
         added_vocab_start_index,
         added_vocab_end_index,
     )
-    # ``input_mask`` marks out-of-shard ids; keep = its complement, cast to the
-    # embedding output dtype and pre-unsqueezed for the [..., H] * [..., 1]
-    # broadcast that zeroes out-of-shard rows.
     keep = (~input_mask).to(dtype=dtype).unsqueeze(-1)
     return masked_input.to(device), keep.to(device)
 

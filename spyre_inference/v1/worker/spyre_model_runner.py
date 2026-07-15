@@ -81,6 +81,15 @@ def _compute_slot_mapping_impl(
     PAD_ID: int = _PAD_SLOT_ID,
     BLOCK_SIZE: int = 1024,
 ) -> None:
+    """Map each token position to its flat index in the paged KV cache.
+
+    The upstream vLLM implementation is a Triton kernel (requires a GPU) and
+    the CPU backend delegates to a C++ op in _C.so. Neither is available with
+    VLLM_TARGET_DEVICE=empty, so we reimplement the logic in pure PyTorch.
+
+    Correctness is validated indirectly by the upstream attention backend test
+    (test_causal_backend_correctness) and end-to-end model generation tests.
+    """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
     block_indices = (positions[:num_tokens] // block_size).to(torch.int64)
     block_offsets = (positions[:num_tokens] % block_size).to(torch.int64)

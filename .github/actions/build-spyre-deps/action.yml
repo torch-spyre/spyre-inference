@@ -45,7 +45,7 @@ runs:
       shell: bash
       env:
         ARTIFACTORY_USER: ${{ inputs.artifactory_user }}
-        ARTIFACTORY_API_KEY: ${{ inputs.artifactory_api_key }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory_api_key }}
         ARTIFACTORY_BASE_URL: ${{ inputs.artifactory_base_url }}
         ARTIFACTORY_RPM_PATH: ${{ inputs.artifactory_rpm_path }}
         ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}

@@ -133,6 +133,7 @@ tests:
             override:
               model:
                 - ibm-ai-platform/micro-g3.3-8b-instruct-1b
+                - ibm-granite/granite-4.1-3b
               dtype: [torch.float16]
               max_tokens: [2] # one prefill and one decode
 

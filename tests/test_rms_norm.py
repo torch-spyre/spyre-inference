@@ -101,7 +101,7 @@ def mock_forward_oot_with_residual(
 
 
 @pytest.mark.rmsnorm
-def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
+def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor):
     """Verify RMSNorm OOT registration: class swap."""
     from vllm.model_executor.layers.layernorm import RMSNorm
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm

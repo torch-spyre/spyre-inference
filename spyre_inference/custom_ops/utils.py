@@ -79,7 +79,10 @@ def _convert_op_func(
         # if tensor.device.type == "spyre":
         #     return tensor.to("cpu").to(tensor.device)
         # return tensor.clone()
-        raise RuntimeError(f'Trying to convert a tensor to the same device ({tensor.device.type}) and same dtype ({tensor.dtype}), should never happen!')
+        raise RuntimeError(
+            f"Trying to convert a tensor to the same device ({tensor.device.type}) "
+            + "and same dtype ({tensor.dtype}), should never happen!"
+        )
 
     # Spyre requires CPU for dtype changes
     if tensor.device.type == "spyre" and tensor.dtype != target_dtype:

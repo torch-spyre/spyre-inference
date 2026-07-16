@@ -42,6 +42,3 @@ htmlcov/
 # mkdocs documentation
 /site
 docs/examples
-
-# Auto-generated multi-AIU rank env (see .vscode/setup_aiu_multicard_env.sh)
-.vscode/aiu_multicard.env

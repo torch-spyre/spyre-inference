@@ -98,70 +98,67 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if self.world_size == 1:
             return input_
 
-        # TP all_reduce, staged through the gloo CPU group.
-        #
-        # Why not spyreccl directly: the spyreccl backend has no native
-        # allreduce (SpyreCommsContext::allreduce throws). A hand-rolled
-        # send/recv/broadcast on the spyreccl `device_group` works for
-        # *eagerly-allocated* Spyre tensors, but the tensors that reach this
-        # method under torch.compile are compiled-graph intermediate buffers
-        # allocated by the Inductor/scratchpad allocator. Their device storage
-        # is NOT registered in libspyre_comms' symbol table, so the collective
-        # aborts with "The Nth envelope at rank R missing symbolic address".
-        #
-        # The gloo CPU group has a real, working allreduce and does not care
-        # about Spyre device-address registration. Staging through host memory
-        # (D2H -> gloo allreduce -> H2D) is correct for any Spyre tensor,
-        # eager or compiled, at any world size. The hidden-state shards reduced
-        # here are small (e.g. [16, 4096] fp16 = 128 KiB), so the extra copies
-        # are cheap relative to the layer compute.
-        #
-        # `.to("cpu")` produces a fresh host tensor, so the returned value is a
-        # new tensor (the custom-op all_reduce contract is out-of-place; we do
-        # NOT mutate `input_`).
-        #
-        # REPLACE-WITH-NATIVE: once libspyre_comms gains a native allreduce
-        # (and, for the compiled path, registers Inductor-allocated buffers in
-        # its symbol table), delete this override and let the base class call
-        # `dist.all_reduce(input_, group=self.device_group)`.
-        cpu_input = input_.to("cpu")
-        dist.all_reduce(  # ty: ignore[possibly-missing-attribute]
-            cpu_input, group=self.cpu_group
+        if self.world_size != 2:
+            # REPLACE-WITH-NATIVE: once libspyre_comms supports allreduce
+            # natively, delete this entire `all_reduce` override and let
+            # the base class call `dist.all_reduce(input_, group=self.device_group)`.
+            raise NotImplementedError(
+                _spyre_collective_unsupported_message(
+                    "allreduce",
+                    self.world_size,
+                    blocker="libspyre_comms native allreduce impl",
+                )
+            )
+
+        # We hand `input_` directly to dist.send/dist.recv, which require
+        # contiguous storage. The base class's dist.all_reduce path has
+        # its own internal handling, but ours doesn't.
+        assert input_.is_contiguous(), (
+            "SpyreCommunicator.all_reduce requires a contiguous input tensor; "
+            f"got tensor with shape={tuple(input_.shape)} stride={input_.stride()}"
         )
-        return cpu_input.to(input_.device)
+
+        # TP=2 manual all_reduce.
+        #
+        # We verified on this pod that:
+        #   - dist.send / dist.recv on the spyreccl group work for paired
+        #     ranks at world_size=2.
+        #   - dist.broadcast works on the spyreccl group at any world size.
+        #   - The Spyre comms message matcher requires every p2p message
+        #     to have an immediate matching counterpart across all ranks;
+        #     only world_size=2 trivially satisfies that constraint with a
+        #     single send/recv pair.
+        #
+        # Pattern:
+        #   Rank 1 -> Rank 0 (send/recv).
+        #   Rank 0 sums in place.
+        #   Rank 0 -> all (broadcast).
+        #
+        # REPLACE-WITH-NATIVE: when libspyre_comms gains a native allreduce
+        # and a comms RPM containing it is available, drop this branch.
+        other = 1 - self.rank_in_group
+        if self.rank_in_group == 0:
+            scratch = torch.empty_like(input_)
+            dist.recv(scratch, src=self.ranks[other], group=self.device_group)
+            input_.add_(scratch)
+        else:
+            dist.send(input_, dst=self.ranks[other], group=self.device_group)
+        dist.broadcast(input_, src=self.ranks[0], group=self.device_group)
+        return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # All-gather, staged through the gloo CPU group.
-        #
-        # Two reasons we don't all_gather on the spyreccl `device_group`:
-        #   1. The base class routes through `dist.all_gather_into_tensor`, whose
-        #      spyreccl `_allgather_base` entry point is still stubbed.
-        #   2. Even list-form `dist.all_gather` on the spyreccl group fails for
-        #      the tensors that reach this method: they are compiled-graph /
-        #      Inductor-allocated (or otherwise not eagerly-registered) Spyre
-        #      buffers whose storage is NOT in libspyre_comms' symbol table, so
-        #      the collective aborts with "The Nth envelope at rank R missing
-        #      symbolic address" (same failure mode as all_reduce).
-        #
-        # The gloo CPU group has a working all_gather and needs no Spyre
-        # device-address registration. Staging through host memory (D2H -> gloo
-        # all_gather -> H2D) is correct for any Spyre tensor, eager or compiled,
-        # at any world size. `dist.all_gather` mutates the output list in place,
-        # so we build a fresh CPU output list and move the concatenation back.
-        #
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up spyreccl
-        # `_allgather_base` AND registers Inductor-allocated buffers in its
-        # symbol table, delete this override and let the base class handle it.
+        # The base class uses dist.all_gather_into_tensor which needs
+        # _allgather_base in spyreccl is still stubbed. Use list-form
+        # dist.all_gather instead (natively supported).
+        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
+        # delete this override and let the base class handle it.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        cpu_input = input_.to("cpu")
-        output_list = [torch.empty_like(cpu_input) for _ in range(self.world_size)]
-        dist.all_gather(  # ty: ignore[possibly-missing-attribute]
-            output_list, cpu_input, group=self.cpu_group
-        )
-        return torch.cat(output_list, dim=dim).to(input_.device)
+        output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+        dist.all_gather(output_list, input_, group=self.device_group)
+        return torch.cat(output_list, dim=dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

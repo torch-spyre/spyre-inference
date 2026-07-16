@@ -75,10 +75,11 @@ def _convert_op_func(
     target_dtype = dtype if dtype is not None else tensor.dtype
 
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
-        # Same-device, same-dtype: return FRESH, due to current torch-spyre limitations.
-        if tensor.device.type == "spyre":
-            return tensor.to("cpu").to(tensor.device)
-        return tensor.clone()
+        # # Same-device, same-dtype: return FRESH, due to current torch-spyre limitations.
+        # if tensor.device.type == "spyre":
+        #     return tensor.to("cpu").to(tensor.device)
+        # return tensor.clone()
+        raise RuntimeError(f'Trying to convert a tensor to the same device ({tensor.device.type}) and same dtype ({tensor.dtype}), should never happen!')
 
     # Spyre requires CPU for dtype changes
     if tensor.device.type == "spyre" and tensor.dtype != target_dtype:

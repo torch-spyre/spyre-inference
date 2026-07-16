@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import Mock
 
 import pytest
@@ -217,6 +218,23 @@ def assert_close_outliers(
         ) from e
 
 
+def _alibi_slopes(num_heads: int) -> list[float]:
+    """Standard ALiBi slope generator (Press et al. 2022).
+
+    For power-of-two head counts, uses the geometric sequence from the paper.
+    For non-power-of-two counts, interleaves the next power-of-two sequence.
+    """
+
+    def _pow2(n: int) -> list[float]:
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        return [start * (start**i) for i in range(n)]
+
+    if math.log2(num_heads).is_integer():
+        return _pow2(num_heads)
+    closest = 2 ** math.floor(math.log2(num_heads))
+    return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
+
+
 def ref_attn(
     query: torch.Tensor,
     key_cache: list[torch.Tensor],
@@ -228,6 +246,7 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    alibi_slopes: list[float] | None = None,
 ) -> torch.Tensor:
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
@@ -268,6 +287,18 @@ def ref_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if alibi_slopes is not None:
+            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
+            # Under strict causal decoding the q_abs_pos term cancels through
+            # softmax, so any per-row-constant simplification is equivalent —
+            # keep the full form here for clarity in the reference.
+            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
+            context_len = kv_len - query_len
+            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
+            kv_abs = torch.arange(kv_len, dtype=torch.float32)
+            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
+            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
+            attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
@@ -285,6 +316,8 @@ def _run_spyre_attn_test(
     sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
+    use_alibi: bool = False,
+    soft_cap: float | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
@@ -299,6 +332,8 @@ def _run_spyre_attn_test(
 
     torch.set_default_device("cpu")
     set_random_seed(0)
+
+    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -377,10 +412,10 @@ def _run_spyre_attn_test(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
-        logits_soft_cap=None,
+        logits_soft_cap=soft_cap,
     )
 
     output = torch.empty_like(query).to(cache_device)
@@ -405,7 +440,8 @@ def _run_spyre_attn_test(
         block_size=block_size,
         scale=scale,
         sliding_window=sliding_window,
-        soft_cap=None,
+        soft_cap=soft_cap,
+        alibi_slopes=alibi_slopes,
     )
 
     if max(query_lens) >= 32:
@@ -422,6 +458,17 @@ def _run_spyre_attn_test(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+    # Release Spyre DMA mappings eagerly. Python doesn't free the KV-page
+    # tensors between tests until GC runs, but the Spyre VFIO driver keeps
+    # DMA regions mapped until the storage is actually released. Accumulated
+    # mappings across many tests in one pytest process can exhaust the VFIO
+    # address-space table (RAS::VFIO::MapDMAFailed).
+    if configure_device == "spyre":
+        del k_pages, v_pages, kv_cache, output
+        import gc
+
+        gc.collect()
 
 
 @pytest.mark.parametrize(
@@ -562,6 +609,95 @@ def test_spyre_attn_sliding_window(
         sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+def test_spyre_attn_alibi(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """ALiBi positional bias correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "soft_cap",
+    [
+        pytest.param(50.0, id="soft_cap(50)"),
+    ],
+)
+def test_spyre_attn_soft_cap(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    soft_cap: float,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Logits soft-cap correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
     )
 
 

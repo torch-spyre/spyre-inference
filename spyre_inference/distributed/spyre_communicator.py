@@ -14,36 +14,23 @@
 
 """DeviceCommunicator override for IBM Spyre devices.
 
-libspyre_comms natively implements: `barrier`, `broadcast`, `send`/`recv`,
-list-form `allgather`, and `gather`. The `allreduce` and `reduce` overrides
-on `SpyreCommsContext` are still throw-stubs. The `_allgather_base` entry
-point on the torch-spyre spyreccl backend side is also still stubbed,
-so `dist.all_gather_into_tensor` does not work.
+`all_reduce` and `all_gather` are overridden to run on the gloo CPU group
+(D2H -> gloo collective -> H2D) rather than the spyreccl `device_group`. Two
+reasons the spyreccl group can't be used directly:
+  - libspyre_comms has no native `allreduce` (SpyreCommsContext::allreduce
+    throws), and torch-spyre's spyreccl `_allgather_base` is stubbed (so
+    `dist.all_gather_into_tensor`, which the base class uses, does not work).
+  - Even the collectives libspyre_comms does implement require the tensor's
+    device storage to be registered in its symbol table. Tensors that reach
+    these methods under torch.compile are Inductor/scratchpad-allocated
+    buffers that are NOT registered, so a spyreccl collective on them aborts
+    with "The Nth envelope at rank R missing symbolic address".
 
-This class supplies:
-  - A hand-rolled `all_reduce` for TP=2 using send/recv + broadcast (native
-    allreduce is not yet available).
-  - An `all_gather` that uses native list-form `dist.all_gather` because
-    the base class routes through `dist.all_gather_into_tensor` (blocked
-    by the `_allgather_base` stub).
+Staging through gloo sidesteps both: gloo has working collectives and needs
+no Spyre device-address registration, and it is correct for any Spyre tensor
+(eager or compiled) at any world size. `reduce_scatter` is not on the TP
+forward path and raises a clear NotImplementedError.
 
-This class supplies a hand-rolled fallback for `all_reduce` that works for
-TP=2 by using send/recv + broadcast (all of which ARE implemented), so the
-TP forward path can run end-to-end on two ranks without waiting for the
-upstream comms-side implementations to land. Other collectives raise a
-clear NotImplementedError describing what's needed to unblock them.
-
-Remaining per-op blockers (REPLACE-WITH-NATIVE markers below):
-  - all_reduce : libspyre_comms native allreduce.
-  - all_gather : torch-spyre spyreccl `_allgather_base` (so the base class
-                 can use `dist.all_gather_into_tensor` directly).
-  - reduce     : libspyre_comms native reduce (not on the TP forward path).
-
-The companion test file `tests/test_spyre_comms_native_probes.py` runs
-each native collective on a real spyreccl device_group and is xfail-strict.
-When a comms RPM lands an impl, the corresponding probe flips to passing,
-the strict-xfail fails CI, and that's the signal to delete the override
-here.
 """
 
 from __future__ import annotations
@@ -55,13 +42,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 
-
-# libspyre_comms enforces a per-message minimum size (128 bytes). Every
-# TP all_reduce we expect to see in inference is on a hidden-state shard
-# that comfortably exceeds this threshold (hidden_size=1024 float16 =
-# 2048 bytes, well above the 128-byte threshold), so we don't pad here.
-# If something smaller hits this path, the fallback will surface the
-# comms-layer error verbatim and we add padding then.
+from spyre_inference.custom_ops.utils import convert
 
 
 def _spyre_collective_unsupported_message(
@@ -83,13 +64,12 @@ def _spyre_collective_unsupported_message(
 
 
 class SpyreCommunicator(DeviceCommunicatorBase):
-    """Spyre-specific DeviceCommunicator with manual fallbacks.
+    """Spyre-specific DeviceCommunicator with gloo-staged fallbacks.
 
-    See the module docstring for the full picture. In short:
-      - `all_reduce` is overridden with a TP=2-only manual reduce-to-root
-        + broadcast that uses send/recv. TP>2 raises.
-      - All other broken collectives raise NotImplementedError describing
-        what's needed to unblock them.
+    - `all_reduce` and `all_gather` run on the gloo CPU group (CPU fallback;
+      D2H -> gloo -> H2D), which works for any Spyre tensor at any world size.
+    - `reduce_scatter` (not on the TP forward path) raises
+      NotImplementedError describing what's needed to unblock it.
     """
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -124,11 +104,11 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         # (and, for the compiled path, registers Inductor-allocated buffers in
         # its symbol table), delete this override and let the base class call
         # `dist.all_reduce(input_, group=self.device_group)`.
-        cpu_input = input_.to("cpu")
+        cpu_input = convert(input_, device="cpu")
         dist.all_reduce(  # ty: ignore[possibly-missing-attribute]
             cpu_input, group=self.cpu_group
         )
-        return cpu_input.to(input_.device)
+        return convert(cpu_input, device=input_.device)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # All-gather, staged through the gloo CPU group.
@@ -156,12 +136,12 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        cpu_input = input_.to("cpu")
+        cpu_input = convert(input_, device="cpu")
         output_list = [torch.empty_like(cpu_input) for _ in range(self.world_size)]
         dist.all_gather(  # ty: ignore[possibly-missing-attribute]
             output_list, cpu_input, group=self.cpu_group
         )
-        return torch.cat(output_list, dim=dim).to(input_.device)
+        return convert(torch.cat(output_list, dim=dim), device=input_.device)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

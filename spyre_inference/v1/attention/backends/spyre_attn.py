@@ -177,13 +177,7 @@ def _indirect_matmul_mock(
 
 
 def _maybe_compile(fn):
-    """Return fn unchanged: attention kernels always run eager for now."""
-    return fn
-
-
-def _maybe_compile_attn(fn):
-    """Like _maybe_compile, but also honors the SPYRE_FORCE_COMPILE_ATTN
-    escape hatch.
+    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
 
     Used only for the online-softmax attention kernel — the reshape/cache
     kernel is *not* covered, because forcing compile on it currently hits an
@@ -193,7 +187,7 @@ def _maybe_compile_attn(fn):
     """
     if _FORCE_COMPILE_ATTN:
         return torch.compile(fn, dynamic=False)
-    return _maybe_compile(fn)
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -674,21 +668,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
-            # Deliberately uses _maybe_compile (not _maybe_compile_attn):
-            # SPYRE_FORCE_COMPILE_ATTN must not force-compile this kernel.
-            # torch.compile of _create_compilable_reshape_and_cache currently
-            # fails inside torch-spyre's Inductor pass with
-            # `Unsupported: missing device_tensor_layout on graph input arg0_1`.
-            # Move to _maybe_compile_attn once that gap is resolved.
-            self._reshape_fns[num_tokens] = _maybe_compile(
-                _create_compilable_reshape_and_cache(num_tokens)
-            )
+            # Currently not compiled
+            self._reshape_fns[num_tokens] = _create_compilable_reshape_and_cache(num_tokens)
+
         return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile_attn(
+            self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(num_blocks, padded_query_len)
             )
         return self._attn_fns[key]

@@ -28,9 +28,9 @@ import torch
 # `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
 # autoload doesn't trigger the load at `import torch` time.
 
-import vllm.v1.worker.cpu_worker as cpu_worker_module
 from vllm.logger import init_logger
-from vllm.v1.worker.cpu_worker import CPUWorker
+from vllm.utils.torch_utils import set_random_seed
+from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference.custom_ops import register_all
@@ -39,21 +39,22 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 logger = init_logger(__name__)
 
 
-class TorchSpyreWorker(CPUWorker):
+class TorchSpyreWorker(Worker):
     """A worker class that executes the model on IBM's Spyre device.
 
-    Inherits from CPUWorker but extends init_device to:
-    - Create a TorchSpyreModelRunner with torch.device("spyre")
+    Inherits from Worker (gpu_worker) directly — Spyre is not a CPU device
+    and does not need any of the CPU-specific init (NUMA binding,
+    torch.ops._C.init_cpu_memory_env, host-RAM profiling) that CPUWorker
+    provides. The distributed init, random seed, and model runner
+    construction are handled here.
     """
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
-        # vllm.v1.worker.gpu_worker.Worker.load_model wraps weight loading in
-        # a memory pool context that calls get_mem_allocator_instance(). That
-        # only short-circuits to nullcontext() when current_platform.is_cpu()
-        # returns True; our platform reports OOT (so custom-op forward_oot
-        # dispatch works), so the upstream check falls through and raises.
-        # Spyre weights live on-device, not in a host-side cumem allocator,
-        # so a nullcontext is the correct behaviour here.
+        # Worker.load_model wraps weight loading in a memory pool context
+        # that calls get_mem_allocator_instance(). That only short-circuits
+        # to nullcontext() when current_platform.is_cpu() returns True; our
+        # platform reports OOT, so the upstream check falls through and raises.
+        # Spyre weights live on-device, not in a host-side cumem allocator.
         return nullcontext()
 
     def init_device(self) -> None:
@@ -86,20 +87,33 @@ class TorchSpyreWorker(CPUWorker):
         # layers will be swapped out with the custom implementations for spyre.
         register_all()
 
-        # Patch the CPUModelRunner with the TorchSpyreModelRunner.
-        # We pass the unindexed `torch.device("spyre")` because the
-        # current device for this process is already pinned via
-        # `set_device(local_rank)` above; tensors created on
-        # `torch.device("spyre")` will land on that card.
-        original = cpu_worker_module.CPUModelRunner
-        cpu_worker_module.CPUModelRunner = lambda *a, **kw: TorchSpyreModelRunner(  # ty: ignore[invalid-assignment]
+        # Initialize the distributed environment.
+        from vllm.platforms import current_platform
+
+        init_worker_distributed_environment(
+            self.vllm_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+            current_platform.dist_backend,
+        )
+
+        # Set random seed.
+        set_random_seed(self.model_config.seed)
+
+        # Construct the model runner directly — no monkey-patching needed.
+        self.model_runner = TorchSpyreModelRunner(
             self.vllm_config,
             torch.device("spyre"),
         )
-        try:
-            super().init_device()
-        finally:
-            cpu_worker_module.CPUModelRunner = original
+
+    def determine_available_memory(self) -> int:
+        # Spyre's KV cache lives on-device with a fixed budget set by
+        # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
+        # num_gpu_blocks_override is also set, so this value is only used as
+        # an upper bound sanity check by the engine.
+        assert self.cache_config.kv_cache_memory_bytes is not None
+        return self.cache_config.kv_cache_memory_bytes
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # FIXME: Work around for https://github.com/torch-spyre/torch-spyre/issues/1420
@@ -123,3 +137,9 @@ class TorchSpyreWorker(CPUWorker):
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    def sleep(self, level: int = 1) -> None:
+        pass
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        pass

@@ -61,6 +61,13 @@ def _record_function(name: str):
     return decorator
 
 
+# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
+# regardless of the vLLM compilation config. Used to evaluate the compiled path
+# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
+# Default: off (unset or "0").
+_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
+
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len

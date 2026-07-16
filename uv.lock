@@ -75,8 +75,7 @@ overrides = [
     { name = "torchaudio", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'", index = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" },
-    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
+    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le'", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
 ]
 build-constraints = [{ name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" }]
 
@@ -7610,8 +7609,7 @@ dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin')" },
     { name = "torch-spyre" },
-    { name = "vllm", version = "0.24.0+cpu", source = { registry = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'" },
-    { name = "vllm", version = "0.24.0+cpu", source = { git = "https://github.com/vllm-project/vllm?rev=v0.24.0#ee0da84ab9e04ac7610e28580af62c365e898389" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'linux'" },
+    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le'" },
 ]
 
 [package.dev-dependencies]
@@ -7626,8 +7624,7 @@ requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=85e077c41c5f8617ce0ee0d06ab94c071c254c9e" },
-    { name = "vllm", marker = "sys_platform != 'linux'", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
-    { name = "vllm", marker = "sys_platform == 'linux'", specifier = ">=0.24.0,<0.25", index = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" },
+    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -8666,119 +8663,7 @@ wheels = [
 [[package]]
 name = "vllm"
 version = "0.24.0+cpu"
-source = { registry = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux'",
-]
-dependencies = [
-    { name = "aiohttp" },
-    { name = "anthropic" },
-    { name = "blake3" },
-    { name = "cachetools" },
-    { name = "cbor2" },
-    { name = "cloudpickle" },
-    { name = "compressed-tensors" },
-    { name = "depyf" },
-    { name = "diskcache" },
-    { name = "einops" },
-    { name = "fastapi", extra = ["standard"] },
-    { name = "filelock" },
-    { name = "ijson" },
-    { name = "intel-openmp", marker = "platform_machine == 'x86_64'" },
-    { name = "jsonschema" },
-    { name = "lark" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'" },
-    { name = "lm-format-enforcer" },
-    { name = "mcp" },
-    { name = "mistral-common", extra = ["image"] },
-    { name = "model-hosting-container-standards" },
-    { name = "msgspec" },
-    { name = "ninja" },
-    { name = "numba", marker = "platform_machine != 's390x'" },
-    { name = "numpy" },
-    { name = "openai" },
-    { name = "openai-harmony" },
-    { name = "opencv-python-headless" },
-    { name = "opentelemetry-api" },
-    { name = "opentelemetry-exporter-otlp" },
-    { name = "opentelemetry-sdk" },
-    { name = "opentelemetry-semantic-conventions-ai" },
-    { name = "outlines-core" },
-    { name = "partial-json-parser" },
-    { name = "pillow" },
-    { name = "prometheus-client" },
-    { name = "prometheus-fastapi-instrumentator" },
-    { name = "protobuf" },
-    { name = "psutil" },
-    { name = "py-cpuinfo" },
-    { name = "pybase64" },
-    { name = "pydantic" },
-    { name = "python-json-logger" },
-    { name = "pyyaml" },
-    { name = "pyzmq" },
-    { name = "regex" },
-    { name = "requests" },
-    { name = "safetensors" },
-    { name = "sentencepiece" },
-    { name = "setproctitle" },
-    { name = "setuptools" },
-    { name = "six", marker = "python_full_version >= '3.12'" },
-    { name = "starlette" },
-    { name = "tiktoken" },
-    { name = "tokenizers" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" } },
-    { name = "tqdm" },
-    { name = "transformers" },
-    { name = "typing-extensions" },
-    { name = "watchfiles" },
-    { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
-]
-wheels = [
-    { url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcpu-cp38-abi3-manylinux_2_34_aarch64.whl" },
-    { url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/vllm-0.24.0%2Bcpu-cp38-abi3-manylinux_2_34_x86_64.whl" },
-]
-
-[[package]]
-name = "vllm"
-version = "0.24.0+cpu"
 source = { git = "https://github.com/vllm-project/vllm?rev=v0.24.0#ee0da84ab9e04ac7610e28580af62c365e898389" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'",
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-    "python_full_version < '3.12' and platform_machine != 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and platform_machine == 'aarch64' and platform_machine not in 's390x, ppc64le' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
-]
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },

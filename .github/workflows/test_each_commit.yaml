@@ -79,6 +79,7 @@ jobs:
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - cfg: Non-distributed spyre tests

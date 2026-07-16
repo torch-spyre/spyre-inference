@@ -131,20 +131,37 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         return cpu_input.to(input_.device)
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # The base class uses dist.all_gather_into_tensor which needs
-        # _allgather_base in spyreccl is still stubbed. Use list-form
-        # dist.all_gather instead (natively supported).
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
-        # delete this override and let the base class handle it.
+        # All-gather, staged through the gloo CPU group.
+        #
+        # Two reasons we don't all_gather on the spyreccl `device_group`:
+        #   1. The base class routes through `dist.all_gather_into_tensor`, whose
+        #      spyreccl `_allgather_base` entry point is still stubbed.
+        #   2. Even list-form `dist.all_gather` on the spyreccl group fails for
+        #      the tensors that reach this method: they are compiled-graph /
+        #      Inductor-allocated (or otherwise not eagerly-registered) Spyre
+        #      buffers whose storage is NOT in libspyre_comms' symbol table, so
+        #      the collective aborts with "The Nth envelope at rank R missing
+        #      symbolic address" (same failure mode as all_reduce).
+        #
+        # The gloo CPU group has a working all_gather and needs no Spyre
+        # device-address registration. Staging through host memory (D2H -> gloo
+        # all_gather -> H2D) is correct for any Spyre tensor, eager or compiled,
+        # at any world size. `dist.all_gather` mutates the output list in place,
+        # so we build a fresh CPU output list and move the concatenation back.
+        #
+        # REPLACE-WITH-NATIVE: when torch-spyre wires up spyreccl
+        # `_allgather_base` AND registers Inductor-allocated buffers in its
+        # symbol table, delete this override and let the base class handle it.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+        cpu_input = input_.to("cpu")
+        output_list = [torch.empty_like(cpu_input) for _ in range(self.world_size)]
         dist.all_gather(  # ty: ignore[possibly-missing-attribute]
-            output_list, input_, group=self.device_group
+            output_list, cpu_input, group=self.cpu_group
         )
-        return torch.cat(output_list, dim=dim)
+        return torch.cat(output_list, dim=dim).to(input_.device)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

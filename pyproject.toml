@@ -107,7 +107,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "85e077c41c5f8617ce0ee0d06ab94c071c254c9e" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },

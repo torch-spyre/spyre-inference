@@ -2961,15 +2961,6 @@ wheels = [
 ]
 
 [[package]]
-name = "intel-openmp"
-version = "2024.2.1"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/78/2d/64570ae938a8ee2337ed8ba28ae1d85d3555ee6e5faadabea9e8b43a900d/intel_openmp-2024.2.1-py2.py3-none-manylinux1_x86_64.whl", hash = "sha256:21892ea07a9c6e164707d2b44e6f396f9f2ab6cc7e108755011fad59b596182a", size = 29565156, upload-time = "2024-08-07T15:15:07.808Z" },
-    { url = "https://files.pythonhosted.org/packages/c8/6c/9334569937fd3c6ec93f9fe3da268db38f5113673d568854fa18a20f36ec/intel_openmp-2024.2.1-py2.py3-none-win_amd64.whl", hash = "sha256:b1fb47eefc6cbc2358216684dd87bd2315464e6d29ac84f9313819fe1528d969", size = 3602212, upload-time = "2024-08-07T15:12:45.626Z" },
-]
-
-[[package]]
 name = "interegular"
 version = "0.3.3"
 source = { registry = "https://pypi.org/simple" }
@@ -7623,7 +7614,7 @@ dev = [
 requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=85e077c41c5f8617ce0ee0d06ab94c071c254c9e" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.24.0" },
 ]
 
@@ -8389,7 +8380,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=85e077c41c5f8617ce0ee0d06ab94c071c254c9e#85e077c41c5f8617ce0ee0d06ab94c071c254c9e" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54#869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54" }
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },
@@ -8662,7 +8653,7 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.24.0+cpu"
+version = "0.24.0+empty"
 source = { git = "https://github.com/vllm-project/vllm?rev=v0.24.0#ee0da84ab9e04ac7610e28580af62c365e898389" }
 dependencies = [
     { name = "aiohttp" },
@@ -8678,7 +8669,6 @@ dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "filelock" },
     { name = "ijson" },
-    { name = "intel-openmp", marker = "platform_machine == 'x86_64'" },
     { name = "jsonschema" },
     { name = "lark" },
     { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'" },
@@ -8688,7 +8678,6 @@ dependencies = [
     { name = "model-hosting-container-standards" },
     { name = "msgspec" },
     { name = "ninja" },
-    { name = "numba", marker = "platform_machine != 's390x'" },
     { name = "numpy" },
     { name = "openai" },
     { name = "openai-harmony" },
@@ -8720,10 +8709,6 @@ dependencies = [
     { name = "starlette" },
     { name = "tiktoken" },
     { name = "tokenizers" },
-    { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'aarch64' and sys_platform == 'darwin'" },
-    { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine == 'aarch64' or sys_platform != 'darwin'" },
-    { name = "torchaudio", marker = "sys_platform == 'never'" },
-    { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "typing-extensions" },

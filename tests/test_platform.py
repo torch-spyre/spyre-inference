@@ -14,6 +14,9 @@
 
 """Unit tests for platform.py configuration logic."""
 
+import math
+from types import SimpleNamespace
+
 import torch
 
 from vllm.config import VllmConfig, ModelConfig, CacheConfig
@@ -168,3 +171,103 @@ def test_block_size_valid_no_override():
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.block_size == 128
+
+
+def _fake_vllm_config(layer_types, use_text_config=True):
+    """Minimal stand-in exposing the attribute path _is_hybrid_attention reads."""
+    hf_config = SimpleNamespace(layer_types=layer_types)
+    model_config = SimpleNamespace(hf_config=hf_config)
+    if use_text_config:
+        model_config.hf_text_config = hf_config
+    return SimpleNamespace(model_config=model_config)
+
+
+def test_is_hybrid_attention_true():
+    """Interleaved (multiple distinct) layer_types → hybrid."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Gemma-2 style interleaving of two attention types.
+    layer_types = ["sliding_attention", "full_attention"] * 13
+    assert TorchSpyrePlatform._is_hybrid_attention(_fake_vllm_config(layer_types))
+
+
+def test_is_hybrid_attention_single_type():
+    """A single distinct layer type is homogeneous, not hybrid."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    assert not TorchSpyrePlatform._is_hybrid_attention(_fake_vllm_config(["full_attention"] * 32))
+
+
+def test_is_hybrid_attention_missing_layer_types():
+    """Models without layer_types (None or absent) are not hybrid."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    assert not TorchSpyrePlatform._is_hybrid_attention(_fake_vllm_config(None))
+
+    # hf_config with no layer_types attribute at all.
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace())
+    cfg = SimpleNamespace(model_config=model_config)
+    assert not TorchSpyrePlatform._is_hybrid_attention(cfg)
+
+
+def test_num_gpu_blocks_override_homogeneous():
+    """Non-hybrid models get the plain seqs × blocks/seq pinned block count."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    blocks_per_seq = math.ceil(
+        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
+    )
+    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq
+
+
+def test_num_gpu_blocks_override_skipped_for_hybrid():
+    """Hybrid models leave num_gpu_blocks_override unset so vLLM sizes the cache.
+
+    The single-group formula under-allocates for multi-group KV caches; the
+    real requirement depends on vLLM's internal group packing, which isn't
+    known at this stage. So we must NOT pin a block count for hybrid models.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    # Simulate a hybrid model by injecting interleaved layer_types onto the
+    # HF config, mirroring Gemma-2/3's sliding/full split (2 distinct types).
+    interleaved = ["sliding_attention", "full_attention"] * 13
+    model_config.hf_config.layer_types = interleaved
+    model_config.hf_text_config.layer_types = interleaved
+
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.num_gpu_blocks_override is None

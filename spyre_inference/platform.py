@@ -264,15 +264,46 @@ class TorchSpyrePlatform(CpuPlatform):
         # configured batch area: max_num_seqs sequences × ceil(max_model_len /
         # block_size) blocks each. Anything more is over-allocation while
         # the attention op is still unoptimized.
+        #
+        # This single-group formula is only valid for homogeneous models. A
+        # hybrid model (e.g. Gemma-2/3's interleaved sliding/full attention)
+        # builds several vLLM v1 KV cache groups; the block count vLLM needs is
+        # `group_size × Σ_groups(blocks_per_group)`, where the group count and
+        # shared-tensor padding come from vLLM's internal layer-grouping and are
+        # not derivable here — the KV cache specs don't exist until after model
+        # load and profiling. Pinning the single-group count under-allocates and
+        # trips `_check_enough_kv_cache_memory`. For hybrid models we skip the
+        # cap and let vLLM size the cache from the profiled memory budget
+        # (VLLM_CPU_KVCACHE_SPACE, above), which is correct by construction.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
-            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            max_model_len = vllm_config.model_config.max_model_len
-            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
-            logger.info(
-                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
-                cache_config.num_gpu_blocks_override,
-                max_num_seqs,
-                blocks_per_seq,
-            )
+            if cls._is_hybrid_attention(vllm_config):
+                logger.info(
+                    "Hybrid attention model detected; leaving num_gpu_blocks "
+                    "to vLLM (skipping the single-group block-count override)."
+                )
+            else:
+                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+                max_model_len = vllm_config.model_config.max_model_len
+                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                logger.info(
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    cache_config.num_gpu_blocks_override,
+                    max_num_seqs,
+                    blocks_per_seq,
+                )
+
+    @staticmethod
+    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
+        """Whether the model interleaves multiple attention types.
+
+        HF exposes the per-layer attention type as `layer_types` (the field
+        vLLM keys its KV cache grouping on). More than one distinct value means
+        vLLM v1 builds multiple KV cache groups (a hybrid model). Models without
+        `layer_types`, or with a single type, are homogeneous.
+        """
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+        layer_types = getattr(hf_config, "layer_types", None)
+        return bool(layer_types) and len(set(layer_types)) > 1

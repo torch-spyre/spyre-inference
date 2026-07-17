@@ -29,6 +29,30 @@ from .utils import convert
 logger = init_logger(__name__)
 
 
+class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
+    """Embedding method whose logits projection lands on CPU.
+
+    Tied-weight models in the Gemma (1/2/3n) and Cohere/Command-R families
+    compute logits through the tied ``embed_tokens`` (a VocabParallelEmbedding)
+    rather than a ParallelLMHead — vLLM passes ``self.model.embed_tokens`` to the
+    LogitsProcessor, which calls ``quant_method.apply``. The base ``apply`` keeps
+    the logits on the input (Spyre) device, so the sampler's downstream
+    ``log_softmax`` (no Spyre kernel, no CPU fallback) raises NotImplementedError.
+
+    Mirror SpyreParallelLMHead.forward_oot: return logits on CPU. The
+    ``embedding()`` lookup path used by the normal embedding forward is inherited
+    unchanged.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return convert(super().apply(layer, x, bias), device="cpu")
+
+
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
@@ -40,6 +64,9 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # Route the logits-projection path (used when this embedding is the tied
+        # LM head) through the CPU-converting method so log_softmax runs on CPU.
+        self.quant_method = SpyreUnquantizedEmbeddingMethod()
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:

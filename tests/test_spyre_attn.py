@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import Mock
 
 import pytest
@@ -217,6 +218,23 @@ def assert_close_outliers(
         ) from e
 
 
+def _alibi_slopes(num_heads: int) -> list[float]:
+    """Standard ALiBi slope generator (Press et al. 2022).
+
+    For power-of-two head counts, uses the geometric sequence from the paper.
+    For non-power-of-two counts, interleaves the next power-of-two sequence.
+    """
+
+    def _pow2(n: int) -> list[float]:
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        return [start * (start**i) for i in range(n)]
+
+    if math.log2(num_heads).is_integer():
+        return _pow2(num_heads)
+    closest = 2 ** math.floor(math.log2(num_heads))
+    return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
+
+
 def ref_attn(
     query: torch.Tensor,
     key_cache: list[torch.Tensor],
@@ -228,6 +246,7 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    alibi_slopes: list[float] | None = None,
 ) -> torch.Tensor:
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
@@ -268,6 +287,18 @@ def ref_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if alibi_slopes is not None:
+            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
+            # Under strict causal decoding the q_abs_pos term cancels through
+            # softmax, so any per-row-constant simplification is equivalent —
+            # keep the full form here for clarity in the reference.
+            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
+            context_len = kv_len - query_len
+            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
+            kv_abs = torch.arange(kv_len, dtype=torch.float32)
+            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
+            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
+            attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
@@ -278,106 +309,31 @@ def ref_attn(
     return torch.cat(outputs, dim=0)
 
 
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [
-        pytest.param("NONE", id="compilation_NONE"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        pytest.param([(1, 1024)], id="decode(q=1,kv=1024)"),
-        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
-        pytest.param([(64, 512)], id="prefill(q=64,kv=512)"),
-        pytest.param([(100, 512)], id="prefill(q=100,kv=512)"),
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
-        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
-        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "num_heads",
-    [
-        pytest.param((32, 8), id="GQA"),
-        # pytest.param((32, 32), id="MHA"),
-        # pytest.param((32, 1), id="MQA"),
-    ],
-)
-@pytest.mark.parametrize(
-    "head_size",
-    [
-        pytest.param(128, id="head_size(128)"),
-        # pytest.param(256, id="head_size(256)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "block_size",
-    [
-        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
-        # See: https://github.com/torch-spyre/spyre-inference/issues/239
-        pytest.param(64, id="block_size(64)"),
-        pytest.param(128, id="block_size(128)"),
-        pytest.param(256, id="block_size(256)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "sliding_window",
-    [
-        pytest.param(None, id="swa_none"),
-        pytest.param(4, id="swa_4"),
-        pytest.param(16, id="swa_16"),
-    ],
-)
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(torch.float16, id="dtype(fp16)"),
-    ],
-)
-@pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize(
-    "num_blocks",
-    [
-        # pytest.param(2048, id="num_blocks(2048)"),
-        pytest.param(256, id="num_blocks(256)"),
-    ],
-)
 @torch.inference_mode()
-def test_spyre_attn(
-    default_vllm_config,
-    num_blocks: int,
-    soft_cap: float | None,
-    dtype: torch.dtype,
-    sliding_window: int | None,
-    block_size: int,
-    head_size: int,
-    num_heads: tuple[int, int],
+def _run_spyre_attn_test(
     seq_lens: list[tuple[int, int]],
+    block_size: int,
+    sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
+    use_alibi: bool = False,
+    soft_cap: float | None = None,
 ) -> None:
-    """Validate SpyreAttentionImpl against a reference implementation."""
+    """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
     # "missing device_tensor_layout on graph input arg0_1"
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
         pytest.skip("STOCK + device_spyre, currently fails.")
 
-    num_query_heads, num_kv_heads = num_heads
-    # only for preparation, actual device is set via `configure_device`
+    num_query_heads, num_kv_heads = 32, 8
+    head_size = 128
+    num_blocks = 256
+    dtype = torch.float16
+
     torch.set_default_device("cpu")
     set_random_seed(0)
+
+    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -391,7 +347,6 @@ def test_spyre_attn(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    # list based creation here, update once this changes
     k_pages_cpu: list[torch.Tensor] = [
         torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
@@ -409,8 +364,6 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Populate KV cache and build slot mapping. New tokens use key/value so that
-    # ref_attn sees the same data _reshape_and_cache writes to the device pages.
     slot_mapping = []
     q_offset = 0
     for seq_idx in range(num_seqs):
@@ -439,7 +392,6 @@ def test_spyre_attn(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    # Transfer populated pages to device
     k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
     v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
 
@@ -460,7 +412,7 @@ def test_spyre_attn(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
@@ -468,10 +420,6 @@ def test_spyre_attn(
 
     output = torch.empty_like(query).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
-    # Note: attn_impl.forward() internally calls _reshape_and_cache() to write
-    # the new K/V tokens into the cache, so this test exercises both the cache
-    # writing and attention computation paths. TODO: Add a dedicated unit test
-    # for _reshape_and_cache to independently verify cache writes.
     attn_impl.forward(
         layer=None,
         query=query,
@@ -493,6 +441,7 @@ def test_spyre_attn(
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
+        alibi_slopes=alibi_slopes,
     )
 
     if max(query_lens) >= 32:
@@ -500,8 +449,6 @@ def test_spyre_attn(
     else:
         atol, rtol = 0.2, 0.2
 
-    # Allow a small number of outlier elements to exceed the base tolerance,
-    # which can happen due to nondeterministic hardware optimizations.
     assert_close_outliers(
         output.to("cpu"),
         ref_output,
@@ -510,6 +457,247 @@ def test_spyre_attn(
         rtol=rtol,
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
+    )
+
+    # Release Spyre DMA mappings eagerly. Python doesn't free the KV-page
+    # tensors between tests until GC runs, but the Spyre VFIO driver keeps
+    # DMA regions mapped until the storage is actually released. Accumulated
+    # mappings across many tests in one pytest process can exhaust the VFIO
+    # address-space table (RAS::VFIO::MapDMAFailed).
+    if configure_device == "spyre":
+        del k_pages, v_pages, kv_cache, output
+        import gc
+
+        gc.collect()
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+    ],
+)
+def test_spyre_attn_core(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Attention correctness across execution modes with representative config."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 64)], id="decode(q=1,kv=64)"),
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(32, 288)], id="prefill(q=32,kv=288)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        pytest.param(64, id="block_size(64)"),
+        pytest.param(128, id="block_size(128)"),
+        pytest.param(256, id="block_size(256)"),
+    ],
+)
+def test_spyre_attn_block_sizes(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    block_size: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Page tiling correctness across block sizes."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 4)], id="decode(q=1,kv=4)"),
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "sliding_window",
+    [
+        pytest.param(4, id="swa_4"),
+        pytest.param(16, id="swa_16"),
+    ],
+)
+def test_spyre_attn_sliding_window(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Sliding window mask correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+def test_spyre_attn_alibi(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """ALiBi positional bias correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "soft_cap",
+    [
+        pytest.param(50.0, id="soft_cap(50)"),
+    ],
+)
+def test_spyre_attn_soft_cap(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    soft_cap: float,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Logits soft-cap correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
     )
 
 

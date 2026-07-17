@@ -17,6 +17,8 @@
 from dataclasses import dataclass
 from typing import Callable, ClassVar, NamedTuple
 
+import os
+
 import torch
 
 from spyre_inference.custom_ops.utils import convert
@@ -38,6 +40,12 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
+# regardless of the vLLM compilation config. Used to evaluate the compiled path
+# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
+# Default: off (unset or "0").
+_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -185,6 +193,21 @@ def _maybe_compile(fn):
     return torch.compile(fn, dynamic=False)
 
 
+def _maybe_compile_attn(fn):
+    """Like _maybe_compile, but also honors the SPYRE_FORCE_COMPILE_ATTN
+    escape hatch.
+
+    Used only for the online-softmax attention kernel — the reshape/cache
+    kernel is *not* covered, because forcing compile on it currently hits an
+    unsupported torch-spyre Inductor path (missing device_tensor_layout on
+    graph input). Flip _get_reshape_fn to call this helper too once that gap
+    is resolved.
+    """
+    if _FORCE_COMPILE_ATTN:
+        return torch.compile(fn, dynamic=False)
+    return _maybe_compile(fn)
+
+
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
@@ -214,13 +237,27 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     return specialized_reshape_and_cache_kernel
 
 
-def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
+def _create_compilable_page_attn(
+    num_blocks: int,
+    padded_query_len: int,
+    has_alibi: bool = False,
+    logits_soft_cap: float = 0.0,
+):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks and padded_query_len are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
+    logits_soft_cap are closure constants.
     """
 
-    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+    def specialized_paged_attn_kernel(
+        q,
+        k_pages,
+        v_pages,
+        page_indices,
+        mask_tiles,
+        scale,
+        alibi_bias_tiles=None,
+    ):
         """
         This kernels specializes for num_blocks and padded_query_len.
 
@@ -229,6 +266,11 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
             mask_tiles: [num_blocks]
+            alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
+                (only when has_alibi=True; None otherwise). The query-axis dim
+                is 1 because softmax absorbs per-query-row constants — see
+                the derivation at the bias-tile construction site in
+                _online_softmax_attention.
         """
 
         tile_max = None
@@ -253,6 +295,17 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
                 q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
             )
             scores *= scale
+            if logits_soft_cap > 0.0:
+                # Pull logits into (-cap, +cap) before the mask add so masked
+                # positions still map cleanly to -inf. Applied before the ALiBi
+                # bias so the positional term is not squashed by the tanh.
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+            if has_alibi:
+                # ALiBi bias slope[h] * (kv_pos - context_len). The additive
+                # mask_tile below uses finfo.min for masked positions, so this
+                # bias cannot un-mask them.
+                assert alibi_bias_tiles is not None
+                scores = scores + alibi_bias_tiles[i]
             scores = scores + mask_tile
             scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
@@ -649,6 +702,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
+        # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
+        # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
+        # per-block bias construction in _online_softmax_attention broadcasts
+        # cleanly against the score-tile shape.
+        if alibi_slopes is not None:
+            slopes_t = torch.tensor(alibi_slopes, dtype=torch.float16)
+            if slopes_t.numel() != num_heads:
+                raise ValueError(
+                    f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
+                )
+            self.alibi_slopes: torch.Tensor | None = slopes_t.view(
+                num_kv_heads, self.num_queries_per_kv, 1, 1
+            )
+        else:
+            self.alibi_slopes = None
+
+        # Normalise the API's Optional[float] into a plain float so the kernel
+        # can bake it as a closure constant. logits_soft_cap == 0.0 disables
+        # soft-capping (kernel takes the same path as upstream).
+        self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
+
         # Compiled function caches (keyed by iteration count for reshape, and
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
@@ -656,23 +730,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
-        if alibi_slopes is not None:
-            raise NotImplementedError("ALiBi slopes not supported yet")
-        if logits_soft_cap is not None:
-            raise NotImplementedError("Logits soft cap not supported yet")
-
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
+            # Deliberately uses _maybe_compile (not _maybe_compile_attn):
+            # SPYRE_FORCE_COMPILE_ATTN must not force-compile this kernel.
+            # torch.compile of _create_compilable_reshape_and_cache currently
+            # fails inside torch-spyre's Inductor pass with
+            # `Unsupported: missing device_tensor_layout on graph input arg0_1`.
+            # Move to _maybe_compile_attn once that gap is resolved.
             self._reshape_fns[num_tokens] = _maybe_compile(
                 _create_compilable_reshape_and_cache(num_tokens)
             )
         return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+        # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
+        # has_alibi and logits_soft_cap don't need to be part of the cache key.
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, padded_query_len)
+            self._attn_fns[key] = _maybe_compile_attn(
+                _create_compilable_page_attn(
+                    num_blocks,
+                    padded_query_len,
+                    has_alibi=self.alibi_slopes is not None,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
             )
         return self._attn_fns[key]
 
@@ -840,10 +922,47 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
             mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
+            # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
+            #
+            # The full ALiBi form is slope[h] * (kv_pos - (context_len + q_rel)),
+            # which varies over both query and KV positions. The (context_len + q_rel)
+            # term is a per-query-row constant, and softmax is invariant under adding
+            # any per-row constant to its input (numerator and denominator both pick
+            # up the same exp() factor). We therefore drop it and keep only the
+            # kv-dependent term — the softmax output is bit-identical to the full
+            # form, and each tile stays 1D over KV (block_size floats per head)
+            # instead of 2D (aligned_max_query_len * block_size).
+            #
+            # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
+            # (alibi_offset = seq_offset - context_len) — the production Triton path.
+            #
+            # Per-tile shape: [num_kv_heads, num_queries_per_kv, 1, block_size].
+            alibi_bias_tiles: list[torch.Tensor] | None = None
+            if self.alibi_slopes is not None:
+                context_len = kv_len - query_len
+                alibi_bias_tiles = []
+                for b in range(num_blocks_needed):
+                    kv_pos = torch.arange(
+                        b * block_size,
+                        (b + 1) * block_size,
+                        dtype=torch.float16,
+                    )
+                    rel = (kv_pos - context_len).view(1, 1, 1, block_size)
+                    bias = self.alibi_slopes * rel
+                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+
             # Run attention on target device
             q_dev = convert(q, device=_target_device)
             attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-            result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
+            result = attn_fn(
+                q_dev,
+                k_pages,
+                v_pages,
+                page_indices,
+                mask_tiles,
+                self.scale,
+                alibi_bias_tiles=alibi_bias_tiles,
+            )
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]

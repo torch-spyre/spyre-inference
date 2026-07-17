@@ -119,8 +119,7 @@ python -m spyre_testing_plugin.sync_upstream_test_deps
 
 **pyproject.toml key settings:**
 
-- `build-constraint-dependencies = ["torch==2.11.0"]` - Ensures consistent torch version
-- `extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }` - CPU backend for vLLM
+- `extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty" } }` - Empty backend for vLLM (no C kernels)
 - `tool.uv.sources` - Pulls vllm and torch-spyre from GitHub (not PyPI)
 - `[[tool.uv.index]]` - PyTorch CPU index for torch/torchvision
 

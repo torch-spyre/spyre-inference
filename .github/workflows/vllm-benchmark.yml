@@ -112,22 +112,6 @@ jobs:
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 
-      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
-      # against libnuma.so.1. Extract the RPM into a userspace dir and add
-      # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
-      # ships numactl-libs.
-      - name: Provide libnuma userspace
-        run: |
-          set -euo pipefail
-          NUMA_DIR="$RUNNER_TEMP/numa-libs"
-          mkdir -p "$NUMA_DIR"
-          cd "$NUMA_DIR"
-          curl -fsSL -o numactl-libs.rpm \
-            'https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/Packages/n/numactl-libs-2.0.19-3.el10.x86_64.rpm'
-          rpm2cpio numactl-libs.rpm | cpio -idmv
-          ls -la usr/lib64/
-          echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-
       - name: Resolve vLLM commit
         env:
           INPUT_VLLM_BRANCH: ${{ inputs.vllm_branch || 'main' }}

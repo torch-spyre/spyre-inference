@@ -357,7 +357,8 @@ def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config
     """gather_rotation returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice
     on Spyre for a supported config."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
-    from spyre_inference.custom_ops.rotary_embedding import round_up
+    from vllm.utils.math_utils import round_up
+    from spyre_inference.custom_ops.rotary_embedding import _SPYRE_STICK
 
     max_position, num_tokens = 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
@@ -366,4 +367,4 @@ def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config
     rot = rope.gather_rotation(positions, torch.device("spyre"))
     assert rot is not None
     assert rot.device.type == "spyre"
-    assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2))
+    assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2, _SPYRE_STICK))

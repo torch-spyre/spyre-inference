@@ -41,6 +41,7 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .utils import convert
@@ -51,11 +52,6 @@ logger = init_logger(__name__)
 # rotary_dim // 2; when that is not a stick multiple the split-half view has a
 # sub-stick stride the inductor rejects, so it is padded up on-device.
 _SPYRE_STICK = 64
-
-
-def round_up(n: int, m: int = _SPYRE_STICK) -> int:
-    """Round ``n`` up to the nearest multiple of ``m`` (the Spyre stick size)."""
-    return ((n + m - 1) // m) * m
 
 
 @lru_cache
@@ -120,7 +116,7 @@ class _SpyreRotaryMixin:
                 f"head_size); got is_neox_style={self.is_neox_style}, "
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
-        self._padded_inner = round_up(self.rotary_dim // 2)
+        self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
         self._rotation_cache: torch.Tensor | None = None
         self._rope_key = f"spyre_rope_{next(self._key_counter)}"
         # cos_sin_cache is DMA'd to Spyre by load_model_to_spyre; keep a CPU
@@ -199,7 +195,7 @@ def _rope_rot_op_func(positions: torch.Tensor, rope_key: str, head_size: int) ->
 
 def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) -> torch.Tensor:
     return torch.empty(
-        (positions.shape[0], 2, 2, round_up(head_size // 2)),
+        (positions.shape[0], 2, 2, round_up(head_size // 2, _SPYRE_STICK)),
         dtype=torch.float16,
         device=positions.device,
     )

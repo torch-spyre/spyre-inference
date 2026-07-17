@@ -56,7 +56,7 @@ class TorchSpyrePlatform(CpuPlatform):
     device_name: str = "cpu"
     device_type: str = "cpu"
 
-    dispatch_key: str = "CompositeExplicitAutograd"
+    dispatch_key: str = "PrivateUse1"
 
     # Multi-backend init string consumed by both vllm's
     # `init_distributed_environment` and `torch.distributed.new_group`.
@@ -197,10 +197,6 @@ class TorchSpyrePlatform(CpuPlatform):
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
         return AttentionBackendEnum.CUSTOM.get_path()
-
-    @classmethod
-    def use_custom_op_collectives(cls) -> bool:
-        return True
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

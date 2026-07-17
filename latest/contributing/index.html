@@ -2017,10 +2017,14 @@
 <div class="language-sh highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>prek<span class="w"> </span>install
 </span></code></pre></div>
 <h3 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h3>
-<p>The project includes both local tests (located in <code>spyre_inference/tests/</code>) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in <code>pyproject.toml</code>, for compatibility verification.</p>
+<p>The project includes both local tests (located in <code>tests/</code>) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in <code>pyproject.toml</code>, for compatibility verification.</p>
 <h4 id="test-markers">Test Markers<a class="headerlink" href="#test-markers" title="Permanent link">&para;</a></h4>
 <p>The test suite uses pytest markers to categorize tests:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">markers</span> <span class="o">=</span> <span class="p">[</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="s2">&quot;distributed: Tests requiring multiple spyre cards&quot;</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="s2">&quot;upstream: Tests coming from upstream vLLM&quot;</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="s2">&quot;attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job&quot;</span><span class="p">,</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="p">]</span>
 </span></code></pre></div>
 <p>Some useful overrides:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1"># Run only local tests</span>
@@ -2029,11 +2033,11 @@
 </span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="c1"># Run all upstream tests</span>
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>pytest<span class="w"> </span>-m<span class="w"> </span>upstream
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1"># Run attention tests from upstream only (see spyre_inference/testing/upstream_tests.yaml for markers on upstream tests)</span>
+</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1"># Run attention tests from upstream only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)</span>
 </span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;attention&quot;</span>
 </span></code></pre></div>
 <h4 id="upstream-test-integration">Upstream Test Integration<a class="headerlink" href="#upstream-test-integration" title="Permanent link">&para;</a></h4>
-<p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference</code> set automatically. See <code>tests/conftest.py</code> for implementation details.</p>
+<p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor</code> set automatically. See <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> for implementation details.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>To force a re-clone, remove <code>~/.cache/vllm-upstream-tests</code>.</p>
@@ -2044,7 +2048,7 @@
 <p><strong>SKIP_UPSTREAM_TESTS</strong>: Skip upstream tests entirely. Accepts <code>1</code>, <code>true</code>, or <code>yes</code>.</p>
 <p><strong>VLLM_COMMIT</strong>: Override the vLLM commit SHA from <code>pyproject.toml</code>.</p>
 <p><strong>VLLM_REPO_URL</strong>: Override the vLLM repository URL. Defaults to <code>https://github.com/vllm-project/vllm</code>.</p>
-<p><strong>UPSTREAM_TESTS_PATHS</strong>: Comma-separated paths to include, relative to <code>tests/</code>. Defaults to <code>models/language/generation</code>.</p>
+<p><strong>UPSTREAM_TESTS_PATHS</strong>: Not currently consumed by the plugin — the set of upstream test paths is auto-derived from the <code>rel_path</code> entries in <code>tests/plugin/spyre_testing_plugin/upstream_tests.yaml</code>.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>Environment variables can be passed directly to the <code>pytest</code> command, e.g. <code>VLLM_COMMIT=abc123def456 pytest</code>.</p>

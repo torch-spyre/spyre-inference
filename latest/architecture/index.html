@@ -1241,6 +1241,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Custom Op Replacement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#weight-un-fusing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight un-fusing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1259,6 +1276,17 @@
     <span class="md-ellipsis">
       
         Device Placement Strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hf-adapters-transformers-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HF-adapters Transformers backend
       
     </span>
   </a>
@@ -1578,6 +1606,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Custom Op Replacement">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#weight-un-fusing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Weight un-fusing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1596,6 +1641,17 @@
     <span class="md-ellipsis">
       
         Device Placement Strategy
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hf-adapters-transformers-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HF-adapters Transformers backend
       
     </span>
   </a>
@@ -1651,25 +1707,37 @@ ops injected via OOT registration.</p>
     indicate inheritance; solid arrows indicate composition or dependency.
   </figcaption>
 </figure>
-<p>The plugin registers via two entry points:</p>
+<p>The plugin registers via three entry points:</p>
 <table>
 <thead>
 <tr>
 <th>Entry Point</th>
+<th>Target</th>
 <th>Purpose</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>vllm.platform_plugins</code></td>
-<td>Registers <code>TorchSpyrePlatform</code> — sets dtype, worker class, and attention backend</td>
+<td><code>spyre_inference:register</code></td>
+<td>Registers <code>TorchSpyrePlatform</code> — sets dtype, worker class, attention backend, and distributed backend</td>
 </tr>
 <tr>
 <td><code>vllm.general_plugins</code></td>
-<td>Calls <code>register_all()</code> — registers all custom ops before model loading</td>
+<td><code>spyre_inference:register_ops</code></td>
+<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the opaque <code>spyre_rotary_cpu</code> and <code>spyre_convert</code> custom ops</td>
+</tr>
+<tr>
+<td><code>vllm.general_plugins</code></td>
+<td><code>spyre_inference:register_hf_adapters</code></td>
+<td>Overrides vLLM's <code>TransformersForCausalLM</code> with <code>HfAdaptersForCausalLM</code> so <code>model_impl="transformers"</code> uses hf-adapters (matmul-based RoPE) on Spyre</td>
 </tr>
 </tbody>
 </table>
+<p><code>vLLM</code> is built from source with <code>VLLM_TARGET_DEVICE=empty</code> (no device-specific C
+kernels), so the platform overrides a few CPU-backend assumptions: <code>import_kernels()</code> is
+a no-op (there is no <code>vllm._C</code>), and the model runner reimplements the slot-mapping
+kernel in pure PyTorch.</p>
 <h2 id="component-view-of-a-granite-model">Component view of a Granite model<a class="headerlink" href="#component-view-of-a-granite-model" title="Permanent link">&para;</a></h2>
 <figure>
   <img alt="Plugin Architecture" src="plugin-architecture.svg" style="width: 140%; max-width: 1000px; margin-left: -20%" />
@@ -1680,9 +1748,11 @@ ops injected via OOT registration.</p>
   </figcaption>
 </figure>
 <h2 id="custom-op-replacement">Custom Op Replacement<a class="headerlink" href="#custom-op-replacement" title="Permanent link">&para;</a></h2>
-<p>Each layer in the Granite model that requires Spyre-specific handling is replaced via
-vLLM's <code>@ClassName.register_oot()</code> decorator. When vLLM instantiates a layer, the
-decorator intercepts and returns the Spyre implementation instead.</p>
+<p>Each layer that requires Spyre-specific handling is replaced via vLLM's
+<code>@ClassName.register_oot()</code> decorator. Most replacements are pure class swaps that run
+when the ops package is imported; two layers (rotary embedding, the <code>convert</code> helper)
+also register an opaque custom op via <code>register_all()</code> so their device transfers stay
+invisible to <code>torch.compile</code>.</p>
 <table>
 <thead>
 <tr>
@@ -1697,58 +1767,69 @@ decorator intercepts and returns the Spyre implementation instead.</p>
 <td><code>RMSNorm</code></td>
 <td><code>SpyreRMSNorm</code></td>
 <td>Spyre</td>
-<td>Custom op boundary for <code>torch.compile</code></td>
+<td><code>forward_oot</code> runs a <code>maybe_compile</code>d kernel directly on Spyre; no float32 promotion (torch-spyre limitation)</td>
 </tr>
 <tr>
-<td><code>RotaryEmbedding</code></td>
-<td><code>SpyreRotaryEmbedding</code></td>
+<td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>
+<td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code></td>
 <td>CPU</td>
-<td>Fallback — Spyre doesn't support strided views</td>
+<td>Wrapped in the opaque <code>spyre_rotary_cpu</code> custom op; the whole rotary (incl. <code>index_select</code>) runs eagerly on CPU so Inductor sees one fallback kernel</td>
 </tr>
 <tr>
 <td><code>VocabParallelEmbedding</code></td>
 <td><code>SpyreVocabParallelEmbedding</code></td>
 <td>Spyre + CPU</td>
-<td>TP shard mask runs on CPU (Spyre inductor rejects int64 constants); embedding lookup on Spyre</td>
+<td>TP shard mask computed on CPU (Spyre inductor rejects int64 constants); the <code>aten.embedding</code> gather itself is a <strong>silent CPU fallback</strong> in torch-spyre (<a href="https://github.com/torch-spyre/torch-spyre/issues/420">torch-spyre#420</a>); weights and output live on Spyre; <code>all_reduce</code> when TP&gt;1</td>
 </tr>
 <tr>
 <td><code>QKVParallelLinear</code></td>
 <td><code>SpyreQKVParallelLinear</code></td>
-<td>Spyre + CPU</td>
-<td>TP≥1, <code>F.linear()</code> on Spyre, D2H after for downstream <code>.split()</code></td>
-</tr>
-<tr>
-<td><code>RowParallelLinear</code></td>
-<td><code>SpyreRowParallelLinear</code></td>
 <td>Spyre</td>
-<td>TP≥1, <code>F.linear()</code> + <code>all_reduce</code> when <code>reduce_results=True</code></td>
-</tr>
-<tr>
-<td><code>MergedColumnParallelLinear</code></td>
-<td><em>(unchanged)</em></td>
-<td>Spyre</td>
-<td>Upstream class with <code>SpyreUnquantizedLinearMethod</code> swapped in</td>
+<td>Subclass only asserts <code>gather_output=False</code>; the fused weight is split at load by the un-fusing pass, and <code>forward</code> runs <code>q</code>/<code>k</code>/<code>v</code> as three <code>F.linear</code> calls on Spyre</td>
 </tr>
 <tr>
 <td><code>SiluAndMul</code></td>
 <td><code>SpyreSiluAndMul</code></td>
 <td>Spyre</td>
-<td>Slicing done on CPU (Spyre limitation)</td>
+<td>Consumes the pre-split <code>gate</code>/<code>up</code> parts (see un-fusing); the fused fallback path slices on CPU (Spyre slicing corrupts views)</td>
 </tr>
 <tr>
 <td><code>ParallelLMHead</code></td>
 <td><code>SpyreParallelLMHead</code></td>
-<td>Spyre</td>
-<td>TP≥1; vocab partition padded up to a multiple of 64×32</td>
+<td>Spyre → CPU</td>
+<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP <code>all_gather</code></td>
+</tr>
+<tr>
+<td><code>LogitsProcessor</code></td>
+<td><code>SpyreLogitsProcessor</code></td>
+<td>—</td>
+<td>Makes logits contiguous — the downstream in-place <code>logits *= scale</code> otherwise trips a torch-spyre compile issue</td>
 </tr>
 </tbody>
 </table>
+<p><code>RowParallelLinear</code> and <code>MergedColumnParallelLinear</code> are <strong>not</strong> subclassed:</p>
+<ul>
+<li><code>RowParallelLinear</code> (<code>o_proj</code>, <code>down_proj</code>) runs the upstream class unchanged — <code>F.linear</code>
+  dispatches to Spyre, and <code>all_reduce</code> (via <code>SpyreCommunicator</code>) fires when <code>reduce_results=True</code>
+  under TP&gt;1.</li>
+<li><code>MergedColumnParallelLinear</code> (<code>gate_up_proj</code>) is un-fused at load into separate <code>gate</code>/<code>up</code>
+  Parameters (see below).</li>
+</ul>
+<h3 id="weight-un-fusing">Weight un-fusing<a class="headerlink" href="#weight-un-fusing" title="Permanent link">&para;</a></h3>
+<p><code>analyze_and_unfuse</code> (<code>custom_ops/unfuse.py</code>) runs once after the checkpoint is loaded,
+while weights are still on CPU. Fused projections are a problem on Spyre: splitting a
+fused weight's output on-device yields strided views that corrupt when transferred. So
+the pass splits each fused weight (<code>QKVParallelLinear</code>, and the <code>MergedColumnParallelLinear</code>
+feeding a <code>SpyreSiluAndMul</code>) into contiguous per-part Parameters and rebinds <code>forward</code> to
+run one <code>F.linear</code> per part. The result is a <code>SplitQKV</code> / <code>SplitSiluAndMul</code> container that
+the unmodified downstream idioms — <code>q, k, v = qkv.split(...)</code> and <code>gate, up = proj</code> — keep
+consuming unchanged.</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
 (no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each
-page is <code>[num_kv_heads, block_size, head_size]</code> — rather than a monolithic tensor. The
-default backend runs a FlashAttention-style online softmax that iterates over pages
-without any compact-gather step:</p>
+page is <code>[num_kv_heads, block_size, head_size]</code> — rather than a monolithic tensor. It
+runs a FlashAttention-style online softmax that iterates over pages without any
+compact-gather step:</p>
 <table>
 <thead>
 <tr>
@@ -1776,12 +1857,12 @@ without any compact-gather step:</p>
 <tr>
 <td>4. Online softmax over pages</td>
 <td>Spyre</td>
-<td>Compiled per <code>(num_blocks, padded_query_len)</code> kernel: <code>Q @ Kᵀ</code> → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
+<td>Compiled per <code>(num_blocks, padded_query_len)</code> kernel: <code>Q @ Kᵀ · scale</code> → optional soft-cap → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
 </tr>
 <tr>
-<td>5. Per-token write-back</td>
-<td>Spyre</td>
-<td><code>spyre.overwrite</code> each result token into the output buffer</td>
+<td>5. Write-back</td>
+<td>CPU → Spyre</td>
+<td>Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token <code>spyre.overwrite</code> scatter doesn't scale)</td>
 </tr>
 </tbody>
 </table>
@@ -1790,8 +1871,12 @@ without any compact-gather step:</p>
 <li><strong>KV length alignment</strong>: 256 tokens (avoids per-step recompilation on Spyre)</li>
 <li><strong>Query chunk size</strong>: 32 tokens (consistent tensor shapes for compilation)</li>
 <li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
+<li><strong>Block size</strong>: Must be a multiple of 64; the platform rounds a user-supplied
+  <code>block_size</code> up to the next multiple of 64 automatically</li>
 <li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
-  layout-propagation pass; only GQA configurations are exercised today.</li>
+  layout-propagation pass; only GQA configurations are exercised today</li>
+<li><strong>Supported</strong>: sliding-window masking and logits soft-capping are both handled;
+  ALiBi slopes are not</li>
 </ul>
 <h2 id="device-placement-strategy">Device Placement Strategy<a class="headerlink" href="#device-placement-strategy" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyreModelRunner</code> inherits from vLLM's <code>GPUModelRunner</code> and treats Spyre as the
@@ -1803,35 +1888,64 @@ override:</p>
 <li><strong>Int / bool dtypes</strong>: <code>.gpu</code> aliased to <code>.cpu</code> (Spyre doesn't natively support these)</li>
 </ul>
 <p><code>self.device</code> stays <code>cpu</code> so that scatter, indexing, and block-table ops run on CPU, but
-float compute tensors land on Spyre via <code>self._spyre_device</code>.</p>
+float compute tensors land on Spyre via <code>self._spyre_device</code>. Because there is no
+<code>vllm._C</code> under <code>VLLM_TARGET_DEVICE=empty</code>, the runner also swaps in a pure-PyTorch
+<code>_compute_slot_mapping</code> implementation for the paged-cache slot mapping.</p>
+<p>At load time, <code>load_model</code> calls <code>analyze_and_unfuse(self.model)</code> (weight un-fusing) and
+then moves every module except <code>Attention</code> scale buffers onto Spyre.</p>
 <p><code>_SpyreModelWrapper</code> sits between the model runner and the model and converts at the
 call boundary:</p>
 <ul>
 <li><strong>Input</strong>: CPU <code>int32</code>/<code>int64</code> tensors → Spyre <code>int64</code> (for embedding lookup)</li>
 <li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling)</li>
+<li><strong><code>compute_logits</code></strong>: moves the CPU-sliced <code>hidden_states[logits_indices]</code> back onto
+  Spyre for the <code>SpyreParallelLMHead</code> matmul, which then returns logits on CPU</li>
 </ul>
-<p>The embedding lookup itself runs on Spyre via <code>SpyreVocabParallelEmbedding</code>, which
-inherits weight loading and shard arithmetic from upstream and only overrides <code>forward</code>
-to compute the TP shard mask on CPU (the upstream helper does int64 comparisons against
-Python int constants, which the Spyre inductor backend rejects).</p>
+<p><code>SpyreVocabParallelEmbedding</code> inherits weight loading and shard arithmetic from upstream
+and overrides <code>forward</code> to compute the TP shard mask on CPU (the upstream helper does
+int64 comparisons against Python int constants, which the Spyre inductor backend
+rejects). Its weight and output tensors live on Spyre, but the <code>aten.embedding</code> gather
+itself is a <strong>silent CPU fallback</strong> in torch-spyre
+(<a href="https://github.com/torch-spyre/torch-spyre/issues/420">torch-spyre#420</a>) — the lookup
+is shuttled D2H/H2D even though the tensors are on Spyre, so no <code>FallbackWarning</code>-free
+"Spyre embedding" exists yet.</p>
 <p>Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (rotary embeddings, q/k/v slicing,
-the per-sequence attention varlen loop, logits indexing).</p>
+operations that Spyre doesn't yet support natively (the embedding gather, rotary
+embeddings, q/k/v slicing, the per-sequence attention varlen loop, logits indexing).</p>
+<h2 id="hf-adapters-transformers-backend">HF-adapters Transformers backend<a class="headerlink" href="#hf-adapters-transformers-backend" title="Permanent link">&para;</a></h2>
+<p>When <code>model_impl="transformers"</code>, the <code>register_hf_adapters</code> general plugin swaps vLLM's
+<code>TransformersForCausalLM</code> for <code>HfAdaptersForCausalLM</code> (<code>spyre_inference/hf_adapters.py</code>).
+vLLM's stock Transformers backend still handles model creation, weight loading, attention
+routing, the KV cache, and scheduling; the Spyre OOT layers above apply automatically at
+instantiation. The adapter's main job is to replace HF's <code>RotaryEmbedding</code> with a
+matmul-based RoPE (<code>apply_rope_matmul</code>), padding Q/K into a stick-aligned dimension for
+the rotation when <code>head_dim/2</code> is not a multiple of the Spyre block size and contracting
+back afterward.</p>
 <h2 id="distributed-tp">Distributed (TP)<a class="headerlink" href="#distributed-tp" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyrePlatform.get_device_communicator_cls</code> returns <code>SpyreCommunicator</code>, a
-<code>DeviceCommunicatorBase</code> override that lives in
-<code>spyre_inference/distributed/spyre_communicator.py</code>. It exists because the installed
-<code>libspyre_comms.so</code> only implements <code>barrier</code>, <code>broadcast</code>, single-tensor <code>allgather</code>,
-and pairwise <code>send</code>/<code>recv</code>; the list-form <code>allgather</code>, <code>allreduce</code>, <code>gather</code>, and
-<code>reduce</code> overrides on <code>SpyreCommsContext</code> are throw-stubs.</p>
-<p>For the TP=2 forward path, <code>SpyreCommunicator.all_reduce</code> provides a manual
-send/recv-then-broadcast fallback. <code>all_gather</code> and <code>gather</code> route CPU tensors through
-the gloo half of the multi-backend <code>cpu:gloo,spyre:spyreccl</code> device group; Spyre
-tensors raise a clear <code>NotImplementedError</code> describing what's needed to unblock them.
-Each fallback is tagged <code>REPLACE-WITH-NATIVE</code> so the file can be deleted (or pared back
-to genuine perf overrides) once the comms library catches up. The
-<code>tests/test_spyre_comms_native_probes.py</code> xfail-strict suite is the canonical signal:
-when a probe flips green, delete the corresponding override.</p>
+<code>DeviceCommunicatorBase</code> override in
+<code>spyre_inference/distributed/spyre_communicator.py</code>. The installed <code>libspyre_comms.so</code>
+now implements <code>barrier</code>, <code>broadcast</code>, <code>send</code>/<code>recv</code>, list-form <code>allgather</code>, and
+<code>gather</code>; only <code>allreduce</code> and <code>reduce</code> remain throw-stubs, and torch-spyre's spyreccl
+backend still stubs <code>_allgather_base</code> (so <code>dist.all_gather_into_tensor</code> doesn't work).</p>
+<p><code>SpyreCommunicator</code> therefore supplies:</p>
+<ul>
+<li><strong><code>all_reduce</code></strong> — a manual TP=2 reduce-to-root + broadcast built from <code>send</code>/<code>recv</code>
+  (native allreduce is not available yet; TP&gt;2 raises).</li>
+<li><strong><code>all_gather</code></strong> — routes CPU tensors through the gloo half of the multi-backend
+  <code>cpu:gloo,spyre:spyreccl</code> group, and uses native list-form <code>dist.all_gather</code> for Spyre
+  tensors (the base class's <code>dist.all_gather_into_tensor</code> path is blocked by the
+  <code>_allgather_base</code> stub).</li>
+<li><strong><code>reduce_scatter</code></strong> — raises; it is not on the TP forward path.</li>
+</ul>
+<p><code>gather</code> is no longer overridden — it now works natively. Each remaining fallback is
+tagged <code>REPLACE-WITH-NATIVE</code>; the <code>tests/test_spyre_comms_native_probes.py</code> xfail-strict
+suite is the canonical signal: when a probe flips green, delete the corresponding
+override.</p>
+<p>The worker (<code>TorchSpyreWorker</code>) inherits directly from vLLM's <code>Worker</code> (gpu_worker), not
+<code>CPUWorker</code> — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
+profiling). Data parallelism (<code>data_parallel_size &gt; 1</code>) is rejected in
+<code>check_and_update_config</code>.</p>
 
 
 

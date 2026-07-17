@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib.metadata
 import math
 import multiprocessing
@@ -65,14 +66,54 @@ class TorchSpyrePlatform(CpuPlatform):
     # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
-    # Hard caps for the on-device KV cache. Large batch volumes trigger
-    # `RAS::VFIO::MapDMAFailed` during `_initialize_kv_caches`.
-    MAX_MODEL_LEN_CAP: int = 128
-    MAX_NUM_SEQS_CAP: int = 8
+    # Cap applied to `max_model_len` only when the user didn't pass one —
+    # `check_max_model_len` runs only in vLLM's model-derived branch.
+    _DEFAULT_DERIVED_MAX_MODEL_LEN = 2048
+
+    # Applied only when the user didn't pass `--max-num-seqs`; vLLM's own
+    # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
+    # `pre_register_and_update`.
+    _DEFAULT_MAX_NUM_SEQS = 4
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    @classmethod
+    def check_max_model_len(cls, max_model_len: int) -> int:
+        # vLLM only calls this on the user-didn't-specify branch of
+        # `_get_and_verify_max_len`, so user-supplied values are untouched.
+        return min(max_model_len, cls._DEFAULT_DERIVED_MAX_MODEL_LEN)
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        # Runs at the top of `EngineArgs.create_engine_config`, before
+        # `_set_default_max_num_seqs_and_batched_tokens_args`. This is the
+        # earliest safe seam to monkey-patch `EngineArgs`: doing it from
+        # `register()` cyclically re-imports arg_utils during platform
+        # discovery, and the swallowed ImportError silently downgrades us
+        # to CpuPlatform.
+        from vllm.engine.arg_utils import EngineArgs
+
+        original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+        if getattr(original, "_spyre_patched", False):
+            return
+
+        @functools.wraps(original)
+        def _spyre_patched(self, usage_context, model_config, parallel_config):
+            user_supplied = self.max_num_seqs is not None
+            original(self, usage_context, model_config, parallel_config)
+            if not user_supplied and self.max_num_seqs is not None:
+                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+
+        _spyre_patched._spyre_patched = True
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+
+    @classmethod
+    def import_kernels(cls) -> None:
+        # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
+        # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
+        pass
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -165,29 +206,6 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
-        # Clamp the user-facing KV-cache knobs so the auto-derived
-        # `num_gpu_blocks_override` below fits in Spyre's DMA region. Done
-        # before super() because CpuPlatform's logic also reads max_model_len.
-        model_config = vllm_config.model_config
-        if model_config.max_model_len > cls.MAX_MODEL_LEN_CAP:
-            logger.warning(
-                "Spyre's on-device KV cache cannot fit max_model_len=%d; "
-                "clamping to MAX_MODEL_LEN_CAP=%d.",
-                model_config.max_model_len,
-                cls.MAX_MODEL_LEN_CAP,
-            )
-            model_config.max_model_len = cls.MAX_MODEL_LEN_CAP
-
-        scheduler_config = vllm_config.scheduler_config
-        if scheduler_config.max_num_seqs > cls.MAX_NUM_SEQS_CAP:
-            logger.warning(
-                "Spyre's on-device KV cache cannot fit max_num_seqs=%d; "
-                "clamping to MAX_NUM_SEQS_CAP=%d.",
-                scheduler_config.max_num_seqs,
-                cls.MAX_NUM_SEQS_CAP,
-            )
-            scheduler_config.max_num_seqs = cls.MAX_NUM_SEQS_CAP
-
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The list-based attention backend requires 64-element stick alignment for
         # torch.compile.
@@ -217,8 +235,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
-            # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
-            # Override with TorchSpyreWorker for Spyre-specific functionality
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
@@ -232,15 +248,12 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        # CPUWorker derives its KV-cache budget from host RAM, but on Spyre
-        # the cache lives on-device — the host-RAM math is meaningless and
-        # `gpu_memory_utilization * total_RAM` typically exceeds available
-        # RAM on Spyre boxes, tripping CPUWorker.__init__'s preflight check.
+        # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
+        # math in CpuPlatform.check_and_update_config is meaningless for us.
         # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
-        # populate `cache_config.kv_cache_memory_bytes` below, which both
-        # bypasses the preflight check and short-circuits the host-RSS math
-        # in CPUWorker.determine_available_memory. Skip when the user has
-        # explicitly supplied --kv-cache-memory-bytes so we don't clobber it.
+        # populate `cache_config.kv_cache_memory_bytes`, which
+        # TorchSpyreWorker.determine_available_memory returns directly.
+        # Skip when the user has explicitly supplied --kv-cache-memory-bytes.
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 

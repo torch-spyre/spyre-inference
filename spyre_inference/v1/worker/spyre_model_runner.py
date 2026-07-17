@@ -60,6 +60,66 @@ from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
+# Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
+# (unavailable with VLLM_TARGET_DEVICE=empty).
+
+_PAD_SLOT_ID = -1
+
+
+def _compute_slot_mapping_impl(
+    num_tokens: int,
+    max_num_tokens: int,
+    query_start_loc: torch.Tensor,
+    positions: torch.Tensor,
+    block_table: torch.Tensor,
+    block_table_stride: int,
+    block_size: int,
+    slot_mapping: torch.Tensor,
+    TOTAL_CP_WORLD_SIZE: int = 1,
+    TOTAL_CP_RANK: int = 0,
+    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
+    PAD_ID: int = _PAD_SLOT_ID,
+    BLOCK_SIZE: int = 1024,
+) -> None:
+    """Map each token position to its flat index in the paged KV cache.
+
+    The upstream vLLM implementation is a Triton kernel (requires a GPU) and
+    the CPU backend delegates to a C++ op in _C.so. Neither is available with
+    VLLM_TARGET_DEVICE=empty, so we reimplement the logic in pure PyTorch.
+
+    Correctness is validated indirectly by the upstream attention backend test
+    (test_causal_backend_correctness) and end-to-end model generation tests.
+    """
+    assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
+    block_indices = (positions[:num_tokens] // block_size).to(torch.int64)
+    block_offsets = (positions[:num_tokens] % block_size).to(torch.int64)
+
+    num_reqs = query_start_loc.shape[0] - 1
+    req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
+    for i in range(num_reqs):
+        start = query_start_loc[i].item()
+        end = query_start_loc[i + 1].item()
+        req_indices[start:end] = i
+
+    flat_indices = req_indices * block_table_stride + block_indices
+    block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
+    slot_mapping[:num_tokens] = block_numbers * block_size + block_offsets
+    if max_num_tokens > num_tokens:
+        slot_mapping[num_tokens:max_num_tokens] = PAD_ID
+
+
+class _FuncWrapper:
+    """Mimics Triton's grid-launch syntax: kernel[(grid,)](...) → kernel(...)."""
+
+    def __init__(self, func):
+        self.func = func
+
+    def __getitem__(self, grid):
+        return self.func
+
+
+_compute_slot_mapping_kernel = _FuncWrapper(_compute_slot_mapping_impl)
+
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
     """Spyre-specific CpuGpuBuffer with Spyre-safe copies and split dtypes.
@@ -228,13 +288,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.use_cuda_graph = False
         self.cascade_attn_enabled = False
 
-        # Replace Triton kernel with C++ CPU implementation.
+        # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
-        # Same replacement as CPUModelRunner._postprocess_triton().
-        import vllm.utils.cpu_triton_utils as cpu_tl
+        # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
+        # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
         import vllm.v1.worker.block_table
 
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = cpu_tl.compute_slot_mapping_kernel
+        vllm.v1.worker.block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load model and compile for Spyre."""

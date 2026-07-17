@@ -252,23 +252,6 @@ jobs:
           uv pip show torch
           uv pip freeze
 
-      # image_torch_spyre doesn't ship numactl-libs, but vllm/_C is linked
-      # against libnuma.so.1. Extract the RPM into a userspace dir and add
-      # it to LD_LIBRARY_PATH so vllm/_C can load. Remove once the image
-      # ships numactl-libs.
-      - name: Provide libnuma userspace
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        run: |
-          set -euo pipefail
-          NUMA_DIR="$RUNNER_TEMP/numa-libs"
-          mkdir -p "$NUMA_DIR"
-          cd "$NUMA_DIR"
-          curl -fsSL -o numactl-libs.rpm \
-            'https://dl.rockylinux.org/pub/rocky/10/BaseOS/x86_64/os/Packages/n/numactl-libs-2.0.19-3.el10.x86_64.rpm'
-          rpm2cpio numactl-libs.rpm | cpio -idmv
-          ls -la usr/lib64/
-          echo "LD_LIBRARY_PATH=$NUMA_DIR/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-
       - name: Run tests
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
         run: |

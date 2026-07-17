@@ -92,22 +92,20 @@ override-dependencies = [
     "requests>=2.32.4",
 
 ]
-# This adds constraints to all dependent build environments, which will ensure everything is built
-# with the same version of torch. This CANNOT conflict with a package's existing build dependencies
 build-constraint-dependencies = ["torch==2.11.0"]
-# This ensures that we build the cpu backend for vLLM
+# This ensures that we build vLLM with no device-specific C kernels (empty backend).
+# This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
+# on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
 # The `CMAKE_ARGS="--fresh"` ensures that cmake doesn't cache binary paths from ephemeral build environments
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu", CMAKE_ARGS = "--fresh" } }
+extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
 
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
 vllm = [
-  # Pre-built CPU wheels (x86_64 + aarch64) — avoids ~30 min C++ kernel compilation on Linux CI.
-  # manylinux_2_35 requires glibc >= 2.35; RHEL 10.2 ships 2.39 so this is compatible.
-  { index = "vllm-cpu", marker = "sys_platform == 'linux'" },
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0", marker = "sys_platform != 'linux'" },
+  # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "85e077c41c5f8617ce0ee0d06ab94c071c254c9e" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
@@ -124,24 +122,12 @@ spyre-testing-plugin = { workspace = true }
 members = ["tests/plugin"]
 
 # vllm specifies "common" build dependencies in pyproject.toml, while specific requirements for
-# cpu builds are specified here:
-# See https://github.com/vllm-project/vllm/blob/v0.15.1/requirements/cpu-build.txt
-# In the future, we may need to use this section to specify extra dependencies required to build
-# vllm from source for the cpu backend.
-# NB: This section CANNOT be used to override dependencies to a conflicting version. For example,
-# you cannot add torch==2.10.0 if vllm's build dependencies already specify torch>=2.11.0
+# building from source are specified here. The empty backend has minimal build deps.
+# NB: This section CANNOT be used to override dependencies to a conflicting version.
 # [tool.uv.extra-build-dependencies]
 # vllm = [
 #     "ninja",
 # ]
-
-# Pre-built vllm CPU wheels (x86_64 + aarch64 Linux). The path component is the git commit SHA
-# for the pinned rev (v0.24.0 = ee0da84ab9e04ac7610e28580af62c365e898389). Update both this hash
-# and the rev in tool.uv.sources together when bumping vllm.
-[[tool.uv.index]]
-name = "vllm-cpu"
-url = "https://wheels.vllm.ai/ee0da84ab9e04ac7610e28580af62c365e898389/cpu"
-explicit = true
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set

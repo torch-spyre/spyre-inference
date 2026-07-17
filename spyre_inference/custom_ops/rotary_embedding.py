@@ -161,8 +161,6 @@ class _SpyreRotaryMixin:
         query: torch.Tensor,
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        target_device = positions.device
-        target_dtype = query.dtype
         # Fetch the pre-gathered slice via the opaque op so the forward-context read
         # stays out of the torch.compile graph.
         rot = torch.ops.vllm.spyre_rope_rot(
@@ -170,12 +168,9 @@ class _SpyreRotaryMixin:
             self._rope_key,  # ty: ignore[invalid-argument-type]
             self.head_size,
         )
-        q = convert(query, device=target_device, dtype=target_dtype)
-        out_query = _rotate_neox_2x2(q, rot, self.head_size)
-        out_key = None
-        if key is not None:
-            k = convert(key, device=target_device, dtype=target_dtype)
-            out_key = _rotate_neox_2x2(k, rot, self.head_size)
+        # query/key arrive on Spyre from the QKV projection; rot is primed on Spyre.
+        out_query = _rotate_neox_2x2(query, rot, self.head_size)
+        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
         return out_query, out_key
 
 

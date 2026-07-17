@@ -79,6 +79,7 @@ jobs:
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
     strategy:
+      fail-fast: false
       matrix:
         include:
           - cfg: Non-distributed spyre tests
@@ -245,6 +246,12 @@ jobs:
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze
+
+      - name: Ensure public HF models cached
+        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
+        env:
+          HF_HUB_OFFLINE: '0'
+        run: uv run .github/cache_config/manage_cache.py --public
 
       - name: Run tests
         if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}

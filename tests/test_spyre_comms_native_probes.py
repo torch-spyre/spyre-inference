@@ -107,5 +107,15 @@ def test_native_all_gather_list_works(run_tp_probe) -> None:
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "native gather on the spyreccl device_group aborts with 'The Nth "
+        "envelope at rank R missing symbolic address'. libspyre_comms' "
+        "Construct-time address propagation does not assign a symbolic address "
+        "to gather's non-root send envelope, so dist.gather crashes the worker "
+        "(SIGABRT)."
+    ),
+)
 def test_native_gather_works(run_tp_probe) -> None:
     run_tp_probe("native_gather", world_size=2)

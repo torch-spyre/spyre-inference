@@ -30,18 +30,13 @@ logger = init_logger(__name__)
 
 
 class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
-    """Embedding method whose logits projection lands on CPU.
+    """Returns logits on CPU when a tied ``embed_tokens`` is used as the LM head.
 
-    Tied-weight models in the Gemma (1/2/3n) and Cohere/Command-R families
-    compute logits through the tied ``embed_tokens`` (a VocabParallelEmbedding)
-    rather than a ParallelLMHead — vLLM passes ``self.model.embed_tokens`` to the
-    LogitsProcessor, which calls ``quant_method.apply``. The base ``apply`` keeps
-    the logits on the input (Spyre) device, so the sampler's downstream
-    ``log_softmax`` (no Spyre kernel, no CPU fallback) raises NotImplementedError.
-
-    Mirror SpyreParallelLMHead.forward_oot: return logits on CPU. The
-    ``embedding()`` lookup path used by the normal embedding forward is inherited
-    unchanged.
+    Tied-weight models (Gemma, Cohere) project logits through ``embed_tokens``'
+    ``apply`` rather than a ParallelLMHead. The base ``apply`` leaves logits on
+    Spyre, where the sampler's ``log_softmax`` has no kernel or CPU fallback, so
+    move them to CPU like SpyreParallelLMHead. The ``embedding()`` lookup is
+    inherited unchanged.
     """
 
     def apply(

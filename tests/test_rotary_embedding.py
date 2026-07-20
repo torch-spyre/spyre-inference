@@ -26,22 +26,6 @@ LLAMA3_ROPE_PARAMS = {
 }
 
 
-def _spyre_available() -> bool:
-    try:
-        torch.randn(1, device=torch.device("spyre"))
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture()
-def requires_spyre():
-    """Skip when no Spyre device is present (checked in-fixture, not at import, to
-    avoid claiming the single-tenant device during collection)."""
-    if not _spyre_available():
-        pytest.skip("Spyre device unavailable")
-
-
 def _prime_rope(rope, positions):
     """Mimic _SpyreModelWrapper: pre-gather the rotation slice and stash it in the
     forward context so a direct forward_oot can fetch it. Returns the slice (or None
@@ -77,7 +61,7 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
     )
 
 
-def test_llama3_rotary_forward_matches_reference(requires_spyre, default_vllm_config):
+def test_llama3_rotary_forward_matches_reference(default_vllm_config):
     """forward_oot output matches Llama3RotaryEmbedding.forward_native reference.
 
     Runs the on-device 2x2 path (spyre_rope_rot dispatches under the platform
@@ -118,7 +102,7 @@ def test_llama3_rotary_forward_matches_reference(requires_spyre, default_vllm_co
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
-def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_config):
+def test_base_rotary_forward_matches_reference(default_vllm_config):
     """SpyreRotaryEmbedding.forward_oot (on-device 2x2 path) matches forward_native."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
@@ -154,7 +138,7 @@ def test_base_rotary_forward_matches_reference(requires_spyre, default_vllm_conf
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
-def test_rotary_head_size_64_matches_reference(requires_spyre, default_vllm_config):
+def test_rotary_head_size_64_matches_reference(default_vllm_config):
     """head_size=64 (llama-3.2-1B): inner dim 32 is not stick-aligned, so it runs on
     Spyre via the pad-to-stick path."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -222,7 +206,6 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
 @pytest.mark.parametrize("num_q_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("flatten", [True, False])
 def test_rotary_forward_oot_on_spyre(
-    requires_spyre,
     default_vllm_config,
     head_size,
     num_q_heads,
@@ -299,7 +282,7 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
         )
 
 
-def test_rotary_forward_oot_key_none_on_spyre(requires_spyre, default_vllm_config):
+def test_rotary_forward_oot_key_none_on_spyre(default_vllm_config):
     """forward_oot(..., key=None) returns (rotated_query, None) on Spyre."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
     from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
@@ -321,7 +304,7 @@ def test_rotary_forward_oot_key_none_on_spyre(requires_spyre, default_vllm_confi
     )
 
 
-def test_llama3_rotary_forward_oot_on_spyre(requires_spyre, default_vllm_config):
+def test_llama3_rotary_forward_oot_on_spyre(default_vllm_config):
     """Llama3 (scaled) rotation runs on Spyre and matches forward_native, confirming
     the 2x2 cache inherits llama3 frequency scaling via the MRO."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -353,7 +336,7 @@ def test_llama3_rotary_forward_oot_on_spyre(requires_spyre, default_vllm_config)
     torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
-def test_rotary_sel_cache_isolated_across_layers(requires_spyre, default_vllm_config):
+def test_rotary_sel_cache_isolated_across_layers(default_vllm_config):
     """Two distinct rope modules (different rope_theta -> different rotations) prime
     their own slices into one spyre_rope_rot dict under distinct _rope_key entries;
     each forward_oot fetches its own slice and matches its own reference. A key mixup
@@ -390,7 +373,7 @@ def test_rotary_sel_cache_isolated_across_layers(requires_spyre, default_vllm_co
 
 
 @pytest.mark.parametrize("head_size", [128, 64])
-def test_gather_rotation_returns_spyre_slice(requires_spyre, default_vllm_config, head_size):
+def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
     """gather_rotation returns the per-token [T, 2, 2, round_up(rotary_dim//2)] slice
     on Spyre for a supported config."""
     from vllm.model_executor.layers.rotary_embedding import get_rope

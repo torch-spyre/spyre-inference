@@ -37,7 +37,7 @@ PLUGIN_ROOT = Path(__file__).parent.parent
 PYPROJECT_PATH = PLUGIN_ROOT / "pyproject.toml"
 
 # Libraries to exclude from upstream test dependencies
-FILTERED_LIBRARIES = {"terratorch"}
+FILTERED_LIBRARIES = {"terratorch", "transformers"}
 
 
 def extract_vllm_commit(pyproject_path: Path) -> str:

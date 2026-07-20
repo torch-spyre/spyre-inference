@@ -34,14 +34,14 @@ prek install
 
 ### Testing
 
-The project includes both local tests (located in `spyre_inference/tests/`) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
+The project includes both local tests (located in `tests/`) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in `pyproject.toml`, for compatibility verification.
 
 #### Test Markers
 
 The test suite uses pytest markers to categorize tests:
 
 ```python
---8<-- "spyre_inference/pyproject.toml:test-markers-definition"
+--8<-- "pyproject.toml:test-markers-definition"
 ```
 
 Some useful overrides:
@@ -53,13 +53,13 @@ pytest
 # Run all upstream tests
 pytest -m upstream
 
-# Run attention tests from upstream only (see spyre_inference/testing/upstream_tests.yaml for markers on upstream tests)
+# Run attention tests from upstream only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)
 pytest -m "attention"
 ```
 
 #### Upstream Test Integration
 
-Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference` set automatically. See `tests/conftest.py` for implementation details.
+Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor` set automatically. See `tests/plugin/spyre_testing_plugin/pytest_plugin.py` for implementation details.
 
 !!! tip
     To force a re-clone, remove `~/.cache/vllm-upstream-tests`.
@@ -76,7 +76,7 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
 
 **VLLM_REPO_URL**: Override the vLLM repository URL. Defaults to `https://github.com/vllm-project/vllm`.
 
-**UPSTREAM_TESTS_PATHS**: Comma-separated paths to include, relative to `tests/`. Defaults to `models/language/generation`.
+**UPSTREAM_TESTS_PATHS**: Not currently consumed by the plugin — the set of upstream test paths is auto-derived from the `rel_path` entries in `tests/plugin/spyre_testing_plugin/upstream_tests.yaml`.
 
 !!! tip
     Environment variables can be passed directly to the `pytest` command, e.g. `VLLM_COMMIT=abc123def456 pytest`.

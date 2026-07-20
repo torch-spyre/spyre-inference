@@ -15,6 +15,7 @@ permissions:
 jobs:
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -23,53 +24,27 @@ jobs:
       with:
         python-version: "3.12"
         enable-cache: true
-    # torch-spyre cannot install without the spyre runtime libs installed
-    # we're not running any tests so we can skip the dev group with `--no-dev`
+
     - name: "Install dependencies"
-      run: uv sync --frozen --no-install-package torch-spyre --no-install-package vllm --no-dev -v
+      run: uv sync --frozen --no-install-package torch-spyre --no-dev -v
+
+    - name: "Clone torch-spyre source for type stubs"
+      run: |
+        TORCH_SPYRE_REV=$(grep -oP '^torch-spyre = .*rev = "\K[^"]+' pyproject.toml)
+        git clone --depth 1 https://github.com/torch-spyre/torch-spyre /tmp/torch-spyre
+        git -C /tmp/torch-spyre fetch --depth 1 origin "$TORCH_SPYRE_REV"
+        git -C /tmp/torch-spyre checkout "$TORCH_SPYRE_REV"
+        mkdir /tmp/torch-spyre-stubs
+        cp -r /tmp/torch-spyre/torch_spyre /tmp/torch-spyre-stubs/
+
     - run: echo "::add-matcher::.github/workflows/matchers/ruff.json"
-    - uses: j178/prek-action@v1
+
+    - name: "Run linting via prek"
+      uses: j178/prek-action@v1
       with:
         extra_args: --all-files --hook-stage manual
 
-  type-check:
-    name: 'ty type check'
-    # `ty` needs the real torch/vllm/torch-spyre deps to type check imports,
-    # which need the spyre runtime libs (carried by `image_torch_spyre`)
-    # to install. The check itself does not exercise the Spyre device, so it
-    # runs on `spyre_pf_x0` (no cards).
-    runs-on:
-      - x86_64
-      - spyre_pf_x0
-      - linux
-      # - image_torch_spyre
-      - image_torch_spyre_pinned
-    timeout-minutes: 30
-    steps:
-    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-    - name: Install Spyre RPMs
-      id: spyre-rpms
-      uses: ./.github/actions/spyre-rpm-install
-
-    - name: "Set up Python"
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-      with:
-        enable-cache: true
-        cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
-        cache-local-path: ${{ runner.temp }}/setup-uv-cache
-        prune-cache: false
-
-    - name: "Install dependencies"
+    - name: "Run ty type check"
       env:
-        AIU_SETUP_MULTI_AIU: '0'
-      run: |
-        source /etc/profile.d/ibm-aiu-setup.sh
-        uv sync --frozen --no-dev -v
-
-    - name: "Run ty via prek"
-      env:
-        AIU_SETUP_MULTI_AIU: '0'
-      run: |
-        source /etc/profile.d/ibm-aiu-setup.sh
-        uvx prek@v0.4.4 run ty --all-files --stage pre-commit
+        PYTHONPATH: /tmp/torch-spyre-stubs
+      run: uvx prek@v0.4.4 run ty --all-files --stage pre-commit

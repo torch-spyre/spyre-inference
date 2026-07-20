@@ -214,9 +214,7 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     actual_key = _rotate_neox_2x2(key, rot, head_size)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
-    torch.testing.assert_close(
-        actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 

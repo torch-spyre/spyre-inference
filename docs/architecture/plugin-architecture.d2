@@ -6,19 +6,24 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "SpyreVocabParallelEmbedding\n(Spyre lookup;\nTP shard mask on CPU)" {
+  EMB: "SpyreVocabParallelEmbedding\n(aten.embedding = CPU fallback;\nweights/output on Spyre)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  LM: "SpyreParallelLMHead\nfloat16 → logits\nvocab partition padded to 64×32" {
+  LP: "SpyreLogitsProcessor\n(logits.contiguous())" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
+  LM: "SpyreParallelLMHead\nF.linear on Spyre → logits→CPU\n(TP≥1 vocab shard; pad to 64×32)" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
+    style.font-color: "#ffffff"
+  }
 }
 
-granite: "Granite-3 8B Decoder Layer (× 32)" {
+granite: "Granite Decoder Layer (× N)" {
   style.fill: "#e0e0e0"
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
@@ -28,12 +33,12 @@ granite: "Granite-3 8B Decoder Layer (× 32)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  QKV: "SpyreQKVParallelLinear\n(D2H after F.linear)" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  QKV: "QKVParallelLinear (un-fused)\nq,k,v = 3× F.linear on Spyre" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ROPE: "SpyreRotaryEmbedding\n(CPU fallback)" {
+  ROPE: "SpyreRotaryEmbedding\n(CPU fallback via\nspyre_rotary_cpu op)" {
     style.fill: "#e65100"
     style.stroke: "#bf360c"
     style.font-color: "#ffffff"
@@ -43,9 +48,9 @@ granite: "Granite-3 8B Decoder Layer (× 32)" {
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  O_PROJ: "SpyreRowParallelLinear\n(H2D before F.linear,\nall_reduce when TP>1)" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  O_PROJ: "RowParallelLinear — o_proj\n(upstream; F.linear on Spyre,\nall_reduce when TP>1)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
   N2: "SpyreRMSNorm" {
@@ -53,19 +58,19 @@ granite: "Granite-3 8B Decoder Layer (× 32)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  GATE: "MergedColumnParallelLinear" {
+  GATE: "MergedColumnParallelLinear (un-fused)\ngate,up = 2× F.linear on Spyre" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ACT: "SpyreSiluAndMul" {
+  ACT: "SpyreSiluAndMul\nsilu(gate) * up on Spyre" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  DOWN: "SpyreRowParallelLinear\n(all_reduce when TP>1)" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  DOWN: "RowParallelLinear — down_proj\n(upstream; all_reduce when TP>1)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
 
@@ -74,7 +79,7 @@ granite: "Granite-3 8B Decoder Layer (× 32)" {
   N2 -> GATE -> ACT -> DOWN
 }
 
-attn_detail: "SpyreAttentionImpl Pipeline (default backend)" {
+attn_detail: "SpyreAttentionImpl Pipeline" {
   style.fill: "#e0e0e0"
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
@@ -89,17 +94,17 @@ attn_detail: "SpyreAttentionImpl Pipeline (default backend)" {
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  S3: "Per-sequence loop\n(varlen via query_start_loc;\npad query_len to 32)" {
+  S3: "Per-sequence varlen loop\n(query_start_loc; pad q_len to 32)" {
     style.fill: "#e65100"
     style.stroke: "#bf360c"
     style.font-color: "#ffffff"
   }
-  S4: "Online softmax over pages\nQ @ Kᵀ → +mask → softmax → @V\n(compiled per (num_blocks, q_len))" {
+  S4: "Online softmax over pages\nQ @ Kᵀ·scale → soft-cap? →\n+mask → softmax → @V\n(compiled per (num_blocks, q_len))" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  S5: "Per-token write-back\n(spyre.overwrite into output)" {
+  S5: "Stage result on CPU,\nthen bulk-copy into\nSpyre output buffer" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -109,7 +114,8 @@ attn_detail: "SpyreAttentionImpl Pipeline (default backend)" {
 }
 
 bookends.EMB -> granite: "hidden states"
-granite -> bookends.LM: "final hidden"
+granite -> bookends.LP: "final hidden"
+bookends.LP -> bookends.LM: "lm_head"
 granite.ATTN -> attn_detail: "detail" {style.stroke-dash: 3}
 
 legend: " " {

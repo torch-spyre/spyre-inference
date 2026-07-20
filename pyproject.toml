@@ -81,9 +81,6 @@ override-dependencies = [
     # The range here should match the numba dependency
     "numpy>=1.24,<2.3",
 
-    # opencv-python-headless==4.13.0.90 has a packaging bug that incorrectly depends on libxcb.so.1,
-    # causing import failure on headless Linux systems.
-    "opencv-python-headless==4.12.0.88",
 
     # setuptools is specified as a runtime dep by vllm, make sure it's patched for CVEs
     "setuptools>=82",
@@ -107,7 +104,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "85e077c41c5f8617ce0ee0d06ab94c071c254c9e" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },

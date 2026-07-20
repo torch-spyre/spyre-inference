@@ -155,8 +155,8 @@ tests:
               # Upstream uses a single tuple parametrize keyed
               # `(model, distributed_executor_backend, attention_backend, test_suite, extra_env)`;
               # supply the full tuple per row.
-              "model, distributed_executor_backend, attention_backend, test_suite, extra_env":
-                - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "mp", "CUSTOM", "L4", {}]
+              "model, distributed_executor_backend, attention_backend, target_test_suites, extra_env":
+                - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "mp", "CUSTOM", ["L4"], {}]
             skip:
               # input embeddings not yet supported on spyre
               enable_prompt_embeds: [true]

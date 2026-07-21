@@ -42,20 +42,26 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        # Fallback for unit tests that call `layer.to("spyre")` directly and
+        # skip the runner's CPU pin. Never hit from the runner path.
+        if not torch.compiler.is_compiling() and self.weight.device.type == "spyre":
+            self.weight = torch.nn.Parameter(self.weight.data.to("cpu"), requires_grad=False)
+
+        cpu_input = convert(input_, device="cpu")
         if self.tp_size > 1:
             masked_input, input_mask = get_masked_input_and_mask(
-                convert(input_, device="cpu"),
+                cpu_input,
                 self.shard_indices.org_vocab_start_index,
                 self.shard_indices.org_vocab_end_index,
                 self.shard_indices.num_org_vocab_padding,
                 self.shard_indices.added_vocab_start_index,
                 self.shard_indices.added_vocab_end_index,
             )
-            masked_input = convert(masked_input, device=input_.device)
         else:
-            masked_input = input_
+            masked_input = cpu_input
 
         output_parallel = self.quant_method.embedding(self, masked_input.long())
+        output_parallel = convert(output_parallel, device=input_.device)
 
         if self.tp_size > 1:
             keep = (~input_mask).to(output_parallel.dtype).unsqueeze(-1)

@@ -30,6 +30,7 @@ Real TP=2 collective correctness on hardware lives in
 """
 
 import sys
+import warnings
 
 import pytest
 import torch
@@ -169,6 +170,28 @@ def test_int64_compiled_compare_against_python_int(tp_group) -> None:
     out = cmp_ge(on_spyre, 8)
     expected = cpu >= 8
     torch.testing.assert_close(out.cpu(), expected)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre routes aten.embedding.default to CPU. When this flips to "
+        "passing, remove the CPU pin in TorchSpyreModelRunner.load_model and "
+        "the forward-path CPU bounce in SpyreVocabParallelEmbedding."
+    ),
+)
+def test_embedding_does_not_fall_back_to_cpu() -> None:
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    weight = torch.randn(128, 64, dtype=torch.float16, device="spyre")
+    input_ids = torch.tensor([0, 1, 2, 3], dtype=torch.int64, device="spyre")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        F.embedding(input_ids, weight)
+
+    fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not any("embedding" in m for m in fallback_msgs), fallback_msgs
 
 
 if __name__ == "__main__":

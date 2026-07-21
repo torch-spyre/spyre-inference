@@ -203,11 +203,16 @@ class TorchSpyrePlatform(CpuPlatform):
         attn_type = getattr(attn_selector_config, "attn_type", None)
         if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
             # Specific Spyre attention for encoder models.
-            return (
+            backend_path = (
                 "spyre_inference.v1.attention.backends.spyre_encoder_attn."
                 "SpyreEncoderAttentionBackend"
             )
-        # Standard Spyre attention (CUSTOM registration at class body).
+        else:
+            # Standard Spyre attention.
+            backend_path = cls._backend_path
+
+        # Register the selected Spyre attention implementation as CUSTOM.
+        register_backend(AttentionBackendEnum.CUSTOM, backend_path)
         return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod

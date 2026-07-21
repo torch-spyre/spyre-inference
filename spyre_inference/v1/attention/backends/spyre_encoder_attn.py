@@ -32,10 +32,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _overwrite,
 )
 
-# Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
-# L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
-# so Inductor never enters insert_bmm_padding (torch-spyre KeyError: 'val' on
-# FX nodes missing meta["val"] when padding MiniLM's head_size=32).
+# Pad each sequence's KV length to the Spyre stick (64 fp16 elements) so the
+# cache-less encoder SDPA's P·V matmul gets a valid hardware layout.
 ENCODER_SEQ_ALIGNMENT = 64
 
 
@@ -48,7 +46,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     runs one batched, padded SDPA on Spyre.
     """
 
-    def forward(
+    def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]
@@ -85,12 +83,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         head_size = query.shape[2]
-        # Pad D to the stick when models use a smaller head dim (MiniLM=32).
-        # Zero-pad is exact for SDPA: padded Q/K slots add 0 to scores; cropped
-        # output drops the zero V channels. Keeps self.scale = 1/sqrt(real D).
-        head_size_padded = (
-            (head_size + ENCODER_SEQ_ALIGNMENT - 1) // ENCODER_SEQ_ALIGNMENT * ENCODER_SEQ_ALIGNMENT
-        )
 
         # The ragged->dense batch assembly below (per-sequence variable-length
         # slicing, transposes, and scatter) relies on strided views that
@@ -108,10 +100,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         )
         aligned_len = max(aligned_len, ENCODER_SEQ_ALIGNMENT)
 
-        # Dense padded batch: [num_seqs, H, L_aligned, D_padded]. Zeros stay pad.
-        q_batched = torch.zeros(num_seqs, num_heads, aligned_len, head_size_padded, dtype=dtype)
-        k_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype)
-        v_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size_padded, dtype=dtype)
+        # Dense padded batch: [num_seqs, H, L_aligned, D]. Padding rows stay zero.
+        q_batched = torch.zeros(num_seqs, num_heads, aligned_len, head_size, dtype=dtype)
+        k_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size, dtype=dtype)
+        v_batched = torch.zeros(num_seqs, num_kv_heads, aligned_len, head_size, dtype=dtype)
 
         # Additive mask: 0 where a (query, kv) pair may attend, -inf elsewhere.
         neg_inf = torch.finfo(dtype).min
@@ -123,14 +115,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             q_end = q_start + q_len
             kv_len = min(q_len, kv_lens[s])
 
-            # [L, H, D] -> [H, L, D] into the unpadded prefix of D_padded.
-            q_batched[s, :, :q_len, :head_size] = query_cpu[q_start:q_end].transpose(0, 1)
-            k_batched[s, :, :kv_len, :head_size] = key_cpu[q_start : q_start + kv_len].transpose(
-                0, 1
-            )
-            v_batched[s, :, :kv_len, :head_size] = value_cpu[q_start : q_start + kv_len].transpose(
-                0, 1
-            )
+            # [L, H, D] -> [H, L, D]
+            q_batched[s, :, :q_len, :] = query_cpu[q_start:q_end].transpose(0, 1)
+            k_batched[s, :, :kv_len, :] = key_cpu[q_start : q_start + kv_len].transpose(0, 1)
+            v_batched[s, :, :kv_len, :] = value_cpu[q_start : q_start + kv_len].transpose(0, 1)
             mask[s, 0, :q_len, :kv_len] = 0.0
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
@@ -143,41 +131,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         v_dev = convert(v_batched, target_device.type)
         mask_dev = convert(mask, target_device.type)
 
-        # Single on-device SDPA: [num_seqs, H, L_aligned, D_padded].
+        # Single on-device SDPA over the whole batch: [num_seqs, H, L_aligned, D].
         attn_out = F.scaled_dot_product_attention(
             q_dev, k_dev, v_dev, attn_mask=mask_dev, **sdpa_kwargs
         )
 
         # Scatter unpadded results back into the flat output. Pull to CPU first
-        # (Spyre slicing corrupts memory). For stick-aligned head_size (64) we
-        # can per-token spyre.overwrite into [1, H, D]. MiniLM's D=32 makes that
-        # stick expression illegal (``d1 + 32*Mod(d0, 2)``), so flatten H*D
-        # (384 % 64 == 0) for the device write instead.
+        # (Spyre slicing corrupts memory); _overwrite handles the per-token write
+        # for both Spyre and CPU targets.
         attn_out_cpu = convert(attn_out, "cpu", output.dtype)
-        flat_cpu = torch.empty(n, num_heads * head_size, dtype=output.dtype)
         for s in range(num_seqs):
             q_start = q_starts[s]
             q_len = query_lens[s]
-            # [H, L_aligned, D_padded] -> [q_len, H, D] -> [q_len, H*D]
-            seq_out = (
-                attn_out_cpu[s, :, :q_len, :head_size]
-                .transpose(0, 1)
-                .reshape(q_len, num_heads * head_size)
-            )
-            flat_cpu[q_start : q_start + q_len] = seq_out
-
-        use_flat_write = target_device.type == "spyre" and head_size % ENCODER_SEQ_ALIGNMENT != 0
-        out_target = output.reshape(output.shape[0], -1) if use_flat_write else output
-        for i in range(n):
-            if use_flat_write:
-                tok = convert(flat_cpu[i : i + 1].contiguous(), target_device.type, output.dtype)
-            else:
-                tok = convert(
-                    flat_cpu[i : i + 1].view(1, num_heads, head_size).contiguous(),
-                    target_device.type,
-                    output.dtype,
-                )
-            _overwrite(tok, out_target, [0], [i])
+            # [H, L_aligned, D] -> [q_len, H, D]
+            seq_out = attn_out_cpu[s, :, :q_len, :].transpose(0, 1)
+            for i in range(q_len):
+                tok = convert(seq_out[i : i + 1].contiguous(), target_device.type, output.dtype)
+                _overwrite(tok, output, [0], [q_start + i])
 
         return output
 

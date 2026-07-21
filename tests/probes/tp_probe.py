@@ -35,6 +35,7 @@ tests in this directory.
 
 import argparse
 import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -150,6 +151,12 @@ def main():
         PROBES[args.probe](device, device_group, world_size, rank)
 
     dist.destroy_process_group()
+
+    # Hard-exit this throwaway per-rank subprocess. Tears down all running threads
+    # so it doesn't rely on correctness of dist.destroy_process_group().
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

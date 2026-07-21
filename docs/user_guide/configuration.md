@@ -5,8 +5,12 @@
 To load the plugin, set the `VLLM_PLUGINS` environment variable before running vLLM:
 
 ```bash
-export VLLM_PLUGINS=spyre_inference
+export VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor
 ```
+
+`spyre_inference` activates the platform, `spyre_inference_ops` registers the OOT custom
+ops, and `spyre_inference_hf_adaptor` swaps in the hf-adapters Transformers backend
+(needed for `model_impl="transformers"`).
 
 ## Usage
 
@@ -33,13 +37,15 @@ The `pyproject.toml` includes several key build configurations:
 ```toml
 [tool.uv]
 build-constraint-dependencies = ["torch==2.11.0"]
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu" } }
+extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
 ```
 
 These settings ensure:
 
 - All packages are built with the same PyTorch version (2.11.0)
-- vLLM is built specifically for the CPU backend
+- vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
+  the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`
+  (whose CPU-optimized ops we don't need; Spyre provides its own)
 
 ### Source Repositories
 
@@ -49,9 +55,10 @@ The plugin pulls dependencies from specific Git repositories:
 [tool.uv.sources]
 vllm = { git = "https://github.com/vllm-project/vllm", rev = "..." }
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "..." }
+hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "..." }
 ```
 
-This ensures that both torch-spyre and vllm are compiled from source, instead of pulling pre-compiled wheels from PyPI.
+This ensures that torch-spyre, hf-adapters, and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.
 
 ### PyTorch CPU Index
 

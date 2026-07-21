@@ -49,6 +49,22 @@ else:
 logger = init_logger(__name__)
 
 
+def _disable_torch_accelerator() -> None:
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
+    # raise "Cannot access accelerator device when none is available." Our OOT
+    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
+    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
+    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    def _noop(*args, **kwargs) -> None:
+        return None
+
+    torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
+    torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+
+
+_disable_torch_accelerator()
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 

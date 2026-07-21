@@ -145,6 +145,33 @@ def test_block_size_override_user_specified():
     )
 
 
+def test_torch_accelerator_ops_are_noop():
+    """Regression for #327: EngineCore shutdown must not crash on accelerator ops."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    # The module applies the patch at import. A live spyre accelerator would make
+    # the real empty_cache() return None too, so assert on identity here.
+    assert torch.accelerator.empty_cache.__name__ == "_noop"
+    assert torch.accelerator.synchronize.__name__ == "_noop"
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("Cannot access accelerator device when none is available.")
+
+    saved_empty_cache = torch.accelerator.empty_cache
+    saved_synchronize = torch.accelerator.synchronize
+    try:
+        torch.accelerator.empty_cache = _raise
+        torch.accelerator.synchronize = _raise
+
+        _disable_torch_accelerator()
+
+        assert torch.accelerator.empty_cache() is None
+        assert torch.accelerator.synchronize() is None
+    finally:
+        torch.accelerator.empty_cache = saved_empty_cache
+        torch.accelerator.synchronize = saved_synchronize
+
+
 def test_block_size_valid_no_override():
     """Test that valid block_size (multiple of 64) is not changed."""
     from spyre_inference.platform import TorchSpyrePlatform

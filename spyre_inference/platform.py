@@ -107,9 +107,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
         _spyre_patched._spyre_patched = True
-        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
-            _spyre_patched  # ty: ignore[invalid-assignment]
-        )
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
 
     @classmethod
     def import_kernels(cls) -> None:

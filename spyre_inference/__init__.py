@@ -25,11 +25,6 @@ from typing import Any
 # library can't load before init_device runs.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
-from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
-from vllm.logger import DEFAULT_LOGGING_CONFIG
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -61,6 +56,12 @@ def register_hf_adapters():
 
 def _init_logging():
     """Setup logging, extending from the vLLM logging config"""
+    from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
+    from vllm.logger import DEFAULT_LOGGING_CONFIG, init_logger
+
+    global logger
+    logger = init_logger(__name__)
+
     config: dict[str, Any] = {}
 
     if VLLM_CONFIGURE_LOGGING:

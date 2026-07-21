@@ -127,7 +127,9 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
 
     For float dtypes: .cpu on CPU, .gpu on Spyre (float16).
     For int/bool dtypes: .gpu aliased to .cpu (CPUModelRunner pattern).
-    All copies are currently synchronous as torch-spyre does not yet support `non_blocking`.
+    Float H2D uses ``non_blocking=True``; callers must sync via
+    ``TorchSpyreModelRunner._sync_device`` (``torch.spyre.synchronize``)
+    before consuming the Spyre tensors.
 
     Inherits from `CpuGpuBuffer` (without invoking its `__init__`) so that
     `_make_buffer` overrides remain Liskov-compatible with `GPUModelRunner`.
@@ -164,7 +166,9 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
             return self.gpu if n is None else self.gpu[:n]
         src = self.cpu if n is None else self.cpu[:n]
         dst = self.gpu if n is None else self.gpu[:n]
-        dst.copy_(src)
+        # Async H2D via torch-spyre's aten::_copy_from / copyAsync path.
+        # GPUModelRunner calls _sync_device before the tensors are consumed.
+        dst.copy_(src, non_blocking=True)
         return dst
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
@@ -485,10 +489,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         pass
 
     def _sync_device(self) -> None:
-        # TODO: Replace with torch.spyre.synchronize() when available.
-        # For now, all copies are synchronous (no non_blocking), so
-        # explicit sync is not needed.
-        pass
+        # Wait for outstanding async H2D from SpyreCpuGpuBuffer.copy_to_gpu
+        # (and any other non_blocking copies) before the runner consumes
+        # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
+        torch.spyre.synchronize(self._spyre_device)
 
     def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
         return 0, None

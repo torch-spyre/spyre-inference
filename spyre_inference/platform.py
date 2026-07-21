@@ -107,7 +107,9 @@ class TorchSpyrePlatform(CpuPlatform):
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
         _spyre_patched._spyre_patched = True
-        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = (
+            _spyre_patched  # ty: ignore[invalid-assignment]
+        )
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -190,11 +192,6 @@ class TorchSpyrePlatform(CpuPlatform):
         # See `spyre_inference/distributed/spyre_communicator.py`.
         return "spyre_inference.distributed.spyre_communicator.SpyreCommunicator"
 
-    # Encoder backend path returned for ENCODER/ENCODER_ONLY layers.
-    _encoder_backend_path = (
-        "spyre_inference.v1.attention.backends.spyre_encoder_attn.SpyreEncoderAttentionBackend"
-    )
-
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
         # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
@@ -205,7 +202,12 @@ class TorchSpyrePlatform(CpuPlatform):
         attn_selector_config = kwargs.get("attn_selector_config") or (args[0] if args else None)
         attn_type = getattr(attn_selector_config, "attn_type", None)
         if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
-            return cls._encoder_backend_path
+            # Specific Spyre attention for encoder models.
+            return (
+                "spyre_inference.v1.attention.backends.spyre_encoder_attn."
+                "SpyreEncoderAttentionBackend"
+            )
+        # Standard Spyre attention (CUSTOM registration at class body).
         return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod

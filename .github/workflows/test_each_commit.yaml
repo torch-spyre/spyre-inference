@@ -90,7 +90,16 @@ jobs:
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
             flags: >-
-              -m "not (distributed or upstream or attention)"
+              -m "not (distributed or upstream or attention or compile_cache)"
+          - cfg: Compile-cache recursion regression
+            runs_on:
+              - x86_64
+              - spyre_pf_x1__pvc_1tb_x1
+              - linux
+            # image_label: image_torch_spyre
+            image_label: image_torch_spyre_pinned
+            flags: >-
+              -m "compile_cache and not (distributed or upstream)"
           - cfg: Spyre attention tests
             runs_on:
               - x86_64

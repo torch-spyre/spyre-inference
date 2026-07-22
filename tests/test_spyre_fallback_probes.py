@@ -27,18 +27,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
-def _spyre_available() -> bool:
-    try:
-        torch.randn(1, device=torch.device("spyre"))
-        return True
-    except Exception:
-        return False
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
 @pytest.fixture()
 def spyre_device():
-    if not _spyre_available():
+    if not spyre_available():
         pytest.skip("Spyre device not available")
     return torch.device("spyre")
 

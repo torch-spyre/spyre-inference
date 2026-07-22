@@ -31,29 +31,16 @@ plumbing lives in the `run_tp_probe` fixture in `tests/conftest.py`.
 
 from __future__ import annotations
 
-import os
 
 import pytest
 
-
-def _spyre_device_count() -> int:
-    """Return the number of visible Spyre cards, or 0 if unavailable.
-
-    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
-    cards are visible) instead of touching the Spyre runtime, so
-    `uses_subprocess` tests don't import torch_spyre in the main
-    pytest process.
-    """
-    try:
-        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
-    except ValueError:
-        return 0
+from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
 
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
 def test_native_all_reduce_works(run_tp_probe) -> None:
@@ -63,7 +50,7 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
 @pytest.mark.xfail(
@@ -83,7 +70,7 @@ def test_native_all_gather_into_tensor_works(run_tp_probe) -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
 def test_native_all_gather_list_works(run_tp_probe) -> None:
@@ -93,7 +80,7 @@ def test_native_all_gather_list_works(run_tp_probe) -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
 def test_native_gather_works(run_tp_probe) -> None:

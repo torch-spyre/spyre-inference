@@ -26,16 +26,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
+from spyre_testing_plugin.pytest_plugin import spyre_available as _spyre_available
 
 pytestmark = pytest.mark.attention
-
-
-def _spyre_available() -> bool:
-    try:
-        torch.randn(1, device=torch.device("spyre"))
-        return True
-    except Exception:
-        return False
 
 
 @pytest.fixture()

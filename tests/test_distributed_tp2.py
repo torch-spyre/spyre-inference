@@ -21,19 +21,7 @@ import os
 
 import pytest
 
-
-def _spyre_device_count() -> int:
-    """Return the number of visible Spyre cards, or 0 if unavailable.
-
-    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
-    cards are visible) instead of touching the Spyre runtime, so
-    `uses_subprocess` tests don't import torch_spyre in the main
-    pytest process.
-    """
-    try:
-        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
-    except ValueError:
-        return 0
+from spyre_testing_plugin.pytest_plugin import spyre_device_count as _spyre_device_count
 
 
 @pytest.mark.uses_subprocess

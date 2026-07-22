@@ -192,6 +192,25 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
+        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
+        # decoders use the paged backend. vLLM passes attn_type via the selector
+        # config, so the choice lives here rather than as a branch in the impl.
+        from vllm.v1.attention.backend import AttentionType
+
+        attn_selector_config = kwargs.get("attn_selector_config") or (args[0] if args else None)
+        attn_type = getattr(attn_selector_config, "attn_type", None)
+        if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+            # Specific Spyre attention for encoder models.
+            backend_path = (
+                "spyre_inference.v1.attention.backends.spyre_encoder_attn."
+                "SpyreEncoderAttentionBackend"
+            )
+        else:
+            # Standard Spyre attention.
+            backend_path = cls._backend_path
+
+        # Register the selected Spyre attention implementation as CUSTOM.
+        register_backend(AttentionBackendEnum.CUSTOM, backend_path)
         return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod

@@ -31,7 +31,6 @@ plumbing lives in the `run_tp_probe` fixture in `tests/conftest.py`.
 
 from __future__ import annotations
 
-import os
 
 import pytest
 

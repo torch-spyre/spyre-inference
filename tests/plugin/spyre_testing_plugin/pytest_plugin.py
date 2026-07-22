@@ -91,7 +91,7 @@ _terminal_reporter = None
 
 def spyre_available() -> bool:
     """Check if Spyre device is available for testing.
-    
+
     Returns:
         True if a Spyre device can be allocated, False otherwise.
     """
@@ -109,7 +109,7 @@ def spyre_device_count() -> int:
     cards are visible) instead of touching the Spyre runtime, so
     `uses_subprocess` tests don't import torch_spyre in the main
     pytest process.
-    
+
     Returns:
         Number of visible Spyre devices, or 0 if unavailable.
     """

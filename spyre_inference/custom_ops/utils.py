@@ -20,7 +20,6 @@ dtype conversion.
 """
 
 from functools import lru_cache
-from typing import Any
 
 import torch
 
@@ -28,36 +27,6 @@ from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
-
-# Shared registry: layer_name -> layer instance (for custom op lookup)
-_LAYER_REGISTRY: dict[str, Any] = {}
-_INSTANCE_COUNTERS: dict[str, int] = {}
-
-
-def register_layer(instance: Any, prefix: str) -> str:
-    """Register a layer instance and return its unique name.
-
-    Used by custom ops that need to look up `self` from a standalone
-    function (the custom op runs outside torch.compile and receives
-    only a string key).
-
-    Args:
-        instance: The layer instance to register.
-        prefix: Base name, e.g. "spyre_rmsnorm".
-
-    Returns:
-        Unique layer name, e.g. "spyre_rmsnorm_0".
-    """
-    count = _INSTANCE_COUNTERS.get(prefix, 0)
-    name = f"{prefix}_{count}"
-    _INSTANCE_COUNTERS[prefix] = count + 1
-    _LAYER_REGISTRY[name] = instance
-    return name
-
-
-def get_layer(name: str) -> Any:
-    """Look up a registered layer by name."""
-    return _LAYER_REGISTRY[name]
 
 
 def _convert_op_func(

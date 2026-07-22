@@ -1,8 +1,9 @@
-name: Build torch-spyre and download RPMS from dispatch
+name: Download override Spyre RPMs from dispatch
 description: >
-  Install torch-spyre from source checking out the given reference 
-  Download and install spyre RPMs
-  This action is meant for integration dispatch events.
+  Download override spyre RPMs from Artifactory and extract them into
+  user-space on top of the locked baseline installed by spyre-rpm-install.
+  This action is meant for integration dispatch events; torch-spyre itself
+  is built from the dispatched ref by the caller via `uv add git+...`.
 
 inputs:
   rpm_names:
@@ -13,10 +14,6 @@ inputs:
       Full Artifactory URL to download RPMs from (e.g.
       https://artifactory.example.com/path/to/rpms). When set, overrides the
       ARTIFACTORY_BASE_URL + ARTIFACTORY_RPM_PATH secrets.
-    required: false
-    default: ''
-  torch_spyre_ref:
-    description: Branch, tag, or SHA of torch-spyre to check out and test
     required: false
     default: ''
   artifactory_user:
@@ -51,43 +48,36 @@ runs:
         ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}
         DOWNLOAD_SCRIPT: .github/scripts/download_rpms.sh
         RPM_NAMES: ${{ inputs.rpm_names }}
-        RPMS_DOWNLOAD_DIR: ${{ inputs.output_dir }}
+        RPMS_DOWNLOAD_DIR: ${{ runner.temp }}/override-rpms
       run: |
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
-        cd /home/senuser/torch-spyre
         ls -la "$DOWNLOAD_SCRIPT"
         "$DOWNLOAD_SCRIPT"
 
+    # Extract the downloaded RPMs into user-space, layering them on top of the
+    # locked baseline that spyre-rpm-install already extracted. The runners have
+    # no root, so `sudo dnf install` is unavailable; rpm2cpio + cpio into the
+    # same root means the LD_LIBRARY_PATH / SENTIENT_BASE_INSTALL_DIR that
+    # spyre-rpm-install wired already point at these files.
+    #
+    # spyre-rpm-install exports SENTIENT_BASE_INSTALL_DIR=<root>/opt/ibm/spyre;
+    # the RPMs contain opt/ibm/spyre/..., so we extract at <root> (that env var
+    # with the /opt/ibm/spyre suffix stripped) rather than reassuming the path.
     - name: Install RPMs
       if: ${{ inputs.rpm_names != '' }}
       shell: bash
       run: |
-        cd /home/senuser/torch-spyre
-        ls -la rpms/
-        sudo dnf install -y rpms/*.rpm
-
-    - name: Checkout torch-spyre
-      shell: bash
-      working-directory: /home/senuser
-      env:
-        TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
-      run: |
-        source "$HOME/.bashrc"
-        source /etc/profile.d/ibm-aiu-setup.sh
-        git config --global --add safe.directory '*'
-        if [[ -n "$TORCH_SPYRE_REF" ]]; then
-          cd /home/senuser/torch-spyre
-          TARGET_SHA="$TORCH_SPYRE_REF"
-          TARGET_REF="$TORCH_SPYRE_REF"
-          echo "TARGET_REF=${TARGET_REF}"
-          echo "TARGET_SHA=${TARGET_SHA}"
-          git fetch --tags --force origin "+${TARGET_SHA}" || \
-            git fetch --tags --force origin
-          git checkout --force "${TARGET_SHA}"
-          git submodule sync --recursive
-          git submodule update --init --recursive --force
-          git log -1 --oneline
+        set -euo pipefail
+        if [[ -z "${SENTIENT_BASE_INSTALL_DIR:-}" ]]; then
+          echo "::error::SENTIENT_BASE_INSTALL_DIR is unset; run the spyre-rpm-install action first."
+          exit 1
         fi
-        uv pip show torch
-        uv pip freeze
+        SPYRE_LIBS="${SENTIENT_BASE_INSTALL_DIR%/opt/ibm/spyre}"
+        RPMS_DIR="${RUNNER_TEMP}/override-rpms"
+        mkdir -p "$SPYRE_LIBS"
+        ls -la "$RPMS_DIR"
+        for rpm in "$RPMS_DIR"/*.rpm; do
+          echo "Extracting $(basename "$rpm")..."
+          rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
+        done

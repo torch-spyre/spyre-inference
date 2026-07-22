@@ -1,5 +1,16 @@
 name: 'test_each_commit'
 
+# ---------------------------------------------------------------------------
+# push / PR / merge_group entrypoint. Thin caller of the reusable
+# _test_matrix.yaml (build + 6-config test matrix). The required-check gate
+# (run-spyre-unit-tests) lives here because a reusable workflow's internal job
+# names do not surface as top-level checks for branch protection.
+#
+# workflow_dispatch lives in integration-tests.yaml (the sole dispatch
+# entrypoint); this workflow only fires on push/PR/merge_group, so the
+# reusable workflow's github.repository/github.ref fallbacks apply and no
+# inputs need to be threaded through.
+# ---------------------------------------------------------------------------
 on:
   push:
     branches: [main]
@@ -8,67 +19,10 @@ on:
     branches: [main]
   merge_group:
     types: [checks_requested]
-  workflow_dispatch:
-    inputs:
-      torch_spyre_ref:
-        description: Branch, tag, or SHA of torch-spyre to check out and test
-        required: false
-        type: string
-        default: ""
-      rpm_location:
-        description: The Artifactory location where to download the RPM from
-        required: false
-        type: string
-        default: ""
-      rpm_names:
-        description: A space separated list of RPM names to download and install
-        required: false
-        type: string
-        default: ""
-      ref:
-        description: Branch, tag, or SHA of spyre-inference to check out and test
-        required: false
-        type: string
-        default: ""
-      repository:
-        description: |
-          Full clone URL/owner-name of the spyre-inference fork to check out
-          (e.g. "myuser/spyre-inference"); leave empty for the base repo. Used by
-          the cross-repo Test-With: flow to test a companion fork/branch.
-        required: false
-        type: string
-        default: ""
-      pr_url_hash:
-        description: |
-          Hash of the full URL of the PR that triggered this run.
-          Sent by the internal integration pipeline; unused on push/PR/merge_group.
-        required: false
-        type: string
-        default: ""
-      build_torch_spyre:
-        description: Accepted for dispatch-contract parity with torch-spyre; unused here.
-        required: false
-        type: boolean
-        default: true
-      runner_label:
-        description: |
-          Per-PR ephemeral runner-set IMAGE label to select for runs-on
-          (image_torch_spyre_pr_<component>_<sha12>, e.g.
-          image_torch_spyre_pr_flex_8ddcf3e155e9). The per-PR ephemeral flow
-          passes that PR's set label so jobs land on the per-PR image (the changed
-          RPM is baked in -> no runtime sudo). Empty keeps push/PR/merge_group runs
-          on the standing image_torch_spyre set (today's behaviour).
-        required: false
-        type: string
-        default: ""
 
 concurrency:
-  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch' && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || github.ref }}
   cancel-in-progress: true
-
-defaults:
-  run:
-    shell: bash
 
 permissions:
   contents: read
@@ -77,207 +31,16 @@ permissions:
 
 jobs:
   test:
-    name: 'build and run tests (${{ matrix.cfg }})'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - cfg: Non-distributed spyre tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "not (distributed or upstream or attention)"
-          - cfg: Spyre attention tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "attention and not (distributed or upstream)"
-          - cfg: Distributed spyre tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m distributed
-          - cfg: Upstream vLLM tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and not distributed and not model"
-          - cfg: Upstream distributed vLLM tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and distributed"
-          - cfg: Upstream model vLLM tests
-            runs_on:
-              - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
-              - linux
-            # image_label: image_torch_spyre
-            image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and model and not distributed"
-    # Compose runner labels from matrix.runs_on and the image label.
-    # When inputs.runner_label is set (per-PR dispatch flow), it replaces
-    # the standing image label with the per-PR image label.
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
-    timeout-minutes: 720
-    env:
-      # The CI env var is very important.
-      # GitHub actions automatically sets CI=true
-      # which causes the pytest inductor tests to fail with AssertionError
-      # due to a mix of fallbacks and decompositions.
-      # Here we set it to an empty string (or we could also unset it).
-      CI: ''
-      STORAGE_1_DIR: /storage-1/spyre-inference
-      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
-      # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
-      # against a gated repo 401s even when the model is on the PVC.
-      HF_HUB_OFFLINE: '1'
-
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          # Cross-repo Test-With: companion fork/branch (empty = base repo / dispatched ref).
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Get changed source files
-        id: changed-src-files
-        uses: tj-actions/changed-files@v46
-        with:
-          # Avoid using single or double quotes for multiline patterns.
-          files: |
-            .github/workflows/test_each_commit.yaml
-            .github/actions/build-spyre-deps/action.yml
-            .github/actions/spyre-rpm-install/action.yml
-            pyproject.toml
-            uv.lock
-            spyre-rpms.lock
-            tests/**/*.py
-            tests/**/*.yaml
-            spyre_inference/**/*.py
-            spyre_inference/**/*.yaml
-
-      - name: Install Spyre RPMs
-        id: spyre-rpms
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        uses: ./.github/actions/spyre-rpm-install
-
-      - name: Set up uv
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
-        with:
-          enable-cache: true
-          # Key the uv wheel cache on the RPM lock file: different library
-          # versions may require torch-spyre to be recompiled.
-          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
-          # Use local runner temp to avoid ownership/permission issues on $HOME.
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
-          # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
-          # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
-          prune-cache: false
-
-      - uses: ./.github/actions/build-spyre-deps
-        if: ${{ inputs.torch_spyre_ref != '' }}
-        with:
-          rpm_names: ${{ inputs.rpm_names }}
-          rpm_location: ${{ inputs.rpm_location }}
-          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
-          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
-          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
-          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-
-      - name: Gather runner info
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          date
-          pwd
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo "--- env ---"
-          env | sort
-          echo "--- AIU env ---"
-          env | sort | grep AIU || true
-          echo "--- repo listing ---"
-          ls -lart
-          echo "---"
-
-      - name: Dump UV cache info
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        run: |
-          find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
-
-      - name: Build spyre-inference
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        env:
-          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            uv add torch-spyre /home/senuser/torch-spyre
-            uv sync --verbose --group dev
-          else
-            uv sync --frozen --verbose --group dev
-          fi
-          # Print the resolved torch install for log visibility.
-          uv pip show torch
-          uv pip freeze
-
-      - name: Ensure public HF models cached
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        env:
-          HF_HUB_OFFLINE: '0'
-        run: uv run .github/cache_config/manage_cache.py --public
-
-      - name: Run tests
-        if: ${{ steps.changed-src-files.outputs.any_changed == 'true' || inputs.torch_spyre_ref != '' }}
-        run: |
-          unset _IBM_AIU_SETUP
-          rm /tmp/etc/ibm/spyre/topo.json
-          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
-          set +e
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          set -e
-          echo "Running tests for config: ${{ matrix.cfg }}..."
-          uv run pytest -s -vvv ${{ matrix.flags }}
-          echo "tests done"
+    uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
+    with:
+      # PR flow: skip the build/test when no source files changed.
+      skip_if_no_changes: true
 
   # ---------------------------------------------------------------------------
   # Required check gate -- this job name must match the existing branch
   # protection rule: "tests / Run Spyre unit tests".
-  # It fans in all matrix jobs so the single required check
+  # It fans in the reusable matrix result so the single required check
   # passes only when every suite passes.
   # ---------------------------------------------------------------------------
   run-spyre-unit-tests:

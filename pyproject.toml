@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm>=0.24.0,<0.25",
+    "vllm>=0.25.1,<0.26",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -102,9 +102,9 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "-
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.24.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.25.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "869cff54f0ace8fe0e6e8cd72ce0e9bc28868e54" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "d88fa98f413842a5383fe73f062f64fe9d943b7e" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },
@@ -226,6 +226,7 @@ markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
+    "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
 ]
 # --8<-- [end:test-markers-definition]
 

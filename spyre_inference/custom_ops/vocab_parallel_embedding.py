@@ -28,6 +28,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .utils import convert
+
 logger = init_logger(__name__)
 
 
@@ -44,9 +46,15 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        # Fallback for unit tests that call `layer.to("spyre")` directly and
+        # skip the runner's CPU pin. Never hit from the runner path.
+        if not torch.compiler.is_compiling() and self.weight.device.type == "spyre":
+            self.weight = torch.nn.Parameter(self.weight.data.to("cpu"), requires_grad=False)
+
+        cpu_input = convert(input_, device="cpu")
         if self.tp_size > 1:
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-                input_,  # ty: ignore[invalid-argument-type]
+                cpu_input,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
@@ -55,7 +63,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
             )
         else:
-            masked_input = input_
+            masked_input = cpu_input
             keep = None
 
         output = self.quant_method.embedding(self, masked_input.long())
@@ -77,7 +85,7 @@ def _vocab_mask_op_func(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     device = input_.device
     masked_input, input_mask = get_masked_input_and_mask(
-        input_.to("cpu"),
+        input_,
         org_vocab_start_index,
         org_vocab_end_index,
         num_org_vocab_padding,

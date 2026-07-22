@@ -20,13 +20,13 @@ import gc
 
 import pytest
 
-from spyre_testing_plugin.pytest_plugin import spyre_device_count as _spyre_device_count
+from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
 
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_tp2_llm_construction() -> None:
@@ -50,7 +50,7 @@ def test_tp2_llm_construction() -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
-    _spyre_device_count() < 2,
+    spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_tp2_llm_generate_matches_tp1() -> None:

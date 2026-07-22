@@ -26,7 +26,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available as _spyre_available
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pytestmark = pytest.mark.attention
 
@@ -40,7 +40,7 @@ def configure_device(request, monkeypatch):
     """
 
     device_mode = request.param
-    if device_mode == "spyre" and not _spyre_available():
+    if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
 

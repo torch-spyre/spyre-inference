@@ -15,14 +15,11 @@
 """Native libspyre_comms collective probes.
 
 Each test attempts a *native* base-class collective on a real spyreccl
-device_group at TP=2. Today every probe fails because the corresponding
-SpyreCommsContext method (or torch-spyre stub) throws. They are
+device_group at TP=2. Probes that are still blocked are marked
 xfail(strict=True) so when libspyre_comms gains the native impl and a
 comms RPM is rebuilt, the probe flips to passing, the strict-xfail
 fails CI, and that's the signal to delete the matching manual fallback
-in `spyre_inference.distributed.spyre_communicator` and (optionally)
-revert `TorchSpyrePlatform.get_device_communicator_cls` to the base
-class.
+in `spyre_inference.distributed.spyre_communicator`.
 
 These tests are cheap to maintain but each spawns its own pair of
 subprocesses, which is slow. They are gated on `>=2` Spyre cards so
@@ -58,14 +55,6 @@ def _spyre_device_count() -> int:
 @pytest.mark.skipif(
     _spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "libspyre_comms does not yet implement native allreduce; "
-        "SpyreCommsContext::allreduce throws. When this flips to passing, "
-        "delete SpyreCommunicator.all_reduce."
-    ),
 )
 def test_native_all_reduce_works(run_tp_probe) -> None:
     run_tp_probe("native_all_reduce", world_size=2)

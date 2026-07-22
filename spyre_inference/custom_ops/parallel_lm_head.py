@@ -87,11 +87,6 @@ class SpyreParallelLMHead(ParallelLMHead):
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
-    def _apply(self, fn, recurse=True):
-        super()._apply(fn, recurse=recurse)
-        self.padded_weight = fn(self.padded_weight)
-        return self
-
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         """OOT forward pass.
 

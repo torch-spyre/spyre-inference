@@ -59,9 +59,6 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.custom_ops.vocab_parallel_embedding import (
-    SpyreVocabParallelEmbedding,
-)
 
 logger = init_logger(__name__)
 
@@ -357,24 +354,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         analyze_and_unfuse(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-        # Attention is nn.Module (not PluggableLayer) so OOT registration is
-        # not possible. Patch _apply to no-op before model.to("spyre") so
-        # the CPU attention backend can access scale buffers without device
-        # mismatch.
-        for module in self.model.modules():
-            if isinstance(module, Attention):
-                module._apply = lambda fn, recurse=True, _m=module: _m
+        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
+        # an nn.Module, but just the attention implementation.
+        Attention._apply = lambda self, fn, recurse=True: self
 
-        # Move layer weights to Spyre device. The Attention._apply no-op
-        # patched above keeps attention scale buffers on CPU; every other
-        # module (linear, embedding, RMSNorm, SiluAndMul, ParallelLMHead)
-        # has its weights moved to Spyre.
+        # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
-
-        # F.embedding has no Spyre kernel; keep the weight on CPU.
-        for module in self.model.modules():
-            if isinstance(module, SpyreVocabParallelEmbedding):
-                module.weight = nn.Parameter(module.weight.data.to("cpu"), requires_grad=False)
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)

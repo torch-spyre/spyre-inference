@@ -45,7 +45,9 @@ class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return convert(super().apply(layer, x, bias), device="cpu")
+        # layer.weight is pinned to CPU, so project on CPU too: F.linear against a
+        # Spyre x would hit the device mismatch, and logits must land on CPU anyway.
+        return super().apply(layer, convert(x, device="cpu"), bias)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")

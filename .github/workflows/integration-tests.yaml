@@ -1,0 +1,149 @@
+name: integration-tests
+
+# ---------------------------------------------------------------------------
+# Triggered by commits in upstream dependant repos (deeptools, flex, torch-spyre
+# etc.) via workflow_dispatch.  Runs the full test matrix against a specified
+# spyre-inference ref so regressions from upstream changes are caught early.
+#
+# Example caller pattern from an upstream repo's workflow:
+#
+#   gh workflow run integration-tests.yaml \
+#     --repo <org>/spyre-inference \
+#     -f triggering_repo=<repo link to deeptools/flex/torch-spyre> \
+#     -f triggering_sha=${{ github.sha }} \
+#     -f pr_url_hash=$(echo -n "${{ github.event.pull_request.html_url }}" | sha256sum | cut -c1-16) \
+#     -f torch_spyre_ref=... \
+#     -f rpm_location=... \
+#     -f rpm_names=...
+# ---------------------------------------------------------------------------
+on:
+  workflow_dispatch:
+    inputs:
+      # ---- Upstream provenance ----------------
+      triggering_repo:
+        description: Name of the upstream repo that triggered this run (e.g. "deeptools", "flex", "torch-spyre")
+        required: false
+        type: string
+        default: ''
+      triggering_sha:
+        description: Commit SHA in the upstream repo that triggered this run
+        required: false
+        type: string
+        default: ''
+      pr_url_hash:
+        description: |
+          Hash of the full URL of the upstream PR that triggered this run.
+          Used to key the concurrency group so that re-runs for the same PR
+          cancel any in-flight run. Leave empty for non-PR triggers.
+        required: false
+        type: string
+        default: ''
+
+      # ---- refs to test ----------
+      ref:
+        description: Branch, tag, or SHA of spyre-inference to check out and test
+        required: false
+        type: string
+        default: ''
+      repository:
+        description: Full clone URL/owner-name of a spyre-inference fork (e.g. "myuser/spyre-inference"); leave empty for the base repo
+        required: false
+        type: string
+        default: ''
+      torch_spyre_ref:
+        description: Branch, tag, or SHA of torch-spyre to check out and build against
+        required: false
+        type: string
+        default: ''
+
+      # ---- RPM / image overrides ------------------
+      rpm_location:
+        description: Artifactory location for RPM download
+        required: false
+        type: string
+        default: ''
+      rpm_names:
+        description: Space-separated list of RPM names to download and install
+        required: false
+        type: string
+        default: ''
+      runner_label:
+        description: |
+          Per-PR ephemeral runner-set IMAGE label
+          (image_torch_spyre_pr_<component>_<sha12>).
+          Leave empty to use the standing image_torch_spyre set.
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Print a summary of what triggered this run so it is tracked
+  # ---------------------------------------------------------------------------
+  provenance:
+    name: Log upstream dependant tool regression trigger
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show trigger info
+        run: |
+          {
+            echo "## Integration test triggered by upstream change"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Upstream repo       | ${{ inputs.triggering_repo || '(not specified)' }} |"
+            echo "| Upstream commit     | ${{ inputs.triggering_sha || '(not specified)' }} |"
+            echo "| PR URL hash         | ${{ inputs.pr_url_hash || '(not specified)' }} |"
+            echo "| spyre-inference ref | ${{ inputs.ref || github.sha }} |"
+            echo "| torch-spyre ref     | ${{ inputs.torch_spyre_ref || '(none)' }} |"
+            echo "| RPM names           | ${{ inputs.rpm_names || '(none)' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Run the full test matrix via the reusable workflow shared with
+  # test_each_commit.yaml.
+  # ---------------------------------------------------------------------------
+  run-tests:
+    needs: provenance
+    uses: ./.github/workflows/_test_matrix.yaml
+    secrets: inherit
+    with:
+      # Dispatch flow: always run, regardless of changed files.
+      skip_if_no_changes: false
+      ref: ${{ inputs.ref || '' }}
+      repository: ${{ inputs.repository || '' }}
+      torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}
+      rpm_location: ${{ inputs.rpm_location || '' }}
+      rpm_names: ${{ inputs.rpm_names || '' }}
+      runner_label: ${{ inputs.runner_label || '' }}
+
+  # ----------------------------------------------------------------------------------
+  # Fan-in gate job so callers can poll a single stable job name for pass/fail.
+  # ----------------------------------------------------------------------------------
+  integration-test-result:
+    name: Integration test result
+    runs-on: ubuntu-latest
+    needs: run-tests
+    if: always()
+    steps:
+      - name: Evaluate test results
+        run: |
+          RESULT="${{ needs.run-tests.result }}"
+          echo "run-tests result: ${RESULT}"
+
+          if [[ "${RESULT}" == "success" ]]; then
+            echo "All integration test suites passed."
+            exit 0
+          fi
+
+          echo "One or more integration test suites failed or were cancelled."
+          exit 1

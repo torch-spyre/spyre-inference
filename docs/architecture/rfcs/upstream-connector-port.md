@@ -17,7 +17,7 @@ The upstream vLLM `OffloadingConnector` framework gives every CUDA platform thre
 2. A worker-side `OffloadingHandler` registry keyed by `(src_type, dst_type)` that performs the actual transfer.
 3. An `OffloadingSpec` factory that lets out-of-tree platforms drop in their own manager + handlers without touching upstream code.
 
-As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. This RFC does **not** build on that framework as a milestone (§3.5 keeps it as background): the fast second tier we want is a future byte-addressable, DMA-able secondary memory pool reached through the same shared-pool DMA path as M2 — not a filesystem/object `SecondaryTierManager`, so a tiering milestone would be a detour. See §2 "Goals removed."
+As of vLLM v0.22, this stack has grown a fourth layer — a first-class **multi-tier framework** that lets a single connector cascade across host RAM, filesystem, and object stores. This RFC does **not** build on that framework as a milestone (§3.5 keeps it as background): the fast second tier we want is a future byte-addressable, DMA-able secondary memory pool reached through the same shared-pool DMA path as M2 — not a filesystem/object `SecondaryTierManager`, so a tiering milestone would be a detour.
 
 The existing `spyre-inference` plugin has **none** of this wired up. `TorchSpyreWorker` extends `CPUWorker` and never calls `register_kv_caches`. Both the single-tier `CPUOffloadingSpec` and the new `TieringOffloadingSpec` (which subclasses `CPUOffloadingSpec`) error out on non-CUDA platforms via the `current_platform.is_cuda_alike()` check at `vllm/v1/kv_offload/cpu/spec.py:89`. So the entire upstream offload + tiering stack is unreachable from Spyre today, and the only KV-tier story we have is "the whole cache is on-device, full-stop."
 
@@ -33,28 +33,14 @@ This RFC proposes how to combine the two: take the prototype's data-copy primiti
 - The Spyre device↔host copy goes through one named, testable primitive (`SpyreKvDmaCopier`). For KV data the copy must be **byte-exact**: the default converting `copy_tensor` path re-encodes fp16 through the device representation and drifts ~1 ULP on about half of values (§4/§6.1), which is a correctness defect for a KV tier — so M1's copier uses the byte-exact raw copy path (`torch_spyre._C.copy_tensor_raw`), not the converting `copy_tensor`. That raw primitive is a pending torch-spyre dependency (not present in the current pinned build), so M1 is gated on it landing the same way M2 is (§6.7, §10 Q1). No earlier low-level prototype path is reused; no internal DMA-queue primitives.
 - `pytest tests/v1/kv_offload/` runs the same matrix as upstream for the CPU spec, plus a Spyre-specific test that round-trips a known-pattern block device→host→device.
 
-### Goals removed (former M1.5 — filesystem/object tiering)
-
-An earlier draft proposed an M1.5 that registered a `SpyreTieringOffloadingSpec` over the upstream
-`tiering/{fs,obj}` `SecondaryTierManager`s (host-RAM-plus-filesystem tiered offload, cross-shared via
-content-hashed paths on a shared volume). **This milestone is dropped.** The fast second tier Spyre
-actually wants is a future **byte-addressable, DMA-able secondary memory pool**, reached the
-same way as the M2 shared host pool: through the same shared-pool DMA path as M2. It is *not* a filesystem or object
-store, so it does not fit the `SecondaryTierManager` contract (which assumes a `primary_kv_view`
-memoryview read/written by CPU-side store/load, not a DMA endpoint). Building the fs/obj tiering path
-would therefore be throwaway work on the way to that pool. Cross-instance sharing — the real value M1.5
-was reaching for — is delivered directly by **M2** (a shared host-RAM pool now, the DMA-able secondary pool later) without
-a disk round-trip. The upstream tiering framework is retained only as background (§3.5) for readers
-who still want an fs/obj tier as a deployment choice; it is not a milestone of this RFC.
-
 ### Goals (M2 — cross-instance shared host-memory KV pool)
 
 M1 gives each instance its **own** host-RAM primary tier — a block offloaded by one instance is
 invisible to every other. M2 makes the host tier a single **shared host KV pool** provided by the
 hardware runtime and shared by every co-located Spyre instance, so a KV block offloaded by one
-instance is reloaded by another with **one raw DMA and no serialization**. This is the cross-instance
-sharing the dropped M1.5 was reaching for, but at memory speed and without a disk round-trip — and it
-is the same shared-pool DMA path a future byte-addressable, DMA-able secondary memory pool will use.
+instance is reloaded by another with **one raw DMA and no serialization** — at memory speed and
+without a disk round-trip. It is the same shared-pool DMA path a future byte-addressable, DMA-able
+secondary memory pool will use.
 
 - A user runs two `vllm serve` instances on the same host, each with `spec_name:
   "SpyreSharedOffloadingSpec"` and a shared pool config, and the second instance gets a prefix-cache
@@ -125,7 +111,7 @@ vLLM v0.22 added a multi-tier framework on top of the four pieces above:
 
 A deployment selects `spec_name: "TieringOffloadingSpec"` (a single spec) and lists secondary tiers in `extra_config`. The `TieringOffloadingManager` orchestrates a coherent hierarchy — primary CPU tier mmap'd via `SharedOffloadRegion`, plus one or more `SecondaryTierManager`s that read/write through a `primary_kv_view: memoryview`. Stores can cascade primary→secondary; loads can promote secondary→primary; the manager owns the bookkeeping.
 
-This framework is **background only** for this RFC — it is not a milestone (see §2 "Goals removed").
+This framework is **background only** for this RFC — it is not a milestone.
 A deployment may still select an fs/obj `SecondaryTierManager` on top of M1's `SpyreOffloadingSpec`
 via upstream config if it wants a disk/object tier, but this RFC ships no Spyre-specific tiering spec:
 the fast second tier we care about (a future byte-addressable, DMA-able secondary memory pool) is
@@ -153,7 +139,7 @@ _C.copy_tensor(cpu_in, spyre_in, non_blocking=False) # host → device
 
 **`copy_tensor` is not byte-exact for KV data, so it is not what M1 or M2 use.** The default `copy_tensor` path is a *converting* copy: a plain fp16 device↔host round-trip re-encodes into the device representation and drifts ~1 ULP on about half of the values. For a KV tier — where the whole point is to reload a block and reuse it as if it were never evicted — that drift is a correctness defect, not a rounding nicety. **Both M1 and M2 therefore require the byte-exact raw copy path** (`torch_spyre._C.copy_tensor_raw`, §6.7), a raw DMA that reproduces the device page's bytes exactly with no dtype/layout conversion. The converting `copy_tensor` merely exists today; the byte-exact raw primitive M1 and M2 both need is still pending (§10 Q1), so both milestones are gated on it landing.
 
-M1's device↔host copy is a single raw-DMA primitive. Earlier internal Spyre prototypes drove the device DMA queues directly through internal DMA-queue primitives, addressed via device addresses parsed from a compile-time descriptor; that was an earlier low-level prototype path that existed before torch-spyre exposed a Python copy surface, and it is not reused here. With the torch-spyre copy surface available, the connector handler operates on plain `torch.Tensor` arguments and never touches those internal DMA-queue primitives or descriptor artifacts.
+M1's device↔host copy is a single raw-DMA primitive over the torch-spyre copy surface: the connector handler operates on plain `torch.Tensor` arguments and never touches low-level DMA-queue primitives or compile-time descriptor artifacts.
 
 ### 4.1 Data paths in scope
 
@@ -357,13 +343,12 @@ the host destination from a process-local page to a `SharedHostPool` slot.
 
 ### 6.4 Filesystem/object tiering — not a milestone
 
-An earlier draft specified a `SpyreTieringOffloadingSpec` here (a sibling of upstream
-`TieringOffloadingSpec` that skipped the `is_cuda_alike()` gate and reused `TieringOffloadingManager`
-+ `SecondaryTierFactory` over an fs/obj tier). It has been **removed** (§2 "Goals removed"): the fast
-second tier we want is a future byte-addressable, DMA-able secondary memory pool served by M2's
-shared-pool path, not an fs/obj `SecondaryTierManager`. A deployment that wants a disk/object tier can
-still select upstream `TieringOffloadingSpec` + `tiering/{fs,obj}` on top of M1's `SpyreOffloadingSpec`
-via config — no Spyre-specific spec is needed for that, and none is shipped here.
+This RFC ships no Spyre-specific tiering spec. The fast second tier we want is a future
+byte-addressable, DMA-able secondary memory pool served by M2's shared-pool path, not an fs/obj
+`SecondaryTierManager` (which assumes a `primary_kv_view` memoryview read/written by CPU-side
+store/load, not a DMA endpoint). A deployment that wants a disk/object tier can still select upstream
+`TieringOffloadingSpec` + `tiering/{fs,obj}` on top of M1's `SpyreOffloadingSpec` via config — no
+Spyre-specific spec is needed for that, and none is shipped here.
 
 ### 6.5 Registration
 
@@ -516,7 +501,6 @@ DMA-ing into a slot with `copy_tensor_raw(dev_tensor, pool, slot_id, ...)`:
 
 <!-- NOTE: the SVG below is stale and must be regenerated from the updated .mmd/.d2 sources (labels changed to SharedHostPool / SharedHostMetadata / slot_id / copy_tensor_raw). -->
 
-
 <details>
 <summary>Diagram sources (Mermaid at <code>figures/spyre-shared-pool-m2.mmd</code>; D2 at <code>figures/spyre-shared-pool-m2.d2</code>, rendered to <code>spyre-shared-pool-m2.d2.svg</code>)</summary>
 
@@ -624,7 +608,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 
 ## 10. Open questions
 
-1. **Device↔host primitive — the byte-exact raw copy is still pending.** A *converting* copy entrypoint (`torch_spyre._C.copy_tensor`) is bound in the current pinned torch-spyre commit and routes through `SpyreStream::copyAsync`. But for KV data it is **not** the primitive M1 needs: the converting path re-encodes fp16 through the device representation and drifts ~1 ULP on about half of the values (§4/§6.1), which is a correctness defect for a KV tier. M1 (and M2) require the **byte-exact raw copy** `copy_tensor_raw`, which reproduces the device page's bytes exactly with no dtype/layout conversion and lets the runtime own the copy size. That raw primitive is **not in the current pinned build** — it is the external prerequisite both milestones are gated on. The earlier debate about low-level DMA fallbacks vs. unmerged accessors is no longer relevant; the open item is landing the byte-exact raw copy, not the converting copy that merely exists.
+1. **Device↔host primitive — the byte-exact raw copy is still pending.** A *converting* copy entrypoint (`torch_spyre._C.copy_tensor`) is bound in the current pinned torch-spyre commit and routes through `SpyreStream::copyAsync`. But for KV data it is **not** the primitive M1 needs: the converting path re-encodes fp16 through the device representation and drifts ~1 ULP on about half of the values (§4/§6.1), which is a correctness defect for a KV tier. M1 (and M2) require the **byte-exact raw copy** `copy_tensor_raw`, which reproduces the device page's bytes exactly with no dtype/layout conversion and lets the runtime own the copy size. That raw primitive is **not in the current pinned build** — it is the external prerequisite both milestones are gated on. The open item is landing the byte-exact raw copy, not the converting copy that merely exists.
 2. **`OffloadingConnectorWorker` device assertions.** Does any code in the worker path call `.is_cuda` on the registered tensors? A quick grep at implementation time will tell us; if so, we land a one-liner upstream.
 3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
 4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
@@ -633,7 +617,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 
 ## 11. Out of scope (filed as follow-ups)
 
-- **Public Spyre device↔host primitive for third-party connectors.** Promote `spyre_inference.v1.kv_offload.copier.SpyreKvDmaCopier` to a stable, documented import surface so out-of-tree connectors that today target CUDA's `swap_blocks_batch` / `cudaMemcpy` can swap their device↔host hop for Spyre by importing one symbol. M1 builds the primitive; a later commit stabilizes its API and documents it. (Raised by [@yuezhu1](https://github.com/yuezhu1) on the M1 draft. Note: cross-instance *sharing* of the host pool is now a first-class milestone — see M2 in §2 / §6.7–6.8 — which is distinct from this connector-reuse item; the raw-copy primitive M2 adds is the natural thing to stabilize here.)
+- **Public Spyre device↔host primitive for third-party connectors.** Promote `spyre_inference.v1.kv_offload.copier.SpyreKvDmaCopier` to a stable, documented import surface so out-of-tree connectors that today target CUDA's `swap_blocks_batch` / `cudaMemcpy` can swap their device↔host hop for Spyre by importing one symbol. M1 builds the primitive; a later commit stabilizes its API and documents it. (Raised by [@yuezhu1](https://github.com/yuezhu1). Note: cross-instance *sharing* of the host pool is now a first-class milestone — see M2 in §2 / §6.7–6.8 — which is distinct from this connector-reuse item; the raw-copy primitive M2 adds is the natural thing to stabilize here.)
 - **Direct device ↔ filesystem / object store.** Would need a Spyre-side analogue of NVIDIA GDS so a secondary tier can read/write device memory without a host bounce. Requires both a torch-spyre primitive and a contract change to upstream's `SecondaryTierManager` (which today takes a `primary_kv_view: memoryview` over CPU memory). Tracked separately. (Raised by [@yuezhu1](https://github.com/yuezhu1).)
 - **PD disaggregation on Spyre.** Standalone RFC, builds on M1. Every component PD needs *except* the cross-host transport is delivered by M1 — the follow-up is purely about wiring a NIXL agent into the upstream PD producer/consumer connectors. The prior prototype's NIXL connector and `CpuBufferManager` get two *hosts* exchanging CPU tensors over the network; M1 makes the device→host hop stand on its own, so that NIXL adapter can be lifted into a PD-specific RFC without re-doing the device-side work.
 - **Async DMA on Spyre.** Depends on torch-spyre exposing a stream/event API. Until then, the synchronous handler is fine for offload/prefetch but precludes overlap with compute.

@@ -890,12 +890,6 @@ def run_tp_probe(pytestconfig):
     return _run
 
 
-@pytest.fixture()
-def should_do_global_cleanup_after_test():
-    """Skip global cleanup for Spyre - torch.accelerator.empty_cache() doesn't work yet."""
-    return False
-
-
 @pytest.fixture(autouse=True)
 def relax_torch_tolerances(request, monkeypatch):
     """Relax torch.testing.assert_close tolerances for upstream tests.

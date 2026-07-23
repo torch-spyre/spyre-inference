@@ -75,6 +75,18 @@ on:
         required: false
         type: string
         default: ''
+      test_type:
+        description: >-
+          Suite subset to run. Default: full (every config). Selects which matrix
+          configs run (see _test_matrix.yaml); same knob and vocabulary as the
+          sibling repos.
+        required: false
+        type: choice
+        options:
+          - smoke
+          - core
+          - full
+        default: full
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -106,6 +118,7 @@ jobs:
             echo "| spyre-inference ref | ${{ inputs.ref || github.sha }} |"
             echo "| torch-spyre ref     | ${{ inputs.torch_spyre_ref || '(none)' }} |"
             echo "| RPM names           | ${{ inputs.rpm_names || '(none)' }} |"
+            echo "| Test type           | ${{ inputs.test_type || 'full' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
@@ -125,6 +138,7 @@ jobs:
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       runner_label: ${{ inputs.runner_label || '' }}
+      test_type: ${{ inputs.test_type || 'full' }}
 
   # ----------------------------------------------------------------------------------
   # Fan-in gate job so callers can poll a single stable job name for pass/fail.

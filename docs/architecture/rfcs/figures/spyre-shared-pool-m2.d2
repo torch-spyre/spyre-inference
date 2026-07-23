@@ -1,0 +1,38 @@
+direction: down
+
+instA: Spyre instance A {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  OA: "OffloadingConnector + SpyreSharedOffloadingSpec\n(subclasses M1's SpyreOffloadingSpec)"
+  HA: "SpyreCpuOffloadingHandlers -> SpyreKvDmaCopier"
+  OA -> HA
+}
+
+instB: Spyre instance B {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  OB: "OffloadingConnector + SpyreSharedOffloadingSpec"
+  HB: "SpyreCpuOffloadingHandlers -> SpyreKvDmaCopier"
+  OB -> HB
+}
+
+RAW: "torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)\nbyte-exact raw DMA — device page <-> pool slot\n(no host pointers / device addresses cross into Python)" {
+  style.fill: "#ffe4e1"
+  style.stroke: "#a83232"
+}
+
+pool: shared host KV pool (hardware runtime, one per node) {
+  style.fill: "#fff4e6"
+  style.stroke: "#c1620a"
+  META: "SharedHostMetadata - shared directory\nblock-hash -> slot_id; lookup / claim / publish / evict;\npublish gate -> a stale slot degrades to a miss, never torn bytes"
+  SLOTS: "SharedHostPool - fixed-size slots\nDMA-able shared memory, addressed by slot_id" {
+    shape: cylinder
+  }
+  META -- SLOTS
+}
+
+instA.HA -> RAW: "store (offload) / load (reload)"
+instB.HB -> RAW: "store (offload) / load (reload)"
+RAW <-> pool.SLOTS: "raw DMA into slot"
+instA.HA -> pool.META: "claim / publish / lookup" { style.stroke-dash: 3 }
+instB.HB -> pool.META: "lookup (peer hit)" { style.stroke-dash: 3 }

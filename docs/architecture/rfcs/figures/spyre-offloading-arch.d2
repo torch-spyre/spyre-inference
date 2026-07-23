@@ -18,11 +18,11 @@ spyre: spyre-inference (new code - this RFC) {
   Handlers: "create_handlers() -> SpyreCpuOffloadingHandlers\n(overrides the hook; get_handlers drops the CUDA gate)"
   D2H: "gpu_to_cpu_handler (store: Spyre -> host)"
   H2D: "cpu_to_gpu_handler (load: host -> Spyre)"
-  Copier: "SpyreKvDmaCopier\nwrapper around torch_spyre._C.copy_tensor\n.copy_d2h / .copy_h2d" {
+  Copier: "SpyreKvDmaCopier\nwrapper around the byte-exact raw copy\n.copy_d2h / .copy_h2d" {
     style.fill: "#ffe4e1"
     style.stroke: "#a83232"
   }
-  Backend: "torch_spyre._C.copy_tensor(src, dst, non_blocking=False)\nSpyreStream.copyAsync -> flex runtime DMA" {
+  Backend: "torch_spyre._C.copy_tensor_raw(dev_tensor, host_dst, to_device)\nbyte-exact raw DMA via the hardware runtime (bit-identical)" {
     style.fill: "#ffe4e1"
     style.stroke: "#a83232"
   }

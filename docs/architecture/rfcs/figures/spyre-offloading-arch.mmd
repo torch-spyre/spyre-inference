@@ -17,8 +17,8 @@ flowchart TB
         Handlers["create_handlers() → SpyreCpuOffloadingHandlers<br/><i>overrides the hook; get_handlers drops the CUDA gate</i>"]
         D2H["gpu_to_cpu_handler<br/>(store: Spyre → host RAM block)"]
         H2D["cpu_to_gpu_handler<br/>(load: host RAM block → Spyre)"]
-        Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around torch_spyre._C.copy_tensor<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
-        Backend["<b>torch_spyre._C.copy_tensor(src, dst, non_blocking=False)</b><br/>SpyreStream.copyAsync → flex runtime DMA<br/>(direction auto-detected from src.is_cpu/.is_privateuseone)"]
+        Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around the byte-exact raw copy<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
+        Backend["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, host_dst, to_device)</b><br/>byte-exact raw DMA via the hardware runtime<br/>(no dtype/layout conversion — bit-identical round-trip)"]
 
         Spec --> Mgr
         Spec --> Handlers

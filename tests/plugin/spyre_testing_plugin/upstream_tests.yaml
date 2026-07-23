@@ -116,16 +116,18 @@ tests:
     - rel_path: tests/models/language/pooling/test_embedding.py
       allow_list:
         - test: "test_models"
-          mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
+          mode: mandatory_pass
           tags: [model, embedding, upstream, uses_subprocess]
           params:
             allow:
               model:
                 - BAAI/bge-base-en-v1.5
+                - sentence-transformers/all-MiniLM-L12-v2
 
     - rel_path: tests/models/language/pooling/test_auto_prefix_cache_support.py
       allow_list:
         - test: "test_embed_models"
+          # Prefix-cache path for embeds not validated on Spyre yet.
           mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
           tags: [model, embedding, upstream, uses_subprocess]
           params:

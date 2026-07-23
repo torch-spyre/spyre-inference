@@ -113,7 +113,6 @@ dependencies = [
     "tokenizers==0.22.2",
     "torch==2.11.0",
     "torchaudio==2.11.0",
-    "torchcodec>=0.14",
     "torchvision==0.26.0",
     "tqdm>=4.68.4",
     "transformers>=5.5.3",

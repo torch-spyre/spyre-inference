@@ -36,8 +36,10 @@ from spyre_testing_plugin import pytest_plugin
 PLUGIN_ROOT = Path(__file__).parent.parent
 PYPROJECT_PATH = PLUGIN_ROOT / "pyproject.toml"
 
-# Libraries to exclude from upstream test dependencies
-FILTERED_LIBRARIES = {"terratorch", "transformers"}
+# Libraries to exclude from upstream test dependencies.
+# torchcodec: ST ≥5 imports it for A/V; Spyre CI is CPU-only (no libnvrtc).
+# Text-only SentenceTransformer HF compare uses a stub in pytest_plugin instead.
+FILTERED_LIBRARIES = {"terratorch", "transformers", "torchcodec"}
 
 
 def extract_vllm_commit(pyproject_path: Path) -> str:

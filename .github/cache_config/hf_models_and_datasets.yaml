@@ -14,5 +14,10 @@ gated_models:
 public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
   - BAAI/bge-base-en-v1.5
+  - sentence-transformers/all-MiniLM-L12-v2
+  - ibm-granite/granite-embedding-125m-english
+  - ibm-granite/granite-embedding-278m-multilingual
+  - intfloat/multilingual-e5-large
+  - sentence-transformers/all-roberta-large-v1
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b

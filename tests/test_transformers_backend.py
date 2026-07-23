@@ -24,17 +24,6 @@ import pytest
 
 
 @pytest.mark.uses_subprocess
-# TODO: The transformers backend does not compile on Spyre. HuggingFace
-# RMSNorm/LayerNorm upcast to float32 inside the norm
-# (`hidden_states.to(torch.float32)`), which the torch-spyre Inductor backend
-# cannot lower: the subsequent multi-arg pointwise mixes the fp32-converted
-# (DL16_TO_FP32 "staggered" ElementArrangement) operand with a full-width
-# STANDARD operand, raising `Unsupported: Multi-arg pointwise with mixed EA ...`.
-@pytest.mark.xfail(
-    reason="transformers backend does not compile on Spyre:\
-        unsupported dtype upcast under torch.compile",
-    strict=True,
-)
 @pytest.mark.parametrize(
     "model",
     [

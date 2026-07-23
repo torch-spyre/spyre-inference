@@ -71,7 +71,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         if self.tp_size > 1 and keep is not None:
             output = output * keep
             output = tensor_model_parallel_all_reduce(output)
-        return output
+        return convert(output, device=input_.device)
 
 
 def _vocab_mask_op_func(

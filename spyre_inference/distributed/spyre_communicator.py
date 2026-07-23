@@ -60,7 +60,12 @@ def _spyre_collective_unsupported_message(
         f"No fallback is implemented for world_size={world_size}. Either "
         "wait for the upstream implementation to land + a comms RPM rebuild, "
         "or extend SpyreCommunicator with an additional manual fallback."
-    """Spyre-specific DeviceCommunicator with gloo-staged fallbacks.
+    )
+    return "".join(parts)
+
+
+class SpyreCommunicator(DeviceCommunicatorBase):
+    """Spyre-specific DeviceCommunicator with manual fallbacks.
 
     See the module docstring for the full picture. In short:
       - `all_gather` is overridden to use list-form `dist.all_gather`
@@ -70,37 +75,18 @@ def _spyre_collective_unsupported_message(
     """
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # All-gather, staged through the gloo CPU group.
-        #
-        # Two reasons we don't all_gather on the spyreccl `device_group`:
-        #   1. The base class routes through `dist.all_gather_into_tensor`, whose
-        #      spyreccl `_allgather_base` entry point is still stubbed.
-        #   2. Even list-form `dist.all_gather` on the spyreccl group fails for
-        #      the tensors that reach this method: they are compiled-graph /
-        #      Inductor-allocated (or otherwise not eagerly-registered) Spyre
-        #      buffers whose storage is NOT in libspyre_comms' symbol table, so
-        #      the collective aborts with "The Nth envelope at rank R missing
-        #      symbolic address" (same failure mode as all_reduce).
-        #
-        # The gloo CPU group has a working all_gather and needs no Spyre
-        # device-address registration. Staging through host memory (D2H -> gloo
-        # all_gather -> H2D) is correct for any Spyre tensor, eager or compiled,
-        # at any world size. `dist.all_gather` mutates the output list in place,
-        # so we build a fresh CPU output list and move the concatenation back.
-        #
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up spyreccl
-        # `_allgather_base` AND registers Inductor-allocated buffers in its
-        # symbol table, delete this override and let the base class handle it.
+        # The base class uses dist.all_gather_into_tensor which needs
+        # _allgather_base in spyreccl is still stubbed. Use list-form
+        # dist.all_gather instead (natively supported).
+        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
+        # delete this override and let the base class handle it.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        cpu_input = convert(input_, device="cpu")
-        output_list = [torch.empty_like(cpu_input) for _ in range(self.world_size)]
-        dist.all_gather(  # ty: ignore[possibly-missing-attribute]
-            output_list, cpu_input, group=self.cpu_group
-        )
-        return convert(torch.cat(output_list, dim=dim), device=input_.device)
+        output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+        dist.all_gather(output_list, input_, group=self.device_group)
+        return torch.cat(output_list, dim=dim)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

@@ -24,8 +24,8 @@ forward-context read out of torch.compile graphs) and applies the rotation.
 
 When the head's inner dim is not stick-aligned the rotation also needs a constant
 ``{0, 1}`` expand matrix; it is built once on Spyre off the compiled path (in
-``_prime_expand_matrix``) and read as a device-resident argument, so no CPU
-constant is traced into the graph and lifted as a graph input.
+``_prime_expand_matrix``) and passed to the op as a device-resident argument, so
+no CPU constant is traced into the graph and lifted as a graph input.
 
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
@@ -185,9 +185,16 @@ class _SpyreRotaryMixin:
         )
         # query/key arrive on Spyre from the QKV projection; rot and the expand
         # matrix are primed on Spyre off the compiled path.
+        # Apply the rotation through the opaque spyre_rope_rotate op.
         e = self._expand_matrix
-        out_query = _rotate_neox_2x2(query, rot, self.head_size, e)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size, e) if key is not None else None
+        if e is None:
+            e = query.new_empty(0)
+        out_query = torch.ops.vllm.spyre_rope_rotate(query, rot, e, self.head_size)
+        out_key = (
+            torch.ops.vllm.spyre_rope_rotate(key, rot, e, self.head_size)
+            if key is not None
+            else None
+        )
         return out_query, out_key
 
 
@@ -222,6 +229,20 @@ def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) ->
     )
 
 
+def _rope_rotate_op_func(
+    x: torch.Tensor, rot: torch.Tensor, expand_matrix: torch.Tensor, head_size: int
+) -> torch.Tensor:
+    """Opaque-op body: apply the 2x2 rotation eagerly on-device."""
+    e = expand_matrix if expand_matrix.numel() > 0 else None
+    return _rotate_neox_2x2(x, rot, head_size, e)
+
+
+def _rope_rotate_op_fake(
+    x: torch.Tensor, rot: torch.Tensor, expand_matrix: torch.Tensor, head_size: int
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_rope_rot custom op. OOT class replacement happens at import
@@ -232,4 +253,10 @@ def register():
         fake_impl=_rope_rot_op_fake,
         dispatch_key=current_platform.dispatch_key,
     )
-    logger.debug_once("Registered custom op: spyre_rope_rot")
+    direct_register_custom_op(
+        op_name="spyre_rope_rotate",
+        op_func=_rope_rotate_op_func,
+        fake_impl=_rope_rotate_op_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+    logger.debug_once("Registered custom ops: spyre_rope_rot, spyre_rope_rotate")

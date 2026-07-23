@@ -1,0 +1,22 @@
+name: DCO
+
+# The DCO GitHub App only reports on `pull_request` events, so it never posts a
+# status on the `merge_group` event a queued PR fires. That leaves the merge
+# queue stuck on a forever-pending required "DCO" check.
+#
+# This workflow runs only on merge_group and emits a passing check with the same
+# name ("DCO") to satisfy the requirement. This relies on required checks being
+# matched by name.
+on:
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  DCO:
+    name: DCO          # must exactly match the DCO App's check name
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "DCO is enforced on the PR; the merge queue merges the same reviewed commits, so passing here."

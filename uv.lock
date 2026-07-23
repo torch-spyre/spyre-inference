@@ -7611,7 +7611,7 @@ dev = [
 requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=d88fa98f413842a5383fe73f062f64fe9d943b7e" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=aa17f9e54779675a5c7463fcc26fb41f2f8c7cba" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.25.1" },
 ]
 
@@ -7731,7 +7731,6 @@ dependencies = [
     { name = "torch", version = "2.11.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torch", version = "2.11.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin'" },
     { name = "torchaudio", marker = "sys_platform == 'never'" },
-    { name = "torchcodec" },
     { name = "torchvision", marker = "sys_platform == 'never'" },
     { name = "tqdm" },
     { name = "transformers" },
@@ -7855,7 +7854,6 @@ requires-dist = [
     { name = "tokenizers", specifier = "==0.22.2" },
     { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchaudio", specifier = "==2.11.0" },
-    { name = "torchcodec", specifier = ">=0.14" },
     { name = "torchvision", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm", specifier = ">=4.68.4" },
     { name = "transformers", specifier = ">=5.5.3" },
@@ -8461,7 +8459,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=d88fa98f413842a5383fe73f062f64fe9d943b7e#d88fa98f413842a5383fe73f062f64fe9d943b7e" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=aa17f9e54779675a5c7463fcc26fb41f2f8c7cba#aa17f9e54779675a5c7463fcc26fb41f2f8c7cba" }
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },

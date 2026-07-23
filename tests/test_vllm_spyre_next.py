@@ -70,7 +70,6 @@ def test_long_context_model_load():
     assert len(output[0].outputs[0].text) > 0
 
 
-@pytest.mark.compile_cache
 @pytest.mark.uses_subprocess
 @pytest.mark.skipif(_spyre_device_count() < 1, reason="needs a Spyre card")
 def test_batched_decode_does_not_exhaust_compile_cache():

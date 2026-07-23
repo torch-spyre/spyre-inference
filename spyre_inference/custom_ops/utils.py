@@ -44,7 +44,14 @@ def _convert_op_func(
     target_dtype = dtype if dtype is not None else tensor.dtype
 
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
-        return tensor
+        # # Same-device, same-dtype: return FRESH, due to current torch-spyre limitations.
+        # if tensor.device.type == "spyre":
+        #     return tensor.to("cpu").to(tensor.device)
+        # return tensor.clone()
+        raise RuntimeError(
+            f"Trying to convert a tensor to the same device ({tensor.device.type}) "
+            + "and same dtype ({tensor.dtype}), should never happen!"
+        )
 
     # Spyre requires CPU for dtype changes
     if tensor.device.type == "spyre" and tensor.dtype != target_dtype:
@@ -89,6 +96,12 @@ def convert(tensor, device=None, dtype=None):
         return None
     if isinstance(device, str):
         device = torch.device(device)
+    # Short-circuit a true no-op at the call site so Inductor never emits a
+    # same-device/dtype spyre_convert FallbackKernel into the graph.
+    target_device = device if device is not None else tensor.device
+    target_dtype = dtype if dtype is not None else tensor.dtype
+    if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
+        return tensor
     return torch.ops.vllm.spyre_convert(
         tensor,
         device,  # ty: ignore[invalid-argument-type]

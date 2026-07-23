@@ -62,7 +62,10 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
                 layer.padded_weight.shape[0],
             )
         else:
-            layer.padded_weight = layer.weight
+            # Clone → INDEPENDENT storage from `weight`. With
+            # tie_word_embeddings, `weight` IS `embed_tokens.weight` and must
+            # stay on CPU; `_apply` below moves only `padded_weight` to Spyre.
+            layer.padded_weight = Parameter(layer.weight.data.clone())
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -88,8 +91,10 @@ class SpyreParallelLMHead(ParallelLMHead):
         self.quant_method = SpyreUnquantizedLMHeadMethod()
 
     def _apply(self, fn, recurse=True):
-        super()._apply(fn, recurse=recurse)
+        # Do NOT move `self.weight`, must stay on CPU.
         self.padded_weight = fn(self.padded_weight)
+        if getattr(self, "bias", None) is not None:
+            self.bias = fn(self.bias)
         return self
 
     def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:

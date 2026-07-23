@@ -430,33 +430,28 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
 
-        Spyre compilation is handled here (not by vLLM's @support_torch_compile)
-        because Spyre requires static shapes — dynamic shapes (SymInt) are not
-        supported by the Spyre Inductor backend.
+        Spyre requires static shapes — dynamic shapes (SymInt) are not yet supported.
+        We therefore pass `dynamic=False` to torch.compile(...).
 
         Supported modes:
-        - enforce_eager=True: no compilation (eager execution)
-        - CompilationMode.NONE: Spyre-managed compilation with torch.compile
-        Other vLLM compilation modes (VLLM_COMPILE, STOCK_TORCH_COMPILE) are
-        not supported — the platform forces CompilationMode.NONE in
-        apply_config_platform_defaults().
+
+        - CompilationMode.NONE: eager execution
+        - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
         """
         mode = self.compilation_config.mode
-        if mode != CompilationMode.NONE:
+        if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
             raise ValueError(
-                f"Unsupported compilation mode {mode} for Spyre. "
-                f"Only CompilationMode.NONE is supported. Spyre handles "
-                f"compilation internally via _compile_for_spyre(). "
-                f"Use enforce_eager=True to disable compilation entirely."
+                f"Unsupported compilation mode {mode} for Spyre. Only "
+                f"CompilationMode.NONE and CompilationMode.STOCK_TORCH_COMPILE "
+                f"are supported."
             )
 
         if self.vllm_config.model_config.enforce_eager:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # Custom ops (spyre_rmsnorm, spyre_cpu_fallback, etc.) are opaque
-        # to dynamo but don't cause graph breaks — fullgraph=True is safe.
-        # dynamic=False ensures static shapes (Spyre can't handle SymInt).
+        # Trigger whole-model compile:
+        # a single fullgraph over the entire model using dynamic=False.
         t0 = time.time()
         self.model = torch.compile(
             self.model,
@@ -464,7 +459,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             fullgraph=True,
             dynamic=False,
         )
-        logger.info("Model compiled for Spyre (backend=inductor) in %.3fs.", time.time() - t0)
+        logger.info(
+            "Compiled model %s as a single graph for Spyre in %.3fs.",
+            type(self.get_model()).__name__,
+            time.time() - t0,
+        )
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

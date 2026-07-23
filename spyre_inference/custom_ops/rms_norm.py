@@ -33,11 +33,8 @@ logger = init_logger(__name__)
 class SpyreRMSNorm(RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
-    _dynamic_arg_dims = {"x": [], "residual": []}
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._compiled_forward_spyre = self.maybe_compile(self._forward_spyre_impl)
 
         logger.warning_once(
             "SpyreRMSNorm: no dtype promotion is performed, "
@@ -49,39 +46,26 @@ class SpyreRMSNorm(RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """RMSNorm kernel for Spyre."""
+
         if self.variance_size_override is not None:
             raise NotImplementedError("TODO: variance_size_override not yet implemented")
 
-        return self._compiled_forward_spyre(
-            x,
-            self.variance_epsilon,
-            self.hidden_size,
-            self.weight.data if self.has_weight else None,
-            residual,
-        )
-
-    @staticmethod
-    def _forward_spyre_impl(
-        x: torch.Tensor,
-        variance_epsilon: float,
-        hidden_size: int,
-        weight: torch.Tensor | None = None,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """RMSNorm kernel for Spyre. Compiled separately via maybe_compile."""
         if residual is not None:
             x = x + residual
             residual = x
 
-        if x.shape[-1] != hidden_size:
-            raise ValueError(f"Expected hidden_size to be {hidden_size}, but found: {x.shape[-1]}")
+        if x.shape[-1] != self.hidden_size:
+            raise ValueError(
+                f"Expected hidden_size to be {self.hidden_size}, but found: {x.shape[-1]}"
+            )
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
 
-        x = x * torch.rsqrt(variance + variance_epsilon)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
 
-        if weight is not None:
-            x = x * weight
+        if self.has_weight:
+            x = x * self.weight
         if residual is None:
             return x
         else:

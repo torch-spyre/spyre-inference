@@ -227,6 +227,7 @@ markers = [
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
+    "compile: torch.compile end-to-end tests (tests/test_compile.py)",
 ]
 # --8<-- [end:test-markers-definition]
 

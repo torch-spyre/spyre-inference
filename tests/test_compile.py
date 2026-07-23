@@ -12,14 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""TP=2 distributed tests"""
+"""Torch.compile tests"""
 
 from __future__ import annotations
 
-import gc
-
 import pytest
 
+
+@pytest.mark.compile
 def test_basic_llm_inference() -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
     """

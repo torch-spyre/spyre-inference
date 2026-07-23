@@ -39,9 +39,7 @@ EMBEDDING_MODELS = [
 COSINE_MIN = 0.99
 
 _REF_PATH = Path(__file__).parent / "data" / "encoder_embed_refs.json"
-_REFERENCES: dict = (
-    json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
-)
+_REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -58,10 +56,7 @@ def test_encoder_embed_models(model: str) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
     ref = _REFERENCES.get(model)
     if ref is None:
-        pytest.skip(
-            f"No cached HF reference for {model}. Regenerate with "
-            "`uv run --no-sync python tests/data/generate_encoder_embed_refs.py`."
-        )
+        pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
 
     prompts = ref["prompts"]
     llm = LLM(
@@ -82,6 +77,5 @@ def test_encoder_embed_models(model: str) -> None:
         assert all(math.isfinite(x) for x in emb)
         sim = _cosine(emb, ref_emb)
         assert sim >= COSINE_MIN, (
-            f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference "
-            f"for prompt {prompt!r}"
+            f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
         )

@@ -14,7 +14,7 @@
 
 """Write CPU HF embeddings to encoder_embed_refs.json for cosine checks.
 
-    python tests/data/generate_encoder_embed_refs.py
+python tests/data/generate_encoder_embed_refs.py
 """
 
 from __future__ import annotations
@@ -49,9 +49,7 @@ def main() -> None:
         embeddings = st.encode(prompts, normalize_embeddings=True)
         data[model] = {
             "prompts": prompts,
-            "embeddings": [
-                [round(float(x), _ROUND) for x in row] for row in embeddings
-            ],
+            "embeddings": [[round(float(x), _ROUND) for x in row] for row in embeddings],
         }
 
     out_path = Path(__file__).parent / "encoder_embed_refs.json"

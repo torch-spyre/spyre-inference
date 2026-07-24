@@ -1,15 +1,7 @@
 name: Install locked Spyre RPMs
 description: >
   Restores the GHA RPM cache for the current spyre-rpms.lock, extracts
-  RPMs into user-space via rpm2cpio, wires LD_LIBRARY_PATH, and outputs
-  the lock-file hash for use as the uv wheel-cache suffix.
-
-outputs:
-  rpms-hash:
-    description: >
-      Hash of spyre-rpms.lock. Pass as uv cache-suffix so the wheel cache
-      is invalidated when RPM versions change.
-    value: ${{ steps.hash.outputs.rpms-hash }}
+  RPMs into user-space via rpm2cpio, and wires LD_LIBRARY_PATH.
 
 runs:
   using: composite
@@ -52,8 +44,3 @@ runs:
         # subsequent steps rather than using the stale image-baked /opt/ibm/spyre.
         echo "SENTIENT_BASE_INSTALL_DIR=${SPYRE_LIBS}/opt/ibm/spyre" >> "$GITHUB_ENV"
         echo "_IBM_AIU_SETUP=" >> "$GITHUB_ENV"
-
-    - name: Output RPM hash
-      id: hash
-      shell: bash
-      run: echo "rpms-hash=${{ hashFiles('spyre-rpms.lock') }}" >> "$GITHUB_OUTPUT"

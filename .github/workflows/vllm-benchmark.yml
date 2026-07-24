@@ -100,7 +100,11 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
+          # Invalidate only on lock changes; setup-uv's default glob also hashes
+          # pyproject.toml, so config-only edits would needlessly bust the cache.
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           prune-cache: false
 

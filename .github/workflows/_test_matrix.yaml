@@ -244,9 +244,11 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
-          # Key the uv wheel cache on the RPM lock file: different library
-          # versions may require torch-spyre to be recompiled.
-          cache-suffix: ${{ steps.spyre-rpms.outputs.rpms-hash }}
+          # Invalidate only on lock changes; setup-uv's default glob also hashes
+          # pyproject.toml, so config-only edits would needlessly bust the cache.
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
           # Use local runner temp to avoid ownership/permission issues on $HOME.
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
           # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,

@@ -43,8 +43,8 @@ def _assert_non_blocking_true(mock_copy) -> None:
     if "non_blocking" in kwargs:
         assert kwargs["non_blocking"] is True
     else:
-        # copy_(self, src, non_blocking=True)
-        assert len(args) >= 3 and args[2] is True
+        # copy_(self, src, non_blocking=True) or copy_(src, True)
+        assert args[-1] is True
 
 
 def test_float_copy_to_gpu_passes_non_blocking_true():
@@ -53,7 +53,9 @@ def test_float_copy_to_gpu_passes_non_blocking_true():
     buf.cpu.copy_(torch.arange(8, dtype=torch.float32))
 
     with patch.object(torch.Tensor, "copy_", autospec=True) as mock_copy:
-        mock_copy.side_effect = lambda self, src, non_blocking=False: self
+        # autospec'd Tensor.copy_ is invoked as copy_(src, *, non_blocking=...)
+        # (receiver is bound; not passed as a positional arg).
+        mock_copy.side_effect = lambda *args, **kwargs: buf.gpu
         out = buf.copy_to_gpu()
 
     assert out is buf.gpu
@@ -65,7 +67,7 @@ def test_float_copy_to_gpu_partial_slice_passes_non_blocking_true():
     buf = _float_buffer_without_device_alloc()
 
     with patch.object(torch.Tensor, "copy_", autospec=True) as mock_copy:
-        mock_copy.side_effect = lambda self, src, non_blocking=False: self
+        mock_copy.side_effect = lambda *args, **kwargs: buf.gpu[:3]
         buf.copy_to_gpu(n=3)
 
     _assert_non_blocking_true(mock_copy)

@@ -76,6 +76,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.vfio_reaper import reap_vfio_holders, spyre_hardware_present
 
 _YAML_FILENAME = "upstream_tests.yaml"
 _YAML_PATH = Path(__file__).parent / _YAML_FILENAME
@@ -1002,3 +1003,27 @@ def pytest_fixture_setup(fixturedef, request):
     elif fixturedef.argname == "should_do_global_cleanup_after_test":
         fixturedef.func = lambda: False
         fixturedef.argnames = ()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Record whether a test failed/errored, so teardown only reaps after failures."""
+    outcome = yield
+    report = outcome.get_result()
+    if report.failed:
+        item._spyre_test_failed = True
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """After a FAILED test on a Spyre host, force-free the card for the next test.
+
+    Only failures can orphan a holder, so gating to failures leaves a
+    cleanly-passing test's card alone — a cached `LLM`, or the in-process device
+    tests whose card belongs to the still-alive pytest process. `trylast` runs it
+    after all other teardown (fixture finalizers, the tests' own `del llm`).
+    """
+    if not spyre_hardware_present():
+        return
+    if getattr(item, "_spyre_test_failed", False):
+        reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)

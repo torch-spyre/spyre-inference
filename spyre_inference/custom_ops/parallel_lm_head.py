@@ -80,8 +80,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         # other quantization methods are rejected.
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
-                f"SpyreParallelLMHead does not support "
-                f"{type(self.quant_method).__name__}."
+                f"SpyreParallelLMHead does not support {type(self.quant_method).__name__}."
             )
 
         logger.debug("Building SpyreParallelLMHead with TP size %d ", self.tp_size)

@@ -323,5 +323,7 @@ jobs:
         with:
           name: 'Test report (${{ matrix.cfg }})'
           path: junit-${{ strategy.job-index }}.xml
-          reporter: python-xunit
+          # dorny/test-reporter@v1 has no python-specific reporter; java-junit
+          # parses the generic JUnit-XML schema pytest's --junit-xml emits.
+          reporter: java-junit
           fail-on-error: false

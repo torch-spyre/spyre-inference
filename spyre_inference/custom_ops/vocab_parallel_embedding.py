@@ -29,6 +29,27 @@ from .utils import convert
 logger = init_logger(__name__)
 
 
+class SpyreUnquantizedEmbeddingMethod(UnquantizedEmbeddingMethod):
+    """Returns logits on CPU when a tied ``embed_tokens`` is used as the LM head.
+
+    Tied-weight models (Gemma, Cohere) project logits through ``embed_tokens``'
+    ``apply`` rather than a ParallelLMHead. The base ``apply`` leaves logits on
+    Spyre, where the sampler's ``log_softmax`` has no kernel or CPU fallback, so
+    move them to CPU like SpyreParallelLMHead. The ``embedding()`` lookup is
+    inherited unchanged.
+    """
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # layer.weight is pinned to CPU, so project on CPU too: F.linear against a
+        # Spyre x would hit the device mismatch, and logits must land on CPU anyway.
+        return super().apply(layer, convert(x, device="cpu"), bias)
+
+
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
@@ -40,6 +61,9 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # Route the logits-projection path (used when this embedding is the tied
+        # LM head) through the CPU-converting method so log_softmax runs on CPU.
+        self.quant_method = SpyreUnquantizedEmbeddingMethod()
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         # Fallback for unit tests that call `layer.to("spyre")` directly and

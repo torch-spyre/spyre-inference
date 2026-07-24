@@ -415,10 +415,20 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Number of query heads.
     num_heads: int = 0
 
-    # Pre-tiled additive attention mask. attention_mask_tiles[seq_idx][block_idx]
-    # gives the mask tile for one KV page of one sequence.
-    # Each tile: [aligned_max_query_len, block_size] on CPU.
+    # Pre-tiled additive attention mask. attention_mask_tiles[seq_idx][i]
+    # gives the mask tile for the i-th ACTIVE block of one sequence (indexed
+    # by position within active_block_indices[seq_idx], not by absolute block
+    # index). Each tile: [aligned_max_query_len, block_size] on CPU. When
+    # sliding_window is None, active == all blocks and the layout is
+    # equivalent to indexing by absolute block index.
     attention_mask_tiles: list[list[torch.Tensor]] | None = None
+
+    # For each sequence: absolute block indices whose mask is not fully
+    # `-inf` (blocks that contribute to at least one query's attention).
+    # None means all blocks are active (sliding_window is None, or the
+    # window covers the whole sequence). When set, len(active_block_indices[s])
+    # matches len(attention_mask_tiles[s]).
+    active_block_indices: list[list[int]] | None = None
 
     # Global aligned query length for stable kernel compilation.
     # max_query_len rounded up to QUERY_CHUNK_SIZE (32). All queries are
@@ -475,6 +485,27 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
+        # Shared zero tile reused for interior active blocks (fully inside the
+        # window, so their mask is all-zeros). Allocated lazily on first use
+        # and resized if aligned_max_query_len or block_size changes across
+        # calls.
+        self._zero_tile: torch.Tensor | None = None
+        self._zero_tile_shape: tuple[int, int] = (0, 0)
+
+    def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
+        """Return (or create) the shared all-zero mask tile for interior blocks.
+
+        The returned tensor is reused by reference across all interior blocks
+        and sequences in a batch. Callers must treat it as read-only: any
+        in-place mutation would corrupt every interior tile simultaneously.
+        This is safe today because attention kernels only read mask tiles.
+        """
+        shape = (aligned_max_query_len, self.block_size)
+        if self._zero_tile is None or self._zero_tile_shape != shape:
+            self._zero_tile = torch.zeros(shape, dtype=self.model_dtype)
+            self._zero_tile_shape = shape
+        return self._zero_tile
+
     def _build_attention_mask(
         self,
         seq_lens: torch.Tensor,
@@ -485,15 +516,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         aligned_max_seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        """Build additive attention mask on Spyre.
+        """Build additive attention mask on Spyre for the non-sliding-window path.
 
         All sequences share the same aligned_max_query_len so every mask tile
         has a uniform query dimension — this avoids per-sequence kernel
         specializations.
 
+        Sliding-window sequences take a different path: see
+        _build_active_tiles_with_skip.
+
         Returns:
             - mask: [num_seqs, aligned_max_query_len, aligned_max_seq_len] additive mask
         """
+        assert self.sliding_window is None
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         num_seqs = len(seq_lens)
 
@@ -512,23 +547,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)
             causal_ok = kv_pos_exp <= causal_limit
             attend = attend & causal_ok
-
-        # Sliding window mask: limit attention to recent tokens
-        # For query at absolute position p, attend to [max(0, p - sliding_window + 1), p]
-        # Example: p=5, window=4 → attend to [2,3,4,5] (4 tokens)
-        # Note: computed on max_query_len; padding applied after (lines 454-462)
-        if self.sliding_window is not None:
-            context_lens = seq_lens - query_lens  # [num_seqs]
-            # Absolute query position: context_len + q_pos
-            # Window start: max(0, absolute_pos - sliding_window + 1)
-            window_start = (
-                context_lens.unsqueeze(1) + q_pos.unsqueeze(0) - self.sliding_window + 1
-            ).clamp(min=0)
-            kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, aligned_max_seq_len]
-            window_ok = kv_pos_exp >= window_start.unsqueeze(
-                2
-            )  # [num_seqs, max_query_len, aligned_max_seq_len]
-            attend = attend & window_ok
 
         # Convert to additive mask: finfo.min for masked positions, 0 for valid
         mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
@@ -551,6 +569,160 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         return mask_additive
 
+    def _build_single_tile(
+        self,
+        block_idx: int,
+        kv_len: int,
+        query_len: int,
+        context_len: int,
+        aligned_max_query_len: int,
+        apply_causal_mask: bool,
+    ) -> torch.Tensor:
+        """Build the additive mask tile for one (sequence, block) pair.
+
+        Returns a [aligned_max_query_len, block_size] CPU tensor.
+
+        Only called for boundary blocks that require real mask content:
+          - lower-boundary blocks (window-start cutoff falls inside them for
+            at least one query), and
+          - the upper-boundary block (last block: KV padding, plus causal
+            during prefill).
+        Interior blocks reuse the shared zero tile instead.
+        """
+        block_size = self.block_size
+        mask_min = torch.finfo(self.model_dtype).min
+
+        # KV positions covered by this block. May extend past kv_len (handled
+        # by the kv_valid mask below).
+        kv_start = block_idx * block_size
+        kv_end = kv_start + block_size
+
+        q_pos = torch.arange(aligned_max_query_len)  # [aligned_max_query_len]
+        kv_pos = torch.arange(kv_start, kv_end)  # [block_size]
+
+        # Padding mask: query rows beyond query_len are fully masked;
+        # KV columns beyond kv_len are fully masked.
+        q_valid = q_pos < query_len  # [aligned_max_query_len]
+        kv_valid = kv_pos < kv_len  # [block_size]
+        attend = q_valid.unsqueeze(1) & kv_valid.unsqueeze(0)  # [Q, B]
+
+        # Causal mask (prefill only): query at absolute position
+        # context_len + q_pos can only attend to KV positions <= that value.
+        if apply_causal_mask:
+            causal_limit = context_len + q_pos  # [aligned_max_query_len]
+            attend = attend & (kv_pos.unsqueeze(0) <= causal_limit.unsqueeze(1))
+
+        # Sliding window: per-query window_start.
+        assert self.sliding_window is not None
+        abs_q_pos = context_len + q_pos  # [aligned_max_query_len]
+        window_start = (abs_q_pos - self.sliding_window + 1).clamp(min=0)
+        attend = attend & (kv_pos.unsqueeze(0) >= window_start.unsqueeze(1))
+
+        mask_bool = ~attend
+        return torch.where(
+            mask_bool,
+            torch.tensor(mask_min, dtype=self.model_dtype),
+            torch.tensor(0.0, dtype=self.model_dtype),
+        )
+
+    def _build_active_tiles_with_skip(
+        self,
+        kv_len: int,
+        query_len: int,
+        context_len: int,
+        aligned_max_query_len: int,
+        apply_causal_mask: bool,
+    ) -> tuple[list[int], list[torch.Tensor]]:
+        """Return (active_block_indices, mask_tiles) using arithmetic block-skip.
+
+        active_block_indices: absolute block indices whose mask contributes
+        to at least one query's attention (i.e. inside the window of the
+        earliest query).
+        mask_tiles: one tile per active block, in the same order.
+
+        Block classification:
+          - [0, first_active):
+                entirely outside every query's window; skipped.
+          - [first_active, last_lower_boundary]:
+                lower-boundary blocks — the window cutoff falls inside them
+                for at least one query. Real tile with per-query-row cutoffs.
+                In decode (query_len == 1) this collapses to a single block.
+          - (last_lower_boundary, last_causal_interior]:
+                interior blocks — fully inside every query's window AND fully
+                below the earliest query's causal limit. Mask is all-zero.
+          - (last_causal_interior, last_block):
+                causal-boundary blocks — inside every window, but early
+                queries have causal cutoffs falling inside them (prefill
+                only). Real tile.
+          - last_block:
+                upper-boundary block — always has KV padding (and causal
+                cutoffs during prefill). Real tile.
+
+        When any of the boundary ranges overlap (short kv_len, single-block
+        sequence, etc.) real tiles are built for the union — never zero tiles.
+        """
+        assert self.sliding_window is not None
+        block_size = self.block_size
+        num_blocks = (kv_len + block_size - 1) // block_size
+
+        # Earliest query (q_pos=0) has window
+        # [max(0, context_len - W + 1), context_len].
+        # Latest query (q_pos=query_len-1) has window
+        # [max(0, kv_len - W), kv_len - 1].
+        # A block is fully outside every query's window when its highest KV
+        # position is below the earliest query's window start.
+        # NOTE: using the EARLIEST query's window (not the latest, kv_len - W)
+        # is required for prefill correctness. In a prefill batch with
+        # query_len > 1, early queries have earlier windows and their
+        # in-window blocks would otherwise be incorrectly dropped. For decode
+        # (query_len == 1) both formulas coincide.
+        earliest_window_start = max(0, context_len - self.sliding_window + 1)
+        latest_window_start = max(0, kv_len - self.sliding_window)
+
+        first_active = earliest_window_start // block_size
+        # Every block from first_active up to the block containing the
+        # latest window start can have a per-query cutoff falling inside it.
+        last_lower_boundary = latest_window_start // block_size
+        # A block is fully below the earliest query's causal limit
+        # (abs_pos = context_len) iff (b + 1) * block_size - 1 <= context_len.
+        # For decode (no causal mask) all blocks satisfy this trivially.
+        if apply_causal_mask:
+            last_causal_interior = (context_len + 1) // block_size - 1
+        else:
+            last_causal_interior = num_blocks - 1
+        last_block = num_blocks - 1
+
+        active_bs = list(range(first_active, num_blocks))
+        if not active_bs:
+            return [], []
+
+        zero_tile = self._get_zero_tile(aligned_max_query_len)
+        tiles: list[torch.Tensor] = []
+
+        for b in active_bs:
+            is_lower_boundary = b <= last_lower_boundary
+            is_upper_boundary = (b == last_block) and not is_lower_boundary
+            is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
+            if is_lower_boundary or is_upper_boundary or is_causal_boundary:
+                tiles.append(
+                    self._build_single_tile(
+                        b,
+                        kv_len,
+                        query_len,
+                        context_len,
+                        aligned_max_query_len,
+                        apply_causal_mask,
+                    )
+                )
+            else:
+                # Interior block: entirely within every query's window,
+                # entirely filled with valid KV tokens, and (for prefill)
+                # entirely below the earliest query's causal limit.
+                # Mask is all-zero.
+                tiles.append(zero_tile)
+
+        return active_bs, tiles
+
     def build(
         self,
         common_prefix_len: int,
@@ -569,6 +741,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         causal = common_attn_metadata.causal
         if isinstance(causal, torch.Tensor):
             causal = bool(causal.item())
+        # Batch-level flag: True iff the batch contains at least one prefill
+        # sequence (max_query_len > 1). For decode sequences (query_len == 1)
+        # in a mixed batch, the causal constraint is subsumed by the KV
+        # validity mask (the single query at position context_len can only
+        # attend to KV positions [0, kv_len) = [0, context_len]), so applying
+        # the causal mask to them is a correct no-op.
         apply_causal_mask = causal and max_query_len > 1
 
         aligned_max_query_len = (
@@ -578,32 +756,59 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
-        mask_cpu = self._build_attention_mask(
-            seq_lens,
-            query_start_loc,
-            apply_causal_mask,
-            max_query_len,
-            aligned_max_query_len,
-            aligned_max_seq_len,
-            torch.device("cpu"),
-        )
-
-        # Pre-tile the mask: split into per-block tiles.
-        # Query dimension is uniform (aligned_max_query_len) for all sequences,
-        # so tiling only follows the KV dimension.
         num_seqs = common_attn_metadata.num_reqs
         block_size = self.block_size
         attention_mask_tiles: list[list[torch.Tensor]] = []
-        for s in range(num_seqs):
-            seq_tiles: list[torch.Tensor] = []
-            kv_len_s = int(seq_lens[s].item())
-            num_blocks_s = (kv_len_s + block_size - 1) // block_size
-            for b in range(num_blocks_s):
-                col_start = b * block_size
-                col_end = col_start + block_size
-                tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
-                seq_tiles.append(tile.contiguous())
-            attention_mask_tiles.append(seq_tiles)
+        active_block_indices: list[list[int]] | None = None
+
+        if self.sliding_window is None:
+            # No sliding window: build the full additive mask and split it into
+            # per-block tiles (one tile per absolute block index).
+            mask_cpu = self._build_attention_mask(
+                seq_lens,
+                query_start_loc,
+                apply_causal_mask,
+                max_query_len,
+                aligned_max_query_len,
+                aligned_max_seq_len,
+                torch.device("cpu"),
+            )
+            # Pre-tile the mask: split into per-block tiles.
+            # Query dimension is uniform (aligned_max_query_len) for all sequences,
+            # so tiling only follows the KV dimension.
+            for s in range(num_seqs):
+                seq_tiles: list[torch.Tensor] = []
+                kv_len_s = int(seq_lens[s].item())
+                num_blocks_s = (kv_len_s + block_size - 1) // block_size
+                for b in range(num_blocks_s):
+                    col_start = b * block_size
+                    col_end = col_start + block_size
+                    tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
+                    seq_tiles.append(tile.contiguous())
+                attention_mask_tiles.append(seq_tiles)
+            # active_block_indices stays None, so forward iterates all blocks.
+        else:
+            # Sliding window: arithmetic block-skip. Blocks entirely outside
+            # every query's window are dropped; interior blocks share a
+            # zero mask tile; only boundary blocks get real per-query cutoffs.
+            active_block_indices = []
+            query_lens_list = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
+            seq_lens_list = seq_lens.tolist()
+
+            for s in range(num_seqs):
+                kv_len_s = int(seq_lens_list[s])
+                query_len_s = int(query_lens_list[s])
+                context_len_s = kv_len_s - query_len_s
+
+                active_bs, tiles = self._build_active_tiles_with_skip(
+                    kv_len_s,
+                    query_len_s,
+                    context_len_s,
+                    aligned_max_query_len,
+                    apply_causal_mask,
+                )
+                active_block_indices.append(active_bs)
+                attention_mask_tiles.append(tiles)
 
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
         sm_cpu = slot_mapping.detach().cpu()
@@ -628,6 +833,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
             attention_mask_tiles=attention_mask_tiles,
+            active_block_indices=active_block_indices,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
         )
@@ -893,6 +1099,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
+        active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
@@ -935,9 +1142,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
-            page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
-            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+            all_page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
+
+            # Restrict to active (non-fully-masked) blocks when sliding window
+            # is set. When active_block_indices_all is None (no sliding), all
+            # blocks are active in their natural order.
+            if active_block_indices_all is not None:
+                active_bs = active_block_indices_all[seq_idx]
+            else:
+                active_bs = list(range(num_blocks_needed))
+
+            if len(active_bs) == 0:
+                # Every KV position is outside every query's window. Attention
+                # over the empty set is undefined; write zeros.
+                output_cpu[q_start:q_end] = 0.0
+                continue
+
+            page_indices = [all_page_indices[b] for b in active_bs]
+            # mask_tiles_all[seq_idx] is indexed by position within active_bs.
+            mask_tiles = [
+                convert(mask_tiles_all[seq_idx][i], device=_target_device)
+                for i in range(len(active_bs))
+            ]
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
@@ -970,7 +1196,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Run attention on target device
             q_dev = convert(q, device=_target_device)
-            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
             result = attn_fn(
                 q_dev,
                 k_pages,

@@ -1,15 +1,11 @@
 name: populate-rpm-cache
 
 on:
-  # For fork PRs: pull_request tokens are capped read-only so a workflow_dispatch
-  # call would 403. pull_request_target runs in base-repo context with a full
-  # write token. The dispatch-for-pr job below does no checkout (no untrusted
-  # code runs), so pull_request_target is safe here. It fires a workflow_dispatch
-  # event — a brand-new trusted event with full cache write access.
-  # Only fires when spyre-rpms.lock changes.
+  # pull_request_target (not pull_request) so fork PRs get a base-repo write
+  # token to dispatch from; the relay job does no checkout, so it's safe.
+  # Fires on every PR update to repopulate an evicted RPM cache — the populate
+  # job is lookup-only guarded, so it's a cheap no-op when the cache is warm.
   pull_request_target:
-    paths:
-      - spyre-rpms.lock
   push:
     branches: [main]
   workflow_dispatch:

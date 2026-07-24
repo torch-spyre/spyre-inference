@@ -24,6 +24,9 @@ jobs:
       with:
         python-version: "3.12"
         enable-cache: true
+        # Key only on uv.lock; setup-uv's default glob also hashes
+        # pyproject.toml, so config-only edits would needlessly bust the cache.
+        cache-dependency-glob: uv.lock
 
     - name: "Install dependencies"
       run: uv sync --frozen --no-install-package torch-spyre --no-dev -v

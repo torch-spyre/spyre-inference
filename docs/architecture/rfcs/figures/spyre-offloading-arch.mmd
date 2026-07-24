@@ -1,0 +1,42 @@
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+
+    subgraph vllm["<b>vllm</b> (upstream — unchanged)"]
+        direction TB
+        OC["OffloadingConnector"]
+        OCW["OffloadingConnectorWorker"]
+        Factory["OffloadingSpecFactory<br/>.create_spec(&quot;SpyreOffloadingSpec&quot;)"]
+        OC -- "register_kv_caches" --> OCW
+        OC -- "get_handlers (via factory)" --> Factory
+    end
+
+    subgraph spyre["<b>spyre-inference</b> (new code — this RFC)"]
+        direction TB
+        Spec["SpyreOffloadingSpec<br/>(subclasses CPUOffloadingSpec)"]
+        Mgr["get_manager() → CPUOffloadingManager<br/><i>reused verbatim from upstream</i>"]
+        Handlers["create_handlers() → SpyreCpuOffloadingHandlers<br/><i>overrides the hook; get_handlers drops the CUDA gate</i>"]
+        D2H["gpu_to_cpu_handler<br/>(store: Spyre → host RAM block)"]
+        H2D["cpu_to_gpu_handler<br/>(load: host RAM block → Spyre)"]
+        Copier["<b>SpyreKvDmaCopier</b><br/>thin wrapper around the byte-exact raw copy<br/>.copy_d2h(spyre_tensor, host_tensor)<br/>.copy_h2d(host_tensor, spyre_tensor)"]
+        Backend["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, host_dst, to_device)</b><br/>byte-exact raw DMA via the hardware runtime<br/>(no dtype/layout conversion — bit-identical round-trip)"]
+
+        Spec --> Mgr
+        Spec --> Handlers
+        Handlers --> D2H
+        Handlers --> H2D
+        D2H --> Copier
+        H2D --> Copier
+        Copier --> Backend
+    end
+
+    Factory -. "resolves to" .-> Spec
+    OCW -- "transfer_async" --> D2H
+    OCW -- "transfer_async" --> H2D
+
+    classDef upstream fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
+    classDef plugin fill:#fff4e6,stroke:#c1620a,color:#3a2300
+    classDef hot fill:#ffe4e1,stroke:#a83232,color:#3a0000
+
+    class OC,OCW,Factory upstream
+    class Spec,Mgr,Handlers,D2H,H2D plugin
+    class Copier,Backend hot

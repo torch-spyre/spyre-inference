@@ -1,0 +1,40 @@
+direction: down
+
+vllm: vllm (upstream - unchanged) {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  OC: OffloadingConnector
+  OCW: OffloadingConnectorWorker
+  Factory: "OffloadingSpecFactory\n.create_spec(\"SpyreOffloadingSpec\")"
+  OC -> OCW: register_kv_caches
+  OC -> Factory: "get_handlers (via factory)"
+}
+
+spyre: spyre-inference (new code - this RFC) {
+  style.fill: "#fff4e6"
+  style.stroke: "#c1620a"
+  Spec: "SpyreOffloadingSpec\n(subclasses CPUOffloadingSpec)"
+  Mgr: "get_manager() -> CPUOffloadingManager (reused verbatim)"
+  Handlers: "create_handlers() -> SpyreCpuOffloadingHandlers\n(overrides the hook; get_handlers drops the CUDA gate)"
+  D2H: "gpu_to_cpu_handler (store: Spyre -> host)"
+  H2D: "cpu_to_gpu_handler (load: host -> Spyre)"
+  Copier: "SpyreKvDmaCopier\nwrapper around the byte-exact raw copy\n.copy_d2h / .copy_h2d" {
+    style.fill: "#ffe4e1"
+    style.stroke: "#a83232"
+  }
+  Backend: "torch_spyre._C.copy_tensor_raw(dev_tensor, host_dst, to_device)\nbyte-exact raw DMA via the hardware runtime (bit-identical)" {
+    style.fill: "#ffe4e1"
+    style.stroke: "#a83232"
+  }
+  Spec -> Mgr
+  Spec -> Handlers
+  Handlers -> D2H
+  Handlers -> H2D
+  D2H -> Copier
+  H2D -> Copier
+  Copier -> Backend
+}
+
+vllm.Factory -> spyre.Spec: "resolves to" { style.stroke-dash: 3 }
+vllm.OCW -> spyre.D2H: transfer_async
+vllm.OCW -> spyre.H2D: transfer_async

@@ -1,0 +1,38 @@
+%%{ init: { "flowchart": { "htmlLabels": true, "curve": "basis" }, "theme": "neutral" } }%%
+flowchart TB
+    subgraph instA["<b>Spyre instance A</b>"]
+        direction TB
+        OA["OffloadingConnector + SpyreSharedOffloadingSpec<br/>(subclasses M1's SpyreOffloadingSpec)"]
+        HA["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
+        OA --> HA
+    end
+    subgraph instB["<b>Spyre instance B</b>"]
+        direction TB
+        OB["OffloadingConnector + SpyreSharedOffloadingSpec"]
+        HB["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
+        OB --> HB
+    end
+
+    RAW["<b>torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)</b><br/>byte-exact raw DMA — device page ↔ pool slot<br/>(no host pointers / device addresses cross into Python)"]
+
+    subgraph pool["<b>shared host KV pool</b> (hardware runtime, one per node)"]
+        direction TB
+        META["<b>SharedHostMetadata</b> — shared directory<br/>block-hash → slot_id; lookup / claim / publish / evict;<br/>publish gate → a stale slot degrades to a miss, never torn bytes"]
+        SLOTS[("<b>SharedHostPool</b> — fixed-size slots<br/>DMA-able shared memory, addressed by slot_id")]
+        META --- SLOTS
+    end
+
+    HA -->|"store (offload) / load (reload)"| RAW
+    HB -->|"store (offload) / load (reload)"| RAW
+    RAW <-->|"raw DMA into slot"| SLOTS
+    HA -. "claim / publish / lookup" .-> META
+    HB -. "lookup (peer hit)" .-> META
+
+    classDef inst fill:#eef5ff,stroke:#3b6fb3,color:#0b2447
+    classDef hot  fill:#ffe4e1,stroke:#a83232,color:#3a0000
+    classDef pl   fill:#fff4e6,stroke:#c1620a,color:#3a2300
+    classDef mem  fill:#e9f7ef,stroke:#1e7d44,color:#06331d
+    class OA,HA,OB,HB inst
+    class RAW hot
+    class META pl
+    class SLOTS mem

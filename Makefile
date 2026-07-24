@@ -110,7 +110,7 @@ test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 # this as 6 separate marker-combo jobs, not one unfiltered run -- mirror that
 # here so `make test TEST_TYPE=full` is GHA-parity, one flat JUnit file per
 # combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
-test: ## Run tests. TEST_TYPE=smoke|core|full (default full) or set MARK_OVERRIDE directly.
+tests: ## Run tests. TEST_TYPE=smoke|core|full (default full) or set MARK_OVERRIDE directly.
 	if [ -n "$(MARK_OVERRIDE)" ] || [ "$(TEST_TYPE)" != "full" ]; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \
@@ -125,7 +125,7 @@ test: ## Run tests. TEST_TYPE=smoke|core|full (default full) or set MARK_OVERRID
 	  exit $$rc; \
 	fi
 
-tests: test  ## Alias for `test`.
+test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
 
 perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 	mkdir -p "$(RESULTS_DIR)"

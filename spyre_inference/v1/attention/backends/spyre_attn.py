@@ -103,30 +103,6 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: list[torch.Tensor]
 
 
-def _overwrite(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    dims: list[int],
-    offsets: list[int],
-) -> None:
-    """Write input into output at the specified position (in-place)."""
-    if output.device.type == "spyre":
-        # `torch.ops.spyre.overwrite` is dynamically registered, so its
-        # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(
-            input,  # ty: ignore[invalid-argument-type]
-            output,  # ty: ignore[invalid-argument-type]
-            dims,  # ty: ignore[invalid-argument-type]
-            offsets,  # ty: ignore[invalid-argument-type]
-        )
-    else:
-        # intended behaviour on cpu
-        sliced_t = output
-        for i, dim in enumerate(dims):
-            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-        sliced_t.copy_(input)
-
-
 def _indirect_matmul_mock(
     a: torch.Tensor | list[torch.Tensor],
     address_or_index_of_a: int | torch.Tensor | None,
@@ -218,11 +194,8 @@ def _maybe_compile_attn(fn):
     """Like _maybe_compile, but also honors the SPYRE_FORCE_COMPILE_ATTN
     escape hatch.
 
-    Used only for the online-softmax attention kernel — the reshape/cache
-    kernel is *not* covered, because forcing compile on it currently hits an
-    unsupported torch-spyre Inductor path (missing device_tensor_layout on
-    graph input). Flip _get_reshape_fn to call this helper too once that gap
-    is resolved.
+    Used only for the online-softmax attention kernel. The reshape/cache scatter
+    is not compiled at all (see _reshape_and_cache).
     """
     if _FORCE_COMPILE_ATTN:
         return torch.compile(fn, dynamic=False)
@@ -232,30 +205,6 @@ def _maybe_compile_attn(fn):
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
-
-
-def _create_compilable_reshape_and_cache(num_tokens: int):
-    """Create a reshape_and_cache with fixed token count for torch.compile.
-
-    Dynamo unrolls the loop because num_tokens is a closure constant.
-    """
-
-    def specialized_reshape_and_cache_kernel(
-        key,
-        value,
-        k_pages,
-        v_pages,
-        block_indices,
-        block_offsets,
-        target_device,
-    ):
-        for t in range(num_tokens):
-            k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
-            v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
-            _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
-            _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
-
-    return specialized_reshape_and_cache_kernel
 
 
 def _create_compilable_page_attn(
@@ -744,25 +693,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
-        # Compiled function caches (keyed by iteration count for reshape, and
-        # by (num_blocks, padded_query_len) for the per-page attention loop)
-        self._reshape_fns: dict[int, object] = {}
+        # Compiled function cache for the per-page attention loop, keyed by
+        # (num_blocks, padded_query_len).
         self._attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
-
-    def _get_reshape_fn(self, num_tokens: int):
-        if num_tokens not in self._reshape_fns:
-            # Deliberately uses _maybe_compile (not _maybe_compile_attn):
-            # SPYRE_FORCE_COMPILE_ATTN must not force-compile this kernel.
-            # torch.compile of _create_compilable_reshape_and_cache currently
-            # fails inside torch-spyre's Inductor pass with
-            # `Unsupported: missing device_tensor_layout on graph input arg0_1`.
-            # Move to _maybe_compile_attn once that gap is resolved.
-            self._reshape_fns[num_tokens] = _maybe_compile(
-                _create_compilable_reshape_and_cache(num_tokens)
-            )
-        return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
@@ -853,16 +788,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
-        num_tokens = key_cpu.shape[0]
-
         # Force CPU contiguous: value from QKV split-along-last-dim is
         # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
         # silently corrupts data (see custom_ops/silu_and_mul.py).
         key_cpu = key_cpu.contiguous()
         value_cpu = value_cpu.contiguous()
 
-        fn = self._get_reshape_fn(num_tokens)
-        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
+        # Scatter tokens into page[:, offset, :], grouped by page (one
+        # index_copy_ per page). index_copy_ takes the offset as a runtime
+        # tensor (and falls back to CPU), so it never recompiles per offset —
+        # unlike torch.ops.spyre.overwrite, whose specialize_int wrapper bakes
+        # one binary per distinct slot until the recompiles overflow dynamo's
+        # accumulated_recompile_limit and recurse (RecursionError, small batches).
+        tokens_by_page: dict[int, list[int]] = {}
+        for t in range(key_cpu.shape[0]):
+            tokens_by_page.setdefault(block_indices[t], []).append(t)
+
+        for page_idx, toks in tokens_by_page.items():
+            offsets = torch.tensor([block_offsets[t] for t in toks], device=_target_device)
+            # [len, num_kv_heads, head_size] -> [num_kv_heads, len, head_size]
+            k_src = convert(key_cpu[toks].transpose(0, 1).contiguous(), _target_device)
+            v_src = convert(value_cpu[toks].transpose(0, 1).contiguous(), _target_device)
+            k_pages[page_idx].index_copy_(1, offsets, k_src)
+            v_pages[page_idx].index_copy_(1, offsets, v_src)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
@@ -898,15 +846,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Scattering into `output` on Spyre dim=0 has no working primitive:
-        # `output[i:j] = ...` and `narrow().copy_(...)` silently write to row 0;
-        # `torch.ops.spyre.overwrite` is deprecated and its compile_once wrapper
-        # compiles one SDSC binary per unique offset, which recurses past the
-        # dynamo cache limit once vLLM's model compile has filled it. Raising
-        # the limit unblocks short tests but compiles N binaries for a
-        # query_len=N prefill, which doesn't scale to long contexts. Stage the
-        # result on CPU and bulk-copy at the end of the per-sequence loop.
-        # Revisit when torch-spyre lands symbolic-offset overwrite
+        # Spyre has no working dim-0 scatter into `output`: slice-assign and
+        # narrow().copy_() silently write to row 0, and torch.ops.spyre.overwrite
+        # recompiles per offset until it overflows dynamo's
+        # accumulated_recompile_limit and recurses (see _reshape_and_cache).
+        # `output` is a fresh buffer and the result must come to CPU anyway for
+        # the head-axis reshape (broken on Spyre), so stage it on CPU and do one
+        # bulk copy. Revisit when torch-spyre lands symbolic-offset overwrite
         # (torch-spyre#220 / #1371-3).
         output_cpu = torch.zeros_like(output, device="cpu")
 

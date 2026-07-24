@@ -17,7 +17,8 @@
 Spyre Device Constraints:
     - Tensor Parallelism: TP>=1 supported with vocabulary sharding (each rank
       computes logits for its vocab partition)
-    - No quantization support: only UnquantizedEmbeddingMethod is replaced
+    - Quantization: Fp8Config supported (resolves to UnquantizedEmbeddingMethod).
+      Other quantization methods raise NotImplementedError.
 """
 
 import torch
@@ -75,11 +76,11 @@ class SpyreParallelLMHead(ParallelLMHead):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        quant_config = kwargs.get("quant_config")
-        if quant_config is not None:
+        # Only UnquantizedEmbeddingMethod supported. Fp8Config resolves to it;
+        # other quantization methods are rejected.
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
-                "SpyreParallelLMHead does not support quantization "
-                f"(quant_config={quant_config}). Only quant_config=None is supported."
+                f"SpyreParallelLMHead does not support {type(self.quant_method).__name__}."
             )
 
         logger.debug("Building SpyreParallelLMHead with TP size %d ", self.tp_size)

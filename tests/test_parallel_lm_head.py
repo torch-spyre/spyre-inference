@@ -162,6 +162,29 @@ def test_lm_head_oot_dispatch(tp_group):
 
 
 @pytest.mark.parallel_lm_head
+def test_lm_head_fp8_config_accepted(tp_group):
+    """SpyreParallelLMHead accepts Fp8Config without raising.
+
+    Fp8Config.get_quant_method returns None for ParallelLMHead (it only
+    handles LinearBase/Attention), so upstream falls back to
+    UnquantizedEmbeddingMethod, which we then replace with
+    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
+    of the checkpoint's quantization config.
+    """
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreParallelLMHead,
+        SpyreUnquantizedLMHeadMethod,
+    )
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+
+    assert isinstance(layer, SpyreParallelLMHead)
+    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+
+
+@pytest.mark.parallel_lm_head
 @pytest.mark.padding_workaround
 def test_non_aligned_weight_is_padded(tp_group):
     """process_weights_after_loading pads weight rows not divisible by ALIGN.

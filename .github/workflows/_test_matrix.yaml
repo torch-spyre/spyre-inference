@@ -105,8 +105,8 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "not (distributed or upstream or attention)"
+            # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
+            test_target: test-smoke
           - cfg: Spyre attention tests
             test_types: core full
             runs_on:
@@ -115,8 +115,7 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "attention and not (distributed or upstream)"
+            test_target: test-attention
           - cfg: Distributed spyre tests
             test_types: core full
             runs_on:
@@ -125,8 +124,7 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m distributed
+            test_target: test-distributed
           - cfg: Upstream vLLM tests
             # Upstream-vLLM suites are excluded from smoke/core (heavy).
             test_types: full
@@ -136,8 +134,7 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and not distributed and not model"
+            test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
             test_types: full
             runs_on:
@@ -146,8 +143,7 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and distributed"
+            test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
             test_types: full
             runs_on:
@@ -156,8 +152,7 @@ jobs:
               - linux
             # image_label: image_torch_spyre
             image_label: image_torch_spyre_pinned
-            flags: >-
-              -m "upstream and model and not distributed"
+            test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.
@@ -305,15 +300,30 @@ jobs:
 
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
+        # Env setup (aiu-setup sourcing, topo.json cleanup) and the marker
+        # expression for this config both live in the Makefile's
+        # test_target now -- the single entrypoint/owner for one
+        # marker-combo invocation, so the marker set is not duplicated here.
         run: |
-          unset _IBM_AIU_SETUP
-          rm /tmp/etc/ibm/spyre/topo.json
-          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
-          set +e
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          set -e
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          uv run pytest -s -vvv ${{ matrix.flags }}
+          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ strategy.job-index }}.xml
           echo "tests done"
+
+      - name: Upload JUnit results
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ strategy.job-index }}
+          path: junit-${{ strategy.job-index }}.xml
+          retention-days: 14
+
+      - name: Publish JUnit test report
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: 'Test report (${{ matrix.cfg }})'
+          path: junit-${{ strategy.job-index }}.xml
+          # dorny/test-reporter@v1 has no python-specific reporter; java-junit
+          # parses the generic JUnit-XML schema pytest's --junit-xml emits.
+          reporter: java-junit
+          fail-on-error: false

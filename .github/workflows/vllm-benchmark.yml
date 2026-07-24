@@ -131,20 +131,12 @@ jobs:
           echo "### Benchmarking vLLM [${HEAD_SHA}](https://github.com/vllm-project/vllm/commit/${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run vLLM benchmarks
+        # aiu-setup + the benchmark invocation both live in the Makefile's
+        # perf-tests target now -- the single entrypoint, so this doesn't
+        # hand-duplicate ibm-aiu-setup.sh sourcing.
         run: |
-          unset _IBM_AIU_SETUP
-          rm /tmp/etc/ibm/spyre/topo.json
-          # ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that
-          # fails on image_torch_spyre; env vars are already exported by then.
-          set +e
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          set -eux
           mkdir -p benchmark-results
-
-          uv run python3 .github/scripts/run_vllm_benchmarks.py \
-            --configs-dir vllm-benchmarks/benchmarks/spyre \
-            --results-dir benchmark-results > benchmark-results/run.log 2>&1
+          make perf-tests RESULTS_DIR=benchmark-results > benchmark-results/run.log 2>&1
 
       - name: Install ClickHouse ingest dependencies
         if: github.event_name == 'push'

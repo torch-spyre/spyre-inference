@@ -609,7 +609,7 @@
   <span class="md-ellipsis">
     
   
-    Examples
+    Architecture
   
 
     
@@ -622,6 +622,94 @@
         
         <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_3_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_1_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../architecture/index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4" id="__nav_1_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -651,10 +739,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_3_1" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_1" >
         
           
-          <label class="md-nav__link" for="__nav_1_3_1" id="__nav_1_3_1_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_1_4_1" id="__nav_1_4_1_label" tabindex="0">
             
   
   
@@ -672,8 +760,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_3_1_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_1_3_1">
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_1">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -803,10 +891,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5" >
         
           
-          <label class="md-nav__link" for="__nav_1_4" id="__nav_1_4_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_1_5" id="__nav_1_5_label" tabindex="0">
             
   
   
@@ -824,8 +912,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_4_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_1_4">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -919,10 +1007,10 @@
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_6" >
         
           
-          <label class="md-nav__link" for="__nav_1_5" id="__nav_1_5_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_1_6" id="__nav_1_6_label" tabindex="0">
             
   
   
@@ -940,8 +1028,8 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_5_label" aria-expanded="false">
-          <label class="md-nav__title" for="__nav_1_5">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_6">
             <span class="md-nav__icon md-icon"></span>
             
   
@@ -1633,7 +1721,7 @@
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import json,sys;[print(r[&#39;tag_name&#39;],r[&#39;published_at&#39;]) for r in json.load(sys.stdin)[:10]]&quot;</span>
 </span></code></pre></div>
 <p>Tags look like <code>vMAJOR.MINOR.PATCH</code> (e.g. <code>v0.23.0</code>). Confirm "latest stable" with the user only if they were vague — otherwise just go.</p>
-<p>Three places in <code>pyproject.toml</code> move together:</p>
+<p>Two places in <code>pyproject.toml</code> move together:</p>
 <div class="language-toml highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">[project]</span>
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">dependencies</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
 </span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="s2">&quot;torch-spyre&quot;</span><span class="p">,</span>
@@ -1643,53 +1731,37 @@
 </span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
 </span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="k">[tool.uv.sources]</span>
 </span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="n">vllm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
-</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="c1"># On Linux, install from the prebuilt CPU wheel index (avoids ~30 min C++ compile in CI).</span>
-</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">index</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;vllm-cpu&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">marker</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;sys_platform == &#39;linux&#39;&quot;</span><span class="w"> </span><span class="p">},</span>
-</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;https://github.com/vllm-project/vllm&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;v{VERSION}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">marker</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;sys_platform != &#39;linux&#39;&quot;</span><span class="w"> </span><span class="p">},</span>
-</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="p">]</span>
-</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a>
-</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="c1"># ...further down...</span>
-</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
-</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="k">[[tool.uv.index]]</span>
-</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;vllm-cpu&quot;</span>
-</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;https://wheels.vllm.ai/&lt;commit-sha&gt;/cpu&quot;</span><span class="w">  </span><span class="c1"># update this SHA too</span>
-</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="n">explicit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="c1"># Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;https://github.com/vllm-project/vllm&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;v{VERSION}&quot;</span><span class="w"> </span><span class="p">},</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="p">]</span>
 </span></code></pre></div>
-<p>The <code>[[tool.uv.index]]</code> URL embeds the <strong>commit SHA</strong> (not the tag name) of the pinned rev. Get it with:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>curl<span class="w"> </span>-s<span class="w"> </span><span class="s2">&quot;https://api.github.com/repos/vllm-project/vllm/git/refs/tags/v{VERSION}&quot;</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="p">|</span><span class="w"> </span>python3<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import sys,json; d=json.load(sys.stdin); print(d[&#39;object&#39;][&#39;sha&#39;])&quot;</span>
-</span></code></pre></div>
-<p>Then verify the wheels actually exist at that SHA before merging:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>-w<span class="w"> </span><span class="s2">&quot;%{http_code}&quot;</span><span class="w"> </span><span class="s2">&quot;https://wheels.vllm.ai/&lt;sha&gt;/cpu/&quot;</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="c1"># Should return 200</span>
-</span></code></pre></div>
-<p>Bump all three: the version constraint in <code>[project]</code>, the git rev in the non-linux source entry, and the SHA in the <code>vllm-cpu</code> index URL (also update the inline comment above it).</p>
+<p>vLLM builds from source on every platform (<code>VLLM_TARGET_DEVICE=empty</code>, no C kernels), so there's no prebuilt-wheel index to update — bump only the git <code>rev</code> and the <code>[project]</code> version constraint.</p>
 <p>The runtime lower bound (<code>vllm&gt;=X.Y.Z</code>) and the upper cap (<code>&lt;X.(Y+1)</code>) exist because we only maintain compatibility with the latest release — any non-backwards-compatible change we land for the new rev will break earlier vLLMs, so they must be excluded from dependency resolution. The <code>&lt;X.(Y+1)</code> cap excludes future minor releases that haven't been validated yet.</p>
 <p>The version constraint in <code>[project.dependencies]</code> controls what downstream environments installing <code>spyre-inference</code> from a wheel will resolve to. It must agree with the pinned rev, or a wheel install will silently pull a different vLLM than we tested against.</p>
 <h2 id="step-2-rebuild-re-sync">Step 2: Rebuild &amp; Re-sync<a class="headerlink" href="#step-2-rebuild-re-sync" title="Permanent link">&para;</a></h2>
-<p>On Linux, vLLM installs from a prebuilt CPU wheel (seconds). On macOS/Windows it is still built from source, which takes 4–5 minutes. Run sequentially:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>sync-upstream-test-deps
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev<span class="w">    </span><span class="c1"># picks up changes the sync script wrote into tests/plugin/pyproject.toml</span>
+<p>vLLM builds from source on every platform (~4–5 minutes with the empty backend). Run sequentially:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>sync-upstream-test-deps
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev<span class="w">    </span><span class="c1"># picks up changes the sync script wrote into tests/plugin/pyproject.toml</span>
 </span></code></pre></div>
 <p><code>sync-upstream-test-deps</code> rewrites <code>tests/plugin/pyproject.toml</code> with the dependency list pulled from <code>vllm/requirements/test.in</code> at the new rev (filters out forbidden packages like <code>terratorch</code>). Check the diff — large changes are normal across a minor-version bump (lm-eval, mistral-common, fastsafetensors versions move; arctic-inference / instanttensor pick up <code>; platform_machine == 'x86_64'</code> markers when upstream gates them).</p>
 <p>If <code>uv sync</code> fails with a dependency conflict that wasn't there before, the override list in <code>pyproject.toml &gt; [tool.uv] &gt; override-dependencies</code> may need to grow. Don't add overrides speculatively — only if a real conflict appears.</p>
 <p>If the lock file needs to be deleted and regenerated from scratch (e.g. after a messy merge conflict resolution), <code>uv lock</code> alone will fail because building <code>torch-spyre</code> metadata requires <code>SPYRE_COMMS_INSTALL_DIR</code>. Use <code>USE_SPYRE_CCL=0 uv lock</code> instead — that env var skips the multi-Spyre comm library requirement and lets uv resolve without a real Spyre build environment.</p>
 <p>After the sync, smoke-test the import:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import spyre_inference; print(&#39;ok&#39;)&quot;</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;import spyre_inference; print(&#39;ok&#39;)&quot;</span>
 </span></code></pre></div>
 <p>If this fails with <code>ImportError</code> from inside vLLM, the upstream API moved out from under one of our imports — <code>grep -rn "&lt;missing-symbol&gt;" .venv/lib64/python3.12/site-packages/vllm/</code> to find where it went, then update our import.</p>
 <h2 id="step-3-triage-in-this-order">Step 3: Triage in This Order<a class="headerlink" href="#step-3-triage-in-this-order" title="Permanent link">&para;</a></h2>
 <p>Don't run the full <code>pytest</code> first — vLLM startup is ~30s per test file, and the failures cluster by category. Run the cheapest categories first so you can fix-and-rerun quickly.</p>
 <p><strong>Always use <code>uv run --no-sync</code></strong> for every test invocation — without <code>--no-sync</code>, uv re-resolves dependencies on every call and reverts any local <code>torch-spyre</code> install you may have done.</p>
 <h3 id="3a-custom-ops-no-vllm-engine">3a. Custom Ops (No vLLM Engine)<a class="headerlink" href="#3a-custom-ops-no-vllm-engine" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_platform.py<span class="w"> </span>tests/test_mlp.py<span class="w"> </span>tests/test_rms_norm.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/test_silu_and_mul.py<span class="w"> </span>tests/test_parallel_lm_head.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">  </span>tests/test_vocab_parallel_embedding.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_platform.py<span class="w"> </span>tests/test_mlp.py<span class="w"> </span>tests/test_rms_norm.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span>tests/test_silu_and_mul.py<span class="w"> </span>tests/test_parallel_lm_head.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span>tests/test_vocab_parallel_embedding.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>These exercise the linear/RMSNorm/embedding/silu_and_mul ops against a CPU reference. Failures here usually mean a vLLM layer's constructor signature changed (new kwarg, renamed parameter) or a <code>vocab_parallel_embedding</code>-style helper was moved. Fix in <code>spyre_inference/custom_ops/</code>.</p>
 <h3 id="3b-attention-backend">3b. Attention Backend<a class="headerlink" href="#3b-attention-backend" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_spyre_attn.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_spyre_attn.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>~10 minutes. If this fails, likely culprits:</p>
 <ul>
@@ -1698,16 +1770,16 @@
 <li><code>bind_kv_cache</code> layout flipped (see 3e for the upstream KV cache layout note — same change, exposed twice).</li>
 </ul>
 <h3 id="3c-end-to-end-vllm-single-process">3c. End-to-End vLLM (Single-Process)<a class="headerlink" href="#3c-end-to-end-vllm-single-process" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_vllm_spyre_next.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/test_vllm_spyre_next.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;not upstream&quot;</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>This is the most common place to hit OOT platform traps (see above). Fix those with surgical <code>TorchSpyreWorker</code> overrides as described.</p>
 <p>Not all failures here are OOT traps — also watch for constructor or method signature changes on classes we instantiate or inherit from, new abstract methods on base classes, and import path moves (symbol relocated to a different vLLM module).</p>
 <h3 id="3d-distributed">3d. Distributed<a class="headerlink" href="#3d-distributed" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;distributed&quot;</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;distributed&quot;</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>~5 minutes. Failures usually point to changes in <code>vllm.distributed.parallel_state</code> (group construction, device_communicator dispatch). The OOT branches in <code>_platform_device_type</code> and <code>parallel_state.py:~448</code> use <code>current_platform.device_name</code> — if those branches moved to a different predicate, our <code>device_name = "cpu"</code> may stop being routed correctly.</p>
 <h3 id="3e-upstream-tests">3e. Upstream Tests<a class="headerlink" href="#3e-upstream-tests" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;upstream&quot;</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;upstream&quot;</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>These run upstream vLLM test files against our backend, filtered by <code>tests/plugin/spyre_testing_plugin/upstream_tests.yaml</code>. The most common failure mode is <strong>upstream test infra refactoring</strong> — the test file changes shape, our <code>patch_backend_list</code> fixture (in <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code>) no longer matches. Read the upstream test file — check <code>upstream_tests.yaml</code> for the canonical path, or find it under <code>~/.cache/vllm-upstream-tests/worktree-&lt;rev&gt;/</code> (the subpath like <code>tests/v1/attention/test_attention_backends.py</code> may have moved between releases) — and diff its assumptions against what <code>patch_backend_list</code> does. The recurring trap is the <strong>KV-cache tensor layout</strong>: upstream has flipped between <code>(2, num_blocks, …)</code> and <code>(num_blocks, 2, …)</code> layouts more than once. Our fixture has to slice this tensor into <code>(k_pages, v_pages)</code> lists for <code>SpyreAttentionImpl.forward</code>. Check the slicing dim against wherever the upstream test constructs the KV cache (e.g. a function like <code>create_and_prepopulate_kv_cache</code> — name may differ in the new rev).</p>
 <p>Other upstream-side patterns to watch for:</p>
@@ -1719,16 +1791,16 @@
 <p>If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kernel-specific behaviour), block-list it in <code>upstream_tests.yaml</code> rather than papering over with a tolerance bump.</p>
 <h2 id="step-4-full-sweep-format">Step 4: Full Sweep + Format<a class="headerlink" href="#step-4-full-sweep-format" title="Permanent link">&para;</a></h2>
 <p>Once each category is green individually, run the full suite to catch any cross-test interactions:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>Roughly 16 minutes on a Spyre host. Then format:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>bash<span class="w"> </span>format.sh
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>bash<span class="w"> </span>format.sh
 </span></code></pre></div>
 <p><code>format.sh</code> runs prek (ruff, ruff-format, ty, codespell, markdownlint, actionlint) and exits non-zero if anything needs to be added/committed. Do <strong>not</strong> auto-add <code>.hypothesis/</code> — that directory is a per-run cache, gitignored.</p>
 <h2 id="what-to-commit">What to Commit<a class="headerlink" href="#what-to-commit" title="Permanent link">&para;</a></h2>
 <p>Five files typically change for a vLLM bump:</p>
 <ol>
-<li><code>pyproject.toml</code> — three things: the <code>rev</code> in the non-linux <code>[tool.uv.sources]</code> entry, the <code>vllm&gt;=X.Y.Z,&lt;X.(Y+1)</code> constraint in <code>[project] dependencies</code>, and the commit SHA in the <code>[[tool.uv.index]] name = "vllm-cpu"</code> URL.</li>
+<li><code>pyproject.toml</code> — two things: the <code>rev</code> in the <code>[tool.uv.sources]</code> vllm entry, and the <code>vllm&gt;=X.Y.Z,&lt;X.(Y+1)</code> constraint in <code>[project] dependencies</code>.</li>
 <li><code>uv.lock</code> — auto-regenerated by <code>uv sync</code>. Don't hand-edit.</li>
 <li><code>tests/plugin/pyproject.toml</code> — auto-regenerated by <code>sync-upstream-test-deps</code>. Review the diff but don't hand-edit.</li>
 <li><code>spyre_inference/v1/worker/spyre_worker.py</code> (sometimes) or <code>spyre_inference/platform.py</code> — surgical overrides for new upstream wrappers.</li>

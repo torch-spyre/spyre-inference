@@ -6,7 +6,7 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "SpyreVocabParallelEmbedding\n(aten.embedding = CPU fallback;\nweights/output on Spyre)" {
+  EMB: "SpyreVocabParallelEmbedding\n(weight pinned to CPU; gather\nCPU→CPU; output→Spyre)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -38,9 +38,9 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ROPE: "SpyreRotaryEmbedding\n(CPU fallback via\nspyre_rotary_cpu op)" {
-    style.fill: "#e65100"
-    style.stroke: "#bf360c"
+  ROPE: "SpyreRotaryEmbedding\n(2×2 rotation on Spyre via\nspyre_rope_rot; freq index_select CPU)" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
   ATTN: "SpyreAttentionImpl\n(mixed CPU+Spyre)" {
@@ -113,10 +113,35 @@ attn_detail: "SpyreAttentionImpl Pipeline" {
   S1 -> S2 -> S3 -> S4 -> S5
 }
 
+encoder_attn: "SpyreEncoderAttentionImpl (no KV cache)" {
+  style.fill: "#e0e0e0"
+  style.stroke: "#9e9e9e"
+  style.font-color: "#212121"
+
+  E1: "Ragged→dense batch on CPU\n(per-seq slice/transpose/scatter;\npad L & D to 64-stick)" {
+    style.fill: "#e65100"
+    style.stroke: "#bf360c"
+    style.font-color: "#ffffff"
+  }
+  E2: "Single batched padded SDPA on Spyre\nF.scaled_dot_product_attention\n(is_causal=False, additive mask, enable_gqa)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  E3: "Scatter to CPU, then per-token\noverwrite back into Spyre output" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
+    style.font-color: "#ffffff"
+  }
+
+  E1 -> E2 -> E3
+}
+
 bookends.EMB -> granite: "hidden states"
 granite -> bookends.LP: "final hidden"
 bookends.LP -> bookends.LM: "lm_head"
 granite.ATTN -> attn_detail: "detail" {style.stroke-dash: 3}
+granite.ATTN -> encoder_attn: "encoder-only models\nuse this impl instead" {style.stroke-dash: 3}
 
 legend: " " {
   style.fill: "#e0e0e0"

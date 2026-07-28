@@ -181,7 +181,7 @@ Contents of the script and why each entry matters:
 
 | Variable / action | Value | Purpose |
 |---|---|---|
-| (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the spyre-inference venv's `python` and installed packages on `PATH` |
+| (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the venv's `python` and packages on `PATH`. This is a deployment-style path; for a local `uv sync` install use `source .venv/bin/activate`. |
 | `VLLM_PLUGINS` | `spyre_inference` | Required for vLLM to load the Spyre platform plugin |
 | (kineto check) | — | Inspects `torch.__version__` and warns if the stock wheel is installed instead of the `+aiu.kineto` patched build; prints the install command to fix it |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |

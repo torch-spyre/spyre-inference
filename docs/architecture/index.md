@@ -25,7 +25,7 @@ The plugin registers via three entry points:
 | Entry Point | Target | Purpose |
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
-| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rotary_cpu` and `spyre_convert` custom ops |
+| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rope_rot` and `spyre_convert` custom ops |
 | `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
@@ -48,14 +48,15 @@ kernel in pure PyTorch.
 Each layer that requires Spyre-specific handling is replaced via vLLM's
 `@ClassName.register_oot()` decorator. Most replacements are pure class swaps that run
 when the ops package is imported; two layers (rotary embedding, the `convert` helper)
-also register an opaque custom op via `register_all()` so their device transfers stay
-invisible to `torch.compile`.
+also register an opaque custom op via `register_all()` — `spyre_convert` keeps device
+transfers invisible to `torch.compile`, and `spyre_rope_rot` keeps the forward-context
+read of the gathered rotation slice out of the compiled graph.
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `maybe_compile`d kernel directly on Spyre; no float32 promotion (torch-spyre limitation) |
-| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | CPU | Wrapped in the opaque `spyre_rotary_cpu` custom op; the whole rotary (incl. `index_select`) runs eagerly on CPU so Inductor sees one fallback kernel |
-| `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre + CPU | TP shard mask computed on CPU (Spyre inductor rejects int64 constants); the `aten.embedding` gather itself is a **silent CPU fallback** in torch-spyre ([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)); weights and output live on Spyre; `all_reduce` when TP>1 |
+| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
+| `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | Consumes the pre-split `gate`/`up` parts (see un-fusing); the fused fallback path slices on CPU (Spyre slicing corrupts views) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
@@ -108,6 +109,24 @@ Key constraints:
 - **Supported**: sliding-window masking and logits soft-capping are both handled;
   ALiBi slopes are not
 
+### Encoder-only attention
+
+Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONLY`
+layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
+→ `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
+`spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
+the full sequence — so it skips the paged-cache machinery entirely and instead:
+
+1. Assembles a dense, padded batch on CPU (per-sequence variable-length slice, transpose,
+   and scatter of ragged Q/K/V into `[num_seqs, H, L, D]`, plus an additive attention
+   mask). Both sequence length `L` and head dim `D` are padded to the
+   `ENCODER_SEQ_ALIGNMENT = 64` stick so the on-device matmuls stay stick-aligned (this
+   is what lets small-head-dim models like MiniLM's `head_size=32` compile).
+2. Runs a single batched `F.scaled_dot_product_attention` on Spyre
+   (`is_causal=False`, additive mask, `enable_gqa` when `num_kv_heads != num_heads`).
+3. Scatters the unpadded results back to CPU, then writes them per token into the Spyre
+   output buffer.
+
 ## Device Placement Strategy
 
 `TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
@@ -137,15 +156,17 @@ call boundary:
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward` to compute the TP shard mask on CPU (the upstream helper does
 int64 comparisons against Python int constants, which the Spyre inductor backend
-rejects). Its weight and output tensors live on Spyre, but the `aten.embedding` gather
-itself is a **silent CPU fallback** in torch-spyre
-([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)) — the lookup
-is shuttled D2H/H2D even though the tensors are on Spyre, so no `FallbackWarning`-free
-"Spyre embedding" exists yet.
+rejects). Because `F.embedding` has no Spyre kernel, its `_apply` override is a no-op
+that pins the weight to CPU: the input is `convert`ed to CPU, the gather runs
+CPU-to-CPU, and only the gathered output is `convert`ed back to Spyre. This replaces the
+earlier silent D2H/H2D CPU fallback of `aten.embedding`
+([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)), which
+copied the full `[vocab, hidden]` weight on every decode step.
 
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (the embedding gather, rotary
-embeddings, q/k/v slicing, the per-sequence attention varlen loop, logits indexing).
+operations that Spyre doesn't yet support natively (the embedding gather, the rotary
+frequency-cache `index_select`, q/k/v slicing, the per-sequence attention varlen loop,
+logits indexing).
 
 ## HF-adapters Transformers backend
 
@@ -163,21 +184,20 @@ back afterward.
 `TorchSpyrePlatform.get_device_communicator_cls` returns `SpyreCommunicator`, a
 `DeviceCommunicatorBase` override in
 `spyre_inference/distributed/spyre_communicator.py`. The installed `libspyre_comms.so`
-now implements `barrier`, `broadcast`, `send`/`recv`, list-form `allgather`, and
-`gather`; only `allreduce` and `reduce` remain throw-stubs, and torch-spyre's spyreccl
+now implements `barrier`, `broadcast`, `send`/`recv`, list-form `allgather`, `gather`,
+and `allreduce`; only `reduce` remains a throw-stub, and torch-spyre's spyreccl
 backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't work).
 
-`SpyreCommunicator` therefore supplies:
+`SpyreCommunicator` therefore only overrides:
 
-- **`all_reduce`** — a manual TP=2 reduce-to-root + broadcast built from `send`/`recv`
-  (native allreduce is not available yet; TP>2 raises).
 - **`all_gather`** — routes CPU tensors through the gloo half of the multi-backend
   `cpu:gloo,spyre:spyreccl` group, and uses native list-form `dist.all_gather` for Spyre
   tensors (the base class's `dist.all_gather_into_tensor` path is blocked by the
   `_allgather_base` stub).
 - **`reduce_scatter`** — raises; it is not on the TP forward path.
 
-`gather` is no longer overridden — it now works natively. Each remaining fallback is
+`all_reduce` and `gather` are no longer overridden — they now work natively via
+`libspyre_comms`. Each remaining fallback is
 tagged `REPLACE-WITH-NATIVE`; the `tests/test_spyre_comms_native_probes.py` xfail-strict
 suite is the canonical signal: when a probe flips green, delete the corresponding
 override.

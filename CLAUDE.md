@@ -74,7 +74,7 @@ uv run ty
 - `spyre` - Tests defined in this repo
 - `upstream` - vLLM upstream compatibility tests
 
-When running a subset, prefer `-m "not upstream"` unless you specifically want upstream tests — broad selectors can otherwise match tests pulled in by `spyre-testing-plugin`. Tests that need real Spyre hardware are gated by the `requires_spyre` fixture and skip silently on CPU-only hosts; "all green" on a non-Spyre machine does not mean the change works.
+When running a subset, prefer `-m "not upstream"` unless you specifically want upstream tests — broad selectors can otherwise match tests pulled in by `spyre-testing-plugin`. Tests that need real Spyre hardware guard themselves inline with `if not spyre_available(): pytest.skip(...)` (or `@pytest.mark.skipif(...)`) and skip on CPU-only hosts; "all green" on a non-Spyre machine does not mean the change works.
 
 ### Test Layout
 
@@ -101,7 +101,7 @@ This keeps test infrastructure out of the production package.
 
 - `SKIP_UPSTREAM_TESTS=1` - Skip upstream tests
 - `VLLM_COMMIT=<sha>` - Override vLLM commit
-- `UPSTREAM_TESTS_PATHS=models/language/generation` - Paths to sync from vLLM
+- `UPSTREAM_TESTS_PATHS=models/language/generation` - Comma-separated override for which upstream test paths to collect (default: auto from the YAML config); read by the pytest plugin, **not** consumed by the sync-upstream-test-deps script
 
 **Syncing upstream test dependencies:**
 
@@ -132,7 +132,7 @@ When editing `./torch-spyre/` (or any sibling checkout) and reinstalling via `uv
 ## Spyre-Specific Constraints
 
 - **Device alignment**: Head size must be multiple of 64 (128-byte stick size / 2 bytes for float16)
-- **Tensor parallelism**: TP≥1 supported (custom linear layers handle weight sharding + `all_reduce` via `SpyreCommunicator` — see `docs/architecture/index.md` "Distributed (TP)"). **DP>1 is rejected** in `TorchSpyrePlatform.check_and_update_config`; the spyre-comms global rank space hasn't been validated for DP×TP.
+- **Tensor parallelism**: TP≥1 supported (custom linear layers handle weight sharding; `all_reduce` is now provided natively by `libspyre_comms` and is no longer overridden in `SpyreCommunicator` — see `docs/architecture/index.md` "Distributed (TP)"). **DP>1 is rejected** in `TorchSpyrePlatform.check_and_update_config`; the spyre-comms global rank space hasn't been validated for DP×TP.
 - **dtype**: float16 only (model_config.dtype check in platform.py)
 - **Compilation**: Platform-level compile is set to `CompilationMode.NONE` due to CPU fallback ops creating intermediates. **Caveat**: under the pytest `default_vllm_config` fixture, `cfg.mode` is Python `None` (not the `NONE=0` enum), so per-module gates like `_maybe_compile` in `spyre_attn.py` may still wrap kernels with `torch.compile(..., dynamic=False)`. Don't assume "eager in tests" when comparing pytest behavior to a plain script.
 - **Single accelerator**: Spyre is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/`xdist`, no parallel `uv run pytest` invocations, no backgrounding one Spyre test while starting another. Parallel invocations hang, produce undefined device state, or corrupt the compile cache.

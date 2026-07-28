@@ -26,7 +26,8 @@ subprocesses, which is slow. They are gated on `>=2` Spyre cards so
 they only run on the 2-card pods where the rest of TP=2 testing lives.
 
 The probe bodies live in `tests/probes/tp_probe.py`; the subprocess
-plumbing lives in the `run_tp_probe` fixture in `tests/conftest.py`.
+plumbing lives in the `run_tp_probe` fixture in
+`tests/plugin/spyre_testing_plugin/pytest_plugin.py`.
 """
 
 from __future__ import annotations

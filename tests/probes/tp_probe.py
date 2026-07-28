@@ -17,9 +17,9 @@ Each probe exercises one collective on a real spyreccl device_group.
 The shared `main()` prologue handles env-rendezvous, vllm config, and
 worker-distributed-env init, then dispatches to the requested probe.
 
-Tests invoke this via the `run_tp_probe` fixture in tests/conftest.py,
-which spawns one subprocess per rank. To run a probe directly for
-debugging:
+Tests invoke this via the `run_tp_probe` fixture in
+tests/plugin/spyre_testing_plugin/pytest_plugin.py, which spawns one
+subprocess per rank. To run a probe directly for debugging:
 
     RANK=0 WORLD_SIZE=2 LOCAL_RANK=0 LOCAL_WORLD_SIZE=2 \\
     MASTER_ADDR=127.0.0.1 MASTER_PORT=29500 \\

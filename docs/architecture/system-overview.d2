@@ -98,7 +98,7 @@ worker: "n == TP size worker procs" {
     style.stroke: "#263238"
     style.font-color: "#ffffff"
   }
-  SpyreComm: "SpyreCommunicator\n(manual TP=2 all_reduce;\nlist-form all_gather)" {
+  SpyreComm: "SpyreCommunicator\n(list-form all_gather;\nallreduce/gather native)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -152,6 +152,18 @@ worker: "n == TP size worker procs" {
     style.font-color: "#ffffff"
     style.bold: true
   }
+  SpyreEncoderAttnBackend: "SpyreEncoderAttentionBackend\n(encoder-only, no KV cache)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
+  SpyreEncoderAttnImpl: "SpyreEncoderAttentionImpl\n(bidirectional SDPA)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+    style.bold: true
+  }
 
   Sampler: Sampler {
     style.fill: "#37474f"
@@ -171,6 +183,9 @@ worker: "n == TP size worker procs" {
   SpyreModelRunner -> Sampler
   SpyreAttnBackend -> SpyreAttnImpl: creates
   SpyreAttnBackend -> SpyreMetaBuilder: creates
+  SpyreAttnBackend -> SpyreEncoderAttnBackend: "▷" {style.stroke-dash: 3}
+  SpyreAttnImpl -> SpyreEncoderAttnImpl: "▷" {style.stroke-dash: 3}
+  SpyreEncoderAttnBackend -> SpyreEncoderAttnImpl: creates
 }
 
 api.EngineClient -> engine.EngineCore: {style.stroke-dash: 3}

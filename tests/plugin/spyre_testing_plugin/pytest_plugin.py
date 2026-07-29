@@ -943,10 +943,10 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # Patch the KV cache layout for CUSTOM backend. The upstream test allocates
-    # kv_cache as a single tensor [2, num_blocks, block_size, num_kv_heads, head_size];
-    # SpyreAttentionImpl.forward expects (k_pages, v_pages) where each is a
-    # per-block list of [num_kv_heads, block_size, head_size] tensors.
+    # The upstream test allocates one kv_cache tensor of
+    # [num_blocks, num_kv_heads, block_size, 2 * head_size]; SpyreAttentionImpl
+    # wants (k_pages, v_pages), each a per-block list of
+    # [num_kv_heads, block_size, head_size].
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -964,11 +964,10 @@ def patch_backend_list(request, monkeypatch):
         sliding_window=None,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
-            # [num_blocks, 2, block_size, num_kv_heads, head_size]
-            #   -> per-side [num_blocks, num_kv_heads, block_size, head_size]
-            #   -> list of num_blocks tensors of [num_kv_heads, block_size, head_size]
-            k_blocks = kv_cache[:, 0].transpose(1, 2).contiguous()
-            v_blocks = kv_cache[:, 1].transpose(1, 2).contiguous()
+            # K and V are concatenated on the last dim.
+            head_size = kv_cache.shape[-1] // 2
+            k_blocks = kv_cache[..., :head_size].contiguous()
+            v_blocks = kv_cache[..., head_size:].contiguous()
             kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
         return orig_run_attention_backend(
             backend,

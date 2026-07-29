@@ -83,11 +83,14 @@ def _compute_slot_mapping_impl(
     block_table_stride: int,
     block_size: int,
     slot_mapping: torch.Tensor,
+    KV_CACHE_BLOCK_SIZE: int | None = None,
+    BLOCKS_PER_KV_BLOCK: int = 1,
     TOTAL_CP_WORLD_SIZE: int = 1,
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
     PAD_ID: int = _PAD_SLOT_ID,
-    KV_CACHE_BLOCK_SIZE: int = 1024,
+    # Triton tile width; unused here, kept for call compatibility.
+    BLOCK_SIZE: int = 1024,
 ) -> None:
     """Map each token position to its flat index in the paged KV cache.
 
@@ -97,10 +100,18 @@ def _compute_slot_mapping_impl(
 
     Correctness is validated indirectly by the upstream attention backend test
     (test_causal_backend_correctness) and end-to-end model generation tests.
+
+    ``block_size`` is the kernel's block size, ``KV_CACHE_BLOCK_SIZE`` the KV
+    manager's, and ``BLOCKS_PER_KV_BLOCK`` the ratio between them (1 on Spyre).
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-    block_indices = (positions[:num_tokens] // block_size).to(torch.int64)
-    block_offsets = (positions[:num_tokens] % block_size).to(torch.int64)
+    kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
+
+    # KV manager block, then the kernel block within it.
+    token_positions = positions[:num_tokens]
+    virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
+    local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
+    block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
 
     num_reqs = query_start_loc.shape[0] - 1
     req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
@@ -111,7 +122,7 @@ def _compute_slot_mapping_impl(
 
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * block_size + block_offsets
+    slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
     if max_num_tokens > num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 

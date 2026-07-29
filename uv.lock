@@ -38,7 +38,7 @@ overrides = [
     { name = "torchaudio", marker = "sys_platform == 'never'" },
     { name = "torchvision", marker = "sys_platform == 'never'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le'", git = "https://github.com/vllm-project/vllm?rev=v0.25.1" },
+    { name = "vllm", marker = "platform_machine not in 's390x, ppc64le'", git = "https://github.com/vllm-project/vllm?rev=v0.26.0" },
 ]
 
 [[package]]
@@ -1584,15 +1584,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/17/4d/ac7ffa80c69ea1df30a8aa11b3578692a5118e7cd1aa157e3ef73b092d15/dill-0.3.8.tar.gz", hash = "sha256:3ebe3c479ad625c4553aca177444d89b486b1d84982eeacded644afc0cf797ca", size = 184847, upload-time = "2024-01-27T23:42:16.145Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/7a/cef76fd8438a42f96db64ddaa85280485a9c395e7df3db8158cfec1eee34/dill-0.3.8-py3-none-any.whl", hash = "sha256:c36ca9ffb54365bdd2f8eb3eff7d2a21237f8452b57ace88b1ac615b7e815bd7", size = 116252, upload-time = "2024-01-27T23:42:14.239Z" },
-]
-
-[[package]]
-name = "diskcache"
-version = "5.6.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3f/21/1c1ffc1a039ddcc459db43cc108658f32c57d271d7289a2794e401d0fdb6/diskcache-5.6.3.tar.gz", hash = "sha256:2c3a3fa2743d8535d832ec61c2054a1641f41775aa7c556758a109941e33e4fc", size = 67916, upload-time = "2023-08-31T06:12:00.316Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/3f/27/4570e78fc0bf5ea0ca45eb1de3818a23787af9b390c0b0a0033a1b8236f9/diskcache-5.6.3-py3-none-any.whl", hash = "sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19", size = 45550, upload-time = "2023-08-31T06:11:58.822Z" },
 ]
 
 [[package]]
@@ -7611,7 +7602,7 @@ requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=6ea824ef9dc9bc6422fd1c3e32a6d6b55918e265" },
-    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.25.1" },
+    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.26.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -7644,7 +7635,6 @@ dependencies = [
     { name = "datasets" },
     { name = "decord", marker = "platform_machine == 'x86_64'" },
     { name = "depyf" },
-    { name = "diskcache" },
     { name = "einops" },
     { name = "fastapi", extra = ["standard"] },
     { name = "fastsafetensors" },
@@ -7662,7 +7652,7 @@ dependencies = [
     { name = "kaldi-native-fbank" },
     { name = "lark" },
     { name = "librosa" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'" },
+    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
     { name = "lm-eval", extra = ["api"] },
     { name = "lm-format-enforcer" },
     { name = "matplotlib" },
@@ -7764,11 +7754,10 @@ requires-dist = [
     { name = "cloudpickle", specifier = ">=3.1.2" },
     { name = "cohere-melody", specifier = ">=0.9.0" },
     { name = "compressed-tensors", specifier = "==0.17.0" },
-    { name = "datamodel-code-generator", specifier = ">=0.68.1" },
+    { name = "datamodel-code-generator", specifier = ">=0.69.0" },
     { name = "datasets", specifier = ">=3.3.0,<=3.6.0" },
     { name = "decord", marker = "platform_machine == 'x86_64'", specifier = "==0.6.0" },
     { name = "depyf", specifier = "==0.20.0" },
-    { name = "diskcache", specifier = "==5.6.3" },
     { name = "einops", specifier = ">=0.8.2" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.133.0,<0.137.0" },
     { name = "fastsafetensors", specifier = ">=0.3.2" },
@@ -7780,16 +7769,16 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "ijson", specifier = ">=3.5.1" },
     { name = "imagehash", specifier = ">=4.3.2" },
-    { name = "instanttensor", marker = "platform_machine == 'x86_64'", specifier = ">=0.1.5" },
+    { name = "instanttensor", marker = "platform_machine == 'x86_64'", specifier = ">=0.1.9" },
     { name = "jiwer", specifier = ">=4.0.0" },
     { name = "jsonschema", specifier = ">=4.23.0" },
     { name = "kaldi-native-fbank", specifier = ">=1.18.7" },
     { name = "lark", specifier = "==1.2.2" },
     { name = "librosa", specifier = ">=0.11.0" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'", specifier = ">=1.7.0,<1.8.0" },
+    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=1.7.0,<1.8.0" },
     { name = "lm-eval", extras = ["api"], specifier = ">=0.4.12" },
     { name = "lm-format-enforcer", specifier = "==0.11.3" },
-    { name = "matplotlib", specifier = ">=3.11.0" },
+    { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "mcp", specifier = ">=1.28.1" },
     { name = "mistral-common", extras = ["audio", "image"], specifier = ">=1.11.5" },
     { name = "model-hosting-container-standards", specifier = ">=0.1.14,<1.0.0" },
@@ -7810,7 +7799,7 @@ requires-dist = [
     { name = "opentelemetry-semantic-conventions-ai", specifier = ">=0.4.1" },
     { name = "outlines-core", specifier = "==0.2.14" },
     { name = "partial-json-parser", specifier = ">=0.2.1.1.post7" },
-    { name = "peft", specifier = ">=0.18.1" },
+    { name = "peft", specifier = ">=0.19.1" },
     { name = "perceptron", specifier = ">=0.3.5" },
     { name = "pillow", specifier = ">=11.3.0" },
     { name = "plotly", specifier = ">=6.9.0" },
@@ -7833,14 +7822,14 @@ requires-dist = [
     { name = "pyyaml" },
     { name = "pyzmq", specifier = ">=25.0.0" },
     { name = "ray", extras = ["cgraph", "default"], specifier = ">=2.48.0" },
-    { name = "regex", specifier = ">=2026.6.28" },
+    { name = "regex", specifier = ">=2026.7.19" },
     { name = "requests", specifier = ">=2.26.0" },
     { name = "runai-model-streamer", extras = ["azure", "gcs", "s3"], specifier = "==0.15.7" },
     { name = "safetensors", specifier = ">=0.6.2" },
     { name = "schemathesis", specifier = ">=4.0.0" },
     { name = "segmentation-models-pytorch", specifier = ">0.4.0" },
     { name = "sentence-transformers", specifier = ">=5.2.0" },
-    { name = "sentencepiece", specifier = ">=0.2.1" },
+    { name = "sentencepiece", specifier = ">=0.2.2" },
     { name = "setproctitle", specifier = ">=1.3.7" },
     { name = "setuptools", marker = "python_full_version >= '3.12'", specifier = ">=77.0.3,<81.0.0" },
     { name = "six", marker = "python_full_version >= '3.12'", specifier = ">=1.16.0" },
@@ -7854,12 +7843,12 @@ requires-dist = [
     { name = "torch", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchaudio", specifier = "==2.11.0" },
     { name = "torchvision", specifier = "==0.26.0", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "tqdm", specifier = ">=4.68.4" },
+    { name = "tqdm", specifier = ">=4.69.0" },
     { name = "transformers", specifier = ">=5.5.3" },
     { name = "transformers-stream-generator", specifier = ">=0.0.5" },
     { name = "tritonclient", specifier = ">=2.51.0" },
     { name = "typing-extensions", specifier = ">=4.10" },
-    { name = "vector-quantize-pytorch", specifier = ">=1.30.1" },
+    { name = "vector-quantize-pytorch", specifier = ">=1.31.0" },
     { name = "vocos", specifier = ">=0.1.0" },
     { name = "watchfiles", specifier = ">=1.2.0" },
     { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'", specifier = ">=0.2.1,<1.0.0" },
@@ -8727,8 +8716,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.25.1+empty"
-source = { git = "https://github.com/vllm-project/vllm?rev=v0.25.1#752a3a504485790a2e8491cacbb35c137339ad34" }
+version = "0.26.0+empty"
+source = { git = "https://github.com/vllm-project/vllm?rev=v0.26.0#568afb3a13806beb53bb2e6bd518269357b237c0" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -8738,14 +8727,13 @@ dependencies = [
     { name = "cloudpickle" },
     { name = "compressed-tensors" },
     { name = "depyf" },
-    { name = "diskcache" },
     { name = "einops" },
     { name = "fastapi", extra = ["standard"] },
     { name = "filelock" },
     { name = "ijson" },
     { name = "jsonschema" },
     { name = "lark" },
-    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 'x86_64'" },
+    { name = "llguidance", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
     { name = "lm-format-enforcer" },
     { name = "mcp" },
     { name = "mistral-common", extra = ["image"] },

@@ -87,7 +87,7 @@ def _compute_slot_mapping_impl(
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
     PAD_ID: int = _PAD_SLOT_ID,
-    BLOCK_SIZE: int = 1024,
+    KV_CACHE_BLOCK_SIZE: int = 1024,
 ) -> None:
     """Map each token position to its flat index in the paged KV cache.
 

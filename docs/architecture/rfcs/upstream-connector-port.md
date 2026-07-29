@@ -151,9 +151,9 @@ M1's device↔host copy is a single raw-DMA primitive over the torch-spyre copy 
 | Spyre device ↔ **shared** host-RAM pool (cross-instance, on-node) | **M2** | `OffloadingConnector` + `SpyreSharedOffloadingSpec` | Multiple co-located instances attach one shared host KV pool (`SharedHostPool`) with a shared directory (`SharedHostMetadata`); a block offloaded by one instance is reloaded by another with one raw DMA — no serialization, no disk. Device↔pool transfer is `copy_tensor_raw(dev_tensor, pool, slot_id, ...)`; the seam between the plugin and torch-spyre is an integer `slot_id` (§6.6). Reuses M1's device↔host copier unchanged. See §6.7–6.8. |
 | Direct Spyre device ↔ filesystem / object store | Out of scope | n/a | Would require a Spyre-side analogue of NVIDIA GDS so a secondary tier can DMA without a host bounce. Not provided by torch-spyre today, and the upstream `SecondaryTierManager` contract assumes the `primary_kv_view` is over CPU memory; supporting this would change both. Filed as a future-work item in §11. |
 
-M1 and M2 reuse the same device↔host copy path (§4/§6.1, §6.7); M2 only changes the host destination
-from a per-instance `torch.empty` page to a slot in the shared `SharedHostPool`, named by integer
-`slot_id`. A deployment that additionally wants a disk/object tier can still stack an upstream fs/obj
+M1 and M2 reuse the same device↔host copy path (§4/§6.1, §6.7); both offload into a `SharedHostPool`
+slot named by integer `slot_id`, and M2 only changes the pool from M1's single-process one to a named
+cross-instance pool with a `SharedHostMetadata` directory. A deployment that additionally wants a disk/object tier can still stack an upstream fs/obj
 `SecondaryTierManager` on top of M1's `SpyreOffloadingSpec` via config, but this RFC ships no
 Spyre-specific tiering spec (§2, §3.5).
 
@@ -239,7 +239,7 @@ import torch_spyre._C as _spyre_c
 
 
 class SpyreKvDmaCopier:
-    """Single-purpose owner of every host↔Spyre KV byte transfer.
+    """Single-purpose owner of every device↔pool KV byte transfer.
 
     Thin wrapper around torch_spyre._C.copy_tensor_raw, the byte-exact raw
     DMA bound to SpyreStream.copyAsync → the hardware runtime's raw-copy
@@ -248,14 +248,21 @@ class SpyreKvDmaCopier:
     drifts ~1 ULP on about half of values (§4), which is a correctness
     defect for a KV tier, so the copier uses the raw path exclusively.
     We expose two named methods purely for handler readability.
+
+    The host destination is always a SharedHostPool slot named by integer
+    slot_id — there is no host-tensor form of copy_tensor_raw (raw host
+    pointers never cross into Python). M1 uses a single-process pool; M2
+    uses the same pool shape plus a cross-instance directory (§6.7). This
+    is why the copier is byte-for-byte identical across both milestones.
     """
 
-    def copy_d2h(self, src_spyre: torch.Tensor, dst_host: torch.Tensor) -> None:
-        # byte-exact raw DMA; no dtype/layout conversion
-        _spyre_c.copy_tensor_raw(src_spyre, dst_host, to_device=False, non_blocking=False)
+    def copy_d2h(self, dev: torch.Tensor, pool, slot_id: int) -> None:
+        # offload: byte-exact raw DMA device → pool slot; no dtype/layout conversion
+        _spyre_c.copy_tensor_raw(dev, pool, slot_id, to_device=False, non_blocking=False)
 
-    def copy_h2d(self, src_host: torch.Tensor, dst_spyre: torch.Tensor) -> None:
-        _spyre_c.copy_tensor_raw(dst_spyre, src_host, to_device=True, non_blocking=False)
+    def copy_h2d(self, dev: torch.Tensor, pool, slot_id: int) -> None:
+        # reload: byte-exact raw DMA pool slot → device
+        _spyre_c.copy_tensor_raw(dev, pool, slot_id, to_device=True, non_blocking=False)
 ```
 
 Constraints:
@@ -279,7 +286,8 @@ class SpyreCpuOffloadingHandlers:
                  block_size_factor: int,
                  num_cpu_blocks: int,
                  copier: SpyreKvDmaCopier,
-                 pool=None): ...             # M2 passes the SharedHostPool; M1 leaves None
+                 pool,                        # SharedHostPool: single-process (M1) or shared (M2)
+                 directory=None): ...         # SharedHostMetadata; M2 passes it, M1 leaves None
 
     @property
     def gpu_to_cpu_handler(self) -> OffloadingHandler: ...   # store: Spyre → host
@@ -290,20 +298,23 @@ class SpyreCpuOffloadingHandlers:
 Each direction is a `_SingleDirectionSpyreHandler(OffloadingHandler)` implementing the v0.24.0
 contract:
 
-1. `transfer_async(job_id, transfer_spec) -> bool` — walk the block-id pairs in `transfer_spec` and call `copier.copy_{d2h,h2d}` for each.
+1. `transfer_async(job_id, transfer_spec) -> bool` — walk the block-id pairs in `transfer_spec`, resolve each to a pool `slot_id` (M1: directly from the block index; M2: via the `SharedHostMetadata` directory), and call `copier.copy_{d2h,h2d}(dev, pool, slot_id)` for each.
 2. `get_finished() -> list[TransferResult]` — return `TransferResult(job_id, success=...)` records; synchronous today, so every submitted job is already done.
 3. `shutdown()` clears references to the registered tensors.
 
-Host-side destinations differ by milestone. When `pool is None` (M1), a
-`torch.zeros(num_cpu_blocks, cpu_page_bytes, int8)` per attention group is the process-local host page,
-exactly as upstream `CpuGpuOffloadingHandlers` builds it (verified at v0.24.0). When a `SharedHostPool`
-is supplied (M2), the host destination is a fixed-size pool slot named by integer `slot_id`, and the
-copier's raw DMA targets that slot via `copy_tensor_raw(dev_tensor, pool, slot_id, ...)` (§6.7–6.8).
-Crucially, the M2 device↔host copy path is the M1 path **unchanged** — the only difference is the host
-destination is a pool slot rather than a `torch.empty` page. Pinning is **internal to the pool**: there
-is no Python-level host-buffer registration and no raw host pointer or device address crosses into
-Python (a hard runtime requirement). There is no `cudaHostRegister` on Spyre — there is no equivalent,
-and none is needed because the runtime owns pinning inside `SharedHostPool`.
+The host destination is a `SharedHostPool` slot in **both** milestones — the canonical
+`copy_tensor_raw(dev_tensor, pool, slot_id, ...)` has no host-tensor form (raw host pointers never
+cross into Python, §6.7), so there is no `torch.empty` host-page path. M1 supplies a **single-process**
+pool: a `SharedHostPool` sized from `cpu_bytes_to_use`, with **no** `SharedHostMetadata` directory
+(one instance, no cross-instance lookup — the handler assigns `slot_id` directly from the block index).
+M2 supplies the **same pool shape plus a shared directory** so co-located instances name each other's
+slots by content hash (§6.7–6.8). Either way the copier's raw DMA targets the slot via
+`copy_tensor_raw(dev_tensor, pool, slot_id, ...)`. This is why the M2 device↔host copy path is the M1
+path **unchanged** — M2 adds only the cross-instance directory, not a different transfer. Pinning is
+**internal to the pool**: there is no Python-level host-buffer registration and no raw host pointer or
+device address crosses into Python (a hard runtime requirement). There is no `cudaHostRegister` on
+Spyre — there is no equivalent, and none is needed because the runtime owns pinning inside
+`SharedHostPool`.
 
 ### 6.3 `SpyreOffloadingSpec`
 
@@ -314,10 +325,23 @@ hook (return Spyre handlers) and the platform gate in `get_handlers`. Everything
 
 ```python
 # spyre_inference/v1/kv_offload/spec.py
+import os
+import torch_spyre._C as _spyre_c
+from torch_spyre._C import SharedHostPool
+
 class SpyreOffloadingSpec(CPUOffloadingSpec):
     def __init__(self, vllm_config, kv_cache_config):
         super().__init__(vllm_config, kv_cache_config)   # computes self.num_blocks, block_size_factor
         self._copier = SpyreKvDmaCopier()
+        # M1's host tier is a single-process SharedHostPool (no shared directory).
+        # M2's SpyreSharedOffloadingSpec overrides this to attach a *named* pool +
+        # SharedHostMetadata directory instead (§6.8). num_slots/slot_bytes come
+        # from the same cpu_bytes_to_use math the parent already ran; the name is
+        # process-unique so nothing else attaches it.
+        self._pool = SharedHostPool.create_or_attach(
+            _spyre_c.get_dma_stream(), name=f"/kv.m1.{os.getpid()}",
+            num_slots=self.num_blocks, slot_bytes=self.cpu_page_bytes,
+        )
 
     # get_manager: inherited from CPUOffloadingSpec (reuse the upstream manager verbatim).
 
@@ -327,6 +351,7 @@ class SpyreOffloadingSpec(CPUOffloadingSpec):
             block_size_factor=self.block_size_factor,
             num_cpu_blocks=self.num_blocks,
             copier=self._copier,
+            pool=self._pool,                             # M1: single-process; directory stays None
         )
 
     def get_handlers(self, kv_caches):
@@ -341,7 +366,8 @@ class SpyreOffloadingSpec(CPUOffloadingSpec):
 historical reasons), so we use it for Spyre. Subclassing `CPUOffloadingSpec` (not `OffloadingSpec`
 directly) also gives M2's `SpyreSharedOffloadingSpec` a clean base: it subclasses **this M1 spec**
 (§6.8) and reuses the same `get_handlers` yield structure and `create_handlers` hook, changing only
-the host destination from a process-local page to a `SharedHostPool` slot.
+the pool from single-process to a named cross-instance `SharedHostPool` + `SharedHostMetadata`
+directory.
 
 ### 6.4 Filesystem/object tiering — not a milestone
 
@@ -390,10 +416,11 @@ The one thing we have to verify in implementation is that `OffloadingConnectorWo
 
 ### 6.7 M2 — the shared host pool surface (`SharedHostPool` / `SharedHostMetadata` / `copy_tensor_raw`)
 
-M1's `SpyreKvDmaCopier` already does a byte-exact raw DMA between a device page and a host destination
-(§6.1). M2 keeps that copy path unchanged and only changes the host destination to a slot in a shared
-host KV pool provided by the hardware runtime. torch-spyre exposes that pool to Python as two objects
-(the torch-spyre KV-offload Python-surface design):
+M1's `SpyreKvDmaCopier` already does a byte-exact raw DMA between a device page and a `SharedHostPool`
+slot (§6.1). M2 keeps that copy path unchanged and only swaps M1's single-process pool for a shared,
+named host KV pool provided by the hardware runtime, adding a directory so co-located instances name
+each other's slots. torch-spyre exposes that pool to Python as two objects (the torch-spyre KV-offload
+Python-surface design):
 
 ```python
 # torch_spyre._C (M2 dependency — not in the current pinned build).
@@ -430,8 +457,9 @@ a tensor): **raw host pointers and device addresses never cross into Python** �
 (the data pool is index-addressed and the metadata directory keys pinning/eviction on the slot) — and
 there is deliberately **no** Python-level host-buffer registration, because pinning is internal to the
 pool (flex pins the whole pool once per IOMMU Function inside `create_or_attach`). The M2
-`SpyreKvDmaCopier` reuses its M1 `copy_d2h` / `copy_h2d` methods against `copy_tensor_raw`; the only
-added argument is `(pool, slot_id)` in place of a torch-owned host tensor.
+`SpyreKvDmaCopier` reuses its M1 `copy_d2h` / `copy_h2d` methods against `copy_tensor_raw`
+**verbatim** — the copier already takes `(dev, pool, slot_id)` in M1; M2 changes only *which* pool it
+is handed (a named cross-instance one) and adds the directory that picks the `slot_id`.
 
 **Which layer calls the directory.** flex owns the *mechanism* (the pool, the `copyRaw` DMA, the
 directory lock, the DMA-completion publish gate, and the `generation` reuse check). This RFC's
@@ -442,13 +470,14 @@ RFC §3.1 ownership contract.
 ### 6.8 M2 — `SpyreSharedOffloadingSpec`: the shared host pool design
 
 M2 makes the host tier a **single shared host KV pool shared by every co-located instance**, instead
-of M1's per-instance `torch.empty` host blocks. There is **one design**: the pool is a `SharedHostPool`
+of M1's per-instance single-process pool. There is **one design**: the pool is a `SharedHostPool`
 of fixed-size slots with a `SharedHostMetadata` directory, both provided by the hardware runtime
 through torch-spyre (§6.7), and the plugin names each offloadable slot by an integer `slot_id`.
 
 **`SpyreSharedOffloadingSpec` subclasses M1's `SpyreOffloadingSpec`.** It reuses M1's
 `SpyreCpuOffloadingHandlers` / `SpyreKvDmaCopier` device↔host path **unchanged** — the only difference
-is the host destination is a pool slot, not a process-local `torch.empty` page. Its manager names each
+is the pool is a *named, cross-instance* `SharedHostPool` with a `SharedHostMetadata` directory rather
+than M1's single-process pool with no directory. Its manager names each
 offloadable block by content hash (exactly as vLLM's prefix cache already computes it), maps that hash
 to a pool `slot_id` via `SharedHostMetadata` (`claim` on store, `lookup` on load), and honors
 `publish` / `evict` and the directory's concurrency guarantees:
@@ -463,16 +492,17 @@ class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
     """Cross-instance shared host KV pool on Spyre.
 
     Subclasses M1's SpyreOffloadingSpec and reuses its handlers + copier
-    unchanged. The ONLY difference from M1 is the host destination: a slot
-    in a flex-owned SharedHostPool, named by integer slot_id via a shared
-    SharedHostMetadata directory (block-hash -> slot_id), instead of a
-    process-local torch.empty page. Two instances attaching the same named
-    pool + directory see the same slots.
+    unchanged. The ONLY difference from M1 is the pool: a *named*, flex-owned
+    SharedHostPool plus a shared SharedHostMetadata directory (block-hash ->
+    slot_id), instead of M1's single-process pool with no directory. Two
+    instances attaching the same named pool + directory see the same slots.
     """
     def __init__(self, vllm_config, kv_cache_config):
-        super().__init__(vllm_config, kv_cache_config)
+        super().__init__(vllm_config, kv_cache_config)  # M1 built a single-process self._pool
         cfg = self.shared_pool                       # {name, num_slots, slot_bytes, max_chunks}
         stream = _spyre_c.get_dma_stream()           # pooled DMA stream (torch-spyre §3.4)
+        # Replace M1's single-process pool with the *named* cross-instance one,
+        # and add the shared directory M1 doesn't have.
         self._pool = SharedHostPool.create_or_attach(
             stream, name=cfg.name,
             num_slots=cfg.num_slots, slot_bytes=cfg.slot_bytes,
@@ -481,11 +511,11 @@ class SpyreSharedOffloadingSpec(SpyreOffloadingSpec):
             name=cfg.name, num_slots=cfg.num_slots, max_chunks=cfg.max_chunks,
         )
 
-    def create_handlers(self, kv_caches):            # M1's hook; only the host dest changes
+    def create_handlers(self, kv_caches):            # M1's hook; adds the directory
         return SpyreCpuOffloadingHandlers(
             kv_caches=kv_caches, block_size_factor=self.block_size_factor,
             num_cpu_blocks=self._pool.slot_count(), copier=self._copier,
-            pool=self._pool,                         # host slots come from the shared pool
+            pool=self._pool, directory=self._directory,   # cross-instance lookup/claim/publish
         )
     # get_handlers: inherited from SpyreOffloadingSpec (§6.3) — drops the CUDA gate.
 ```
@@ -638,7 +668,7 @@ The PD-disaggregation half of the prior prototype (custom NIXL connector and `Cp
 3. **TP > 1.** `SpyreCommunicator` currently only supports TP=2. The connector handler operates per-rank, so TP>1 should be transparent, but we should verify the `kv_caches` dict the worker hands us at TP=2 contains exactly the local-rank slice. (It does on CUDA; we expect the same on Spyre because both go through the same upstream allocator.)
 4. **Block alignment.** Spyre's `_allocate_kv_cache_tensors` rounds `num_blocks` up to a multiple of 64 (`spyre_model_runner.py:336`). The upstream `block_size_factor` machinery assumes the GPU/device block count and the offloaded block count are integer-related, which holds, but the alignment slack means a few blocks at the end are unusable. We should document this in the spec and not try to "use" the alignment slack on the host side.
 5. **`SpyreOffloadingSpec` parent class.** Two viable bases: subclass `OffloadingSpec` directly (clean, but we duplicate the ~30 lines of `__init__` math from `CPUOffloadingSpec` that compute `num_blocks` from `cpu_bytes_to_use`); or subclass `CPUOffloadingSpec` and override `get_handlers` to skip the `is_cuda_alike()` gate (less duplication, but inherits a parent that documents itself as CUDA-only). The implementation will pick one once we see how much of `CPUOffloadingSpec` is genuinely CUDA-coupled vs. just gated. M2's `SpyreSharedOffloadingSpec` subclasses this M1 spec, so the choice cascades.
-6. **Host block allocation for M2.** M1's `SpyreCpuOffloadingHandlers` builds host-side block tensors with `torch.empty` (per-instance, unshared) when `pool is None`. M2 instead passes the handlers a runtime-provided `SharedHostPool`, and the host destination becomes a fixed-size pool slot named by integer `slot_id` (§6.7–6.8). The handlers' `pool` parameter (§6.2) is the seam; they self-allocate a process-local page only when it is `None`. The plugin holds no host pointers or device addresses — pinning is internal to the pool.
+6. **Host pool for M1 vs M2.** Both milestones offload into a `SharedHostPool` slot — the canonical `copy_tensor_raw(dev, pool, slot_id, ...)` has no host-tensor form (§6.7), so there is no `torch.empty` host-page path on either. M1 attaches a **single-process** pool with no directory (the handler assigns `slot_id` from the block index); M2 attaches a **named cross-instance** pool plus a `SharedHostMetadata` directory that maps content hash → `slot_id` (§6.7–6.8). The handlers' `pool` / `directory` parameters (§6.2) are the seam; M1 leaves `directory=None`. The plugin holds no host pointers or device addresses — pinning is internal to the pool.
 
 ## 11. Out of scope (filed as follow-ups)
 
@@ -734,9 +764,10 @@ vllm serve <model> --kv-transfer-config '{
       on a build without the M2 torch-spyre surface must not error — the spec import is lazy via the
       factory, as in §3.4).
 - [ ] `SpyreSharedOffloadingSpec` reuses M1's `SpyreCpuOffloadingHandlers` / `SpyreKvDmaCopier`
-      device↔host path unchanged — the only difference from M1 is the host destination is a pool slot
-      named by integer `slot_id`, not a process-local `torch.empty` page. The plugin holds no host
-      pointers or device addresses.
+      device↔host path unchanged — the only difference from M1 is the pool is a named cross-instance
+      `SharedHostPool` with a `SharedHostMetadata` directory, not M1's single-process pool. Both
+      offload into a slot named by integer `slot_id`; the plugin holds no host pointers or device
+      addresses.
 
 ## 13. References
 

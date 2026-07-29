@@ -105,6 +105,7 @@ jobs:
             uv.lock
             spyre-rpms.lock
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          # See prune-uv-cache-safe
           prune-cache: false
 
       - name: Install spyre-inference
@@ -114,6 +115,11 @@ jobs:
           uv sync --frozen --verbose --group dev
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
+
+      # Slim the cache for setup-uv's post-job save without discarding the
+      # compiled torch-spyre/vllm wheels. Must run after the uv sync above.
+      - name: Prune uv cache (safe)
+        uses: ./.github/actions/prune-uv-cache-safe
 
       - name: Resolve vLLM commit
         env:

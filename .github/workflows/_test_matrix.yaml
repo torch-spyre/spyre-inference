@@ -240,9 +240,7 @@ jobs:
             spyre-rpms.lock
           # Use local runner temp to avoid ownership/permission issues on $HOME.
           cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # `uv cache prune --ci` (setup-uv's default) removes pre-built wheels,
-          # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
-          # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
+          # See prune-uv-cache-safe
           prune-cache: false
           # Never save cache for ephemeral merge queue branches
           save-cache: ${{ github.event_name != 'merge_group' }}
@@ -289,6 +287,12 @@ jobs:
           # Print the resolved torch install for log visibility.
           uv pip show torch
           uv pip freeze
+
+      # Slim the cache for setup-uv's post-job save without discarding the
+      # compiled torch-spyre/vllm wheels. Must run after the build's uv sync.
+      - name: Prune uv cache (safe)
+        if: ${{ steps.gate.outputs.run == 'true' && github.event_name != 'merge_group' }}
+        uses: ./.github/actions/prune-uv-cache-safe
 
       - name: Ensure public HF models cached
         if: ${{ steps.gate.outputs.run == 'true' }}

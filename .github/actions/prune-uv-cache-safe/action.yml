@@ -1,0 +1,100 @@
+name: Prune uv cache (safe)
+description: |
+  Shrink the uv cache for CI upload WITHOUT discarding our expensive
+  compiled-from-source wheels (torch-spyre, vllm).
+
+  WHY THIS EXISTS
+  ---------------
+  The obvious way to slim the cache is setup-uv's `prune-cache: true`, which
+  runs `uv cache prune --ci`. That flag reclaims the multi-GB of build-time
+  junk we DO want gone -- chiefly the CUDA `torch==2.11` toolchain + ~15 nvidia
+  packages (~2.7GB) that vLLM's PEP-517 build isolation drags in and which never
+  appear in the runtime lockfile. So far so good.
+
+  The problem: `uv cache prune --ci` also deletes torch-spyre and vllm, which
+  cost ~50s+ each to compile from source. uv's docs promise `--ci` "retains any
+  wheels that were built from source", and it DOES for ordinary source builds
+  (verified: a plain git-built markupsafe wheel and the pure-python
+  hf-adapters-spyre wheel both survive). But torch-spyre and vllm are built with
+  custom build settings -- `[tool.uv.extra-build-dependencies]` for torch-spyre,
+  `extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty",
+  CMAKE_ARGS = "--fresh" } }` for vllm. uv nests wheels built with custom build
+  settings under an extra settings-keyed hash directory:
+
+      KEPT  by --ci:  sdists-vN/git/<digest>/<sha>/<wheel>
+      DROPPED by --ci: sdists-vN/git/<digest>/<sha>/<build-hash>/<wheel>
+
+  `--ci`'s source-build retention doesn't recurse into that extra level, so our
+  two most expensive wheels get thrown away on every run despite a cache hit,
+  contradicting the documented contract. (Closest upstream report is
+  astral-sh/uv#10403, about `--ci` clearing large *downloaded* deps -- the
+  nvidia half of our problem -- but not this source-built-wheel case.)
+
+  WHAT THIS ACTION DOES
+  ---------------------
+  Backup -> `uv cache prune --ci` -> restore. It snapshots every source-built
+  wheel (everything under `sdists-vN/`), runs the aggressive prune to reclaim
+  the downloaded registry wheels + unzipped archives, then restores only the
+  source-built wheels that prune removed. Restoring a wheel at its
+  content-addressed cache path is enough for the next `uv sync` to reuse it
+  (re-unzip, ~2s) instead of rebuilding (~50s+); verified end-to-end.
+
+  Run this as a normal job step AFTER `uv sync`. setup-uv's cache save runs in a
+  post-job hook, after all main steps, so it uploads the slimmed+restored cache.
+  Keep `prune-cache: false` on setup-uv (its prune is atomic with save, leaving
+  no injection point to restore between them).
+
+runs:
+  using: composite
+  steps:
+    - name: Prune uv cache (safe)
+      shell: bash
+      run: |
+        set -euo pipefail
+        CACHE="$(uv cache dir)"
+        if [[ ! -d "$CACHE" ]]; then
+          echo "No uv cache at '$CACHE'; nothing to prune."
+          exit 0
+        fi
+
+        echo "uv cache before prune: $(du -sh "$CACHE" 2>/dev/null | cut -f1)"
+
+        # Snapshot every source-built wheel (all sdists-vN buckets), preserving
+        # the cache-relative path so we can drop it back exactly where uv looks.
+        # The bucket name is version-suffixed (sdists-v9 today); glob to survive
+        # a bump. Backups go to $RUNNER_TEMP so they land on the same filesystem
+        # (fast cp, no cross-device copy) and are cleaned up with the runner.
+        BK="$(mktemp -d "${RUNNER_TEMP:-/tmp}/uv-src-wheels.XXXXXX")"
+        backed_up=0
+        shopt -s nullglob
+        for sdists in "$CACHE"/sdists-v*/; do
+          while IFS= read -r -d '' whl; do
+            rel="${whl#"$CACHE"/}"
+            mkdir -p "$BK/$(dirname "$rel")"
+            cp -a "$whl" "$BK/$rel"
+            backed_up=$((backed_up + 1))
+          done < <(find "$sdists" -type f -name '*.whl' -print0)
+        done
+        shopt -u nullglob
+        echo "Backed up $backed_up source-built wheel(s)."
+
+        uv cache prune --ci
+
+        # Restore only the source-built wheels that --ci removed. Restoring one
+        # that survived would be a harmless no-op, but the existence check keeps
+        # the log honest about what the bug actually dropped.
+        restored=0
+        while IFS= read -r -d '' bwhl; do
+          rel="${bwhl#"$BK"/}"
+          dest="$CACHE/$rel"
+          if [[ ! -e "$dest" ]]; then
+            mkdir -p "$(dirname "$dest")"
+            cp -a "$bwhl" "$dest"
+            echo "  restored (dropped by --ci): $rel"
+            restored=$((restored + 1))
+          fi
+        done < <(find "$BK" -type f -name '*.whl' -print0)
+        rm -rf "$BK"
+
+        echo "Restored $restored source-built wheel(s) that --ci removed."
+        echo "uv cache after prune:  $(du -sh "$CACHE" 2>/dev/null | cut -f1)"

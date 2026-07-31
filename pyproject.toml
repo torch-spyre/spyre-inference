@@ -54,11 +54,12 @@ local_scheme = "no-local-version"
 default-groups = ["dev"]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs
-# `uv lock`. TODO: add s390x
 required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'linux' and platform_machine == 'ppc64le'",
+    "sys_platform == 'linux' and platform_machine == 's390x'",
 ]
+
 override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
@@ -72,16 +73,16 @@ override-dependencies = [
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "pyarrow; platform_machine not in 's390x, ppc64le'",
+
     # Runtime pin here must match the `uv.extra-build-dependencies.torch-spyre` pin.
     # Compatible with torch-spyre's `~=2.13.0`
-    "torch==2.13.0 ; platform_machine not in 's390x, ppc64le'",
+    "torch==2.13.0",
 
     # setuptools is specified as a runtime dep by vllm, make sure it's patched for CVEs
     "setuptools>=82",
 
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
-
 ]
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency

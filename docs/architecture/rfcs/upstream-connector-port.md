@@ -538,6 +538,21 @@ whose write has been published, and a slot reused mid-copy fails the check and i
 This correctness property is now **owned by the runtime directory** — the plugin holds no host
 pointers, no device addresses, and no lock of its own; it names slots by integer and passes tensors.
 
+**Sequencing and the GIL (per Takeshi review).** The connector composes each transfer as a *sequence*
+of directory operations issued one call at a time through the torch-spyre bindings, under the Python
+GIL — `claim` → D2H `copy_tensor_raw` → `publish` on store, `lookup` → H2D `copy_tensor_raw` on load
+(the generation-checked pin is held inside the runtime for the duration of the copy). The connector
+deliberately holds **no lock across this sequence**, and there is no single combined
+`claim_dma_publish` call: correctness across the span is carried entirely by the runtime's
+`RESERVED` + `generation` + publish gate (the "Torn reads" guarantee above), not by the caller. This
+is what makes the multi-call sequence safe from Python — and it depends on two properties of the layer
+below, called out here so the end-to-end contract is explicit: (1) the runtime never holds its
+directory lock across a DMA (runtime RFC §4.4), so a peer's wait is short and bounded; and (2) the
+torch-spyre bindings **release the GIL** while blocked in the runtime (`lookup`/`claim`/`publish`/
+`evict` and blocking `copy_tensor_raw`), so one instance stalled on a peer's lock never freezes this
+process's Python threads — the vLLM scheduler and other connectors keep running. The connector relies
+on those guarantees; it does not implement them.
+
 **Dependency gating.** M2 is gated on the runtime + torch-spyre surface — `copy_tensor_raw`,
 `SharedHostPool`, and `SharedHostMetadata` — landing. These are **external prerequisites, not present
 in the current pinned build**; §7 and §11 track them. M2 is specified here so the milestone ladder is
@@ -756,6 +771,11 @@ vllm serve <model> --kv-transfer-config '{
       read is consumed — the `SharedHostMetadata` publish gate plus its generation/concurrency check
       means a stale or mid-write slot degrades to a **cache miss, never torn bytes**, under concurrent
       multi-instance load. This is owned by the runtime directory, not the plugin.
+- [ ] Sequencing under the GIL: the connector composes `claim`→D2H→`publish` / `lookup`→H2D across
+      separate binding calls and holds **no** lock across the sequence (no combined `claim_dma_publish`);
+      a directory op or blocking `copy_tensor_raw` that stalls on a peer's lock does **not** block this
+      process's other Python threads — the torch-spyre bindings release the GIL while blocked in the
+      runtime (verified against the torch-spyre surface, runtime RFC §4.4).
 
 **A2.3 — no regression, dependency honesty.**
 

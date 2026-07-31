@@ -29,14 +29,10 @@ logger = init_logger(__name__)
 class SpyreSiluAndMul(SiluAndMul):
     """Out-of-tree (OOT) SiluAndMul implementation for IBM's Spyre device."""
 
-    def __init__(self, *args, **kwargs):
-        """Initialize SpyreSiluAndMul layer."""
-        super().__init__(*args, **kwargs)
-
     def forward_oot(self, x) -> torch.Tensor:
         """SwiGLU: silu(gate) * up, output shape [..., d].
 
-        `x` is either a pre-split gate/up pair (a SplitSiluAndMul from an
+        `x` is either a pre-split gate/up pair (a SplitGateUp from an
         un-fused gate_up_proj, see unfuse.py) or a fused [..., 2*d] tensor.
         The fused path only runs for layers unfuse left alone (e.g. quantized).
         """

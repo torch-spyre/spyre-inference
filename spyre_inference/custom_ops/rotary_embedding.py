@@ -20,7 +20,10 @@ cache is index_select'd on CPU (Spyre has no eager index_select):
 ``_SpyreModelWrapper`` calls ``gather_rotation`` before the model forward, moves
 the gathered slice to Spyre, and stashes it in the vLLM forward context;
 ``forward_oot`` fetches it through the opaque ``spyre_rope_rot`` op (keeping the
-forward-context read out of torch.compile graphs) and applies the rotation.
+forward-context read out of torch.compile graphs) and applies the rotation through
+the opaque ``spyre_rope_rotate`` op. The rotation is kept opaque (its body runs
+eagerly on Spyre) because torch-spyre's compiled lowering of the 2x2 rotation
+corrupts when fused into the full-model graph.
 
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
@@ -168,9 +171,22 @@ class _SpyreRotaryMixin:
             self._rope_key,  # ty: ignore[invalid-argument-type]
             self.head_size,
         )
-        # query/key arrive on Spyre from the QKV projection; rot is primed on Spyre.
-        out_query = _rotate_neox_2x2(query, rot, self.head_size)
-        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
+        # Apply the rotation through the opaque spyre_rope_rotate op so the 2x2
+        # rotation runs eagerly on Spyre.
+        out_query = torch.ops.vllm.spyre_rope_rotate(
+            query,  # ty: ignore[invalid-argument-type]
+            rot,
+            self.head_size,
+        )
+        out_key = (
+            torch.ops.vllm.spyre_rope_rotate(
+                key,  # ty: ignore[invalid-argument-type]
+                rot,
+                self.head_size,
+            )
+            if key is not None
+            else None
+        )
         return out_query, out_key
 
 
@@ -212,6 +228,15 @@ def _rope_rot_op_fake(positions: torch.Tensor, rope_key: str, head_size: int) ->
     )
 
 
+def _rope_rotate_op_func(x: torch.Tensor, rot: torch.Tensor, head_size: int) -> torch.Tensor:
+    """Opaque-op body: apply the 2x2 rotation eagerly on-device."""
+    return _rotate_neox_2x2(x, rot, head_size)
+
+
+def _rope_rotate_op_fake(x: torch.Tensor, rot: torch.Tensor, head_size: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_rope_rot custom op. OOT class replacement happens at import
@@ -222,4 +247,10 @@ def register():
         fake_impl=_rope_rot_op_fake,
         dispatch_key=current_platform.dispatch_key,
     )
-    logger.debug_once("Registered custom op: spyre_rope_rot")
+    direct_register_custom_op(
+        op_name="spyre_rope_rotate",
+        op_func=_rope_rotate_op_func,
+        fake_impl=_rope_rotate_op_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
+    logger.debug_once("Registered custom ops: spyre_rope_rot, spyre_rope_rotate")

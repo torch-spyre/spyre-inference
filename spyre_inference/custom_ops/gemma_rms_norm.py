@@ -15,15 +15,10 @@
 """Spyre OOT replacement for GemmaRMSNorm.
 
 Gemma models (1/2/3) use GemmaRMSNorm for every normalization (input/post-attn/
-pre-post-feedforward layernorms and gemma-3's per-head q_norm/k_norm). The stock
-forward routes through `ir.ops.rms_norm`, whose native implementation promotes to
-float32 (`x.to(torch.float32)`) — unsupported on Spyre, producing NaN/Inf garbage.
-This mirrors SpyreRMSNorm (fp16, no promotion) with Gemma's two differences:
-`x * (1 + w)` instead of `x * w`.
+pre-post-feedforward layernorms and gemma-3's per-head q_norm/k_norm).
 
 References:
     - Upstream GemmaRMSNorm: vllm/model_executor/layers/layernorm.py
-    - SpyreRMSNorm: spyre_inference/custom_ops/rms_norm.py
 """
 
 import torch
@@ -38,11 +33,8 @@ logger = init_logger(__name__)
 class SpyreGemmaRMSNorm(GemmaRMSNorm):
     """Out-of-tree (OOT) GemmaRMSNorm implementation for IBM's Spyre."""
 
-    _dynamic_arg_dims = {"x": [], "residual": []}
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._compiled_forward_spyre = self.maybe_compile(self._forward_spyre_impl)
 
         logger.warning_once(
             "SpyreGemmaRMSNorm: no dtype promotion is performed, "
@@ -54,28 +46,14 @@ class SpyreGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self._compiled_forward_spyre(
-            x,
-            self.variance_epsilon,
-            self.weight.data,
-            residual,
-        )
-
-    @staticmethod
-    def _forward_spyre_impl(
-        x: torch.Tensor,
-        variance_epsilon: float,
-        weight: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """GemmaRMSNorm kernel for Spyre. Compiled separately via maybe_compile."""
         if residual is not None:
             x = x + residual
             residual = x
 
         variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + variance_epsilon)
-        x = x * (1.0 + weight)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        x = x * (1.0 + self.weight.data)
 
         if residual is None:
             return x

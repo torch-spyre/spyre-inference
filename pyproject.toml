@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm>=0.25.1,<0.26",
+    "vllm>=0.26.0,<0.27",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -52,13 +52,17 @@ local_scheme = "no-local-version"
 
 [tool.uv]
 default-groups = ["dev"]
+
+# Declare every platform this lockfile must stay installable on, independent of which host runs
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'ppc64le'",
+    "sys_platform == 'linux' and platform_machine == 's390x'",
+]
+
 override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
-
-    # Test deps that aren't actually required
-    "arctic-inference; sys_platform == 'never'",
-    "perf-analyzer; sys_platform == 'never'",
 
     # Skipping torch-vision temporarily
     # TODO: This will be required in the future for VLM support via vllm
@@ -68,27 +72,17 @@ override-dependencies = [
     "torchaudio; sys_platform == 'never'",
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
-    "vllm ; platform_machine not in 's390x, ppc64le'",
-    "ray; platform_machine not in 's390x, ppc64le'",
-    # uv doesn't resolve numba->llvmlite constraint correctly...
-    #   if numba is updated, this version will likely need to be too
-    "llvmlite==0.47.0; platform_machine not in 's390x, ppc64le'",
     "pyarrow; platform_machine not in 's390x, ppc64le'",
+
     # Runtime pin here must match the `uv.extra-build-dependencies.torch-spyre` pin.
-    # Compatible with torch-spyre's `~=2.12.0`
-    "torch==2.12.1 ; platform_machine not in 's390x, ppc64le'",
-
-    # torch-spyre declares a dependency on numpy>2.3, conflicting with numba needed by vLLM
-    # The range here should match the numba dependency
-    "numpy>=1.24,<2.3",
-
+    # Compatible with torch-spyre's `~=2.13.0`
+    "torch==2.13.0",
 
     # setuptools is specified as a runtime dep by vllm, make sure it's patched for CVEs
     "setuptools>=82",
 
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
-
 ]
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
@@ -102,12 +96,15 @@ extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "-
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.25.1" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "6ea824ef9dc9bc6422fd1c3e32a6d6b55918e265" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "30c708894aee9bd78827919f15401cd08b2e46c9" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
-  { index = "pytorch-cpu" },
+  # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
+  # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
+  { git = "https://github.com/pytorch/pytorch", tag = "v2.13.0", marker = "platform_machine == 'ppc64le'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le'" },
 ]
 torchvision = [
   { index = "pytorch-cpu" },
@@ -120,7 +117,7 @@ members = ["tests/plugin"]
 
 [tool.uv.extra-build-dependencies]
 # Pin the same torch version for building torch-spyre to avoid any ABI drift
-torch-spyre = ["torch==2.12.1"]
+torch-spyre = ["torch==2.13.0"]
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set
@@ -249,7 +246,5 @@ plugins.md007.indent = 4
 
 [dependency-groups]
 dev = [
-    "pytest",
-    "pyyaml",
     "spyre-testing-plugin",
 ]

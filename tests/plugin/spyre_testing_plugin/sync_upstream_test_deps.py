@@ -13,9 +13,19 @@
 # limitations under the License.
 
 """
-Sync upstream test dependencies with vLLM test dependencies.
+Sync the plugin's upstream vLLM test dependencies.
 
-Run this whenever the vLLM version is updated to keep test dependencies in sync.
+Run this whenever the vLLM version is updated. Unlike a wholesale mirror of
+vLLM's `requirements/test/cuda.in`, this enforces a curated ALLOW_LIST: only
+deps that (a) a test we collect/run actually needs AND (b) vLLM's own runtime
+closure does not already provide. Everything else in cuda.in is intentionally
+omitted (see issue #447). The `[project].dependencies` array is regenerated
+from the allow-list on every run, so it must not be hand-edited — add names to
+ALLOW_LIST below and re-run instead. Versions and extras are taken verbatim
+from cuda.in; platform markers come from the allow-list value.
+
+After running, review the diff, then `uv lock` (from the workspace root) to
+refresh the lockfile with any new versions.
 
 Usage:
     python -m spyre_testing_plugin.sync_upstream_test_deps
@@ -30,250 +40,308 @@ import tomllib
 import urllib.error
 import urllib.request
 from pathlib import Path
+
 from spyre_testing_plugin import pytest_plugin
 
 # Plugin package root - syncs the plugin's pyproject.toml
 PLUGIN_ROOT = Path(__file__).parent.parent
 PYPROJECT_PATH = PLUGIN_ROOT / "pyproject.toml"
+ROOT_PYPROJECT = PLUGIN_ROOT.parent.parent / "pyproject.toml"
 
-# Libraries to exclude from upstream test dependencies.
-# torchcodec: ST ≥5 imports it for A/V; Spyre CI is CPU-only (no libnvrtc).
-# Text-only SentenceTransformer HF compare uses a stub in pytest_plugin instead.
-FILTERED_LIBRARIES = {"terratorch", "transformers", "torchcodec"}
+# Curated allow-list: upstream test deps we actually need that vLLM's runtime
+# closure does not already provide. The value is an optional PEP 508 environment
+# marker (platform gating etc.); None means unconditional. Names must match a
+# package in cuda.in — the version and extras are pulled from there.
+#
+# To add a dep: confirm a test we collect/run needs it AND that it is not
+# already in vLLM's runtime closure (`uv export --no-dev` from the root), then
+# add its name here. The sync run reports both checks for any cuda.in dep not
+# yet listed.
+ALLOW_LIST: dict[str, str | None] = {
+    "buildkite-test-collector": None,
+    # ppl_utils.py (imported by the collected test_qwen.py, even while its test
+    # is skipped) does a module-level `from datasets import load_dataset`, so
+    # collection fails without it. Pulls pyarrow+pandas — heavy on ppc64le.
+    "datasets": None,
+    "pytest-asyncio": None,
+    "pytest-cov": None,
+    "pytest-forked": None,
+    "pytest-rerunfailures": None,
+    "pytest-shard": None,
+    "pytest-timeout": None,
+    "sentence-transformers": None,
+    "tblib": None,
+}
+
+# Base deps always present regardless of upstream; not part of the sync.
+BASE_DEPS = {"pytest", "pyyaml"}
+
+# cuda.in deps we have reviewed and deliberately do NOT take, so the sync report
+# can flag only genuinely-new upstream additions. These back model families,
+# eval harnesses, and tooling that none of the tests we collect/run exercise.
+EXCLUDED = {
+    # Vision-model test deps
+    "albumentations",
+    "decord",
+    "imagehash",
+    "instanttensor",
+    "open-clip-torch",
+    "perceptron",
+    "segmentation-models-pytorch",
+    "timm",
+    # Audio-model test deps
+    "av",  # audio_in_video decode; no collected/run test uses it
+    "soundfile",  # audio / speech-to-text tests; no collected/run test uses it
+    "kaldi-native-fbank",
+    "librosa",
+    "transformers-stream-generator",
+    "vector-quantize-pytorch",
+    "vocos",
+    # A/V decode: SentenceTransformer>=5 imports torchcodec; Spyre CI is CPU-only
+    "torchcodec",
+    "terratorch",
+    # Eval harnesses / metrics
+    "jiwer",
+    "lm-eval",
+    "mteb",
+    "num2words",
+    # Quantization / alternate model backends
+    "bitsandbytes",
+    "arctic-inference",
+    "cohere-melody",
+    "gpt-oss",
+    "peft",
+    # torch extras excluded elsewhere (torchaudio/torchvision via the root
+    # override; numba/ray are pure test deps for paths we don't run)
+    "numba",
+    "ray",
+    "torchaudio",
+    "torchvision",
+    # Alternate model-loader / weight-format test deps (each pulls native
+    # wheels painful on ppc64le); only their own *_loader tests use them, none
+    # of which we collect.
+    "runai-model-streamer",  # runai_streamer load format
+    "tensorizer",  # tensorizer load format
+    "fastsafetensors",  # fastsafetensors load format
+    # Entrypoints / OpenAI-server test deps (no entrypoints test collected)
+    "grpcio-reflection",  # grpc server reflection
+    "schemathesis",  # openai schema fuzz test
+    # Misc tooling not exercised by our tests
+    "backoff",
+    "blobfile",
+    "datamodel-code-generator",
+    "genai-perf",
+    "matplotlib",
+    "openpyxl",
+    "plotly",
+    "pqdm",
+    "tritonclient",
+}
+
+# Header emitted inside the generated dependencies array.
+_GENERATED_HEADER = (
+    "    # Net-new upstream vLLM test deps — GENERATED by sync_upstream_test_deps\n"
+    "    # from ALLOW_LIST. Do not hand-edit; edit the allow-list and re-run.\n"
+    "    # Versions/extras track vLLM cuda.in.\n"
+)
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
 
 
 def extract_vllm_commit(pyproject_path: Path) -> str:
-    """
-    Extract the vLLM git commit/tag from pyproject.toml.
-
-    Returns the commit hash or tag specified in [tool.uv.sources].
-    """
+    """Extract the vLLM git commit/tag from [tool.uv.sources] in pyproject.toml."""
     with open(pyproject_path, "rb") as f:
         data = tomllib.load(f)
 
     try:
         vllm_source = data["tool"]["uv"]["sources"]["vllm"]
-
-        # Handle both single source and list of sources
-        if isinstance(vllm_source, list):
-            for source in vllm_source:
-                if isinstance(source, dict) and "git" in source and "rev" in source:
-                    return source["rev"]
-            raise ValueError("No git source with rev found in vllm sources list")
-        elif isinstance(vllm_source, dict):
-            if "git" in vllm_source and "rev" in vllm_source:
-                return vllm_source["rev"]
-            raise ValueError("vLLM source does not have both 'git' and 'rev' fields")
-        else:
-            raise ValueError(f"Unexpected vllm source type: {type(vllm_source)}")
-
+        sources = vllm_source if isinstance(vllm_source, list) else [vllm_source]
+        for source in sources:
+            if isinstance(source, dict) and "git" in source and "rev" in source:
+                return source["rev"]
+        raise ValueError("No git source with 'rev' found in vllm sources")
     except KeyError as e:
         raise ValueError(
-            f"Could not find vLLM git rev in pyproject.toml [tool.uv.sources]: missing key {e}"
+            f"Could not find vLLM git rev in {pyproject_path} [tool.uv.sources]: missing {e}"
         ) from e
 
 
 def download_test_requirements(commit: str, cache_dir: Path) -> Path:
-    """
-    Download the test.in file from vLLM repository at the specified commit.
-
-    Returns the path to the downloaded file.
-    """
+    """Download cuda.in from the vLLM repository at the given commit."""
     url = f"https://raw.githubusercontent.com/vllm-project/vllm/{commit}/requirements/test/cuda.in"
-    cache_file = cache_dir / f"vllm-{commit[:8]}-test.in"
+    cache_file = cache_dir / f"vllm-{commit[:8]}-cuda.in"
 
     print(f"Downloading test requirements from vLLM commit {commit[:8]}...")
-
     try:
         with urllib.request.urlopen(url) as response:
-            content = response.read()
-
-        with open(cache_file, "wb") as f:
-            f.write(content)
-
-        print(f"Downloaded to: {cache_file}")
-        return cache_file
-
+            cache_file.write_bytes(response.read())
     except urllib.error.HTTPError as e:
         raise RuntimeError(
-            f"Failed to download test.in from vLLM commit {commit}: {e}\n"
-            f"URL: {url}\n"
-            "Please verify the commit exists in the vLLM repository."
+            f"Failed to download cuda.in from vLLM commit {commit}: {e}\nURL: {url}"
         ) from e
 
+    print(f"Downloaded to: {cache_file}")
+    return cache_file
 
-def filter_requirements(test_in: Path, filtered_libs: set[str]) -> Path:
+
+def parse_requirements(path: Path) -> dict[str, tuple[str, str | None]]:
     """
-    Filter out specified libraries from the requirements file.
+    Parse a pip-style requirements file.
 
-    Returns path to the filtered requirements file.
+    Returns {normalized_name: (spec, inline_comment)} where `spec` is the
+    name+extras+version as declared upstream (any environment marker stripped,
+    since we overlay our own) and `inline_comment` is upstream's trailing
+    ``# ...`` note if any.
     """
-    with open(test_in) as f:
-        lines = f.readlines()
-
-    filtered_lines = []
-    for line in lines:
-        # Skip empty lines and comments
-        if not line.strip() or line.strip().startswith("#"):
-            filtered_lines.append(line)
+    reqs: dict[str, tuple[str, str | None]] = {}
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        # Skip blanks, comments, and `-r`/`-c` includes. The only include here is
+        # `-r ../common.txt` (vLLM's runtime/common deps) — those are already
+        # provided by the installed vllm package, so we never allow-list them; the
+        # runtime-closure check confirms membership independently.
+        if not line or line.startswith(("#", "-")):
             continue
-
-        # Extract package name (handle various formats: pkg, pkg==ver, pkg>=ver, etc.)
-        pkg_name = re.split(r"[=<>!~\[]", line.strip())[0].strip()
-
-        # Keep line if package is not in filtered list
-        if pkg_name.lower() not in {lib.lower() for lib in filtered_libs}:
-            filtered_lines.append(line)
-
-    # Write filtered content to new file
-    filtered_path = test_in.parent / f"{test_in.stem}-filtered{test_in.suffix}"
-    with open(filtered_path, "w") as f:
-        f.writelines(filtered_lines)
-
-    return filtered_path
-
-
-def clear_dependencies(pyproject_path: Path) -> None:
-    """
-    Clear the [project].dependencies section, keeping only pytest and pyyaml.
-    """
-    with open(pyproject_path) as f:
-        lines = f.readlines()
-
-    result, inside, depth = [], False, 0
-    for i, line in enumerate(lines):
-        # Detect start of dependencies array
-        if not inside and re.match(r"^dependencies\s*=\s*\[", line):
-            inside = True
-            depth = line.count("[") - line.count("]")
-            # Start fresh dependencies with minimal base
-            result.append('dependencies = [\n    "pytest",\n    "pyyaml",\n')
-            if depth <= 0 and "]" in line:
-                # Single-line array, skip to end
-                inside = False
+        spec, _, comment = line.partition("#")
+        spec = spec.split(";", 1)[0].strip()
+        if not spec:
             continue
-        if inside:
-            depth += line.count("[") - line.count("]")
-            if depth <= 0:
-                inside = False
-                # Close the array
-                result.append("]\n")
+        name = re.split(r"[<>=!~\[ ]", spec, maxsplit=1)[0]
+        reqs[_norm(name)] = (spec, comment.strip() or None)
+    return reqs
+
+
+def runtime_closure(root_dir: Path) -> set[str]:
+    """Package names in vLLM's non-dev runtime closure, from the current lock.
+
+    Best-effort: returns an empty set if the export fails, in which case the
+    report simply omits the "already provided by runtime" annotation.
+    """
+    result = subprocess.run(
+        ["uv", "export", "--no-dev", "--frozen", "--no-hashes", "--no-emit-project"],
+        cwd=root_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print("Warning: `uv export --no-dev` failed; skipping runtime-closure report.")
+        return set()
+    names = set()
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "-")):
             continue
-        result.append(line)
-
-    with open(pyproject_path, "w") as f:
-        f.writelines(result)
+        names.add(_norm(re.split(r"[<>=!~\[ ;]", line, maxsplit=1)[0]))
+    return names
 
 
-def reorder_dependencies(pyproject_path: Path) -> None:
+def build_dependency_lines(
+    upstream: dict[str, tuple[str, str | None]],
+) -> tuple[list[str], list[str]]:
+    """Generate the pyproject dependency lines for the allow-list.
+
+    Returns (lines, missing) where `missing` are allow-list names absent from cuda.in.
     """
-    Reorder dependencies so pytest and pyyaml come first, followed by a comment
-    separating them from the upstream vLLM test dependencies.
-    """
-    with open(pyproject_path) as f:
-        content = f.read()
+    lines, missing = [], []
+    for name in sorted(ALLOW_LIST):
+        if name not in upstream:
+            missing.append(name)
+            continue
+        spec, comment = upstream[name]
+        marker = ALLOW_LIST[name]
+        entry = f"{spec} ; {marker}" if marker else spec
+        line = f'    "{entry}",'
+        if comment:
+            line += f"  # {comment}"
+        lines.append(line)
+    return lines, missing
 
-    # Extract the dependencies array
-    match = re.search(r"^(dependencies\s*=\s*\[)\s*\n(.*?)(^\])", content, re.MULTILINE | re.DOTALL)
-    if not match:
-        return
 
-    prefix = match.group(1)
-    body = match.group(2)
-    suffix = match.group(3)
+def write_dependencies(pyproject_path: Path, dep_lines: list[str]) -> None:
+    """Regenerate the [project].dependencies array in place."""
+    content = pyproject_path.read_text()
+    block = (
+        "dependencies = [\n"
+        '    "pytest",\n'
+        '    "pyyaml",\n'
+        f"{_GENERATED_HEADER}"
+        f"{chr(10).join(dep_lines)}\n"
+        "]"
+    )
+    new_content, n = re.subn(r"(?ms)^dependencies\s*=\s*\[.*?^\]", block, content, count=1)
+    if n != 1:
+        raise ValueError(f"Could not locate a [project].dependencies array in {pyproject_path}")
+    pyproject_path.write_text(new_content)
 
-    # Parse individual dependency lines (ignore comments)
-    deps = []
-    for line in body.strip().splitlines():
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            deps.append(stripped.rstrip(","))
 
-    # Separate our deps from upstream deps
-    our_deps = []
-    upstream_deps = []
-    for dep in deps:
-        # Remove quotes for comparison
-        name = dep.strip('"').split("[")[0].split("=")[0].split(">")[0].split("<")[0].split("!")[0]
-        if name in ("pytest", "pyyaml"):
-            our_deps.append(dep)
+def report_unlisted(upstream: dict[str, tuple[str, str | None]], runtime: set[str]) -> None:
+    """Report cuda.in deps not in the allow-list, classified for review."""
+    already, excluded, new = [], [], []
+    for name in sorted(upstream):
+        if name in ALLOW_LIST or name in BASE_DEPS:
+            continue
+        if name in EXCLUDED:
+            excluded.append(name)
+        elif name in runtime:
+            already.append(name)
         else:
-            upstream_deps.append(dep)
+            new.append(name)
 
-    # Rebuild the dependencies section
-    lines = [f"{prefix}\n"]
-    for dep in our_deps:
-        lines.append(f"    {dep},\n")
-    lines.append("    # upstream vLLM test dependencies: see sync_upstream_test_deps\n")
-    for dep in upstream_deps:
-        lines.append(f"    {dep},\n")
-    lines.append(f"{suffix}\n")
-
-    new_section = "".join(lines)
-    new_content = content[: match.start()] + new_section + content[match.end() + 1 :]
-
-    with open(pyproject_path, "w") as f:
-        f.write(new_content)
+    print(f"\ncuda.in deps not in the allow-list ({len(already) + len(excluded) + len(new)}):")
+    print(f"  already provided by vLLM runtime ({len(already)}): {', '.join(already) or '-'}")
+    print(f"  excluded by policy ({len(excluded)}): {', '.join(excluded) or '-'}")
+    if new:
+        print(f"  NEW — review whether any collected/run test needs these ({len(new)}):")
+        for name in new:
+            print(f"      {name}")
+    else:
+        print("  NEW: none")
 
 
 def main():
     if len(sys.argv) > 1:
         print("Usage: python -m spyre_testing_plugin.sync_upstream_test_deps", file=sys.stderr)
         return 1
-
     if not PYPROJECT_PATH.exists():
         print(f"Error: {PYPROJECT_PATH} not found", file=sys.stderr)
         return 1
+    if not ROOT_PYPROJECT.exists():
+        print(f"Error: root pyproject.toml not found at {ROOT_PYPROJECT}", file=sys.stderr)
+        return 1
 
     try:
-        # Extract vLLM commit from the ROOT pyproject.toml (workspace root)
-        root_pyproject = PLUGIN_ROOT.parent.parent / "pyproject.toml"
-        if not root_pyproject.exists():
-            print(f"Error: Root pyproject.toml not found at {root_pyproject}", file=sys.stderr)
-            return 1
-
-        vllm_commit = extract_vllm_commit(root_pyproject)
+        vllm_commit = extract_vllm_commit(ROOT_PYPROJECT)
         print(f"Found vLLM commit: {vllm_commit}")
 
-        # Create cache directory for downloaded files
         cache_dir = pytest_plugin._cache_root() / ".cache"
         cache_dir.mkdir(exist_ok=True)
+        cuda_in = download_test_requirements(vllm_commit, cache_dir)
 
-        # Download test.in from the vLLM repository
-        test_in = download_test_requirements(vllm_commit, cache_dir)
+        upstream = parse_requirements(cuda_in)
 
-        # Filter out excluded libraries
-        if FILTERED_LIBRARIES:
-            print(f"Filtering out libraries: {', '.join(FILTERED_LIBRARIES)}")
-            test_in = filter_requirements(test_in, FILTERED_LIBRARIES)
-
-        # Clear existing upstream-tests section
-        print("Clearing existing dependencies...")
-        clear_dependencies(PYPROJECT_PATH)
-
-        # Add dependencies using uv
-        print(f"Adding dependencies from {test_in}...")
-        result = subprocess.run(
-            ["uv", "add", "--no-sync", "-r", test_in],
-            cwd=PLUGIN_ROOT,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        if result.returncode != 0:
+        dep_lines, missing = build_dependency_lines(upstream)
+        if missing:
             print(
-                f"Error: uv command failed with exit code {result.returncode}",
+                "Error: these ALLOW_LIST names are no longer in vLLM cuda.in — "
+                f"reconcile the allow-list: {', '.join(missing)}",
                 file=sys.stderr,
             )
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
             return 1
 
-        # Reorder so pytest/pyyaml come first with a separator comment
-        reorder_dependencies(PYPROJECT_PATH)
+        # Read the runtime closure before rewriting the plugin pyproject: the
+        # frozen `uv export` needs the lock to still match on-disk pyprojects
+        # (true right after the `uv sync` that precedes this script). Rewriting
+        # first would stale the lock and collapse the runtime bucket.
+        runtime = runtime_closure(ROOT_PYPROJECT.parent)
 
-        print("Done.")
-        print("Review changes to tests/plugin/pyproject.toml before committing.")
+        write_dependencies(PYPROJECT_PATH, dep_lines)
+        print(f"Regenerated {len(dep_lines)} allow-listed deps in {PYPROJECT_PATH.name}.")
+
+        report_unlisted(upstream, runtime)
+
+        print("\nDone. Review the diff, then run `uv lock` from the workspace root.")
         return 0
 
     except Exception as e:

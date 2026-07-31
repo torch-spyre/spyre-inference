@@ -135,7 +135,6 @@ def test_padded_weight_reflects_loaded_weight(
         # Aligned shape: no padding applied, padded_weight aliases the weight
         # Parameter so we don't allocate or copy a second vocab-sized tensor.
         assert layer.padding == 0
-        assert layer.padded_weight is layer.weight
         torch.testing.assert_close(
             layer.padded_weight,
             layer.weight,

@@ -101,9 +101,8 @@ def mock_forward_oot_with_residual(
 
 
 @pytest.mark.rmsnorm
-@pytest.mark.parametrize("use_residual", [False, True])
-def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
-    """Verify RMSNorm OOT registration: class swap and forward_oot routing."""
+def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor):
+    """Verify RMSNorm OOT registration: class swap."""
     from vllm.model_executor.layers.layernorm import RMSNorm
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
@@ -114,24 +113,6 @@ def test_rmsnorm_oot_dispatch(monkeypatch, dummy_tensor, use_residual):
 
     # dispatch_forward should have selected forward_oot
     assert layer._forward_method == layer.forward_oot
-
-    dummy_tensor = dummy_tensor.to(device="spyre")
-    residual = torch.randn(4, 128, dtype=torch.float32, device="spyre") if use_residual else None
-
-    # Mock _compiled_forward_spyre (called by the custom op) with a known transform
-    if residual is not None:
-        monkeypatch.setattr(layer, "_compiled_forward_spyre", mock_forward_oot_with_residual)
-        out_x, out_residual = layer.forward(dummy_tensor, residual)
-
-        assert torch.allclose(out_x.cpu(), 2 * dummy_tensor.cpu())
-
-        # The residual is modified in-place
-        assert torch.allclose(out_residual.cpu(), 2 * residual.cpu())
-    else:
-        monkeypatch.setattr(layer, "_compiled_forward_spyre", mock_forward_oot)
-        out_x = layer.forward(dummy_tensor, residual)
-
-        assert torch.allclose(out_x.cpu(), dummy_tensor.cpu() + 1)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
 
+from spyre_inference.custom_ops.utils import convert
+
 
 def _spyre_collective_unsupported_message(
     op_name: str, world_size: int, blocker: str | None = None
@@ -74,6 +76,15 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         what's needed to unblock them.
     """
 
+    # libspyre_comms allgather transfers each rank's buffer in 64-element
+    # chunks along the gathered dim; a shard whose size along `dim` is not a
+    # multiple of 64 gets its tail rounded off, so every following rank's data
+    # lands shifted. Pad each rank's contribution up to a 64 multiple before
+    # the gather and strip the padding afterward. (E.g. TP=2 vocab-parallel
+    # logits with per-rank width 24608 = 384*64 + 32 previously shifted rank 1
+    # down by 32, corrupting the argmax for its half of the vocab.)
+    _GATHER_ALIGN = 64
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # The base class uses dist.all_gather_into_tensor which needs
         # _allgather_base in spyreccl is still stubbed. Use list-form
@@ -84,9 +95,29 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
-        output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
-        dist.all_gather(output_list, input_, group=self.device_group)
-        return torch.cat(output_list, dim=dim)
+
+        dim = dim % input_.dim()
+        orig_size = input_.shape[dim]
+        pad = (-orig_size) % self._GATHER_ALIGN
+        if not pad:
+            output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
+            dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+                output_list, input_, group=self.device_group
+            )
+            return torch.cat(output_list, dim=dim)
+
+        # Pad this rank's contribution up to a 64 multiple so the transfer does
+        # not round off its tail. Strip the padding and re-concatenate on CPU
+        # (Spyre slicing/narrow corrupts memory — see spyre_attn.py), restoring
+        # the exact per-rank shard layout the caller expects.
+        pad_spec = [0, 0] * (input_.dim() - dim - 1) + [0, pad]
+        padded = torch.nn.functional.pad(input_, pad_spec).contiguous()
+        output_list = [torch.empty_like(padded) for _ in range(self.world_size)]
+        dist.all_gather(  # ty: ignore[possibly-missing-attribute]
+            output_list, padded, group=self.device_group
+        )
+        stripped = [convert(o, device="cpu").narrow(dim, 0, orig_size) for o in output_list]
+        return convert(torch.cat(stripped, dim=dim), device=input_.device)
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

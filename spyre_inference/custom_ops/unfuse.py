@@ -22,10 +22,10 @@ pass splits the fused weight into contiguous Parameters at load time
 Each un-fused forward returns a `SplitProjection` holding the pre-split parts.
 The subclass matches its downstream consumer:
 
-  * SplitQKV        (QKVParallelLinear): mimics `Tensor.split`/`.chunk`, so the
+  * SplitQKV     (QKVParallelLinear): mimics `Tensor.split`/`.chunk`, so the
     unmodified attention idiom `q, k, v = qkv.split(...)` keeps working.
-  * SplitSiluAndMul (MergedColumnParallelLinear feeding SiluAndMul): iterable,
-    so `gate, up = proj` unpacks the two parts for SpyreSiluAndMul.
+  * SplitGateUp  (MergedColumnParallelLinear feeding a gated MLP): iterable, so
+    `gate, up = proj` unpacks the two parts for SpyreSiluAndMul / SpyreGeluAndMul.
 """
 
 import types
@@ -43,7 +43,11 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
+from .gelu_and_mul import SpyreGeluAndMul
 from .silu_and_mul import SpyreSiluAndMul
+
+# Gated-MLP activations whose sibling gate_up_proj should be un-fused.
+_GATED_MLP_ACTIVATIONS = (SpyreSiluAndMul, SpyreGeluAndMul)
 
 logger = init_logger(__name__)
 
@@ -84,8 +88,8 @@ class SplitQKV(SplitProjection):
         return q, k, v
 
 
-class SplitSiluAndMul(SplitProjection):
-    """Gate/up parts, unpackable as `gate, up = proj` by SpyreSiluAndMul."""
+class SplitGateUp(SplitProjection):
+    """Gate/up parts, unpackable as `gate, up = proj` by a gated-MLP activation."""
 
     __slots__ = ()
 
@@ -179,33 +183,27 @@ def _unfuse_qkv(module: QKVParallelLinear) -> None:
     module.forward = types.MethodType(_qkv_forward, module)  # ty: ignore[invalid-assignment]
 
 
-def _silu_and_mul_forward(self, x: torch.Tensor):
-    """Rebound MergedColumnParallelLinear.forward -> SplitSiluAndMul (+ optional bias)."""
+def _gate_up_forward(self, x: torch.Tensor):
+    """Rebound MergedColumnParallelLinear.forward -> SplitGateUp (+ optional bias)."""
     fold_bias = not self.skip_bias_add
     gate = F.linear(x, self.gate_weight.data, _bias_data(self, "gate_bias") if fold_bias else None)
     up = F.linear(x, self.up_weight.data, _bias_data(self, "up_bias") if fold_bias else None)
-    return _split_forward(SplitSiluAndMul(gate, up), self, ["gate", "up"])
+    return _split_forward(SplitGateUp(gate, up), self, ["gate", "up"])
 
 
-def _unfuse_silu_and_mul(module: MergedColumnParallelLinear) -> None:
+def _unfuse_gate_up(module: MergedColumnParallelLinear) -> None:
     """Split a gate_up_proj weight into gate/up Parameters, rebind forward."""
     _assert_cpu(module, "gate_up_proj")
     sizes = list(module.output_partition_sizes)  # per-rank, TP-correct
     _split_into_params(module, ["gate", "up"], sizes)
     module.forward = types.MethodType(  # ty: ignore[invalid-assignment]
-        _silu_and_mul_forward, module
+        _gate_up_forward, module
     )
 
 
-def _gate_up_sibling(act_fn: nn.Module, parent_of: dict[int, nn.Module]):
-    """The gate_up_proj MergedColumnParallelLinear feeding `act_fn`, if any."""
-    parent = parent_of.get(id(act_fn))
-    if parent is None:
-        return None
-    for child in parent.children():
-        if isinstance(child, MergedColumnParallelLinear) and len(child.output_partition_sizes) == 2:
-            return child
-    return None
+def _feeds_gated_mlp(gate_up: nn.Module, parent: nn.Module) -> bool:
+    """True if `gate_up`'s sibling activation is a gated-MLP op we handle."""
+    return any(isinstance(child, _GATED_MLP_ACTIVATIONS) for child in parent.children())
 
 
 def analyze_and_unfuse(model: nn.Module) -> None:
@@ -213,9 +211,9 @@ def analyze_and_unfuse(model: nn.Module) -> None:
 
     Cases currently handled:
       * QKV: every unquantized QKVParallelLinear is un-fused.
-      * SiluAndMul: driven from each SpyreSiluAndMul activation, un-fusing its
-        sibling gate_up_proj — the only projection with a part-consuming
-        consumer.
+      * Gated MLP: every 2-way gate_up_proj whose sibling activation is a
+        gated-MLP op (SpyreSiluAndMul / SpyreGeluAndMul) is un-fused.
+
     """
     parent_of = {id(model): model}
     for parent in model.modules():
@@ -223,21 +221,25 @@ def analyze_and_unfuse(model: nn.Module) -> None:
             parent_of[id(child)] = parent
 
     n_qkv = 0
-    n_silu_and_mul = 0
+    n_gate_up = 0
     for module in model.modules():
         # QKV projections.
         if isinstance(module, QKVParallelLinear) and _unfusable(module):
             _unfuse_qkv(module)
             n_qkv += 1
-        # Gate/up projections feeding SiluAndMul.
-        if isinstance(module, SpyreSiluAndMul):
-            gate_up = _gate_up_sibling(module, parent_of)
-            if gate_up is not None and _unfusable(gate_up):
-                _unfuse_silu_and_mul(gate_up)
-                n_silu_and_mul += 1
+        # Gate/up projections feeding a gated-MLP activation.
+        if (
+            isinstance(module, MergedColumnParallelLinear)
+            and len(module.output_partition_sizes) == 2
+            and _unfusable(module)
+        ):
+            parent = parent_of.get(id(module))
+            if parent is not None and _feeds_gated_mlp(module, parent):
+                _unfuse_gate_up(module)
+                n_gate_up += 1
 
     logger.debug(
         "Spyre weight-unfusing: unfused %d QKV and %d gate/up projections.",
         n_qkv,
-        n_silu_and_mul,
+        n_gate_up,
     )

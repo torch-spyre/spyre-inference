@@ -32,7 +32,7 @@ def test_merged_column_matches_reference(
     matches the fused upstream F.linear.
 
     The model-agnostic pass (analyze_and_unfuse) splits the fused weight on
-    CPU and rebinds forward to return the two parts as a SplitSiluAndMul; a
+    CPU and rebinds forward to return the two parts as a SplitGateUp; a
     MergedColumnParallelLinear is only un-fused when it has a SiluAndMul
     sibling, so we wrap it in a minimal MLP parent.
     """
@@ -40,7 +40,7 @@ def test_merged_column_matches_reference(
 
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
-    from spyre_inference.custom_ops.unfuse import SplitSiluAndMul, analyze_and_unfuse
+    from spyre_inference.custom_ops.unfuse import SplitGateUp, analyze_and_unfuse
 
     dtype = torch.float16
     torch.manual_seed(0)
@@ -81,7 +81,7 @@ def test_merged_column_matches_reference(
     mlp = mlp.to("spyre")
     gate_up, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(gate_up, SplitSiluAndMul)
+    assert isinstance(gate_up, SplitGateUp)
     gate, up = gate_up
     actual = torch.cat([gate, up], dim=-1)
     assert actual.shape == (num_tokens, 2 * intermediate_size)

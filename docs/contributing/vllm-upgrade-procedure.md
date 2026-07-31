@@ -75,12 +75,33 @@ vLLM builds from source on every platform (~4–5 minutes with the empty backend
 ```bash
 uv sync --group dev
 uv run --no-sync sync-upstream-test-deps
-uv sync --group dev    # picks up changes the sync script wrote into tests/plugin/pyproject.toml
+uv lock                # sync-upstream-test-deps only rewrites tests/plugin/pyproject.toml
+uv sync --group dev    # picks up the regenerated allow-list
 ```
 
-`sync-upstream-test-deps` rewrites `tests/plugin/pyproject.toml` with the dependency list pulled from `vllm/requirements/test.in` at the new rev (filters out forbidden packages like `terratorch`). Check the diff — large changes are normal across a minor-version bump (lm-eval, mistral-common, fastsafetensors versions move; arctic-inference / instanttensor pick up `; platform_machine == 'x86_64'` markers when upstream gates them).
+`sync-upstream-test-deps` does **not** mirror upstream's test requirements. It enforces a curated allow-list and regenerates the `[project].dependencies` array in `tests/plugin/pyproject.toml` from it. The allow-list (and a reviewed `EXCLUDED` set) live in the script itself — `tests/plugin/spyre_testing_plugin/sync_upstream_test_deps.py`. The rule the allow-list encodes: only declare an upstream test dep here if **(a)** a test we actually collect/run needs it **and (b)** it is not already in vLLM's own runtime closure. The generated array is machine-owned — **do not hand-edit it**; change `ALLOW_LIST`/`EXCLUDED` and re-run.
 
-If `uv sync` fails with a dependency conflict that wasn't there before, the override list in `pyproject.toml > [tool.uv] > override-dependencies` may need to grow. Don't add overrides speculatively — only if a real conflict appears.
+The script pulls each allowed dep's version and extras verbatim from vLLM's `requirements/test/cuda.in` at the new rev, overlays any platform marker from the allow-list value (e.g. `runai-model-streamer ... ; platform_machine == 'x86_64'`), and fails (RC=1) if an `ALLOW_LIST` name has disappeared from `cuda.in` — reconcile the allow-list if so.
+
+**Triage the sync report.** It classifies every `cuda.in` dep *not* in the allow-list into three buckets:
+
+- **already provided by vLLM runtime** — deps present in `uv export --no-dev` (torch, tokenizers, transformers, …). This is the automated runtime audit: it proves we aren't re-declaring what installing vLLM already gives us. Nothing to do.
+- **excluded by policy** — the reviewed-and-rejected set in `EXCLUDED` (model-family/eval/tooling deps no collected test exercises). Nothing to do.
+- **NEW** — a cuda.in dep this repo has never classified. **This is the only bucket that needs action.** For each, decide:
+    - Does a test we collect or run import/need it, and is it *absent* from the runtime bucket? → add its normalized name to `ALLOW_LIST` (with a marker value if upstream gates it by platform), re-run the sync.
+    - Otherwise → add it to `EXCLUDED` so future runs stay quiet.
+
+  A clean bump shows `NEW: none`. Confirm allow-list sufficiency after `uv sync` with a collect-only pass (no Spyre hardware needed):
+
+  ```bash
+  uv run --no-sync pytest --collect-only -q -p no:cacheprovider -m "upstream"
+  ```
+
+  A missing dep surfaces here as a collect-time `ImportError` naming the exact package — add that one dep and re-run. RC=0 with the expected test count means the allow-list covers collection.
+
+  **Collection sufficiency is not runtime sufficiency.** A collect-only pass only proves the deps imported *at import time* are present. A `mandatory_pass` test can still need a dep that is imported lazily inside a fixture or test body — e.g. the pooling embedding tests build an HF reference via `hf_runner(model, is_sentence_transformer=True)`, which imports `sentence-transformers` only when the test actually runs (on Spyre hardware). Those deps pass collection while absent and then fail the run, so any allow-list entry justified by "a test we run needs it" (rather than collection) must be reasoned about separately — clarify with an inline comment on the `ALLOW_LIST` entry.
+
+If `uv sync` fails with a dependency conflict that wasn't there before, the override list in `pyproject.toml > [tool.uv] > override-dependencies` may need to grow. Don't add overrides speculatively — only if a real conflict appears. Note that test-only exclusions belong in the plugin's allow-list (omit the name), **not** in these root overrides — the overrides are reserved for deps that would otherwise be pulled in transitively.
 
 If the lock file needs to be deleted and regenerated from scratch (e.g. after a messy merge conflict resolution), `uv lock` alone will fail because building `torch-spyre` metadata requires `SPYRE_COMMS_INSTALL_DIR`. Use `USE_SPYRE_CCL=0 uv lock` instead — that env var skips the multi-Spyre comm library requirement and lets uv resolve without a real Spyre build environment.
 
@@ -176,7 +197,7 @@ Five files typically change for a vLLM bump:
 
 1. `pyproject.toml` — two things: the `rev` in the `[tool.uv.sources]` vllm entry, and the `vllm>=X.Y.Z,<X.(Y+1)` constraint in `[project] dependencies`.
 2. `uv.lock` — auto-regenerated by `uv sync`. Don't hand-edit.
-3. `tests/plugin/pyproject.toml` — auto-regenerated by `sync-upstream-test-deps`. Review the diff but don't hand-edit.
+3. `tests/plugin/pyproject.toml` — auto-regenerated by `sync-upstream-test-deps` from the allow-list. Review the diff but don't hand-edit; to add or drop a dep, edit `ALLOW_LIST`/`EXCLUDED` in `sync_upstream_test_deps.py` and re-run. The allow-list edit itself is the fourth file that may change on a bump.
 4. `spyre_inference/v1/worker/spyre_worker.py` (sometimes) or `spyre_inference/platform.py` — surgical overrides for new upstream wrappers.
 5. `tests/plugin/spyre_testing_plugin/pytest_plugin.py` (sometimes) — fixture updates for upstream test-infra churn.
 

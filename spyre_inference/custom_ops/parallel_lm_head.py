@@ -31,7 +31,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -63,7 +62,9 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
                 layer.padded_weight.shape[0],
             )
         else:
-            layer.padded_weight = layer.weight
+            # Clone → INDEPENDENT storage from `weight`. With
+            # tie_word_embeddings, `weight` IS `embed_tokens.weight`.
+            layer.padded_weight = Parameter(layer.weight.data.clone())
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -104,6 +105,5 @@ class SpyreParallelLMHead(ParallelLMHead):
         if self.padding > 0:
             # .contiguous() kept for safety
             out = out[:, : -self.padding].contiguous()
-        # Logits must land on CPU: the subsequent all_gather (TP > 1) would
-        # crash on a Spyre tensor.
-        return convert(out, device="cpu")
+        # Logits stay on the Spyre device.
+        return out

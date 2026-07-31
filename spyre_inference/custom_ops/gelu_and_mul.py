@@ -35,13 +35,18 @@ class SpyreGeluAndMul(GeluAndMul):
     def forward_oot(self, x) -> torch.Tensor:
         """GeGLU: gelu(gate) * up, output shape [..., d].
 
-        `x` is either a pre-split gate/up pair (from unfuse.py) or a fused
-        [..., 2*d] tensor. Slicing a Spyre tensor corrupts memory, so the fused
-        path slices on CPU (mirrors SpyreSiluAndMul).
+        `x` is either a pre-split gate/up pair (a SplitGateUp from an un-fused
+        gate_up_proj, see unfuse.py) or a fused [..., 2*d] tensor. The fused
+        path only runs for layers unfuse left alone (e.g. quantized); slicing a
+        Spyre tensor corrupts memory, so it slices on CPU (mirrors
+        SpyreSiluAndMul).
         """
         if not isinstance(x, torch.Tensor):
+            # Unfused path: gate/up already split, both contiguous on device.
             x1, x2 = x
         else:
+            # Fused path: slice on CPU — slicing a Spyre tensor corrupts memory,
+            # and non-contiguous slices corrupt again on transfer back.
             original_device = x.device
             x = convert(x, device="cpu")
             d = x.shape[-1] // 2

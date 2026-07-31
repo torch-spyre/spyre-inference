@@ -83,10 +83,13 @@ def _compute_slot_mapping_impl(
     block_table_stride: int,
     block_size: int,
     slot_mapping: torch.Tensor,
+    KV_CACHE_BLOCK_SIZE: int | None = None,
+    BLOCKS_PER_KV_BLOCK: int = 1,
     TOTAL_CP_WORLD_SIZE: int = 1,
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
     PAD_ID: int = _PAD_SLOT_ID,
+    # Triton tile width; unused here, kept for call compatibility.
     BLOCK_SIZE: int = 1024,
 ) -> None:
     """Map each token position to its flat index in the paged KV cache.
@@ -97,10 +100,18 @@ def _compute_slot_mapping_impl(
 
     Correctness is validated indirectly by the upstream attention backend test
     (test_causal_backend_correctness) and end-to-end model generation tests.
+
+    ``block_size`` is the kernel's block size, ``KV_CACHE_BLOCK_SIZE`` the KV
+    manager's, and ``BLOCKS_PER_KV_BLOCK`` the ratio between them (1 on Spyre).
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-    block_indices = (positions[:num_tokens] // block_size).to(torch.int64)
-    block_offsets = (positions[:num_tokens] % block_size).to(torch.int64)
+    kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
+
+    # KV manager block, then the kernel block within it.
+    token_positions = positions[:num_tokens]
+    virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
+    local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
+    block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
 
     num_reqs = query_start_loc.shape[0] - 1
     req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
@@ -111,7 +122,7 @@ def _compute_slot_mapping_impl(
 
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * block_size + block_offsets
+    slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
     if max_num_tokens > num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
@@ -276,14 +287,14 @@ class _SpyreModelWrapper:
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
         on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU. Thus, convert here, perform the lm_head operation and
-        then convert the resulting logits back to CPU
-        for downstream sampling.
+        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
+        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
+        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
+        converts back to CPU right after the gather (before the vocab slice
+        and scale), so downstream sampling gets CPU logits.
         """
         hidden_states = convert(hidden_states, device=self._spyre_device)
-        # logits are returned on cpu
-        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
-        return logits
+        return self._model.compute_logits(hidden_states, *args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -330,9 +341,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
-        import vllm.v1.worker.block_table
+        from vllm.v1.worker import block_table
 
-        vllm.v1.worker.block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        # Deliberately swap the Triton JITFunction for the grid-launch-compatible
+        # _FuncWrapper; the type mismatch is the point of the patch.
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:
@@ -419,33 +432,28 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
 
-        Spyre compilation is handled here (not by vLLM's @support_torch_compile)
-        because Spyre requires static shapes — dynamic shapes (SymInt) are not
-        supported by the Spyre Inductor backend.
+        Spyre requires static shapes — dynamic shapes (SymInt) are not yet supported.
+        We therefore pass `dynamic=False` to torch.compile(...).
 
         Supported modes:
-        - enforce_eager=True: no compilation (eager execution)
-        - CompilationMode.NONE: Spyre-managed compilation with torch.compile
-        Other vLLM compilation modes (VLLM_COMPILE, STOCK_TORCH_COMPILE) are
-        not supported — the platform forces CompilationMode.NONE in
-        apply_config_platform_defaults().
+
+        - CompilationMode.NONE: eager execution
+        - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
         """
         mode = self.compilation_config.mode
-        if mode != CompilationMode.NONE:
+        if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
             raise ValueError(
-                f"Unsupported compilation mode {mode} for Spyre. "
-                f"Only CompilationMode.NONE is supported. Spyre handles "
-                f"compilation internally via _compile_for_spyre(). "
-                f"Use enforce_eager=True to disable compilation entirely."
+                f"Unsupported compilation mode {mode} for Spyre. Only "
+                f"CompilationMode.NONE and CompilationMode.STOCK_TORCH_COMPILE "
+                f"are supported."
             )
 
-        if self.vllm_config.model_config.enforce_eager:
+        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # Custom ops (spyre_rmsnorm, spyre_cpu_fallback, etc.) are opaque
-        # to dynamo but don't cause graph breaks — fullgraph=True is safe.
-        # dynamic=False ensures static shapes (Spyre can't handle SymInt).
+        # Trigger whole-model compile:
+        # a single fullgraph over the entire model using dynamic=False.
         t0 = time.time()
         self.model = torch.compile(
             self.model,
@@ -453,7 +461,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             fullgraph=True,
             dynamic=False,
         )
-        logger.info("Model compiled for Spyre (backend=inductor) in %.3fs.", time.time() - t0)
+        logger.info(
+            "Compiled model %s as a single graph for Spyre in %.3fs.",
+            type(self.get_model()).__name__,
+            time.time() - t0,
+        )
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

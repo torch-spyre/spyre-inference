@@ -44,33 +44,34 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
+    def _apply(self, fn, recurse=True):
+        # F.embedding has no Spyre kernel; keep the weight on CPU.
+        return self
+
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.tp_size <= 1:
-            return self._embedding(input_.long())
+        cpu_input = convert(input_, device="cpu")
+        if self.tp_size > 1:
+            masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
+                cpu_input,
+                self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.added_vocab_start_index,  # ty: ignore[invalid-argument-type]
+                self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
+                self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
+            )
+        else:
+            masked_input = cpu_input
+            keep = None
 
-        # TP>1 needs the per-shard mask, but upstream get_masked_input_and_mask
-        # compiles an int64 `>=` comparison the Spyre inductor backend rejects,
-        # so compute the mask on CPU (see spyre_vocab_mask) and embed on-device.
-        masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-            convert(input_, device="cpu"),
-            self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
-            self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
-            self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
-            self.shard_indices.added_vocab_start_index,  # ty: ignore[invalid-argument-type]
-            self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
-            self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
-        )
-        masked_input = convert(masked_input.long(), device=input_.device)
-        output = self._embedding(masked_input) * convert(keep, device=input_.device)
-        return tensor_model_parallel_all_reduce(output)
+        output = self.quant_method.embedding(self, masked_input.long())
 
-    def _embedding(self, ids: torch.Tensor) -> torch.Tensor:
-        # torch-spyre's embedding kernel SIGABRTs in dsc codegen on a single-row
-        # gather (torch-spyre#3418); pad to two rows on-device and slice back.
-        # Remove once #3418 lands and the single-token probe stops xfailing.
-        if ids.shape[0] == 1:
-            return self.quant_method.embedding(self, torch.cat([ids, ids]))[:1]
-        return self.quant_method.embedding(self, ids)
+        if self.tp_size > 1 and keep is not None:
+            output = output * keep
+            output = convert(output, device=input_.device)
+            output = tensor_model_parallel_all_reduce(output)
+            return output
+        return convert(output, device=input_.device)
 
 
 def _vocab_mask_op_func(

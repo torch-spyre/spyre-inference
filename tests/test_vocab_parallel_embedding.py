@@ -174,8 +174,13 @@ def test_int64_compiled_compare_against_python_int(tp_group) -> None:
 
 @pytest.mark.vocab_parallel_embedding
 def test_embedding_does_not_fall_back_to_cpu() -> None:
-    """torch-spyre now has a native aten.embedding.default kernel, so
-    F.embedding on-device must not emit a CPU FallbackWarning."""
+    """torch-spyre now has a native aten.embedding.default kernel, so a multi-row
+    F.embedding on-device must not emit a CPU FallbackWarning.
+
+    The single-row gather still crashes (torch-spyre#3418; see
+    test_single_token_embedding_on_device), and single-token decode hits it every
+    step, so SpyreVocabParallelEmbedding.forward still gathers on CPU. Move it
+    on-device once the single-row probe below flips to passing."""
     from torch_spyre.ops.fallbacks import FallbackWarning
 
     weight = torch.randn(128, 64, dtype=torch.float16, device="spyre")
@@ -195,9 +200,9 @@ def test_embedding_does_not_fall_back_to_cpu() -> None:
     reason=(
         "torch-spyre's embedding kernel SIGABRTs in dsc codegen on a single-row "
         "gather (torch-spyre#3418): `!allocNode->layoutDimOrder_.empty()`. "
-        "SpyreVocabParallelEmbedding._embedding works around this by padding to "
-        "two rows on-device and slicing back. When this flips to passing, delete "
-        "that pad-and-slice workaround."
+        "Single-token decode hits this every step, which is why "
+        "SpyreVocabParallelEmbedding.forward still gathers on CPU rather than "
+        "on-device. When this flips to passing, move that gather on-device."
     ),
 )
 def test_single_token_embedding_on_device() -> None:

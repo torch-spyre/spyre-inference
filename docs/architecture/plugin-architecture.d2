@@ -6,7 +6,7 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "SpyreVocabParallelEmbedding\n(on-Spyre gather; n=1 padded\nto 2 rows, torch-spyre#3418)" {
+  EMB: "SpyreVocabParallelEmbedding\n(weight pinned to CPU; gather\nCPU→CPU; output→Spyre)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -38,9 +38,9 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ROPE: "SpyreRotaryEmbedding\n(2×2 rotation on Spyre via spyre_rope_rot;\nfreq index_select on Spyre; n=1 padded, #3418)" {
-    style.fill: "#1565c0"
-    style.stroke: "#0d47a1"
+  ROPE: "SpyreRotaryEmbedding\n(2×2 rotation on Spyre via\nspyre_rope_rot; freq index_select CPU)" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
   ATTN: "SpyreAttentionImpl\n(mixed CPU+Spyre)" {

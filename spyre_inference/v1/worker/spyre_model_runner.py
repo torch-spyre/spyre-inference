@@ -212,10 +212,9 @@ class _SpyreModelWrapper:
         which handles H2D/D2H for the sample_hidden_states subset.
 
     RoPE priming (per forward pass):
-        Gather each RoPE module's per-token rotation slice on-device (positions
-        arrive on the host, so this is an H2D of the indices, no D2H) and stash it
-        in the forward context; forward_oot reads it back, shared across all
-        attention layers.
+        Gather each RoPE module's per-token rotation slice on the host (no D2H)
+        and stash it in the forward context; forward_oot reads it back, shared
+        across all attention layers.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -234,7 +233,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_rope_modules", rope_modules or [])
 
     def __call__(self, *args, **kwargs):
-        # Prime RoPE from host positions (H2D of the indices only, no D2H).
+        # Prime RoPE while positions are still on the host (no D2H).
         self._prime_rope_rotation(kwargs.get("positions"))
 
         # Convert integer tensor inputs to Spyre int64

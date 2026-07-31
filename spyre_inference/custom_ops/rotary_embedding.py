@@ -15,10 +15,10 @@
 """Spyre OOT replacement for RotaryEmbedding.
 
 Applies rotary position embeddings on the Spyre device via a complex-free 2x2
-rotation-matrix formulation (ported from foundation-model-stack). The 2x2
-rotation cache lives on-device and the frequency gather runs on Spyre via
-``index_select``: ``_SpyreModelWrapper`` calls ``gather_rotation`` before the
-model forward and stashes the gathered slice in the vLLM forward context;
+rotation-matrix formulation (ported from foundation-model-stack). The frequency
+cache is index_select'd on CPU (Spyre has no eager index_select):
+``_SpyreModelWrapper`` calls ``gather_rotation`` before the model forward, moves
+the gathered slice to Spyre, and stashes it in the vLLM forward context;
 ``forward_oot`` fetches it through the opaque ``spyre_rope_rot`` op (keeping the
 forward-context read out of torch.compile graphs) and applies the rotation through
 the opaque ``spyre_rope_rotate`` op. The rotation is kept opaque (its body runs
@@ -107,8 +107,7 @@ class _SpyreRotaryMixin:
 
     Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
     ``NotImplementedError`` at construction. The rotation cache is derived lazily from
-    the base ``cos_sin_cache`` (inheriting all rope-scaling variants), built once on
-    CPU and then moved to each device it is gathered on (memoized per device).
+    the base ``cos_sin_cache`` (inheriting all rope-scaling variants) and kept on CPU.
     """
 
     _key_counter = itertools.count()
@@ -124,58 +123,40 @@ class _SpyreRotaryMixin:
                 f"rotary_dim={self.rotary_dim}, head_size={self.head_size}."
             )
         self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
-        self._device_rotation_cache: dict[str, torch.Tensor] = {}
+        self._rotation_cache: torch.Tensor | None = None
         self._rope_key = f"spyre_rope_{next(self._key_counter)}"
 
     def _apply(self, fn, recurse=True):
         # cos_sin_cache has no Spyre kernel; keep cos_sin_cache on CPU.
         return self
 
-    def _build_rotation_cache(self) -> torch.Tensor:
-        """Build the CPU 2x2 rotation cache [max_pos, 2, 2, padded_inner] from
+    def _get_rotation_cache(self) -> torch.Tensor:
+        """Lazily build the CPU 2x2 rotation cache [max_pos, 2, 2, padded_inner] from
         cos_sin_cache ([[cos, -sin], [sin, cos]]), zero-padding the inner dim to the
         next stick multiple."""
-        inner = self.rotary_dim // 2
-        cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
-        cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
-            self.cos_sin_cache.shape[0], 2, 2, inner
-        )
-        if self._padded_inner != inner:
-            cache = torch.nn.functional.pad(cache, (0, self._padded_inner - inner))
-        return cache
-
-    def _rotation_cache_on(self, device: torch.device) -> torch.Tensor:
-        """Return the 2x2 rotation cache resident on ``device``. Built on CPU once
-        (stored as the ``"cpu"`` entry) and moved to each device on first use,
-        memoized by ``device.type`` so a rope instance shared across CPU-ref and
-        Spyre tests keeps a distinct copy per device."""
-        cached = self._device_rotation_cache.get(device.type)
-        if cached is None:
-            cpu_cache = self._device_rotation_cache.setdefault("cpu", self._build_rotation_cache())
-            cached = convert(cpu_cache, device=device, dtype=self.dtype)
-            self._device_rotation_cache[device.type] = cached
-        return cached
+        if self._rotation_cache is None:
+            inner = self.rotary_dim // 2
+            cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
+            cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
+                self.cos_sin_cache.shape[0], 2, 2, inner
+            )
+            if self._padded_inner != inner:
+                cache = torch.nn.functional.pad(cache, (0, self._padded_inner - inner))
+            self._rotation_cache = cache
+        return self._rotation_cache
 
     def gather_rotation(
         self, positions: torch.Tensor, target_device: torch.device
     ) -> torch.Tensor | None:
-        """Gather this pass's per-token 2x2 rotation slice via an on-device
-        ``index_select`` over the target-device rotation cache. Returns ``None`` for
-        multi-dim (mrope/xdrope) positions."""
+        """Gather this pass's per-token 2x2 rotation slice on the host and move it to
+        Spyre. Returns ``None`` for multi-dim (mrope/xdrope) positions."""
         cpu_positions = convert(positions, device="cpu")
         assert cpu_positions is not None
         if cpu_positions.dim() > 1:
             return None
         pos = cpu_positions.flatten().to(torch.int64)
-        cache = self._rotation_cache_on(target_device)
-        idx = convert(pos, device=target_device)
-        # torch-spyre's dsc codegen SIGABRTs on a single-row index_select
-        # (!allocNode->layoutDimOrder_.empty() — the same crash as the single-row
-        # embedding gather, torch-spyre#3418), which single-token decode hits every
-        # step; pad to two rows on-device and slice back. Remove once #3418 lands.
-        if idx.shape[0] == 1:
-            return cache.index_select(0, torch.cat([idx, idx]))[:1]
-        return cache.index_select(0, idx)
+        selected = self._get_rotation_cache().index_select(0, pos)
+        return convert(selected, device=target_device, dtype=self.dtype)
 
     def forward_oot(
         self,

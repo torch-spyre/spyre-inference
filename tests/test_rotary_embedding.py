@@ -155,8 +155,8 @@ def test_rotary_forward_oot_on_spyre(
     )
 
     assert actual_query.device.type == "spyre"
-    # The rotation cache is moved on-device and index_select'd on Spyre.
-    assert rope._device_rotation_cache["spyre"].device.type == "spyre"
+    # The rotation cache stays on CPU (no eager index_select); only the slice moves.
+    assert rope._rotation_cache is not None and rope._rotation_cache.device.type == "cpu"
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )
@@ -277,23 +277,6 @@ def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
     assert rot is not None
     assert rot.device.type == "spyre"
     assert tuple(rot.shape) == (num_tokens, 2, 2, round_up(rope.rotary_dim // 2, _SPYRE_STICK))
-
-
-@pytest.mark.rotary
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
-def test_gather_rotation_single_token_on_spyre(default_vllm_config, head_size):
-    """A single-token gather (decode step) matches the CPU reference. Exercises the
-    pad-to-two-rows workaround for torch-spyre's single-row index_select crash
-    (torch-spyre#3418)."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-
-    rope = get_rope(head_size, 2048, is_neox_style=True, dtype=torch.float16)
-    positions = torch.tensor([7], dtype=torch.long)
-
-    rot = rope.gather_rotation(positions, torch.device("spyre"))
-    expected = rope.gather_rotation(positions, torch.device("cpu"))
-    assert rot is not None and rot.device.type == "spyre" and rot.shape[0] == 1
-    torch.testing.assert_close(rot.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.rotary

@@ -2072,7 +2072,7 @@ read of the gathered rotation slice out of the compiled graph.</p>
 <td><code>SiluAndMul</code></td>
 <td><code>SpyreSiluAndMul</code></td>
 <td>Spyre</td>
-<td>Consumes the pre-split <code>gate</code>/<code>up</code> parts (see un-fusing); the fused fallback path slices on CPU (Spyre slicing corrupts views)</td>
+<td><code>forward_oot</code> runs a <code>torch.compile</code>d <code>forward_native</code> directly on the fused <code>[..., 2*d]</code> tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour)</td>
 </tr>
 <tr>
 <td><code>ParallelLMHead</code></td>
@@ -2093,18 +2093,17 @@ read of the gathered rotation slice out of the compiled graph.</p>
 <li><code>RowParallelLinear</code> (<code>o_proj</code>, <code>down_proj</code>) runs the upstream class unchanged — <code>F.linear</code>
   dispatches to Spyre, and <code>all_reduce</code> (via <code>SpyreCommunicator</code>) fires when <code>reduce_results=True</code>
   under TP&gt;1.</li>
-<li><code>MergedColumnParallelLinear</code> (<code>gate_up_proj</code>) is un-fused at load into separate <code>gate</code>/<code>up</code>
-  Parameters (see below).</li>
+<li><code>MergedColumnParallelLinear</code> (<code>gate_up_proj</code>) runs the upstream class unchanged: the
+  fused <code>[..., 2*d]</code> output feeds straight into <code>SpyreSiluAndMul</code>, which slices gate/up
+  on-device.</li>
 </ul>
 <h3 id="weight-un-fusing">Weight un-fusing<a class="headerlink" href="#weight-un-fusing" title="Permanent link">&para;</a></h3>
 <p><code>analyze_and_unfuse</code> (<code>custom_ops/unfuse.py</code>) runs once after the checkpoint is loaded,
-while weights are still on CPU. Fused projections are a problem on Spyre: splitting a
-fused weight's output on-device yields strided views that corrupt when transferred. So
-the pass splits each fused weight (<code>QKVParallelLinear</code>, and the <code>MergedColumnParallelLinear</code>
-feeding a <code>SpyreSiluAndMul</code>) into contiguous per-part Parameters and rebinds <code>forward</code> to
-run one <code>F.linear</code> per part. The result is a <code>SplitQKV</code> / <code>SplitSiluAndMul</code> container that
-the unmodified downstream idioms — <code>q, k, v = qkv.split(...)</code> and <code>gate, up = proj</code> — keep
-consuming unchanged.</p>
+while weights are still on CPU. The fused <code>QKVParallelLinear</code> weight is a problem on Spyre:
+splitting its output on-device yields strided views that corrupt when transferred. So the
+pass splits the fused weight into contiguous per-part Parameters and rebinds <code>forward</code> to
+run one <code>F.linear</code> per part. The result is a <code>SplitQKV</code> container that the unmodified
+downstream idiom — <code>q, k, v = qkv.split(...)</code> — keeps consuming unchanged.</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
 (no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each

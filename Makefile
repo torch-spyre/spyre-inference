@@ -23,6 +23,26 @@ else
 JUNIT_ARGS :=
 endif
 
+# --- Coverage ---------------------------------------------------------------
+# Opt-in via COVERAGE=1: run-one then exports PYTHONPATH (sitecustomize
+# bootstrap) + COVERAGE_PROCESS_START so every interpreter it spawns (pytest +
+# vLLM workers) measures. As a command-line var, COVERAGE propagates to the
+# fan-out sub-makes automatically.
+COVERAGE ?=
+COVERAGE_RC := $(CURDIR)/.coveragerc
+COVERAGE_BOOTSTRAP := $(CURDIR)/tests/coverage
+# `coverage` tool for the coverage target. Standalone hosts without the venv
+# (e.g. GHA's fan-in) override COVERAGE_TOOL=coverage.
+COVERAGE_TOOL ?= uv run --no-sync coverage
+# Dir of .coverage.* files to combine. Empty = current dir.
+COVERAGE_DATA ?=
+
+ifneq ($(COVERAGE),)
+COVERAGE_ENV := PYTHONPATH="$(COVERAGE_BOOTSTRAP)$${PYTHONPATH:+:$$PYTHONPATH}" COVERAGE_PROCESS_START="$(COVERAGE_RC)"
+else
+COVERAGE_ENV :=
+endif
+
 # Map TEST_TYPE to a pytest -m marker expression. full -> no filter (all tests).
 # MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that need a marker
 # expression finer than the 3 coarse tiers (e.g. CI splitting the "full"-only
@@ -44,7 +64,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests \
+.PHONY: help test tests run-one aiu-setup perf-tests coverage \
         test-smoke test-attention test-distributed \
         test-upstream test-upstream-distributed test-upstream-model
 
@@ -53,7 +73,9 @@ help: ## Show this help message
 	@echo ""
 	@echo "Variables: TEST_TYPE=smoke|core|full (default full), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
-	@echo "  RESULTS_DIR (aggregate 'full' JUnit output dir, default '$(RESULTS_DIR)')"
+	@echo "  RESULTS_DIR (aggregate 'full' JUnit output dir, default '$(RESULTS_DIR)'),"
+	@echo "  COVERAGE=1 (measure coverage during test runs), then \`make coverage\` to aggregate"
+	@echo "  (COVERAGE_DATA=dir of data files, COVERAGE_TOOL=coverage for a standalone runner)"
 
 # Marker set for GHA's _test_matrix.yaml is intentionally NOT duplicated in
 # YAML: each matrix.cfg's "Run tests" step calls one of the test-<name>
@@ -86,7 +108,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	uv run pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	$(COVERAGE_ENV) uv run pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention)' JUNIT_XML=$(JUNIT_XML)
@@ -126,6 +148,15 @@ tests: ## Run tests. TEST_TYPE=smoke|core|full (default full) or set MARK_OVERRI
 	fi
 
 test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
+
+# Combine COVERAGE=1 data into one dataset ([paths] maps across runners) and
+# emit a log table, coverage.xml, htmlcov/, and coverage.md.
+coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.xml + htmlcov/ + coverage.md.
+	$(COVERAGE_TOOL) combine --rcfile=$(COVERAGE_RC) $(COVERAGE_DATA)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --show-missing
+	$(COVERAGE_TOOL) xml --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) html --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --format=markdown > coverage.md
 
 perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 	mkdir -p "$(RESULTS_DIR)"

@@ -80,13 +80,16 @@ endef
 aiu-setup: ## Internal: source ibm-aiu-setup.sh and run its one-time side effects (memoized via a stamp file for this run).
 	$(AIU_SETUP_CMD)
 
+# uv invocations below pass --active --no-sync: they must use the prebaked image venv
+# ($VIRTUAL_ENV) and skip re-resolution, since the lockfile pins wheels (torch +cpu,
+# bitsandbytes) that have no ppc64le build even though the venv is already complete.
 run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARGS.
 	# ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that fails on
 	# the Spyre image; env vars are already exported by then, so tolerate
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	uv run pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention)' JUNIT_XML=$(JUNIT_XML)
@@ -130,6 +133,6 @@ test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
 perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR.
 	mkdir -p "$(RESULTS_DIR)"
 	$(AIU_SETUP_CMD); \
-	uv run python3 .github/scripts/run_vllm_benchmarks.py \
+	uv run --active --no-sync python3 .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
 		--results-dir "$(RESULTS_DIR)"

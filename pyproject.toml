@@ -118,7 +118,7 @@ members = ["tests/plugin"]
 [tool.uv.extra-build-dependencies]
 # Pin the same torch version for building torch-spyre to avoid any ABI drift
 torch-spyre = ["torch==2.13.0"]
-vllm = ["torch"]
+vllm = ["torch"] # Makes uv resolve torch during build-isolation via the sources defined here rather than pypi, avoiding failure on s390x
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set

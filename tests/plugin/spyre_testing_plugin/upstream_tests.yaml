@@ -45,6 +45,7 @@ tests:
                 - mistralai/Mistral-7B-Instruct-v0.3
                 # - Qwen/Qwen2.5-0.5B-Instruct # needs tied-weight lm_head fix (compute_logits hits cpu/spyre mixed-device decomposition)
                 # - TitanML/tiny-mixtral # needs swa support
+                # - google/gemma-2-2b-it # sliding-window model; blocked by IOMMU DMA aperture limit (unrelated to this PR)
             override:
               max_tokens: [2] # one prefill and one decode for speed
             skip:

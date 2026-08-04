@@ -133,6 +133,17 @@ class TorchSpyreWorker(Worker):
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
+
+        mgr = getattr(self.model_runner, "spyre_graph_manager", None)
+        if mgr is not None and mgr.is_captured:
+            logger.info(
+                "Compilation complete: %d buckets in %.2fs. Range: [%d, %d]",
+                len(mgr.bucket_sizes),
+                self.compilation_config.compilation_time,
+                mgr.bucket_sizes[0] if mgr.bucket_sizes else 0,
+                mgr.bucket_sizes[-1] if mgr.bucket_sizes else 0,
+            )
+
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

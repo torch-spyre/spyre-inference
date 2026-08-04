@@ -47,11 +47,14 @@ from torch.utils._pytree import tree_map
 
 import numpy as np
 
+from typing import TYPE_CHECKING
+
 from vllm.config import VllmConfig, CompilationMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -60,6 +63,11 @@ from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.worker.spyre_graph_manager import SpyreGraphManager
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
@@ -292,11 +300,10 @@ class _SpyreModelWrapper:
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
         on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        is on CPU; move it onto Spyre for the lm_head matmul.
+
+        SpyreLogitsProcessor.forward ensures logits are returned on CPU
+        regardless of TP configuration.
         """
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
@@ -342,6 +349,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.use_cuda_graph = False
         self.cascade_attn_enabled = False
 
+        # Bucket dispatcher (initialized after model load)
+        self.spyre_graph_manager: SpyreGraphManager | None = None
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
@@ -350,7 +360,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
     @staticmethod
     def _patch_encoder_ops_for_spyre(model_config) -> None:
@@ -461,6 +471,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # receive CPU tensors without needing per-call-site overrides.
         self.model = _SpyreModelWrapper(self.model, self._spyre_device, rope_modules)
 
+        # Initialize bucket dispatcher for shape bucketing at runtime.
+        self.init_graph_manager()
+
+    def init_graph_manager(self) -> None:
+        """Initialize SpyreGraphManager for runtime bucket dispatch.
+
+        Enabled for STOCK_TORCH_COMPILE mode (handles shape bucketing).
+        Skipped when enforce_eager=True or mode is NONE.
+        """
+        if self.vllm_config.model_config.enforce_eager:
+            logger.info("Graph manager disabled (enforce_eager=True)")
+            return
+
+        if self.compilation_config.mode == CompilationMode.NONE:
+            logger.info("Graph manager disabled (mode=NONE)")
+            return
+
+        self.spyre_graph_manager = SpyreGraphManager(self.vllm_config)
+
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
 
@@ -500,41 +529,110 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def warming_up_model(self) -> None:
-        """Run a dummy forward pass to warm up kernels and optional compile.
+        """Warm up the model by running _dummy_run for each bucket size.
 
-        In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1`` to
-        stay under the Spyre DMA limit for encoder dummy batches. Compiled
-        mode uses the normal warmup size so shapes match torch.compile.
+        With STOCK_TORCH_COMPILE, each bucket size triggers Dynamo tracing.
+        Attention is an opaque custom op Dynamo includes it in the graph
+        but does not trace into its implementation. Inductor compiles the
+        graph (with attention as a leaf node) for each bucket size.
+
+        Subsequent _dummy_run calls exercise the compiled code paths to
+        warm Inductor caches.
+
+        Without a graph manager (enforce_eager=True or mode=NONE),
+        falls back to a single warmup pass. In that eager path, pooling
+        models cap token count (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and
+        force ``max_num_seqs=1`` to stay under the Spyre DMA limit for
+        encoder dummy batches.
         """
-        logger.info("Warming up model...")
-        t0 = time.time()
-        num_tokens = min(
-            max(16, self.max_num_reqs),
-            self.scheduler_config.max_num_batched_tokens,
-        )
-        with _set_spyre_compilation_settings(self.vllm_config):
-            use_eager_pooling_warmup = (
-                self.model_config.runner_type == "pooling"
-                and self.vllm_config.model_config.enforce_eager
+        if self.spyre_graph_manager is None:
+            logger.info("Running single warmup pass (graph manager Disabled)...")
+            t0 = time.time()
+            num_tokens = min(
+                max(16, self.max_num_reqs),
+                self.scheduler_config.max_num_batched_tokens,
             )
-            if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
-                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
-                saved_max_num_seqs = self.scheduler_config.max_num_seqs
-                try:
-                    self.scheduler_config.max_num_seqs = 1
-                    logger.info(
-                        "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
-                        num_tokens,
-                        saved_max_num_seqs,
-                    )
+            with _set_spyre_compilation_settings(self.vllm_config):
+                use_eager_pooling_warmup = (
+                    self.model_config.runner_type == "pooling"
+                    and self.vllm_config.model_config.enforce_eager
+                )
+                if use_eager_pooling_warmup:
+                    # Match single-sequence embed metadata; cap tokens for DMA.
+                    num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+                    saved_max_num_seqs = self.scheduler_config.max_num_seqs
+                    try:
+                        self.scheduler_config.max_num_seqs = 1
+                        logger.info(
+                            "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
+                            num_tokens,
+                            saved_max_num_seqs,
+                        )
+                        self._dummy_run(num_tokens)
+                    finally:
+                        self.scheduler_config.max_num_seqs = saved_max_num_seqs
+                else:
                     self._dummy_run(num_tokens)
-                finally:
-                    self.scheduler_config.max_num_seqs = saved_max_num_seqs
-            else:
-                self._dummy_run(num_tokens)
-        logger.info("Warmup done in %.3fs.", time.time() - t0)
+            logger.info("Warmup done in %.3fs.", time.time() - t0)
+            return
+
+        bucket_sizes = self.spyre_graph_manager.bucket_sizes
+        logger.info(
+            "Warming up model with %d bucket sizes [%d..%d]...",
+            len(bucket_sizes),
+            bucket_sizes[0] if bucket_sizes else 0,
+            bucket_sizes[-1] if bucket_sizes else 0,
+        )
+        t0 = time.time()
+        with _set_spyre_compilation_settings(self.vllm_config):
+            for size in sorted(bucket_sizes, reverse=True):
+                self._dummy_run(size)
+        self.spyre_graph_manager.mark_captured()
+        logger.info(
+            "Warmup complete in %.3fs for %d buckets.",
+            time.time() - t0,
+            len(bucket_sizes),
+        )
+
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        """Execute model with bucket dispatch: pad to nearest bucket, trim output.
+
+        When spyre_graph_manager is active, pads the batch to the nearest
+        compiled bucket size so Dynamo dispatches to pre-compiled Inductor
+        code. After execution, trims output back to actual size.
+        """
+        if self.spyre_graph_manager is None:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+
+        actual_num_tokens = scheduler_output.total_num_scheduled_tokens
+        if actual_num_tokens == 0:
+            return None
+
+        desc = self.spyre_graph_manager.dispatch(actual_num_tokens)
+
+        if desc is None:
+            logger.warning(
+                "Batch size %d exceeds max bucket %d; running unpadded.",
+                actual_num_tokens,
+                self.spyre_graph_manager._max_bucket_size,
+            )
+            return super().execute_model(scheduler_output, intermediate_tensors)
+
+        # Pad to bucket boundary
+        scheduler_output.total_num_scheduled_tokens = desc.padded_num_tokens
+
+        output = super().execute_model(scheduler_output, intermediate_tensors)
+
+        # Restore actual count and trim sampled ids on sync ModelRunnerOutput.
+        scheduler_output.total_num_scheduled_tokens = actual_num_tokens
+        if isinstance(output, ModelRunnerOutput):
+            output.sampled_token_ids = output.sampled_token_ids[:actual_num_tokens]
+
+        return output
 
     # --- KV cache allocation ---
 

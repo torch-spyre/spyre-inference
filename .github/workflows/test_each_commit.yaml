@@ -34,8 +34,12 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     secrets: inherit
     with:
-      # PR flow: skip the build/test when no source files changed.
-      skip_if_no_changes: true
+      # PR/merge_group flow: skip the build/test when no source files
+      # changed. A push to main (trunk) always runs regardless -- a merge
+      # should always validate the merged state, not rely on the PR-diff
+      # change-detection heuristic.
+      skip_if_no_changes: ${{ github.event_name != 'push' }}
+      test_type: ${{ github.event_name == 'push' && 'trunk' || 'full' }}
 
   # ---------------------------------------------------------------------------
   # Required check gate -- this job name must match the existing branch

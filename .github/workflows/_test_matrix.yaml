@@ -67,13 +67,15 @@ on:
         default: ""
       test_type:
         description: |
-          Suite subset to run: smoke | core | full (default). Selects which of
-          the matrix configs below run — each entry declares the test_types it
-          belongs to, and a job is skipped unless test_type is in its set:
+          Suite subset to run: smoke | core | full (default) | trunk. Selects
+          which of the matrix configs below run — each entry declares the
+          test_types it belongs to, and a job is skipped unless test_type is
+          in its set:
             smoke — fast per-op unit tests only (1 config, single card)
             core  — all spyre-native tests (per-op + attention + distributed),
                     excludes the heavy upstream-vLLM suites
             full  — every config (default; back-compatible)
+            trunk — push-to-main CI; same coverage as full
           Also accepts the user-facing tier aliases unit (= core), integration
           (= smoke), regression (= full) -- resolved once in the "Decide
           whether to run" step below, so every caller (Jenkins, config.yaml)
@@ -102,7 +104,7 @@ jobs:
         include:
           - cfg: Non-distributed spyre tests
             # Fast per-op unit tests: the smoke set.
-            test_types: smoke core full
+            test_types: smoke core full trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -111,7 +113,7 @@ jobs:
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
-            test_types: core full
+            test_types: core full trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -119,7 +121,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention
           - cfg: Distributed spyre tests
-            test_types: core full
+            test_types: core full trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -128,7 +130,7 @@ jobs:
             test_target: test-distributed
           - cfg: Upstream vLLM tests
             # Upstream-vLLM suites are excluded from smoke/core (heavy).
-            test_types: full
+            test_types: full trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -136,7 +138,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
-            test_types: full
+            test_types: full trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -144,7 +146,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
-            test_types: full
+            test_types: full trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -216,8 +218,8 @@ jobs:
           # accepts any string, and an unknown value would match no config and
           # silently skip every job -> a green run that tested nothing.
           case "${RESOLVED_TEST_TYPE}" in
-            smoke|core|full) ;;
-            *) echo "::error::Invalid test_type '${RAW_TEST_TYPE}'. Valid: smoke | core | full | unit | integration | regression"; exit 1 ;;
+            smoke|core|full|trunk) ;;
+            *) echo "::error::Invalid test_type '${RAW_TEST_TYPE}'. Valid: smoke | core | full | trunk | unit | integration | regression"; exit 1 ;;
           esac
           if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
              || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then

@@ -79,7 +79,9 @@ on:
         description: >-
           Suite subset to run. Default: full (every config). Selects which matrix
           configs run (see _test_matrix.yaml); same knob and vocabulary as the
-          sibling repos.
+          sibling repos. Also accepts the user-facing tier aliases unit (= core),
+          integration (= smoke), regression (= full) -- e.g. via the API/gh CLI,
+          since this dropdown only lists the underlying suite names.
         required: false
         type: choice
         options:

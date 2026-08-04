@@ -74,8 +74,12 @@ on:
             core  — all spyre-native tests (per-op + attention + distributed),
                     excludes the heavy upstream-vLLM suites
             full  — every config (default; back-compatible)
-          Same knob and vocabulary as the sibling repos (torch-spyre PR #2924,
-          hf-adapters #106); the mapping to configs is repo-internal.
+          Also accepts the user-facing tier aliases unit (= core), integration
+          (= smoke), regression (= full) -- resolved once in the "Decide
+          whether to run" step below, so every caller (Jenkins, config.yaml)
+          sees the same mapping. Same knob and vocabulary as the sibling repos
+          (torch-spyre PR #2924, hf-adapters #106); the mapping to configs is
+          repo-internal.
         required: false
         type: string
         default: full
@@ -198,14 +202,28 @@ jobs:
       #      (so test_type selects a subset of the matrix; full = every config).
       - name: Decide whether to run
         id: gate
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
+          # Resolve user-facing tier aliases to this workflow's own vocabulary
+          # (smoke/core/full) once here, the single choke point every caller
+          # (Jenkins, config.yaml) passes through -- no caller needs its own
+          # copy of this mapping.
+          case "${RAW_TEST_TYPE}" in
+            unit)        RESOLVED_TEST_TYPE=core ;;
+            integration) RESOLVED_TEST_TYPE=smoke ;;
+            regression)  RESOLVED_TEST_TYPE=full ;;
+            '')          RESOLVED_TEST_TYPE=full ;;
+            *)           RESOLVED_TEST_TYPE="${RAW_TEST_TYPE}" ;;
+          esac
+
           # Reject an unrecognized test_type loudly. type: choice guards the
           # workflow_dispatch entrypoint, but this reusable workflow_call path
           # accepts any string, and an unknown value would match no config and
           # silently skip every job -> a green run that tested nothing.
-          case "${{ inputs.test_type }}" in
+          case "${RESOLVED_TEST_TYPE}" in
             smoke|core|full) ;;
-            *) echo "::error::Invalid test_type '${{ inputs.test_type }}'. Valid: smoke | core | full"; exit 1 ;;
+            *) echo "::error::Invalid test_type '${RAW_TEST_TYPE}'. Valid: smoke | core | full | unit | integration | regression"; exit 1 ;;
           esac
           if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
              || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
@@ -214,7 +232,7 @@ jobs:
             changed=false
           fi
           case " ${{ matrix.test_types }} " in
-            *" ${{ inputs.test_type }} "*) selected=true ;;
+            *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
             *) selected=false ;;
           esac
           if [[ "$changed" == "true" && "$selected" == "true" ]]; then

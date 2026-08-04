@@ -6,9 +6,21 @@ SHELL := /bin/bash
 #   smoke — fast per-op unit tests only
 #   core  — all spyre-native tests (per-op + attention + distributed);
 #           excludes the heavy upstream-vLLM suites
-#   full  — everything (default)
-# Empty / unset defaults to "full".
-TEST_TYPE ?= full
+#   full  — everything
+# Also accepts the user-facing tier aliases unit (= core), integration (= smoke),
+# regression (= full) -- same mapping as _test_matrix.yaml's gate step.
+# Empty / unset defaults to "regression" (= full).
+TEST_TYPE ?= regression
+
+# Resolve the user-facing tier aliases to this Makefile's own vocabulary once,
+# up front, so the marker mapping below only has to handle smoke|core|full.
+ifeq ($(TEST_TYPE),unit)
+override TEST_TYPE := core
+else ifeq ($(TEST_TYPE),integration)
+override TEST_TYPE := smoke
+else ifeq ($(TEST_TYPE),regression)
+override TEST_TYPE := full
+endif
 
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
@@ -51,7 +63,7 @@ RESULTS_DIR ?= .
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: TEST_TYPE=smoke|core|full (default full), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
+	@echo "Variables: TEST_TYPE=smoke|core|full|unit|integration|regression (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
 	@echo "  RESULTS_DIR (aggregate 'full' JUnit output dir, default '$(RESULTS_DIR)')"
 
@@ -113,7 +125,7 @@ test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 # this as 6 separate marker-combo jobs, not one unfiltered run -- mirror that
 # here so `make test TEST_TYPE=full` is GHA-parity, one flat JUnit file per
 # combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=smoke|core|full (default full) or set MARK_OVERRIDE directly.
+tests: ## Run tests. TEST_TYPE=smoke|core|full|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
 	if [ -n "$(MARK_OVERRIDE)" ] || [ "$(TEST_TYPE)" != "full" ]; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \

@@ -13,14 +13,11 @@ SHELL := /bin/bash
 TEST_TYPE ?= regression
 
 # Resolve the user-facing tier aliases to this Makefile's own vocabulary once,
-# up front, so the marker mapping below only has to handle smoke|core|full.
-ifeq ($(TEST_TYPE),unit)
-override TEST_TYPE := core
-else ifeq ($(TEST_TYPE),integration)
-override TEST_TYPE := smoke
-else ifeq ($(TEST_TYPE),regression)
-override TEST_TYPE := full
-endif
+# up front, via the shared script (same source of truth as _test_matrix.yaml's
+# gate step), so the marker mapping below only has to handle smoke|core|full.
+# override is required: TEST_TYPE is commonly set on the `make` command line,
+# which a plain := reassignment cannot override.
+override TEST_TYPE := $(shell scripts/resolve_test_type.sh "$(TEST_TYPE)")
 
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.

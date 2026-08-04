@@ -206,16 +206,10 @@ jobs:
           RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
           # Resolve user-facing tier aliases to this workflow's own vocabulary
-          # (smoke/core/full) once here, the single choke point every caller
-          # (Jenkins, config.yaml) passes through -- no caller needs its own
-          # copy of this mapping.
-          case "${RAW_TEST_TYPE}" in
-            unit)        RESOLVED_TEST_TYPE=core ;;
-            integration) RESOLVED_TEST_TYPE=smoke ;;
-            regression)  RESOLVED_TEST_TYPE=full ;;
-            '')          RESOLVED_TEST_TYPE=full ;;
-            *)           RESOLVED_TEST_TYPE="${RAW_TEST_TYPE}" ;;
-          esac
+          # (smoke/core/full) via the shared script -- same source of truth as
+          # the Makefile's TEST_TYPE resolution, the single choke point every
+          # caller (Jenkins, config.yaml) passes through.
+          RESOLVED_TEST_TYPE="$(scripts/resolve_test_type.sh "${RAW_TEST_TYPE}")"
 
           # Reject an unrecognized test_type loudly. type: choice guards the
           # workflow_dispatch entrypoint, but this reusable workflow_call path

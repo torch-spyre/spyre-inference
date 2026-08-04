@@ -7,6 +7,7 @@ SHELL := /bin/bash
 #   core  — all spyre-native tests (per-op + attention + distributed);
 #           excludes the heavy upstream-vLLM suites
 #   full  — everything
+#   trunk — same coverage as full; push-to-main CI label (see resolve_test_type.sh)
 # Also accepts the user-facing tier aliases unit (= core), integration (= smoke),
 # regression (= full) -- same mapping as _test_matrix.yaml's gate step.
 # Empty / unset defaults to "regression" (= full).
@@ -41,12 +42,14 @@ ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
 else ifeq ($(TEST_TYPE),full)
 MARK_EXPR :=
+else ifeq ($(TEST_TYPE),trunk)
+MARK_EXPR :=
 else ifeq ($(TEST_TYPE),smoke)
 MARK_EXPR := -m "not (distributed or upstream or attention)"
 else ifeq ($(TEST_TYPE),core)
 MARK_EXPR := -m "not upstream"
 else
-$(error Invalid TEST_TYPE '$(TEST_TYPE)'. Valid values: smoke | core | full)
+$(error Invalid TEST_TYPE '$(TEST_TYPE)'. Valid values: smoke | core | full | trunk)
 endif
 
 # Root all-suite JUnit output under one directory so a caller can glob it in
@@ -60,7 +63,7 @@ RESULTS_DIR ?= .
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: TEST_TYPE=smoke|core|full|unit|integration|regression (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
+	@echo "Variables: TEST_TYPE=smoke|core|full|trunk|unit|integration|regression (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
 	@echo "  RESULTS_DIR (aggregate 'full' JUnit output dir, default '$(RESULTS_DIR)')"
 
@@ -118,12 +121,13 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
 
-# When MARK_OVERRIDE is unset and TEST_TYPE=full, GHA's _test_matrix.yaml runs
-# this as 6 separate marker-combo jobs, not one unfiltered run -- mirror that
-# here so `make test TEST_TYPE=full` is GHA-parity, one flat JUnit file per
-# combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=smoke|core|full|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
-	if [ -n "$(MARK_OVERRIDE)" ] || [ "$(TEST_TYPE)" != "full" ]; then \
+# When MARK_OVERRIDE is unset and TEST_TYPE=full (or trunk, same coverage),
+# GHA's _test_matrix.yaml runs this as 6 separate marker-combo jobs, not one
+# unfiltered run -- mirror that here so `make test TEST_TYPE=full` is
+# GHA-parity, one flat JUnit file per combo in RESULTS_DIR, same convention
+# hf-adapters' Makefile uses.
+tests: ## Run tests. TEST_TYPE=smoke|core|full|trunk|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
+	if [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "full" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the generic linear-transpose pass (custom_ops/transpose_linear.py).
+"""Tests for the generic linear-transpose pass (custom_ops/linear.py).
 
 These run on CPU (no Spyre device needed): the pass is a pure host-side weight
 mutation and `spyre_linear_t` is a plain `torch.matmul`, arithmetically identical
@@ -74,7 +74,7 @@ def test_transposed_linear_matches_reference(tp_group, num_tokens, use_bias):
     The core correctness guard: a wrong transpose or axis swap would change the
     output here. Runs entirely on CPU.
     """
-    from spyre_inference.custom_ops.transpose_linear import (
+    from spyre_inference.custom_ops.linear import (
         transpose_linear_weights_for_spyre,
     )
 
@@ -110,7 +110,7 @@ def _bias(layer):
 @pytest.mark.mlp
 def test_weight_replaced_with_transpose(tp_group):
     """The pass sets `weight = None` and stores `weight_t` == `weightᵀ` bit-for-bit."""
-    from spyre_inference.custom_ops.transpose_linear import (
+    from spyre_inference.custom_ops.linear import (
         transpose_linear_weights_for_spyre,
     )
 
@@ -139,7 +139,7 @@ def test_quantized_layer_skipped_without_cross_contamination(tp_group):
     Guards the per-module `quant_method.apply` patch: because vLLM builds a fresh
     UnquantizedLinearMethod per layer, patching one must not affect the other.
     """
-    from spyre_inference.custom_ops.transpose_linear import (
+    from spyre_inference.custom_ops.linear import (
         transpose_linear_weights_for_spyre,
     )
 
@@ -163,7 +163,7 @@ def test_quantized_layer_skipped_without_cross_contamination(tp_group):
 def test_unfused_qkv_skipped_by_generic_pass(tp_group):
     """A layer whose `weight` is already None (un-fused QKV) is skipped."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
-    from spyre_inference.custom_ops.transpose_linear import (
+    from spyre_inference.custom_ops.linear import (
         transpose_linear_weights_for_spyre,
     )
 

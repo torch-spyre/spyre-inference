@@ -18,7 +18,7 @@ Fused projections force a Spyre->CPU->Spyre roundtrip: splitting a fused
 weight's output on Spyre yields strided views that corrupt on transfer. This
 pass splits the fused weight into contiguous Parameters at load time (on CPU),
 each stored transposed ([in, out]) so the forward GEMM is the Spyre-fast
-`x @ A` (see transpose_linear.py / torch-spyre #3512).
+`x @ A` (see linear.py / torch-spyre #3512).
 
 The un-fused forward returns a `SplitQKV` (a `SplitProjection`) holding the
 pre-split parts. It mimics `Tensor.split`/`.chunk`, so the unmodified attention
@@ -38,7 +38,7 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 
-from .transpose_linear import spyre_linear_t
+from .linear import spyre_linear_t
 
 
 logger = init_logger(__name__)

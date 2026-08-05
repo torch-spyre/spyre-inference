@@ -31,7 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .transpose_linear import spyre_linear_t
+from .linear import spyre_linear_t
 
 
 logger = init_logger(__name__)

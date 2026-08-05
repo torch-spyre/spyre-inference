@@ -54,6 +54,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
@@ -408,6 +409,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
+
+        # Materialize each RoPE module's device-resident rotation cache now, before
+        # compile. Otherwise the lazy build on the first forward_oot is traced into the
+        # whole-model graph under STOCK_TORCH_COMPILE (330+ MB of cache scratch in the
+        # HBM pool → segfault in libsenlib); pre-building lifts it as a plain graph input.
+        for m in self.model.modules():
+            if isinstance(m, _SpyreRotaryMixin):
+                m._get_device_rotation_cache(self._spyre_device)
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()

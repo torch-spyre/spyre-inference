@@ -38,9 +38,9 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ROPE: "SpyreRotaryEmbedding\n(2×2 rotation on Spyre via\nspyre_rope_rot; freq index_select CPU)" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  ROPE: "SpyreRotaryEmbedding\n(on-device 4D-cache index_select +\n2×2 rotation on Spyre via spyre_rope_rotate)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
   ATTN: "SpyreAttentionImpl\n(mixed CPU+Spyre)" {

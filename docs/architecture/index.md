@@ -25,7 +25,7 @@ The plugin registers via three entry points:
 | Entry Point | Target | Purpose |
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
-| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rope_rot` and `spyre_convert` custom ops |
+| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rope_rotate` and `spyre_convert` custom ops |
 | `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
@@ -49,13 +49,13 @@ Each layer that requires Spyre-specific handling is replaced via vLLM's
 `@ClassName.register_oot()` decorator. Most replacements are pure class swaps that run
 when the ops package is imported; two layers (rotary embedding, the `convert` helper)
 also register an opaque custom op via `register_all()` — `spyre_convert` keeps device
-transfers invisible to `torch.compile`, and `spyre_rope_rot` keeps the forward-context
-read of the gathered rotation slice out of the compiled graph.
+transfers invisible to `torch.compile`, and `spyre_rope_rotate` keeps the 2×2 rotation
+kernel out of the compiled graph (its fused lowering corrupts under whole-model compile).
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `maybe_compile`d kernel directly on Spyre; no float32 promotion (torch-spyre limitation) |
-| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
+| `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device: a device-resident 4D rotation cache (`[max_pos, 2, 2, padded]`) is gathered with `index_select` on Spyre, on the fly inside `forward_oot` (`gather_rotation`), then the 2×2 rotation-matrix formulation is applied through the opaque `spyre_rope_rotate` op (kept opaque because its fused lowering corrupts under whole-model compile). No priming, no CPU gather. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
@@ -163,9 +163,9 @@ earlier silent D2H/H2D CPU fallback of `aten.embedding`
 copied the full `[vocab, hidden]` weight on every decode step.
 
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (the embedding gather, the rotary
-frequency-cache `index_select`, q/k/v slicing, the per-sequence attention varlen loop,
-logits indexing).
+operations that Spyre doesn't yet support natively (the embedding gather, q/k/v slicing,
+the per-sequence attention varlen loop, logits indexing). RoPE's rotation-cache gather now
+runs on-device (`index_select`), so it is no longer among them.
 
 ## HF-adapters Transformers backend
 

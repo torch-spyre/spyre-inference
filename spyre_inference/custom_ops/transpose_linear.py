@@ -82,8 +82,16 @@ def transpose_linear_weights_for_spyre(model: nn.Module) -> None:
     the LM head are transposed by their own modules.
     """
     n_linear = 0
+    n_quantized = 0
     for module in model.modules():
-        if not isinstance(module, LinearBase) or not _is_unquantized(module):
+        if not isinstance(module, LinearBase):
+            continue
+        if not _is_unquantized(module):
+            # Quantized LinearBase keeps the slow `F.linear` (`x @ Aᵀ`) path: we
+            # only transpose unquantized weights. Count it so we can warn — the
+            # embedding / LM-head paths reject quantization outright, but generic
+            # linears would otherwise skip silently.
+            n_quantized += 1
             continue
         w = getattr(module, "weight", None)
         # Skip un-fused QKV (weight is None; q/k/v_weight handled in unfuse.py)
@@ -95,6 +103,14 @@ def transpose_linear_weights_for_spyre(model: nn.Module) -> None:
             _transposed_apply, module.quant_method
         )
         n_linear += 1
+
+    if n_quantized > 0:
+        logger.warning_once(
+            "Spyre linear transpose: %d quantized LinearBase layer(s) left on the "
+            "slow `F.linear` (x @ Aᵀ) path — the transpose fast path (torch-spyre "
+            "#3512) only applies to unquantized weights.",
+            n_quantized,
+        )
 
     n_head = sum(1 for m in model.modules() if isinstance(m, ParallelLMHead))
     logger.debug(

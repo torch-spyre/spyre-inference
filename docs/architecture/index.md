@@ -56,7 +56,7 @@ kernel out of the compiled graph (its fused lowering corrupts under whole-model 
 |---|---|---|---|
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `maybe_compile`d kernel directly on Spyre; no float32 promotion (torch-spyre limitation) |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device: a device-resident 4D rotation cache (`[max_pos, 2, 2, padded]`) is gathered with `index_select` on Spyre, on the fly inside `forward_oot` (`gather_rotation`), then the 2×2 rotation-matrix formulation is applied through the opaque `spyre_rope_rotate` op (kept opaque because its fused lowering corrupts under whole-model compile). No priming, no CPU gather. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
-| `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
+| `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre | The weight moves to Spyre with the rest of the model and the embedding gather runs on-device (`aten.embedding` has a Spyre kernel). Only the TP shard mask still round-trips to CPU (upstream `get_masked_input_and_mask` does int64 comparisons against Python int constants, which the Spyre inductor backend rejects), then `masked_input`/`keep` are `convert`ed back to Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
@@ -153,19 +153,20 @@ call boundary:
   Spyre for the `SpyreParallelLMHead` matmul, which then returns logits on CPU
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
-and overrides `forward` to compute the TP shard mask on CPU (the upstream helper does
+and overrides `forward`. The weight moves to Spyre with the rest of the model, and the
+embedding gather runs on-device now that `aten.embedding` has a Spyre kernel
+([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)) — this
+replaces the earlier silent D2H/H2D CPU fallback that copied the full `[vocab, hidden]`
+weight on every decode step. The one remaining CPU round-trip is the TP shard mask: when
+TP>1, `forward` runs the upstream `get_masked_input_and_mask` helper on CPU (it does
 int64 comparisons against Python int constants, which the Spyre inductor backend
-rejects). Because `F.embedding` has no Spyre kernel, its `_apply` override is a no-op
-that pins the weight to CPU: the input is `convert`ed to CPU, the gather runs
-CPU-to-CPU, and only the gathered output is `convert`ed back to Spyre. This replaces the
-earlier silent D2H/H2D CPU fallback of `aten.embedding`
-([torch-spyre#420](https://github.com/torch-spyre/torch-spyre/issues/420)), which
-copied the full `[vocab, hidden]` weight on every decode step.
+rejects), then `convert`s `masked_input`/`keep` back to Spyre before the on-device gather
+and `all_reduce`.
 
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (the embedding gather, q/k/v slicing,
-the per-sequence attention varlen loop, logits indexing). RoPE's rotation-cache gather now
-runs on-device (`index_select`), so it is no longer among them.
+operations that Spyre doesn't yet support natively (q/k/v slicing, the per-sequence
+attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
+gather both run on-device now, so neither is among them.
 
 ## HF-adapters Transformers backend
 

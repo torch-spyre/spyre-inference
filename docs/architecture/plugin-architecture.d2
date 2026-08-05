@@ -6,9 +6,9 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "SpyreVocabParallelEmbedding\n(weight pinned to CPU; gather\nCPU→CPU; output→Spyre)" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  EMB: "SpyreVocabParallelEmbedding\n(on-device gather; TP shard\nmask on CPU when TP>1)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
   LP: "SpyreLogitsProcessor\n(logits.contiguous())" {

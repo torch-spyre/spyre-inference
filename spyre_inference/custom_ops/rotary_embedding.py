@@ -149,19 +149,16 @@ class _SpyreRotaryMixin:
             )
         return self._device_rotation_cache
 
-    def gather_rotation(
-        self, positions: torch.Tensor, target_device: torch.device
-    ) -> torch.Tensor | None:
+    def gather_rotation(self, positions: torch.Tensor, target_device: torch.device) -> torch.Tensor:
         """Index the device-resident cache to get this pass's per-token 2x2 rotation
-        slice; ``positions`` may arrive on the host or on Spyre. Returns ``None`` for
-        multi-dim (mrope/xdrope) positions.
+        slice; ``positions`` may arrive on the host or on Spyre.
 
-        Called on the fly inside ``forward_oot``, so ``positions`` arrives as Spyre
-        int64 (the model wrapper converts integer inputs to int64 at the model
-        boundary). torch-spyre's ``index_select`` downcasts int64 indices to int32
-        internally (safe for positions < 2**31), so no explicit cast is needed here."""
-        if positions.dim() > 1:
-            return None
+        In production this is called on the fly inside ``forward_oot`` with Spyre int64
+        positions (the model wrapper converts integer inputs to int64 at the model
+        boundary); torch-spyre's ``index_select`` downcasts int64 indices to int32
+        internally (safe for positions < 2**31), so no explicit cast is needed. The
+        host path (``target_device.type != "spyre"``) still handles CPU int64 positions
+        for the CPU-reference tests on dev laptops."""
         idx = positions.flatten()
         if target_device.type != "spyre":
             # CPU-reference path (dev laptops, rotation-math test): host index_select,

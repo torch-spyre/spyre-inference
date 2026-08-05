@@ -264,17 +264,6 @@ def test_gather_rotation_returns_spyre_slice(default_vllm_config, head_size):
 
 
 @pytest.mark.rotary
-def test_gather_rotation_mrope_positions_returns_none(default_vllm_config):
-    """Multi-dim (mrope/xdrope) positions have no Spyre rotation path: gather_rotation
-    returns None (forward_oot then has no rotation slice for that module)."""
-    from vllm.model_executor.layers.rotary_embedding import get_rope
-
-    rope = get_rope(128, 2048, is_neox_style=True, dtype=torch.float16)
-    positions = torch.randint(0, 2048, (3, 8), dtype=torch.long)  # 2D -> mrope-style
-    assert rope.gather_rotation(positions, torch.device("cpu")) is None
-
-
-@pytest.mark.rotary
 @pytest.mark.parametrize(
     "head_size,partial_rotary_factor",
     [

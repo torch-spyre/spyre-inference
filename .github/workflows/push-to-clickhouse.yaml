@@ -107,7 +107,9 @@ jobs:
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
-      # Download all XML artifacts produced by the triggering run.
+      # Download every artifact from the triggering run and unzip it — artifact
+      # *names* carry no file extension (only the file inside the zip does), so
+      # filtering has to happen post-unzip by actual filename, not by artifact name.
       # ---------------------------------------------------------------------------
       - name: List artifacts from triggering run
         id: list-artifacts
@@ -116,7 +118,7 @@ jobs:
         run: |
           ARTIFACTS=$(gh api \
             "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
-            --jq '[.artifacts[] | select(.name | endswith(".xml")) | {id: .id, name: .name}]')
+            --jq '[.artifacts[] | {id: .id, name: .name}]')
           echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
           echo "Found artifacts:"
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"

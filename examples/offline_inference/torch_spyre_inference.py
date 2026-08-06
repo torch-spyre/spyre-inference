@@ -16,6 +16,7 @@
 This example shows how to run offline inference on Spyre using the torch-spyre
 plugin code with the TorchSpyreModelRunner.
 
+By default this runs with torch.compile (STOCK_TORCH_COMPILE).
 Use --enforce-eager to skip torch.compile and run in eager mode.
 """
 
@@ -63,11 +64,20 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile, run in eager mode",
     )
+    parser.add_argument(
+        "--enforce-attn-eager",
+        action="store_true",
+        dest="enforce_attn_eager",
+        help="Run the attention kernel eagerly (default force-compiled).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if not args.enforce_attn_eager:
+        os.environ["SPYRE_FORCE_COMPILE_ATTN"] = "1"
 
     if platform.machine() == "arm64":
         print(
@@ -124,6 +134,9 @@ def main():
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
     ]
 
+    # Set STOCK_TORCH_COMPILE as the compile mode for Spyre if not running eager.
+    compilation_config = None if args.enforce_eager else {"mode": "STOCK_TORCH_COMPILE"}
+
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -133,6 +146,7 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         dtype="float16",
         enforce_eager=args.enforce_eager,
+        compilation_config=compilation_config,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
 

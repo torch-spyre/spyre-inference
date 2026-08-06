@@ -422,6 +422,26 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Repo Scoping
+# ---------------------------------------------------------------------------
+
+
+def _is_spyre_inference_session(config: pytest.Config) -> bool:
+    """True only when this pytest session is running against spyre-inference itself.
+
+    This plugin is registered via a global ``pytest11`` entry point, so pytest
+    autoloads it for *every* invocation in a venv that has spyre-testing-plugin
+    installed -- including unrelated repos (e.g. hf-adapters) that happen to
+    share the venv. Session-wide side effects (forcing VLLM_PLUGINS, patching
+    the active vLLM platform to OOT, cloning upstream vLLM tests) must stay
+    scoped to spyre-inference's own test runs, or they silently corrupt test
+    runs in other repos.
+    """
+    rootdir = Path(config.rootdir)
+    return (rootdir / "spyre_inference").is_dir() and (rootdir / "pyproject.toml").is_file()
+
+
+# ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
 
@@ -431,6 +451,12 @@ def pytest_configure(config):
     """Register Spyre plugins and detect/clone vLLM repo."""
     global _terminal_reporter
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
+
+    if not _is_spyre_inference_session(config):
+        # Not spyre-inference's own test session (e.g. autoloaded in another
+        # repo's venv) -- skip all Spyre-specific setup and upstream cloning.
+        config._upstream_tests_base = None
+        return
 
     # Set env vars BEFORE any vllm imports
     os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
@@ -706,7 +732,7 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _spyre_session_config():
+def _spyre_session_config(pytestconfig):
     """Session-wide plugin setup and default VllmConfig context.
 
     Runs once per test session to:
@@ -718,7 +744,16 @@ def _spyre_session_config():
     Individual tests no longer need to request default_vllm_config just for
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
+
+    Being autouse, this fixture runs for every test collected in the session --
+    including tests in other repos when this plugin gets autoloaded via its
+    global pytest11 entry point. Guard against patching the active vLLM
+    platform for sessions that aren't spyre-inference's own.
     """
+    if not _is_spyre_inference_session(pytestconfig):
+        yield
+        return
+
     os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 

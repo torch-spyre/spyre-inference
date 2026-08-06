@@ -916,6 +916,13 @@ def relax_torch_tolerances(request, monkeypatch):
     monkeypatch.setattr(torch.testing, "assert_close", relaxed_assert_close)
 
 
+@pytest.fixture(autouse=True)
+def inference_mode():
+    """Run every test under torch.inference_mode()."""
+    with torch.inference_mode():
+        yield
+
+
 @pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""

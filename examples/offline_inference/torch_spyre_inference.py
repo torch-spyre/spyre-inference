@@ -151,6 +151,15 @@ def main():
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
 
+    # When compiling (whole-model or attention kernel), run an untimed warmup
+    # pass first so any lazy per-shape Inductor recompiles happen outside the
+    # timed GENERATE window below.
+    if not args.enforce_eager or args.force_compile_attn:
+        print("=============== WARMUP")
+        t_warm = time.time()
+        llm.generate(prompts, sampling_params)
+        print(f"Warmup pass took {time.time() - t_warm:.2f} sec")
+
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
     print("=============== GENERATE")

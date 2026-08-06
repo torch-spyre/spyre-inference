@@ -77,6 +77,8 @@ def main():
     args = parse_args()
 
     if not args.enforce_attn_eager:
+        # Note: SPYRE_FORCE_COMPILE_ATTN=1 only compiles the
+        # specialized_paged_attn_kernel, not the complete attention.
         os.environ["SPYRE_FORCE_COMPILE_ATTN"] = "1"
 
     if platform.machine() == "arm64":

@@ -65,6 +65,32 @@ def _disable_torch_accelerator() -> None:
 _disable_torch_accelerator()
 
 
+def _raise_dynamo_recompile_limits() -> None:
+    # torch-spyre runs every aten op on the spyre device as its own
+    # torch.compile(op, dynamic=False), and all of them funnel through a single
+    # shared dynamo frame. dynamo specializes per input signature, so the
+    # accumulated recompile counter on that one frame climbs with every distinct
+    # batch shape (the prefill token dimension is not bucketed) across every
+    # op in the forward. A realistic serve workload overruns dynamo's default
+    # accumulated_recompile_limit (256), and the limit handler then re-enters the
+    # compile path recursively -> RecursionError, killing the engine.
+    #
+    # The (op × shape) set is finite and every recompile is correct, so raise
+    # both limits far out of reach. Set at import to cover every process (engine
+    # + TP workers); torch._dynamo.config is process-local. This previously lived
+    # in a vllm_bench_wrapper.py shim for benchmarks (torch-spyre issue #444);
+    # doing it here makes a plain `vllm serve` work without any wrapper.
+    import torch._dynamo
+
+    # ty thinks these are Literal[256]; torch._dynamo.config accepts arbitrary
+    # ints at runtime, so suppress the overly strict assignment check.
+    torch._dynamo.config.cache_size_limit = 100000  # ty: ignore[invalid-assignment]
+    torch._dynamo.config.accumulated_recompile_limit = 100000  # ty: ignore[invalid-assignment]
+
+
+_raise_dynamo_recompile_limits()
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 

@@ -150,7 +150,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         # Scatter unpadded results back into the flat output. Pull to CPU first
         # (Spyre slicing corrupts memory). For stick-aligned head_size (64) we
-        # can per-token spyre.overwrite into [1, H, D]. MiniLM's D=32 makes that
+        # can per-token narrow().copy_() into [1, H, D]. MiniLM's D=32 makes that
         # stick expression illegal (``d1 + 32*Mod(d0, 2)``), so flatten H*D
         # (384 % 64 == 0) for the device write instead.
         attn_out_cpu = convert(attn_out, "cpu", output.dtype)

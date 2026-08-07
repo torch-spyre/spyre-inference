@@ -4,7 +4,7 @@ instA: Spyre instance A {
   style.fill: "#eef5ff"
   style.stroke: "#3b6fb3"
   OA: "OffloadingConnector + SpyreSharedOffloadingSpec\n(subclasses M1's SpyreOffloadingSpec)"
-  HA: "SpyreCpuOffloadingHandlers -> SpyreKvDmaCopier"
+  HA: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
   OA -> HA
 }
 
@@ -12,7 +12,7 @@ instB: Spyre instance B {
   style.fill: "#eef5ff"
   style.stroke: "#3b6fb3"
   OB: "OffloadingConnector + SpyreSharedOffloadingSpec"
-  HB: "SpyreCpuOffloadingHandlers -> SpyreKvDmaCopier"
+  HB: "SpyreOffloadingWorker -> SpyreKvDmaCopier"
   OB -> HB
 }
 

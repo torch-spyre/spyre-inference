@@ -3,13 +3,13 @@ flowchart TB
     subgraph instA["<b>Spyre instance A</b>"]
         direction TB
         OA["OffloadingConnector + SpyreSharedOffloadingSpec<br/>(subclasses M1's SpyreOffloadingSpec)"]
-        HA["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
+        HA["SpyreOffloadingWorker → SpyreKvDmaCopier"]
         OA --> HA
     end
     subgraph instB["<b>Spyre instance B</b>"]
         direction TB
         OB["OffloadingConnector + SpyreSharedOffloadingSpec"]
-        HB["SpyreCpuOffloadingHandlers → SpyreKvDmaCopier"]
+        HB["SpyreOffloadingWorker → SpyreKvDmaCopier"]
         OB --> HB
     end
 

@@ -86,6 +86,11 @@ QUERY_CHUNK_SIZE = 32
 # yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
 ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
+# Use indirect tensor indexing for the varlen query layout. When enabled, the
+# flat query tensor stays on device and sequences are gathered via index tensors
+# rather than materializing a dense padded query on CPU.
+_USE_INDIRECT_QUERY = os.environ.get("SPYRE_USE_INDIRECT_QUERY", "1") == "1"
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -285,6 +290,8 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
+            q: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+               (dense assembled query, used for single-seq decode fallback)
             k_pages: list of [num_kv_heads, block_size, head_size]
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
@@ -302,18 +309,8 @@ def _create_compilable_page_attn(
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            # Syntax with views and indirect access
-            # (i.e. instead of _indirect_matmul_mock)
-            # k_page = k_pages[page_idx]
-            # v_page = v_pages[page_idx]
-            # k_page_4d = k_page.unsqueeze(1)
-            # v_page_4d = v_page.unsqueeze(1)
-
             mask_tile = mask_tiles[i]
 
-            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            # NOTE: for true "varlen" layout, q would be
-            # an indirect access too (avoided here for simplicity...)
             scores = _indirect_matmul_mock(
                 q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
             )
@@ -335,7 +332,6 @@ def _create_compilable_page_attn(
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                # tile_output = torch.matmul(tile_probs, v_page_4d)
                 tile_output = _indirect_matmul_mock(
                     tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
                 )
@@ -350,7 +346,6 @@ def _create_compilable_page_attn(
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
                 tile_output += _indirect_matmul_mock(
                     tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
                 )
@@ -361,6 +356,121 @@ def _create_compilable_page_attn(
         return tile_output / tile_sum
 
     return specialized_paged_attn_kernel
+
+
+def _create_compilable_page_attn_indirect_query(
+    num_blocks: int,
+    padded_query_len: int,
+    num_kv_heads: int,
+    num_heads: int,
+    head_size: int,
+    has_alibi: bool = False,
+    logits_soft_cap: float = 0.0,
+):
+    """Create online softmax attention with indirect query gather.
+
+    Instead of receiving a dense 4D query tensor, the kernel receives the flat
+    varlen query buffer and an index list selecting the tokens for one
+    sequence. The selected tokens are gathered, reshaped to
+    [num_kv_heads, num_queries_per_kv, padded_query_len, head_size], padded to
+    the global aligned length, and used directly in the page loop. This avoids
+    a CPU round-trip for batch decode, prefill, and mixed batches.
+
+    Closure constants: num_blocks, padded_query_len, num_kv_heads, num_heads,
+    head_size, has_alibi, logits_soft_cap.
+    """
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    def specialized_paged_attn_indirect_query_kernel(
+        query,  # [num_tokens, num_heads, head_size] on target device
+        k_pages,
+        v_pages,
+        page_indices,
+        mask_tiles,
+        scale,
+        alibi_bias_tiles=None,
+    ):
+        """
+        Expected shapes:
+            query: flat varlen query buffer [num_tokens, num_heads, head_size]
+            k_pages, v_pages: list of [num_kv_heads, block_size, head_size]
+            page_indices: [num_blocks]
+            mask_tiles: [num_blocks]
+        """
+        # Gather this sequence's query tokens and reshape to the 4D layout the
+        # page loop expects. Use index_select with a contiguous 1-D index tensor;
+        # unbind+stack accidentally gathers the whole flat query buffer on Spyre
+        # because the per-row slices collapse to the same underlying storage.
+        seq_len = query.shape[0]
+        indices = torch.arange(seq_len, device=query.device)
+        q_seq = query.index_select(0, indices).contiguous()
+        q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+        q = q.reshape(num_kv_heads, num_queries_per_kv, -1, head_size)
+        if padded_query_len > q.shape[2]:
+            pad = torch.zeros(
+                num_kv_heads,
+                num_queries_per_kv,
+                padded_query_len - q.shape[2],
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            q = torch.cat([q, pad], dim=2)
+
+        tile_max = None
+        tile_sum = None
+        tile_output = None
+
+        for i in range(num_blocks):
+            page_idx = page_indices[i]
+            mask_tile = mask_tiles[i]
+
+            scores = _indirect_matmul_mock(
+                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+            )
+            scores *= scale
+            if logits_soft_cap > 0.0:
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+            if has_alibi:
+                assert alibi_bias_tiles is not None
+                scores = scores + alibi_bias_tiles[i]
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                assert tile_max is not None
+                assert tile_sum is not None
+                assert tile_output is not None
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output += _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+
+        assert tile_output is not None and tile_sum is not None
+        result = tile_output / tile_sum
+        # Reshape back to [query_len, num_heads, head_size] on device.
+        result = result.reshape(num_heads, padded_query_len, head_size)
+        result = result.transpose(0, 1).contiguous()
+        # Slice real tokens after the contiguous() so the returned tensor has
+        # a concrete shape equal to the sequence query length. Doing the slice
+        # before contiguous() hits a Spyre layout bug where result[:q_seq.shape[0]]
+        # returns a tensor whose size-0 dimension is misreported after D2H.
+        return result[: q_seq.shape[0]]
+
+    return specialized_paged_attn_indirect_query_kernel
 
 
 @dataclass
@@ -750,6 +860,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
+        self._attn_fns_indirect_query: dict[tuple[int, int], object] = {}
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
@@ -774,6 +885,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
             )
         return self._attn_fns[key]
+
+    def _get_attn_fn_indirect_query(self, num_blocks: int, padded_query_len: int):
+        key = (num_blocks, padded_query_len)
+        if key not in self._attn_fns_indirect_query:
+            self._attn_fns_indirect_query[key] = _maybe_compile(
+                _create_compilable_page_attn_indirect_query(
+                    num_blocks,
+                    padded_query_len,
+                    num_kv_heads=self.num_kv_heads,
+                    num_heads=self.num_heads,
+                    head_size=self.head_size,
+                    has_alibi=self.alibi_slopes is not None,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
+            )
+        return self._attn_fns_indirect_query[key]
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -813,10 +940,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
         ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
+
+        # Decide whether we can keep the query on device for the whole varlen
+        # batch. Indirect query access is enabled by default and supports all
+        # batch shapes/prefill on Spyre, removing the CPU round-trip.
+        use_indirect_query = _USE_INDIRECT_QUERY and _target_device.type == "spyre"
         needs_query_cpu = (
-            attn_metadata.max_query_len > 1
-            or attn_metadata.num_seqs > 1
-            or not ondevice_overwrite_ok
+            not use_indirect_query
+            and (
+                attn_metadata.max_query_len > 1
+                or attn_metadata.num_seqs > 1
+                or not ondevice_overwrite_ok
+            )
         )
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
@@ -833,7 +968,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen).
         # Pass on-device query for single-sequence decode (assembled at offset 0
-        # without a CPU round-trip); everything else goes through query_cpu.
+        # without a CPU round-trip) or the indirect-query path; everything else
+        # goes through query_cpu.
         query_dev = convert(query, _target_device) if not needs_query_cpu else None
         output = self._online_softmax_attention(
             query_dev,
@@ -932,6 +1068,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (torch-spyre#220 / #1371-3).
         output_cpu = torch.zeros_like(output, device="cpu")
 
+        use_indirect_query = _USE_INDIRECT_QUERY and _target_device.type == "spyre"
+
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
@@ -940,7 +1078,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            if query_dev is not None and query_len == 1:
+            if use_indirect_query:
+                # Indirect query path: pass the flat on-device query buffer and
+                # let the kernel gather the sequence's tokens. The kernel uses
+                # unbind+stack (index_select hits a Spyre layout bug for
+                # head_size=64). This works for decode/prefill and any batch size.
+                q_dev = query_dev
+            elif query_dev is not None and query_len == 1:
                 # Single-sequence decode: assemble the padded 4D query on device.
                 # The one real token is written at offset 0 (a safe Spyre write);
                 # padded query rows are masked out and dropped from the result.
@@ -1016,16 +1160,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
-            result = attn_fn(
-                q_dev,
-                k_pages,
-                v_pages,
-                page_indices,
-                mask_tiles,
-                self.scale,
-                alibi_bias_tiles=alibi_bias_tiles,
-            )
+            if use_indirect_query:
+                attn_fn = self._get_attn_fn_indirect_query(
+                    num_blocks_needed, aligned_max_query_len
+                )
+                result = attn_fn(
+                    query_dev,
+                    k_pages,
+                    v_pages,
+                    page_indices,
+                    mask_tiles,
+                    self.scale,
+                    alibi_bias_tiles=alibi_bias_tiles,
+                )
+            else:
+                attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+                result = attn_fn(
+                    q_dev,
+                    k_pages,
+                    v_pages,
+                    page_indices,
+                    mask_tiles,
+                    self.scale,
+                    alibi_bias_tiles=alibi_bias_tiles,
+                )
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             #   → [query_len, num_heads, head_size]
@@ -1033,9 +1191,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # is broken) and write into the CPU staging buffer; one bulk H2D
             # at the end of the loop replaces the per-token writes.
             result_cpu = convert(result, "cpu", output.dtype)
-            result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
-            result_cpu = result_cpu.transpose(1, 2).contiguous()
-            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
+            if use_indirect_query:
+                # Indirect-query kernel returns the whole batch result
+                # [num_actual_tokens, num_heads, head_size]; slice the rows for
+                # this sequence before assigning.
+                output_cpu[q_start:q_end] = result_cpu[q_start:q_end]
+            else:
+                result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
+                result_cpu = result_cpu.transpose(1, 2).contiguous()
+                output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
 
         output.copy_(convert(output_cpu, device=_target_device))
         return output

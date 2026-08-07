@@ -561,6 +561,48 @@ def test_spyre_attn_decode_head_size(
 )
 @pytest.mark.parametrize(
     "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+    ],
+)
+def test_spyre_attn_varlen_indirect_query(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Indirect query access keeps varlen batches on device (issue #399).
+
+    The forward path gathers each sequence's query tokens from the flat
+    on-device query buffer via index_select, avoiding the CPU round-trip for
+    batch decode, prefill, and mixed batches.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
     [
         pytest.param("NONE", id="compilation_NONE"),
         pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),

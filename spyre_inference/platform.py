@@ -232,6 +232,32 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
+            # Build bucket sizes for pre-compilation warmup.
+            max_num_seqs = (
+                vllm_config.scheduler_config.max_num_seqs
+                if vllm_config.scheduler_config.max_num_seqs is not None
+                else cls._DEFAULT_MAX_NUM_SEQS
+            )
+            max_capture_size = min(max_num_seqs * 2, 512)
+            compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
+            if max_capture_size >= 8:
+                compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
+            if max_capture_size >= 256:
+                compile_sizes += list(range(256, max_capture_size + 1, 16))
+            vllm_config.compilation_config.compile_sizes = compile_sizes
+
+            # Cap max_num_batched_tokens so the scheduler never sends more
+            # tokens than the largest compiled bucket.
+            if (
+                vllm_config.scheduler_config.max_num_batched_tokens is None
+                or vllm_config.scheduler_config.max_num_batched_tokens > max_capture_size
+            ):
+                logger.warning(
+                    "Setting max_num_batched_tokens=%d (max compiled bucket size).",
+                    max_capture_size,
+                )
+                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.

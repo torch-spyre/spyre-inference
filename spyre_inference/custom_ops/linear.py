@@ -22,10 +22,10 @@ load time and swaps the GEMM to `x @ Wᵀ`, which is the fast path. It is the
 pure-PyTorch equivalent of torch-spyre's `[1,0]` weight layout, which only fires
 for `nn.Linear` and so misses every vLLM parallel-linear.
 
-The pass runs on CPU after `analyze_and_unfuse` and before the move to Spyre.
-QKV projections (already un-fused into `q/k/v_weight` by that pass) carry their
-own transpose in `unfuse.py`; the LM head transposes `padded_weight` in
-`parallel_lm_head.py`. Both reuse `spyre_linear_t` here so the fast path is
+The pass runs on CPU before the move to Spyre. QKV projections keep their fused
+weight and are handled by ``_patch_attention_qkv_splits`` in the model runner
+(compiled slice+clone). The LM head transposes ``padded_weight`` in
+``parallel_lm_head.py``. Both reuse ``spyre_linear_t`` here so the fast path is
 defined once.
 """
 
@@ -89,9 +89,10 @@ def _transpose_weight(module: nn.Module, name: str) -> None:
 def transpose_linear_weights_for_spyre(model: nn.Module) -> None:
     """Transpose 2-D linear weights so the forward GEMM is `x @ A` (Spyre-fast).
 
-    Runs after the checkpoint is loaded and un-fused (weights on CPU). Covers
-    generic unquantized `LinearBase` layers; un-fused QKV (`weight is None`) and
-    the LM head are transposed by their own modules.
+    Runs after the checkpoint is loaded (weights on CPU). Covers generic
+    unquantized `LinearBase` layers; fused QKV (handled by compiled
+    slice+clone in the model runner) and the LM head are transposed by
+    their own modules.
     """
     n_linear = 0
     n_quantized = 0
@@ -106,8 +107,8 @@ def transpose_linear_weights_for_spyre(model: nn.Module) -> None:
             n_quantized += 1
             continue
         w = getattr(module, "weight", None)
-        # Skip un-fused QKV (weight is None; q/k/v_weight handled in unfuse.py)
-        # and anything without a plain 2-D weight.
+        # Skip QKV (fused weight transposed by the model runner's compiled
+        # slice+clone path) and anything without a plain 2-D weight.
         if w is None or w.dim() != 2 or w.device.type != "cpu":
             continue
         _transpose_weight(module, "weight")

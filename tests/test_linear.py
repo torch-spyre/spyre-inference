@@ -16,9 +16,10 @@
 
 These run on CPU (no Spyre device needed): the pass is a pure host-side weight
 mutation and `spyre_linear_t` is a plain `torch.matmul`, arithmetically identical
-to `F.linear` on any device. The QKV and LM-head transposes have their own tests
-(test_unfuse.py, test_parallel_lm_head.py); this file covers the generic
-`LinearBase` path (down_proj, gate_up_proj, ...) that those two do not.
+to `F.linear` on any device. QKV projections keep their fused weight (handled by
+compiled slice+clone in the model runner); the LM head has its own tests in
+test_parallel_lm_head.py. This file covers the generic `LinearBase` path
+(down_proj, gate_up_proj, ...).
 """
 
 import pytest
@@ -160,8 +161,8 @@ def test_quantized_layer_skipped_without_cross_contamination(tp_group):
 
 
 @pytest.mark.mlp
-def test_unfused_qkv_skipped_by_generic_pass(tp_group):
-    """A layer whose `weight` is already None (un-fused QKV) is skipped."""
+def test_qkv_none_weight_skipped_by_generic_pass(tp_group):
+    """A layer whose `weight` is None is skipped by the generic transpose pass."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from spyre_inference.custom_ops.linear import (
         transpose_linear_weights_for_spyre,
@@ -178,7 +179,7 @@ def test_unfused_qkv_skipped_by_generic_pass(tp_group):
         disable_tp=True,
         prefix="qkv_proj",
     )
-    # Emulate the post-unfuse state: fused weight cleared.
+    # Edge case: weight cleared (e.g. by a quantizer or other pass).
     qkv.weight = None
 
     # Must not raise and must not create a weight_t.

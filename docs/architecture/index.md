@@ -57,10 +57,10 @@ read of the gathered rotation slice out of the compiled graph.
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `maybe_compile`d kernel directly on Spyre; no float32 promotion (torch-spyre limitation) |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
-| `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
+| `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass asserts `gather_output=False`; the fused weight stays on-device and `F.linear` runs normally; in eager mode the model runner patches each attention module's forward to replace `qkv.split(...)` with a compiled slice+clone (Spyre drops `storage_offset` on graph inputs, so raw `split` views silently corrupt) |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
-| `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
+| `LogitsProcessor` | `SpyreLogitsProcessor` | — | Overrides `_gather_logits` (TP>1) and `_get_logits` (all TP sizes) to move logits from Spyre to CPU before downstream scaling / sampling |
 
 `RowParallelLinear` and `MergedColumnParallelLinear` are **not** subclassed:
 
@@ -70,15 +70,6 @@ read of the gathered rotation slice out of the compiled graph.
 - `MergedColumnParallelLinear` (`gate_up_proj`) runs the upstream class unchanged: the
   fused `[..., 2*d]` output feeds straight into `SpyreSiluAndMul`, which slices gate/up
   on-device.
-
-### Weight un-fusing
-
-`analyze_and_unfuse` (`custom_ops/unfuse.py`) runs once after the checkpoint is loaded,
-while weights are still on CPU. The fused `QKVParallelLinear` weight is a problem on Spyre:
-splitting its output on-device yields strided views that corrupt when transferred. So the
-pass splits the fused weight into contiguous per-part Parameters and rebinds `forward` to
-run one `F.linear` per part. The result is a `SplitQKV` container that the unmodified
-downstream idiom — `q, k, v = qkv.split(...)` — keeps consuming unchanged.
 
 ## Attention Backend
 
@@ -141,8 +132,12 @@ float compute tensors land on Spyre via `self._spyre_device`. Because there is n
 `vllm._C` under `VLLM_TARGET_DEVICE=empty`, the runner also swaps in a pure-PyTorch
 `_compute_slot_mapping` implementation for the paged-cache slot mapping.
 
-At load time, `load_model` calls `analyze_and_unfuse(self.model)` (weight un-fusing) and
-then moves every module except `Attention` scale buffers onto Spyre.
+At load time, `load_model` moves every module except `Attention` scale buffers onto
+Spyre, then calls `_compile_for_spyre` which — in eager mode — patches each attention
+module's forward via `_patch_attention_qkv_splits`: the original `qkv.split(...)` is
+replaced with a compiled slice+clone that produces contiguous Q/K/V tensors with
+`storage_offset=0` (Spyre's Inductor backend drops graph-input offsets, so raw `split`
+views silently read from offset 0).
 
 `_SpyreModelWrapper` sits between the model runner and the model and converts at the
 call boundary:
@@ -164,8 +159,7 @@ copied the full `[vocab, hidden]` weight on every decode step.
 
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
 operations that Spyre doesn't yet support natively (the embedding gather, the rotary
-frequency-cache `index_select`, q/k/v slicing, the per-sequence attention varlen loop,
-logits indexing).
+frequency-cache `index_select`, the per-sequence attention varlen loop, logits indexing).
 
 ## HF-adapters Transformers backend
 

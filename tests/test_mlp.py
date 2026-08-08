@@ -28,34 +28,29 @@ import torch.nn.functional as F
 def test_merged_column_matches_reference(
     tp_group, num_tokens, hidden_size, intermediate_size, use_bias
 ):
-    """A fused gate_up_proj on Spyre matches the upstream CPU F.linear."""
-    import torch.nn as nn
+    """MergedColumnParallelLinear (gate_up_proj) fused output on Spyre
+    matches upstream CPU F.linear.
 
-    from vllm.model_executor.layers.activation import SiluAndMul
+    MergedColumnParallelLinear runs the upstream class unchanged: the fused
+    ``[..., 2*d]`` output feeds straight into ``SpyreSiluAndMul``, which
+    slices gate/up on-device via indirect access under torch.compile.
+    """
+
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
     dtype = torch.float16
     torch.manual_seed(0)
 
-    class MLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.gate_up_proj = MergedColumnParallelLinear(
-                input_size=hidden_size,
-                output_sizes=[intermediate_size, intermediate_size],
-                bias=use_bias,
-                params_dtype=dtype,
-                quant_config=None,
-                disable_tp=True,
-                prefix="gate_up_proj",
-            )
-            self.act_fn = SiluAndMul()
+    layer = MergedColumnParallelLinear(
+        input_size=hidden_size,
+        output_sizes=[intermediate_size, intermediate_size],
+        bias=use_bias,
+        params_dtype=dtype,
+        quant_config=None,
+        disable_tp=True,
+        prefix="gate_up_proj",
+    )
 
-    mlp = MLP()
-    layer = mlp.gate_up_proj
-
-    # torch.empty() leaves memory uninitialised (may contain NaN in float16);
-    # fill with small random values so the comparison is meaningful.
     layer.weight.data.normal_(std=0.02)
     if layer.bias is not None:
         layer.bias.data.zero_()
@@ -64,9 +59,10 @@ def test_merged_column_matches_reference(
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    mlp = mlp.to("spyre")
+    layer = layer.to("spyre")
     gate_up, bias = layer(x.to("spyre"))
     assert bias is None
+    assert isinstance(gate_up, torch.Tensor)
     assert gate_up.shape == (num_tokens, 2 * intermediate_size)
 
     torch.testing.assert_close(gate_up.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
@@ -84,16 +80,13 @@ def test_merged_column_matches_reference(
 )
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, head_size, use_bias):
-    """An un-fused qkv_proj returns a SplitQKV whose (q, k, v) match the
-    fused upstream F.linear.
-
-    analyze_and_unfuse splits the fused weight on CPU and rebinds forward to
-    return a SplitQKV container; the unmodified `qkv.split(...)` idiom then
-    yields three contiguous tensors — no slice on a Spyre tensor.
+    """Fused qkv_proj on Spyre produces a contiguous fused tensor matching
+    the CPU reference.  The Q/K/V slice+clone is compiled separately by the
+    model runner (``_patch_attention_qkv_splits``) — this test only validates
+    the projection itself.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
-    from spyre_inference.custom_ops.unfuse import SplitQKV, analyze_and_unfuse
 
     dtype = torch.float16
     hidden_size = num_heads * head_size
@@ -111,41 +104,20 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     )
     assert isinstance(layer, SpyreQKVParallelLinear)
 
-    # torch.empty() leaves memory uninitialised (may contain NaN in float16);
-    # fill with small random values so the comparison is meaningful.
     layer.weight.data.normal_(std=0.02)
     if layer.bias is not None:
         layer.bias.data.zero_()
 
-    # Capture the fused reference BEFORE the pass destructively un-fuses.
     torch.manual_seed(1)
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
     expected = F.linear(x, layer.weight, layer.bias)
 
-    # A bare QKV layer (no parent) still gets un-fused — QKV detection does
-    # not require a sibling.
-    analyze_and_unfuse(layer)
-    assert layer.weight is None, "fused weight should be cleared to None"
-    for attr in ("q_weight", "k_weight", "v_weight"):
-        assert hasattr(layer, attr), f"missing unfused param {attr}"
-
     layer = layer.to("spyre")
-    qkv, bias = layer(x.to("spyre"))
+    result, bias = layer(x.to("spyre"))
     assert bias is None
-    assert isinstance(qkv, SplitQKV)
-    # Exercise the unmodified downstream idiom.
-    q_size = num_heads * head_size
-    kv_size = num_kv_heads * head_size
-    q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-    actual = torch.cat([q, k, v], dim=-1)
+    assert isinstance(result, torch.Tensor)
 
-    assert q.shape == (num_tokens, q_size)
-    assert k.shape == (num_tokens, kv_size)
-    assert v.shape == (num_tokens, kv_size)
-    # Each part is contiguous on Spyre — no view, no D2H workaround needed.
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-
-    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(result.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.mlp
@@ -194,9 +166,10 @@ def test_qkv_oot_registration(tp_group):
     """QKVParallelLinear is swapped for the Spyre OOT subclass.
 
     Merged/Row parallel linears are intentionally NOT subclassed: unquantized
-    apply() on Spyre is already plain F.linear, and the gate/up + qkv weights
-    are handled by analyze_and_unfuse. Only QKV keeps a subclass, to assert
-    the gather_output=False invariant.
+    apply() on Spyre is already plain F.linear.  QKV keeps a subclass to
+    assert the ``gather_output=False`` invariant; the compiled slice+clone
+    that replaces ``qkv.split()`` is applied at the model-runner level
+    (``_patch_attention_qkv_splits``).
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear

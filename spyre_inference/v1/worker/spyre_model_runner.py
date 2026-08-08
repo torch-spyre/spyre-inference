@@ -58,7 +58,6 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
 from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -406,9 +405,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV projections.
-        analyze_and_unfuse(self.model)
-
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
@@ -418,7 +414,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # forward GEMM is the fast `x @ A` instead of `F.linear`'s slow `x @ Aᵀ`
         # (torch-spyre #3512). vLLM linears aren't nn.Linear, so torch-spyre's
         # [1,0]-layout `.to("spyre")` patch skips them; we do the equivalent here
-        # in pure PyTorch. Runs after un-fusing (QKV carries its own transpose).
+        # in pure PyTorch. QKV stays fused (handled by compiled slice+clone).
         transpose_linear_weights_for_spyre(self.model)
 
         # Move layer weights to Spyre device.
@@ -480,6 +476,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 f"are supported."
             )
 
+        self._patch_attention_qkv_splits(
+            compile_split=self.vllm_config.model_config.enforce_eager
+            or mode is CompilationMode.NONE
+        )
+
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
@@ -498,6 +499,70 @@ class TorchSpyreModelRunner(GPUModelRunner):
             type(self.get_model()).__name__,
             time.time() - t0,
         )
+
+    def _patch_attention_qkv_splits(self, compile_split: bool = True) -> None:
+        """Replace ``qkv.split()`` with slice+clone.
+
+        Spyre drops ``storage_offset`` on graph inputs, so non-zero-offset
+        views from ``split()`` read wrong data.  Slicing + ``.clone()``
+        produces fresh contiguous tensors whose offsets are zero.
+
+        Args:
+            compile_split: If True (eager mode), the slice+clone is wrapped in
+                ``torch.compile`` so the views stay inside a compiled region.
+                If False (fullgraph mode), the slice+clone is plain Python —
+                the outer ``torch.compile(fullgraph=True)`` traces through it.
+        """
+        from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
+
+        def _split_qkv(qkv, q_size, kv_size):
+            return (
+                qkv[..., :q_size].clone(),
+                qkv[..., q_size : q_size + kv_size].clone(),
+                qkv[..., q_size + kv_size :].clone(),
+            )
+
+        split_fn = torch.compile(_split_qkv, dynamic=False) if compile_split else _split_qkv
+
+        count = 0
+        for _name, module in self.model.named_modules():
+            if not (
+                hasattr(module, "qkv_proj")
+                and isinstance(module.qkv_proj, SpyreQKVParallelLinear)
+                and hasattr(module, "q_size")
+                and hasattr(module, "kv_size")
+                and hasattr(module, "rotary_emb")
+                and hasattr(module, "attn")
+                and hasattr(module, "o_proj")
+            ):
+                continue
+
+            def _make_forward(qkv_proj, rotary, attn, o_proj, qs, kvs):
+                def forward(positions, hidden_states):
+                    qkv, _ = qkv_proj(hidden_states)
+                    q, k, v = split_fn(qkv, qs, kvs)
+                    q, k = rotary(positions, q, k)
+                    output, _ = o_proj(attn(q, k, v))
+                    return output
+
+                return forward
+
+            module.forward = _make_forward(
+                module.qkv_proj,
+                module.rotary_emb,
+                module.attn,
+                module.o_proj,
+                module.q_size,
+                module.kv_size,
+            )
+            count += 1
+
+        if count:
+            logger.info(
+                "Patched %d attention module(s) with QKV slice+clone for Spyre (compiled=%s).",
+                count,
+                compile_split,
+            )
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

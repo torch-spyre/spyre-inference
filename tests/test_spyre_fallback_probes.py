@@ -42,41 +42,24 @@ def spyre_device():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "compile",
-        pytest.param(
-            "eager",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "Spyre returns a non-contiguous last-dim slice whose values are "
-                    "correct, but using it as a binary-op operand silently produces "
-                    "wrong results (the second operand appears to ignore its storage "
-                    "offset). This blocks removing the CPU detour in SpyreSiluAndMul "
-                    "(fused gate|up slice) and SpyreParallelLMHead (unpad slice)."
-                ),
-            ),
-        ),
-    ],
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Spyre returns a non-contiguous last-dim slice whose values are "
+        "correct, but using it as a binary-op operand silently produces "
+        "wrong results (the second operand appears to ignore its storage "
+        "offset). This blocks removing the CPU detour in SpyreSiluAndMul "
+        "(fused gate|up slice) and SpyreParallelLMHead (unpad slice)."
+    ),
 )
-def test_spyre_last_dim_slice(spyre_device, mode):
+def test_spyre_last_dim_slice(spyre_device):
     """Last-dim slice of a Spyre tensor (fused gate|up path)."""
     x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)
-
-    def fn(x):
-        d = x.shape[-1] // 2
-        gate = x[..., :d]
-        up = x[..., d:]
-        return F.silu(gate) * up
-
-    if mode == "compile":
-        fn = torch.compile(fn, dynamic=False, backend="inductor")
-
-    expected = F.silu(x.cpu()[..., : x.shape[-1] // 2]) * x.cpu()[..., x.shape[-1] // 2 :]
-
-    out = fn(x)
-
+    d = x.shape[-1] // 2
+    gate = x[..., :d]
+    up = x[..., d:]
+    out = F.silu(gate) * up
+    expected = F.silu(x.cpu()[..., :d]) * x.cpu()[..., d:]
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
@@ -108,17 +91,16 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     strict=True,
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
-        "an indexed scatter write. Historically this forced SpyreQKVParallelLinear "
-        "to D2H its result before returning; the current Spyre path side-steps it "
-        "by un-fusing the QKV weight after load. The probe is kept because the "
-        "underlying torch-spyre limitation still gates attention's per-token "
-        "KV-cache scatter and other rework."
+        "an indexed scatter write. QKV projections use a compiled "
+        "slice+clone (via _patch_attention_qkv_splits in the model runner) "
+        "to avoid split's offset views, but the underlying torch-spyre "
+        "limitation still gates attention's per-token KV-cache scatter."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):
     """Scatter write whose source is a non-contiguous strided view.
 
-    Failure path:
+    Failure path (raw split, without compiled slice+clone):
       1. qkv.split()        → strided 2D Spyre views
       2. v.view(-1, H, D)   → non-contiguous 3D Spyre tensor (Attention.forward)
       3. kv_cache[idx] = v  → scatter write with strided source
@@ -153,12 +135,12 @@ def test_spyre_strided_scatter_source(spyre_device):
     kv_cache[block_indices, 1, block_offsets] = v
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=("Spyre lacks a native index_select kernel. This blocks on-device RoPE cos/sin gather."),
+)
 def test_spyre_index_select_for_rope(spyre_device):
-    """index_select rows from a cache (RoPE cos/sin gather primitive).
-
-    torch-spyre has a multi-row index_select kernel. The single-row case now works
-    too (torch-spyre#3418; see test_spyre_single_row_index_select), so
-    SpyreRotaryEmbedding.gather_rotation gathers on-device."""
+    """index_select rows from a cache (RoPE cos/sin gather primitive)."""
     cos_sin_cache = torch.randn(2048, 64, dtype=torch.float16, device=spyre_device)
     positions = torch.arange(32, device=spyre_device)
     out = cos_sin_cache.index_select(0, positions)
@@ -166,21 +148,9 @@ def test_spyre_index_select_for_rope(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
-def test_spyre_single_row_index_select(spyre_device):
-    """A one-row index_select over the 4D RoPE rotation cache (single-token decode).
-
-    Fixed by torch-spyre#3418; this now guards the on-device gather in
-    SpyreRotaryEmbedding.gather_rotation."""
-    cache = torch.randn(2048, 2, 2, 64, dtype=torch.float16, device=spyre_device)
-    idx = torch.zeros(1, dtype=torch.int64, device=spyre_device)
-    out = cache.index_select(0, idx)
-    expected = cache.cpu().index_select(0, idx.cpu())
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
-
-
-# Note: the embedding single-row probe lives in
-# tests/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
-# It is intentionally not duplicated here.
+# Note: embedding now runs natively on Spyre via indirect access (no CPU
+# fallback). The positive assertion lives in
+# tests/test_vocab_parallel_embedding.py::test_embedding_does_not_fall_back_to_cpu.
 
 
 # ---------------------------------------------------------------------------

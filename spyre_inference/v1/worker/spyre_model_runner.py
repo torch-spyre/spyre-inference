@@ -57,8 +57,6 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
-from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -406,20 +404,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV projections.
-        analyze_and_unfuse(self.model)
-
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
-
-        # Store 2-D linear weights transposed (Wᵀ) and matmul directly, so the
-        # forward GEMM is the fast `x @ A` instead of `F.linear`'s slow `x @ Aᵀ`
-        # (torch-spyre #3512). vLLM linears aren't nn.Linear, so torch-spyre's
-        # [1,0]-layout `.to("spyre")` patch skips them; we do the equivalent here
-        # in pure PyTorch. Runs after un-fusing (QKV carries its own transpose).
-        transpose_linear_weights_for_spyre(self.model)
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)

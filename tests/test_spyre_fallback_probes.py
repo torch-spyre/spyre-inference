@@ -184,7 +184,64 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 3. Symbolic-offset in-place write
+# 3. Indirect tensor access in matmul (attention page gathering)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Indirectly indexing a dense Spyre tensor by a device index, then "
+        "transposing and using it in torch.matmul, silently produces wrong "
+        "results (layout-propagation bug). The attention backend therefore "
+        "keeps _indirect_matmul_mock, which gathers pages from a Python list "
+        "of per-page tensors. When true indirect access works on Spyre, "
+        "_indirect_matmul_mock can be replaced by direct indexing in "
+        "_create_compilable_page_attn."
+    ),
+)
+def test_spyre_indirect_matmul_tensor_index(spyre_device):
+    """Index a dense tensor by a device index before matmul (attention gather).
+
+    This is the primitive _indirect_matmul_mock emulates with a Python list
+    inside the compiled attention loop:
+      k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
+      scores = torch.matmul(q, k_page)
+    where page_idx lives on the Spyre device.
+    """
+    num_kv_heads = 2
+    block_size = 64
+    head_size = 64
+    num_blocks = 4
+    query_len = 32
+
+    q = torch.randn(1, num_kv_heads, query_len, head_size, dtype=torch.float16, device=spyre_device)
+    k_pages = torch.randn(
+        num_blocks,
+        num_kv_heads,
+        block_size,
+        head_size,
+        dtype=torch.float16,
+        device=spyre_device,
+    )
+    page_idx = torch.tensor(2, dtype=torch.int32, device=spyre_device)
+
+    @torch.compile(dynamic=False)
+    def page_attn(q, k_pages, page_idx):
+        k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
+        return torch.matmul(q, k_page)
+
+    scores = page_attn(q, k_pages, page_idx)
+
+    expected = torch.matmul(
+        q.cpu(),
+        k_pages.cpu()[2].unsqueeze(1).transpose(-2, -1),
+    )
+    torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 4. Symbolic-offset in-place write
 # ---------------------------------------------------------------------------
 
 
@@ -244,7 +301,7 @@ def test_spyre_narrow_copy_row_write(spyre_device, mode):
 
 
 # ---------------------------------------------------------------------------
-# 4. In-place mul on non-contiguous tensor (LogitsProcessor)
+# 5. In-place mul on non-contiguous tensor (LogitsProcessor)
 # ---------------------------------------------------------------------------
 
 

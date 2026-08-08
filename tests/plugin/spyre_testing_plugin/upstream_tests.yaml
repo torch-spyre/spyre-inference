@@ -43,7 +43,7 @@ tests:
                 # - facebook/opt-125m # requires a torch-spyre fix for int adds
                 - meta-llama/Llama-3.2-1B-Instruct
                 - mistralai/Mistral-7B-Instruct-v0.3
-                # - Qwen/Qwen2.5-0.5B-Instruct # needs tied-weight lm_head fix (compute_logits hits cpu/spyre mixed-device decomposition)
+                - Qwen/Qwen2.5-0.5B-Instruct # tied-weight lm_head routes logits through embed_tokens (SpyreVocabParallelEmbedding → CPU)
                 # - TitanML/tiny-mixtral # needs swa support
             override:
               max_tokens: [2] # one prefill and one decode for speed

@@ -16,6 +16,7 @@
 This example shows how to run offline inference on Spyre using the torch-spyre
 plugin code with the TorchSpyreModelRunner.
 
+By default this runs with torch.compile (STOCK_TORCH_COMPILE).
 Use --enforce-eager to skip torch.compile and run in eager mode.
 """
 
@@ -63,11 +64,21 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile, run in eager mode",
     )
+    parser.add_argument(
+        "--force-compile-attn",
+        action="store_true",
+        dest="force_compile_attn",
+        help="Compile the attention kernel (specialized_paged_attn_kernel, off by default).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Note: SPYRE_FORCE_COMPILE_ATTN=1 only compiles the
+    # specialized_paged_attn_kernel, not the complete attention.
+    os.environ["SPYRE_FORCE_COMPILE_ATTN"] = "1" if args.force_compile_attn else "0"
 
     if platform.machine() == "arm64":
         print(
@@ -124,6 +135,9 @@ def main():
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
     ]
 
+    # Set STOCK_TORCH_COMPILE as the compile mode for Spyre if not running eager.
+    compilation_config = None if args.enforce_eager else {"mode": "STOCK_TORCH_COMPILE"}
+
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -133,8 +147,18 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         dtype="float16",
         enforce_eager=args.enforce_eager,
+        compilation_config=compilation_config,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
+
+    # When compiling (whole-model or attention kernel), run an untimed warmup
+    # pass first so any lazy per-shape Inductor recompiles happen outside the
+    # timed GENERATE window below.
+    if not args.enforce_eager or args.force_compile_attn:
+        print("=============== WARMUP")
+        t_warm = time.time()
+        llm.generate(prompts, sampling_params)
+        print(f"Warmup pass took {time.time() - t_warm:.2f} sec")
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

@@ -85,14 +85,23 @@ comment on each rule-2 issue** pinging the assignee(s) for a status update and a
 ETA. This creates a written record of why work slipped and gives anyone watching the
 issue visibility into the new target.
 
-Suggested comment template (adjust the months each run):
+Suggested comment template (adjust the months each run). Lead with an explicit
+"automated message" marker so recipients don't mistake it for a human ping:
 
 ```text
-Monthly cleanup: this issue carried the `<closing>YYYY` label and is rolling into
-`<active>YYYY`. @<assignees> — could you share a quick status update and a new
-estimated completion date? If the work has been deprioritized or blocked, please
-note that here too so anyone tracking this knows what to expect.
+🤖 **Automated monthly board cleanup** (this is an automated message from the
+end-of-month label reconciliation — not a human. No action needed beyond a quick
+reply.)
+
+This issue carried the `<closing>YYYY` label and has been rolled into `<active>YYYY`.
+@<assignees> — could you share a quick status update and a new estimated completion
+date? If the work has been deprioritized or blocked, please note that here too so
+anyone tracking this knows what to expect.
 ```
+
+Only ping issues that have assignees — a status request on an unassigned issue pings
+no one. Surface the unassigned rule-2 issues separately so the user can decide whether
+to assign owners or skip them.
 
 Apply with:
 

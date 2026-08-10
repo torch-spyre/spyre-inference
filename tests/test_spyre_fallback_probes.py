@@ -273,12 +273,12 @@ def test_spyre_inplace_mul_noncontiguous(spyre_device):
 # 5. Attention-result reshape + on-device scatter into output (issue #400)
 # ---------------------------------------------------------------------------
 #
-# These two probes gate removing the CPU round-trip in
+# These two probes guard the on-device path in
 # SpyreAttentionImpl._online_softmax_attention (spyre_attn.py): the
 # attention kernel returns [num_kv_heads, num_queries_per_kv, aligned_q, D] and
 # must become [query_len, num_heads, D] written into the caller's output buffer.
-# Both the head-axis transpose+contiguous and the per-seq scatter are currently
-# done on CPU. When these XPASS, the detour can move on-device.
+# Both the head-axis transpose+contiguous and the per-seq scatter now run on
+# device; these probes catch a regression if a torch-spyre bump breaks either.
 
 
 @pytest.mark.parametrize(

@@ -56,6 +56,12 @@ def parse_args() -> Any:
     parser.add_argument("--job-id", type=str, default="0")
     parser.add_argument("--pr-number", type=str, default="0")
     parser.add_argument(
+        "--arch",
+        type=str,
+        default=os.environ.get("BENCHMARK_ARCH", "x86_64"),
+        help="hardware architecture the benchmark ran on (e.g. x86_64, ppc64le, s390x)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print rows instead of inserting into ClickHouse",
@@ -168,6 +174,7 @@ def extract_rows(
     job_id: str,
     workflow: str,
     pr_number: int,
+    arch: str = "x86_64",
 ) -> list[dict[str, Any]]:
     """Extract ClickHouse rows from vLLM benchmark JSON files.
 
@@ -195,7 +202,7 @@ def extract_rows(
         extra = json.dumps(
             {
                 "device": "spyre",
-                "arch": "x86_64",
+                "arch": arch,
                 "hardware_type": "IBM_Spyre",
                 "model": model,
                 "test_name": filename.replace(".pytorch.json", "").replace(".json", ""),
@@ -340,6 +347,7 @@ def main() -> None:
         job_id=args.job_id,
         workflow=args.workflow,
         pr_number=pr_number,
+        arch=args.arch,
     )
 
     if not rows:

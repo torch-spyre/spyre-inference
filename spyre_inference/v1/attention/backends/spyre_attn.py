@@ -879,7 +879,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
-        target_device: torch.device,
+        _target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
@@ -889,7 +889,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             converts each token slice to target_device (H2D DMA) before writing.
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
-        target_device: device of the KV pages (used for per-token H2D in kernel)
+        _target_device: device of the KV pages (used for per-token H2D in kernel)
         """
         num_tokens = key.shape[0]
         # Force contiguous: non-contiguous CPU tensors (QKV split) corrupt on
@@ -897,7 +897,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         key = key.contiguous()
         value = value.contiguous()
         fn = self._get_reshape_fn(num_tokens)
-        fn(key, value, k_pages, v_pages, block_indices, block_offsets, target_device)
+        fn(key, value, k_pages, v_pages, block_indices, block_offsets, _target_device)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(

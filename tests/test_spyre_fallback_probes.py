@@ -225,7 +225,9 @@ def test_spyre_d2d_narrow_copy_at_constant_offset(spyre_device):
     # Source: a single-token K slice — matches key[t].unsqueeze(1).contiguous()
     k_tok = torch.randn(num_kv_heads, 1, head_size, dtype=torch.float16, device=spyre_device)
     # Destination: one KV page — matches k_pages[block_indices[t]]
-    page = torch.zeros(num_kv_heads, block_size, head_size, dtype=torch.float16, device=spyre_device)
+    page = torch.zeros(
+        num_kv_heads, block_size, head_size, dtype=torch.float16, device=spyre_device
+    )
 
     # Write at a non-zero constant offset to exercise the full code path
     offset = 37  # Python int constant — same as block_offsets[t] in the kernel

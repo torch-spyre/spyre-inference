@@ -89,6 +89,7 @@ QUERY_CHUNK_SIZE = 32
 # (e.g. head_size=64 Llama variants) fall back to CPU for the K/V write.
 ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE = 128
 
+
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
@@ -764,9 +765,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Whether D2D narrow().copy_() is safe for this model's head_size.
         # head_size must be a multiple of 128 (double stick) for copy_from_d2d
         # to produce a valid stick expression. head_size=64 falls back to CPU.
-        self._ondevice_kv_write = (
-            head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
-        )
+        self._ondevice_kv_write = head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
 
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
@@ -874,8 +873,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
-        key_cpu: torch.Tensor,
-        value_cpu: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         block_indices: list[int],

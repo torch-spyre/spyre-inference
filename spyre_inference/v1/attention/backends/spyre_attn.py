@@ -82,10 +82,12 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
-# On-device query overwrite only compiles for head_size multiples of 128; 64
-# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
-ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
-
+# Minimum head_size multiple required for D2D narrow().copy_() to produce a
+# stick-aligned expression in torch-spyre's copy_from_d2d.  head_size=64 has a
+# 2-level stick hierarchy that yields Mod(d1, 32) — unsupported.  head_size=128
+# (two sticks per token slice) compiles cleanly.  Models with head_size < 128
+# (e.g. head_size=64 Llama variants) fall back to CPU for the K/V write.
+ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE = 128
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -228,10 +230,20 @@ def _maybe_compile(fn):
 # ---------------------------------------------------------------------------
 
 
-def _create_compilable_reshape_and_cache(num_tokens: int):
+def _create_compilable_reshape_and_cache(num_tokens: int, ondevice_write: bool):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
+    ondevice_write=True  (head_size % 128 == 0):
+        key/value arrive on Spyre. narrow().copy_() produces a double-stick-
+        aligned source (128 fp16 elements) that copy_from_d2d handles correctly.
+
+    ondevice_write=False (head_size=64, i.e. head_size % 128 != 0):
+        key/value arrive on CPU (converted by forward() before the call).
+        Each token slice is transferred H2D individually via convert(), avoiding
+        copy_from_d2d entirely. copy_from_d2d fails for head_size=64 because
+        the [num_kv_heads, 1, 64] source has a 2-level stick hierarchy that
+        produces Mod(d1, 32) — unsupported by the Spyre Inductor backend.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -246,8 +258,8 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         for t in range(num_tokens):
             k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
             v_tok = convert(value[t].unsqueeze(1).contiguous(), target_device)
-            _overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])
-            _overwrite(v_tok, v_pages[block_indices[t]], [1], [block_offsets[t]])
+            k_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(k_tok)
+            v_pages[block_indices[t]].narrow(1, block_offsets[t], 1).copy_(v_tok)
 
     return specialized_reshape_and_cache_kernel
 
@@ -740,16 +752,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Compiled function caches (keyed by iteration count for reshape, and
         # by (num_blocks, padded_query_len) for the per-page attention loop)
+        # Whether D2D narrow().copy_() is safe for this model's head_size.
+        # head_size must be a multiple of 128 (double stick) for copy_from_d2d
+        # to produce a valid stick expression. head_size=64 falls back to CPU.
+        self._ondevice_kv_write = (
+            head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
+        )
+
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
+        logger.debug_once(
+            "Using SpyreAttentionBackend with LIST-BASED online softmax "
+            "(ondevice_kv_write=%s, head_size=%d)",
+            self._ondevice_kv_write,
+            head_size,
+        )
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
-            # Currently not compiled
-            self._reshape_fns[num_tokens] = _create_compilable_reshape_and_cache(num_tokens)
-
+            self._reshape_fns[num_tokens] = _create_compilable_reshape_and_cache(
+                num_tokens, self._ondevice_kv_write
+            )
         return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
@@ -794,28 +818,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
-        # Query handling depends on whether we can stay on device:
-        #   - Single-sequence decode: on-device assembly works (offset 0), but
-        #     only when the head_size keeps the overwrite layout representable
-        #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
-        #   - Batch decode / prefill: needs the CPU path because the per-seq
-        #     query densification slices/transposes at offset > 0, which
-        #     corrupts on Spyre.
-        key_cpu = convert(key, "cpu")
-        value_cpu = convert(value, "cpu")
-        ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
+        # Step 1: Reshape and cache — write new tokens into pages.
+        # For head_size % 128 == 0: key/value stay on Spyre (D2D narrow+copy).
+        # For head_size=64: convert to CPU first; H2D DMA avoids copy_from_d2d
+        # which fails with Mod(d1,32) for the [num_kv_heads,1,64] source shape.
+        kv_key = key[:num_actual_tokens]
+        kv_val = value[:num_actual_tokens]
+        if not self._ondevice_kv_write:
+            kv_key = convert(kv_key, "cpu").contiguous()
+            kv_val = convert(kv_val, "cpu").contiguous()
+        # Query handling: single-sequence decode can assemble on-device at
+        # offset 0 when head_size supports it; batch/prefill use CPU path.
+        ondevice_overwrite_ok = self.head_size % ONDEVICE_KV_WRITE_HEAD_SIZE_MULTIPLE == 0
         needs_query_cpu = (
             attn_metadata.max_query_len > 1
             or attn_metadata.num_seqs > 1
             or not ondevice_overwrite_ok
         )
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
-
-        # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
-            key_cpu[:num_actual_tokens],
-            value_cpu[:num_actual_tokens],
+            kv_key,
+            kv_val,
             k_pages,
             v_pages,
             attn_metadata.slot_block_indices[:num_actual_tokens],
@@ -848,24 +871,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: list[torch.Tensor],
         block_indices: list[int],
         block_offsets: list[int],
-        _target_device: torch.device,
+        target_device: torch.device,
     ) -> None:
         """Write new K/V tokens into their respective pages.
 
         key, value: [num_tokens, num_kv_heads, head_size]
+            On Spyre when _ondevice_kv_write=True (head_size % 128 == 0).
+            On CPU when _ondevice_kv_write=False (head_size=64); the kernel
+            converts each token slice to target_device (H2D DMA) before writing.
         k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
+        target_device: device of the KV pages (used for per-token H2D in kernel)
         """
-        num_tokens = key_cpu.shape[0]
-
-        # Force CPU contiguous: value from QKV split-along-last-dim is
-        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
-        key_cpu = key_cpu.contiguous()
-        value_cpu = value_cpu.contiguous()
-
+        num_tokens = key.shape[0]
+        # Force contiguous: non-contiguous CPU tensors (QKV split) corrupt on
+        # H2D transfer; Spyre tensors need it before the narrow source copy.
+        key = key.contiguous()
+        value = value.contiguous()
         fn = self._get_reshape_fn(num_tokens)
-        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
+        fn(key, value, k_pages, v_pages, block_indices, block_offsets, target_device)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(

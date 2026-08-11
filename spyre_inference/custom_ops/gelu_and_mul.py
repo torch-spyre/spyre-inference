@@ -16,9 +16,8 @@
 
 Gemma models use `gelu_pytorch_tanh` gated MLPs -> vLLM's `GeluAndMul`. The stock
 `forward_native` slices the fused `[..., 2*d]` tensor on the last dim; on Spyre
-that slice is only correct under `torch.compile` (indirect access), so
-`forward_oot` runs a compiled `forward_native`. Mirrors `SpyreSiluAndMul` with
-GELU instead of SiLU.
+that slice now works in eager mode (torch-spyre#3578), so `forward_oot` simply
+calls it directly. Mirrors `SpyreSiluAndMul` with GELU instead of SiLU.
 """
 
 import torch
@@ -30,15 +29,7 @@ from vllm.model_executor.layers.activation import GeluAndMul
 class SpyreGeluAndMul(GeluAndMul):
     """Out-of-tree (OOT) GeluAndMul implementation for IBM's Spyre device."""
 
-    def __init__(self, *args, **kwargs):
-        """Initialize SpyreGeluAndMul layer."""
-        super().__init__(*args, **kwargs)
-
-        # With fullgraph compile enabled, the _forward will be compiled anyways
-        if not torch.compiler.is_dynamo_compiling():
-            self._forward = torch.compile(self.forward_native, dynamic=False)
-
     def forward_oot(self, x) -> torch.Tensor:
         """GeGLU: gelu(gate) * up, output shape [..., d]."""
 
-        return self._forward(x)
+        return self.forward_native(x)

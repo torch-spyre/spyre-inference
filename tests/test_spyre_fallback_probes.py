@@ -42,24 +42,7 @@ def spyre_device():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "compile",
-        pytest.param(
-            "eager",
-            marks=pytest.mark.xfail(
-                reason=(
-                    "Spyre returns a non-contiguous last-dim slice whose values are "
-                    "correct, but using it as a binary-op operand silently produces "
-                    "wrong results (the second operand appears to ignore its storage "
-                    "offset). This blocks removing the CPU detour in SpyreSiluAndMul "
-                    "(fused gate|up slice) and SpyreParallelLMHead (unpad slice)."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("mode", ["compile", "eager"])
 def test_spyre_last_dim_slice(spyre_device, mode):
     """Last-dim slice of a Spyre tensor (fused gate|up path)."""
     x = torch.randn(32, 8192, dtype=torch.float16, device=spyre_device)

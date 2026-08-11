@@ -115,14 +115,23 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place).
+    """Write ``input`` into ``output`` at the specified position (in-place).
 
-    narrow().copy_() at a concrete offset works on both CPU and Spyre.
+    Used by SpyreEncoderAttentionImpl to scatter result tokens into the output
+    buffer. Not used for K/V cache writes (those go through _reshape_and_cache).
     """
-    sliced_t = output
-    for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-    sliced_t.copy_(input)
+    if output.device.type == "spyre":
+        torch.ops.spyre.overwrite(
+            input,  # ty: ignore[invalid-argument-type]
+            output,  # ty: ignore[invalid-argument-type]
+            dims,  # ty: ignore[invalid-argument-type]
+            offsets,  # ty: ignore[invalid-argument-type]
+        )
+    else:
+        sliced_t = output
+        for i, dim in enumerate(dims):
+            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+        sliced_t.copy_(input)
 
 
 def _indirect_matmul_mock(

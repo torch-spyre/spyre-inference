@@ -188,32 +188,62 @@ def test_spyre_single_row_index_select(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-# The per-token KV-cache write in SpyreAttentionImpl is a narrow().copy_() into a
-# page at a slot offset. Eager narrow().copy_() at a constant offset works
-# on-device ("eager" mode); only *compiling* it with a data-dependent (SymInt)
-# offset fails to lower ("compile" mode, xfail). That is why the loop stays eager
-# and copies slot offsets to host int constants rather than indexing pages
-# on-device.
+# Note: H2D narrow().copy_() (CPU src → Spyre dst) at a constant offset works.
+# D2D narrow().copy_() (Spyre src → Spyre dst) still fails — see
+# test_spyre_d2d_narrow_copy_at_constant_offset below.
 
 
-@pytest.mark.parametrize(
-    "mode",
-    [
-        "eager",
-        pytest.param(
-            "compile",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Compiled narrow().copy_() at a data-dependent (SymInt) offset "
-                    "fails to lower ('shape error in scatter op, can not broadcast "
-                    "[.,1,.] to [.,u,.]'). Only compilation is blocked; the eager "
-                    "path works, so slot_mapping is copied to host int constants "
-                    "before the write instead of indexing pages on-device."
-                ),
-            ),
-        ),
-    ],
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Every D2D write on Spyre — narrow().copy_(), __setitem__, and "
+        "torch.ops.spyre.overwrite — routes through copy_from_d2d → "
+        "compile_once → Inductor. For head_size=64 this emits Mod(d1, 32) "
+        "(unsupported 2-level stick hierarchy). For head_size=128 it "
+        "recompiles per unique block_offset, exhausting Dynamo's 256-recompile "
+        "limit and then recursing into copy_from_d2d's own compile wrapper. "
+        "The K/V reshape path uses CPU round-trip (H2D DMA) until torch-spyre "
+        "fixes copy_from_d2d for runtime/symbolic offsets."
+    ),
+)
+def test_spyre_d2d_narrow_copy_at_constant_offset(spyre_device):
+    """D2D eager narrow().copy_() at a constant Python-int offset (head_size=64).
+
+    Exercises the exact write shape from _create_compilable_reshape_and_cache:
+        k_tok = convert(key[t].unsqueeze(1).contiguous(), target_device)
+        k_pages[blk].narrow(1, offset, 1).copy_(k_tok)
+
+    Both tensors are on Spyre. Fails because copy_from_d2d compiles internally
+    and produces an unsupported Mod(d1, 32) stick expression for head_size=64,
+    or exhausts the recompile limit for head_size=128. Remove xfail when
+    torch-spyre supports D2D writes at runtime offsets without recompilation.
+    """
+    num_kv_heads = 2
+    head_size = 64
+    block_size = 64  # minimum valid block_size (multiple of 64)
+
+    # Source: a single-token K slice — matches key[t].unsqueeze(1).contiguous()
+    k_tok = torch.randn(num_kv_heads, 1, head_size, dtype=torch.float16, device=spyre_device)
+    # Destination: one KV page — matches k_pages[block_indices[t]]
+    page = torch.zeros(num_kv_heads, block_size, head_size, dtype=torch.float16, device=spyre_device)
+
+    # Write at a non-zero constant offset to exercise the full code path
+    offset = 37  # Python int constant — same as block_offsets[t] in the kernel
+    page.narrow(1, offset, 1).copy_(k_tok)
+
+    expected = torch.zeros(num_kv_heads, block_size, head_size, dtype=torch.float16)
+    expected[:, offset, :] = k_tok.cpu()[:, 0, :]
+    torch.testing.assert_close(page.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Compiled narrow().copy_() at a data-dependent (SymInt) offset fails "
+        "to lower ('shape error in scatter op, can not broadcast [.,1,.] to "
+        "[.,u,.]'). This is why slot_mapping is copied to host int constants "
+        "before the write instead of indexing pages on-device."
+    ),
 )
 def test_spyre_narrow_copy_row_write(spyre_device, mode):
     """Per-token narrow().copy_() row write (KV-cache reshape_and_cache loop).

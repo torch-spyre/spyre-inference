@@ -17,6 +17,19 @@ function check_command_exists() {
     fi
 }
 
+# Artifactory subdirectory the RPMs live under, between <repo> and <arch>:
+# <repo>/<prefix>/<arch>/<file>. Defaults to `next` — the only tree that
+# publishes every package we pin (see spyre-rpms.lock). Pass `--prefix ''` to
+# fetch straight from <repo>/<arch>/.
+RPM_PREFIX="${RPM_PREFIX:-next}"
+while [[ $# -gt 0 ]] ; do
+    case "$1" in
+        --prefix) RPM_PREFIX="$2"; shift 2 ;;
+        --prefix=*) RPM_PREFIX="${1#*=}"; shift ;;
+        *) echo "unknown argument: $1"; exit 1 ;;
+    esac
+done
+
 if [[ -f ".env" ]] ; then
     echo "found a .env file"
     source .env
@@ -61,11 +74,13 @@ RPMS_DOWNLOAD_DIR="${RPMS_DOWNLOAD_DIR:-rpms}"
 
 mkdir -p "$RPMS_DOWNLOAD_DIR" || exit 1
 
-echo "downloading rpm(s) for arch '${RPM_ARCH}' from '${ARTIFACTORY_LOCATION}' to '${RPMS_DOWNLOAD_DIR}'..."
+RPM_SUBDIR="${RPM_PREFIX:+${RPM_PREFIX}/}"
+
+echo "downloading rpm(s) for arch '${RPM_ARCH}' from '${ARTIFACTORY_LOCATION}/${RPM_SUBDIR}${RPM_ARCH}' to '${RPMS_DOWNLOAD_DIR}'..."
 
 for rpm_name in $RPM_NAMES; do
     filename="${rpm_name}.${RPM_ARCH}.rpm"
-    url="${ARTIFACTORY_LOCATION}/${RPM_ARCH}/${filename}"
+    url="${ARTIFACTORY_LOCATION}/${RPM_SUBDIR}${RPM_ARCH}/${filename}"
     echo "  ${url}"
     curl -fSL \
         -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \

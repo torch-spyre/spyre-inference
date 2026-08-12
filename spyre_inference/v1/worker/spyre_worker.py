@@ -18,6 +18,7 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
+from typing_extensions import override
 
 # `import torch_spyre` is intentionally deferred to inside `init_device`.
 # Importing it loads `libspyre_comms.so`, which captures
@@ -27,8 +28,9 @@ import torch
 # loads. `spyre_inference/__init__.py` sets
 # `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
 # autoload doesn't trigger the load at `import torch` time.
-
+from vllm.distributed.utils import get_worker_rank_suffix
 from vllm.logger import init_logger
+from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
@@ -37,6 +39,23 @@ from spyre_inference.custom_ops import register_all
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
+
+
+def monkey_patch_torch_profiler_activity_map():
+    """This function monkey-patches vLLM's TorchProfilerActivityMap to include PrivateUse1.
+
+    This is a temporary workaround and should be removed once PR
+    https:// github.com/vllm-project/vllm/pull/50977 lands in vLLM, which adds
+    PrivateUse1 to the TorchProfilerActivityMap.
+    """
+    from vllm.profiler.wrapper import TorchProfilerActivityMap as vllm_activity_map
+
+    if "PrivateUse1" not in vllm_activity_map:
+        vllm_activity_map["PrivateUse1"] = torch.profiler.ProfilerActivity.PrivateUse1
+        logger.debug("Patched vLLM TorchProfilerActivityMap to include PrivateUse1")
+
+
+monkey_patch_torch_profiler_activity_map()
 
 
 class TorchSpyreWorker(Worker):
@@ -143,3 +162,24 @@ class TorchSpyreWorker(Worker):
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         pass
+
+    @override
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        if (
+            is_start
+            and self.profiler is None
+            and self.profiler_config is not None
+            and self.profiler_config.profiler == "torch"
+        ):
+            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
+            trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
+
+            self.profiler = TorchProfilerWrapper(
+                self.profiler_config,
+                worker_name=trace_name,
+                local_rank=self.local_rank,
+                activities=["CPU", "PrivateUse1"],  # ty: ignore[invalid-argument-type]
+            )
+            logger.debug("Starting torch profiler with trace name: %s", trace_name)
+
+        return super().profile(is_start, profile_prefix)

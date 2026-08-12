@@ -27,12 +27,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 from vllm import LLM
+from vllm.config import PoolerConfig
 
 EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-125m-english",
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
+]
+
+# None of the product encoder models above ship with LAST pooling (CLS or MEAN).
+# Force LAST on a small CLS model so SpyreLastPool is covered end-to-end.
+LAST_POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
+LAST_POOLING_PROMPTS = [
+    "Hello world.",
+    "The quick brown fox jumps over the lazy dog.",
 ]
 
 # Cross-encoder reranker smoke (classify / score path). One model is enough —
@@ -54,6 +63,28 @@ def _cosine(a: list[float], b: list[float]) -> float:
         torch.tensor(b, dtype=torch.float32),
         dim=0,
     ).item()
+
+
+def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float]]:
+    """CPU HF last-nonpad-token + L2 (matches vLLM LastPool + normalize)."""
+    from transformers import AutoModel, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(model)
+    hf = AutoModel.from_pretrained(model)
+    hf.eval()
+    with torch.inference_mode():
+        enc = tok(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=64,
+            return_tensors="pt",
+        )
+        hs = hf(**enc).last_hidden_state
+        idx = enc["attention_mask"].sum(dim=1) - 1
+        emb = hs[torch.arange(hs.size(0)), idx]
+        emb = F.normalize(emb.float(), p=2, dim=-1)
+    return emb.tolist()
 
 
 @pytest.mark.uses_subprocess
@@ -84,6 +115,41 @@ def test_encoder_embed_models(model: str) -> None:
         sim = _cosine(emb, ref_emb)
         assert sim >= COSINE_MIN, (
             f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
+        )
+
+
+@pytest.mark.uses_subprocess
+def test_encoder_embed_last_pooling() -> None:
+    """SpyreLastPool path: force LAST on granite-125m and match HF last-token.
+
+    Product encoder models in ``EMBEDDING_MODELS`` are CLS or MEAN only; this
+    override exercises the LAST gather + normalize path that
+    ``configure_pooling_for_spyre`` patches to ``SpyreLastPool``.
+    """
+    prompts = LAST_POOLING_PROMPTS
+    ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, prompts)
+
+    llm = LLM(
+        model=LAST_POOLING_MODEL,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=1,
+        enforce_eager=True,
+        pooler_config=PoolerConfig(seq_pooling_type="LAST"),
+    )
+    outputs = llm.embed(prompts)
+    assert len(outputs) == len(prompts)
+
+    for prompt, out, ref_emb in zip(prompts, outputs, ref_embs):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb), (
+            f"LAST {LAST_POOLING_MODEL}: dim mismatch {len(emb)} vs HF {len(ref_emb)}"
+        )
+        assert all(math.isfinite(x) for x in emb)
+        sim = _cosine(emb, ref_emb)
+        assert sim >= COSINE_MIN, (
+            f"LAST {LAST_POOLING_MODEL}: cosine {sim:.4f} < {COSINE_MIN} "
+            f"vs HF last-token for prompt {prompt!r}"
         )
 
 

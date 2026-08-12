@@ -572,43 +572,54 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Pool on the activation device; D2H only the pooled vectors.
 
-        Overrides private ``GPUModelRunner._pool`` — there is no stabler public
-        hook for crop / device placement / pooled-only D2H. Prefer deleting or
-        shrinking this once torch-spyre can safely slice and the upstream CPU
-        path is enough (see fallback probes / #3507–#3508).
+        MEAN / FP32 heads keep the pooler on CPU — delegate to
+        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
+        hook: dim-0 crop must use ``index_select`` (not ``[:n]``), and pooled
+        D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU). Drop this once
+        those ops are safe (fallback probes / #3507–#3508).
         """
-        num_reqs = self.input_batch.num_reqs
-        assert num_reqs == len(self.input_batch.pooling_params), (
-            "Either all or none of the requests in a batch must be pooling request"
-        )
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
         )
 
-        if self._pooling_on_spyre:
-            for params in self.input_batch.pooling_params.values():
-                if params.task in TOKEN_POOLING_TASKS:
-                    raise NotImplementedError(
-                        f"Pooling task {params.task!r} returns per-sequence views "
-                        "of hidden_states, which is unsupported while the pooler "
-                        "runs on Spyre."
-                    )
+        if not self._pooling_on_spyre:
+            return super()._pool(
+                convert(hidden_states, "cpu"),
+                num_scheduled_tokens,
+                num_scheduled_tokens_np,
+                kv_connector_output,
+            )
 
-        # Crop via index_select (Spyre dim-0 slice is unsafe; same path works on CPU).
-        device = self._spyre_device if self._pooling_on_spyre else "cpu"
-        hidden_states = convert(hidden_states, device)
+        num_reqs = self.input_batch.num_reqs
+        assert num_reqs == len(self.input_batch.pooling_params), (
+            "Either all or none of the requests in a batch must be pooling request"
+        )
+
+        for params in self.input_batch.pooling_params.values():
+            if params.task in TOKEN_POOLING_TASKS:
+                raise NotImplementedError(
+                    f"Pooling task {params.task!r} returns per-sequence views "
+                    "of hidden_states, which is unsupported while the pooler "
+                    "runs on Spyre."
+                )
+
+        # Crop via index_select — Spyre dim-0 slice views are unsafe.
+        hidden_states = convert(hidden_states, self._spyre_device)
         if hidden_states.shape[0] != num_scheduled_tokens:
             hidden_states = select_rows(
                 hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
             )
 
+        # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
+        # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1
+        # view is not stick-aligned on Spyre (copy_from_d2d fails). SpyreCLS/Last
+        # only read host ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()
-        # Build cursor on activation device (not CPU int alias of query_start_loc).
         pooling_metadata.build_pooling_cursor(
             num_scheduled_tokens_np,
             seq_lens_cpu,
-            device=hidden_states.device,
+            device=torch.device("cpu"),
         )
 
         model = cast(VllmModelForPooling, self.model)

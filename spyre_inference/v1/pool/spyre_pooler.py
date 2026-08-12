@@ -47,56 +47,52 @@ class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
     """
 
     def forward(self, pooled_data, pooling_metadata):
-        if isinstance(pooled_data, list):
-            pooled_data = torch.stack(pooled_data)
-
-        if (
-            self.head_dtype is not None
-            and isinstance(pooled_data, torch.Tensor)
-            and pooled_data.device.type == "spyre"
-            and pooled_data.dtype != self.head_dtype
-        ):
-            # Upstream ``.to(head_dtype)`` is then a no-op on CPU.
-            pooled_data = convert(pooled_data, "cpu").to(self.head_dtype)
-
+        if self.head_dtype is not None:
+            sample = (
+                pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
+            )
+            if (
+                isinstance(sample, torch.Tensor)
+                and sample.device.type == "spyre"
+                and sample.dtype != self.head_dtype
+            ):
+                if isinstance(pooled_data, list):
+                    pooled_data = torch.stack(pooled_data)
+                # Upstream ``.to(head_dtype)`` is then a no-op on CPU.
+                pooled_data = convert(pooled_data, "cpu").to(self.head_dtype)
         return super().forward(pooled_data, pooling_metadata)
+
+
+def _pooler_output_on_cpu(raw_pooler_output: PoolerOutput) -> PoolerOutput:
+    """Materialize Spyre pooled tensors on CPU; leave host tensors unchanged."""
+    if isinstance(raw_pooler_output, torch.Tensor):
+        if raw_pooler_output.device.type == "spyre":
+            return convert(raw_pooler_output, "cpu")
+        return raw_pooler_output
+    assert isinstance(raw_pooler_output, list)
+    return [
+        convert(t, "cpu") if isinstance(t, torch.Tensor) and t.device.type == "spyre" else t
+        for t in raw_pooler_output
+    ]
 
 
 def copy_pooler_output_to_cpu(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
-    """D2H pooled outputs via ``convert`` (no CUDA non_blocking)."""
-    num_reqs = len(finished_mask)
+    """vLLM ``_copy_pooler_output_to_cpu`` after Spyre→CPU via ``convert``.
 
-    if isinstance(raw_pooler_output, torch.Tensor):
-        if raw_pooler_output.shape[0] != num_reqs:
-            raise ValueError(
-                "Pooler output batch size does not match finished mask size: "
-                f"{raw_pooler_output.shape[0]} != {num_reqs}."
-            )
-        num_finished = sum(finished_mask)
-        if num_finished == 0:
-            return [None] * num_reqs
-        out_cpu = convert(raw_pooler_output, "cpu")
-        if num_finished == num_reqs:
-            return list(out_cpu)
-        finished_indices = [i for i, include in enumerate(finished_mask) if include]
-        partial: list[torch.Tensor | None] = [None] * num_reqs
-        for i in finished_indices:
-            partial[i] = out_cpu[i]
-        return partial
+    Upstream uses ``.to("cpu", non_blocking=True)``, which is not a valid Spyre
+    D2H path. Convert first so the shared finished-mask / partial-batch logic
+    stays in vLLM.
+    """
+    from vllm.v1.worker.gpu_model_runner import (
+        _copy_pooler_output_to_cpu as _vllm_copy_pooler_output_to_cpu,
+    )
 
-    assert isinstance(raw_pooler_output, list)
-    if len(raw_pooler_output) != num_reqs:
-        raise ValueError(
-            "Pooler output batch size does not match finished mask size: "
-            f"{len(raw_pooler_output)} != {num_reqs}."
-        )
-    pooler_output: list[torch.Tensor | None] = [None] * num_reqs
-    for i, (out, include) in enumerate(zip(raw_pooler_output, finished_mask)):
-        if include and out is not None:
-            pooler_output[i] = convert(out, "cpu")
-    return pooler_output
+    return _vllm_copy_pooler_output_to_cpu(
+        _pooler_output_on_cpu(raw_pooler_output),
+        finished_mask,
+    )
 
 
 def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:

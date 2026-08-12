@@ -54,6 +54,7 @@ read of the gathered rotation slice out of the compiled graph.
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
+| `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs upstream `forward_native`, whose fp16→fp32 upcast is only lowered via torch-spyre EA propagation (PR #2927) — correct compiled, broken eager. The `SpyreSiluAndMul` `is_dynamo_compiling()` guard wraps it in `torch.compile` so the upcast is lowered on the eager platform default too |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
@@ -61,13 +62,8 @@ read of the gathered rotation slice out of the compiled graph.
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
 
-`RMSNorm`, `RowParallelLinear`, and `MergedColumnParallelLinear` are **not** subclassed:
+`RowParallelLinear` and `MergedColumnParallelLinear` are **not** subclassed:
 
-- `RMSNorm` runs the upstream class unchanged. Its `forward_native` upcasts to `float32`
-  internally; under the compiled runner (`CompilationMode.STOCK_TORCH_COMPILE`) torch-spyre's
-  compile-time EA propagation (torch-spyre PR #2927) lowers the on-device fp16→fp32 upcast
-  correctly, so no host detour and no custom op is needed. (The upcast is still broken in
-  *eager* — EA propagation is compile-time only — but the model never runs RMSNorm eager.)
 - `RowParallelLinear` (`o_proj`, `down_proj`) runs the upstream class unchanged — `F.linear`
   dispatches to Spyre, and `all_reduce` (via `SpyreCommunicator`) fires when `reduce_results=True`
   under TP>1.

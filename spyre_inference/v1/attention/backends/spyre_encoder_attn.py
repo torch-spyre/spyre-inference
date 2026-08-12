@@ -92,11 +92,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             (head_size + ENCODER_SEQ_ALIGNMENT - 1) // ENCODER_SEQ_ALIGNMENT * ENCODER_SEQ_ALIGNMENT
         )
 
-        # The ragged->dense batch assembly below (per-sequence variable-length
-        # slicing, transposes, and scatter) relies on strided views that
-        # torch-spyre does not yet support reliably, so it is done on CPU. Only
-        # the compute-heavy SDPA matmul is moved to the device (see q_dev/k_dev
-        # /v_dev below). Q/K/V usually already arrive on CPU; convert defensively.
+        # Pack on CPU: Spyre strided scatter/views are unsafe (#3508). SDPA on device.
         query_cpu = convert(query, "cpu")
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")

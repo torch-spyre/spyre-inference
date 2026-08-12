@@ -2,29 +2,40 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 # TEST_TYPE selects which subset of tests to run (uniform knob across the
-# product repos: torch-spyre, hf-adapters, spyre-inference):
-#   smoke — fast per-op unit tests only
-#   core  — all spyre-native tests (per-op + attention + distributed);
-#           excludes the heavy upstream-vLLM suites
-#   full  — everything
-#   trunk — same coverage as full; push-to-main CI label (see resolve_test_type.sh)
-# Also accepts the user-facing tier aliases unit (= core), integration (= smoke),
-# regression (= full) -- same mapping as _test_matrix.yaml's gate step.
-# Empty / unset defaults to "regression" (= full).
+# product repos: torch-spyre, hf-adapters, spyre-inference). These tier names
+# are literal, first-class values -- there is no alias-resolution layer:
+#   unit        — all spyre-native tests (per-op + attention + distributed);
+#                 excludes the heavy upstream-vLLM suites
+#   integration — the smoke suite: fast per-op unit tests only (this is the
+#                 ONLY valid top-level tier for that suite -- TEST_TYPE=smoke
+#                 by itself is rejected below)
+#   regression  — everything
+#   trunk       — same coverage as regression; push-to-main CI label
+#   perf        — vLLM benchmark suite (perf-tests target), not a pytest
+#                 marker subset
+# Empty / unset defaults to "regression". This Makefile is the single source
+# of truth for the valid TEST_TYPE set and its validation -- _test_matrix.yaml
+# resolves TEST_TYPE via `make -s print-test-type TEST_TYPE=...` instead of
+# duplicating this logic in YAML.
 TEST_TYPE ?= regression
 
-# Resolve the user-facing tier aliases to this Makefile's own vocabulary once,
-# up front, via the shared script -- the single source of truth for BOTH the
-# alias map AND the valid set (shared with _test_matrix.yaml). The script also
-# validates: on an unknown type it prints the full "Valid: ..." message to
-# stderr (which reaches the terminal) and exits 1, printing nothing to stdout.
-# $(shell ...) hides the exit code (and .SHELLSTATUS needs GNU make >= 4.2, not
-# guaranteed everywhere), so we detect failure by the empty stdout capture and
-# stop the build. The valid-set list stays only in the script; the marker
-# mapping below is the Makefile's only per-type knowledge.
-override TEST_TYPE := $(strip $(shell scripts/resolve_test_type.sh "$(TEST_TYPE)"))
-ifeq ($(TEST_TYPE),)
-$(error resolve_test_type.sh rejected TEST_TYPE (see the 'Valid: ...' error above))
+empty :=
+space := $(empty) $(empty)
+VALID_TEST_TYPES := unit integration regression trunk perf
+VALID_TEST_TYPES_DISPLAY := $(subst $(space), | ,$(VALID_TEST_TYPES))
+
+# "smoke" is the internal marker-combo this Makefile maps "integration" to
+# (see MARK_EXPR below) -- not itself a valid top-level tier, so a caller
+# reaching for the old name gets pointed at the replacement instead of the
+# generic "Invalid TEST_TYPE" error below.
+ifeq ($(strip $(TEST_TYPE)),smoke)
+$(info ::error::TEST_TYPE=smoke is not a valid tier -- use TEST_TYPE=integration to run that suite. Valid: $(VALID_TEST_TYPES_DISPLAY))
+$(error TEST_TYPE=smoke rejected)
+endif
+
+ifeq ($(filter $(TEST_TYPE),$(VALID_TEST_TYPES)),)
+$(info ::error::Invalid test_type '$(TEST_TYPE)'. Valid: $(VALID_TEST_TYPES_DISPLAY))
+$(error Invalid TEST_TYPE '$(TEST_TYPE)')
 endif
 
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
@@ -40,11 +51,11 @@ else
 JUNIT_ARGS :=
 endif
 
-# Map TEST_TYPE to a pytest -m marker expression. full -> no filter (all tests).
-# MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that need a marker
-# expression finer than the 3 coarse tiers (e.g. CI splitting the "full"-only
-# upstream suites into separate parallel jobs) -- set MARK_OVERRIDE and the
-# TEST_TYPE mapping below is skipped.
+# Map TEST_TYPE to a pytest -m marker expression. regression -> no filter
+# (all tests). MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
+# need a marker expression finer than the 3 coarse tiers (e.g. CI splitting
+# the "regression"-only upstream suites into separate parallel jobs) -- set
+# MARK_OVERRIDE and the TEST_TYPE mapping below is skipped.
 # perf is NOT a pytest marker subset: it is a benchmark mode of `make tests`
 # that shells out to the vLLM benchmark suite (perf-tests target) instead of
 # pytest, so it has no MARK_EXPR. It is accepted here (not rejected) and the
@@ -53,20 +64,20 @@ endif
 # hf-adapters), so CI drives every suite through one knob.
 ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
-else ifeq ($(TEST_TYPE),full)
+else ifeq ($(TEST_TYPE),regression)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),trunk)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
-else ifeq ($(TEST_TYPE),smoke)
+else ifeq ($(TEST_TYPE),integration)
 MARK_EXPR := -m "not (distributed or upstream or attention)"
-else ifeq ($(TEST_TYPE),core)
+else ifeq ($(TEST_TYPE),unit)
 MARK_EXPR := -m "not upstream"
 else
-# resolve_test_type.sh already rejected any type outside its valid set, so a
-# value that reaches here IS valid but has no marker mapping above -- i.e. a
-# new type was added to the script without a case here. Point at the fix.
+# The validation above already rejected any type outside VALID_TEST_TYPES, so
+# a value that reaches here IS valid but has no marker mapping above -- i.e. a
+# new type was added to VALID_TEST_TYPES without a case here. Point at the fix.
 $(error TEST_TYPE '$(TEST_TYPE)' has no pytest marker mapping in this Makefile; add a case above)
 endif
 
@@ -74,16 +85,19 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests \
+.PHONY: help test tests run-one aiu-setup perf-tests print-test-type \
         test-smoke test-attention test-distributed \
         test-upstream test-upstream-distributed test-upstream-model
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: TEST_TYPE=smoke|core|full|trunk|unit|integration|regression (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
+	@echo "Variables: TEST_TYPE=unit|integration|regression|trunk|perf (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
-	@echo "  RESULTS_DIR (aggregate 'full' JUnit output dir, default '$(RESULTS_DIR)')"
+	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)')"
+
+print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
+	@echo "$(TEST_TYPE)"
 
 # Marker set for GHA's _test_matrix.yaml is intentionally NOT duplicated in
 # YAML: each matrix.cfg's "Run tests" step calls one of the test-<name>
@@ -139,15 +153,15 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
 
-# When MARK_OVERRIDE is unset and TEST_TYPE=full (or trunk, same coverage),
-# GHA's _test_matrix.yaml runs this as 6 separate marker-combo jobs, not one
-# unfiltered run -- mirror that here so `make test TEST_TYPE=full` is
-# GHA-parity, one flat JUnit file per combo in RESULTS_DIR, same convention
-# hf-adapters' Makefile uses.
-tests: ## Run tests. TEST_TYPE=smoke|core|full|trunk|perf|unit|integration|regression (default regression) or set MARK_OVERRIDE directly.
+# When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
+# coverage), GHA's _test_matrix.yaml runs this as 6 separate marker-combo
+# jobs, not one unfiltered run -- mirror that here so
+# `make test TEST_TYPE=regression` is GHA-parity, one flat JUnit file per
+# combo in RESULTS_DIR, same convention hf-adapters' Makefile uses.
+tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default regression) or set MARK_OVERRIDE directly.
 	if [ "$(TEST_TYPE)" = "perf" ]; then \
 	  $(MAKE) perf-tests RESULTS_DIR="$(RESULTS_DIR)"; \
-	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "full" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
+	elif [ -n "$(MARK_OVERRIDE)" ] || { [ "$(TEST_TYPE)" != "regression" ] && [ "$(TEST_TYPE)" != "trunk" ]; }; then \
 	  $(MAKE) run-one JUNIT_XML=$(JUNIT_XML); \
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \

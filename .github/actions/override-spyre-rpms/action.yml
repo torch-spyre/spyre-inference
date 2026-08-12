@@ -53,7 +53,9 @@ runs:
         source "$HOME/.bashrc"
         source /etc/profile.d/ibm-aiu-setup.sh
         ls -la "$DOWNLOAD_SCRIPT"
-        "$DOWNLOAD_SCRIPT"
+        # --prefix '' : don't assume the next/ folder- caller can set 
+        # inputs.artifactory_rpm_path
+        "$DOWNLOAD_SCRIPT" --prefix ''
 
     # Extract the downloaded RPMs into user-space, layering them on top of the
     # locked baseline that spyre-rpm-install already extracted. The runners have

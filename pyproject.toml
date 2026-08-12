@@ -92,11 +92,6 @@ override-dependencies = [
 VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
-# Disable the torch-spyre build-time profiler. This is a temporary perf fix
-[tool.uv.extra-build-variables.torch-spyre]
-USE_SPYRE_PROFILER = "0"
-
-
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
@@ -104,7 +99,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "747c5efe2adcd4df538960e4ce39ff6c74cf012f" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "56c288343bd199bbdd65365b24bffdbd39c2b34e" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the

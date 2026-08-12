@@ -111,7 +111,7 @@ def _overwrite(
 ) -> None:
     """Write input into output at the specified position (in-place).
 
-    Uses ``narrow().copy_()`` on both CPU and Spyre.
+    narrow().copy_() at a concrete offset works on both CPU and Spyre.
     """
     sliced_t = output
     for i, dim in enumerate(dims):

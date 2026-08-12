@@ -80,7 +80,7 @@ def _raise_dynamo_recompile_limits() -> None:
     # + TP workers); torch._dynamo.config is process-local (torch-spyre #444).
     import torch._dynamo
 
-    torch._dynamo.config.cache_size_limit = 100000  # ty: ignore[invalid-assignment]
+    torch._dynamo.config.cache_size_limit = 100000
     torch._dynamo.config.accumulated_recompile_limit = 100000  # ty: ignore[invalid-assignment]
 
 

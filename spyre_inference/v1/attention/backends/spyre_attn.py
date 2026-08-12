@@ -115,13 +115,8 @@ def _overwrite(
 ) -> None:
     """Write input into output starting at ``offsets`` along ``dims`` (in-place).
 
-    narrow().copy_() at a concrete offset works on both CPU and Spyre.
-
-    The extent written along each dim comes from ``input``, so a source spanning
-    several consecutive slots is written in ONE call. This matches
-    ``torch.ops.spyre.overwrite``'s own CPU kernel, which also derives the narrow
-    length from ``input.size(dim)``; the previous hardcoded length of 1 was what
-    forced the KV write-back to loop per token.
+    narrow().copy_() at a concrete offset works on both CPU and Spyre. The extent
+    along each dim comes from ``input``, matching ``torch.ops.spyre.overwrite``.
     """
     sliced_t = output
     for i, dim in enumerate(dims):
@@ -241,15 +236,10 @@ def _slot_runs(
 ) -> list[tuple[int, int, int, int]]:
     """Split ``[0, num_tokens)`` into maximal same-page consecutive-slot runs.
 
-    Returns ``(page_idx, first_offset, start, stop)`` tuples; the tokens
-    ``[start, stop)`` all land on ``page_idx`` at offsets
-    ``first_offset ... first_offset + (stop - start) - 1``, so they can be written
-    with a single slice write.
-
-    The split is computed rather than assumed. vLLM's ``slot_mapping`` walks
-    positions in order, so in practice a prefill yields one run per page and a
-    decode step yields one run of length 1 per sequence -- but a scattered mapping
-    still writes correctly here, just with more runs.
+    Returns ``(page_idx, first_offset, start, stop)`` tuples, each writable with a
+    single slice write. A prefill normally yields one run per page and a decode
+    step one run per sequence; a scattered slot mapping still writes correctly,
+    just with more runs.
     """
     runs: list[tuple[int, int, int, int]] = []
     start = 0
@@ -271,12 +261,9 @@ def _slot_runs(
 def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
-    The write is batched per consecutive slot run (see ``_slot_runs``), so a
-    ``num_tokens``-token prefill issues one transfer and one slice write per PAGE
-    per layer instead of per TOKEN. Cost here is dominated by dispatch count, not
-    by bytes moved: each trip is a full Python -> dispatcher -> torch-spyre ->
-    job-launch round trip whose cost is fixed whether it writes 256 bytes or a
-    whole page, so collapsing 128 trips into 1 removes nearly all of it.
+    Writes are batched per slot run because the cost is dominated by dispatch
+    count, not bytes moved: each device round trip costs the same whether it
+    writes one slot or a whole page.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -288,14 +275,10 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
         target_device,
     ):
-        for page_idx, offset, start, stop in _slot_runs(
-            block_indices, block_offsets, num_tokens
-        ):
-            # [n, num_kv_heads, head_size] -> [num_kv_heads, n, head_size], the
-            # pages' own layout, so the write is one narrow().copy_() along the
-            # slot axis. Slicing and transposing happen on the CPU tensors
-            # (Spyre slicing corrupts memory, which is why key/value arrive on
-            # host), then one transfer per run carries the whole thing over.
+        for page_idx, offset, start, stop in _slot_runs(block_indices, block_offsets, num_tokens):
+            # Transpose to the pages' [num_kv_heads, slots, head_size] layout on the
+            # host -- Spyre slicing corrupts memory, which is why key/value arrive
+            # on CPU -- then one transfer per run carries the whole thing over.
             k_run = convert(key[start:stop].transpose(0, 1).contiguous(), target_device)
             v_run = convert(value[start:stop].transpose(0, 1).contiguous(), target_device)
             _overwrite(k_run, k_pages[page_idx], [1], [offset])

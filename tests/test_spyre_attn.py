@@ -1089,20 +1089,12 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
 # ---------------------------------------------------------------------------
 # KV write-back batching (_slot_runs / reshape_and_cache)
 # ---------------------------------------------------------------------------
-#
-# The write-back cost is dominated by DISPATCH COUNT, not by bytes moved: every
-# trip through the loop is a Python -> dispatcher -> torch-spyre -> job-launch
-# round trip whose cost is fixed whether it writes one slot or a whole page.
-# Measured on a 1024-token cold prefill, the per-token loop spent 25.6 s of a
-# 28.5 s prefill in this function. These tests pin the two properties the batched
-# version has to have: it collapses a prefill to one write per page, and it writes
-# exactly the same bytes to exactly the same slots as the per-token version did.
 
 
 def _reshape_and_cache_per_token_reference(
     key, value, k_pages, v_pages, block_indices, block_offsets
 ):
-    """The pre-batching write-back, kept as the correctness oracle."""
+    """The pre-batching per-token write-back, kept as the correctness oracle."""
     for t in range(key.shape[0]):
         k_tok = key[t].unsqueeze(1).contiguous()
         v_tok = value[t].unsqueeze(1).contiguous()
@@ -1110,16 +1102,13 @@ def _reshape_and_cache_per_token_reference(
         torch.narrow(v_pages[block_indices[t]], 1, block_offsets[t], 1).copy_(v_tok)
 
 
-# (label, block_indices, block_offsets) -- every shape the scheduler can hand us.
+# (label, block_indices, block_offsets, expected_runs) with block_size=4.
 _SLOT_MAPPINGS = [
-    # Block-aligned prefill: 8 tokens over two 4-slot pages.
     ("aligned_prefill", [3, 3, 3, 3, 7, 7, 7, 7], [0, 1, 2, 3, 0, 1, 2, 3], 2),
     # Prefill resuming mid-page (prefix-cache partial hit).
     ("unaligned_prefill", [3, 3, 5, 5, 5, 5], [2, 3, 0, 1, 2, 3], 2),
-    # Decode: one token per sequence, each on its own page -- nothing to batch,
-    # so the run count must equal the token count.
     ("decode_batch", [1, 4, 9], [2, 0, 3], 3),
-    # Same page but non-consecutive slots: correctness must win over batching.
+    # Same page, non-consecutive slots: nothing may be batched.
     ("scattered", [2, 2, 2], [0, 2, 3], 2),
     ("single_token", [6], [1], 1),
 ]
@@ -1137,8 +1126,6 @@ def test_slot_runs_count(label, block_indices, block_offsets, expected_runs):
     runs = _slot_runs(block_indices, block_offsets, len(block_indices))
     assert len(runs) == expected_runs, f"{label}: {runs}"
 
-    # Every token is covered exactly once, in order, and each run really is a
-    # same-page consecutive block of slots.
     covered = []
     for page_idx, offset, start, stop in runs:
         for i, t in enumerate(range(start, stop)):
@@ -1158,12 +1145,9 @@ def test_reshape_and_cache_batched_matches_per_token(
 ):
     """The batched write is byte-identical to the per-token write it replaces.
 
-    Runs entirely on CPU: `convert` short-circuits a same-device request, and
+    Runs entirely on CPU: `convert` short-circuits a same-device request and
     `_overwrite` is narrow().copy_() on both CPU and Spyre, so the kernel executes
-    unchanged with host tensors. This is the check
-    `TTFT_GAP_ROOTCAUSE.md` left open ("numerical correctness of the write path is
-    unverified") -- at max_tokens=1 on repetitive filler every run emits the same
-    token, which cannot distinguish a correct write from a misplaced one.
+    unchanged with host tensors.
     """
     from spyre_inference.v1.attention.backends.spyre_attn import (
         _create_compilable_reshape_and_cache,
@@ -1178,12 +1162,9 @@ def test_reshape_and_cache_batched_matches_per_token(
     value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
 
     def fresh_pages():
-        # Sentinel fill, not zeros: a write landing on the wrong slot has to be
-        # visible, and so does a slot that should have been left alone.
+        # Sentinel fill, not zeros, so an untouched slot is distinguishable.
         return [
-            torch.full(
-                (num_kv_heads, block_size, head_size), -7.0, dtype=torch.float16
-            )
+            torch.full((num_kv_heads, block_size, head_size), -7.0, dtype=torch.float16)
             for _ in range(num_pages)
         ]
 
@@ -1210,11 +1191,7 @@ def test_reshape_and_cache_batched_matches_per_token(
 
 
 def test_reshape_and_cache_batches_a_full_prefill():
-    """A block-aligned prefill issues one write per page, not one per token.
-
-    This is the perf claim as an assertion: with block_size=128 a 1024-token
-    prefill drops from 1024 slice writes (plus 1024 transfers) per layer to 8.
-    """
+    """A block-aligned prefill issues one write per page, not one per token."""
     from spyre_inference.v1.attention.backends.spyre_attn import _slot_runs
 
     block_size, num_tokens, first_page = 128, 1024, 16

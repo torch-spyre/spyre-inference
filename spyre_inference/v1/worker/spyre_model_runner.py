@@ -375,58 +375,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
 
     @staticmethod
-    def _patch_encoder_ops_for_spyre(model_config) -> None:
-        """Pack/unpack BERT token_type ids on CPU; Spyre lacks integer bitwise (#3509)."""
-        from vllm.model_executor.models import bert, roberta
-        from vllm.model_executor.models.bert import TOKEN_TYPE_SHIFT
-
-        if not hasattr(bert, "_decode_token_type_ids") or not hasattr(
-            bert, "_encode_token_type_ids"
-        ):
-            raise RuntimeError(
-                "vllm.model_executor.models.bert token_type helpers "
-                "not found; Spyre encoder patch needs updating for this "
-                "vLLM version."
-            )
-
+    def _install_pooling_model_patches(model_config) -> None:
+        """Install model-specific pooling adapters (BERT/RoBERTa token_type, …)."""
         if model_config.runner_type != "pooling":
             return
+        from spyre_inference.models import install_pooling_model_patches
 
-        logger.warning(
-            "Spyre: patching bert/roberta token_type pack/unpack to CPU (#3509). Model: %s",
-            model_config.model,
-        )
-
-        ids_mask = 1 << TOKEN_TYPE_SHIFT
-        tokens_mask = ~ids_mask
-
-        def _encode_token_type_ids(input_ids: torch.Tensor, token_type_ids: torch.Tensor) -> None:
-            n = token_type_ids.shape[0]
-            if input_ids.device.type != "spyre" and token_type_ids.device.type != "spyre":
-                input_ids[:n].bitwise_or_(token_type_ids << TOKEN_TYPE_SHIFT)
-                return
-            ids = convert(input_ids, "cpu").clone()
-            tt = convert(token_type_ids, "cpu")
-            ids[:n].bitwise_or_(tt[:n] << TOKEN_TYPE_SHIFT)
-            input_ids.copy_(convert(ids.contiguous(), input_ids.device))
-
-        def _decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
-            if input_ids.device.type != "spyre":
-                token_type_ids = (input_ids & ids_mask) >> TOKEN_TYPE_SHIFT
-                input_ids.bitwise_and_(tokens_mask)
-                return token_type_ids
-            host = convert(input_ids, "cpu").clone()
-            token_type_ids = (host & ids_mask) >> TOKEN_TYPE_SHIFT
-            host.bitwise_and_(tokens_mask)
-            input_ids.copy_(convert(host.contiguous(), input_ids.device))
-            return convert(token_type_ids.contiguous(), input_ids.device)
-
-        bert._encode_token_type_ids = _encode_token_type_ids  # ty: ignore[invalid-assignment]
-        bert._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
-        if hasattr(roberta, "_encode_token_type_ids"):
-            roberta._encode_token_type_ids = _encode_token_type_ids  # ty: ignore[invalid-assignment]
-        if hasattr(roberta, "_decode_token_type_ids"):
-            roberta._decode_token_type_ids = _decode_token_type_ids  # ty: ignore[invalid-assignment]
+        install_pooling_model_patches()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -437,7 +392,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
 
-        self._patch_encoder_ops_for_spyre(self.model_config)
+        self._install_pooling_model_patches(self.model_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -615,10 +570,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        """Pool on the activation device; D2H only the pooled vectors."""
+        """Pool on the activation device; D2H only the pooled vectors.
+
+        Overrides private ``GPUModelRunner._pool`` — there is no stabler public
+        hook for crop / device placement / pooled-only D2H. Prefer deleting or
+        shrinking this once torch-spyre can safely slice and the upstream CPU
+        path is enough (see fallback probes / #3507–#3508).
+        """
         num_reqs = self.input_batch.num_reqs
         assert num_reqs == len(self.input_batch.pooling_params), (
             "Either all or none of the requests in a batch must be pooling request"
+        )
+        assert not self.use_async_scheduling, (
+            "async scheduling is unsupported while pooling on Spyre"
         )
 
         if self._pooling_on_spyre:
@@ -630,16 +594,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         "runs on Spyre."
                     )
 
-        # Crop to scheduled tokens (gather on Spyre; slice is unsafe).
-        if not self._pooling_on_spyre:
-            hidden_states = convert(hidden_states, "cpu")[:num_scheduled_tokens]
-            hidden_states = hidden_states.contiguous()
-        else:
-            hidden_states = convert(hidden_states, self._spyre_device)
-            if hidden_states.shape[0] != num_scheduled_tokens:
-                hidden_states = select_rows(
-                    hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
-                )
+        # Crop via index_select (Spyre dim-0 slice is unsafe; same path works on CPU).
+        device = self._spyre_device if self._pooling_on_spyre else "cpu"
+        hidden_states = convert(hidden_states, device)
+        if hidden_states.shape[0] != num_scheduled_tokens:
+            hidden_states = select_rows(
+                hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
+            )
 
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()

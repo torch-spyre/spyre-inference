@@ -40,64 +40,26 @@ TOKEN_POOLING_TASKS = frozenset({"token_embed", "token_classify"})
 
 
 class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
-    """Same as upstream, but D2H before ``.to(head_dtype)`` when dtype changes.
+    """D2H before ``.to(head_dtype)`` when dtype changes; rest is upstream.
 
     Pooling defaults ``head_dtype=float32``. Spyre fp16→fp32 cast after CLS
     corrupts embeddings; keep gather on Spyre and cast on CPU.
     """
 
     def forward(self, pooled_data, pooling_metadata):
-        pooling_params = pooling_metadata.pooling_params
-        if len(pooled_data) != len(pooling_params):
-            raise ValueError(
-                f"pooled_data length ({len(pooled_data)}) does not match "
-                f"pooling_params length ({len(pooling_params)})"
-            )
-
         if isinstance(pooled_data, list):
             pooled_data = torch.stack(pooled_data)
 
-        if self.head_dtype is not None:
-            if (
-                isinstance(pooled_data, torch.Tensor)
-                and pooled_data.device.type == "spyre"
-                and self.head_dtype != pooled_data.dtype
-            ):
-                pooled_data = convert(pooled_data, "cpu")
-            pooled_data = pooled_data.to(self.head_dtype)
+        if (
+            self.head_dtype is not None
+            and isinstance(pooled_data, torch.Tensor)
+            and pooled_data.device.type == "spyre"
+            and pooled_data.dtype != self.head_dtype
+        ):
+            # Upstream ``.to(head_dtype)`` is then a no-op on CPU.
+            pooled_data = convert(pooled_data, "cpu").to(self.head_dtype)
 
-        if self.projector is not None:
-            embeddings = self.projector(pooled_data)
-        else:
-            embeddings = pooled_data
-
-        dimensions_list = [pooling_param.dimensions for pooling_param in pooling_params]
-        if any(d is not None for d in dimensions_list):
-            if len(embeddings) != len(dimensions_list):
-                raise ValueError(
-                    f"embeddings length ({len(embeddings)}) does not match "
-                    f"dimensions_list length ({len(dimensions_list)})"
-                )
-            if len(set(dimensions_list)) == 1 and not isinstance(embeddings, list):
-                d = dimensions_list[0]
-                embeddings = embeddings[..., :d]
-            else:
-                embeddings = [
-                    vecs if d is None else vecs[..., :d]
-                    for vecs, d in zip(embeddings, dimensions_list)
-                ]
-
-        if self.activation is not None:
-            flags = [p.use_activation for p in pooling_params]
-            if len(set(flags)) == 1:
-                if flags[0]:
-                    embeddings = self.activation(embeddings)
-            else:
-                embeddings = [
-                    self.activation(vecs) if f else vecs for vecs, f in zip(embeddings, flags)
-                ]
-
-        return embeddings
+        return super().forward(pooled_data, pooling_metadata)
 
 
 def copy_pooler_output_to_cpu(

@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT RMSNorm: upstream forward_native with its fp32 upcast lowered on Spyre.
+"""Spyre OOT replacement for RMSNorm.
 
 The fp16->fp32 upcast is correct only through torch-spyre's compile-time EA
-propagation (PR #2927), broken in eager. Under STOCK_TORCH_COMPILE forward_native
-folds into the outer graph; on the eager platform default the guard below compiles
-it into a subgraph so the upcast is still lowered. Same pattern as SpyreSiluAndMul.
+propagation (PR #2927), broken in eager. Hence force compiling here.
 """
 
 import torch

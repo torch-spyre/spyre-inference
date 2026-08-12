@@ -122,12 +122,12 @@ Don't run the full `pytest` first — vLLM startup is ~30s per test file, and th
 ### 3a. Custom Ops (No vLLM Engine)
 
 ```bash
-uv run --no-sync pytest tests/test_platform.py tests/test_mlp.py tests/test_rms_norm.py \
+uv run --no-sync pytest tests/test_platform.py tests/test_mlp.py \
   tests/test_silu_and_mul.py tests/test_parallel_lm_head.py \
   tests/test_vocab_parallel_embedding.py -m "not upstream" --no-header
 ```
 
-These exercise the linear/RMSNorm/embedding/silu_and_mul ops against a CPU reference. Failures here usually mean a vLLM layer's constructor signature changed (new kwarg, renamed parameter) or a `vocab_parallel_embedding`-style helper was moved. Fix in `spyre_inference/custom_ops/`.
+These exercise the linear/embedding/silu_and_mul ops against a CPU reference. Failures here usually mean a vLLM layer's constructor signature changed (new kwarg, renamed parameter) or a `vocab_parallel_embedding`-style helper was moved. Fix in `spyre_inference/custom_ops/`.
 
 ### 3b. Attention Backend
 

@@ -27,7 +27,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `spyre_inference/custom_ops/` - Device-specific layer implementations:
     - `linear.py` - `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`
-    - `rms_norm.py`, `rotary_embedding.py`, `silu_and_mul.py`, `vocab_parallel_embedding.py`, `parallel_lm_head.py`
+    - `rotary_embedding.py`, `silu_and_mul.py`, `vocab_parallel_embedding.py`, `parallel_lm_head.py`
 
 **Attention Implementation:**
 
@@ -79,7 +79,7 @@ When running a subset, prefer `-m "not upstream"` unless you specifically want u
 ### Test Layout
 
 - `tests/test_spyre_attn.py` — attention backend (`SpyreAttentionImpl`, `SpyreAttentionMetadataBuilder`) vs a CPU reference (`ref_attn`).
-- `tests/test_mlp.py`, `tests/test_rms_norm.py`, `tests/test_silu_and_mul.py`, `tests/test_parallel_lm_head.py` — per-custom-op tests, each comparing a Spyre-device run against a CPU reference.
+- `tests/test_mlp.py`, `tests/test_silu_and_mul.py`, `tests/test_parallel_lm_head.py` — per-custom-op tests, each comparing a Spyre-device run against a CPU reference.
 - `tests/test_vllm_spyre_next.py` — end-to-end vLLM path.
 
 Test runs are slow (~3 min) because of vLLM startup; prefer single-test invocations during iteration.

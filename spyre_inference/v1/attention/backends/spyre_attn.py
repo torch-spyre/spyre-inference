@@ -111,10 +111,7 @@ def _overwrite(
 ) -> None:
     """Write input into output at the specified position (in-place).
 
-    Uses ``narrow().copy_()`` on both CPU and Spyre. The former
-    ``torch.ops.spyre.overwrite`` device branch is gone: that op is deprecated
-    in torch-spyre (which recommends ``output[indices] = input``), and eager
-    ``narrow().copy_()`` at a concrete offset is bit-exact with it on device.
+    Uses ``narrow().copy_()`` on both CPU and Spyre.
     """
     sliced_t = output
     for i, dim in enumerate(dims):
@@ -742,7 +739,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with indirect-access online softmax")
+        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:

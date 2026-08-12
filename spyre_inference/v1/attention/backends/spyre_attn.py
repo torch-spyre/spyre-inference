@@ -263,7 +263,9 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
     Writes are batched per slot run because the cost is dominated by dispatch
     count, not bytes moved: each device round trip costs the same whether it
-    writes one slot or a whole page.
+    writes one slot or a whole page. The slicing / symbolic-offset support this
+    path is waiting on (issue #405) removes the per-offset recompile but not the
+    per-dispatch cost, so the batching is still needed once it lands.
     """
 
     def specialized_reshape_and_cache_kernel(

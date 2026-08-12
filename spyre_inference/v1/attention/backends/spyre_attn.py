@@ -791,12 +791,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # K/V are written to pages via narrow().copy_() in reshape_and_cache.
-        # The varlen query is kept on the target device; per-sequence slices
-        # are taken, reshaped, and padded on-device instead of round-tripping
-        # through CPU for varlen formatting.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        query_dev = convert(query[:num_actual_tokens], _target_device)
+
+        # Query assembly is performed on CPU and then transferred to the target
+        # device. On-device transpose+contiguous for query reshaping hits
+        # unsupported torch-spyre stick expressions for head sizes that are not
+        # multiples of 128 bytes (e.g. head_size=64 for Llama-3.2-1B), so keep
+        # the varlen formatting on CPU and pay the transfer cost.
+        query_cpu = convert(query[:num_actual_tokens], "cpu")
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -811,7 +814,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Step 2: Online softmax attention over pages (varlen).
         output = self._online_softmax_attention(
-            query_dev,
+            query_cpu,
             k_pages,
             v_pages,
             attn_metadata,
@@ -852,7 +855,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor,
+        query_cpu: torch.Tensor,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -867,10 +870,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        Query assembly keeps the varlen query on the target device:
-        per-sequence slices are taken from the flat device-resident query
-        tensor, reshaped, and padded to ``aligned_max_query_len`` on-device.
-        No CPU round-trip is needed for varlen formatting.
+        Query assembly is performed on CPU and then transferred to the target
+        device, because on-device transpose+contiguous for query reshaping hits
+        unsupported torch-spyre stick expressions.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -896,31 +898,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            # Gather this sequence's query tokens from the flat device tensor,
-            # then reshape to the GQA layout and pad to the global aligned
-            # length on device. Slicing the device-resident query avoids the
-            # CPU round-trip that the previous CPU-path needed for varlen
-            # formatting.
-            q_seq = query_dev[q_start:q_end]
-
-            # Reshape: [query_len, num_heads, head_size]
-            #   → [num_kv_heads, num_queries_per_kv, query_len, head_size]
-            q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-            q = q.reshape(num_kv_heads, num_queries_per_kv, query_len, head_size)
-
-            # Pad query to global aligned_max_query_len (uniform for all seqs)
+            # Assemble padded query on CPU, then transfer to the target device.
+            q_seq = query_cpu[q_start:q_end]
             if aligned_max_query_len > query_len:
-                q_padded = torch.zeros(
-                    num_kv_heads,
-                    num_queries_per_kv,
-                    aligned_max_query_len,
-                    head_size,
-                    dtype=q.dtype,
-                    device=q.device,
+                # Pad the query-length dimension (dim 0) to the global aligned
+                # length. F.pad is applied from the last dimension backward, so
+                # three leading zero pairs keep head_size and num_heads
+                # unchanged and pad only the query length.
+                q_seq = torch.nn.functional.pad(
+                    q_seq,
+                    (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
                 )
-                q_padded.narrow(2, 0, query_len).copy_(q)
-                q = q_padded
-            q_dev = q
+            q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+            q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+            q_dev = convert(q, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]

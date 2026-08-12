@@ -54,7 +54,7 @@ read of the gathered rotation slice out of the compiled graph.
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
-| `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs upstream `forward_native`, whose fp16→fp32 upcast is only lowered via torch-spyre EA propagation (PR #2927) — correct compiled, broken eager. The `SpyreSiluAndMul` `is_dynamo_compiling()` guard wraps it in `torch.compile` so the upcast is lowered on the eager platform default too |
+| `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` on Spyre since EA propagation (PR #2927) is correct compiled, but broken eager.|
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
 | `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |

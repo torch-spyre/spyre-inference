@@ -52,7 +52,7 @@ runs:
               pr="${MERGE_GROUP_REF##*/pr-}"   # 3695-<sha>
               pr="${pr%%-*}"                    # 3695
               case "$pr" in
-                ''|*[!0-9]*) pr="" ;;           # not all digits -> treat as unparseable
+                ''|*[!0-9]*) pr="" ;;           # not all digits -> treat as unparsable
               esac
               ;;
           esac

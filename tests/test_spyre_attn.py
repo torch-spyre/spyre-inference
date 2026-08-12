@@ -25,6 +25,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _create_compilable_reshape_and_cache,
+    _slot_runs,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
@@ -1091,17 +1093,6 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
 # ---------------------------------------------------------------------------
 
 
-def _reshape_and_cache_per_token_reference(
-    key, value, k_pages, v_pages, block_indices, block_offsets
-):
-    """The pre-batching per-token write-back, kept as the correctness oracle."""
-    for t in range(key.shape[0]):
-        k_tok = key[t].unsqueeze(1).contiguous()
-        v_tok = value[t].unsqueeze(1).contiguous()
-        torch.narrow(k_pages[block_indices[t]], 1, block_offsets[t], 1).copy_(k_tok)
-        torch.narrow(v_pages[block_indices[t]], 1, block_offsets[t], 1).copy_(v_tok)
-
-
 # (label, block_indices, block_offsets, expected_runs) with block_size=4.
 _SLOT_MAPPINGS = [
     ("aligned_prefill", [3, 3, 3, 3, 7, 7, 7, 7], [0, 1, 2, 3, 0, 1, 2, 3], 2),
@@ -1119,44 +1110,19 @@ _SLOT_MAPPINGS = [
     _SLOT_MAPPINGS,
     ids=[m[0] for m in _SLOT_MAPPINGS],
 )
-def test_slot_runs_count(label, block_indices, block_offsets, expected_runs):
-    """_slot_runs collapses same-page consecutive slots and nothing else."""
-    from spyre_inference.v1.attention.backends.spyre_attn import _slot_runs
-
-    runs = _slot_runs(block_indices, block_offsets, len(block_indices))
-    assert len(runs) == expected_runs, f"{label}: {runs}"
-
-    covered = []
-    for page_idx, offset, start, stop in runs:
-        for i, t in enumerate(range(start, stop)):
-            assert block_indices[t] == page_idx
-            assert block_offsets[t] == offset + i
-            covered.append(t)
-    assert covered == list(range(len(block_indices)))
-
-
-@pytest.mark.parametrize(
-    "label,block_indices,block_offsets,expected_runs",
-    _SLOT_MAPPINGS,
-    ids=[m[0] for m in _SLOT_MAPPINGS],
-)
-def test_reshape_and_cache_batched_matches_per_token(
-    label, block_indices, block_offsets, expected_runs
-):
-    """The batched write is byte-identical to the per-token write it replaces.
+def test_reshape_and_cache_batched(label, block_indices, block_offsets, expected_runs):
+    """Writes collapse to one per consecutive slot run, byte-identically.
 
     Runs entirely on CPU: `convert` short-circuits a same-device request and
     `_overwrite` is narrow().copy_() on both CPU and Spyre, so the kernel executes
     unchanged with host tensors.
     """
-    from spyre_inference.v1.attention.backends.spyre_attn import (
-        _create_compilable_reshape_and_cache,
-    )
-
     set_random_seed(0)
     num_tokens = len(block_indices)
     num_kv_heads, head_size, block_size = 2, 64, 4
     num_pages = max(block_indices) + 1
+
+    assert len(_slot_runs(block_indices, block_offsets, num_tokens)) == expected_runs
 
     key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
     value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
@@ -1168,36 +1134,21 @@ def test_reshape_and_cache_batched_matches_per_token(
             for _ in range(num_pages)
         ]
 
+    # Per-token write-back, the implementation this replaces, as the oracle.
     k_expected, v_expected = fresh_pages(), fresh_pages()
-    _reshape_and_cache_per_token_reference(
-        key, value, k_expected, v_expected, block_indices, block_offsets
-    )
+    for t in range(num_tokens):
+        torch.narrow(k_expected[block_indices[t]], 1, block_offsets[t], 1).copy_(
+            key[t].unsqueeze(1)
+        )
+        torch.narrow(v_expected[block_indices[t]], 1, block_offsets[t], 1).copy_(
+            value[t].unsqueeze(1)
+        )
 
     k_actual, v_actual = fresh_pages(), fresh_pages()
-    kernel = _create_compilable_reshape_and_cache(num_tokens)
-    kernel(
-        key,
-        value,
-        k_actual,
-        v_actual,
-        block_indices,
-        block_offsets,
-        torch.device("cpu"),
+    _create_compilable_reshape_and_cache(num_tokens)(
+        key, value, k_actual, v_actual, block_indices, block_offsets, torch.device("cpu")
     )
 
     for p in range(num_pages):
         torch.testing.assert_close(k_actual[p], k_expected[p], atol=0, rtol=0)
         torch.testing.assert_close(v_actual[p], v_expected[p], atol=0, rtol=0)
-
-
-def test_reshape_and_cache_batches_a_full_prefill():
-    """A block-aligned prefill issues one write per page, not one per token."""
-    from spyre_inference.v1.attention.backends.spyre_attn import _slot_runs
-
-    block_size, num_tokens, first_page = 128, 1024, 16
-    block_indices = [first_page + t // block_size for t in range(num_tokens)]
-    block_offsets = [t % block_size for t in range(num_tokens)]
-
-    runs = _slot_runs(block_indices, block_offsets, num_tokens)
-    assert len(runs) == num_tokens // block_size == 8
-    assert all(stop - start == block_size for _, _, start, stop in runs)

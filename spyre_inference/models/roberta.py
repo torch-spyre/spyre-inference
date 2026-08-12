@@ -35,9 +35,7 @@ def install_spyre_patches() -> None:
     if not hasattr(roberta, "_encode_token_type_ids") or not hasattr(
         roberta, "_decode_token_type_ids"
     ):
-        logger.debug(
-            "Spyre: RoBERTa module has no token_type helpers; skipping adapter"
-        )
+        logger.debug("Spyre: RoBERTa module has no token_type helpers; skipping adapter")
         return
 
     install_on(roberta)

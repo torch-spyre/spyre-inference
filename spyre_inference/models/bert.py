@@ -29,6 +29,5 @@ def install_spyre_patches() -> None:
 
     install_on(bert)
     logger.info(
-        "Spyre: BERT token_type_ids use side-buffer adapter "
-        "(skip vLLM bit-pack; torch-spyre#3509)"
+        "Spyre: BERT token_type_ids use side-buffer adapter (skip vLLM bit-pack; torch-spyre#3509)"
     )

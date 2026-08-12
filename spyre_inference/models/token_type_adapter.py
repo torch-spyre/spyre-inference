@@ -35,9 +35,7 @@ import torch
 _buffer: torch.Tensor | None = None
 
 
-def encode_token_type_ids(
-    input_ids: torch.Tensor, token_type_ids: torch.Tensor
-) -> None:
+def encode_token_type_ids(input_ids: torch.Tensor, token_type_ids: torch.Tensor) -> None:
     """Store ``token_type_ids`` in the side buffer; do not pack into ``input_ids``."""
     global _buffer
     n = token_type_ids.shape[0]
@@ -58,11 +56,7 @@ def encode_token_type_ids(
 
 def decode_token_type_ids(input_ids: torch.Tensor) -> torch.Tensor:
     """Return the side buffer; leave ``input_ids`` unchanged."""
-    if (
-        _buffer is None
-        or _buffer.shape != input_ids.shape
-        or _buffer.device != input_ids.device
-    ):
+    if _buffer is None or _buffer.shape != input_ids.shape or _buffer.device != input_ids.device:
         # encode was not called (single-segment path) → all segment 0
         return torch.zeros_like(input_ids)
     return _buffer

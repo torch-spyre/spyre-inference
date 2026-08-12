@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-specific SiluAndMul implementation"""
+"""Spyre-specific SiluAndMul implementation.
+
+The upstream `forward_native` slices the fused `[..., 2*d]` tensor on the last
+dim; that slice now works in eager mode on Spyre (torch-spyre#3578), so
+`forward_oot` simply calls it directly.
+"""
 
 import torch
 

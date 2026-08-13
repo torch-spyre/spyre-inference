@@ -294,28 +294,18 @@ def _create_compilable_page_attn(
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            # TODO: replace _indirect_matmul_mock with direct indexing once
-            # torch-spyre supports indirect tensor access in compiled matmuls.
-            # See PR #284 ("First attempt to use indirect access for varlen
-            # query layout") for the intended shape of the replacement.
-            #
-            # At that point k_pages/v_pages become dense tensors of shape
-            # [num_blocks, num_kv_heads, block_size, head_size], page_indices
-            # is a tensor of block indices, and the loop body simplifies to:
-            #
-            #   k_page = k_pages[page_idx]      # [KV, B, D]
-            #   v_page = v_pages[page_idx]      # [KV, B, D]
-            #   scores = torch.bmm(q_for_matmul, k_page.transpose(-2, -1))
-            #   ...
-            #   tile_output = torch.bmm(tile_probs, v_page)
-            #
-            # Until then, _indirect_matmul_mock gathers from a Python list of
-            # per-page tensors to avoid the Spyre layout-propagation bug
-            # (see tests/test_spyre_fallback_probes.py::
-            #  test_spyre_indirect_matmul_tensor_index).
+            # Syntax with views and indirect access
+            # (i.e. instead of _indirect_matmul_mock)
+            # k_page = k_pages[page_idx]
+            # v_page = v_pages[page_idx]
+            # k_page_4d = k_page.unsqueeze(1)
+            # v_page_4d = v_page.unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
+            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            # NOTE: for true "varlen" layout, q would be
+            # an indirect access too (avoided here for simplicity...)
             scores = _indirect_matmul_mock(
                 q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
             )

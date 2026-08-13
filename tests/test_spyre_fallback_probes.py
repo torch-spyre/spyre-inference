@@ -14,10 +14,10 @@
 
 """Strict-xfail probes for torch-spyre primitives blocking CPU fallbacks.
 
-Each test exercises a single primitive that the Granite 3.3 forward path
-needs to run fully on-device. They are intentionally strict xfail: when a
-primitive starts working in torch-spyre, the corresponding probe flips to
-XPASS and we can remove the associated CPU detour in spyre-inference.
+Each test exercises a single primitive that spyre-inference needs on-device
+(decoder forward, encoder pack, pooling). They are intentionally strict
+xfail: when a primitive starts working in torch-spyre, the corresponding
+probe flips to XPASS and we can remove the associated workaround here.
 
 All tests run against the real Spyre device when available; otherwise they
 skip silently (the same pattern used by test_spyre_attn.py).
@@ -108,11 +108,11 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     strict=True,
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
-        "an indexed scatter write. Historically this forced SpyreQKVParallelLinear "
-        "to D2H its result before returning; the current Spyre path side-steps it "
-        "by un-fusing the QKV weight after load. The probe is kept because the "
-        "underlying torch-spyre limitation still gates attention's per-token "
-        "KV-cache scatter and other rework."
+        "an indexed scatter write (torch-spyre#3508). Historically this forced "
+        "SpyreQKVParallelLinear to D2H before return; we side-step that by "
+        "un-fusing QKV after load. The same gap keeps encoder-only attention "
+        "Q/K/V pack/unpack on CPU (spyre_encoder_attn.py). Once this probe "
+        "passes, move encoder ragged→dense packing back onto Spyre."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):
@@ -122,6 +122,8 @@ def test_spyre_strided_scatter_source(spyre_device):
       1. qkv.split()        → strided 2D Spyre views
       2. v.view(-1, H, D)   → non-contiguous 3D Spyre tensor (Attention.forward)
       3. kv_cache[idx] = v  → scatter write with strided source
+
+    Also blocks on-device encoder attention packing (torch-spyre#3508).
     """
     num_tokens = 16
     num_heads, num_kv_heads, head_size = 8, 2, 64
@@ -183,6 +185,64 @@ def test_spyre_single_row_index_select(spyre_device):
 # It is intentionally not duplicated here.
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Tensor.index_add_ / aten::index_add is unimplemented on Spyre "
+        "(torch-spyre#3507). Upstream MeanPool uses index_add_ for segment "
+        "sums; until this works we keep MEAN pooling on CPU. When this probe "
+        "passes, add SpyreMeanPool (or drop MEAN from the unsupported list in "
+        "configure_pooling_for_spyre) and keep the pooler on Spyre like CLS/LAST."
+    ),
+)
+def test_spyre_index_add_for_mean_pooling(spyre_device):
+    """Segment sum via index_add_ (MEAN pooling primitive).
+
+    Shape mirrors a small pooled batch: values [T, H], segment ids [T] →
+    out [B, H] with out.index_add_(0, ids, values).
+    """
+    num_tokens, hidden, num_seqs = 12, 64, 3
+    values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+    # Three sequences of lengths 4, 3, 5 (ragged → flat with segment ids).
+    segment_ids = torch.tensor(
+        [0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2],
+        dtype=torch.int64,
+        device=spyre_device,
+    )
+    out = torch.zeros(num_seqs, hidden, dtype=torch.float16, device=spyre_device)
+    out.index_add_(0, segment_ids, values)
+
+    expected = torch.zeros(num_seqs, hidden, dtype=torch.float16)
+    expected.index_add_(0, segment_ids.cpu(), values.cpu())
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Fancy indexing (aten::index.Tensor) is unreliable on Spyre for the "
+        "shapes pooling / logits selection need. Related gather bugs: "
+        "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
+        "different indices), #3503 (fused two gathers, shared index). "
+        "spyre-inference works around this with host-built indices + "
+        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
+        "When this probe passes, revisit those workarounds."
+    ),
+)
+def test_spyre_fancy_index_tensor(spyre_device):
+    """Row gather via advanced indexing ``hs[idx]`` (aten::index.Tensor).
+
+    Upstream CLSPool / logits selection use this form; we use index_select
+    instead. Probe uses a flat [T, H] activation and 1-D int64 row indices.
+    """
+    hidden_states = torch.randn(32, 128, dtype=torch.float16, device=spyre_device)
+    # CLS-style first-token indices for a few sequences (not a simple arange).
+    row_indices = torch.tensor([0, 7, 15, 24], dtype=torch.int64, device=spyre_device)
+    out = hidden_states[row_indices]
+    expected = hidden_states.cpu()[row_indices.cpu()]
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # 3. Symbolic-offset in-place write
 # ---------------------------------------------------------------------------
@@ -193,7 +253,7 @@ def test_spyre_single_row_index_select(spyre_device):
 # on-device ("eager" mode); only *compiling* it with a data-dependent (SymInt)
 # offset fails to lower ("compile" mode, xfail). That is why the loop stays eager
 # and copies slot offsets to host int constants rather than indexing pages
-# on-device.
+# on-device. Same compiled gap (torch-spyre#3508) keeps encoder Q/K/V pack on CPU.
 
 
 @pytest.mark.parametrize(
@@ -207,9 +267,11 @@ def test_spyre_single_row_index_select(spyre_device):
                 reason=(
                     "Compiled narrow().copy_() at a data-dependent (SymInt) offset "
                     "fails to lower ('shape error in scatter op, can not broadcast "
-                    "[.,1,.] to [.,u,.]'). Only compilation is blocked; the eager "
-                    "path works, so slot_mapping is copied to host int constants "
-                    "before the write instead of indexing pages on-device."
+                    "[.,1,.] to [.,u,.]') — torch-spyre#3508. Only compilation is "
+                    "blocked; the eager path works, so slot_mapping is copied to "
+                    "host int constants before KV writes. Same gap keeps encoder "
+                    "Q/K/V pack on CPU; once this and test_spyre_strided_scatter_source "
+                    "pass, move encoder packing back onto Spyre."
                 ),
             ),
         ),

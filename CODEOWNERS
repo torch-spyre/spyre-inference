@@ -17,4 +17,5 @@ spyre_inference/v1/worker/ @torch-spyre/spyre-inference-default-codeowners
 spyre_inference/v1/attention/ @torch-spyre/spyre-inference-default-codeowners @jvlunteren @bringlein
 
 # CICD
-.github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant
+.github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana
+Makefile @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana

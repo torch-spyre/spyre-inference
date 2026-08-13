@@ -76,7 +76,11 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
-from spyre_testing_plugin.vfio_reaper import reap_vfio_holders, spyre_hardware_present
+from spyre_testing_plugin.vfio_reaper import (
+    reap_vfio_holders,
+    spyre_hardware_present,
+    wait_until_card_free,
+)
 
 _YAML_FILENAME = "upstream_tests.yaml"
 _YAML_PATH = Path(__file__).parent / _YAML_FILENAME
@@ -96,6 +100,10 @@ def spyre_available() -> bool:
     Returns:
         True if a Spyre device can be allocated, False otherwise.
     """
+    if not spyre_hardware_present():
+        return False
+
+    wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
     try:
         torch.randn(1, device=torch.device("spyre"))
         return True
@@ -1022,14 +1030,25 @@ def pytest_runtest_makereport(item, call):
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
-    """After a FAILED test on a Spyre host, force-free the card for the next test.
+    """Free the Spyre card at each test boundary on a Spyre host.
 
-    Only failures can orphan a holder, so gating to failures leaves a
-    cleanly-passing test's card alone — a cached `LLM`, or the in-process device
-    tests whose card belongs to the still-alive pytest process. `trylast` runs it
-    after all other teardown (fixture finalizers, the tests' own `del llm`).
+    A failed test can orphan a holder outright, so after a failure we reap
+    (SIGKILL the holder, then wait for the card).
+
+    A *passing* test can also leave the card transiently busy: an out-of-process
+    vLLM engine is force-killed during shutdown and the kernel's VFIO release is
+    asynchronous, so the holder is already on its way out but may not be gone by
+    the time the next test opens the device. There we only wait — killing would
+    take down a legitimately cached `LLM`, or the in-process device tests whose
+    card belongs to the still-alive pytest process.
+
+    `trylast` runs this after all other teardown (fixture finalizers, the tests'
+    own `del llm`).
     """
     if not spyre_hardware_present():
         return
     if getattr(item, "_spyre_test_failed", False):
         reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
+    else:
+        # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
+        wait_until_card_free(exclude_pids={os.getpid()}, log=_log)

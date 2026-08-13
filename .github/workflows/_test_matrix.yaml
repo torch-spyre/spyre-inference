@@ -67,26 +67,28 @@ on:
         default: ""
       test_type:
         description: |
-          Suite subset to run: smoke | core | full (default) | trunk. Selects
-          which of the matrix configs below run — each entry declares the
-          test_types it belongs to, and a job is skipped unless test_type is
-          in its set:
-            smoke — fast per-op unit tests only (1 config, single card)
-            core  — all spyre-native tests (per-op + attention + distributed),
-                    excludes the heavy upstream-vLLM suites
-            full  — every config (default; back-compatible)
-            trunk — push-to-main CI; same coverage as full
-          Also accepts the user-facing tier aliases unit (= core), integration
-          (= smoke), regression (= full) -- resolved once in the "Decide
-          whether to run" step below, so every caller (Jenkins, config.yaml)
-          sees the same mapping. Same knob and vocabulary as the sibling repos
-          (torch-spyre PR #2924, hf-adapters #106); the mapping to configs is
-          repo-internal.
+          Suite subset to run: unit | integration | regression (default) |
+          trunk | perf. These are literal, first-class values -- no
+          alias-resolution layer. Selects which of the matrix configs below
+          run — each entry declares the test_types it belongs to, and a job
+          is skipped unless test_type is in its set:
+            unit        — all spyre-native tests (per-op + attention +
+                          distributed), excludes the heavy upstream-vLLM
+                          suites
+            integration — fast per-op unit tests only, the smoke suite
+                          (1 config, single card)
+            regression  — every config (default)
+            trunk       — push-to-main CI; same coverage as regression
+          Same knob and vocabulary as the sibling repos (torch-spyre,
+          hf-adapters); the mapping to configs is repo-internal. Validated
+          and defaulted (empty -> regression) once in the "Decide whether to
+          run" step below, so every caller (Jenkins, config.yaml) sees the
+          same behavior.
           The perf value runs the dedicated perf job below (the vLLM benchmark
           suite), not any of the pytest matrix configs.
         required: false
         type: string
-        default: full
+        default: regression
       skip_uv_for_benchmarking:
         description: |
           Perf job only. When true, the benchmark runner bypasses `uv run` and
@@ -154,11 +156,12 @@ jobs:
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
-          # resolve_test_type.sh maps tier aliases AND validates the result:
-          # it exits 1 with an ::error:: line if the type is unknown, so this
-          # step does not re-check the valid set. Single source of truth for
-          # the vocabulary is that script (shared with the Makefile).
-          RESOLVED_TEST_TYPE="$(scripts/resolve_test_type.sh "${RAW_TEST_TYPE}")"
+          # `make print-test-type` applies the Makefile's default (empty ->
+          # regression) and validates the result: it exits non-zero with an
+          # ::error:: line if the type is unknown, so this step does not
+          # re-check the valid set. Single source of truth for the
+          # vocabulary is the Makefile.
+          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
           echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
 
   test:
@@ -169,7 +172,7 @@ jobs:
         include:
           - cfg: Non-distributed spyre tests
             # Fast per-op unit tests: the smoke set.
-            test_types: smoke core full trunk
+            test_types: unit integration regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -178,7 +181,7 @@ jobs:
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
-            test_types: core full trunk
+            test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -186,7 +189,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention
           - cfg: Distributed spyre tests
-            test_types: core full trunk
+            test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -194,8 +197,8 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-distributed
           - cfg: Upstream vLLM tests
-            # Upstream-vLLM suites are excluded from smoke/core (heavy).
-            test_types: full trunk
+            # Upstream-vLLM suites are excluded from integration/unit (heavy).
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -203,7 +206,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
-            test_types: full trunk
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -211,7 +214,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
-            test_types: full trunk
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -266,22 +269,23 @@ jobs:
       #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
       #      flow passes only when source files changed;
       #   2. this config's test_types set contains the requested test_type
-      #      (so test_type selects a subset of the matrix; full = every config).
+      #      (so test_type selects a subset of the matrix; regression = every
+      #      config).
       - name: Decide whether to run
         id: gate
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
-          # Resolve user-facing tier aliases to this workflow's own vocabulary
-          # (smoke/core/full) via the shared script -- same source of truth as
-          # the Makefile's TEST_TYPE resolution, the single choke point every
-          # caller (Jenkins, config.yaml) passes through. The script also
-          # rejects an unknown type (exit 1 with an ::error:: line): type:
-          # choice guards the workflow_dispatch entrypoint, but this reusable
+          # Apply the shared default (empty -> regression) and validate via
+          # `make print-test-type` -- the Makefile is the single source of
+          # truth for TEST_TYPE resolution, the single choke point every
+          # caller (Jenkins, config.yaml) passes through. It also rejects an
+          # unknown type (non-zero exit with an ::error:: line): type: choice
+          # guards the workflow_dispatch entrypoint, but this reusable
           # workflow_call path accepts any string, and an unknown value would
           # match no config and silently skip every job -> a green run that
           # tested nothing.
-          RESOLVED_TEST_TYPE="$(scripts/resolve_test_type.sh "${RAW_TEST_TYPE}")"
+          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
           # Expose the resolved type so the perf job (which is NOT one of the
           # matrix.cfg entries) can gate itself on it -- same pattern as the
           # sibling torch-spyre workflow's generate_matrix.resolved_test_type.
@@ -390,15 +394,15 @@ jobs:
         # marker-combo invocation, so the marker set is not duplicated here.
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ strategy.job-index }}.xml
+          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
           echo "tests done"
 
       - name: Upload JUnit results
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ strategy.job-index }}
-          path: junit-${{ strategy.job-index }}.xml
+          name: junit-${{ matrix.test_target }}
+          path: junit-${{ matrix.test_target }}.xml
           retention-days: 14
 
       - name: Publish JUnit test report
@@ -406,7 +410,7 @@ jobs:
         uses: dorny/test-reporter@v1
         with:
           name: 'Test report (${{ matrix.cfg }})'
-          path: junit-${{ strategy.job-index }}.xml
+          path: junit-${{ matrix.test_target }}.xml
           # dorny/test-reporter@v1 has no python-specific reporter; java-junit
           # parses the generic JUnit-XML schema pytest's --junit-xml emits.
           reporter: java-junit

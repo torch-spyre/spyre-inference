@@ -29,14 +29,14 @@ import warnings
 import pytest
 import torch
 
-from torch_spyre._inductor.constants import FP8_E4M3_MAX
+from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
 
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
 def cpu_quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """CPU reference for FP8 quantization: `clamp(x / scale).to(float8_e4m3fn)`."""
-    return (x / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return (x / scale).clamp(-FP8_E4M3FN_MAX, FP8_E4M3FN_MAX).to(torch.float8_e4m3fn)
 
 
 def cpu_dequantize_fp8(x_fp8: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -51,13 +51,13 @@ def cpu_quantize_dequantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.T
 
 @pytest.mark.fp8
 def test_quantize_clamps_to_max():
-    """Reference clamps values beyond +/-FP8_E4M3_MAX."""
+    """Reference clamps values beyond +/-FP8_E4M3FN_MAX."""
     x = torch.tensor([500.0, -500.0, 1000.0], dtype=torch.float16)
     scale = torch.tensor([1.0], dtype=torch.float16)
 
     x_fp8_fp16 = cpu_quantize_fp8(x, scale).to(torch.float16)
 
-    expected = torch.tensor([FP8_E4M3_MAX, -FP8_E4M3_MAX, FP8_E4M3_MAX], dtype=torch.float16)
+    expected = torch.tensor([FP8_E4M3FN_MAX, -FP8_E4M3FN_MAX, FP8_E4M3FN_MAX], dtype=torch.float16)
     torch.testing.assert_close(x_fp8_fp16, expected, atol=0.0, rtol=0.0)
 
 
@@ -70,7 +70,7 @@ def test_quantize_applies_scale_before_clamp():
     x_fp8_fp16 = cpu_quantize_fp8(x, scale).to(torch.float16)
 
     # x/scale = [10, -10, 500] -> clamp -> [10, -10, 448], all FP8-representable
-    expected = torch.tensor([10.0, -10.0, FP8_E4M3_MAX], dtype=torch.float16)
+    expected = torch.tensor([10.0, -10.0, FP8_E4M3FN_MAX], dtype=torch.float16)
     torch.testing.assert_close(x_fp8_fp16, expected, atol=0.0, rtol=0.0)
 
 

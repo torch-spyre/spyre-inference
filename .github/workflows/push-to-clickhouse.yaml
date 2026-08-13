@@ -1,0 +1,231 @@
+name: push-to-clickhouse
+
+# Ingests JUnit XML results from spyre-inference's own pytest matrix into
+# ClickHouse via .github/scripts/ingest_xml_si.py, writing to
+# si_test_runs / si_test_cases / si_run_properties. Triggered by both
+# workflows that produce that matrix (both call the same reusable
+# _test_matrix.yaml, so they emit the exact same suite shape):
+#   - test_each_commit.yaml (push / PR / merge_group entrypoint)
+#   - integration-tests.yaml (workflow_dispatch entrypoint, e.g. upstream
+#     triggers or manual re-runs)
+# Also supports manual dispatch for re-ingesting a specific run.
+on:
+  workflow_run:
+    workflows:
+      - integration-tests
+      - test_each_commit
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to re-ingest (leave blank to skip)
+        required: false
+        default: ''
+      workflow_name:
+        description: Workflow name (integration-tests | test_each_commit)
+        required: false
+        default: integration-tests
+
+concurrency:
+  # Allow at most one ingest per triggering run (re-runs queue behind)
+  group: ingest-${{ github.event.workflow_run.id || inputs.gha_run_id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read   # needed to download artifacts from the triggering run
+
+jobs:
+  ingest:
+    name: Ingest XML -> ClickHouse
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+    timeout-minutes: 15
+    # Skip if the triggering workflow was cancelled (but ingest failures are fine)
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion != 'cancelled'
+
+    env:
+      # ---------------------------------------------------------------------------
+      # Set these secrets in your repo / org settings:
+      #   CLICKHOUSE_HOST   e.g. clickhouse.internal.example.com
+      #   CLICKHOUSE_PORT   e.g. 8123  (HTTP interface)
+      #   CLICKHOUSE_USER   e.g. spyre_writer
+      #   CLICKHOUSE_PASS   the password
+      #   CLICKHOUSE_DB     e.g. spyre
+      # ---------------------------------------------------------------------------
+      CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+      CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+      CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+      CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+      CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+
+      # Metadata about the triggering run
+      TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
+      TRIGGERING_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      TRIGGERING_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      TRIGGERING_AT: ${{ github.event.workflow_run.created_at || '' }}
+      # display_title carries "integration-tests (<test_type>)" via that
+      # workflow's run-name, or the bare tier ("trunk" / "regression") via
+      # test_each_commit's -- the only way this job can recover which tier
+      # ran without an extra API call.
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+
+    steps:
+      # workflow_run always executes this file as it exists on the default
+      # branch, so a plain checkout (no ref:) here pulls the canonical copy
+      # of the ingest script regardless of which ref triggered the run.
+      - name: Checkout ingest script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: |
+            .github/scripts/ingest_xml_si.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: setup venv
+        run: |
+          uv venv
+          source .venv/bin/activate
+          echo "VIRTUAL_ENV $VIRTUAL_ENV"
+
+      - name: Install Python dependencies
+        run: |
+          source .venv/bin/activate
+          uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+
+      - name: Install gh CLI
+        run: |
+          # curl, not wget: not every node in the spyre runner pool has wget.
+          curl -fsSL https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz \
+            -o gh_2.92.0_linux_amd64.tar.gz
+          tar -xzf gh_2.92.0_linux_amd64.tar.gz
+          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          gh_2.92.0_linux_amd64/bin/gh --version
+
+      - name: Resolve PR number
+        id: resolve-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR=$(gh api \
+            "/repos/${{ github.repository }}/commits/${TRIGGERING_SHA}/pulls" \
+            --jq '.[0].number // 0')
+          echo "Resolved PR number: ${PR}"
+          echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
+
+      # ---------------------------------------------------------------------------
+      # Download every artifact from the triggering run and unzip it — artifact
+      # *names* carry no file extension (only the file inside the zip does), so
+      # filtering has to happen post-unzip by actual filename, not by artifact name.
+      # ---------------------------------------------------------------------------
+      - name: List artifacts from triggering run
+        id: list-artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ARTIFACTS=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | {id: .id, name: .name}]')
+          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
+          echo "Found artifacts:"
+          echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
+
+      - name: Download XML artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p xml_artifacts
+          export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
+          python3 <<'PYEOF'
+          import json, os, subprocess, sys
+          from pathlib import Path
+
+          artifacts = json.loads(os.environ['ARTIFACTS'])
+          repo  = os.environ['GITHUB_REPOSITORY']
+          for a in artifacts:
+              print(f"Downloading: {a['name']} (id={a['id']})")
+              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
+                result = subprocess.run([
+                    "gh", "api",
+                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
+                ], check=True, env={**os.environ}, capture_output=True)
+                f.write(result.stdout)
+              # Each artifact unzips into its OWN subdirectory (named after
+              # the artifact) rather than a shared flat one, so two suites
+              # can never clobber each other even if they happen to produce
+              # a JUnit XML with the same basename. ingest_xml_si.py globs
+              # --xml-dir recursively and derives a unique filename from the
+              # path relative to it, so this nesting is exactly what it
+              # expects.
+              dest = Path("xml_artifacts") / a["name"]
+              subprocess.run(
+                  ["unzip", "-o", f"xml_artifacts/{a['name']}.zip", "-d", str(dest)],
+                  check=True,
+              )
+          PYEOF
+          echo "Downloaded XML files:"
+          find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
+
+      - name: Resolve test_type for trigger_type
+        id: extract-tier
+        run: |
+          if [[ "${TRIGGERING_WORKFLOW}" == "test_each_commit" ]]; then
+            # test_each_commit's run-name IS the external-facing tier name
+            # itself ("trunk" on push, "regression" otherwise) -- no parens
+            # to parse out.
+            TIER="${TRIGGERING_DISPLAY_TITLE}"
+          else
+            # integration-tests' run-name is deliberately
+            # "integration-tests (<inputs.test_type>)" -- the RAW test_type
+            # value the caller passed (e.g. "integration" / "regression" /
+            # "trunk"); there is no internal alias vocabulary to resolve
+            # through (see _test_matrix.yaml's test_type description) -- so
+            # parsing it out of display_title recovers the real external-
+            # facing value without an extra API call.
+            TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          fi
+          echo "Resolved test_type: ${TIER:-<none>}"
+          echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
+
+      # ---------------------------------------------------------------------------
+      # Parse each XML file and insert rows into ClickHouse via
+      # ingest_xml_si.py (checked out above), into
+      # si_test_runs / si_test_cases / si_run_properties.
+      # ---------------------------------------------------------------------------
+      - name: Ingest XML files into ClickHouse
+        run: |
+          source .venv/bin/activate
+          python3 .github/scripts/ingest_xml_si.py \
+            --xml-dir xml_artifacts \
+            --workflow "${TRIGGERING_WORKFLOW}" \
+            --branch   "${TRIGGERING_BRANCH}" \
+            --sha      "${TRIGGERING_SHA}" \
+            --run-id   "${TRIGGERING_RUN_ID}" \
+            --triggered-at "${TRIGGERING_AT}" \
+            --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
+            --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
+            --platform "$(uname -m)"
+
+      - name: Summary
+        if: always()
+        run: |-
+          XML_COUNT=$(find xml_artifacts -name "*.xml" 2>/dev/null | wc -l || echo 0)
+          {
+            echo "### ClickHouse Ingest Summary"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering workflow | ${TRIGGERING_WORKFLOW} |"
+            echo "| Triggering run ID   | ${TRIGGERING_RUN_ID} |"
+            echo "| Suite tier          | ${{ steps.extract-tier.outputs.tier }} |"
+            echo "| PR number           | ${{ steps.resolve-pr.outputs.pr_number }} |"
+            echo "| Branch              | ${TRIGGERING_BRANCH} |"
+            echo "| Commit SHA          | ${TRIGGERING_SHA:0:12} |"
+            echo "| XML files ingested  | ${XML_COUNT} |"
+          } >> "$GITHUB_STEP_SUMMARY"

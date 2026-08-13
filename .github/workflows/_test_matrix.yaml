@@ -67,18 +67,66 @@ on:
         default: ""
       test_type:
         description: |
-          Suite subset to run: smoke | core | full (default). Selects which of
-          the matrix configs below run — each entry declares the test_types it
-          belongs to, and a job is skipped unless test_type is in its set:
-            smoke — fast per-op unit tests only (1 config, single card)
-            core  — all spyre-native tests (per-op + attention + distributed),
-                    excludes the heavy upstream-vLLM suites
-            full  — every config (default; back-compatible)
-          Same knob and vocabulary as the sibling repos (torch-spyre PR #2924,
-          hf-adapters #106); the mapping to configs is repo-internal.
+          Suite subset to run: unit | integration | regression (default) |
+          trunk | perf. These are literal, first-class values -- no
+          alias-resolution layer. Selects which of the matrix configs below
+          run — each entry declares the test_types it belongs to, and a job
+          is skipped unless test_type is in its set:
+            unit        — all spyre-native tests (per-op + attention +
+                          distributed), excludes the heavy upstream-vLLM
+                          suites
+            integration — fast per-op unit tests only, the smoke suite
+                          (1 config, single card)
+            regression  — every config (default)
+            trunk       — push-to-main CI; same coverage as regression
+          Same knob and vocabulary as the sibling repos (torch-spyre,
+          hf-adapters); the mapping to configs is repo-internal. Validated
+          and defaulted (empty -> regression) once in the "Decide whether to
+          run" step below, so every caller (Jenkins, config.yaml) sees the
+          same behavior.
+          The perf value runs the dedicated perf job below (the vLLM benchmark
+          suite), not any of the pytest matrix configs.
         required: false
         type: string
-        default: full
+        default: regression
+      skip_uv_for_benchmarking:
+        description: |
+          Perf job only. When true, the benchmark runner bypasses `uv run` and
+          calls the prebaked venv's python3 directly (make ... TEST_TYPE=perf
+          SKIP_UV_FOR_BENCHMARKING=1). Needed on arches where uv re-resolves the
+          project and cannot find a torch/vllm wheel (s390x: torch==2.11.0 has no
+          s390x wheel), so uv builds a fresh venv without torch and every
+          benchmark fails with "No module named 'torch'". Default false keeps the
+          uv path, correct on arches with a resolvable lockfile (amd64, ppc64le).
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      # Declaring any workflow_call.secrets closes the secrets object for
+      # actionlint: every secrets.* used anywhere in this file must then be
+      # listed here. So the pre-existing ARTIFACTORY_* (override-RPM install)
+      # are declared alongside the new CLICKHOUSE_* (perf ingest). All optional;
+      # secrets: inherit at each caller forwards the org/repo secrets present.
+      ARTIFACTORY_USER:
+        required: false
+      ARTIFACTORY_TOKEN:
+        required: false
+      ARTIFACTORY_BASE_URL:
+        required: false
+      ARTIFACTORY_RPM_PATH:
+        required: false
+      # ClickHouse connection for the perf job's benchmark ingest. A run without
+      # them (any non-perf run, or perf with CLICKHOUSE_HOST unset) skips ingest.
+      CLICKHOUSE_HOST:
+        required: false
+      CLICKHOUSE_PORT:
+        required: false
+      CLICKHOUSE_USER:
+        required: false
+      CLICKHOUSE_PASS:
+        required: false
+      CLICKHOUSE_DB:
+        required: false
 
 defaults:
   run:
@@ -90,6 +138,32 @@ permissions:
   actions: read
 
 jobs:
+  # Resolve the user-facing tier alias once, at the job level, so the perf job
+  # (which is not one of the matrix configs) can gate on it. Mirrors the sibling
+  # torch-spyre workflow's generate_matrix.resolved_test_type output.
+  resolve:
+    name: Resolve test type
+    runs-on: ubuntu-latest
+    outputs:
+      resolved_test_type: ${{ steps.resolve.outputs.resolved_test_type }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+      - name: Resolve
+        id: resolve
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type }}
+        run: |
+          # `make print-test-type` applies the Makefile's default (empty ->
+          # regression) and validates the result: it exits non-zero with an
+          # ::error:: line if the type is unknown, so this step does not
+          # re-check the valid set. Single source of truth for the
+          # vocabulary is the Makefile.
+          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
+          echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
+
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
     strategy:
@@ -98,7 +172,7 @@ jobs:
         include:
           - cfg: Non-distributed spyre tests
             # Fast per-op unit tests: the smoke set.
-            test_types: smoke core full
+            test_types: unit integration regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -107,7 +181,7 @@ jobs:
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
-            test_types: core full
+            test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -115,7 +189,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-attention
           - cfg: Distributed spyre tests
-            test_types: core full
+            test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -123,8 +197,8 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-distributed
           - cfg: Upstream vLLM tests
-            # Upstream-vLLM suites are excluded from smoke/core (heavy).
-            test_types: full
+            # Upstream-vLLM suites are excluded from integration/unit (heavy).
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -132,7 +206,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
-            test_types: full
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
@@ -140,7 +214,7 @@ jobs:
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
-            test_types: full
+            test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
@@ -195,26 +269,38 @@ jobs:
       #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
       #      flow passes only when source files changed;
       #   2. this config's test_types set contains the requested test_type
-      #      (so test_type selects a subset of the matrix; full = every config).
+      #      (so test_type selects a subset of the matrix; regression = every
+      #      config).
       - name: Decide whether to run
         id: gate
+        env:
+          RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
-          # Reject an unrecognized test_type loudly. type: choice guards the
-          # workflow_dispatch entrypoint, but this reusable workflow_call path
-          # accepts any string, and an unknown value would match no config and
-          # silently skip every job -> a green run that tested nothing.
-          case "${{ inputs.test_type }}" in
-            smoke|core|full) ;;
-            *) echo "::error::Invalid test_type '${{ inputs.test_type }}'. Valid: smoke | core | full"; exit 1 ;;
-          esac
+          # Apply the shared default (empty -> regression) and validate via
+          # `make print-test-type` -- the Makefile is the single source of
+          # truth for TEST_TYPE resolution, the single choke point every
+          # caller (Jenkins, config.yaml) passes through. It also rejects an
+          # unknown type (non-zero exit with an ::error:: line): type: choice
+          # guards the workflow_dispatch entrypoint, but this reusable
+          # workflow_call path accepts any string, and an unknown value would
+          # match no config and silently skip every job -> a green run that
+          # tested nothing.
+          RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
+          # Expose the resolved type so the perf job (which is NOT one of the
+          # matrix.cfg entries) can gate itself on it -- same pattern as the
+          # sibling torch-spyre workflow's generate_matrix.resolved_test_type.
+          echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
           if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
              || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
             changed=true
           else
             changed=false
           fi
+          # perf is NOT part of the pytest matrix: it runs in the dedicated perf
+          # job below, not as any matrix.cfg. So every matrix config skips when
+          # test_type=perf (selected=false for all), and only the perf job runs.
           case " ${{ matrix.test_types }} " in
-            *" ${{ inputs.test_type }} "*) selected=true ;;
+            *" ${RESOLVED_TEST_TYPE} "*) selected=true ;;
             *) selected=false ;;
           esac
           if [[ "$changed" == "true" && "$selected" == "true" ]]; then
@@ -308,15 +394,15 @@ jobs:
         # marker-combo invocation, so the marker set is not duplicated here.
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ strategy.job-index }}.xml
+          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
           echo "tests done"
 
       - name: Upload JUnit results
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: junit-${{ strategy.job-index }}
-          path: junit-${{ strategy.job-index }}.xml
+          name: junit-${{ matrix.test_target }}
+          path: junit-${{ matrix.test_target }}.xml
           retention-days: 14
 
       - name: Publish JUnit test report
@@ -324,8 +410,120 @@ jobs:
         uses: dorny/test-reporter@v1
         with:
           name: 'Test report (${{ matrix.cfg }})'
-          path: junit-${{ strategy.job-index }}.xml
+          path: junit-${{ matrix.test_target }}.xml
           # dorny/test-reporter@v1 has no python-specific reporter; java-junit
           # parses the generic JUnit-XML schema pytest's --junit-xml emits.
           reporter: java-junit
           fail-on-error: false
+
+  # ---------------------------------------------------------------------------
+  # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
+  # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
+  # one of the matrix configs above: perf runs benchmarks, not pytest markers,
+  # so it lives in its own job and every matrix config skips when
+  # test_type=perf. Weekly-only, like the sibling torch-spyre perf job:
+  # benchmarks are long and hardware-contended, never gated on a PR.
+  # ---------------------------------------------------------------------------
+  perf:
+    name: Perf benchmarks (vLLM)
+    needs: resolve
+    if: >-
+      ${{ !cancelled()
+          && github.event_name != 'pull_request'
+          && needs.resolve.outputs.resolved_test_type == 'perf' }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
+    timeout-minutes: 720
+    env:
+      CI: ''
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      HF_HUB_OFFLINE: '1'
+      RESULTS_DIR: benchmark-results
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install Spyre RPMs
+        uses: ./.github/actions/spyre-rpm-install
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          prune-cache: false
+          save-cache: ${{ github.event_name != 'merge_group' }}
+
+      - name: Install override Spyre RPMs
+        if: ${{ inputs.rpm_names != '' }}
+        uses: ./.github/actions/override-spyre-rpms
+        with:
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+
+      - name: Gather runner info
+        uses: ./.github/actions/gather-runner-info
+
+      - name: Build spyre-inference
+        env:
+          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          if [[ -n "$TORCH_SPYRE_REF" ]]; then
+            uv add --frozen \
+              "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
+            uv sync --verbose --group dev
+          else
+            uv sync --frozen --verbose --group dev
+          fi
+          uv pip show torch
+          uv pip freeze
+
+      - name: Ensure public HF models cached
+        env:
+          HF_HUB_OFFLINE: '0'
+        run: uv run .github/cache_config/manage_cache.py --public
+
+      - name: Run vLLM benchmarks
+        env:
+          # true -> "1" (bypass uv, use the baked venv's python3 directly),
+          # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
+          SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
+        run: |
+          echo "Running vLLM benchmark suite (TEST_TYPE=perf)..."
+          make tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}" \
+            SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
+          echo "benchmarks done"
+
+      # Ingest via the reusable composite action, the single ingest
+      # implementation (no duplicated logic). Secrets cannot reach a composite
+      # action, so the ClickHouse connection is passed as plain inputs. The
+      # action gates internally: an empty clickhouse-host (secret unset) or no
+      # benchmark JSON is a clean no-op, so this runs unconditionally on
+      # non-PR events (fork PRs are already excluded by the job-level if:).
+      - name: Ingest benchmark results into ClickHouse
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: ./.github/actions/ingest-vllm-benchmarks
+        with:
+          results-dir: ${{ env.RESULTS_DIR }}
+          workflow: vLLM Benchmark
+          branch: ${{ inputs.ref || github.ref_name }}
+          sha: ${{ github.sha }}
+          run-id: ${{ github.run_id }}
+          job-id: '0'
+          pr-number: '0'
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}

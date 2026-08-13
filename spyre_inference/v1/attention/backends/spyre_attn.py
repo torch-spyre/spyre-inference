@@ -82,6 +82,10 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
+# On-device query overwrite only compiles for head_size multiples of 128; 64
+# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
+ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -109,29 +113,21 @@ def _overwrite(
     dims: list[int],
     offsets: list[int],
 ) -> None:
-    """Write input into output at the specified position (in-place)."""
-    if output.device.type == "spyre":
-        # `torch.ops.spyre.overwrite` is dynamically registered, so its
-        # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(
-            input,  # ty: ignore[invalid-argument-type]
-            output,  # ty: ignore[invalid-argument-type]
-            dims,  # ty: ignore[invalid-argument-type]
-            offsets,  # ty: ignore[invalid-argument-type]
-        )
-    else:
-        # intended behaviour on cpu
-        sliced_t = output
-        for i, dim in enumerate(dims):
-            sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
-        sliced_t.copy_(input)
+    """Write input into output at the specified position (in-place).
+
+    narrow().copy_() at a concrete offset works on both CPU and Spyre.
+    """
+    sliced_t = output
+    for i, dim in enumerate(dims):
+        sliced_t = torch.narrow(sliced_t, dim, offsets[i], 1)
+    sliced_t.copy_(input)
 
 
 def _indirect_matmul_mock(
     a: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_a: int | torch.Tensor | None,
+    address_or_index_of_a: int | torch.Tensor | list[int] | None,
     b: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_b: int | torch.Tensor | None,
+    address_or_index_of_b: int | torch.Tensor | list[int] | None,
     # we need the option to transform a and/or b, after the indirect access
     transform_a: Callable | None = None,
     transform_b: Callable | None = None,
@@ -141,58 +137,74 @@ def _indirect_matmul_mock(
     address_or_index_of_ : this can be both: index if running on the CPU or if
                            the outer-dimension of the tensors are lists. Or then
                            absolute addresses if it is supported on Spyre.
-                           The semantic is always to access ONE slice of the outer-most
-                           dimension: I.e. if we have a 2D tensor like [8, 32, 32], then
-                           the address_or_index_of would access the first dimension here
-                           (which has the size of 8) and return one element of shape
-                           [1, 32, 32]. Same example for a 3D tensor: if tensor a
-                           would be e.g. [8, 32, 8, 128], and the
-                           address_or_index_of_a is 5, then this matmul would
-                           access the 5th slice of Tensor a and return a slice of
-                           shape [1, 32, 8, 128].
+
+                           Single index: accesses ONE slice (returns same shape as that slice)
+                           List of indices: accesses MULTIPLE slices and concatenates along dim 0
+
+                           Example for list access: if a is a list of [num_tokens] tensors each
+                           [num_heads, head_size], and address_or_index_of_a is [2, 3, 4], then
+                           the result is torch.cat([a[2], a[3], a[4]], dim=0) with shape
+                           [3, num_heads, head_size].
 
     transform_ : This is an optional torch-compilable function to transform (e.g.
                  transpose/rotate) the tensor-slice after it was loaded via
                  the indirect access before the matmul happens.
 
     """
-    current_device = a[0].device.type  # works with tensors and lists (?)
+    # Handle both list and tuple (torch.unbind returns tuple)
+    is_a_list = isinstance(a, (list, tuple))
+    is_b_list = isinstance(b, (list, tuple))
+
+    current_device = a[0].device.type if is_a_list else a.device.type
     if current_device == "spyre":
         # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
-        assert isinstance(a, list) or address_or_index_of_a is None, (
-            "here needs to be true indirect access"
-        )
-        assert isinstance(b, list) or address_or_index_of_b is None, (
-            "here needs to be true indirect access"
-        )
+        assert is_a_list or address_or_index_of_a is None, "here needs to be true indirect access"
+        assert is_b_list or address_or_index_of_b is None, "here needs to be true indirect access"
 
     # resolving indirect access
     # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
     # hence, it has to be views like here
-    if isinstance(a, list) or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
-        if isinstance(address_or_index_of_a, torch.Tensor):
+    if is_a_list or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
+        if isinstance(address_or_index_of_a, list):
+            # Multiple indices - cat the results (for prefill with list-based queries)
+            a_slices = [a[idx] for idx in address_or_index_of_a]
+            a = torch.cat(a_slices, dim=0)
+            if transform_a:
+                a = transform_a(a)
+        elif isinstance(address_or_index_of_a, torch.Tensor):
             assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
             idx_a = int(address_or_index_of_a.item())
+            a = a[idx_a]
+            if transform_a:
+                a = transform_a(a)
         else:
             assert address_or_index_of_a is not None
-            idx_a = address_or_index_of_a
-        # pytorch syntax is the same like for python lists here
-        a = a[idx_a]
-        if transform_a:
-            a = transform_a(a)
-    if isinstance(b, list) or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
-        if isinstance(address_or_index_of_b, torch.Tensor):
+            a = a[address_or_index_of_a]
+            if transform_a:
+                a = transform_a(a)
+
+    if is_b_list or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
+        if isinstance(address_or_index_of_b, list):
+            # Multiple indices - cat the results (for prefill with list-based queries)
+            b_slices = [b[idx] for idx in address_or_index_of_b]
+            b = torch.cat(b_slices, dim=0)
+            if transform_b:
+                b = transform_b(b)
+        elif isinstance(address_or_index_of_b, torch.Tensor):
             assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
             idx_b = int(address_or_index_of_b.item())
+            b = b[idx_b]
+            if transform_b:
+                b = transform_b(b)
         else:
             assert address_or_index_of_b is not None
-            idx_b = address_or_index_of_b
-        b = b[idx_b]
-        if transform_b:
-            b = transform_b(b)
+            b = b[address_or_index_of_b]
+            if transform_b:
+                b = transform_b(b)
 
     # do the actual matmul
+    assert isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
     output = torch.matmul(a, b)
     return output
 
@@ -792,12 +804,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Spyre slicing corrupts memory, so
-        # bring q/k/v to CPU once for all slicing below; per-token slices get
-        # transferred to Spyre individually inside the scatter and attention paths.
+        # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
+        # Query handling depends on whether we can stay on device:
+        #   - Single-sequence decode: on-device assembly works (offset 0), but
+        #     only when the head_size keeps the overwrite layout representable
+        #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
+        #   - Batch decode / prefill: needs the CPU path because the per-seq
+        #     query densification slices/transposes at offset > 0, which
+        #     corrupts on Spyre.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        query_cpu = convert(query, "cpu")
+        ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
+        needs_query_cpu = (
+            attn_metadata.max_query_len > 1
+            or attn_metadata.num_seqs > 1
+            or not ondevice_overwrite_ok
+        )
+        query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -810,9 +833,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             _target_device,
         )
 
-        # Step 2: Online softmax attention over pages (varlen)
+        # Step 2: Online softmax attention over pages (varlen).
+        # Pass on-device query for single-sequence decode (assembled at offset 0
+        # without a CPU round-trip); everything else goes through query_cpu.
+        query_dev = convert(query, _target_device) if not needs_query_cpu else None
         output = self._online_softmax_attention(
-            query_cpu[:num_actual_tokens],
+            query_dev,
+            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
             k_pages,
             v_pages,
             attn_metadata,
@@ -853,7 +880,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_cpu: torch.Tensor,
+        query_dev: torch.Tensor | None,
+        query_cpu: torch.Tensor | None,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
         attn_metadata: SpyreAttentionMetadata,
@@ -867,6 +895,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         tensor on Spyre, passed to bmm directly without slicing.
 
         Writes results directly into the caller's output buffer in-place.
+
+        Query assembly builds the same padded 4D tensor
+        [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
+        the kernel expects. Single-sequence decode assembles it directly on
+        device (offset 0 is a safe Spyre write, so no CPU round-trip); batch
+        decode / prefill build it on CPU and transfer.
+
+        Args:
+            query_dev: Query on target device (for single-seq decode), or None.
+            query_cpu: Query on CPU (for batch/prefill), or None.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -884,18 +922,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Scattering into `output` on Spyre dim=0 has no working primitive:
-        # `output[i:j] = ...` and `narrow().copy_(...)` silently write to row 0;
-        # `torch.ops.spyre.overwrite` is deprecated and its compile_once wrapper
-        # compiles one SDSC binary per unique offset, which recurses past the
-        # dynamo cache limit once vLLM's model compile has filled it. Raising
-        # the limit unblocks short tests but compiles N binaries for a
-        # query_len=N prefill, which doesn't scale to long contexts. Stage the
-        # result on CPU and bulk-copy at the end of the per-sequence loop.
-        # Revisit when torch-spyre lands symbolic-offset overwrite
-        # (torch-spyre#220 / #1371-3).
-        output_cpu = torch.zeros_like(output, device="cpu")
-
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
@@ -904,21 +930,46 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            q_seq = query_cpu[q_start:q_end]
-
-            # Pad query to global aligned_max_query_len (uniform for all seqs)
-            if aligned_max_query_len > query_len:
-                q_seq = torch.nn.functional.pad(
-                    q_seq,
-                    (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                    mode="constant",
-                    value=0.0,
+            if query_dev is not None and query_len == 1:
+                # Single-sequence decode: assemble the padded 4D query on device.
+                # The one real token is written at offset 0 (a safe Spyre write);
+                # padded query rows are masked out and dropped from the result.
+                # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
+                q_row = query_dev.unbind(dim=0)[q_start].reshape(
+                    num_kv_heads, num_queries_per_kv, 1, head_size
                 )
+                if aligned_max_query_len > 1:
+                    q = torch.zeros(
+                        num_kv_heads,
+                        num_queries_per_kv,
+                        aligned_max_query_len,
+                        head_size,
+                        dtype=q_row.dtype,
+                        device=q_row.device,
+                    )
+                    _overwrite(q_row, q, [2], [0])
+                else:
+                    q = q_row
+                q_dev = q
+            else:
+                # Batch decode / prefill: build on CPU, transfer to device.
+                assert query_cpu is not None
+                q_seq = query_cpu[q_start:q_end]
 
-            # Reshape: [padded_query_len, num_heads, head_size]
-            #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-            q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+                # Pad query to global aligned_max_query_len (uniform for all seqs)
+                if aligned_max_query_len > query_len:
+                    q_seq = torch.nn.functional.pad(
+                        q_seq,
+                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
+                        mode="constant",
+                        value=0.0,
+                    )
+
+                # Reshape: [padded_query_len, num_heads, head_size]
+                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+                q_dev = convert(q, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
@@ -955,7 +1006,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            q_dev = convert(q, device=_target_device)
             attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
             result = attn_fn(
                 q_dev,
@@ -968,14 +1018,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
 
             # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            #   → [query_len, num_heads, head_size]
-            # Pull result to CPU (Spyre transpose+contiguous on the head axes
-            # is broken) and write into the CPU staging buffer; one bulk H2D
-            # at the end of the loop replaces the per-token writes.
-            result_cpu = convert(result, "cpu", output.dtype)
-            result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
-            result_cpu = result_cpu.transpose(1, 2).contiguous()
-            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
+            #   → [query_len, num_heads, head_size]. The transpose+contiguous and
+            # the slice-assign into `output` both run on-device; q_start is a
+            # Python int, so the dim-0 write offset is a concrete constant.
+            result = convert(result, dtype=output.dtype)
+            result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
+            result = result.transpose(1, 2).contiguous()
+            output[q_start:q_end] = result[0, :query_len, :, :]
 
-        output.copy_(convert(output_cpu, device=_target_device))
         return output

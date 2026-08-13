@@ -172,6 +172,8 @@ uv run --no-sync pytest tests/test_vllm_spyre_next.py::test_basic_model_load -m 
 
 This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
+**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§6) — the `next/` tree the lock resolves from publishes these link-time libs; the base `x86_64` tree does not.
+
 If the smoke test passes, tell the user:
 
 > Smoke test passed. The branch is ready for you to commit and push — CI will run the full suite.
@@ -186,53 +188,55 @@ If it fails, triage:
 
 ### 6. Update `spyre-rpms.lock`
 
-The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. The lock file entries must exactly match the filenames in artifactory (minus the `.x86_64.rpm` suffix), because `download_rpms.sh` constructs the download URL from them.
+The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. Lock entries are exact Artifactory filenames minus the `.x86_64.rpm` suffix; `download_rpms.sh` appends `.<arch>.rpm` and prepends the subdir to build the URL.
 
-**The trap:** `rpm -qa` on the build host reports the build-number suffix as `_0` (e.g. `ibm-deeptools-2.0.0-0.main.1+1401.ee2f97a_0.el10`), but the actual artifactory filename has a different build number (e.g. `_197.el10`). Writing the `rpm -qa` output directly into the lock file will cause cache misses and download failures.
+**The whole lock resolves from the `next/` subdir** (`<repo>/next/x86_64/`), not the base `<repo>/x86_64/` tree. `next/` is the only tree that publishes *every* lib we link against — including `ibm-libaiupti` (the torch-spyre profiler compiles under `-DHAS_AIUPTI -DUSE_KINETO` and links `-laiupti`), which the base tree doesn't carry at all. `download_rpms.sh --prefix` defaults to `next`, so entries are plain filenames with **no** prefix baked in.
 
-#### Step 1: Read installed RPMs (to get version + commit info)
+**The trap:** `next/` has no monotonic `_NNN` build suffix. Instead it publishes *many rebuilds of the same commit*, distinguished by a 12-hex build hash (e.g. `…a54c45fb.0b76d1bf564c.a54c45f.el10` — dozens of variants for a single commit). There's no ordering in the filename, so the resolution rule is **latest by Artifactory publication time** (`lastModified`), which the `?list` endpoint returns.
+
+#### Step 1: Read installed RPMs (to get package name + commit SHA)
 
 ```bash
-rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 'ibm-*' \
+rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ibm-*' \
   | grep -v '(none)' \
-  | grep -E '^ibm-(deeptools|flex|senlib|spyre-comms|aiu-toolbox)' \
+  | grep -E '^ibm-(deeptools|flex|senlib|spyre-comms|aiu-toolbox|libaiupti)' \
   | sort > /tmp/host-rpms.txt
 ```
 
-This gives us the package names, versions, and commit SHAs — but with `_0` as the build suffix. We need to resolve the real build numbers from artifactory.
+Each line is `NAME  VERSION-RELEASE`; the commit SHA is the 7-hex after `+<count>.` (e.g. `…1+2142.a54c45f_0.el10` → `a54c45f`). We match `next/` builds at that commit.
 
-#### Step 2: Resolve correct build numbers from Artifactory (primary method)
-
-Query the Artifactory API directly to list all RPMs in the x86_64 directory, then match against the installed versions:
+#### Step 2: Resolve each package to its latest `next/` build (primary method)
 
 ```bash
-# Normalize URL (trailing slash causes //artifactory/ double-slash 404s)
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
 
-# Fetch the full x86_64 RPM listing from Artifactory
+# Timestamped listing of the next/ tree (the ?list endpoint returns lastModified)
 curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
-  "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_RPM_REPO/x86_64" \
-  | jq -r '.children[].uri' | sed 's|^/||' > /tmp/artifactory-rpms.txt
-```
+  "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_RPM_REPO/next/x86_64?list&deep=0" \
+  | jq -r '.files[] | "\(.lastModified)\t\(.uri)"' | sed 's|\t/|\t|' \
+  > /tmp/next-timestamped.txt
 
-Then resolve each installed package to its real artifactory filename:
-
-```bash
-while IFS= read -r host_line; do
-  # Strip the _0.el10 suffix to get the version prefix for matching
-  prefix=$(echo "$host_line" | sed 's/_[0-9]*\.el10$//')
-  # Find the highest build number for this prefix in artifactory
-  build_num=$(grep -F "$prefix" /tmp/artifactory-rpms.txt \
-    | grep -oP '_\K[0-9]+(?=\.el10\.x86_64\.rpm)' | sort -n | tail -1)
-  if [[ -n "$build_num" ]]; then
-    echo "${prefix}_${build_num}.el10"
+# For each installed package, pick the newest next/ build at the host's commit.
+: > /tmp/resolved-rpms.txt
+while read -r name ver; do
+  sha=$(echo "$ver" | grep -oP '\+[0-9]+\.\K[0-9a-f]{7}')
+  fn=$(awk -F'\t' -v pat="^${name}-[0-9].*${sha}.*[.]el10[.]x86_64[.]rpm$" \
+        '$2 ~ pat' /tmp/next-timestamped.txt | sort -r | head -1 | cut -f2)
+  if [[ -n "$fn" ]]; then
+    echo "${fn%.x86_64.rpm}" >> /tmp/resolved-rpms.txt
   else
-    echo "NOT FOUND IN ARTIFACTORY: $host_line"
+    echo "NOT IN next/: $name @ $sha" >&2
   fi
-done < /tmp/host-rpms.txt > /tmp/resolved-rpms.txt
+done < /tmp/host-rpms.txt
+cat /tmp/resolved-rpms.txt
 ```
 
-If any packages show "NOT FOUND IN ARTIFACTORY", it means the version installed on the host hasn't been published yet (e.g. installed from a local build). Ask the user how to proceed.
+`sort -r` orders by the leading ISO-8601 timestamp (lexical = chronological), so `head -1` is the most recently published build — a stable, automatable choice among the rebuild variants.
+
+If a package prints `NOT IN next/`, it isn't published there at the host commit. Decide per package:
+
+- **Not needed for the build/link/runtime** (e.g. `ibm-spyre-comms-test` — ships only unit-test binaries under `bin/`, no `.so`, not installed on the host) → drop it from the lock.
+- **Actually needed** → stop and ask the user; do not fall back to the base tree silently (the goal is a single source).
 
 #### Fallback: Artifactory unavailable
 
@@ -245,19 +249,20 @@ gh run list --repo torch-spyre/spyre-inference \
 
 # Find a run that had a cache miss (actually listed RPMs):
 gh run view <RUN_ID> --log 2>/dev/null | grep -c "ibm-deeptools"
-# If > 0, extract filenames from its output and resolve as above.
+# If > 0, extract filenames from its output. Note the CI listing has no
+# timestamps, so pick the build matching the host commit by hand.
 ```
 
 This is less reliable — cache-hit runs won't have the listing, and you may need to trigger a fresh run with a dummy lock-file change.
 
 #### Step 3: Sanity-check — no accidental downgrades
 
-Compare commit counts (the monotonically increasing number) between old and new lock files:
+Compare commit counts (the number after `+`) between old and new lock files. This works across `next/` naming schemes (`main.N+N`, `master.N+N`, `main.1+N`) because the count sits right after `+`:
 
 ```text
-ibm-flex-2.0.0-0.main.1+377.61d25cc_142.el10
+ibm-flex-2.0.0-0.main.456+456.33650c47.89b07ec13974.33650c4.el10
                          ^^^
-                         commit count — monotonically increasing on main
+                         commit count — monotonically increasing
 ```
 
 ```bash
@@ -304,7 +309,23 @@ HEADER
 cat /tmp/resolved-rpms.txt >> spyre-rpms.lock
 ```
 
-Do **not** guess build numbers. If no authoritative source is available (Artifactory API or CI logs), stop and ask the user.
+Do **not** guess. If Artifactory (API or CI logs) can't confirm a filename, stop and ask the user. The `next/` build hashes are per-build and may be garbage-collected over time — always re-resolve to the latest build on each bump rather than assuming an old pin still exists.
+
+Verify the download end-to-end before handing off (this is what CI's populate step runs):
+
+```bash
+ARTIFACTORY_TOKEN="$ARTIFACTORY_TOKEN" \
+ARTIFACTORY_BASE_URL="${ARTIFACTORY_URL%/}" \
+ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
+RPM_NAMES_TXT=spyre-rpms.lock RPMS_DOWNLOAD_DIR=/tmp/rpm-dl-check \
+  bash .github/scripts/download_rpms.sh
+```
+
+All entries should download (exit 0). Spot-check that the link-time lib is present:
+
+```bash
+rpm2cpio /tmp/rpm-dl-check/ibm-libaiupti-*.rpm | cpio -t 2>/dev/null | grep -i '\.so'
+```
 
 #### Cache population
 

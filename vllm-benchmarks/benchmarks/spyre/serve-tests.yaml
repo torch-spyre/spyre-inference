@@ -8,12 +8,19 @@
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
     dtype: float16
     load-format: auto
-    max-model-len: 128
+    max-num-seqs: 4
     port: 8000
     host: 127.0.0.1
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
     input-len: 64
     output-len: 64
-    num-prompts: 5
-    request-rate: 1
+    num-prompts: 16
+    # Unmeasured warmup requests so the reported metrics exclude the one-time
+    # per-shape torch.compile cost paid by the first requests.
+    num-warmups: 8
+    # Cap concurrency at the server's max-num-seqs and let requests burst
+    # (request-rate: inf), so the batch fills without queueing and TTFT
+    # reflects a server loaded to its batch capacity rather than an idle one.
+    max-concurrency: 4
+    request-rate: inf

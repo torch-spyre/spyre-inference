@@ -16,8 +16,9 @@
 
 Fused projections force a Spyre->CPU->Spyre roundtrip: splitting a fused
 weight's output on Spyre yields strided views that corrupt on transfer. This
-pass splits the fused weight into contiguous Parameters at load time
-(on CPU).
+pass splits the fused weight into contiguous Parameters at load time (on CPU),
+each stored transposed ([in, out]) so the forward GEMM is the Spyre-fast
+`x @ A` (see linear.py / torch-spyre #3512).
 
 The un-fused forward returns a `SplitQKV` (a `SplitProjection`) holding the
 pre-split parts. It mimics `Tensor.split`/`.chunk`, so the unmodified attention
@@ -29,7 +30,6 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
@@ -37,6 +37,8 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     UnquantizedLinearMethod,
 )
+
+from .linear import spyre_linear_t
 
 
 logger = init_logger(__name__)
@@ -103,8 +105,9 @@ def _unfusable(module: nn.Module) -> bool:
 def _split_into_params(module: nn.Module, names: list[str], sizes: list[int]) -> None:
     """Split `module.weight` (and bias) row-wise into named per-part Parameters.
 
-    Adds `<name>_weight`/`<name>_bias` Parameters (contiguous, on CPU) and then
-    clears the fused `weight`/`bias` to None.
+    Adds `<name>_weight` Parameters (transposed to `[in, out]`, contiguous, on
+    CPU) and `<name>_bias` Parameters, then clears the fused `weight`/`bias` to
+    None.
     """
     w = cast(torch.Tensor, module.weight.data)
     assert sum(sizes) == w.shape[0], (
@@ -112,8 +115,14 @@ def _split_into_params(module: nn.Module, names: list[str], sizes: list[int]) ->
         f"{w.shape[0]}; refusing to split."
     )
 
+    # Store each part transposed ([in, out]) so the forward GEMM is the
+    # Spyre-fast `x @ A` instead of `F.linear`'s `x @ Aᵀ` (torch-spyre #3512).
     for name, part in zip(names, torch.split(w, sizes, dim=0)):
-        setattr(module, f"{name}_weight", Parameter(part.contiguous(), requires_grad=False))
+        setattr(
+            module,
+            f"{name}_weight",
+            Parameter(part.contiguous().t().contiguous(), requires_grad=False),
+        )
 
     if getattr(module, "bias", None) is not None:
         bias_data = cast(torch.Tensor, module.bias.data)
@@ -146,9 +155,9 @@ def _split_forward(output, module: nn.Module, names: list[str]):
 def _qkv_forward(self, x: torch.Tensor):
     """Rebound QKVParallelLinear.forward -> SplitQKV (+ optional bias)."""
     fold_bias = not self.skip_bias_add
-    q = F.linear(x, self.q_weight.data, _bias_data(self, "q_bias") if fold_bias else None)
-    k = F.linear(x, self.k_weight.data, _bias_data(self, "k_bias") if fold_bias else None)
-    v = F.linear(x, self.v_weight.data, _bias_data(self, "v_bias") if fold_bias else None)
+    q = spyre_linear_t(x, self.q_weight.data, _bias_data(self, "q_bias") if fold_bias else None)
+    k = spyre_linear_t(x, self.k_weight.data, _bias_data(self, "k_bias") if fold_bias else None)
+    v = spyre_linear_t(x, self.v_weight.data, _bias_data(self, "v_bias") if fold_bias else None)
     return _split_forward(SplitQKV(q, k, v), self, ["q", "k", "v"])
 
 

@@ -19,5 +19,6 @@ public_models:
   - ibm-granite/granite-embedding-278m-multilingual
   - intfloat/multilingual-e5-large
   - sentence-transformers/all-roberta-large-v1
+  - BAAI/bge-reranker-v2-m3
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b

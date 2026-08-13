@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
 # Activate the spyre-inference venv
-source /opt/spyre-inference/bin/activate
+if [ -z "$VIRTUAL_ENV" ]; then source /opt/spyre-inference/bin/activate; fi
 
 # Required for Spyre backend
 export VLLM_PLUGINS=spyre_inference
 
 # Check for kineto-patched torch wheel (required for AIU device events in traces)
 _torch_ver=$(python -c "import torch; print(torch.__version__)" 2>/dev/null)
-if echo "$_torch_ver" | grep -q "+aiu.kineto"; then
+if echo "$_torch_ver" | grep -q "+aiu."; then
     echo "[kineto] Patched torch installed: $_torch_ver — AIU device events will be captured."
 else
     echo "[kineto] WARNING: stock torch detected ($_torch_ver). No Spyre device events will appear in traces." >&2

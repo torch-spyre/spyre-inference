@@ -56,12 +56,114 @@ def parse_args() -> Any:
     parser.add_argument("--job-id", type=str, default="0")
     parser.add_argument("--pr-number", type=str, default="0")
     parser.add_argument(
+        "--arch",
+        type=str,
+        default=os.environ.get("BENCHMARK_ARCH", "x86_64"),
+        help="hardware architecture the benchmark ran on (e.g. x86_64, ppc64le, s390x)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print rows instead of inserting into ClickHouse",
     )
 
     return parser.parse_args()
+
+
+# Scalar metrics per vLLM bench schema. Each entry is the JSON key vLLM writes
+# to --output-json (latency, throughput) or --result-filename (serve). Only
+# scalar (single-number) metrics are ingested; list fields (latencies, itls,
+# ttfts, ...) are the raw samples behind these aggregates and are skipped.
+_LATENCY_METRICS = ("avg_latency",)
+_THROUGHPUT_METRICS = (
+    "elapsed_time",
+    "requests_per_second",
+    "tokens_per_second",
+)
+_SERVE_METRICS = (
+    "request_throughput",
+    "output_throughput",
+    "total_token_throughput",
+    "mean_ttft_ms",
+    "median_ttft_ms",
+    "p99_ttft_ms",
+    "mean_tpot_ms",
+    "median_tpot_ms",
+    "p99_tpot_ms",
+    "mean_itl_ms",
+    "median_itl_ms",
+    "p99_itl_ms",
+    "mean_e2el_ms",
+    "median_e2el_ms",
+    "p99_e2el_ms",
+)
+
+
+def extract_vllm_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
+    """Return (metric_name, value) pairs from one vLLM-native benchmark record.
+
+    Detects the vLLM bench schema (latency / throughput / serve) by the keys
+    the record carries and pulls out the scalar metrics for each. The three
+    schemas are disjoint on their signature keys, so a record maps to exactly
+    one. `percentiles` (latency) is a nested {percentile: value} dict and is
+    flattened to `p{percentile}_latency` metrics.
+    """
+    pairs: list[tuple[str, float]] = []
+
+    def _add(name: str, value: Any) -> None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return
+        pairs.append((name, float(value)))
+
+    if "avg_latency" in record:
+        for key in _LATENCY_METRICS:
+            if key in record:
+                _add(key, record[key])
+        percentiles = record.get("percentiles")
+        if isinstance(percentiles, dict):
+            for pct, value in percentiles.items():
+                _add(f"p{pct}_latency", value)
+    elif "requests_per_second" in record or "tokens_per_second" in record:
+        for key in _THROUGHPUT_METRICS:
+            if key in record:
+                _add(key, record[key])
+    elif "request_throughput" in record or "output_throughput" in record:
+        for key in _SERVE_METRICS:
+            if key in record:
+                _add(key, record[key])
+
+    return pairs
+
+
+def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
+    """Return (metric_name, value) pairs from one PyTorch-format record.
+
+    This is the schema `convert_to_pytorch_benchmark_format` writes to
+    `*.pytorch.json`, produced only when SAVE_TO_PYTORCH_BENCHMARK_FORMAT is
+    set. Kept for compatibility with runs that enable it.
+    """
+    if "benchmark" not in record or "metric" not in record:
+        return []
+    metric = record["metric"]
+    metric_name = metric.get("name", "unknown")
+    return [(metric_name, float(v)) for v in metric.get("benchmark_values", [])]
+
+
+def _model_from_record(record: dict[str, Any], filename: str) -> str:
+    """Best-effort model name from a benchmark record, falling back to the file."""
+    benchmark = record.get("benchmark", {})
+    if not isinstance(benchmark, dict):
+        benchmark = {}
+    model_info = record.get("model", {})
+    if not isinstance(model_info, dict):
+        model_info = {}
+    return (
+        benchmark.get("model")
+        or benchmark.get("model_name")
+        or model_info.get("name")
+        or record.get("model_id")
+        or filename.replace(".pytorch.json", "").replace(".json", "")
+    )
 
 
 def extract_rows(
@@ -72,15 +174,64 @@ def extract_rows(
     job_id: str,
     workflow: str,
     pr_number: int,
+    arch: str = "x86_64",
 ) -> list[dict[str, Any]]:
-    """Extract rows from PyTorch benchmark JSON files."""
+    """Extract ClickHouse rows from vLLM benchmark JSON files.
+
+    The vLLM benchmark runner writes native `{test_name}.json` files
+    (latency / throughput / serve schemas). When SAVE_TO_PYTORCH_BENCHMARK_FORMAT
+    is set it ALSO writes `{test_name}.pytorch.json`. This reads both: the
+    PyTorch-format files via their `benchmark`/`metric` schema, and every other
+    `*.json` via the native vLLM schema. A `.pytorch.json` file is not read
+    twice (it is excluded from the native pass).
+    """
     rows = []
     ts = int(time.time() * 1000)
 
-    files = sorted(glob.glob(f"{results_dir}/*.pytorch.json"))
-    log.info("Found %d PyTorch benchmark JSON files in %s", len(files), results_dir)
+    all_json = set(glob.glob(f"{results_dir}/*.json"))
+    pytorch_files = set(glob.glob(f"{results_dir}/*.pytorch.json"))
+    native_files = sorted(all_json - pytorch_files)
+    log.info(
+        "Found %d vLLM-native and %d PyTorch-format benchmark JSON files in %s",
+        len(native_files),
+        len(pytorch_files),
+        results_dir,
+    )
 
-    for file in files:
+    def _emit(filename: str, model: str, metric_name: str, value: float) -> None:
+        extra = json.dumps(
+            {
+                "device": "spyre",
+                "arch": arch,
+                "hardware_type": "IBM_Spyre",
+                "model": model,
+                "test_name": filename.replace(".pytorch.json", "").replace(".json", ""),
+                "head_sha": sha,
+                "pr_number": pr_number,
+                "value": value,
+            }
+        )
+        rows.append(
+            {
+                "timestamp": ts,
+                "schema_version": "v3",
+                "name": "spyre_e2e_benchmark",
+                "metric": metric_name,
+                "actual": float(value),
+                "target": 0.0,
+                "repo": "spyre-inference",
+                "head_branch": branch,
+                "workflow_id": int(run_id) if run_id.isdigit() else 0,
+                "job_id": int(job_id) if job_id.isdigit() else 0,
+                "run_attempt": 1,
+                "extra": extra,
+            }
+        )
+
+    for file, extractor in [
+        *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
+        *[(f, extract_vllm_metrics) for f in native_files],
+    ]:
         filename = os.path.basename(file)
 
         try:
@@ -96,66 +247,17 @@ def extract_rows(
         before_rows = len(rows)
 
         for record in records:
-            if "benchmark" not in record or "metric" not in record:
+            if not isinstance(record, dict):
                 continue
-
-            benchmark = record["benchmark"]
-            metric = record["metric"]
-
-            test_name = benchmark.get("test_name", filename)
-
-            model_info = record.get("model", {})
-            if not isinstance(model_info, dict):
-                model_info = {}
-
-            model = (
-                benchmark.get("model")
-                or benchmark.get("model_name")
-                or model_info.get("name")
-                or filename.replace(".json", "")
-            )
-
-            metric_name = metric.get("name", "unknown")
-            benchmark_values = metric.get("benchmark_values", [])
-
-            if not benchmark_values:
-                log.warning("No benchmark_values in %s", filename)
-                continue
-
-            for value in benchmark_values:
-                extra = json.dumps(
-                    {
-                        "device": "spyre",
-                        "arch": "x86_64",
-                        "hardware_type": "IBM_Spyre",
-                        "model": model,
-                        "test_name": test_name,
-                        "head_sha": sha,
-                        "pr_number": pr_number,
-                        "value": value,
-                    }
-                )
-
-                rows.append(
-                    {
-                        "timestamp": ts,
-                        "schema_version": "v3",
-                        "name": "spyre_e2e_benchmark",
-                        "metric": metric_name,
-                        "actual": float(value),
-                        "target": 0.0,
-                        "repo": "spyre-inference",
-                        "head_branch": branch,
-                        "workflow_id": int(run_id) if run_id.isdigit() else 0,
-                        "job_id": int(job_id) if job_id.isdigit() else 0,
-                        "run_attempt": 1,
-                        "extra": extra,
-                    }
-                )
+            model = _model_from_record(record, filename)
+            for metric_name, value in extractor(record):
+                _emit(filename, model, metric_name, value)
 
         extracted = len(rows) - before_rows
         if extracted:
             log.info("Extracted %d rows from %s", extracted, filename)
+        else:
+            log.warning("No usable metrics in %s", filename)
 
     log.info("Total rows extracted: %d", len(rows))
     return rows
@@ -245,6 +347,7 @@ def main() -> None:
         job_id=args.job_id,
         workflow=args.workflow,
         pr_number=pr_number,
+        arch=args.arch,
     )
 
     if not rows:

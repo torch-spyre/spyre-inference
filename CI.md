@@ -11,6 +11,8 @@ Located in `.github/workflows/`
 
 - There is a workflow to add or remove models, datasets, etc. to/from the cache [add_or_remove_artifacts_from_cache.yaml](.github/workflows/add_or_remove_artifacts_from_cache.yaml)
 
+- A daily cron [pr_reminder_slack.yaml](.github/workflows/pr_reminder_slack.yaml) posts the stalest open PRs to Slack to keep reviews moving. Setup, configuration variables and the failure-escalation behaviour are documented in [scripts/pr_reminder/README.md](scripts/pr_reminder/README.md)
+
 > NOTE: Unfortunately GitHub does not allow secrets in workflow runs triggered on pull requests from forks.
 >
 > <https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-secrets#using-secrets-in-a-workflow>

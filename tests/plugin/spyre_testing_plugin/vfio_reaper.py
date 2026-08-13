@@ -71,6 +71,45 @@ def _pids_holding_vfio(exclude_pids: set[int]) -> list[tuple[int, str, str]]:
     return list(holders.values())
 
 
+def wait_until_card_free(
+    exclude_pids: set[int],
+    log: Callable[[str], None] = print,
+    timeout: float = 5.0,
+    poll: float = 0.1,
+) -> bool:
+    """Poll until no process outside `exclude_pids` holds the Spyre card, or
+    `timeout` elapses. Returns True once the card is free, False on timeout.
+
+    Unlike `reap_vfio_holders` this kills nothing — it only waits. Use it as a
+    barrier at a test boundary when the previous test's out-of-process engine is
+    on its way down but not gone yet: vLLM force-kills its worker on shutdown and
+    the kernel's VFIO release is asynchronous, so a passing engine test can leave
+    the card transiently busy. Waiting here keeps the next test from opening the
+    device mid-teardown and hitting ``RAS::VFIO::DeviceOpenFail ... "Device or
+    resource busy"``.
+
+    A timeout is not fatal: warn and let the caller proceed, so a genuinely
+    stuck holder still surfaces as a loud, self-explaining failure in the test
+    that actually needs the card rather than aborting the session here."""
+    start = time.monotonic()
+    waited = False
+    while True:
+        holders = _pids_holding_vfio(exclude_pids)
+        if not holders:
+            if waited:
+                log(f"[vfio-reaper] card freed in {time.monotonic() - start:.2f}s")
+            return True
+        if time.monotonic() - start >= timeout:
+            detail = ", ".join(f"pid={p} {dev} ({cmd!r})" for p, dev, cmd in holders)
+            log(
+                f"[vfio-reaper] WARNING: Spyre card still held after {timeout}s by {detail}; "
+                f"later card tests may fail with DeviceOpenFail until it is freed."
+            )
+            return False
+        waited = True
+        time.sleep(poll)
+
+
 def reap_vfio_holders(
     exclude_pids: set[int],
     log: Callable[[str], None] = print,
@@ -86,23 +125,9 @@ def reap_vfio_holders(
     if not holders:
         return
 
-    start = time.monotonic()
     for pid, device, cmdline in holders:
         log(f"[vfio-reaper] orphan pid={pid} holding {device} cmd={cmdline!r}; sending SIGKILL")
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.kill(pid, signal.SIGKILL)
 
-    while True:
-        survivors = _pids_holding_vfio(exclude_pids)
-        if not survivors:
-            log(f"[vfio-reaper] card freed in {time.monotonic() - start:.2f}s")
-            return
-        if time.monotonic() - start >= timeout:
-            break
-        time.sleep(poll)
-
-    detail = ", ".join(f"pid={p} {dev} ({cmd!r})" for p, dev, cmd in survivors)
-    log(
-        f"[vfio-reaper] WARNING: Spyre card still held after {timeout}s by {detail}; "
-        f"later card tests may fail with DeviceOpenFail until it is freed."
-    )
+    wait_until_card_free(exclude_pids, log=log, timeout=timeout, poll=poll)

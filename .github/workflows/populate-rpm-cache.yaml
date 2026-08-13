@@ -96,9 +96,11 @@ jobs:
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
         run: |
+          # List the next/ subdir — the tree download_rpms.sh pulls from by
+          # default (see spyre-rpms.lock).
           curl -fSL \
             -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
-            "${ARTIFACTORY_BASE_URL}/artifactory/api/storage/${ARTIFACTORY_RPM_PATH}/x86_64?list&deep=0" \
+            "${ARTIFACTORY_BASE_URL}/artifactory/api/storage/${ARTIFACTORY_RPM_PATH}/next/x86_64?list&deep=0" \
             | jq -r '.files[].uri'
 
       - name: Download RPMs

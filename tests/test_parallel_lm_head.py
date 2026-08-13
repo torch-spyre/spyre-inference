@@ -96,15 +96,15 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
 def test_padded_weight_reflects_loaded_weight(
     tp_group, vocab_size, expect_padding, expect_padded_shape
 ):
-    """padded_weight must hold the loaded checkpoint values, not uninitialized data.
+    """padded_weight_t must hold the loaded checkpoint values, not uninitialized data.
 
-    Regression guard: padded_weight was previously snapshotted in __init__,
+    Regression guard: the padded weight was previously snapshotted in __init__,
     before load_weights ran, so it held whatever torch.empty produced. It is
     now materialized in process_weights_after_loading instead.
 
-    Also asserts the no-padding path: when the weight row count is already a
-    multiple of 64 * 32, process_weights_after_loading must leave padded_weight
-    identical to the weight Parameter (no F.pad, no extra allocation).
+    padded_weight_t is stored transposed ([embedding_dim, padded_vocab]) so the
+    forward GEMM is the Spyre-fast `x @ A`; the vocab padding lands on the
+    trailing columns.
     """
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -116,28 +116,28 @@ def test_padded_weight_reflects_loaded_weight(
 
     layer.quant_method.process_weights_after_loading(layer)
 
+    vocab = layer.weight.shape[0]
     if expect_padding:
         assert layer.padding > 0
-        assert layer.padded_weight.shape == (
-            expect_padded_shape,
+        assert layer.padded_weight_t.shape == (
             embedding_dim,
+            expect_padded_shape,
         )
-        # Top slice mirrors the loaded weight bit-for-bit.
+        # Leading columns mirror the loaded weight (transposed) bit-for-bit.
         torch.testing.assert_close(
-            layer.padded_weight[: layer.weight.shape[0]],
-            layer.weight,
+            layer.padded_weight_t[:, :vocab],
+            layer.weight.t(),
             atol=0.0,
             rtol=0.0,
         )
-        # Padding rows are zeros (F.pad default), so they contribute 0 to logits.
-        assert torch.all(layer.padded_weight[layer.weight.shape[0] :] == 0)
+        # Padding columns are zeros (F.pad default), so they contribute 0 to logits.
+        assert torch.all(layer.padded_weight_t[:, vocab:] == 0)
     else:
-        # Aligned shape: no padding applied, padded_weight aliases the weight
-        # Parameter so we don't allocate or copy a second vocab-sized tensor.
+        # Aligned shape: no padding applied, padded_weight_t is just weightᵀ.
         assert layer.padding == 0
         torch.testing.assert_close(
-            layer.padded_weight,
-            layer.weight,
+            layer.padded_weight_t,
+            layer.weight.t(),
             atol=0.0,
             rtol=0.0,
         )
@@ -203,12 +203,13 @@ def test_non_aligned_weight_is_padded(tp_group):
     layer.quant_method.process_weights_after_loading(layer)
 
     expected_padded_rows = ALIGN  # ceil(63 / ALIGN) * ALIGN
-    assert layer.padded_weight.shape[0] == expected_padded_rows
+    # padded_weight_t is transposed: [embedding_dim, padded_vocab].
+    assert layer.padded_weight_t.shape[1] == expected_padded_rows
     assert layer.padding == expected_padded_rows - 63
-    # Original values preserved in the top rows
-    torch.testing.assert_close(layer.padded_weight[:63], original, atol=0.0, rtol=0.0)
-    # Padding rows are zeros
-    assert torch.all(layer.padded_weight[63:] == 0)
+    # Original values preserved in the leading columns (transposed)
+    torch.testing.assert_close(layer.padded_weight_t[:, :63], original.t(), atol=0.0, rtol=0.0)
+    # Padding columns are zeros
+    assert torch.all(layer.padded_weight_t[:, 63:] == 0)
 
 
 @pytest.mark.parallel_lm_head

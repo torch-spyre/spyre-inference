@@ -31,6 +31,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
+from .linear import spyre_linear_t
+
 
 logger = init_logger(__name__)
 
@@ -53,18 +55,22 @@ class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
         layer.padding = (-size) % ALIGN
 
         if layer.padding > 0:
-            layer.padded_weight = Parameter(F.pad(layer.weight.data, (0, 0, 0, layer.padding)))
+            padded = F.pad(layer.weight.data, (0, 0, 0, layer.padding))
             logger.warning_once(
                 "%s: weights padded from %d to %d (torch-spyre limitation) "
                 "expect numerical differences to upstream vLLM.",
                 layer.__class__.__name__,
                 size,
-                layer.padded_weight.shape[0],
+                padded.shape[0],
             )
         else:
-            # Clone → INDEPENDENT storage from `weight`. With
-            # tie_word_embeddings, `weight` IS `embed_tokens.weight`.
-            layer.padded_weight = Parameter(layer.weight.data.clone())
+            padded = layer.weight.data
+
+        # Store transposed ([hidden, padded_vocab]) so forward_oot's GEMM is the
+        # Spyre-fast `x @ A` (torch-spyre #3512). `.t().contiguous()` gives
+        # INDEPENDENT storage from `weight`; with tie_word_embeddings `weight` IS
+        # `embed_tokens.weight`, which must keep its own (gather) layout.
+        layer.padded_weight_t = Parameter(padded.t().contiguous())
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -72,7 +78,7 @@ class SpyreParallelLMHead(ParallelLMHead):
     """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device."""
 
     padding: int
-    padded_weight: torch.Tensor
+    padded_weight_t: torch.Tensor
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -99,7 +105,7 @@ class SpyreParallelLMHead(ParallelLMHead):
         Returns:
             Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
         """
-        out = F.linear(x, self.padded_weight.data, bias)
+        out = spyre_linear_t(x, self.padded_weight_t.data, bias)
         # Slice off the padding rows that process_weights_after_loading added
         # (they appear as trailing logit columns).
         if self.padding > 0:

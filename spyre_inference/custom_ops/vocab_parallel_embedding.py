@@ -44,15 +44,14 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
-    def _apply(self, fn, recurse=True):
-        # F.embedding has no Spyre kernel; keep the weight on CPU.
-        return self
-
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
-        cpu_input = convert(input_, device="cpu")
         if self.tp_size > 1:
+            # The per-rank mask still runs on CPU: upstream get_masked_input_and_mask
+            # does `input_ >= start` under torch.compile, which Spyre's inductor backend
+            # rejects for int64 constants (see test_int64_compiled_compare_against_python_int).
+            # The embedding gather itself runs on-device below.
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-                cpu_input,
+                convert(input_, device="cpu"),
                 self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
@@ -60,18 +59,18 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
                 self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
             )
+            masked_input = convert(masked_input, device=input_.device)
+            keep = convert(keep, device=input_.device)
         else:
-            masked_input = cpu_input
+            masked_input = input_
             keep = None
 
         output = self.quant_method.embedding(self, masked_input.long())
 
-        if self.tp_size > 1 and keep is not None:
+        if keep is not None:
             output = output * keep
-            output = convert(output, device=input_.device)
             output = tensor_model_parallel_all_reduce(output)
-            return output
-        return convert(output, device=input_.device)
+        return output
 
 
 def _vocab_mask_op_func(

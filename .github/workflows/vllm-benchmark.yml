@@ -25,6 +25,14 @@ on:
           Comma-separated list of models to benchmark (optional, default all)
         required: false
         type: string
+      skip_uv_for_benchmarking:
+        description: >
+          Bypass `uv run` and use the prebaked venv's python3 directly. Needed
+          on s390x, where uv cannot resolve a torch/vllm wheel and otherwise
+          builds a torch-less venv. Leave false on amd64/ppc64le.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' && inputs.vllm_branch != '' && inputs.vllm_branch) || github.ref }}
@@ -149,9 +157,12 @@ jobs:
         # aiu-setup + the benchmark invocation both live in the Makefile's
         # perf-tests target now -- the single entrypoint, so this doesn't
         # hand-duplicate ibm-aiu-setup.sh sourcing.
+        env:
+          SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
         run: |
           mkdir -p benchmark-results
-          make perf-tests RESULTS_DIR=benchmark-results
+          make perf-tests RESULTS_DIR=benchmark-results \
+            SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
       - name: Install ClickHouse ingest dependencies
         if: github.event_name == 'push'

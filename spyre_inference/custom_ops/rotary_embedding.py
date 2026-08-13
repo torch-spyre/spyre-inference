@@ -15,15 +15,16 @@
 """Spyre OOT replacement for RotaryEmbedding.
 
 Applies rotary position embeddings on the Spyre device via a complex-free 2x2
-rotation-matrix formulation (ported from foundation-model-stack). The frequency
-cache is index_select'd on CPU (Spyre has no eager index_select):
-``_SpyreModelWrapper`` calls ``gather_rotation`` before the model forward, moves
-the gathered slice to Spyre, and stashes it in the vLLM forward context;
+rotation-matrix formulation (ported from foundation-model-stack). The 2x2 rotation
+cache is held device-resident and gathered on Spyre with ``index_select``
+(torch-spyre#3418 gave single-row gather a kernel): ``_SpyreModelWrapper`` calls
+``gather_rotation`` before the model forward and stashes the gathered slice in the
+vLLM forward context;
 ``forward_oot`` fetches it through the opaque ``spyre_rope_rot`` op (keeping the
-forward-context read out of torch.compile graphs) and applies the rotation through
-the opaque ``spyre_rope_rotate`` op. The rotation is kept opaque (its body runs
-eagerly on Spyre) because torch-spyre's compiled lowering of the 2x2 rotation
-corrupts when fused into the full-model graph.
+forward-context read out of torch.compile graphs) and applies the rotation through the
+opaque ``spyre_rope_rotate`` op. The rotation is kept opaque (its body runs eagerly on
+Spyre) because torch-spyre's compiled lowering of the 2x2 rotation corrupts when fused
+into the full-model graph.
 
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
@@ -124,6 +125,7 @@ class _SpyreRotaryMixin:
             )
         self._padded_inner = round_up(self.rotary_dim // 2, _SPYRE_STICK)
         self._rotation_cache: torch.Tensor | None = None
+        self._device_rotation_cache: torch.Tensor | None = None
         self._rope_key = f"spyre_rope_{next(self._key_counter)}"
 
     def _apply(self, fn, recurse=True):
@@ -145,18 +147,42 @@ class _SpyreRotaryMixin:
             self._rotation_cache = cache
         return self._rotation_cache
 
+    def _get_device_rotation_cache(self, device: torch.device) -> torch.Tensor:
+        """Device-resident copy of the 4D rotation cache ``[max_pos, 2, 2, padded]``,
+        built once from the CPU cache so the per-pass gather runs on-device via
+        ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
+        if self._device_rotation_cache is None:
+            self._device_rotation_cache = convert(
+                self._get_rotation_cache().contiguous(), device=device, dtype=self.dtype
+            )
+        return self._device_rotation_cache
+
     def gather_rotation(
         self, positions: torch.Tensor, target_device: torch.device
     ) -> torch.Tensor | None:
-        """Gather this pass's per-token 2x2 rotation slice on the host and move it to
-        Spyre. Returns ``None`` for multi-dim (mrope/xdrope) positions."""
-        cpu_positions = convert(positions, device="cpu")
-        assert cpu_positions is not None
-        if cpu_positions.dim() > 1:
+        """Index the device-resident cache to get this pass's per-token 2x2 rotation
+        slice; ``positions`` may arrive on the host or on Spyre. Returns ``None`` for
+        multi-dim (mrope/xdrope) positions.
+
+        Positions should be int32 (the runner downcasts at prime time). int64 still
+        works via torch-spyre's internal downcast, but is warned about since it means
+        input prep didn't hand us int32."""
+        if positions.dim() > 1:
             return None
-        pos = cpu_positions.flatten().to(torch.int64)
-        selected = self._get_rotation_cache().index_select(0, pos)
-        return convert(selected, device=target_device, dtype=self.dtype)
+        idx = positions.flatten()
+        if target_device.type != "spyre":
+            # CPU-reference path (dev laptops, rotation-math test): host index_select,
+            # no Spyre-dispatched op.
+            return self._get_rotation_cache().index_select(0, idx.to(torch.int64)).to(self.dtype)
+        if idx.dtype == torch.int64:
+            logger.warning_once(
+                "SpyreRoPE received int64 positions; input prep should hand int32. "
+                "Falling back to torch-spyre's internal int32 downcast for the gather "
+                "(safe for positions < 2**31)."
+            )
+        return self._get_device_rotation_cache(target_device).index_select(
+            0, convert(idx, device=target_device)
+        )
 
     def forward_oot(
         self,

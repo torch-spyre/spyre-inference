@@ -155,8 +155,12 @@ def test_rotary_forward_oot_on_spyre(
     )
 
     assert actual_query.device.type == "spyre"
-    # The rotation cache stays on CPU (no eager index_select); only the slice moves.
+    # The CPU cache is the source; a device-resident copy is gathered on Spyre.
     assert rope._rotation_cache is not None and rope._rotation_cache.device.type == "cpu"
+    assert (
+        rope._device_rotation_cache is not None
+        and rope._device_rotation_cache.device.type == "spyre"
+    )
     torch.testing.assert_close(
         actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
     )

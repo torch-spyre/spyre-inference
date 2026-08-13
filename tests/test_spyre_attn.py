@@ -313,6 +313,7 @@ def _run_spyre_attn_test(
     soft_cap: float | None = None,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
+    head_size: int = 128,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
@@ -320,7 +321,6 @@ def _run_spyre_attn_test(
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
         pytest.skip("STOCK + device_spyre, currently fails.")
 
-    head_size = 128
     num_blocks = 256
     dtype = torch.float16
 
@@ -506,6 +506,48 @@ def test_spyre_attn_core(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "head_size",
+    [
+        pytest.param(64, id="head_size(64)"),
+        pytest.param(128, id="head_size(128)"),
+    ],
+)
+def test_spyre_attn_decode_head_size(
+    default_vllm_config,
+    head_size: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Single-sequence decode across head sizes (regression for #284).
+
+    head_size=64 is not representable by the on-device query overwrite and must
+    fall back to the CPU path; head_size=128 stays on device. Both must produce
+    correct output.
+    """
+    _run_spyre_attn_test(
+        seq_lens=[(1, 256)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        head_size=head_size,
     )
 
 

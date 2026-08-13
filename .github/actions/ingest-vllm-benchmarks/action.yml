@@ -1,0 +1,129 @@
+name: Ingest vLLM benchmarks into ClickHouse
+description: >
+  Read the vLLM benchmark JSON files in a directory and insert their rows into
+  ClickHouse via .github/scripts/ingest_vllm_benchmarks.py. This is the single
+  ingest implementation for spyre-inference perf: the perf job in
+  _test_matrix.yaml calls it INLINE on the card runner, because on a public repo
+  benchmark numbers must not be uploaded as world-readable artifacts. Secrets
+  cannot reach a composite action, so the caller passes the ClickHouse
+  connection as plain inputs.
+
+inputs:
+  results-dir:
+    description: Directory to read for benchmark *.json. Empty = skip.
+    required: false
+    default: ''
+  workflow:
+    description: Workflow name recorded against the rows.
+    required: false
+    default: vLLM Benchmark
+  branch:
+    description: Branch recorded against the rows.
+    required: false
+    default: ''
+  sha:
+    description: Commit sha recorded against the rows.
+    required: false
+    default: ''
+  run-id:
+    description: Triggering run id recorded against the rows.
+    required: false
+    default: ''
+  job-id:
+    description: Job id recorded against the rows.
+    required: false
+    default: '0'
+  pr-number:
+    description: PR number associated with the rows (0 on non-PR runs).
+    required: false
+    default: '0'
+  clickhouse-host:
+    description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
+    required: false
+    default: ''
+  clickhouse-port:
+    description: ClickHouse port (default 8123 inside the script).
+    required: false
+    default: ''
+  clickhouse-user:
+    description: ClickHouse user.
+    required: false
+    default: ''
+  clickhouse-pass:
+    description: ClickHouse password.
+    required: false
+    default: ''
+  clickhouse-db:
+    description: ClickHouse database.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # ingest_vllm_benchmarks.py reads CLICKHOUSE_HOST as required and --results-dir
+    # as required. So the no-op gate MUST live here: when the connection is not
+    # configured, or no JSON is present, set configured=false and every later
+    # step is a no-op. This lets a caller without ClickHouse secrets (or a run
+    # that produced no benchmark JSON) pass cleanly.
+    - name: Gate on ClickHouse config and results
+      id: gate
+      shell: bash
+      env:
+        CH_HOST: ${{ inputs.clickhouse-host }}
+        RESULTS_DIR: ${{ inputs.results-dir }}
+      run: |
+        if [ -z "${CH_HOST}" ]; then
+          echo "::notice::ClickHouse host not configured; skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        elif [ -z "${RESULTS_DIR}" ]; then
+          echo "::notice::No results-dir provided; skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        elif [ "$(find "${RESULTS_DIR}" -name '*.json' 2>/dev/null | wc -l)" -eq 0 ]; then
+          echo "::warning::No benchmark JSON in ${RESULTS_DIR}; skipping ingest."
+          echo "configured=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up uv
+      if: steps.gate.outputs.configured == 'true'
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+    - name: Set up ingest venv
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      run: |
+        # Build the ingest venv in the workspace, NOT the baked spyre-inference
+        # venv, so the ingest deps never perturb the product environment.
+        uv venv "${RUNNER_TEMP}/ingest-venv"
+        source "${RUNNER_TEMP}/ingest-venv/bin/activate"
+        uv pip install clickhouse-connect
+
+    - name: Ingest benchmark results into ClickHouse
+      if: steps.gate.outputs.configured == 'true'
+      shell: bash
+      env:
+        CLICKHOUSE_HOST: ${{ inputs.clickhouse-host }}
+        CLICKHOUSE_PASS: ${{ inputs.clickhouse-pass }}
+        # Port/user/db are optional. Only export them when non-empty: the script
+        # reads PORT via int(os.environ.get("CLICKHOUSE_PORT") or "8123"), and an
+        # empty user/db would override the client defaults.
+        CH_PORT_IN: ${{ inputs.clickhouse-port }}
+        CH_USER_IN: ${{ inputs.clickhouse-user }}
+        CH_DB_IN: ${{ inputs.clickhouse-db }}
+      run: |
+        source "${RUNNER_TEMP}/ingest-venv/bin/activate"
+        [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
+        [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
+        [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        # Invoke by path: the script's own directory is sys.path[0], so its
+        # sibling `from utils import ...` resolves without extra PYTHONPATH.
+        python3 .github/scripts/ingest_vllm_benchmarks.py \
+          --results-dir "${{ inputs.results-dir }}" \
+          --workflow "${{ inputs.workflow }}" \
+          --branch "${{ inputs.branch }}" \
+          --sha "${{ inputs.sha }}" \
+          --run-id "${{ inputs.run-id }}" \
+          --job-id "${{ inputs.job-id }}" \
+          --pr-number "${{ inputs.pr-number }}"

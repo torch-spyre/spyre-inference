@@ -88,8 +88,9 @@ override-dependencies = [
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
 # The `CMAKE_ARGS="--fresh"` ensures that cmake doesn't cache binary paths from ephemeral build environments
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
-
+[tool.uv.extra-build-variables.vllm]
+VLLM_TARGET_DEVICE = "empty"
+CMAKE_ARGS = "--fresh"
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
@@ -98,7 +99,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "dedc5b1d958be68251101dd5c9a5dba0b9a36c2a" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "56c288343bd199bbdd65365b24bffdbd39c2b34e" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the

@@ -12,21 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Wrapper around vllm CLI that raises torch._dynamo recompilation limits.
+"""Spyre adaptations for vLLM BERT-family pooling models."""
 
-This is a workaround for Spyre custom ops triggering excessive recompilations
-when batch sizes vary during throughput benchmarks. See:
-https://github.com/torch-spyre/spyre-inference/issues/444
-"""
+from __future__ import annotations
 
-import sys
+from vllm.logger import init_logger
 
-import torch._dynamo
+from spyre_inference.models.token_type_adapter import install_on
 
-torch._dynamo.config.cache_size_limit = 100000
-torch._dynamo.config.accumulated_recompile_limit = 100000
+logger = init_logger(__name__)
 
-from vllm.entrypoints.cli.main import main  # noqa: E402
 
-if __name__ == "__main__":
-    sys.exit(main())
+def install_spyre_patches() -> None:
+    """Install BERT token_type side-buffer adapter (see ``token_type_adapter``)."""
+    from vllm.model_executor.models import bert
+
+    install_on(bert)
+    logger.info(
+        "Spyre: BERT token_type_ids use side-buffer adapter (skip vLLM bit-pack; torch-spyre#3509)"
+    )

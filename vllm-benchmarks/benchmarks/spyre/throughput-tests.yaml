@@ -11,5 +11,5 @@
     load_format: auto
     random-input-len: 64
     random-output-len: 64
-    num-prompts: 5
+    num-prompts: 16
     max-model-len: 128

@@ -93,7 +93,10 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
     return env_vars
 
 
-VLLM_WRAPPER = Path(__file__).parent / "vllm_bench_wrapper.py"
+# Invoke the vLLM CLI directly: the dynamo recompile-limit raise the benchmarks
+# need is applied by the platform plugin at import (see
+# spyre_inference/platform.py::_raise_dynamo_recompile_limits, torch-spyre #444).
+VLLM_CLI = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
 def run_benchmark(
@@ -106,7 +109,7 @@ def run_benchmark(
     aiu_world_size: str,
 ) -> bool:
     """Run a single vllm bench command. Returns True on success."""
-    cmd = [sys.executable, str(VLLM_WRAPPER), "bench", bench_type]
+    cmd = [*VLLM_CLI, "bench", bench_type]
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
 
@@ -196,7 +199,7 @@ def run_serve_benchmark(
     model = server_params.pop("model")
     host = str(server_params.get("host", "127.0.0.1"))
     port = int(server_params.get("port", 8000))
-    server_cmd = [sys.executable, str(VLLM_WRAPPER), "serve", model]
+    server_cmd = [*VLLM_CLI, "serve", model]
     server_cmd.extend(build_command_args(server_params))
 
     log.info("=== Starting vLLM server for serve test: %s ===", test_name)
@@ -228,7 +231,7 @@ def run_serve_benchmark(
             return False
 
         # Run bench serve
-        bench_cmd = [sys.executable, str(VLLM_WRAPPER), "bench", "serve"]
+        bench_cmd = [*VLLM_CLI, "bench", "serve"]
         bench_cmd.extend(build_command_args(bench_parameters))
         bench_cmd.extend(
             [

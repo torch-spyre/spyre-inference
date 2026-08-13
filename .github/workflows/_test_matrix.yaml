@@ -177,7 +177,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
           - cfg: Spyre attention tests
@@ -186,7 +186,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             test_target: test-attention
           - cfg: Distributed spyre tests
             test_types: unit regression trunk
@@ -194,7 +194,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             test_target: test-distributed
           - cfg: Upstream vLLM tests
             # Upstream-vLLM suites are excluded from integration/unit (heavy).
@@ -203,7 +203,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             test_target: test-upstream
           - cfg: Upstream distributed vLLM tests
             test_types: regression trunk
@@ -211,7 +211,7 @@ jobs:
               - x86_64
               - spyre_pf_x2__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             test_target: test-upstream-distributed
           - cfg: Upstream model vLLM tests
             test_types: regression trunk
@@ -219,7 +219,7 @@ jobs:
               - x86_64
               - spyre_pf_x1__pvc_1tb_x1
               - linux
-            image_label: image_torch_spyre
+            image_label: image_torch_spyre_shadow
             test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
@@ -357,6 +357,19 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
+          # SHADOW EXPERIMENT (do not merge): the /next dev runner image bakes and
+          # pre-activates /home/senuser/.venv and exports VIRTUAL_ENV to it via
+          # .bashrc. That baked venv is NOT the complete test venv (no vllm /
+          # spyre_testing_plugin), so the Makefile's `uv run --active` binds pytest
+          # to it while `uv sync` populated a separate project .venv. Unsetting
+          # VIRTUAL_ENV in the step shell did not work: the Makefile re-sources
+          # .bashrc which re-activates the baked venv. Instead point uv's PROJECT
+          # environment at the baked venv so `uv sync` installs the 172 packages
+          # INTO the venv that `--active` selects -- one complete venv either way.
+          # GitHub `env:` survives the .bashrc re-source. amd64-only shadow, so the
+          # lockfile resolves fully. The legacy 2.0/ci image needs none of this
+          # (it never activates a venv, so --active falls back to the project .venv).
+          UV_PROJECT_ENVIRONMENT: /home/senuser/.venv
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -392,6 +405,11 @@ jobs:
         # expression for this config both live in the Makefile's
         # test_target now -- the single entrypoint/owner for one
         # marker-combo invocation, so the marker set is not duplicated here.
+        env:
+          # SHADOW EXPERIMENT (do not merge): keep uv's project environment pointed
+          # at the baked venv the Build step populated, so the Makefile's
+          # `uv run --active` runs pytest from a complete venv.
+          UV_PROJECT_ENVIRONMENT: /home/senuser/.venv
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
           make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
@@ -431,7 +449,7 @@ jobs:
       ${{ !cancelled()
           && github.event_name != 'pull_request'
           && needs.resolve.outputs.resolved_test_type == 'perf' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre_shadow')) }}
     timeout-minutes: 720
     env:
       CI: ''

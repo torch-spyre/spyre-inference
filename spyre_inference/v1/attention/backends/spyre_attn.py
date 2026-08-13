@@ -229,7 +229,7 @@ def _maybe_compile(fn):
 # ---------------------------------------------------------------------------
 
 
-def _slot_runs(
+def slot_runs(
     block_indices: list[int],
     block_offsets: list[int],
     num_tokens: int,
@@ -277,12 +277,19 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         block_offsets,
         target_device,
     ):
-        for page_idx, offset, start, stop in _slot_runs(block_indices, block_offsets, num_tokens):
+        for page_idx, offset, start, stop in slot_runs(block_indices, block_offsets, num_tokens):
             # Transpose to the pages' [num_kv_heads, slots, head_size] layout on the
             # host -- Spyre slicing corrupts memory, which is why key/value arrive
             # on CPU -- then one transfer per run carries the whole thing over.
-            k_run = convert(key[start:stop].transpose(0, 1).contiguous(), target_device)
-            v_run = convert(value[start:stop].transpose(0, 1).contiguous(), target_device)
+            # A run of one keeps the per-token indexing instead: batching buys
+            # nothing there, and the transposed slice is a different layout for the
+            # runtime, which showed up as an ITL regression on decode steps.
+            if stop - start == 1:
+                k_run = convert(key[start].unsqueeze(1).contiguous(), target_device)
+                v_run = convert(value[start].unsqueeze(1).contiguous(), target_device)
+            else:
+                k_run = convert(key[start:stop].transpose(0, 1).contiguous(), target_device)
+                v_run = convert(value[start:stop].transpose(0, 1).contiguous(), target_device)
             _overwrite(k_run, k_pages[page_idx], [1], [offset])
             _overwrite(v_run, v_pages[page_idx], [1], [offset])
 

@@ -76,10 +76,7 @@ from spyre_inference.v1.pool import (
 
 logger = init_logger(__name__)
 
-# Observed Spyre DMA failure threshold for encoder-only dummy batches with
-# multiple sequences.  Pooling warmup stays below this limit.
-SPYRE_ENCODER_DMA_TOKEN_LIMIT = 30
-# Token count for pooling warmup (single sequence), kept under the DMA limit.
+# Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
 
 
@@ -481,9 +478,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Run a dummy forward pass to warm up kernels and optional compile.
 
         In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1`` to
-        stay under the Spyre DMA limit for encoder dummy batches. Compiled
-        mode uses the normal warmup size so shapes match torch.compile.
+        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1``.
+        Compiled mode uses the normal warmup size so shapes match torch.compile.
         """
         logger.info("Warming up model...")
         t0 = time.time()
@@ -497,7 +493,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 and self.vllm_config.model_config.enforce_eager
             )
             if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
                 num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
                 saved_max_num_seqs = self.scheduler_config.max_num_seqs
                 try:

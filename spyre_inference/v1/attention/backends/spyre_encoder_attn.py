@@ -148,15 +148,38 @@ def build_attention_mask(
     query_lens: list[int],
     kv_lens: list[int],
     dtype: torch.dtype,
+    device: torch.device | str | None = None,
 ) -> torch.Tensor:
-    """Additive mask ``[B, 1, L, L]``: 0 where attend, ``-inf`` elsewhere."""
-    neg_inf = torch.finfo(dtype).min
-    mask = torch.full((num_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
-    for s in range(num_seqs):
-        q_len = query_lens[s]
-        kv_len = min(q_len, kv_lens[s])
-        mask[s, 0, :q_len, :kv_len] = 0.0
-    return mask
+    """Additive mask ``[B, 1, L, L]``: 0 where attend, ``-inf`` elsewhere.
+
+    Built on the host (vectorized ``lt`` + nested ``where``), then ``convert``'d.
+    On-device materialization is not stick-safe: Spyre cannot produce bool from
+    int32 ``lt``, and cannot broadcast ``where`` of ``[B,1,L,1]`` × ``[B,1,1,L]``
+    into ``[B,1,L,L]`` (no stick-scatter).
+    """
+    if device is None:
+        device = torch.device("cpu")
+    elif not isinstance(device, torch.device):
+        device = torch.device(device)
+    if num_seqs != len(query_lens):
+        raise ValueError(f"num_seqs={num_seqs} != len(query_lens)={len(query_lens)}")
+
+    q_len = torch.tensor(query_lens, dtype=torch.int32)
+    kv_len = torch.tensor(
+        [min(q, k) for q, k in zip(query_lens, kv_lens)],
+        dtype=torch.int32,
+    )
+    q_pos = torch.arange(aligned_len, dtype=torch.int32)
+    kv_pos = torch.arange(aligned_len, dtype=torch.int32)
+    zeros = torch.zeros((), dtype=dtype)
+    neg_inf = torch.tensor(torch.finfo(dtype).min, dtype=dtype)
+
+    q_ok = (q_pos.unsqueeze(0) < q_len.unsqueeze(1)).unsqueeze(1).unsqueeze(-1)
+    k_ok = (kv_pos.unsqueeze(0) < kv_len.unsqueeze(1)).unsqueeze(1).unsqueeze(2)
+    mask = torch.where(q_ok, torch.where(k_ok, zeros, neg_inf), neg_inf)
+    if device.type == "spyre":
+        return convert(mask, device)
+    return mask.to(device)
 
 
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
@@ -232,8 +255,14 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         k_batched = gather_pack(key, kv_pack_idx, head_size_padded)
         v_batched = gather_pack(value, kv_pack_idx, head_size_padded)
 
-        mask = build_attention_mask(num_seqs, aligned_len, query_lens, kv_lens, dtype=query.dtype)
-        mask_dev = convert(mask, target_device.type) if target_device.type != "cpu" else mask
+        mask = build_attention_mask(
+            num_seqs,
+            aligned_len,
+            query_lens,
+            kv_lens,
+            dtype=query.dtype,
+            device=target_device,
+        )
 
         sdpa_kwargs: dict = {"is_causal": False, "scale": scale}
         if num_kv_heads != num_heads:
@@ -241,7 +270,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         # Single on-device SDPA: [num_seqs, H, L_aligned, D_padded].
         attn_out = F.scaled_dot_product_attention(
-            q_batched, k_batched, v_batched, attn_mask=mask_dev, **sdpa_kwargs
+            q_batched, k_batched, v_batched, attn_mask=mask, **sdpa_kwargs
         )
 
         result = gather_unpack(attn_out, unpack_idx, head_size)

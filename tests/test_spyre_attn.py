@@ -537,8 +537,10 @@ def test_spyre_attn_decode_head_size(
 ) -> None:
     """Single-sequence decode across head sizes (regression for #284/#399).
 
-    Both head_size values are assembled on-device via slicing and
-    narrow().copy_(); there is no CPU fallback path for the query.
+    Query assembly is performed on CPU to avoid unsupported torch-spyre stick
+    expressions for head_size values that are not multiples of 128 bytes
+    (e.g., head_size=64 in Llama-3.2-1B). The assembled query is then
+    transferred to the device for attention computation.
     """
     _run_spyre_attn_test(
         seq_lens=[(1, 256)],

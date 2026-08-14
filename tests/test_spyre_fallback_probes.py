@@ -399,3 +399,55 @@ def test_spyre_ondevice_scatter_into_output_at_offset(spyre_device):
     expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16)
     expected[q_start : q_start + query_len] = src.cpu()
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 4. Varlen query assembly
+# ---------------------------------------------------------------------------
+#
+# Query assembly currently round-trips through CPU in spyre_attn.py because
+# on-device transpose+contiguous for query reshaping hits an unsupported
+# torch-spyre stick expression for head_size values that are not multiples of
+# 128 bytes (e.g. head_size=64 in Llama-3.2-1B). When this probe passes, the
+# CPU round-trip in the query assembly path can be removed.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "On-device transpose+contiguous for varlen query reshaping hits an "
+        "unsupported torch-spyre stick expression: Mod(d2, 32) is rejected "
+        "because Spyre expects Mod(var, 64) for this layout. This blocks "
+        "moving varlen query assembly fully onto Spyre for head_size=64. "
+        "Tracked by spyre-inference#399."
+    ),
+)
+@pytest.mark.parametrize(
+    ("head_size", "query_len", "aligned_q"),
+    [
+        (64, 1, 32),  # single-token decode, Llama-3.2-1B head_size
+        (64, 21, 32),  # prefill chunk, Llama-3.2-1B prompt length
+    ],
+)
+def test_spyre_varlen_query_assembly_on_device(spyre_device, head_size, query_len, aligned_q):
+    """Varlen query reshape+pad on device for head_size=64.
+
+    Mirrors spyre_attn.py query assembly:
+      [query_len, num_heads, head_size]
+      -> unsqueeze(0).transpose(1, 2).contiguous()
+      -> reshape(num_kv_heads, num_queries_per_kv, aligned_q, head_size)
+    """
+    num_kv_heads, num_queries_per_kv = 8, 4
+    num_heads = num_kv_heads * num_queries_per_kv
+
+    query = torch.randn(query_len, num_heads, head_size, dtype=torch.float16, device=spyre_device)
+
+    def assemble(q, qlen):
+        if aligned_q > qlen:
+            q = torch.nn.functional.pad(q, (0, 0, 0, 0, 0, aligned_q - qlen))
+        q = q.unsqueeze(0).transpose(1, 2).contiguous()
+        return q.reshape(num_kv_heads, num_queries_per_kv, aligned_q, head_size)
+
+    out = assemble(query, query_len)
+    expected = assemble(query.cpu(), query_len)
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)

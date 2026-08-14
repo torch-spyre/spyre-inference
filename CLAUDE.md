@@ -209,3 +209,114 @@ When exploring a new feature area (e.g., FP8 quantization, new operators, hardwa
 - **Match existing style**: Follow established code patterns and architectural conventions
 - **Prefer simplicity**: When uncertain, choose the simpler, more concise implementation
 - **Assume vLLM familiarity**: The reader may not be an expert on the specific code being read, but should have general experience with vLLM
+
+## GitHub Workflow
+
+**Quick setup (recommended):**
+
+Run the helper script to configure git with your GitHub identity:
+
+```bash
+# Local config (recommended for repo-specific identity)
+./scripts/setup-git-config.sh
+
+# Or global config
+./scripts/setup-git-config.sh --global
+```
+
+This fetches your `name` and `email` from GitHub using `gh api user` and configures git accordingly.
+
+**Manual setup with `gh cli`:**
+
+```bash
+# Fetch name and email from GitHub
+git config user.name "$(gh api user --jq '.name // .login')"
+git config user.email "$(gh api user --jq '.email // empty')"
+```
+
+If the public email is empty, use your GitHub noreply email:
+```bash
+git config user.email "$(gh api user --jq '.email // "\(.login)@users.noreply.github.com"')"
+```
+
+**Creating a new branch:**
+
+Always create new branches from the latest `origin/main` to avoid carrying unrelated commits from other branches:
+
+```bash
+# Fetch latest main and create a clean branch
+git fetch origin main
+git checkout origin/main
+git checkout -b <branch-name>
+```
+
+If a local branch with the same name already exists, delete it first or use a different name:
+```bash
+git branch -D <branch-name>
+git checkout -b <branch-name>
+```
+
+**Pushing PRs from a fork:**
+
+Most contributors work on forks. Add your fork as a remote and push there:
+
+```bash
+# Add your fork (replace <your-username> with your GitHub login)
+git remote add fork https://github.com/<your-username>/spyre-inference.git
+
+# Push branch to your fork
+git push fork <branch-name>
+```
+
+To add your fork programmatically using your GitHub login:
+```bash
+FORK_URL=$(gh api user --jq '"https://github/\(.login)/spyre-inference.git"')
+git remote add fork "$FORK_URL"
+```
+
+If the remote already exists but points elsewhere:
+```bash
+git remote set-url fork "$FORK_URL"
+```
+
+**Creating a PR with `gh cli`:**
+
+After pushing your branch to your fork, create the PR against the upstream repo:
+
+```bash
+# Create PR (works if the current branch is pushed to a fork)
+gh pr create --title "type: short description" --body "PR description"
+```
+
+If `gh` cannot detect the fork automatically, specify the head explicitly:
+```bash
+gh pr create --title "type: short description" \
+             --body "PR description" \
+             --head <your-username>:<branch-name> \
+             --repo torch-spyre/spyre-inference
+```
+
+For multi-line bodies, write the body to a file and use `--body-file`:
+```bash
+cat > /tmp/pr_body.md << 'EOF'
+## Description
+
+Your description here.
+EOF
+gh pr edit <pr-number> --body-file /tmp/pr_body.md
+```
+
+**DCO (Developer Certificate of Origin):**
+
+All commits must include a `Signed-off-by` line. Use `-s` flag or append manually:
+
+```bash
+# With git commit
+git commit -s -m "Your commit message"
+
+# Or amend an existing commit
+git commit --amend -s --no-edit
+```
+
+The sign-off email must match your GitHub email (the one returned by `gh api user --jq '.email'`).
+If they do not match, DCO checks will fail.

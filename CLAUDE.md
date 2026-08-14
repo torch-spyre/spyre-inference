@@ -284,7 +284,10 @@ git remote set-url fork "$FORK_URL"
 Once a PR is open and under review, avoid `git push --force` or `git push --force-with-lease`. Force-pushing rewrites history and can invalidate review comments. Instead, add new commits on top of the branch and push normally:
 
 ```bash
-# Make additional changes
+# Run the formatter before committing
+bash format.sh
+
+# Stage and commit changes
 git add <files>
 git commit -m "type: description of follow-up change" -s
 

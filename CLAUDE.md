@@ -235,6 +235,7 @@ git config user.email "$(gh api user --jq '.email // empty')"
 ```
 
 If the public email is empty, use your GitHub noreply email:
+
 ```bash
 git config user.email "$(gh api user --jq '.email // "\(.login)@users.noreply.github.com"')"
 ```
@@ -251,6 +252,7 @@ git checkout -b <branch-name>
 ```
 
 If a local branch with the same name already exists, delete it first or use a different name:
+
 ```bash
 git branch -D <branch-name>
 git checkout -b <branch-name>
@@ -269,12 +271,14 @@ git push fork <branch-name>
 ```
 
 To add your fork programmatically using your GitHub login:
+
 ```bash
 FORK_URL=$(gh api user --jq '"https://github/\(.login)/spyre-inference.git"')
 git remote add fork "$FORK_URL"
 ```
 
 If the remote already exists but points elsewhere:
+
 ```bash
 git remote set-url fork "$FORK_URL"
 ```
@@ -307,6 +311,7 @@ gh pr create --title "type: short description" --body "PR description"
 ```
 
 If `gh` cannot detect the fork automatically, specify the head explicitly:
+
 ```bash
 gh pr create --title "type: short description" \
              --body "PR description" \
@@ -315,6 +320,7 @@ gh pr create --title "type: short description" \
 ```
 
 For multi-line bodies, write the body to a file and use `--body-file`:
+
 ```bash
 cat > /tmp/pr_body.md << 'EOF'
 ## Description

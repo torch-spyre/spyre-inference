@@ -17,8 +17,8 @@
 Registers as a drop-in replacement for vLLM's TransformersForCausalLM when
 the Spyre platform is active.  vLLM's stock Transformers backend handles
 model creation, weight loading, attention routing, KV cache, scheduling, and
-forward execution.  Spyre OOT layers (SpyreRMSNorm, SpyreSiluAndMul,
-SpyreLinears, etc.) are applied automatically at instantiation time.
+forward execution.  Spyre OOT layers (SpyreRMSNorm, SpyreLinears, etc.)
+are applied automatically at instantiation time.
 
 Activated when ``model_impl="transformers"`` on the Spyre platform via
 ``register_hf_adapters()``.

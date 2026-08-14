@@ -175,7 +175,7 @@ jobs:
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
@@ -184,7 +184,7 @@ jobs:
             test_types: unit regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-attention
@@ -192,7 +192,7 @@ jobs:
             test_types: unit regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
+              - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
             test_target: test-distributed
@@ -201,7 +201,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream
@@ -209,7 +209,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
+              - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
@@ -217,7 +217,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-model
@@ -431,7 +431,7 @@ jobs:
       ${{ !cancelled()
           && github.event_name != 'pull_request'
           && needs.resolve.outputs.resolved_test_type == 'perf' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
     timeout-minutes: 720
     env:
       CI: ''

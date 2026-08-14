@@ -83,7 +83,7 @@ jobs:
       fail-fast: false
     runs-on:
       - x86_64
-      - spyre_pf_x4__pvc_1tb_x1
+      - spyre_pf_x4
       - linux
       - image_torch_spyre
     timeout-minutes: 240

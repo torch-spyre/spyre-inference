@@ -860,7 +860,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Force CPU contiguous: value from QKV split-along-last-dim is
         # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
+        # silently corrupts data.
         key_cpu = key_cpu.contiguous()
         value_cpu = value_cpu.contiguous()
 

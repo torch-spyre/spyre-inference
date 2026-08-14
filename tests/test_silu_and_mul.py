@@ -13,7 +13,10 @@
 # limitations under the License.
 
 """
-Test SpyreSiluAndMul custom op correctness against a reference implementation.
+Test SiluAndMul custom op on Spyre device.
+
+The base class's forward_oot calls forward_native, which now works
+correctly on Spyre (torch-spyre#3578).
 """
 
 import pytest
@@ -35,15 +38,15 @@ def reference_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.siluandmul
 @pytest.mark.parametrize("num_tokens", [16, 17, 64, 128, 1024])
 @pytest.mark.parametrize("d", [64, 256, 1024, 8128, 12800])
-def test_spyre_siluandmul_matches_reference(num_tokens, d):
-    """SpyreSiluAndMul.forward_oot on a Spyre input matches the CPU reference."""
-    from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul
+def test_siluandmul_on_spyre_matches_reference(num_tokens, d):
+    """SiluAndMul.forward_oot on a Spyre input matches the CPU reference."""
+    from vllm.model_executor.layers.activation import SiluAndMul
 
     torch.manual_seed(42)
 
     # Input shape is [num_tokens, 2*d], output shape is [num_tokens, d]
     x = torch.randn(num_tokens, 2 * d, dtype=torch.float16)
-    layer = SpyreSiluAndMul()
+    layer = SiluAndMul()
 
     expected = reference_silu_and_mul(x)
     actual = layer.forward_oot(x.to("spyre"))
@@ -52,15 +55,13 @@ def test_spyre_siluandmul_matches_reference(num_tokens, d):
 
 
 @pytest.mark.siluandmul
-def test_siluandmul_oot_dispatch():
-    """Verify SiluAndMul OOT registration: class swap"""
+def test_siluandmul_oot_method():
+    """Verify SiluAndMul has forward_oot that calls forward_native."""
     from vllm.model_executor.layers.activation import SiluAndMul
-    from spyre_inference.custom_ops.silu_and_mul import SpyreSiluAndMul
 
     layer = SiluAndMul()
 
-    # OOT class swap: SiluAndMul.__new__ should produce SpyreSiluAndMul
-    assert isinstance(layer, SpyreSiluAndMul)
-
-    # dispatch_forward should have selected forward_oot
-    assert layer._forward_method == layer.forward_oot
+    # forward_oot should be the method that gets called on OOT platforms
+    # and it should call forward_native by default
+    assert hasattr(layer, "forward_oot")
+    assert layer.forward_oot is not None

@@ -279,6 +279,21 @@ If the remote already exists but points elsewhere:
 git remote set-url fork "$FORK_URL"
 ```
 
+**Avoid force-pushing after opening a PR:**
+
+Once a PR is open and under review, avoid `git push --force` or `git push --force-with-lease`. Force-pushing rewrites history and can invalidate review comments. Instead, add new commits on top of the branch and push normally:
+
+```bash
+# Make additional changes
+git add <files>
+git commit -m "type: description of follow-up change" -s
+
+# Push new commits without force
+git push fork <branch-name>
+```
+
+Only force-push to fix critical issues (e.g., DCO sign-off mismatch) when no reviewers have left inline comments on the affected commits, and always communicate this in the PR.
+
 **Creating a PR with `gh cli`:**
 
 After pushing your branch to your fork, create the PR against the upstream repo:

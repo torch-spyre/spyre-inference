@@ -1266,7 +1266,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
+            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
             result = attn_fn(
                 q_dev,
                 k_pages,

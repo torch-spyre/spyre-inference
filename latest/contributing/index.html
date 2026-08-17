@@ -2109,11 +2109,11 @@
 <h4 id="test-markers">Test Markers<a class="headerlink" href="#test-markers" title="Permanent link">&para;</a></h4>
 <p>The test suite uses pytest markers to categorize tests:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="n">markers</span> <span class="o">=</span> <span class="p">[</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="s2">&quot;distributed: Tests requiring multiple spyre cards&quot;</span><span class="p">,</span>
-</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="s2">&quot;upstream: Tests coming from upstream vLLM&quot;</span><span class="p">,</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="s2">&quot;attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job&quot;</span><span class="p">,</span>
-</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="s2">&quot;rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)&quot;</span><span class="p">,</span>
-</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    <span class="s2">&quot;fp8: FP8 quantization tests (tests/test_fp8.py)&quot;</span><span class="p">,</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>    <span class="s2">"distributed: Tests requiring multiple spyre cards"</span><span class="p">,</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>    <span class="s2">"upstream: Tests coming from upstream vLLM"</span><span class="p">,</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>    <span class="s2">"attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job"</span><span class="p">,</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>    <span class="s2">"rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)"</span><span class="p">,</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/test_fp8.py)"</span><span class="p">,</span>
 </span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="p">]</span>
 </span></code></pre></div>
 <p>Some useful overrides:</p>
@@ -2124,7 +2124,7 @@
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>pytest<span class="w"> </span>-m<span class="w"> </span>upstream
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
 </span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="c1"># Run attention tests from upstream only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;attention&quot;</span>
+</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention"</span>
 </span></code></pre></div>
 <h4 id="upstream-test-integration">Upstream Test Integration<a class="headerlink" href="#upstream-test-integration" title="Permanent link">&para;</a></h4>
 <p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor</code> set automatically. See <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> for implementation details.</p>

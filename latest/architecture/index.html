@@ -738,10 +738,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#weight-un-fusing" class="md-nav__link">
+  <a href="#transposed-linear-weights" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Weight un-fusing
+        Transposed linear weights
       
     </span>
   </a>
@@ -1491,10 +1491,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#weight-un-fusing" class="md-nav__link">
+  <a href="#transposed-linear-weights" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Weight un-fusing
+        Transposed linear weights
       
     </span>
   </a>
@@ -1873,10 +1873,10 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#weight-un-fusing" class="md-nav__link">
+  <a href="#transposed-linear-weights" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Weight un-fusing
+        Transposed linear weights
       
     </span>
   </a>
@@ -2063,10 +2063,10 @@ read of the gathered rotation slice out of the compiled graph.</p>
 <td>The weight is pinned to CPU (<code>_apply</code> is a no-op — <code>F.embedding</code> has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-<code>convert</code>ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is <code>convert</code>ed back to Spyre; <code>all_reduce</code> when TP&gt;1</td>
 </tr>
 <tr>
-<td><code>QKVParallelLinear</code></td>
-<td><code>SpyreQKVParallelLinear</code></td>
+<td><code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>, <code>ReplicatedLinear</code></td>
+<td><code>SpyreColumnParallelLinear</code>, <code>SpyreMergedColumnParallelLinear</code>, <code>SpyreQKVParallelLinear</code>, <code>SpyreRowParallelLinear</code>, <code>SpyreReplicatedLinear</code></td>
 <td>Spyre</td>
-<td>Subclass only asserts <code>gather_output=False</code>; the fused weight is split at load by the un-fusing pass, and <code>forward</code> runs <code>q</code>/<code>k</code>/<code>v</code> as three <code>F.linear</code> calls on Spyre</td>
+<td>All five swap in <code>SpyreUnquantizedLinearMethod</code> (the transposed-weight fast path below). <code>SpyreQKVParallelLinear</code> additionally asserts <code>gather_output=False</code>; <code>SpyreRowParallelLinear</code> (<code>o_proj</code>, <code>down_proj</code>) inherits upstream's <code>all_reduce</code> when <code>reduce_results=True</code> under TP&gt;1</td>
 </tr>
 <tr>
 <td><code>SiluAndMul</code></td>
@@ -2088,22 +2088,32 @@ read of the gathered rotation slice out of the compiled graph.</p>
 </tr>
 </tbody>
 </table>
-<p><code>RowParallelLinear</code> and <code>MergedColumnParallelLinear</code> are <strong>not</strong> subclassed:</p>
+<h3 id="transposed-linear-weights">Transposed linear weights<a class="headerlink" href="#transposed-linear-weights" title="Permanent link">&para;</a></h3>
+<p><code>F.linear(x, W)</code> computes <code>x @ Wᵀ</code> however <code>W</code> is laid out, and on Spyre that transposed
+matmul is ~3.5× slower than a plain <code>x @ A</code>
+(<a href="https://github.com/torch-spyre/torch-spyre/issues/3512">torch-spyre#3512</a>).
+<code>SpyreUnquantizedLinearMethod</code> (<code>custom_ops/linear.py</code>) closes that gap in two overrides:</p>
 <ul>
-<li><code>RowParallelLinear</code> (<code>o_proj</code>, <code>down_proj</code>) runs the upstream class unchanged — <code>F.linear</code>
-  dispatches to Spyre, and <code>all_reduce</code> (via <code>SpyreCommunicator</code>) fires when <code>reduce_results=True</code>
-  under TP&gt;1.</li>
-<li><code>MergedColumnParallelLinear</code> (<code>gate_up_proj</code>) runs the upstream class unchanged: the
-  fused <code>[..., 2*d]</code> output feeds straight into <code>SpyreSiluAndMul</code>, which slices gate/up
-  on-device.</li>
+<li><code>process_weights_after_loading</code> replaces the loaded <code>[out, in]</code> weight with a contiguous
+  <code>[in, out]</code> <code>Wᵀ</code>, so the transpose is paid once at load time rather than every forward.</li>
+<li><code>apply</code> runs <code>spyre_linear_t</code> — <code>torch.matmul(x, Wᵀ)</code> plus optional bias — instead of
+  <code>F.linear</code>.</li>
 </ul>
-<h3 id="weight-un-fusing">Weight un-fusing<a class="headerlink" href="#weight-un-fusing" title="Permanent link">&para;</a></h3>
-<p><code>analyze_and_unfuse</code> (<code>custom_ops/unfuse.py</code>) runs once after the checkpoint is loaded,
-while weights are still on CPU. The fused <code>QKVParallelLinear</code> weight is a problem on Spyre:
-splitting its output on-device yields strided views that corrupt when transferred. So the
-pass splits the fused weight into contiguous per-part Parameters and rebinds <code>forward</code> to
-run one <code>F.linear</code> per part. The result is a <code>SplitQKV</code> container that the unmodified
-downstream idiom — <code>q, k, v = qkv.split(...)</code> — keeps consuming unchanged.</p>
+<p>The five linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
+<code>UnquantizedLinearMethod</code>; quantized layers keep their own method and the slower
+<code>F.linear</code> path. This is the pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight
+layout, which only fires for <code>nn.Linear</code> and so misses every vLLM parallel-linear.
+<code>SpyreParallelLMHead</code> stores its own <code>padded_weight_t</code> for the same reason and reuses
+<code>spyre_linear_t</code>, so the fast path is defined once.</p>
+<p>Fused projections stay fused. <code>SpyreQKVParallelLinear</code> returns the whole <code>[..., q+k+v]</code>
+tensor and the unmodified upstream idiom <code>q, k, v = qkv.split(...)</code> slices it, exactly as
+<code>SpyreMergedColumnParallelLinear</code>'s <code>[..., 2*d]</code> output feeds <code>SpyreSiluAndMul</code>, which
+slices gate/up on-device. Earlier revisions instead split the QKV weight on CPU at load
+time into three per-part GEMMs — a <code>SplitQKV</code> container built by an <code>analyze_and_unfuse</code>
+pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
+so that pass is gone. The remaining slicing constraint is narrower than it was and lives
+in the attention backend, where offset &gt; 0 views still corrupt on transfer (see
+<a href="#attention-backend">Attention Backend</a>).</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
 (no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each
@@ -2188,8 +2198,9 @@ override:</p>
 float compute tensors land on Spyre via <code>self._spyre_device</code>. Because there is no
 <code>vllm._C</code> under <code>VLLM_TARGET_DEVICE=empty</code>, the runner also swaps in a pure-PyTorch
 <code>_compute_slot_mapping</code> implementation for the paged-cache slot mapping.</p>
-<p>At load time, <code>load_model</code> calls <code>analyze_and_unfuse(self.model)</code> (weight un-fusing) and
-then moves every module except <code>Attention</code> scale buffers onto Spyre.</p>
+<p>At load time, <code>load_model</code> moves every module except <code>Attention</code> scale buffers onto Spyre.
+The weight transposes happen before that, in each layer's
+<code>process_weights_after_loading</code>, while the weights are still on CPU.</p>
 <p><code>_SpyreModelWrapper</code> sits between the model runner and the model and converts at the
 call boundary:</p>
 <ul>

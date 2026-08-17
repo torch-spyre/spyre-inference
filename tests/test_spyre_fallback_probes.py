@@ -253,21 +253,23 @@ def test_spyre_fancy_index_tensor(spyre_device):
     reason=(
         "Indirectly indexing a dense Spyre tensor by a device index, then "
         "transposing and using it in torch.matmul, silently produces wrong "
-        "results (layout-propagation bug). The attention backend therefore "
-        "keeps _indirect_matmul_mock, which gathers pages from a Python list "
-        "of per-page tensors. When true indirect access works on Spyre, "
-        "_indirect_matmul_mock can be replaced by direct indexing in "
-        "_create_compilable_page_attn."
+        "results (layout-propagation bug). The attention backend now uses a "
+        "dense page tensor indexed by a host Python int instead; device-tensor "
+        "page indices are not required for correctness. This probe remains as "
+        "a torch-spyre primitive test until true device-level indirect access "
+        "works."
     ),
 )
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
-    """Index a dense tensor by a device index before matmul (attention gather).
+    """Index a dense tensor by a device index before matmul.
 
-    This is the primitive _indirect_matmul_mock emulates with a Python list
-    inside the compiled attention loop:
+    This is *not* the path the attention backend uses. The backend gathers
+    pages from a dense tensor with a host Python index:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
-    where page_idx lives on the Spyre device.
+    where page_idx is a Python int. That path works on Spyre and is covered
+    by tests/test_spyre_attn.py. This probe tracks the still-broken primitive
+    of indexing by a tensor that lives on the Spyre device.
     """
     num_kv_heads = 2
     block_size = 64

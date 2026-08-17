@@ -658,13 +658,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
-        """Allocate KV cache as lists of individual page tensors on Spyre.
+        """Allocate KV cache as dense page tensors on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
-        is a list of tensors of shape [num_kv_heads, block_size, head_size] on
-        the Spyre device. This matches upstream vLLM's paged model but uses
-        list indices instead of tensor indices — enabling direct per-page bmm
-        without advanced indexing.
+        is a dense tensor of shape [num_blocks, num_kv_heads, block_size,
+        head_size] on the Spyre device. Pages are gathered with host Python
+        indexing inside the compiled attention kernel.
         """
         from vllm.v1.worker.utils import bind_kv_cache
         from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
@@ -687,26 +686,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Default stickification splits head_size into 64-element sticks.
             # Alternative: stickify block_size or num_kv_heads for different
             # access patterns (would require explicit SpyreTensorLayout).
-            k_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
-            v_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
+            k_pages = torch.zeros(
+                num_blocks,
+                spec.num_kv_heads,
+                spec.block_size,
+                spec.head_size,
+                dtype=torch.float16,
+                device=self._spyre_device,
+            )
+            v_pages = torch.zeros(
+                num_blocks,
+                spec.num_kv_heads,
+                spec.block_size,
+                spec.head_size,
+                dtype=torch.float16,
+                device=self._spyre_device,
+            )
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
+"""Paged KV-cache attention backend for Spyre using dense-page tensors and online softmax."""
 
 import functools
 from dataclasses import dataclass
@@ -62,12 +62,6 @@ def _record_function(name: str):
     return decorator
 
 
-# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
-# regardless of the vLLM compilation config. Used to evaluate the compiled path
-# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
-# Default: off (unset or "0").
-_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
-
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -91,11 +85,15 @@ class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
     NamedTuple (not dataclass) because it is a tuple at runtime — Dynamo
-    specializes tuple subscripts at trace time, which is what makes the
-    compile-unrolled per-page loop in `_create_compilable_page_attn` work.
-    A regular dataclass would cross an unverified line with Dynamo's tracing
-    of attribute access on custom objects. Index-by-int and unpacking
-    (`k_pages, v_pages = cache`) keep working unchanged.
+    specializes tuple unpacking at trace time. A regular dataclass would cross
+    an unverified line with Dynamo's tracing of attribute access on custom
+    objects. Index-by-int and unpacking (`k_pages, v_pages = cache`) keep
+    working unchanged.
+
+    Each field is a dense tensor of shape
+    `[num_blocks, num_kv_heads, block_size, head_size]` on the Spyre device.
+    Pages are accessed with a host Python index (`k_pages[page_idx]`), which
+    produces a view suitable for the compiled attention kernel.
 
     Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
     consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
@@ -103,8 +101,8 @@ class SpyrePagedKVCache(NamedTuple):
     `bind_kv_cache(...)` call site for why that type-hole is benign.
     """
 
-    k_pages: list[torch.Tensor]
-    v_pages: list[torch.Tensor]
+    k_pages: torch.Tensor
+    v_pages: torch.Tensor
 
 
 def _overwrite(
@@ -125,17 +123,15 @@ def _overwrite(
 
 
 def _maybe_compile(fn):
-    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
+    """Compile the online-softmax attention kernel.
 
-    Used only for the online-softmax attention kernel — the reshape/cache
-    kernel is *not* covered, because forcing compile on it currently hits an
-    unsupported torch-spyre Inductor path (missing device_tensor_layout on
-    graph input). Flip _get_reshape_fn to call this helper too once that gap
-    is resolved.
+    torch-spyre's eager path cannot handle matmul on offset views of a dense
+    KV tensor ("no mechanism to resolve stick incompatibility"), so the
+    kernel must run through Inductor. The reshape/cache kernel is *not*
+    covered, because forcing compile on it currently hits an unsupported
+    torch-spyre Inductor path (missing device_tensor_layout on graph input).
     """
-    if _FORCE_COMPILE_ATTN:
-        return torch.compile(fn, dynamic=False)
-    return fn
+    return torch.compile(fn, dynamic=False)
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +231,9 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            k_pages: list of [num_kv_heads, block_size, head_size]
-            v_pages: list of [num_kv_heads, block_size, head_size]
-            page_indices: [num_blocks]
+            k_pages: [num_blocks, num_kv_heads, block_size, head_size]
+            v_pages: [num_blocks, num_kv_heads, block_size, head_size]
+            page_indices: [num_blocks] (list of host ints)
             mask_tiles: [num_blocks]
             alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
                 (only when has_alibi=True; None otherwise). The query-axis dim
@@ -410,7 +406,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # torch.compile.
         if self.block_size % 64 != 0:
             raise ValueError(
-                f"block_size must be a multiple of 64 for the list-based attention "
+                f"block_size must be a multiple of 64 for the Spyre attention "
                 f"backend. Got block_size={self.block_size}, head_size={self.head_size}. "
             )
 
@@ -817,8 +813,8 @@ class SpyreAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return [  # ty: ignore[invalid-return-type]
-            (num_blocks, block_size, num_kv_heads, head_size),
-            (num_blocks, block_size, num_kv_heads, head_size),
+            (num_blocks, num_kv_heads, block_size, head_size),
+            (num_blocks, num_kv_heads, block_size, head_size),
         ]
 
     @classmethod
@@ -837,9 +833,10 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
-    KV cache is a tuple (k_pages, v_pages) where each is a list of tensors
-    of shape [num_kv_heads, block_size, head_size] on Spyre. No monolithic
-    cache tensor, no gather masks.
+    KV cache is a tuple (k_pages, v_pages) where each is a dense tensor of
+    shape [num_blocks, num_kv_heads, block_size, head_size] on Spyre. Pages
+    are gathered with host Python indexing inside the compiled kernel; no
+    device-level gather masks are needed.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -893,7 +890,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
+        logger.debug_once("Using SpyreAttentionBackend with DENSE-TENSOR online softmax")
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
@@ -941,7 +938,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         # Derive target device from the KV pages — query may arrive on CPU
         # (e.g. in unit tests) while pages live on the real Spyre device.
-        _target_device = k_pages[0].device
+        _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
@@ -994,8 +991,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self,
         key_cpu: torch.Tensor,
         value_cpu: torch.Tensor,
-        k_pages: list[torch.Tensor],
-        v_pages: list[torch.Tensor],
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
         block_indices: list[int],
         block_offsets: list[int],
         _target_device: torch.device,
@@ -1003,7 +1000,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Write new K/V tokens into their respective pages.
 
         key, value: [num_tokens, num_kv_heads, head_size]
-        k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
+        k_pages, v_pages: [num_blocks, num_kv_heads, block_size, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key_cpu.shape[0]
@@ -1022,8 +1019,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self,
         query_dev: torch.Tensor | None,
         query_cpu: torch.Tensor | None,
-        k_pages: list[torch.Tensor],
-        v_pages: list[torch.Tensor],
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
         _target_device: torch.device,
@@ -1031,8 +1028,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        Each k_page/v_page is [num_kv_heads, block_size, head_size] — a complete
-        tensor on Spyre, passed to bmm directly without slicing.
+        k_pages/v_pages are dense tensors of shape
+        [num_blocks, num_kv_heads, block_size, head_size]; each page is gathered
+        with a host Python index and passed to matmul directly without slicing.
 
         Writes results directly into the caller's output buffer in-place.
 

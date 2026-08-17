@@ -64,21 +64,11 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile, run in eager mode",
     )
-    parser.add_argument(
-        "--force-compile-attn",
-        action="store_true",
-        dest="force_compile_attn",
-        help="Compile the attention kernel (specialized_paged_attn_kernel, off by default).",
-    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    # Note: SPYRE_FORCE_COMPILE_ATTN=1 only compiles the
-    # specialized_paged_attn_kernel, not the complete attention.
-    os.environ["SPYRE_FORCE_COMPILE_ATTN"] = "1" if args.force_compile_attn else "0"
 
     if platform.machine() == "arm64":
         print(

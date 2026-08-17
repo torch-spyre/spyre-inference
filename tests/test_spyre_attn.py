@@ -343,12 +343,8 @@ def _run_spyre_attn_test(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    k_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -372,24 +368,24 @@ def _run_spyre_attn_test(
             for token_idx in range(historical_len):
                 actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
-                v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
+                k_pages_cpu[actual_block, :, block_offset, :] = historical_keys[token_idx]
+                v_pages_cpu[actual_block, :, block_offset, :] = historical_values[token_idx]
         for token_idx in range(historical_len, kv_len):
             block_idx = token_idx // block_size
             block_offset = token_idx % block_size
             actual_block = block_tables[seq_idx, block_idx].item()
-            k_pages_cpu[actual_block][:, block_offset, :] = key[
+            k_pages_cpu[actual_block, :, block_offset, :] = key[
                 q_offset + token_idx - historical_len
             ]
-            v_pages_cpu[actual_block][:, block_offset, :] = value[
+            v_pages_cpu[actual_block, :, block_offset, :] = value[
                 q_offset + token_idx - historical_len
             ]
             slot_mapping.append(actual_block * block_size + block_offset)
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
-    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -428,8 +424,8 @@ def _run_spyre_attn_test(
 
     ref_output = ref_attn(
         query=query,
-        key_cache=k_pages_cpu,
-        value_cache=v_pages_cpu,
+        key_cache=[k_pages_cpu[i] for i in range(num_blocks)],
+        value_cache=[v_pages_cpu[i] for i in range(num_blocks)],
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,
@@ -912,21 +908,17 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     # Single sequence: query_len=32, kv_len=256
     query_len, kv_len = 32, 256
 
-    k_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
 
     # Pre-populate KV cache
     for i in range(kv_len):
         block_idx = i // block_size
         block_offset = i % block_size
-        k_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
+        k_pages_cpu[block_idx, :, block_offset, :] = torch.randn(
             num_kv_heads, head_size, dtype=dtype
         )
-        v_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
+        v_pages_cpu[block_idx, :, block_offset, :] = torch.randn(
             num_kv_heads, head_size, dtype=dtype
         )
 

@@ -16,7 +16,7 @@
 
 import functools
 from dataclasses import dataclass
-from typing import Callable, ClassVar, NamedTuple
+from typing import ClassVar, NamedTuple
 
 import os
 
@@ -122,92 +122,6 @@ def _overwrite(
     for i, dim in enumerate(dims):
         sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
     sliced_t.copy_(input)
-
-
-def _indirect_matmul_mock(
-    a: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_a: int | torch.Tensor | list[int] | None,
-    b: torch.Tensor | list[torch.Tensor],
-    address_or_index_of_b: int | torch.Tensor | list[int] | None,
-    # we need the option to transform a and/or b, after the indirect access
-    transform_a: Callable | None = None,
-    transform_b: Callable | None = None,
-) -> torch.Tensor:
-    """mock implementation for custom indirect matmul
-
-    address_or_index_of_ : this can be both: index if running on the CPU or if
-                           the outer-dimension of the tensors are lists. Or then
-                           absolute addresses if it is supported on Spyre.
-
-                           Single index: accesses ONE slice (returns same shape as that slice)
-                           List of indices: accesses MULTIPLE slices and concatenates along dim 0
-
-                           Example for list access: if a is a list of [num_tokens] tensors each
-                           [num_heads, head_size], and address_or_index_of_a is [2, 3, 4], then
-                           the result is torch.cat([a[2], a[3], a[4]], dim=0) with shape
-                           [3, num_heads, head_size].
-
-    transform_ : This is an optional torch-compilable function to transform (e.g.
-                 transpose/rotate) the tensor-slice after it was loaded via
-                 the indirect access before the matmul happens.
-
-    """
-    # Handle both list and tuple (torch.unbind returns tuple)
-    is_a_list = isinstance(a, (list, tuple))
-    is_b_list = isinstance(b, (list, tuple))
-
-    current_device = a[0].device.type if is_a_list else a.device.type
-    if current_device == "spyre":
-        # constraints for now -> this should change with true indirect access
-        # on the cpu, it also works with "true" indirect access, meaning a/b being tensors
-        assert is_a_list or address_or_index_of_a is None, "here needs to be true indirect access"
-        assert is_b_list or address_or_index_of_b is None, "here needs to be true indirect access"
-
-    # resolving indirect access
-    # it is important here that this DOES NOT RESULT in new tensors being realized in DRAM
-    # hence, it has to be views like here
-    if is_a_list or (isinstance(a, torch.Tensor) and address_or_index_of_a is not None):
-        if isinstance(address_or_index_of_a, list):
-            # Multiple indices - cat the results (for prefill with list-based queries)
-            a_slices = [a[idx] for idx in address_or_index_of_a]
-            a = torch.cat(a_slices, dim=0)
-            if transform_a:
-                a = transform_a(a)
-        elif isinstance(address_or_index_of_a, torch.Tensor):
-            assert len(address_or_index_of_a) == 1, "for now, we support only one page at a time"
-            idx_a = int(address_or_index_of_a.item())
-            a = a[idx_a]
-            if transform_a:
-                a = transform_a(a)
-        else:
-            assert address_or_index_of_a is not None
-            a = a[address_or_index_of_a]
-            if transform_a:
-                a = transform_a(a)
-
-    if is_b_list or (isinstance(b, torch.Tensor) and address_or_index_of_b is not None):
-        if isinstance(address_or_index_of_b, list):
-            # Multiple indices - cat the results (for prefill with list-based queries)
-            b_slices = [b[idx] for idx in address_or_index_of_b]
-            b = torch.cat(b_slices, dim=0)
-            if transform_b:
-                b = transform_b(b)
-        elif isinstance(address_or_index_of_b, torch.Tensor):
-            assert len(address_or_index_of_b) == 1, "for now, we support only one page at a time"
-            idx_b = int(address_or_index_of_b.item())
-            b = b[idx_b]
-            if transform_b:
-                b = transform_b(b)
-        else:
-            assert address_or_index_of_b is not None
-            b = b[address_or_index_of_b]
-            if transform_b:
-                b = transform_b(b)
-
-    # do the actual matmul
-    assert isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
-    output = torch.matmul(a, b)
-    return output
 
 
 def _maybe_compile(fn):
@@ -338,22 +252,14 @@ def _create_compilable_page_attn(
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            # Syntax with views and indirect access
-            # (i.e. instead of _indirect_matmul_mock)
-            # k_page = k_pages[page_idx]
-            # v_page = v_pages[page_idx]
-            # k_page_4d = k_page.unsqueeze(1)
-            # v_page_4d = v_page.unsqueeze(1)
+            k_page = k_pages[page_idx]
+            v_page = v_pages[page_idx]
+            k_page_4d = k_page.unsqueeze(1)
+            v_page_4d = v_page.unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
-            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            # NOTE: for true "varlen" layout, q would be
-            # an indirect access too (avoided here for simplicity...)
-            scores = _indirect_matmul_mock(
-                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
-            )
-            scores *= scale
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
             if logits_soft_cap > 0.0:
                 # Pull logits into (-cap, +cap) before the mask add so masked
                 # positions still map cleanly to -inf. Applied before the ALiBi
@@ -371,10 +277,7 @@ def _create_compilable_page_attn(
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                # tile_output = torch.matmul(tile_probs, v_page_4d)
-                tile_output = _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
+                tile_output = torch.matmul(tile_probs, v_page_4d)
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 # i > 0 only reachable after the i == 0 branch initialized these.
@@ -386,10 +289,7 @@ def _create_compilable_page_attn(
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
-                tile_output += _indirect_matmul_mock(
-                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
-                )
+                tile_output += torch.matmul(tile_probs, v_page_4d)
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 

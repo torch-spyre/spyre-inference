@@ -232,8 +232,8 @@ def _alibi_slopes(num_heads: int) -> list[float]:
 
 def ref_attn(
     query: torch.Tensor,
-    key_cache: list[torch.Tensor],
-    value_cache: list[torch.Tensor],
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     query_lens: list[int],
     kv_lens: list[int],
     block_tables: torch.Tensor,
@@ -368,16 +368,16 @@ def _run_spyre_attn_test(
             for token_idx in range(historical_len):
                 actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                k_pages_cpu[actual_block, :, block_offset, :] = historical_keys[token_idx]
-                v_pages_cpu[actual_block, :, block_offset, :] = historical_values[token_idx]
+                k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
+                v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
         for token_idx in range(historical_len, kv_len):
             block_idx = token_idx // block_size
             block_offset = token_idx % block_size
             actual_block = block_tables[seq_idx, block_idx].item()
-            k_pages_cpu[actual_block, :, block_offset, :] = key[
+            k_pages_cpu[actual_block][:, block_offset, :] = key[
                 q_offset + token_idx - historical_len
             ]
-            v_pages_cpu[actual_block, :, block_offset, :] = value[
+            v_pages_cpu[actual_block][:, block_offset, :] = value[
                 q_offset + token_idx - historical_len
             ]
             slot_mapping.append(actual_block * block_size + block_offset)
@@ -424,8 +424,8 @@ def _run_spyre_attn_test(
 
     ref_output = ref_attn(
         query=query,
-        key_cache=[k_pages_cpu[i] for i in range(num_blocks)],
-        value_cache=[v_pages_cpu[i] for i in range(num_blocks)],
+        key_cache=k_pages_cpu,
+        value_cache=v_pages_cpu,
         query_lens=query_lens,
         kv_lens=kv_lens,
         block_tables=block_tables,
@@ -915,10 +915,10 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     for i in range(kv_len):
         block_idx = i // block_size
         block_offset = i % block_size
-        k_pages_cpu[block_idx, :, block_offset, :] = torch.randn(
+        k_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
             num_kv_heads, head_size, dtype=dtype
         )
-        v_pages_cpu[block_idx, :, block_offset, :] = torch.randn(
+        v_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
             num_kv_heads, head_size, dtype=dtype
         )
 

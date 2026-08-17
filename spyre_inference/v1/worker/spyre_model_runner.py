@@ -66,8 +66,6 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
-from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -410,20 +408,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV / gate-up projections.
-        analyze_and_unfuse(self.model)
-
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
-
-        # Store 2-D linear weights transposed (Wᵀ) and matmul directly, so the
-        # forward GEMM is the fast `x @ A` instead of `F.linear`'s slow `x @ Aᵀ`
-        # (torch-spyre #3512). vLLM linears aren't nn.Linear, so torch-spyre's
-        # [1,0]-layout `.to("spyre")` patch skips them; we do the equivalent here
-        # in pure PyTorch. Runs after un-fusing (QKV carries its own transpose).
-        transpose_linear_weights_for_spyre(self.model)
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
@@ -658,12 +646,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
-        """Allocate KV cache as dense page tensors on Spyre.
+        """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
-        is a dense tensor of shape [num_blocks, num_kv_heads, block_size,
-        head_size] on the Spyre device. Pages are gathered with host Python
-        indexing inside the compiled attention kernel.
+        is a single tensor of shape [num_blocks, num_kv_heads, block_size,
+        head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
+        advertises. The attention kernel selects a page by indexing with a
+        one-element device tensor, so the page read is a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
         from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache

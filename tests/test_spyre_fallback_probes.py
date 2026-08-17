@@ -80,6 +80,11 @@ def test_spyre_last_dim_slice(spyre_device, mode):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
+# ---------------------------------------------------------------------------
+# 2. Matmul output-dimension limitations
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -99,8 +104,36 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     torch.testing.assert_close(logits.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Spyre batchmatmul cannot restickify a size-1 output dimension: "
+        "`x[T, in] @ w[in, 1]` fails to lower with 'cannot restickify any input "
+        "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
+        "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
+        "Fails in both eager and compile. "
+        "When supported, please adapt tests/test_mlp.py::test_replicated_matches_reference"
+    ),
+)
+def test_spyre_matmul_output_dim_1(spyre_device, mode):
+    """Mirrors spyre_linear_t: out = matmul(x[T, in], weight_t[in, out]) with out=1."""
+    x = torch.randn(7, 128, dtype=torch.float16, device=spyre_device)
+    weight_t = torch.randn(128, 1, dtype=torch.float16, device=spyre_device)
+
+    def fn(a, b):
+        return torch.matmul(a, b)
+
+    if mode == "compile":
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    out = fn(x, weight_t)
+    expected = torch.matmul(x.cpu().float(), weight_t.cpu().float())
+    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+
 # ---------------------------------------------------------------------------
-# 2. Scatter / index_select / embedding
+# 3. Scatter / index_select / embedding
 # ---------------------------------------------------------------------------
 
 
@@ -109,10 +142,11 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
         "an indexed scatter write (torch-spyre#3508). Historically this forced "
-        "SpyreQKVParallelLinear to D2H before return; we side-step that by "
-        "un-fusing QKV after load. The same gap keeps encoder-only attention "
-        "Q/K/V pack/unpack on CPU (spyre_encoder_attn.py). Once this probe "
-        "passes, move encoder ragged→dense packing back onto Spyre."
+        "SpyreQKVParallelLinear to D2H before return, and later to un-fuse QKV "
+        "after load; the attention backend now brings k/v to CPU instead. The "
+        "same gap keeps encoder-only attention Q/K/V pack/unpack on CPU "
+        "(spyre_encoder_attn.py). Once this probe passes, move encoder "
+        "ragged→dense packing back onto Spyre."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):
@@ -244,32 +278,28 @@ def test_spyre_fancy_index_tensor(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 3. Indirect tensor access in matmul (attention page gathering)
+# 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Indirectly indexing a dense Spyre tensor by a device index, then "
-        "transposing and using it in torch.matmul, silently produces wrong "
-        "results (layout-propagation bug). The attention backend now uses a "
-        "dense page tensor indexed by a host Python int instead; device-tensor "
-        "page indices are not required for correctness. This probe remains as "
-        "a torch-spyre primitive test until true device-level indirect access "
-        "works."
+        "A ZERO-DIM scalar device index silently produces wrong results: "
+        "k_pages[torch.tensor(2)] fed through transpose into torch.matmul "
+        "diverges from CPU. A ONE-ELEMENT index tensor works and is what the "
+        "attention backend uses -- see "
+        "test_spyre_indirect_page_gather_one_element_index below. Only this "
+        "0-dim form remains broken."
     ),
 )
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
-    """Index a dense tensor by a device index before matmul.
+    """Index a dense tensor by a 0-dim device index before matmul.
 
-    This is *not* the path the attention backend uses. The backend gathers
-    pages from a dense tensor with a host Python index:
+    Mirrors the page gather in _create_compilable_page_attn, but with a 0-dim
+    index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
-    where page_idx is a Python int. That path works on Spyre and is covered
-    by tests/test_spyre_attn.py. This probe tracks the still-broken primitive
-    of indexing by a tensor that lives on the Spyre device.
     """
     num_kv_heads = 2
     block_size = 64
@@ -302,8 +332,100 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+@pytest.mark.parametrize("head_size", [64, 128])
+def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, mode):
+    """Guard the page gather used by SpyreAttentionImpl.
+
+    The index must be a one-element tensor taken as a row slice of a stick-wide
+    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
+    provides. Two nearby index forms do NOT work and are deliberately not used:
+      - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
+      - a slice of a plain 1-D index tensor, or of a shared table row, which
+        fails to compile rather than returning wrong values.
+
+    index_select works in both modes, so it guards the shape of the gather here.
+    The subscript spelling the kernel uses when compiled is covered by
+    test_spyre_indirect_page_gather_subscript_needs_compile.
+    """
+    num_kv_heads, block_size, num_blocks, query_len = 8, 64, 16, 32
+    int32_elems_per_stick = 32
+    page = 5
+
+    q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
+    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages = k_pages_cpu.to(spyre_device)
+
+    table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
+    table_cpu[0, 0] = page
+    table = table_cpu.to(spyre_device)
+
+    def page_attn(q, k_pages, table):
+        k_page = k_pages.index_select(0, table[0, 0:1]).squeeze(0).unsqueeze(1)
+        return torch.matmul(q, k_page.transpose(-2, -1))
+
+    if mode == "compile":
+        page_attn = torch.compile(page_attn, dynamic=False)
+
+    scores = page_attn(q, k_pages, table)
+    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
+    torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Subscripting a dense Spyre tensor with an int32 index lowers "
+                    "to aten.index, which upcasts to int64: eager fails with "
+                    "'type conversion from torch.int32 to torch.int64'. Inductor "
+                    "folds the conversion away, so the compiled path is fine. "
+                    "_create_compilable_page_attn therefore picks the spelling "
+                    "from its `compiled` flag; if this starts passing, that split "
+                    "can collapse to plain subscripting."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
+    """`k_pages[idx]` for the page gather: works compiled, fails eager.
+
+    This asymmetry is why _create_compilable_page_attn takes a `compiled` flag
+    and switches between subscripting and index_select. A compile-only probe
+    would miss it, which is exactly how the eager breakage slipped through once.
+    """
+    num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
+    int32_elems_per_stick = 32
+    page = 5
+
+    q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
+    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages = k_pages_cpu.to(spyre_device)
+
+    table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
+    table_cpu[0, 0] = page
+    table = table_cpu.to(spyre_device)
+
+    def page_attn(q, k_pages, table):
+        k_page = k_pages[table[0, 0:1]].squeeze(0).unsqueeze(1)
+        return torch.matmul(q, k_page.transpose(-2, -1))
+
+    if mode == "compile":
+        page_attn = torch.compile(page_attn, dynamic=False)
+
+    scores = page_attn(q, k_pages, table)
+    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
+    torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
 # ---------------------------------------------------------------------------
-# 4. Symbolic-offset in-place write
+# 5. Symbolic-offset in-place write
 # ---------------------------------------------------------------------------
 
 
@@ -365,7 +487,7 @@ def test_spyre_narrow_copy_row_write(spyre_device, mode):
 
 
 # ---------------------------------------------------------------------------
-# 5. In-place mul on non-contiguous tensor (LogitsProcessor)
+# 6. In-place mul on non-contiguous tensor (LogitsProcessor)
 # ---------------------------------------------------------------------------
 
 
@@ -387,7 +509,7 @@ def test_spyre_inplace_mul_noncontiguous(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 5. Attention-result reshape + on-device scatter into output (issue #400)
+# 7. Attention-result reshape + on-device scatter into output (issue #400)
 # ---------------------------------------------------------------------------
 #
 # These two probes guard the on-device path in

@@ -960,8 +960,9 @@ def patch_backend_list(request, monkeypatch):
 
     # The upstream test allocates one kv_cache tensor of
     # [num_blocks, num_kv_heads, block_size, 2 * head_size]; SpyreAttentionImpl
-    # wants (k_pages, v_pages), each a per-block list of
-    # [num_kv_heads, block_size, head_size].
+    # wants (k_pages, v_pages), each a dense
+    # [num_blocks, num_kv_heads, block_size, head_size] tensor. Only the K/V
+    # split on the last dim is needed — the leading dims already match.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -983,7 +984,7 @@ def patch_backend_list(request, monkeypatch):
             head_size = kv_cache.shape[-1] // 2
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
+            kv_cache = (k_blocks, v_blocks)
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,

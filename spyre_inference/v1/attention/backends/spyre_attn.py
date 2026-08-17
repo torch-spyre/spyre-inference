@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Paged KV-cache attention backend for Spyre using dense-page tensors and online softmax."""
+"""Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
 import functools
 from dataclasses import dataclass
@@ -62,6 +62,12 @@ def _record_function(name: str):
     return decorator
 
 
+# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
+# regardless of the vLLM compilation config. Used to evaluate the compiled path
+# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
+# Default: off (unset or "0").
+_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -80,20 +86,22 @@ QUERY_CHUNK_SIZE = 32
 # yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
 ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
+# Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
+# padded to this width so each row starts on a stick boundary; see
+# SpyreAttentionMetadata.page_index_tables.
+INT32_ELEMS_PER_STICK = 32
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    NamedTuple (not dataclass) because it is a tuple at runtime — Dynamo
-    specializes tuple unpacking at trace time. A regular dataclass would cross
-    an unverified line with Dynamo's tracing of attribute access on custom
-    objects. Index-by-int and unpacking (`k_pages, v_pages = cache`) keep
-    working unchanged.
+    Each field is one dense tensor of shape
+    [num_blocks, num_kv_heads, block_size, head_size] on the Spyre device,
+    matching `SpyreAttentionBackend.get_kv_cache_shape`.
 
-    Each field is a dense tensor of shape
-    `[num_blocks, num_kv_heads, block_size, head_size]` on the Spyre device.
-    Pages are accessed with a host Python index (`k_pages[page_idx]`), which
-    produces a view suitable for the compiled attention kernel.
+    NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
+    (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
+    attribute access on a custom object.
 
     Allocated by `TorchSpyreModelRunner.initialize_kv_cache_tensors` and
     consumed by `SpyreAttentionImpl.forward`. vLLM's `bind_kv_cache` types
@@ -123,15 +131,17 @@ def _overwrite(
 
 
 def _maybe_compile(fn):
-    """Compile the online-softmax attention kernel.
+    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
 
-    torch-spyre's eager path cannot handle matmul on offset views of a dense
-    KV tensor ("no mechanism to resolve stick incompatibility"), so the
-    kernel must run through Inductor. The reshape/cache kernel is *not*
-    covered, because forcing compile on it currently hits an unsupported
-    torch-spyre Inductor path (missing device_tensor_layout on graph input).
+    Used only for the online-softmax attention kernel — the reshape/cache
+    kernel is *not* covered, because forcing compile on it currently hits an
+    unsupported torch-spyre Inductor path (missing device_tensor_layout on
+    graph input). Flip _get_reshape_fn to call this helper too once that gap
+    is resolved.
     """
-    return torch.compile(fn, dynamic=False)
+    if _FORCE_COMPILE_ATTN:
+        return torch.compile(fn, dynamic=False)
+    return fn
 
 
 # ---------------------------------------------------------------------------
@@ -211,11 +221,16 @@ def _create_compilable_page_attn(
     padded_query_len: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
+    compiled: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
-    logits_soft_cap are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
+    logits_soft_cap, and compiled are closure constants.
+
+    ``compiled`` must match whether the caller wraps the result in
+    torch.compile, because it selects how a page is gathered — see the page-read
+    comment in the loop body. Pass the same value used by ``_maybe_compile``.
     """
 
     def specialized_paged_attn_kernel(
@@ -231,9 +246,13 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            k_pages: [num_blocks, num_kv_heads, block_size, head_size]
-            v_pages: [num_blocks, num_kv_heads, block_size, head_size]
-            page_indices: [num_blocks] (list of host ints)
+            k_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
+            v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
+            page_indices: list of num_blocks one-element int32 device tensors.
+                Each must be its own allocation at storage_offset 0 — slicing a
+                single index tensor per block (e.g. narrow(0, i, 1)) is rejected
+                on Spyre because an int32 stick is 32 elements, so a one-element
+                slice at offset i is not stick-aligned.
             mask_tiles: [num_blocks]
             alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
                 (only when has_alibi=True; None otherwise). The query-axis dim
@@ -248,14 +267,30 @@ def _create_compilable_page_attn(
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            k_page = k_pages[page_idx]
-            v_page = v_pages[page_idx]
-            k_page_4d = k_page.unsqueeze(1)
-            v_page_4d = v_page.unsqueeze(1)
+            # Indirect access: page_idx is a device tensor, so the page read is a
+            # real gather (the compiled bundle carries an index tensor) rather
+            # than a trace-time constant slice.
+            #
+            # The two spellings are not interchangeable. Subscripting lowers to
+            # aten.index, which upcasts the int32 index to int64 — fine once
+            # Inductor has folded the conversion away, but eager hits
+            # "type conversion from torch.int32 to torch.int64" on Spyre.
+            # index_select takes the int32 index as-is in both modes.
+            if compiled:
+                k_page = k_pages[page_idx]
+                v_page = v_pages[page_idx]
+            else:
+                k_page = k_pages.index_select(0, page_idx)
+                v_page = v_pages.index_select(0, page_idx)
+            k_page_4d = k_page.squeeze(0).unsqueeze(1)
+            v_page_4d = v_page.squeeze(0).unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
-            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            # NOTE: for true "varlen" layout, q would be an indirect access too
+            # (avoided here for simplicity...)
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1))
+            scores *= scale
             if logits_soft_cap > 0.0:
                 # Pull logits into (-cap, +cap) before the mask add so masked
                 # positions still map cleanly to -inf. Applied before the ALiBi
@@ -376,6 +411,24 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # per 256-token tier, not per distinct sequence length.
     aligned_max_seq_len: int = 0
 
+    # Per-sequence page-index table, one row per active block:
+    # [num_active_blocks, INT32_ELEMS_PER_STICK] int32, column 0 holding that
+    # block's absolute page index (row order matches attention_mask_tiles[s]).
+    #
+    # The kernel takes its gather index as the row slice `table[b, 0:1]`. Each
+    # index has to sit alone at column 0 of a stick-wide row: sharing a row
+    # across blocks does not compile, which is also why the canonical
+    # `block_table_tensor` cannot be indexed directly even when device-resident.
+    #
+    # `page_index_tables_cpu` is built once per step by the metadata builder;
+    # `page_index_tables` is its device mirror, filled by the first layer's
+    # forward() and reused by the rest (every layer in a step shares this
+    # instance), so the tables cost one transfer per sequence per step. The
+    # builder cannot fill it: it is constructed with the runner's device, which
+    # is CPU, while the KV pages live on Spyre.
+    page_index_tables_cpu: list[torch.Tensor] | None = None
+    page_index_tables: list[torch.Tensor] | None = None
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
@@ -406,7 +459,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # torch.compile.
         if self.block_size % 64 != 0:
             raise ValueError(
-                f"block_size must be a multiple of 64 for the Spyre attention "
+                f"block_size must be a multiple of 64 for the list-based attention "
                 f"backend. Got block_size={self.block_size}, head_size={self.head_size}. "
             )
 
@@ -749,8 +802,27 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         slot_block_indices = (sm_cpu // self.block_size).tolist()
         slot_block_offsets = (sm_cpu % self.block_size).tolist()
 
-        # NOTE: since the outer loop of the paged attention implementation
-        #  runs on the CPU (list-based), most meta-data also remains on CPU
+        # Page-index table per sequence, built once here so the per-layer forward
+        # neither reads block_table element-by-element on the host nor transfers a
+        # tensor per block. Row b holds the absolute page index of the b-th active
+        # block; the row width pads each row onto a stick boundary so the kernel can
+        # slice `table[b, 0:1]` as its gather index.
+        bt_cpu = block_table.detach().cpu()
+        page_index_tables_cpu: list[torch.Tensor] = []
+        for s in range(num_seqs):
+            kv_len_s = int(seq_lens[s].item())
+            num_blocks_s = (kv_len_s + block_size - 1) // block_size
+            if active_block_indices is not None:
+                blocks_s = active_block_indices[s]
+            else:
+                blocks_s = list(range(num_blocks_s))
+            table = torch.zeros(max(len(blocks_s), 1), INT32_ELEMS_PER_STICK, dtype=torch.int32)
+            for pos, b in enumerate(blocks_s):
+                table[pos, 0] = int(bt_cpu[s, b])
+            page_index_tables_cpu.append(table)
+
+        # NOTE: the per-sequence/per-block outer loop of the paged attention
+        #  implementation is driven from the host, so most metadata stays on CPU
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_seqs=common_attn_metadata.num_reqs,
@@ -768,6 +840,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_heads=self.num_heads,
             attention_mask_tiles=attention_mask_tiles,
             active_block_indices=active_block_indices,
+            page_index_tables_cpu=page_index_tables_cpu,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
         )
@@ -813,8 +886,8 @@ class SpyreAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return [  # ty: ignore[invalid-return-type]
-            (num_blocks, num_kv_heads, block_size, head_size),
-            (num_blocks, num_kv_heads, block_size, head_size),
+            (num_blocks, block_size, num_kv_heads, head_size),
+            (num_blocks, block_size, num_kv_heads, head_size),
         ]
 
     @classmethod
@@ -833,10 +906,9 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
-    KV cache is a tuple (k_pages, v_pages) where each is a dense tensor of
-    shape [num_blocks, num_kv_heads, block_size, head_size] on Spyre. Pages
-    are gathered with host Python indexing inside the compiled kernel; no
-    device-level gather masks are needed.
+    KV cache is a tuple (k_pages, v_pages) where each is a list of tensors
+    of shape [num_kv_heads, block_size, head_size] on Spyre. No monolithic
+    cache tensor, no gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -890,7 +962,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with DENSE-TENSOR online softmax")
+        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
@@ -910,6 +982,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     padded_query_len,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
+                    # Must track _maybe_compile: it decides whether this kernel is
+                    # compiled, and that decides which page-gather spelling works.
+                    compiled=_FORCE_COMPILE_ATTN,
                 )
             )
         return self._attn_fns[key]
@@ -940,6 +1015,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # (e.g. in unit tests) while pages live on the real Spyre device.
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # Mirror the page-index tables onto the device. Only the first layer of a
+        # step pays this; the rest see the field already populated.
+        if attn_metadata.page_index_tables is None:
+            assert attn_metadata.page_index_tables_cpu is not None
+            attn_metadata.page_index_tables = [
+                convert(t, device=_target_device) for t in attn_metadata.page_index_tables_cpu
+            ]
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
@@ -1028,9 +1111,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        k_pages/v_pages are dense tensors of shape
-        [num_blocks, num_kv_heads, block_size, head_size]; each page is gathered
-        with a host Python index and passed to matmul directly without slicing.
+        Each k_page/v_page is [num_kv_heads, block_size, head_size] — a complete
+        tensor on Spyre, passed to bmm directly without slicing.
 
         Writes results directly into the caller's output buffer in-place.
 
@@ -1053,13 +1135,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
+        page_index_tables = attn_metadata.page_index_tables
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
+        assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1111,7 +1194,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 q_dev = convert(q, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
-            all_page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
 
             # Restrict to active (non-fully-masked) blocks when sliding window
             # is set. When active_block_indices_all is None (no sliding), all
@@ -1127,7 +1209,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            page_indices = [all_page_indices[b] for b in active_bs]
+            # Row slices of the per-sequence page-index table, which was built on
+            # the host once per step and transferred once per step. A row slice is
+            # what the kernel's gather accepts: slicing a plain 1-D index tensor
+            # per block is rejected, even at a stick-aligned offset.
+            page_index_table = page_index_tables[seq_idx]
+            page_indices = [page_index_table[i, 0:1] for i in range(len(active_bs))]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = [
                 convert(mask_tiles_all[seq_idx][i], device=_target_device)

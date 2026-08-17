@@ -356,7 +356,7 @@ def test_spyre_encoder_attn(
 
     cache_device = torch.device(configure_device)
     output = torch.empty_like(query).to(cache_device)
-    kv_cache = SpyrePagedKVCache(k_pages=[], v_pages=[])
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     attn_impl.forward(
         layer=None,
         query=query,

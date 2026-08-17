@@ -347,6 +347,11 @@ jobs:
       - name: Gather runner info
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the runs-on expression: matrix.runs_on plus the per-PR
+          # runner_label override, or the standing matrix.image_label).
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
 
       - name: Dump UV cache info
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -472,6 +477,11 @@ jobs:
 
       - name: Gather runner info
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the perf runs-on expression: the fixed pool labels plus
+          # the per-PR runner_label override, or the standing image label).
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
       - name: Build spyre-inference
         env:

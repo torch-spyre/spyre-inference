@@ -336,8 +336,8 @@ def test_build_attention_mask_matches_loop(
 @pytest.mark.parametrize(
     "head_size",
     [
-        pytest.param(128, id="head_size(128)"),
-        # pytest.param(64, id="head_size(64)"),
+        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32.
+        pytest.param(64, id="head_size(64)"),
     ],
 )
 @pytest.mark.parametrize(

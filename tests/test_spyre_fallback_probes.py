@@ -145,7 +145,7 @@ def test_spyre_matmul_output_dim_1(spyre_device, mode):
         "SpyreQKVParallelLinear to D2H before return, and later to un-fuse QKV "
         "after load; the attention backend now brings k/v to CPU instead. "
         "Encoder-only attention sidesteps scatter with host indices + "
-        "index_select (spyre_encoder_attn.py).")
+        "index_select (spyre_encoder_attn.py)."
     ),
 )
 def test_spyre_strided_scatter_source(spyre_device):

@@ -36,6 +36,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
 )
+from spyre_inference.v1.pool import select_rows
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
 # L-aligned keeps P·V's K stick-aligned; D-aligned keeps QKᵀ's K stick-aligned
@@ -78,18 +79,6 @@ def host_unpack_indices(
     return indices
 
 
-def index_select_rows(tensor: torch.Tensor, row_indices_cpu: torch.Tensor) -> torch.Tensor:
-    """Gather rows along dim 0 via ``index_select`` (no Spyre ``aten::index.Tensor``)."""
-    flat_idx = row_indices_cpu.reshape(-1)
-    if tensor.device.type != "spyre":
-        return torch.index_select(tensor, 0, flat_idx.to(device=tensor.device, dtype=torch.long))
-
-    # int32 indices: Spyre has no int64; sync before read (non_blocking H2D).
-    indices = convert(flat_idx.to(torch.int32), tensor.device)
-    torch.spyre.synchronize(tensor.device)
-    return torch.index_select(tensor, 0, indices)
-
-
 def _pad_head_dim_to_stick(flat: torch.Tensor, head_size_padded: int) -> torch.Tensor:
     """Pad last dim to a stick. MiniLM ``[T,H,32]`` cannot ``F.pad`` on Spyre."""
     head_size = flat.shape[-1]
@@ -118,7 +107,7 @@ def gather_pack(
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
     flat_ext = F.pad(flat, (0, 0, 0, 0, 0, 1))
-    gathered = index_select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
+    gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
     packed = gathered.view(batch, aligned_len, num_heads, head_size_padded)
     return packed.permute(0, 2, 1, 3).contiguous()
 
@@ -132,7 +121,7 @@ def gather_unpack(
     batch, num_heads, aligned_len, head_size_padded = attn_out.shape
     tokens = attn_out.permute(0, 2, 1, 3).contiguous()
     flat_padded = tokens.reshape(batch * aligned_len, num_heads, head_size_padded)
-    gathered = index_select_rows(flat_padded, unpack_indices)
+    gathered = select_rows(flat_padded, unpack_indices)
     if gathered.shape[-1] == head_size:
         return gathered
     # Crop is a slice, not pad. D=32 is half a stick; do it on CPU.

@@ -834,10 +834,10 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        return [  # ty: ignore[invalid-return-type]
-            (num_blocks, block_size, num_kv_heads, head_size),
-            (num_blocks, block_size, num_kv_heads, head_size),
-        ]
+        # K and V are separate tensors in SpyrePagedKVCache, each with the same
+        # shape. The base vLLM API expects a single tuple here; callers like
+        # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:

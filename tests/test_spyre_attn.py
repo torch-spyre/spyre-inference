@@ -884,6 +884,101 @@ def test_block_size_validation():
         assert builder.block_size == block_size
 
 
+def test_kv_cache_shape_matches_runner_allocation():
+    """SpyreAttentionBackend.get_kv_cache_shape must match the runner's allocation.
+
+    The dense paged KV cache has one physical layout used by three places:
+    (1) the backend's advertised shape, (2) TorchSpyreModelRunner's allocation,
+    and (3) the attention kernels. This regression test ensures they stay in
+    sync. If get_kv_cache_shape drifts, vLLM code that allocates from the
+    contract (KV transfer, future tests, Mamba zeroing via
+    get_kv_cache_block_dim) will allocate a transposed cache.
+    """
+    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size = 128
+    num_kv_heads = 8
+    head_size = 128
+    num_blocks = 16
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    cache_config = CacheConfig(block_size=block_size)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    # The public backend contract.
+    shape = SpyreAttentionBackend.get_kv_cache_shape(
+        num_blocks, block_size, num_kv_heads, head_size
+    )
+
+    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples.
+    # The base-class get_kv_cache_block_dim does shape.index(_S), which fails
+    # if shape is a list. Spyre stores K and V as separate NamedTuple fields.
+    assert isinstance(shape, tuple), f"get_kv_cache_shape must return a tuple, got {type(shape)}"
+    assert shape == (
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_size,
+    ), f"Unexpected KV cache shape: {shape}"
+
+    # The runner must allocate exactly the shape it advertises.
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float16,
+    )
+    kv_cache_tensor = KVCacheTensor(
+        size=spec.page_size_bytes * num_blocks,
+        shared_by=["layers.0.self_attn"],
+    )
+    kv_cache_group = KVCacheGroupSpec(
+        layer_names=["layers.0.self_attn"],
+        kv_cache_spec=spec,
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[kv_cache_tensor],
+        kv_cache_groups=[kv_cache_group],
+    )
+
+    # Avoid bind_kv_cache KeyError by giving the runner a fake forward context.
+    fake_layer = Mock()
+    fake_layer.kv_cache = None
+    runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+    k_pages = caches["layers.0.self_attn"].k_pages
+    v_pages = caches["layers.0.self_attn"].v_pages
+
+    assert k_pages.shape == shape
+    assert v_pages.shape == shape
+
+    # Sanity: the physical layout is token-major (block_size before num_kv_heads),
+    # and each page is contiguous in the last two dims.
+    assert k_pages.shape == (num_blocks, block_size, num_kv_heads, head_size)
+
+
 def test_sliding_window_none_equivalence(default_vllm_config):
     """Verify sliding_window=None produces identical results to full attention.
 

@@ -395,6 +395,13 @@ jobs:
         if: ${{ steps.gate.outputs.run == 'true' }}
         # Marker expression and coverage wiring both live in the Makefile
         # test_target. COVERAGE=1 drops .coverage.* data files for the fan-in.
+        #
+        # Bounded so a wedged card acquisition cannot hang silently: a blocking
+        # open() on a contended /dev/vfio device emits no output, so the runner
+        # stops heartbeating and the job is reaped server-side with an
+        # unfinalized log (no conclusion, no diagnosis). Failing here instead
+        # keeps the step's own log and lets the post steps publish JUnit.
+        timeout-minutes: 90
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
           make ${{ matrix.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ matrix.test_target }}.xml

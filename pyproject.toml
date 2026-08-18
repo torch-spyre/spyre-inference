@@ -236,6 +236,11 @@ skip_gitignore = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
+# A card acquisition that blocks in the kernel yields no output, so the test
+# must be cut off from outside. "thread" dumps every thread's stack on expiry,
+# naming the blocking frame; "signal" cannot interrupt an uninterruptible open().
+timeout = 1800
+timeout_method = "thread"
 filterwarnings = [
     "ignore::_pytest.warning_types.PytestUnknownMarkWarning"
 ]

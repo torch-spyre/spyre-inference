@@ -33,10 +33,10 @@ Run the helper script to set `user.name` and `user.email` from your GitHub profi
 
 ```bash
 # Local config (recommended for repo-specific identity)
-./scripts/setup-git-config.sh
+./.claude/skills/github-commit/setup-git-config.sh
 
 # Or global config
-./scripts/setup-git-config.sh --global
+./.claude/skills/github-commit/setup-git-config.sh --global
 ```
 
 This fetches your `name` and `email` via `gh api user` and falls back to your GitHub

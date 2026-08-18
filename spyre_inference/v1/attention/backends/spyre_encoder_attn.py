@@ -35,7 +35,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    _overwrite,
 )
 
 # Pad seq length *and* head dim to the Spyre stick (64 fp16 elements).
@@ -284,19 +283,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 result = convert(result, "cpu")
             src = convert(result.reshape(n, -1).contiguous(), target_device.type, output.dtype)
             output.reshape(n, -1).copy_(src)
-        elif result.shape == output.shape:
+        else:
             if result.device.type != output.device.type:
                 result = convert(result, output.device)
             output.copy_(result)
-        else:
-            result_cpu = convert(result, "cpu") if result.device.type == "spyre" else result
-            for i in range(n):
-                tok = convert(
-                    result_cpu[i : i + 1].contiguous(),
-                    target_device.type,
-                    output.dtype,
-                )
-                _overwrite(tok, output, [0], [i])
 
         return output
 

@@ -171,6 +171,12 @@ jobs:
     with:
       # Dispatch flow: always run, regardless of changed files.
       skip_if_no_changes: false
+      # Keep the legacy baseline install for the dispatch flow: it deliberately
+      # tests a controlled RPM baseline (optionally with torch_spyre_ref /
+      # override RPMs) rather than the image's prebaked stack. The prebaked
+      # default (skip the baseline install) is scoped to the PR/push flow in
+      # test_each_commit.yaml, which is where the lock-vs-image split bit (#543).
+      use_prebaked_image: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}

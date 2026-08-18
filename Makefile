@@ -51,6 +51,26 @@ else
 JUNIT_ARGS :=
 endif
 
+# --- Coverage ---------------------------------------------------------------
+# Opt-in via COVERAGE=1: run-one exports COVERAGE_PROCESS_START so every
+# interpreter it spawns (pytest + vLLM workers) starts coverage. coverage's
+# shipped a1_coverage.pth startup hook fires on that env var, so no PYTHONPATH
+# bootstrap is needed. As a command-line var, COVERAGE propagates to the
+# fan-out sub-makes automatically.
+COVERAGE ?=
+COVERAGE_RC := $(CURDIR)/.coveragerc
+# `coverage` tool for the coverage target. Standalone hosts without the venv
+# (e.g. GHA's fan-in) override COVERAGE_TOOL=coverage.
+COVERAGE_TOOL ?= uv run --no-sync coverage
+# Dir of .coverage.* files to combine. Empty = current dir.
+COVERAGE_DATA ?=
+
+ifneq ($(COVERAGE),)
+COVERAGE_ENV := COVERAGE_PROCESS_START="$(COVERAGE_RC)"
+else
+COVERAGE_ENV :=
+endif
+
 # Map TEST_TYPE to a pytest -m marker expression. regression -> no filter
 # (all tests). MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
 # need a marker expression finer than the 3 coarse tiers (e.g. CI splitting
@@ -85,7 +105,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests print-test-type \
+.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-attention test-distributed \
         test-upstream test-upstream-distributed test-upstream-model
 
@@ -94,7 +114,9 @@ help: ## Show this help message
 	@echo ""
 	@echo "Variables: TEST_TYPE=unit|integration|regression|trunk|perf (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
-	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)')"
+	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)'),"
+	@echo "  COVERAGE=1 (measure coverage during test runs), then \`make coverage\` to aggregate"
+	@echo "  (COVERAGE_DATA=dir of data files, COVERAGE_TOOL=coverage for a standalone runner)"
 
 print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
 	@echo "$(TEST_TYPE)"
@@ -133,7 +155,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention)' JUNIT_XML=$(JUNIT_XML)
@@ -176,6 +198,15 @@ tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default r
 	fi
 
 test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
+
+# Combine COVERAGE=1 data into one dataset ([paths] maps across runners) and
+# emit a log table, coverage.xml, htmlcov/, and coverage.md.
+coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.xml + htmlcov/ + coverage.md.
+	$(COVERAGE_TOOL) combine --keep --rcfile=$(COVERAGE_RC) $(COVERAGE_DATA)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --show-missing
+	$(COVERAGE_TOOL) xml --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) html --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --format=markdown > coverage.md
 
 # On some arches (notably s390x) `uv run` refuses to reuse the prebaked image
 # venv: it re-resolves the project, cannot find an s390x torch/vllm wheel

@@ -16,7 +16,7 @@ bookends: "Model Bookends" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  LM: "SpyreParallelLMHead\nF.linear on Spyre → logits→CPU\n(TP≥1 vocab shard; pad to 64×32)" {
+  LM: "SpyreParallelLMHead\nx @ Wᵀ on Spyre → logits→CPU\n(TP≥1 vocab shard; pad to 64×32)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -33,7 +33,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  QKV: "QKVParallelLinear (un-fused)\nq,k,v = 3× F.linear on Spyre" {
+  QKV: "SpyreQKVParallelLinear (fused)\n1× x @ Wᵀ on Spyre;\nq,k,v split on-device" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -48,7 +48,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  O_PROJ: "RowParallelLinear — o_proj\n(upstream; F.linear on Spyre,\nall_reduce when TP>1)" {
+  O_PROJ: "SpyreRowParallelLinear — o_proj\n(x @ Wᵀ on Spyre;\nall_reduce when TP>1)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -58,7 +58,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  GATE: "MergedColumnParallelLinear (un-fused)\ngate,up = 2× F.linear on Spyre" {
+  GATE: "SpyreMergedColumnParallelLinear (fused)\n1× x @ Wᵀ on Spyre;\ngate,up split on-device" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -68,7 +68,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  DOWN: "RowParallelLinear — down_proj\n(upstream; all_reduce when TP>1)" {
+  DOWN: "SpyreRowParallelLinear — down_proj\n(x @ Wᵀ on Spyre;\nall_reduce when TP>1)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"

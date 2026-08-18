@@ -57,28 +57,39 @@ read of the gathered rotation slice out of the compiled graph.
 | `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `maybe_compile`d kernel directly on Spyre; no float32 promotion (torch-spyre limitation) |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre (`index_select` on CPU) | 2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache `index_select` (`gather_rotation`) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque `spyre_rope_rot` op. Only neox-style full rotary is supported (other configs raise `NotImplementedError` at construction) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | CPU → Spyre | The weight is pinned to CPU (`_apply` is a no-op — `F.embedding` has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-`convert`ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is `convert`ed back to Spyre; `all_reduce` when TP>1 |
-| `QKVParallelLinear` | `SpyreQKVParallelLinear` | Spyre | Subclass only asserts `gather_output=False`; the fused weight is split at load by the un-fusing pass, and `forward` runs `q`/`k`/`v` as three `F.linear` calls on Spyre |
+| `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
 
-`RowParallelLinear` and `MergedColumnParallelLinear` are **not** subclassed:
+### Transposed linear weights
 
-- `RowParallelLinear` (`o_proj`, `down_proj`) runs the upstream class unchanged — `F.linear`
-  dispatches to Spyre, and `all_reduce` (via `SpyreCommunicator`) fires when `reduce_results=True`
-  under TP>1.
-- `MergedColumnParallelLinear` (`gate_up_proj`) runs the upstream class unchanged: the
-  fused `[..., 2*d]` output feeds straight into `SpyreSiluAndMul`, which slices gate/up
-  on-device.
+`F.linear(x, W)` computes `x @ Wᵀ` however `W` is laid out, and on Spyre that transposed
+matmul is ~3.5× slower than a plain `x @ A`
+([torch-spyre#3512](https://github.com/torch-spyre/torch-spyre/issues/3512)).
+`SpyreUnquantizedLinearMethod` (`custom_ops/linear.py`) closes that gap in two overrides:
 
-### Weight un-fusing
+- `process_weights_after_loading` replaces the loaded `[out, in]` weight with a contiguous
+  `[in, out]` `Wᵀ`, so the transpose is paid once at load time rather than every forward.
+- `apply` runs `spyre_linear_t` — `torch.matmul(x, Wᵀ)` plus optional bias — instead of
+  `F.linear`.
 
-`analyze_and_unfuse` (`custom_ops/unfuse.py`) runs once after the checkpoint is loaded,
-while weights are still on CPU. The fused `QKVParallelLinear` weight is a problem on Spyre:
-splitting its output on-device yields strided views that corrupt when transferred. So the
-pass splits the fused weight into contiguous per-part Parameters and rebinds `forward` to
-run one `F.linear` per part. The result is a `SplitQKV` container that the unmodified
-downstream idiom — `q, k, v = qkv.split(...)` — keeps consuming unchanged.
+The five linear subclasses install it in `__init__`, but only when `quant_method` is an
+`UnquantizedLinearMethod`; quantized layers keep their own method and the slower
+`F.linear` path. This is the pure-PyTorch equivalent of torch-spyre's `[1,0]` weight
+layout, which only fires for `nn.Linear` and so misses every vLLM parallel-linear.
+`SpyreParallelLMHead` stores its own `padded_weight_t` for the same reason and reuses
+`spyre_linear_t`, so the fast path is defined once.
+
+Fused projections stay fused. `SpyreQKVParallelLinear` returns the whole `[..., q+k+v]`
+tensor and the unmodified upstream idiom `q, k, v = qkv.split(...)` slices it, exactly as
+`SpyreMergedColumnParallelLinear`'s `[..., 2*d]` output feeds `SpyreSiluAndMul`, which
+slices gate/up on-device. Earlier revisions instead split the QKV weight on CPU at load
+time into three per-part GEMMs — a `SplitQKV` container built by an `analyze_and_unfuse`
+pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
+so that pass is gone. The remaining slicing constraint is narrower than it was and lives
+in the attention backend, where offset > 0 views still corrupt on transfer (see
+[Attention Backend](#attention-backend)).
 
 ## Attention Backend
 
@@ -141,8 +152,9 @@ float compute tensors land on Spyre via `self._spyre_device`. Because there is n
 `vllm._C` under `VLLM_TARGET_DEVICE=empty`, the runner also swaps in a pure-PyTorch
 `_compute_slot_mapping` implementation for the paged-cache slot mapping.
 
-At load time, `load_model` calls `analyze_and_unfuse(self.model)` (weight un-fusing) and
-then moves every module except `Attention` scale buffers onto Spyre.
+At load time, `load_model` moves every module except `Attention` scale buffers onto Spyre.
+The weight transposes happen before that, in each layer's
+`process_weights_after_loading`, while the weights are still on CPU.
 
 `_SpyreModelWrapper` sits between the model runner and the model and converts at the
 call boundary:

@@ -1,12 +1,13 @@
 # PR reminder bot
 
-Posts a daily Slack reminder listing the open pull requests that reviewers have gone
-quiet on, so long-lived contributions don't rot into rebase-only work.
+Posts a Slack reminder on weekdays listing the open pull requests that reviewers have
+gone quiet on, so long-lived contributions don't rot into rebase-only work.
 
-Every day the bot lists open PRs, drops the ones that are drafts or carry an exempt
-label, keeps those idle between `STALE_HOURS` and `MAX_IDLE_DAYS`, sorts them
-oldest-activity-first, and posts the top `MAX_PRS`. When nothing is stale it posts
-nothing — a daily "all clear" would only train people to mute the channel.
+On each run the bot lists open PRs, drops the ones that are drafts, carry an exempt
+label, or are flagged in their title, keeps those idle between `STALE_HOURS` and
+`MAX_IDLE_DAYS`, sorts them oldest-activity-first, and posts the top `MAX_PRS`. When
+nothing is stale it posts nothing — an "all clear" would only train people to mute the
+channel.
 
 The upper bound matters: a PR untouched for over a month is abandoned rather than
 review-blocked, and [stale.yml](../../.github/workflows/stale.yml) already chases those
@@ -17,12 +18,16 @@ the reminder would stop being actionable.
 reviews and label changes.
 
 Driven by [pr_reminder_slack.yaml](../../.github/workflows/pr_reminder_slack.yaml)
-twice a day, plus manual dispatch:
+twice a day on weekdays, plus manual dispatch:
 
 | Cron (UTC) | Zurich | US East | Audience |
 |---|---|---|---|
-| `3 8 * * *` | 10:03 CEST / 09:03 CET | 04:03 EDT / 03:03 EST | European morning |
-| `3 15 * * *` | 17:03 CEST / 16:03 CET | 11:03 EDT / 10:03 EST | US morning |
+| `3 8 * * 1-5` | 10:03 CEST / 09:03 CET | 04:03 EDT / 03:03 EST | European morning |
+| `3 15 * * 1-5` | 17:03 CEST / 16:03 CET | 11:03 EDT / 10:03 EST | US morning |
+
+Day-of-week is evaluated in UTC. Both runs sit mid-day UTC, so `1-5` lands on Mon–Fri
+local time on both sides of the Atlantic with no date-boundary surprises. Monday's post
+covers the weekend, so anything untouched since Friday shows ~3 days idle.
 
 Both fire off the hour on purpose — GitHub delays scheduled runs under load and the top
 of the hour is its documented peak. Cron has no DST handling, so each slides an hour

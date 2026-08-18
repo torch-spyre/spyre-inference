@@ -24,7 +24,7 @@ import pytest
     [
         (
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nA list of Identified Benefits under Debt Management – Count",
+            "\n\nIBMs main businesses are the companies that provide the services of the",
         ),
         pytest.param(
             ("google/gemma-3-1b-it", "\n\nIBM's main"),
@@ -34,7 +34,7 @@ import pytest
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
 
     prompt = "What are IBMs main businesses?"
 
@@ -48,7 +48,11 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
         max_num_seqs=2,
     )
 
-    output = engine.generate(prompt, use_tqdm=False)
+    output = engine.generate(
+        prompt,
+        SamplingParams(temperature=0.0, max_tokens=16),
+        use_tqdm=False,
+    )
 
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
     assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"

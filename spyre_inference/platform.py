@@ -208,8 +208,17 @@ class TorchSpyrePlatform(CpuPlatform):
         # preserve that so eager stays eager.
         # NOTE: If vllm_config.compilation_config.mode is None and
         # vllm_config.model_config.enforce_eager == False,
-        # no particular compilation mode has been selected. Continue in eager for the moment
-        if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode is None:
+        # no particular compilation mode has been selected. Continue in eager for the moment.
+        # vLLM re-runs this hook after mode has already been resolved (e.g. in the
+        # EngineCore subprocess), so we must treat CompilationMode.NONE the same as
+        # an unset (Python None) mode — otherwise a prior eager decision (NONE == 0,
+        # which is not `None`) falls through to the else branch and gets flipped to
+        # STOCK_TORCH_COMPILE, re-enabling torch.compile that our CPU-fallback ops
+        # can't survive.
+        if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode in (
+            None,
+            CompilationMode.NONE,
+        ):
             vllm_config.compilation_config.mode = CompilationMode.NONE
         else:
             # Warn the user if a different compile mode has been selected explicitly

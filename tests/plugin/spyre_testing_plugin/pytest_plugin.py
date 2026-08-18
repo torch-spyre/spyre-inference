@@ -977,6 +977,7 @@ def patch_backend_list(request, monkeypatch):
         kv_cache,
         attn_type=None,
         sliding_window=None,
+        kv_cache_dtype="auto",
     ):
         if backend == AttentionBackendEnum.CUSTOM:
             # K and V are concatenated on the last dim.
@@ -997,6 +998,7 @@ def patch_backend_list(request, monkeypatch):
             kv_cache,
             attn_type,
             sliding_window,
+            kv_cache_dtype,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)

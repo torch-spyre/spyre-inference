@@ -347,6 +347,11 @@ jobs:
       - name: Gather runner info
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the runs-on expression: matrix.runs_on plus the per-PR
+          # runner_label override, or the standing matrix.image_label).
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
 
       - name: Dump UV cache info
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -388,14 +393,25 @@ jobs:
 
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
-        # Env setup (aiu-setup sourcing, topo.json cleanup) and the marker
-        # expression for this config both live in the Makefile's
-        # test_target now -- the single entrypoint/owner for one
-        # marker-combo invocation, so the marker set is not duplicated here.
+        # Marker expression and coverage wiring both live in the Makefile
+        # test_target. COVERAGE=1 drops .coverage.* data files for the fan-in.
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
+          make ${{ matrix.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ matrix.test_target }}.xml
           echo "tests done"
+
+      # Raw per-process data files; their host/pid suffixes are unique across
+      # jobs, so the fan-in's `make coverage` combines them without a per-job
+      # step. if-no-files-found=ignore covers configs that measured nothing.
+      - name: Upload coverage data
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ strategy.job-index }}
+          path: .coverage.*
+          include-hidden-files: true  # .coverage.* are dotfiles
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload JUnit results
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
@@ -415,6 +431,78 @@ jobs:
           # parses the generic JUnit-XML schema pytest's --junit-xml emits.
           reporter: java-junit
           fail-on-error: false
+
+  # ---------------------------------------------------------------------------
+  # Coverage fan-in: combine every job's data into one report. Stock runner
+  # (needs only the coverage tool + a checkout for .coveragerc and the sources).
+  # always() so partial coverage still reports when suites fail; no-op when no
+  # data was produced (e.g. all configs skipped).
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Aggregate coverage
+    needs: test
+    if: always()
+    # Informational -- must never fail the reusable workflow (and thus the
+    # callers' required-check gate).
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Match the test venv's coverage (uv.lock pin) for data-format compat.
+      - name: Install coverage
+        run: python -m pip install 'coverage==7.15.2'
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: covdata
+          merge-multiple: true
+
+      - name: Combine and report
+        run: |
+          shopt -s nullglob
+          files=(covdata/.coverage.*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No coverage data to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Combine/report logic lives in the Makefile; COVERAGE_TOOL=coverage
+          # uses the pip-installed tool (no venv on this runner).
+          make coverage COVERAGE_DATA=covdata COVERAGE_TOOL=coverage
+          pct=$(coverage report --rcfile=.coveragerc --format=total)
+          if   [ "$pct" -ge 90 ]; then color=brightgreen
+          elif [ "$pct" -ge 75 ]; then color=green
+          elif [ "$pct" -ge 60 ]; then color=yellowgreen
+          elif [ "$pct" -ge 40 ]; then color=yellow
+          else color=red
+          fi
+          {
+            echo "### Aggregated spyre_inference coverage"
+            echo ''
+            echo "![coverage](https://img.shields.io/badge/coverage-${pct}%25-${color})"
+            echo ''
+            cat coverage.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: ${{ hashFiles('coverage.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
@@ -472,6 +560,11 @@ jobs:
 
       - name: Gather runner info
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the perf runs-on expression: the fixed pool labels plus
+          # the per-PR runner_label override, or the standing image label).
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
       - name: Build spyre-inference
         env:

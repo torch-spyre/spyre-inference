@@ -5,15 +5,16 @@ name: PR Reminder (Slack)
 # required secret and the optional repo variables.
 on:
   schedule:
-    # Twice a day so each side of the Atlantic gets it in their morning. Both
-    # are deliberately off the hour: GitHub delays scheduled runs under load and
-    # the top of the hour is its documented peak. Cron has no DST handling, so
-    # both drift an hour later in local terms during summer time.
+    # Twice a day, weekdays only (day-of-week 1-5 = Mon-Fri, evaluated in UTC),
+    # so each side of the Atlantic gets it in their morning. Both are
+    # deliberately off the hour: GitHub delays scheduled runs under load and the
+    # top of the hour is its documented peak. Cron has no DST handling, so both
+    # drift an hour later in local terms during summer time.
     #
     # 08:03 UTC = 10:03 Zurich CEST (09:03 CET in winter)
-    - cron: '3 8 * * *'
+    - cron: '3 8 * * 1-5'
     # 15:03 UTC = 10:03 US EST (11:03 EDT in summer)
-    - cron: '3 15 * * *'
+    - cron: '3 15 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:

@@ -106,11 +106,13 @@ git push fork <branch-name>
 
 Stop here. The human opens the PR.
 
-## Avoid force-pushing after opening a PR
+## Never force-push
 
-Once a PR is open and under review, avoid `git push --force` or
-`git push --force-with-lease`. Force-pushing rewrites history and can invalidate review
-comments. Instead, add new commits on top and push normally:
+Never run `git push --force` or `git push --force-with-lease`. Force-pushing rewrites
+history and can permanently lose work or invalidate review comments. If a branch needs
+cleanup, create a new branch instead and push that.
+
+Add new commits on top and push normally:
 
 ```bash
 bash format.sh
@@ -118,6 +120,3 @@ git add <files>
 git commit -m "type: description of follow-up change" -s
 git push fork <branch-name>
 ```
-
-Only force-push to fix critical issues (e.g., DCO sign-off mismatch) when no reviewers
-have left inline comments on the affected commits, and communicate this in the PR.

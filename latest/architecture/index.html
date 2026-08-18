@@ -2116,10 +2116,13 @@ in the attention backend, where offset &gt; 0 views still corrupt on transfer (s
 <a href="#attention-backend">Attention Backend</a>).</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each
-page is <code>[num_kv_heads, block_size, head_size]</code> — rather than a monolithic tensor. It
-runs a FlashAttention-style online softmax that iterates over pages without any
-compact-gather step:</p>
+(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+<code>[num_blocks, block_size, num_kv_heads, head_size]</code> — the shape
+<code>SpyreAttentionBackend.get_kv_cache_shape</code> advertises. It runs a FlashAttention-style
+online softmax that iterates over pages without any compact-gather step, reading each
+page by indexing the dense tensor with a one-element int32 device tensor (an indirect
+access, so the compiled bundle carries a real index rather than a constant slice) and
+permuting the token-major page to head-major on device before the matmuls:</p>
 <table>
 <thead>
 <tr>
@@ -2137,7 +2140,7 @@ compact-gather step:</p>
 <tr>
 <td>2. Reshape &amp; cache</td>
 <td>Spyre</td>
-<td>Per-token overwrite of new K/V into the list-of-pages cache</td>
+<td>Overwrite new K/V into the dense paged cache, one write per same-page slot run (token-major pages take the K/V slice as-is, no host transpose)</td>
 </tr>
 <tr>
 <td>3. Per-sequence varlen loop</td>

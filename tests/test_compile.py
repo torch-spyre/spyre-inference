@@ -53,6 +53,7 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
         enforce_eager=False,
         max_model_len=128,
         max_num_seqs=2,
+        max_num_batched_tokens=8,
     )
 
     output = engine.generate(

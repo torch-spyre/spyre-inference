@@ -86,6 +86,20 @@ on:
         required: false
         type: string
         default: ''
+      use_prebaked_image:
+        description: |
+          When true, trust the target runner image's prebaked Spyre stack and
+          skip the baseline spyre-rpm-install step. Set this true when the
+          dispatch targets a prebaked image (for example a per-PR image via
+          runner_label), so senlib/deeptools/flex all come from the image and
+          the lock-vs-image split cannot recur (see issue #543). Leave false
+          (default) for a plain dispatch that deliberately tests a controlled
+          RPM baseline (with torch_spyre_ref / override rpm_names) on the
+          standing image. The opt-in override step (rpm_names != '') is
+          independent of this flag.
+        required: false
+        type: boolean
+        default: false
       test_type:
         description: >-
           Suite subset to run: unit | integration (default, the smoke suite)
@@ -171,12 +185,12 @@ jobs:
     with:
       # Dispatch flow: always run, regardless of changed files.
       skip_if_no_changes: false
-      # Keep the legacy baseline install for the dispatch flow: it deliberately
-      # tests a controlled RPM baseline (optionally with torch_spyre_ref /
-      # override RPMs) rather than the image's prebaked stack. The prebaked
-      # default (skip the baseline install) is scoped to the PR/push flow in
-      # test_each_commit.yaml, which is where the lock-vs-image split bit (#543).
-      use_prebaked_image: false
+      # Forward the caller's choice. A plain dispatch defaults to false and
+      # keeps the legacy controlled-baseline install (with torch_spyre_ref /
+      # override RPMs). A caller that targets a prebaked image (e.g. Jenkins
+      # dispatching with a per-PR runner_label) passes true to skip the
+      # baseline install and trust the image, same as the PR/push flow (#543).
+      use_prebaked_image: ${{ inputs.use_prebaked_image }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}

@@ -537,11 +537,12 @@ def test_spyre_attn_decode_head_size(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Single-sequence decode across head sizes (regression for #284).
+    """Single-sequence decode across head sizes (regression for #284/#399).
 
-    head_size=64 is not representable by the on-device query overwrite and must
-    fall back to the CPU path; head_size=128 stays on device. Both must produce
-    correct output.
+    Query assembly is performed on CPU to avoid unsupported torch-spyre stick
+    expressions for head_size values that are not multiples of 128 bytes
+    (e.g., head_size=64 in Llama-3.2-1B). The assembled query is then
+    transferred to the device for attention computation.
     """
     _run_spyre_attn_test(
         seq_lens=[(1, 256)],

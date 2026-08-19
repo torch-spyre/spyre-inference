@@ -37,11 +37,11 @@ def reference_lm_head(
 @pytest.mark.parametrize("vocab_size", [64, 128, 49216, 51200])
 @pytest.mark.parametrize("embedding_dim", [64, 128])
 def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_size, embedding_dim):
-    """SpyreParallelLMHead.forward_oot output matches a plain F.linear reference.
+    """SpyreUnquantizedLMHeadMethod.apply output matches a plain F.linear reference.
 
     Exercises the full padded-weight path: checkpoint values are written into
-    layer.weight, padded_weight is materialized in process_weights_after_loading,
-    forward_oot runs the compiled Spyre matmul and unpads the logits.
+    layer.weight, padded_weight_t is materialized in process_weights_after_loading,
+    and quant_method.apply runs the Spyre matmul and eagerly unpads the logits.
     """
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
@@ -62,9 +62,9 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
     expected = reference_lm_head(x, layer.weight.data)
 
     # In production weights live on Spyre after `model.to(spyre_device)`;
-    # mirror that here so forward_oot's H2D + Spyre F.linear actually run.
+    # mirror that here so the H2D + Spyre matmul actually run.
     layer = layer.to("spyre")
-    actual = layer.forward_oot(x.to("spyre"))
+    actual = layer.quant_method.apply(layer, x.to("spyre"))
 
     assert actual.shape == (num_tokens, layer.weight.shape[0])
     # Spyre matmul accumulation order diverges from the CPU reference in fp16;
@@ -118,7 +118,7 @@ def test_padded_weight_reflects_loaded_weight(
 
     vocab = layer.weight.shape[0]
     if expect_padding:
-        assert layer.padding > 0
+        assert layer.spyre_row_padding > 0
         assert layer.padded_weight_t.shape == (
             embedding_dim,
             expect_padded_shape,
@@ -134,7 +134,7 @@ def test_padded_weight_reflects_loaded_weight(
         assert torch.all(layer.padded_weight_t[:, vocab:] == 0)
     else:
         # Aligned shape: no padding applied, padded_weight_t is just weightᵀ.
-        assert layer.padding == 0
+        assert layer.spyre_row_padding == 0
         torch.testing.assert_close(
             layer.padded_weight_t,
             layer.weight.t(),
@@ -205,11 +205,37 @@ def test_non_aligned_weight_is_padded(tp_group):
     expected_padded_rows = ALIGN  # ceil(63 / ALIGN) * ALIGN
     # padded_weight_t is transposed: [embedding_dim, padded_vocab].
     assert layer.padded_weight_t.shape[1] == expected_padded_rows
-    assert layer.padding == expected_padded_rows - 63
+    assert layer.spyre_row_padding == expected_padded_rows - 63
     # Original values preserved in the leading columns (transposed)
     torch.testing.assert_close(layer.padded_weight_t[:, :63], original.t(), atol=0.0, rtol=0.0)
     # Padding columns are zeros
     assert torch.all(layer.padded_weight_t[:, 63:] == 0)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.padding_workaround
+def test_padded_matmul_and_unpad_slice_run_on_device(spyre_or_cpu_device):
+    """The transposed matmul and the un-pad slice run on-device eagerly.
+
+    SpyreUnquantizedLMHeadMethod.apply does `x @ weight_t` on a padding-aligned
+    output dim then slices off the trailing pad columns. Post torch-spyre #3578
+    the un-pad slice lowers on-device in eager mode (the storage offset is
+    honored), so no torch.compile is needed. This isolates that primitive pair
+    (matmul + trailing-slice) from the full layer path.
+    """
+    ALIGN = 64 * 32
+    vocab = 32000
+    padding = (-vocab) % ALIGN
+    hidden = torch.randn(32, 4096, dtype=torch.float16) * 0.01
+    weight_t = torch.randn(4096, vocab + padding, dtype=torch.float16) * 0.01
+
+    def project(x, w):
+        out = torch.matmul(x, w)
+        return out[:, :-padding]
+
+    expected = torch.matmul(hidden, weight_t)[:, :-padding]
+    actual = project(hidden.to(spyre_or_cpu_device), weight_t.to(spyre_or_cpu_device))
+    torch.testing.assert_close(actual.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parallel_lm_head

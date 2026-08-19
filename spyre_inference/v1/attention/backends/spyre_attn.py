@@ -62,6 +62,22 @@ def _record_function(name: str):
     return decorator
 
 
+# Enable the batched decode path in `_online_softmax_attention`.
+#
+# When enabled, and the workload consists exclusively of decode requests
+# (all sequences have `query_len == 1`) with no ALiBi, soft-cap, or sliding
+# window constraints, sequences are bucketed by `num_blocks`. Each bucket
+# executes a single compiled attention kernel using `N * KV` as the leading
+# batch dimension, rather than launching one kernel per sequence.
+#
+# A batch with mixed KV lengths spans multiple buckets, and each distinct
+# `(bucket_size, num_blocks)` pair triggers its own compile the first time
+# it is seen — subsequent steps with the same shape hit the cache.
+#
+# If any of these requirements are not satisfied, execution automatically
+# falls back to the standard per-sequence decode path.
+_BMM_ACROSS_SEQS = os.environ.get("SPYRE_BMM_ACROSS_SEQS", "0") == "1"
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -245,6 +261,67 @@ def _create_compilable_page_attn(
         return tile_output / tile_sum
 
     return specialized_paged_attn_kernel
+
+
+def _create_compilable_page_attn_across_seqs(num_blocks: int):
+    """Online softmax over pages, batched across sequences in one compiled kernel.
+
+    Structurally identical to `_create_compilable_page_attn` except every input
+    carries N sequences in the leading batch axis (`N*num_kv_heads` instead of
+    `num_kv_heads`). ALiBi and logits soft-cap are not supported on this path —
+    callers must fall back to the per-seq kernel when either is active.
+
+    Expected shapes (leading N*KV batch axis):
+        q:               [N*num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+        k_pages_per_block: list of [N*num_kv_heads, 1, block_size, head_size]
+        v_pages_per_block: list of [N*num_kv_heads, 1, block_size, head_size]
+        mask_tiles:      list of [N*num_kv_heads, num_queries_per_kv, padded_query_len, block_size]
+                         (per-block, per-seq masks; -inf where a seq's kv_len
+                          runs out or the block is inactive for that seq)
+    """
+
+    def specialized_across_seqs_kernel(
+        q,
+        k_pages_per_block,
+        v_pages_per_block,
+        mask_tiles,
+        scale,
+    ):
+        tile_max = None
+        tile_sum = None
+        tile_output = None
+
+        for i in range(num_blocks):
+            k_page = k_pages_per_block[i]
+            v_page = v_pages_per_block[i]
+            mask_tile = mask_tiles[i]
+
+            scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                assert tile_max is not None
+                assert tile_sum is not None
+                assert tile_output is not None
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output = tile_output + torch.matmul(tile_probs, v_page)
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+
+        assert tile_output is not None and tile_sum is not None
+        return tile_output / tile_sum
+
+    return specialized_across_seqs_kernel
 
 
 @dataclass
@@ -856,6 +933,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Compiled attention loops, keyed by (num_blocks, padded_query_len)
         self._attn_fns: dict[tuple[int, int], object] = {}
+        # Across-seqs kernel cache — one entry per (tier_size_N, num_blocks) tuple.
+        # Only populated when SPYRE_BMM_ACROSS_SEQS=1 and the batch qualifies.
+        self._attn_fns_across: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -876,6 +956,216 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self._compile_attn,
             )
         return self._attn_fns[key]
+
+    def _get_attn_fn_across(self, tier_size_n: int, num_blocks: int):
+        # Across-seqs kernel: keyed by (N, num_blocks). padded_query_len is
+        # implicitly 1 on this path (decode-only precondition, enforced by
+        # the caller).
+        key = (tier_size_n, num_blocks)
+        if key not in self._attn_fns_across:
+            self._attn_fns_across[key] = _maybe_compile(
+                _create_compilable_page_attn_across_seqs(num_blocks),
+                self._compile_attn,
+            )
+        return self._attn_fns_across[key]
+
+    def _across_seqs_preconditions_met(
+        self,
+        attn_metadata: "SpyreAttentionMetadata",
+        query_cpu: torch.Tensor | None,
+    ) -> bool:
+        """Decode-only precondition for the bmm-across-sequences fast path.
+
+        Requires:
+          - num_seqs >= 2 (single-seq batch has nothing to batch across)
+          - every seq has query_len == 1 (max_query_len == 1)
+          - no ALiBi, no logits soft-cap (kernel doesn't handle these yet)
+          - no sliding window (active_block_indices_all is None)
+          - query_cpu is present (multi-seq batches always take that path today)
+        """
+        if attn_metadata.num_seqs < 2:
+            return False
+        if attn_metadata.max_query_len != 1:
+            return False
+        if self.alibi_slopes is not None:
+            return False
+        if self.logits_soft_cap != 0.0:
+            return False
+        if attn_metadata.active_block_indices is not None:
+            return False
+        return query_cpu is not None
+
+    def _run_across_seqs_dispatch(
+        self,
+        query_cpu: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        attn_metadata: "SpyreAttentionMetadata",
+        output: torch.Tensor,
+        _target_device: torch.device,
+    ) -> None:
+        """Group seqs by num_blocks and run one compiled kernel per tier.
+
+        Each tier folds `tier_N * num_kv_heads` into the leading batch axis of
+        the compiled attention kernel; sequences within a tier share num_blocks
+        so no block-count padding is wasted. Tier outputs are scattered back
+        into `output` at each seq's q_start position, matching the per-seq
+        loop's writeback contract.
+
+        Every device tensor passed to the compiled kernel starts at
+        storage_offset == 0 (torch-spyre#3770 workaround, same discipline as
+        SpyreAttentionMetadata.page_index_tables).
+        """
+        head_size = self.head_size
+        num_heads = self.num_heads
+        num_kv_heads = self.num_kv_heads
+        num_queries_per_kv = self.num_queries_per_kv
+        block_size = attn_metadata.block_size
+        aligned_max_query_len = attn_metadata.aligned_max_query_len
+
+        # Materialize both metadata tensors to host lists once — the tier
+        # dispatch below iterates per-seq and would otherwise pay a
+        # `.item()` CPU round-trip per sequence per step.
+        seq_lens_list = attn_metadata.seq_lens.tolist()
+        query_start_loc_list = attn_metadata.query_start_loc.tolist()
+        mask_tiles_all = attn_metadata.attention_mask_tiles
+        block_table = attn_metadata.block_table
+        assert mask_tiles_all is not None
+
+        # Group sequences by num_blocks_needed.
+        tiers: dict[int, list[int]] = {}
+        for s in range(attn_metadata.num_seqs):
+            kv_len_s = int(seq_lens_list[s])
+            nb_s = (kv_len_s + block_size - 1) // block_size
+            tiers.setdefault(nb_s, []).append(s)
+
+        for tier_nb, seq_idxs in tiers.items():
+            tier_n = len(seq_idxs)
+
+            # --- Query: gather this tier's rows from query_cpu (each seq has
+            # exactly one row, decode-only precondition), pad to
+            # aligned_max_query_len, reshape to
+            # [tier_n * num_kv_heads, num_queries_per_kv, Q, head_size].
+            q_rows_cpu = torch.empty(tier_n, num_heads, head_size, dtype=query_cpu.dtype)
+            for j, s in enumerate(seq_idxs):
+                q_start_s = int(query_start_loc_list[s])
+                q_rows_cpu[j] = query_cpu[q_start_s]
+            # -> [tier_n, num_kv_heads, num_queries_per_kv, 1, head_size]
+            q = q_rows_cpu.reshape(tier_n, num_kv_heads, num_queries_per_kv, 1, head_size)
+            if aligned_max_query_len > 1:
+                pad_q = torch.zeros(
+                    tier_n,
+                    num_kv_heads,
+                    num_queries_per_kv,
+                    aligned_max_query_len - 1,
+                    head_size,
+                    dtype=q.dtype,
+                )
+                q = torch.cat([q, pad_q], dim=3)
+            # Fold tier_n into the leading batch axis and transfer.
+            # `.clone()` on the device tensor materializes it at
+            # storage_offset == 0 so the compiled kernel dereferences the right
+            # bytes (torch-spyre#3770).
+            q_packed = q.reshape(
+                tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
+            ).contiguous()
+            q_packed_dev = convert(q_packed, device=_target_device).clone()
+
+            # --- Per-block K/V gather (built on device from the dense cache).
+            # Invariant: sequences in a tier share the same `num_blocks_needed`,
+            # so `block_table[s, i]` for `i in range(tier_nb)` is always inside
+            # each sequence's real block range (no padded slot reads).
+            # For each block i in [0, tier_nb), gather the tier's tier_n pages
+            # via one index_select on k_pages/v_pages, then permute+reshape+clone
+            # to the [tier_n * num_kv_heads, 1, block_size, head_size] shape the
+            # kernel expects (matches the per-seq path's k_page_4d layout).
+            # Every device tensor the compiled kernel receives is `.clone()`d
+            # to force storage_offset == 0 (torch-spyre#3770).
+            k_list_dev: list[torch.Tensor] = []
+            v_list_dev: list[torch.Tensor] = []
+            for i in range(tier_nb):
+                block_ids_cpu = torch.tensor(
+                    [int(block_table[s, i].item()) for s in seq_idxs], dtype=torch.int32
+                )
+                block_ids_dev = convert(block_ids_cpu, device=_target_device).clone()
+                k_block = k_pages.index_select(0, block_ids_dev)
+                v_block = v_pages.index_select(0, block_ids_dev)
+                # [tier_n, block_size, num_kv_heads, head_size]
+                #   -> [tier_n, num_kv_heads, block_size, head_size]
+                #   -> [tier_n * num_kv_heads, block_size, head_size]
+                #   -> [tier_n * num_kv_heads, 1, block_size, head_size]
+                k_block = (
+                    k_block.permute(0, 2, 1, 3)
+                    .reshape(tier_n * num_kv_heads, block_size, head_size)
+                    .unsqueeze(1)
+                    .clone()
+                )
+                v_block = (
+                    v_block.permute(0, 2, 1, 3)
+                    .reshape(tier_n * num_kv_heads, block_size, head_size)
+                    .unsqueeze(1)
+                    .clone()
+                )
+                k_list_dev.append(k_block)
+                v_list_dev.append(v_block)
+
+            # --- Per-block mask tiles: fold tier_n into leading axis. Each seq
+            # contributes its own [aligned_max_query_len, block_size] tile per
+            # block; the resulting per-block tensor is
+            # [tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, block_size].
+            # Broadcasting over (num_kv_heads, num_queries_per_kv) is materialized
+            # on host and transferred once per block.
+            mask_list_dev: list[torch.Tensor] = []
+            for i in range(tier_nb):
+                mask_tile_cpu = torch.empty(
+                    tier_n,
+                    aligned_max_query_len,
+                    block_size,
+                    dtype=mask_tiles_all[seq_idxs[0]][i].dtype,
+                )
+                for j, s in enumerate(seq_idxs):
+                    # mask_tiles_all[s][i] shape: [aligned_max_query_len, block_size]
+                    # (built by _build_attention_mask; the sliding-window path
+                    # that produces a different layout is excluded by the
+                    # precondition).
+                    mask_tile_cpu[j] = mask_tiles_all[s][i]
+                # [tier_n, Q, B] -> [tier_n, 1, 1, Q, B] -> expand to KV/QPK, then fold.
+                mask_expanded = (
+                    mask_tile_cpu.reshape(tier_n, 1, 1, aligned_max_query_len, block_size)
+                    .expand(
+                        tier_n, num_kv_heads, num_queries_per_kv, aligned_max_query_len, block_size
+                    )
+                    .contiguous()
+                    .reshape(
+                        tier_n * num_kv_heads,
+                        num_queries_per_kv,
+                        aligned_max_query_len,
+                        block_size,
+                    )
+                )
+                mask_list_dev.append(convert(mask_expanded, device=_target_device).clone())
+
+            # --- Run the compiled across-seqs kernel for this tier.
+            attn_fn = self._get_attn_fn_across(tier_n, tier_nb)
+            result = attn_fn(q_packed_dev, k_list_dev, v_list_dev, mask_list_dev, self.scale)
+            # result: [tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
+            result = convert(result, dtype=output.dtype)
+            result = result.reshape(
+                tier_n, num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
+            )
+            # -> [tier_n, aligned_max_query_len, num_heads, head_size]
+            result = (
+                result.reshape(tier_n, num_heads, aligned_max_query_len, head_size)
+                .transpose(1, 2)
+                .contiguous()
+            )
+
+            # --- Scatter tier outputs back into `output`. query_len is 1 per
+            # seq (decode-only precondition); the .clone() is the same
+            # workaround for torch-spyre#3826 the per-seq loop uses.
+            for j, s in enumerate(seq_idxs):
+                q_start_s = int(query_start_loc_list[s])
+                output[q_start_s : q_start_s + 1] = result[j, 0:1, :, :].clone()
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1004,6 +1294,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
+
+        # Optional bmm-across-sequences fast path. Gated on SPYRE_BMM_ACROSS_SEQS
+        # and a decode-only precondition (see the helper for the full list).
+        # Returns True when it handled the whole batch; the per-seq loop below
+        # runs only when this path declines.
+        if _BMM_ACROSS_SEQS and self._across_seqs_preconditions_met(attn_metadata, query_cpu):
+            # Precondition helper guarantees query_cpu is not None here.
+            assert query_cpu is not None
+            self._run_across_seqs_dispatch(
+                query_cpu, k_pages, v_pages, attn_metadata, output, _target_device
+            )
+            return output
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization

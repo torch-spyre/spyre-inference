@@ -2122,7 +2122,9 @@ in the attention backend, where offset &gt; 0 views still corrupt on transfer (s
 online softmax that iterates over pages without any compact-gather step, reading each
 page by indexing the dense tensor with a one-element int32 device tensor (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
-permuting the token-major page to head-major on device before the matmuls:</p>
+permuting the token-major page to head-major on device before the matmuls. The cache is
+allocated with the slot axis outermost in the device layout (<code>slot_major_kv_layout</code>) so
+the write can scatter through a slot-major view of it:</p>
 <table>
 <thead>
 <tr>
@@ -2133,14 +2135,14 @@ permuting the token-major page to head-major on device before the matmuls:</p>
 </thead>
 <tbody>
 <tr>
-<td>1. q/k/v → CPU</td>
+<td>1. q → CPU</td>
 <td>CPU</td>
-<td>Bring <code>q</code>, <code>k</code>, <code>v</code> to CPU once (Spyre slicing corrupts strided views)</td>
+<td>Bring <code>q</code> to CPU when its layout cannot be assembled on device; <code>k</code>/<code>v</code> stay put</td>
 </tr>
 <tr>
 <td>2. Reshape &amp; cache</td>
 <td>Spyre</td>
-<td>Overwrite new K/V into the dense paged cache, one write per same-page slot run (token-major pages take the K/V slice as-is, no host transpose)</td>
+<td>Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single <code>index_copy_</code> per tensor</td>
 </tr>
 <tr>
 <td>3. Per-sequence varlen loop</td>

@@ -13,8 +13,7 @@ name: Test matrix (reusable)
 #   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
 #     false (always run). May pass runner_label to pick a per-PR image, rpm_*
 #     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
-#     from source, and use_prebaked_image=true to trust that image's stack and
-#     skip the baseline install.
+#     from source, and use_prebaked_image=true to skip the baseline RPM install.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -31,19 +30,9 @@ on:
         type: boolean
         default: true
       use_prebaked_image:
-        description: |
-          When true, trust the runner image's prebaked Spyre stack and skip the
-          baseline spyre-rpm-install step. Set this true only when the runner
-          image already carries the exact stack under test, for example a
-          per-PR image selected with runner_label. On such an image the
-          spyre-rpms.lock baseline is redundant and can even conflict: senlib
-          reads its config from a hardcoded /opt path that a $RUNNER_TEMP
-          extract cannot redirect, so a lock-vs-image senlib mismatch aborts in
-          gather-runner-info (see issue #543).
-
-          Default false keeps the baseline install, so the PR/push flow builds
-          against the pinned spyre-rpms.lock set and is unaffected by this flag.
-          The override step (rpm_names != '') is independent of this flag.
+        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
+        # action). It does not change the override step or any other step.
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
         required: false
         type: boolean
         default: false
@@ -328,9 +317,9 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Install the locked baseline by default (PR/push flow). A caller that
-      # runs on a prebaked image (use_prebaked_image=true) skips this step and
-      # trusts the image's own Spyre stack instead. See issue #543.
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
         id: spyre-rpms
         if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
@@ -555,9 +544,9 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      # Install the locked baseline by default. A caller on a prebaked image
-      # (use_prebaked_image=true) skips this and trusts the image's own Spyre
-      # stack instead. See issue #543 and use_prebaked_image above.
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install

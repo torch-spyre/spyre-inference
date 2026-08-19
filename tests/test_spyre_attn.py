@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -46,6 +47,12 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
+
+
+def bmm_across_seqs(request, monkeypatch):
+    """Flip the SPYRE_BMM_ACROSS_SEQS gate; the env var is only read at import."""
+    monkeypatch.setattr(spyre_attn, "_BMM_ACROSS_SEQS", request.param)
+    return request.param
 
 
 @pytest.fixture()
@@ -565,6 +572,93 @@ def test_spyre_attn_compiled_multi_seq(
 
     Sequences past batch slot 0 silently gathered slot 0's KV pages
     (torch-spyre#3770); only a real compiled batch on device catches it.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize("bmm_across_seqs", [True], indirect=True)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Decode-only batches — the envelope the bmm-across-seqs path targets.
+        pytest.param([(1, 256), (1, 512)], id="uniform_decode(2seqs)"),
+        pytest.param([(1, 256), (1, 256), (1, 512), (1, 512)], id="staircase_decode(4seqs)"),
+        pytest.param([(1, 128), (1, 384), (1, 512)], id="skewed_decode(3seqs)"),
+    ],
+)
+def test_spyre_attn_bmm_across_seqs_decode(
+    default_vllm_config,
+    bmm_across_seqs: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """SPYRE_BMM_ACROSS_SEQS=1: fold N into leading batch dim for decode-only batches.
+
+    Preconditions the fast path checks: num_seqs >= 2, every query_len == 1,
+    no ALiBi, no soft-cap, no sliding window. When met, the compiled kernel
+    receives N*num_kv_heads as its leading batch axis and processes the whole
+    batch in one call (per tier of common num_blocks); otherwise falls back
+    silently to the per-seq loop.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize("bmm_across_seqs", [True], indirect=True)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Precondition-violating batches — SPYRE_BMM_ACROSS_SEQS=1 must
+        # silently fall back to the per-seq loop and match the reference.
+        pytest.param([(1, 512)], id="single_seq(fallback)"),
+        pytest.param([(32, 256), (64, 512)], id="prefill_max_query_len_gt_1(fallback)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed_decode_prefill(fallback)"),
+    ],
+)
+def test_spyre_attn_bmm_across_seqs_fallback(
+    default_vllm_config,
+    bmm_across_seqs: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """SPYRE_BMM_ACROSS_SEQS=1 on batches that violate the fast-path preconditions.
+
+    Guards the silent-fallback contract: the flag must have no observable
+    effect on correctness for single-seq, prefill, or mixed batches — the
+    per-seq loop still runs and results still match the CPU reference.
     """
     _run_spyre_attn_test(
         seq_lens=seq_lens,

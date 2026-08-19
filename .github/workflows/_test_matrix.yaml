@@ -6,14 +6,15 @@ name: Test matrix (reusable)
 # different setup:
 #
 #   test_each_commit.yaml (push/PR/merge_group): skip_if_no_changes=true, so the
-#     build/test only runs when source files changed. Runs on the standing
-#     prebaked image and uses its Spyre stack as-is (use_prebaked_image=true,
-#     the default), so the baseline spyre-rpm-install is skipped.
+#     build/test only runs when source files changed. Installs the locked
+#     baseline RPMs (spyre-rpm-install) on the standing image, so every PR
+#     builds against the pinned spyre-rpms.lock set.
 #
 #   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
 #     false (always run). May pass runner_label to pick a per-PR image, rpm_*
-#     to layer override RPMs, and torch_spyre_ref to build a specific
-#     torch-spyre from source.
+#     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
+#     from source, and use_prebaked_image=true to trust that image's stack and
+#     skip the baseline install.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -31,18 +32,21 @@ on:
         default: true
       use_prebaked_image:
         description: |
-          When true (default), trust the runner image's prebaked Spyre stack
-          and skip the baseline spyre-rpm-install step. The image ships a
-          self-consistent senlib/deeptools/flex set, so installing the
-          spyre-rpms.lock baseline on top only risks a version split (senlib
-          reads its config from hardcoded /opt paths that the override cannot
-          redirect, so a lock-vs-image senlib mismatch aborts in
-          gather-runner-info; see issue #543). Set false to restore the legacy
-          behaviour of extracting the locked baseline into $RUNNER_TEMP. The
-          opt-in override step (rpm_names != '') is independent of this flag.
+          When true, trust the runner image's prebaked Spyre stack and skip the
+          baseline spyre-rpm-install step. Set this true only when the runner
+          image already carries the exact stack under test, for example a
+          per-PR image selected with runner_label. On such an image the
+          spyre-rpms.lock baseline is redundant and can even conflict: senlib
+          reads its config from a hardcoded /opt path that a $RUNNER_TEMP
+          extract cannot redirect, so a lock-vs-image senlib mismatch aborts in
+          gather-runner-info (see issue #543).
+
+          Default false keeps the baseline install, so the PR/push flow builds
+          against the pinned spyre-rpms.lock set and is unaffected by this flag.
+          The override step (rpm_names != '') is independent of this flag.
         required: false
         type: boolean
-        default: true
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -324,9 +328,9 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Prebaked image (default): skip the baseline install and use the image's
-      # own Spyre stack. Only run it when a caller opts out (use_prebaked_image
-      # false) to test the locked baseline instead. See issue #543.
+      # Install the locked baseline by default (PR/push flow). A caller that
+      # runs on a prebaked image (use_prebaked_image=true) skips this step and
+      # trusts the image's own Spyre stack instead. See issue #543.
       - name: Install Spyre RPMs
         id: spyre-rpms
         if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
@@ -551,8 +555,9 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      # Prebaked image (default): skip the baseline install, use the image's
-      # own Spyre stack. See issue #543 and use_prebaked_image above.
+      # Install the locked baseline by default. A caller on a prebaked image
+      # (use_prebaked_image=true) skips this and trusts the image's own Spyre
+      # stack instead. See issue #543 and use_prebaked_image above.
       - name: Install Spyre RPMs
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install

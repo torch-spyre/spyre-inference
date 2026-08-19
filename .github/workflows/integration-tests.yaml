@@ -186,10 +186,10 @@ jobs:
       # Dispatch flow: always run, regardless of changed files.
       skip_if_no_changes: false
       # Forward the caller's choice. A plain dispatch defaults to false and
-      # keeps the legacy controlled-baseline install (with torch_spyre_ref /
-      # override RPMs). A caller that targets a prebaked image (e.g. Jenkins
-      # dispatching with a per-PR runner_label) passes true to skip the
-      # baseline install and trust the image, same as the PR/push flow (#543).
+      # installs the controlled baseline (with torch_spyre_ref / override RPMs),
+      # the same baseline the PR/push flow installs. A caller that targets a
+      # prebaked image (e.g. Jenkins dispatching with a per-PR runner_label)
+      # passes true to skip the baseline install and trust the image (#543).
       use_prebaked_image: ${{ inputs.use_prebaked_image }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}

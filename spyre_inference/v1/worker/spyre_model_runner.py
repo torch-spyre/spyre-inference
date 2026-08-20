@@ -375,7 +375,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
     @staticmethod
     def _install_pooling_model_patches(model_config) -> None:
@@ -457,6 +457,38 @@ class TorchSpyreModelRunner(GPUModelRunner):
             keep_outputs_on_device=self._pooling_on_spyre,
         )
 
+    @staticmethod
+    def _model_has_spyre_fp8(model: nn.Module) -> bool:
+        """True if the model has Spyre FP8 linears.
+
+        ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
+        Granite ``compressed-tensors`` stores it on the scheme
+        (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
+        Checkpoint FP8 weights are the fallback: ``process_weights_after_loading``
+        keeps ``float8_e4m3fn``.
+        """
+        from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
+
+        def _is_fp8_kernel(obj: object) -> bool:
+            if SpyreFp8LinearKernel is not None and isinstance(obj, SpyreFp8LinearKernel):
+                return True
+            return SpyreFp8LinearKernel is not None and isinstance(
+                getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
+            )
+
+        for module in model.modules():
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
+                return True
+            quant_method = getattr(module, "quant_method", None)
+            if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
+                getattr(quant_method, "scheme", None)
+            ):
+                return True
+            if _is_fp8_kernel(getattr(module, "scheme", None)):
+                return True
+        return False
+
     def _compile_for_spyre(self) -> None:
         """Apply torch.compile for Spyre with static shapes.
 
@@ -467,6 +499,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         - CompilationMode.NONE: eager execution
         - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
+          (``fullgraph=False`` when the model uses Spyre FP8 linears)
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -480,19 +513,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # Trigger whole-model compile:
-        # a single fullgraph over the entire model using dynamic=False.
+        # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
+        # stays isolated. fullgraph=True cannot graph-break.
+        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
         t0 = time.time()
         self.model = torch.compile(
             self.model,
             backend="inductor",
-            fullgraph=True,
+            fullgraph=not uses_fp8,
             dynamic=False,
         )
         logger.info(
-            "Compiled model %s as a single graph for Spyre in %.3fs.",
+            "Compiled model %s for Spyre in %.3fs (fullgraph=%s).",
             type(self.get_model()).__name__,
             time.time() - t0,
+            not uses_fp8,
         )
 
     def warming_up_model(self) -> None:

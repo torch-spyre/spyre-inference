@@ -24,6 +24,7 @@ from . import rotary_embedding
 from . import linear
 from . import utils
 from . import vocab_parallel_embedding  # noqa: F401
+from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -32,6 +33,7 @@ logger = init_logger(__name__)
 @lru_cache(maxsize=1)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
+    register_spyre_fp8_linear_kernel()
     rotary_embedding.register()
     utils.register()
     vocab_parallel_embedding.register()

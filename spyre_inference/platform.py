@@ -286,6 +286,11 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def supports_fp8(cls) -> bool:
+        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        return True
+
+    @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
         is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.

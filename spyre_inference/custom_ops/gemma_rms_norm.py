@@ -17,16 +17,13 @@
 Gemma models (1/2/3) use GemmaRMSNorm for every normalization (input/post-attn/
 pre-post-feedforward layernorms and gemma-3's per-head q_norm/k_norm).
 
-References:
-    - Upstream GemmaRMSNorm: vllm/model_executor/layers/layernorm.py
+The fp16->fp32 upcast is correct only through torch-spyre's compile-time EA
+propagation (PR #2927), broken in eager. Hence force compiling here.
 """
 
 import torch
 
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
-
-logger = init_logger(__name__)
 
 
 @GemmaRMSNorm.register_oot(name="GemmaRMSNorm")
@@ -36,25 +33,16 @@ class SpyreGemmaRMSNorm(GemmaRMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        logger.warning_once(
-            "SpyreGemmaRMSNorm: no dtype promotion is performed, "
-            "expect numerical differences to upstream vLLM."
-        )
+        # With fullgraph compile enabled, forward_native is compiled anyway.
+        self._forward = self.forward_native
+        if not torch.compiler.is_dynamo_compiling():
+            self._forward = torch.compile(self.forward_native, dynamic=False)
 
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """GemmaRMSNorm kernel for Spyre. Compiled separately via maybe_compile."""
         if residual is not None:
-            x = x + residual
-            residual = x
-
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-        x = x * (1.0 + self.weight.data)
-
-        if residual is None:
-            return x
-        return x, residual
+            return self._forward(x, residual)
+        return self._forward(x)

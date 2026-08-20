@@ -127,6 +127,8 @@ def test_rotary_forward_oot_on_spyre(
         dtype=torch.float16,
     )
 
+    rope.to("spyre")
+
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten)
 
@@ -168,6 +170,7 @@ def test_llama3_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flat
         rope_parameters=LLAMA3_ROPE_PARAMS,
         dtype=torch.float16,
     )
+    rope.to("spyre")
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)
@@ -193,6 +196,7 @@ def test_rotary_forward_oot_key_none_on_spyre(default_vllm_config, head_size):
     torch.manual_seed(0)
     max_position, num_tokens, num_heads = 2048, 16, 4
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
+    rope.to("spyre")
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
@@ -226,6 +230,8 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
         rope_parameters={"rope_theta": 1000000.0},
         dtype=torch.float16,
     )
+    rope_a.to("spyre")
+    rope_b.to("spyre")
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     qa = torch.randn(num_tokens, nh * head_size, dtype=torch.float16)
@@ -249,9 +255,10 @@ def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_
 
     max_position, num_tokens = 2048, 32
     rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
+    rope.to("spyre")
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
-    cache = rope._get_device_rotation_cache(positions.device)
+    cache = rope._get_device_rotation_cache()
     rot = cache.index_select(0, positions.flatten())
     assert rot.device.type == "spyre"
     assert tuple(rot.shape) == (num_tokens, 2, 2, rope.rotary_dim // 2)
@@ -394,6 +401,7 @@ def test_yarn_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flatte
         rope_parameters=YARN_ROPE_PARAMS,
         dtype=torch.float16,
     )
+    rope.to("spyre")
 
     positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
     query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)

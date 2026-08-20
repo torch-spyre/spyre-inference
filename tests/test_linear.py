@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the generic linear-transpose pass (custom_ops/linear.py).
+"""Tests for the transposed-weight linear method (custom_ops/linear.py).
 
-These run on CPU (no Spyre device needed): the pass is a pure host-side weight
-mutation and `spyre_linear_t` is a plain `torch.matmul`, arithmetically identical
-to `F.linear` on any device. The QKV and LM-head transposes have their own tests
-(test_unfuse.py, test_parallel_lm_head.py); this file covers the generic
-`LinearBase` path (down_proj, gate_up_proj, ...) that those two do not.
+These run on CPU (no Spyre device needed): `process_weights_after_loading` is a
+pure host-side weight mutation and `spyre_linear_t` is a plain `torch.matmul`,
+arithmetically identical to `F.linear` on any device. The generic
+`LinearBase` path (gate_up_proj, down_proj, ...) is covered here; QKV and the
+LM head have their own tests (test_mlp.py, test_parallel_lm_head.py).
 """
 
 import pytest
@@ -59,28 +59,34 @@ def _make_mlp_module(hidden, inter, bias=False):
     return MLP()
 
 
+def _bias(layer):
+    return layer.bias.data if layer.bias is not None else None
+
+
 def _forward(layer, x):
-    """Run the (possibly rebound) unquantized apply and drop the bias tuple."""
-    out = layer.quant_method.apply(layer, x, layer.bias if layer.bias is not None else None)
-    return out
+    """Run the transposed apply and drop the bias tuple."""
+    return layer.quant_method.apply(layer, x, _bias(layer))
 
 
 @pytest.mark.mlp
 @pytest.mark.parametrize("num_tokens", [1, 7, 64])
 @pytest.mark.parametrize("use_bias", [False, True])
 def test_transposed_linear_matches_reference(tp_group, num_tokens, use_bias):
-    """After the pass, the GEMM `x @ Wᵀ (+bias)` matches the upstream F.linear.
+    """After processing weights, `x @ Wᵀ (+bias)` matches the upstream F.linear.
 
     The core correctness guard: a wrong transpose or axis swap would change the
     output here. Runs entirely on CPU.
     """
     from spyre_inference.custom_ops.linear import (
-        transpose_linear_weights_for_spyre,
+        SpyreMergedColumnParallelLinear,
+        SpyreRowParallelLinear,
     )
 
     hidden, inter = 128, 256
     torch.manual_seed(0)
     mlp = _make_mlp_module(hidden, inter, bias=use_bias)
+    assert isinstance(mlp.gate_up_proj, SpyreMergedColumnParallelLinear)
+    assert isinstance(mlp.down_proj, SpyreRowParallelLinear)
     for layer in (mlp.gate_up_proj, mlp.down_proj):
         layer.weight.data.normal_(std=0.02)
         if layer.bias is not None:
@@ -90,10 +96,12 @@ def test_transposed_linear_matches_reference(tp_group, num_tokens, use_bias):
     x_gate = torch.randn(num_tokens, hidden, dtype=torch.float16)
     x_down = torch.randn(num_tokens, inter, dtype=torch.float16)
 
+    # Capture the reference BEFORE process_weights_after_loading transposes.
     exp_gate = F.linear(x_gate, mlp.gate_up_proj.weight.data, _bias(mlp.gate_up_proj))
     exp_down = F.linear(x_down, mlp.down_proj.weight.data, _bias(mlp.down_proj))
 
-    transpose_linear_weights_for_spyre(mlp)
+    for layer in (mlp.gate_up_proj, mlp.down_proj):
+        layer.quant_method.process_weights_after_loading(layer)
 
     torch.testing.assert_close(
         _forward(mlp.gate_up_proj, x_gate).float(), exp_gate.float(), atol=1e-2, rtol=1e-2
@@ -103,17 +111,9 @@ def test_transposed_linear_matches_reference(tp_group, num_tokens, use_bias):
     )
 
 
-def _bias(layer):
-    return layer.bias.data if layer.bias is not None else None
-
-
 @pytest.mark.mlp
-def test_weight_replaced_with_transpose(tp_group):
-    """The pass sets `weight = None` and stores `weight_t` == `weightᵀ` bit-for-bit."""
-    from spyre_inference.custom_ops.linear import (
-        transpose_linear_weights_for_spyre,
-    )
-
+def test_weight_stored_transposed(tp_group):
+    """process_weights_after_loading replaces `weight` with `weightᵀ`, contiguous."""
     hidden, inter = 128, 256
     torch.manual_seed(0)
     mlp = _make_mlp_module(hidden, inter)
@@ -123,64 +123,30 @@ def test_weight_replaced_with_transpose(tp_group):
     original = mlp.down_proj.weight.data.clone()
     orig_shape = original.shape  # [out, in] == [hidden, inter]
 
-    transpose_linear_weights_for_spyre(mlp)
+    mlp.down_proj.quant_method.process_weights_after_loading(mlp.down_proj)
 
-    assert mlp.down_proj.weight is None
-    wt = mlp.down_proj.weight_t
-    assert wt.shape == (orig_shape[1], orig_shape[0])  # [in, out]
-    assert wt.data.is_contiguous()
-    torch.testing.assert_close(wt.data, original.t(), atol=0.0, rtol=0.0)
+    w = mlp.down_proj.weight
+    assert w.shape == (orig_shape[1], orig_shape[0])  # [in, out]
+    assert w.data.is_contiguous()
+    torch.testing.assert_close(w.data, original.t(), atol=0.0, rtol=0.0)
 
 
 @pytest.mark.mlp
-def test_quantized_layer_skipped_without_cross_contamination(tp_group):
-    """A quantized LinearBase is left untouched; a sibling unquantized one is not.
+def test_unquantized_layers_get_spyre_method(tp_group):
+    """Unquantized linears get `SpyreUnquantizedLinearMethod` swapped in.
 
-    Guards the per-module `quant_method.apply` patch: because vLLM builds a fresh
-    UnquantizedLinearMethod per layer, patching one must not affect the other.
+    The mixin only replaces the method when it is an `UnquantizedLinearMethod`
+    (`quant_config=None` here), so a quantized layer would keep its own
+    slow-but-correct F.linear method untouched.
     """
-    from spyre_inference.custom_ops.linear import (
-        transpose_linear_weights_for_spyre,
-    )
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
 
     hidden, inter = 128, 256
     torch.manual_seed(0)
     mlp = _make_mlp_module(hidden, inter)
-    # Simulate a quantized layer: any non-UnquantizedLinearMethod trips the guard.
-    mlp.gate_up_proj.quant_method = object()
 
-    transpose_linear_weights_for_spyre(mlp)
-
-    # Quantized layer: fully untouched.
-    assert mlp.gate_up_proj.weight is not None
-    assert not hasattr(mlp.gate_up_proj, "weight_t")
-    # Unquantized sibling: transposed.
-    assert mlp.down_proj.weight is None
-    assert hasattr(mlp.down_proj, "weight_t")
-
-
-@pytest.mark.mlp
-def test_unfused_qkv_skipped_by_generic_pass(tp_group):
-    """A layer whose `weight` is already None (un-fused QKV) is skipped."""
-    from vllm.model_executor.layers.linear import QKVParallelLinear
-    from spyre_inference.custom_ops.linear import (
-        transpose_linear_weights_for_spyre,
-    )
-
-    torch.manual_seed(0)
-    qkv = QKVParallelLinear(
-        hidden_size=8 * 64,
-        head_size=64,
-        total_num_heads=8,
-        total_num_kv_heads=2,
-        params_dtype=torch.float16,
-        quant_config=None,
-        disable_tp=True,
-        prefix="qkv_proj",
-    )
-    # Emulate the post-unfuse state: fused weight cleared.
-    qkv.weight = None
-
-    # Must not raise and must not create a weight_t.
-    transpose_linear_weights_for_spyre(qkv)
-    assert not hasattr(qkv, "weight_t")
+    assert isinstance(mlp.gate_up_proj.quant_method, SpyreUnquantizedLinearMethod)
+    assert isinstance(mlp.down_proj.quant_method, SpyreUnquantizedLinearMethod)
+    # SpyreUnquantizedLinearMethod is itself an UnquantizedLinearMethod subclass.
+    assert isinstance(mlp.down_proj.quant_method, UnquantizedLinearMethod)

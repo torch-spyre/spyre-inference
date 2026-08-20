@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm>=0.26.0,<0.27",
+    "vllm>=0.27.1,<0.28",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -92,14 +92,18 @@ override-dependencies = [
 VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
+# Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
+[tool.uv.extra-build-variables.torch-spyre]
+USE_SPYRE_PROFILER = "0"
+
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.26.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "56c288343bd199bbdd65365b24bffdbd39c2b34e" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8d4f43bb3493d13c33cbb2608558dfcdf44774c" }
 hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
@@ -232,6 +236,11 @@ skip_gitignore = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
+# A card acquisition that blocks in the kernel yields no output, so the test
+# must be cut off from outside. "thread" dumps every thread's stack on expiry,
+# naming the blocking frame; "signal" cannot interrupt an uninterruptible open().
+timeout = 1800
+timeout_method = "thread"
 filterwarnings = [
     "ignore::_pytest.warning_types.PytestUnknownMarkWarning"
 ]
@@ -240,7 +249,9 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
-    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
+    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py, tests/test_spyre_encoder_attn.py); slow, runs in its own CI job",
+    "encoder_attention: encoder-attention subset (tests/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
+    "compile: torch.compile end-to-end tests (tests/test_compile.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/test_fp8.py)",
 ]
@@ -269,4 +280,5 @@ plugins.md007.indent = 4
 [dependency-groups]
 dev = [
     "spyre-testing-plugin",
+    "coverage",
 ]

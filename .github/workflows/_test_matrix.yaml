@@ -7,12 +7,13 @@ name: Test matrix (reusable)
 #
 #   test_each_commit.yaml (push/PR/merge_group): skip_if_no_changes=true, so the
 #     build/test only runs when source files changed. Installs the locked
-#     baseline RPMs (spyre-rpm-install) and runs on the standing image.
+#     baseline RPMs (spyre-rpm-install) on the standing image, so every PR
+#     builds against the pinned spyre-rpms.lock set.
 #
 #   integration-tests.yaml (upstream-dependency dispatch): skip_if_no_changes=
 #     false (always run). May pass runner_label to pick a per-PR image, rpm_*
-#     to layer override RPMs, and torch_spyre_ref to build a specific
-#     torch-spyre from source.
+#     to layer override RPMs, torch_spyre_ref to build a specific torch-spyre
+#     from source, and use_prebaked_image=true to skip the baseline RPM install.
 #
 # Each caller supplies its own fan-in gate job (the required-check name lives in
 # the caller, since a reusable workflow's internal job names do not surface as
@@ -28,6 +29,13 @@ on:
         required: false
         type: boolean
         default: true
+      use_prebaked_image:
+        # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
+        # action). It does not change the override step or any other step.
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        required: false
+        type: boolean
+        default: false
       torch_spyre_ref:
         description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
         required: false
@@ -171,28 +179,50 @@ jobs:
       matrix:
         include:
           - cfg: Non-distributed spyre tests
-            # Fast per-op unit tests: the smoke set.
+            # Fast per-op unit tests: the smoke set (compile split out below).
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
             test_target: test-smoke
+          - cfg: Spyre compile tests
+            # Split out of smoke (it was ~20 min of a ~28 min job). MUST keep
+            # `integration` in this set: the multi-repo integration hook runs
+            # only the integration-tagged configs, so dropping it here would
+            # silently lose the torch.compile end-to-end check that guards
+            # against upstream-runtime regressions.
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-compile
           - cfg: Spyre attention tests
+            # Decoder attention only; the encoder split runs below.
             test_types: unit regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-attention
+          - cfg: Encoder attention tests
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-encoder-attention
           - cfg: Distributed spyre tests
             test_types: unit regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
+              - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
             test_target: test-distributed
@@ -201,7 +231,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream
@@ -209,7 +239,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x2__pvc_1tb_x1
+              - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
@@ -217,7 +247,7 @@ jobs:
             test_types: regression trunk
             runs_on:
               - x86_64
-              - spyre_pf_x1__pvc_1tb_x1
+              - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-model
@@ -309,9 +339,12 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
         id: spyre-rpms
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
@@ -347,6 +380,11 @@ jobs:
       - name: Gather runner info
         if: ${{ steps.gate.outputs.run == 'true' }}
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the runs-on expression: matrix.runs_on plus the per-PR
+          # runner_label override, or the standing matrix.image_label).
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
 
       - name: Dump UV cache info
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -388,14 +426,32 @@ jobs:
 
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
-        # Env setup (aiu-setup sourcing, topo.json cleanup) and the marker
-        # expression for this config both live in the Makefile's
-        # test_target now -- the single entrypoint/owner for one
-        # marker-combo invocation, so the marker set is not duplicated here.
+        # Marker expression and coverage wiring both live in the Makefile
+        # test_target. COVERAGE=1 drops .coverage.* data files for the fan-in.
+        #
+        # Bounded so a wedged card acquisition cannot hang silently: a blocking
+        # open() on a contended /dev/vfio device emits no output, so the runner
+        # stops heartbeating and the job is reaped server-side with an
+        # unfinalized log (no conclusion, no diagnosis). Failing here instead
+        # keeps the step's own log and lets the post steps publish JUnit.
+        timeout-minutes: 90
         run: |
           echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} JUNIT_XML=junit-${{ matrix.test_target }}.xml
+          make ${{ matrix.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ matrix.test_target }}.xml
           echo "tests done"
+
+      # Raw per-process data files; their host/pid suffixes are unique across
+      # jobs, so the fan-in's `make coverage` combines them without a per-job
+      # step. if-no-files-found=ignore covers configs that measured nothing.
+      - name: Upload coverage data
+        if: ${{ always() && steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ strategy.job-index }}
+          path: .coverage.*
+          include-hidden-files: true  # .coverage.* are dotfiles
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload JUnit results
         if: ${{ always() && steps.gate.outputs.run == 'true' }}
@@ -417,6 +473,78 @@ jobs:
           fail-on-error: false
 
   # ---------------------------------------------------------------------------
+  # Coverage fan-in: combine every job's data into one report. Stock runner
+  # (needs only the coverage tool + a checkout for .coveragerc and the sources).
+  # always() so partial coverage still reports when suites fail; no-op when no
+  # data was produced (e.g. all configs skipped).
+  # ---------------------------------------------------------------------------
+  coverage:
+    name: Aggregate coverage
+    needs: test
+    if: always()
+    # Informational -- must never fail the reusable workflow (and thus the
+    # callers' required-check gate).
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Match the test venv's coverage (uv.lock pin) for data-format compat.
+      - name: Install coverage
+        run: python -m pip install 'coverage==7.15.2'
+
+      - name: Download coverage data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: covdata
+          merge-multiple: true
+
+      - name: Combine and report
+        run: |
+          shopt -s nullglob
+          files=(covdata/.coverage.*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No coverage data to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # Combine/report logic lives in the Makefile; COVERAGE_TOOL=coverage
+          # uses the pip-installed tool (no venv on this runner).
+          make coverage COVERAGE_DATA=covdata COVERAGE_TOOL=coverage
+          pct=$(coverage report --rcfile=.coveragerc --format=total)
+          if   [ "$pct" -ge 90 ]; then color=brightgreen
+          elif [ "$pct" -ge 75 ]; then color=green
+          elif [ "$pct" -ge 60 ]; then color=yellowgreen
+          elif [ "$pct" -ge 40 ]; then color=yellow
+          else color=red
+          fi
+          {
+            echo "### Aggregated spyre_inference coverage"
+            echo ''
+            echo "![coverage](https://img.shields.io/badge/coverage-${pct}%25-${color})"
+            echo ''
+            cat coverage.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage reports
+        if: ${{ hashFiles('coverage.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            coverage.xml
+            htmlcov/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
   # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
   # one of the matrix configs above: perf runs benchmarks, not pytest markers,
@@ -431,7 +559,7 @@ jobs:
       ${{ !cancelled()
           && github.event_name != 'pull_request'
           && needs.resolve.outputs.resolved_test_type == 'perf' }}
-    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre')) }}
     timeout-minutes: 720
     env:
       CI: ''
@@ -445,7 +573,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
+      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
+      # use_prebaked_image is true, so the run uses the image's Spyre stack
+      # as-is. See issue #543.
       - name: Install Spyre RPMs
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
@@ -472,6 +604,11 @@ jobs:
 
       - name: Gather runner info
         uses: ./.github/actions/gather-runner-info
+        with:
+          # Echo the exact runner-label selectors this job's runs-on used
+          # (mirrors the perf runs-on expression: the fixed pool labels plus
+          # the per-PR runner_label override, or the standing image label).
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
       - name: Build spyre-inference
         env:

@@ -137,7 +137,12 @@ class _SpyreRotaryMixin:
         cos_sin_cache ([[cos, -sin], [sin, cos]]), zero-padding the inner dim to the
         next stick multiple."""
         if self._rotation_cache is None:
-            inner = self.rotary_dim // 2
+            # Derive inner from the cache actually present, not rotary_dim: when a
+            # head is padded (head_size=64 -> 128), fix_padded_rope injects the
+            # original narrower cos_sin_cache so the real frequencies survive; the
+            # trailing dims are then zero-padded to _padded_inner (harmless because
+            # the matching x pair dims are zero from weight padding).
+            inner = self.cos_sin_cache.shape[-1] // 2
             cos, sin = self.cos_sin_cache.chunk(2, dim=-1)
             cache = torch.stack([cos, -sin, sin, cos], dim=1).view(
                 self.cos_sin_cache.shape[0], 2, 2, inner

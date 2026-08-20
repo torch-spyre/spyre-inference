@@ -64,7 +64,43 @@ def parse_args():
         default=os.environ.get("AIU_WORLD_SIZE", "1"),
         help="AIU_WORLD_SIZE value (default: from env or '1')",
     )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="",
+        help="comma-separated model names to run (empty = all); matched "
+        "case-insensitively against each config's model",
+    )
+    parser.add_argument(
+        "--bench-types",
+        type=str,
+        default="",
+        help="comma-separated subset of latency,throughput,serve to run (empty = all)",
+    )
     return parser.parse_args()
+
+
+def _config_model(config: dict) -> str | None:
+    """Model name for a benchmark config (serve uses server_parameters)."""
+    for key in ("parameters", "server_parameters"):
+        model = config.get(key, {}).get("model")
+        if model:
+            return model
+    return None
+
+
+def _select_configs(configs: list, models: set[str], source: Path) -> list:
+    """Keep only configs whose model is in `models` (empty = keep all)."""
+    if not models:
+        return configs
+    selected = []
+    for config in configs:
+        model = _config_model(config)
+        if model and model.lower() in models:
+            selected.append(config)
+        else:
+            log.info("Skipping %s (model %s not selected)", config.get("test_name"), model)
+    return selected
 
 
 def build_command_args(parameters: dict) -> list[str]:
@@ -141,6 +177,7 @@ def run_benchmarks_from_file(
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
+    models: set[str],
 ) -> tuple[int, int]:
     """Run all benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -153,6 +190,8 @@ def run_benchmarks_from_file(
     if not isinstance(configs, list):
         log.error("%s is not a YAML list", config_file)
         return 0, 1
+
+    configs = _select_configs(configs, models, config_file)
 
     passed = 0
     failed = 0
@@ -275,6 +314,7 @@ def run_serve_benchmarks_from_file(
     results_dir: Path,
     spyre_devices: str,
     aiu_world_size: str,
+    models: set[str],
 ) -> tuple[int, int]:
     """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
@@ -288,6 +328,8 @@ def run_serve_benchmarks_from_file(
         log.error("%s is not a YAML list", config_file)
         return 0, 1
 
+    configs = _select_configs(configs, models, config_file)
+
     passed = 0
     failed = 0
     for config in configs:
@@ -295,6 +337,9 @@ def run_serve_benchmarks_from_file(
         server_parameters = config.get("server_parameters", {})
         bench_parameters = config.get("parameters", {})
         env_config = config.get("environment_variables", {})
+        # Large models pay a one-time warmup compile before /health passes;
+        # let a config bump this past the 180s default.
+        health_timeout = int(config.get("server_health_timeout", 180))
 
         success = run_serve_benchmark(
             test_name=test_name,
@@ -304,6 +349,7 @@ def run_serve_benchmarks_from_file(
             results_dir=results_dir,
             spyre_devices=spyre_devices,
             aiu_world_size=aiu_world_size,
+            health_timeout=health_timeout,
         )
         if success:
             passed += 1
@@ -313,46 +359,64 @@ def run_serve_benchmarks_from_file(
     return passed, failed
 
 
+VALID_BENCH_TYPES = ("latency", "throughput", "serve")
+
+
 def main():
     args = parse_args()
     configs_dir = Path(args.configs_dir)
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
+    models = {m.strip().lower() for m in args.models.split(",") if m.strip()}
+    bench_types = {b.strip().lower() for b in args.bench_types.split(",") if b.strip()}
+    unknown = bench_types - set(VALID_BENCH_TYPES)
+    if unknown:
+        log.error("Unknown bench types %s; valid: %s", sorted(unknown), VALID_BENCH_TYPES)
+        sys.exit(2)
+    if not bench_types:
+        bench_types = set(VALID_BENCH_TYPES)
+
     total_passed = 0
     total_failed = 0
 
     # Run latency benchmarks
-    passed, failed = run_benchmarks_from_file(
-        config_file=configs_dir / "latency-tests.yaml",
-        bench_type="latency",
-        results_dir=results_dir,
-        spyre_devices=args.spyre_devices,
-        aiu_world_size=args.aiu_world_size,
-    )
-    total_passed += passed
-    total_failed += failed
+    if "latency" in bench_types:
+        passed, failed = run_benchmarks_from_file(
+            config_file=configs_dir / "latency-tests.yaml",
+            bench_type="latency",
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+            models=models,
+        )
+        total_passed += passed
+        total_failed += failed
 
     # Run throughput benchmarks
-    passed, failed = run_benchmarks_from_file(
-        config_file=configs_dir / "throughput-tests.yaml",
-        bench_type="throughput",
-        results_dir=results_dir,
-        spyre_devices=args.spyre_devices,
-        aiu_world_size=args.aiu_world_size,
-    )
-    total_passed += passed
-    total_failed += failed
+    if "throughput" in bench_types:
+        passed, failed = run_benchmarks_from_file(
+            config_file=configs_dir / "throughput-tests.yaml",
+            bench_type="throughput",
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+            models=models,
+        )
+        total_passed += passed
+        total_failed += failed
 
     # Run serve benchmarks (after latency/throughput to avoid port conflicts)
-    passed, failed = run_serve_benchmarks_from_file(
-        config_file=configs_dir / "serve-tests.yaml",
-        results_dir=results_dir,
-        spyre_devices=args.spyre_devices,
-        aiu_world_size=args.aiu_world_size,
-    )
-    total_passed += passed
-    total_failed += failed
+    if "serve" in bench_types:
+        passed, failed = run_serve_benchmarks_from_file(
+            config_file=configs_dir / "serve-tests.yaml",
+            results_dir=results_dir,
+            spyre_devices=args.spyre_devices,
+            aiu_world_size=args.aiu_world_size,
+            models=models,
+        )
+        total_passed += passed
+        total_failed += failed
 
     # Summary
     log.info("=== Benchmark Summary ===")

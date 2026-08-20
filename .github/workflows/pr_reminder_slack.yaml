@@ -1,0 +1,75 @@
+name: PR Reminder (Slack)
+
+# Daily nudge for reviewers: posts the stalest open PRs to Slack via
+# scripts/pr_reminder/pr_reminder.py. See scripts/pr_reminder/README.md for the
+# required secret and the optional repo variables.
+on:
+  schedule:
+    # Twice a day, weekdays only (day-of-week 1-5 = Mon-Fri, evaluated in UTC),
+    # so each side of the Atlantic gets it in their morning. Both are
+    # deliberately off the hour: GitHub delays scheduled runs under load and the
+    # top of the hour is its documented peak. Cron has no DST handling, so both
+    # drift an hour later in local terms during summer time.
+    #
+    # 08:03 UTC = 10:03 Zurich CEST (09:03 CET in winter)
+    - cron: '3 8 * * 1-5'
+    # 15:03 UTC = 10:03 US EST (11:03 EDT in summer)
+    - cron: '3 15 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Render the message and print it instead of posting to Slack
+        type: boolean
+        default: true
+
+permissions:
+  contents: read        # check out the reminder script
+  pull-requests: read   # list open PRs
+  issues: write         # file the failure-escalation issue
+
+concurrency:
+  group: pr-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    name: Post stale-PR reminder
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Posting needs EITHER the SLACK_WEBHOOK_URL secret (channel is fixed by
+      # the hook) OR the SLACK_BOT_TOKEN secret plus the SLACK_CHANNEL_ID
+      # variable. The webhook wins when both are set. Everything below is
+      # optional and falls back to the defaults shown.
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      SLACK_MENTION_GROUP_ID: ${{ vars.PR_REMINDER_SLACK_GROUP_ID || 'S0BKBNPFP0W' }}
+      MAX_PRS: ${{ vars.PR_REMINDER_MAX_PRS || '10' }}
+      STALE_HOURS: ${{ vars.PR_REMINDER_STALE_HOURS || '24' }}
+      MAX_IDLE_DAYS: ${{ vars.PR_REMINDER_MAX_IDLE_DAYS || '30' }}
+      EXEMPT_LABELS: ${{ vars.PR_REMINDER_EXEMPT_LABELS || 'keep-open,stale,do-not-merge' }}
+
+    steps:
+      - name: Checkout reminder script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: scripts/pr_reminder
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Install Python dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install -r scripts/pr_reminder/requirements.txt
+
+      # Scheduled runs have no inputs, so dry_run is falsy there and the job
+      # posts for real; manual dispatch defaults to a dry run.
+      - name: Post reminder
+        run: |
+          source .venv/bin/activate
+          python3 scripts/pr_reminder/pr_reminder.py ${DRY_RUN:+--dry-run}
+        env:
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}

@@ -5,28 +5,28 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -2186,13 +2186,13 @@ resolution-markers = [
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -2282,14 +2282,14 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -4125,21 +4125,21 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
-    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.12.*' and platform_machine != 'ppc64le' and sys_platform == 'darwin'",
     "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -4399,6 +4399,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "coverage" },
     { name = "spyre-testing-plugin" },
 ]
 
@@ -4407,12 +4408,15 @@ requires-dist = [
     { name = "hf-adapters-spyre", git = "https://github.com/torch-spyre/hf-adapters.git?rev=a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" },
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=56c288343bd199bbdd65365b24bffdbd39c2b34e" },
-    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.26.0" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=f8d4f43bb3493d13c33cbb2608558dfcdf44774c" },
+    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.27.1" },
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "spyre-testing-plugin", editable = "tests/plugin" }]
+dev = [
+    { name = "coverage" },
+    { name = "spyre-testing-plugin", editable = "tests/plugin" },
+]
 
 [[package]]
 name = "spyre-testing-plugin"
@@ -4770,7 +4774,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=56c288343bd199bbdd65365b24bffdbd39c2b34e#56c288343bd199bbdd65365b24bffdbd39c2b34e" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=f8d4f43bb3493d13c33cbb2608558dfcdf44774c#f8d4f43bb3493d13c33cbb2608558dfcdf44774c" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -4945,8 +4949,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.26.0+empty"
-source = { git = "https://github.com/vllm-project/vllm?rev=v0.26.0#568afb3a13806beb53bb2e6bd518269357b237c0" }
+version = "0.27.1+empty"
+source = { git = "https://github.com/vllm-project/vllm?rev=v0.27.1#6e448d0ea9bf3d88d898b65449ca6dc2aec170ac" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },

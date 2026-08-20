@@ -6,7 +6,23 @@
     SPYRE_DEVICES: '0'
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    tensor_parallel_size: 1 # TP is not supported; SpyreCommunicator: allreduce is not natively available
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    random-input-len: 64
+    random-output-len: 64
+    num-prompts: 16
+    max-model-len: 128
+- test_name: throughput_granite33-8b_tp1_in64_out64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    # Extra time to compile
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 1
     dtype: float16
     load_format: auto
     random-input-len: 64

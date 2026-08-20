@@ -17,6 +17,8 @@
 import math
 from types import SimpleNamespace
 
+import pytest
+
 import torch
 
 from vllm.config import VllmConfig, ModelConfig, CacheConfig
@@ -292,3 +294,105 @@ def test_num_gpu_blocks_override_skipped_for_hybrid():
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
     assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+
+def _fake_pad_config(head_dim=64, num_heads=8, **rope_attrs):
+    """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
+
+    hf_config and hf_text_config share one object (the common case). Returns
+    (vllm_config, hf_config, model_config) so tests can assert on mutations.
+    """
+    hf_config = SimpleNamespace(
+        num_attention_heads=num_heads,
+        hidden_size=head_dim * num_heads,
+        head_dim=head_dim,
+        **rope_attrs,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        model_arch_config=SimpleNamespace(head_size=head_dim),
+        using_transformers_backend=lambda: False,
+    )
+    return SimpleNamespace(model_config=model_config), hf_config, model_config
+
+
+def test_pad_head_dim_full_rotary_pads():
+    """Full neox rotary (rotary_dim == head_dim): head_dim 64 -> 128 as normal.
+
+    transformers 5.x carries all RoPE config in ``rope_parameters``; absence of a
+    partial-rotary factor there means full rotary.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0}
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 128
+    assert hf._spyre_orig_head_dim == 64
+    assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_rejects_rope_dim():
+    """An absolute rope_dim override won't scale to the padded width -> fail fast."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "rope_dim": 64},
+    )
+    with pytest.raises(NotImplementedError, match="rope_dim"):
+        TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    # Bail out before mutating anything.
+    assert hf.head_dim == 64
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+    assert mc.model_arch_config.head_size == 64
+
+
+def test_pad_head_dim_rejects_partial_rotary_factor():
+    """Partial rotary (GPTNeoX/Phi shape) lands in rope_parameters in 5.x -> fail fast."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    )
+    with pytest.raises(NotImplementedError, match="partial_rotary_factor"):
+        TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+    assert hf.head_dim == 64
+
+
+def test_reduced_rotary_dim_reason_branches():
+    """Unit-test the detector directly. All RoPE config lives in rope_parameters (5.x)."""
+    from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+
+    ns = SimpleNamespace
+    # Full rotary / no rope config -> not reduced.
+    assert reduced_rotary_dim_reason(ns()) is None
+    assert reduced_rotary_dim_reason(ns(rope_parameters={"rope_type": "default"})) is None
+    assert reduced_rotary_dim_reason(ns(rope_parameters={"partial_rotary_factor": 1.0})) is None
+
+    # Reductions below head_dim.
+    assert "rope_dim" in reduced_rotary_dim_reason(ns(rope_parameters={"rope_dim": 64}))
+    assert "partial_rotary_factor" in reduced_rotary_dim_reason(
+        ns(rope_parameters={"partial_rotary_factor": 0.25})
+    )
+
+
+def test_pad_head_dim_aligned_model_with_rope_dim_not_rejected():
+    """head_dim already 128-aligned (e.g. MLA rope_dim models): guard must not fire."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(
+        head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "rope_dim": 64},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)  # returns early, no raise
+
+    assert hf.head_dim == 128
+    assert not hasattr(hf, "_spyre_orig_head_dim")

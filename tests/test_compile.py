@@ -18,23 +18,27 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.compile
+
 
 @pytest.mark.parametrize(
     "model_ref_output",
     [
         (
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            "\n\nA list of Identified Benefits under Debt Management – Count",
+            "\n\nIBMs main businesses are the companies that provide the services of the",
         ),
-        pytest.param(
-            ("google/gemma-3-1b-it", "\n\nIBM's main"),
-            marks=pytest.mark.skip(reason="Gemma3 currently doesn't work with torch.compile"),
+        (
+            "google/gemma-3-1b-it",
+            "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
         ),
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
-    from vllm import LLM
+    from vllm import LLM, SamplingParams
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     prompt = "What are IBMs main businesses?"
 
@@ -48,7 +52,11 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
         max_num_seqs=2,
     )
 
-    output = engine.generate(prompt, use_tqdm=False)
+    output = engine.generate(
+        prompt,
+        SamplingParams(temperature=0.0, max_tokens=16),
+        use_tqdm=False,
+    )
 
     assert prompt == output[0].prompt, "Model output contained wrong prompt!"
     assert ref_output == output[0].outputs[0].text, "Model produced wrong output!"

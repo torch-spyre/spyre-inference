@@ -109,6 +109,9 @@ EXCLUDED = {
     "bitsandbytes",
     "arctic-inference",
     "cohere-melody",
+    # cohere chat v2 api tests (protocol/serving import cohere.types);
+    # no entrypoints test collected
+    "cohere",
     "gpt-oss",
     "peft",
     # torch extras excluded elsewhere (torchaudio/torchvision via the root
@@ -136,6 +139,7 @@ EXCLUDED = {
     "plotly",
     "pqdm",
     "tritonclient",
+    "torch-abi-audit",  # CI check for PyTorch stable ABI compliance; not a collected/run test dep
 }
 
 # Header emitted inside the generated dependencies array.

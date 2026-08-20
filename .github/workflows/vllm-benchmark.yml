@@ -83,7 +83,7 @@ jobs:
       fail-fast: false
     runs-on:
       - x86_64
-      - spyre_pf_x4__pvc_1tb_x1
+      - spyre_pf_x4
       - linux
       - image_torch_spyre
     timeout-minutes: 240
@@ -159,9 +159,11 @@ jobs:
         # hand-duplicate ibm-aiu-setup.sh sourcing.
         env:
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
+          MATRIX_MODELS: ${{ matrix.models }}
         run: |
           mkdir -p benchmark-results
           make perf-tests RESULTS_DIR=benchmark-results \
+            MODELS="${MATRIX_MODELS}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
       - name: Install ClickHouse ingest dependencies

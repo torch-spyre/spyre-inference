@@ -208,8 +208,17 @@ class TorchSpyrePlatform(CpuPlatform):
         # preserve that so eager stays eager.
         # NOTE: If vllm_config.compilation_config.mode is None and
         # vllm_config.model_config.enforce_eager == False,
-        # no particular compilation mode has been selected. Continue in eager for the moment
-        if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode is None:
+        # no particular compilation mode has been selected. Continue in eager for the moment.
+        # vLLM re-runs this hook after mode has already been resolved (e.g. in the
+        # EngineCore subprocess), so we must treat CompilationMode.NONE the same as
+        # an unset (Python None) mode — otherwise a prior eager decision (NONE == 0,
+        # which is not `None`) falls through to the else branch and gets flipped to
+        # STOCK_TORCH_COMPILE, re-enabling torch.compile that our CPU-fallback ops
+        # can't survive.
+        if vllm_config.model_config.enforce_eager or vllm_config.compilation_config.mode in (
+            None,
+            CompilationMode.NONE,
+        ):
             vllm_config.compilation_config.mode = CompilationMode.NONE
         else:
             # Warn the user if a different compile mode has been selected explicitly
@@ -277,6 +286,66 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
+        """Override hf_config.head_dim to a 128-multiple when the native head_dim
+        is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
+
+        No-op on the transformers backend (it pads RoPE itself), for models whose
+        head_dim is already a multiple of 128 (e.g. head_size=128 Granite), and for
+        models without RoPE. The restickify failure this works around is
+        RoPE-induced, so non-RoPE models (OPT, GPT-2, GPT-BigCode) lower fine at
+        head=64; padding them is both unnecessary and unsupported by the port,
+        which assumes a RoPE model that sizes attention from ``config.head_dim`` and
+        names its output projection ``o_proj`` (OPT ignores ``config.head_dim`` and
+        uses ``out_proj``).
+        """
+        from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+
+        model_config = vllm_config.model_config
+        # `model_impl` stays "auto" when vLLM falls back to the Transformers backend
+        # for an unregistered arch, so check the resolved class, not the request.
+        if model_config.using_transformers_backend():
+            return
+
+        hf_config = model_config.hf_config
+        num_heads = getattr(hf_config, "num_attention_heads", None)
+        hidden_size = getattr(hf_config, "hidden_size", None)
+        if num_heads is None or hidden_size is None:
+            return
+
+        # transformers 5.x unifies all RoPE config under `rope_parameters`
+        cfgs = (hf_config, model_config.hf_text_config)
+        if not any(getattr(c, "rope_parameters", None) for c in cfgs):
+            return
+
+        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
+        if orig % 128 == 0:
+            return
+
+        padded = ((orig + 127) // 128) * 128
+        for cfg in (hf_config, model_config.hf_text_config):
+            reason = reduced_rotary_dim_reason(cfg)
+            if reason is not None:
+                raise NotImplementedError(
+                    f"Spyre must pad attention head_dim {orig} -> {padded} for stick "
+                    f"alignment, but this model reduces the rotary dimension below "
+                    f"head_dim ({reason})."
+                )
+        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+            cfg._spyre_orig_head_dim = orig
+            cfg.head_dim = padded
+        # ModelConfig snapshots head_size into model_arch_config in __post_init__,
+        # before this hook runs; keep it in sync or get_head_size() (and the KV
+        # page-size accounting built on it) reports the pre-pad width.
+        model_config.model_arch_config.head_size = padded
+        logger.info(
+            "Padding attention head_dim %d -> %d for Spyre stick alignment "
+            "(original preserved as _spyre_orig_head_dim).",
+            orig,
+            padded,
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -288,15 +357,18 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"but was specified to be {vllm_config.model_config.dtype}"
             )
 
+        # Pad attention head_dim up to a stick-aligned size on the native path.
+        cls._maybe_pad_head_dim(vllm_config)
+
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The list-based attention backend requires 64-element stick alignment for
+        # The Spyre paged attention backend requires 64-element stick alignment for
         # torch.compile.
         cache_config = vllm_config.cache_config
         original_block_size = cache_config.block_size
         if original_block_size % 64 != 0:
             new_block_size = ((original_block_size + 63) // 64) * 64
             logger.warning(
-                "Block size must be a multiple of 64 for the list-based attention "
+                "Block size must be a multiple of 64 for the Spyre paged attention "
                 "backend. Overriding block_size from %d to %d.",
                 original_block_size,
                 new_block_size,

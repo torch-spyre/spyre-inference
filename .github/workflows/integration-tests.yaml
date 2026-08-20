@@ -86,6 +86,11 @@ on:
         required: false
         type: string
         default: ''
+      use_prebaked_image:
+        description: When true, skip the "Install Spyre RPMs" step and use the runner image's Spyre stack as-is.
+        required: false
+        type: boolean
+        default: false
       test_type:
         description: >-
           Suite subset to run: unit | integration (default, the smoke suite)
@@ -107,9 +112,25 @@ on:
         default: integration
 
 concurrency:
+  # PR-context runs (native pull_request, or workflow_dispatch carrying a
+  # pr_url_hash) key on the PR itself, so re-triggering the same PR cancels its
+  # own stale in-flight run -- unchanged from before.
+  #
+  # A non-PR dispatch (scheduled/main-push/nightly/weekly -- pr_url_hash empty)
+  # previously fell back to bare github.ref, so EVERY such dispatch of this
+  # workflow on the same ref shared one group regardless of test_type. Two
+  # unrelated dispatches landing close together (e.g. a nightly trunk run while
+  # a push-triggered trunk run is still going) then cancelled each other via
+  # cancel-in-progress, silently killing a run mid-job with no test failure and
+  # no error -- see the run/job-level symptoms this fixes. Disambiguating by
+  # test_type stops different suites from colliding at all.
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
-    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || github.ref }}
-  cancel-in-progress: true
+    && inputs.pr_url_hash != '' && inputs.pr_url_hash) || format('{0}-{1}', github.ref, inputs.test_type) }}
+  # Only cancel for a PR-context run (re-running the same PR should supersede
+  # its own stale run). A non-PR dispatch is never "the same PR re-triggered" --
+  # cancelling it destroys a run that has nothing superseding it, so a same
+  # test_type/ref collision QUEUES behind the in-flight run instead of killing it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.pr_url_hash != '') }}
 
 permissions:
   contents: read
@@ -155,6 +176,10 @@ jobs:
     with:
       # Dispatch flow: always run, regardless of changed files.
       skip_if_no_changes: false
+      # Forward the caller's choice. Default false installs the baseline RPMs.
+      # A dispatch on a prebaked image (for example Jenkins with a per-PR
+      # runner_label) passes true to skip that install. See issue #543.
+      use_prebaked_image: ${{ inputs.use_prebaked_image }}
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       torch_spyre_ref: ${{ inputs.torch_spyre_ref || '' }}

@@ -66,8 +66,14 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
-from spyre_inference.custom_ops.linear import transpose_linear_weights_for_spyre
-from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
+from spyre_inference.custom_ops.head_pad import (
+    fix_padded_attention_scale,
+    fix_padded_rope,
+    install_head_pad_weight_loader,
+    install_padded_head_dim,
+    reject_padded_qk_norm,
+    verify_padded_head_dim,
+)
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -78,10 +84,7 @@ from spyre_inference.v1.pool import (
 
 logger = init_logger(__name__)
 
-# Observed Spyre DMA failure threshold for encoder-only dummy batches with
-# multiple sequences.  Pooling warmup stays below this limit.
-SPYRE_ENCODER_DMA_TOKEN_LIMIT = 30
-# Token count for pooling warmup (single sequence), kept under the DMA limit.
+# Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
 
 
@@ -394,6 +397,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         self._install_pooling_model_patches(self.model_config)
 
+        # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
+        # stream in, when the platform overrode head_dim (e.g. head_size=64).
+        # Must run before load_model builds+loads the (now 128-wide) params.
+        install_padded_head_dim(self.model_config)
+        install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
+
         # Load model on CPU
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
@@ -410,20 +419,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Un-fuse QKV / gate-up projections.
-        analyze_and_unfuse(self.model)
+        # Restore original RoPE frequencies and attention scale corrupted by the
+        # head_dim width override (no-op unless the platform padded head_dim).
+        verify_padded_head_dim(self.model, self.model_config.hf_config)
+        reject_padded_qk_norm(self.model, self.model_config.hf_config)
+        fix_padded_rope(self.model, self.model_config.hf_config)
+        fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
-
-        # Store 2-D linear weights transposed (Wᵀ) and matmul directly, so the
-        # forward GEMM is the fast `x @ A` instead of `F.linear`'s slow `x @ Aᵀ`
-        # (torch-spyre #3512). vLLM linears aren't nn.Linear, so torch-spyre's
-        # [1,0]-layout `.to("spyre")` patch skips them; we do the equivalent here
-        # in pure PyTorch. Runs after un-fusing (QKV carries its own transpose).
-        transpose_linear_weights_for_spyre(self.model)
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
@@ -493,9 +499,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Run a dummy forward pass to warm up kernels and optional compile.
 
         In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1`` to
-        stay under the Spyre DMA limit for encoder dummy batches. Compiled
-        mode uses the normal warmup size so shapes match torch.compile.
+        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1``.
+        Compiled mode uses the normal warmup size so shapes match torch.compile.
         """
         logger.info("Warming up model...")
         t0 = time.time()
@@ -509,7 +514,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 and self.vllm_config.model_config.enforce_eager
             )
             if use_eager_pooling_warmup:
-                # Match single-sequence embed metadata; cap tokens for DMA.
                 num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
                 saved_max_num_seqs = self.scheduler_config.max_num_seqs
                 try:
@@ -658,16 +662,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
-        """Allocate KV cache as lists of individual page tensors on Spyre.
+        """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
-        is a list of tensors of shape [num_kv_heads, block_size, head_size] on
-        the Spyre device. This matches upstream vLLM's paged model but uses
-        list indices instead of tensor indices — enabling direct per-page bmm
-        without advanced indexing.
+        is a single tensor of shape [num_blocks, block_size, num_kv_heads,
+        head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
+        advertises. The attention kernel selects a page by indexing with a
+        one-element device tensor, so the page read is a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
-        from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            SpyrePagedKVCache,
+            slot_major_kv_layout,
+        )
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
@@ -684,29 +691,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Default stickification splits head_size into 64-element sticks.
-            # Alternative: stickify block_size or num_kv_heads for different
-            # access patterns (would require explicit SpyreTensorLayout).
-            k_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
-            v_pages: list[torch.Tensor] = [
-                torch.zeros(
-                    spec.num_kv_heads,
-                    spec.block_size,
-                    spec.head_size,
-                    dtype=torch.float16,
-                    device=self._spyre_device,
-                )
-                for _ in range(num_blocks)
-            ]
+            # Host-allocated then transferred: only .to() takes a device_layout.
+            layout = slot_major_kv_layout(
+                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            )
+
+            k_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            v_pages = torch.zeros(
+                num_blocks,
+                spec.block_size,
+                spec.num_kv_heads,
+                spec.head_size,
+                dtype=torch.float16,
+            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

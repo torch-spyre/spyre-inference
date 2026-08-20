@@ -26,10 +26,13 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
+    build_attention_mask,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
-pytestmark = pytest.mark.attention
+# extra `encoder_attention` mark so CI can split this into its own job
+# because these tests are pretty slow.
+pytestmark = [pytest.mark.attention, pytest.mark.encoder_attention]
 
 
 @pytest.fixture()
@@ -66,8 +69,8 @@ def configure_compilation(request, monkeypatch):
     original_limit = torch._dynamo.config.accumulated_recompile_limit
 
     cfg.mode = compilation_mode
-    # Increase recompilation limit to handle list-based page_indices
-    # which trigger recompilation on each unique block index value
+    # Increase recompilation limit: the page-attention kernel is specialized
+    # (and so recompiled) per unique (num_blocks, padded_query_len)
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -233,6 +236,70 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
+def _loop_attention_mask(
+    num_seqs: int,
+    aligned_len: int,
+    query_lens: list[int],
+    kv_lens: list[int],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Host slice-write reference for ``build_attention_mask``."""
+    neg_inf = torch.finfo(dtype).min
+    mask = torch.full((num_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
+    for s in range(num_seqs):
+        q_len = query_lens[s]
+        kv_len = min(q_len, kv_lens[s])
+        mask[s, 0, :q_len, :kv_len] = 0.0
+    return mask
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,aligned_len",
+    [
+        pytest.param([32], [32], 64, id="single_32"),
+        pytest.param([9, 70, 5], [9, 70, 5], 128, id="batch_unaligned"),
+        pytest.param([16, 8], [8, 8], 64, id="kv_shorter_than_q"),
+    ],
+)
+@torch.inference_mode()
+def test_build_attention_mask_matches_loop(
+    configure_device: str,
+    query_lens: list[int],
+    kv_lens: list[int],
+    aligned_len: int,
+) -> None:
+    """Vectorized host mask must match the slice-write reference.
+
+    Spyre ``convert`` of fp16 ``finfo.min`` (-65504) is not bit-exact (off by
+    32). Attend slots must stay 0; pad slots must stay hugely negative.
+    """
+    dtype = torch.float16
+    device = torch.device(configure_device)
+    ref = _loop_attention_mask(len(query_lens), aligned_len, query_lens, kv_lens, dtype)
+    got = build_attention_mask(
+        len(query_lens),
+        aligned_len,
+        query_lens,
+        kv_lens,
+        dtype=dtype,
+        device=device,
+    ).cpu()
+    attend = ref == 0
+    torch.testing.assert_close(got[attend], ref[attend], atol=0, rtol=0)
+    if configure_device == "cpu":
+        torch.testing.assert_close(got, ref, atol=0, rtol=0)
+        return
+    assert bool((got[~attend] < -1e4).all()), "pad slots must stay a large negative"
+
+
 @pytest.mark.parametrize(
     "configure_device",
     [
@@ -269,8 +336,8 @@ def ref_encoder_attn(
 @pytest.mark.parametrize(
     "head_size",
     [
-        pytest.param(128, id="head_size(128)"),
-        # pytest.param(64, id="head_size(64)"),
+        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32.
+        pytest.param(64, id="head_size(64)"),
     ],
 )
 @pytest.mark.parametrize(
@@ -356,7 +423,7 @@ def test_spyre_encoder_attn(
 
     cache_device = torch.device(configure_device)
     output = torch.empty_like(query).to(cache_device)
-    kv_cache = SpyrePagedKVCache(k_pages=[], v_pages=[])
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     attn_impl.forward(
         layer=None,
         query=query,

@@ -241,6 +241,9 @@ def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
     class FakeLMHead:
         def __init__(self, weight_tensor):
             self.weight = weight_tensor
+            # Upstream _get_logits reads lm_head.tp_size to decide whether to
+            # gather across TP ranks; single-rank test, so no gather.
+            self.tp_size = 1
             self.shard_indices = type(
                 "SI", (), {"num_org_vocab_padding": 0, "org_vocab_start_index": 0}
             )()

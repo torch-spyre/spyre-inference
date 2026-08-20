@@ -1,105 +1,145 @@
 # Profiling Spyre with Kineto
 
-This manual explains how to profile Spyre workloads using PyTorch's
-Kineto profiler on both the **old stack** (`sendnn-inference`) and the
-**new stack** (`spyre-inference`). Both stacks use the same class of
-Kineto-patched torch build, but the vLLM-level API for enabling
-profiling differs.
+This manual explains how to profile Spyre workloads with
+`spyre-inference` using PyTorch's Kineto profiler.
 
 ---
 
 ## 1. Prerequisites
 
-### 1.1 Kineto-patched torch wheel (both stacks)
+### 1.1 AIUPTI profiler backend
 
 A standard CPU-only PyTorch build includes the Kineto profiling
 framework, but its `PrivateUse1` backend — PyTorch's generic slot for
 third-party accelerators — is a no-op. Run the profiler as-is and the
 device timeline in Perfetto is empty.
 
-The patched build connects Kineto's `PrivateUse1` profiler slot to
-`libaiupti.so`, the AIU hardware performance-counter library that
-records kernel start/end timestamps directly on the card.
+The AIUPTI activity provider connects Kineto's `PrivateUse1` profiler
+slot to `libaiupti.so`, the AIU hardware performance-counter library
+that records kernel start/end timestamps directly on the card.
+Historically this shipped as a separate `+aiu.kineto` torch wheel; as
+of torch-spyre PR
+[#1856](https://github.com/torch-spyre/torch-spyre/pull/1856)
+(merged 2026-08-04) it lives inside `torch-spyre` itself and is
+registered via PyTorch's `REGISTER_PRIVATEUSE1_PROFILER` macro. The
+Python-facing API is unchanged — you still use
+`torch.profiler.profile(activities=[CPU, PrivateUse1])`.
 
-Wheels are published at the `kineto-spyre` release page:
-
-<https://github.com/IBM/kineto-spyre/releases>
-
-**Pick the wheel that matches the torch build currently installed in
-your venv.** The patched wheel replaces the stock torch install, so
-its version must line up with what is already there. Check first:
-
-```bash
-python -c "import torch, sys; print(torch.__version__, sys.version_info[:2])"
-```
-
-Then pick the release asset whose:
-
-- **torch major.minor version** matches the reported `torch.__version__`
-  prefix
-- **`cpXY` Python tag** matches the reported Python version (e.g.
-  `cp312` for Python 3.12)
-- **platform tag** matches your OS/architecture (typically
-  `linux_x86_64`)
-
-Filenames follow the pattern
-`torch-<MAJOR.MINOR.PATCH>+aiu.kineto.<KINETO_VER>-<pyver>-<pyver>-<platform>.whl`.
+The AIUPTI backend is compiled in **only** when torch-spyre is built
+with `USE_SPYRE_PROFILER=1`. The `spyre-inference` `pyproject.toml`
+currently pins this flag to `"0"` (under
+`[tool.uv.extra-build-variables.torch-spyre]`) to avoid a long
+model-load stall on Z, so a plain `uv sync` produces a torch-spyre
+wheel with **no AIU device events** in the trace — CPU-side rows are
+present, the device row is empty, and no error is raised.
 
 ### 1.2 Requirements on the target system
 
-Before installing the wheel, verify:
-
-1. **`libaiupti.so` is present** on the system:
+1. **`libaiupti.so` and its headers are present:**
 
    ```bash
    ls /opt/ibm/spyre/runtime/lib/libaiupti.so
+   ls /opt/ibm/spyre/runtime/include/libaiupti/*.h
    ```
 
-   This is the AIU hardware performance-counter library that the
-   patched Kineto build links against. It ships with the Spyre
-   runtime. If it is missing, profiling will silently produce empty
-   device rows.
+   The runtime library and its headers ship with the Spyre runtime.
+   Both are needed at build time; the `.so` is needed at run time.
 
 2. **The Spyre device is accessible** — typically a `/dev/vfio/<N>`
    node exposed to the container.
 
 3. **`uv` is available** (or an equivalent Python package installer).
 
-### 1.3 Installing the wheel
+### 1.3 Enabling the AIUPTI backend
 
-Activate the venv that contains your vLLM install and force-reinstall
-the patched wheel:
+**Option A — persistent (`pyproject.toml` flip):**
 
-```bash
-source /path/to/your-venv/bin/activate
-uv pip install --no-deps --force-reinstall /path/to/downloaded-wheel.whl
+Edit `pyproject.toml` in `spyre-inference`:
+
+```toml
+[tool.uv.extra-build-variables.torch-spyre]
+USE_SPYRE_PROFILER = "1"   # was "0"
 ```
 
-`--no-deps` prevents unrelated dependency updates. `--force-reinstall`
-is required because the base version prefix matches the stock CPU
-wheel — without it, `uv` considers the install already satisfied and
-skips.
+Then `uv sync` — the resulting wheel has AIUPTI compiled in. This is
+the right path for anyone using this venv for profiling long-term.
+Because the flag was originally set to `"0"` to work around long Z
+model-load times, flipping it in-tree is a project-level decision, not
+a silent local edit.
+
+**Option B — rebuild in place after each pod recreate:**
+
+If you want to leave `pyproject.toml` alone, force-reinstall
+torch-spyre with the flag set:
+
+```bash
+USE_SPYRE_PROFILER=1 \
+  LIBAIUPTI_INSTALL_DIR=/opt/ibm/spyre/runtime \
+  LD_LIBRARY_PATH="/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH" \
+  /path/to/your-venv/bin/python -m pip install \
+    --no-deps --force-reinstall --no-cache-dir \
+    "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@<rev>"
+```
+
+Pin `<rev>` to whatever commit `[tool.uv.sources.torch-spyre]` in
+`pyproject.toml` resolves to. Do **not** pass `--no-build-isolation`:
+the build system's `torch~=2.13.0` requirement needs an isolated env,
+and the venv's torch is not trusted for build. Build isolation
+downloads ~1 GB of torch into `/tmp/pip-build-env-*/` and cleans up
+after; watch `/tmp` space on tight pods.
+
+`uv sync` / `uv run` will silently re-install the pinned non-profiler
+wheel on top of this — invoke Python from the venv directly, or use
+`uv run --no-sync …`, when iterating.
 
 ### 1.4 Verify installation
 
-After install, `torch.__version__` should include the `+aiu.kineto`
-suffix:
+Stock torch is expected — the `+aiu.kineto` suffix is gone:
 
 ```bash
 python -c "import torch; print(torch.__version__)"
-# Expected: <MAJOR.MINOR.PATCH>+aiu.kineto.<KINETO_VER>
+# Expected: 2.13.0+cpu   (no +aiu.kineto suffix)
 ```
 
-If it still reports the plain `+cpu` string, `--force-reinstall` was
-not applied or the wheel was installed into the wrong venv.
+The real signal is that the AIUPTI backend is linked into
+`torch_spyre/_C.so`. Four checks — all four must pass:
+
+```bash
+SO=$(python -c "import torch_spyre, os; print(os.path.join(os.path.dirname(torch_spyre.__file__), '_C.so'))")
+
+# 1. Wheel size — profiler-enabled build is ~5× bigger (~77 MB vs ~15 MB).
+ls -la "$SO"
+
+# 2. libaiupti actually linked.
+ldd "$SO" | grep libaiupti
+# → libaiupti.so => /opt/ibm/spyre/runtime/lib/libaiupti.so
+
+# 3. AIUPTI symbols present in the shared object.
+nm -CD "$SO" | grep -i AiuptiActivityProfilerSession | head -3
+# → several T (defined text) entries
+
+# 4. A produced trace contains `kernel`-category events.
+python -c "
+import json, collections
+t = json.load(open('<path>.pt.trace.json'))
+cats = collections.Counter(e.get('cat','') for e in t['traceEvents'])
+assert cats.get('kernel', 0) > 0, f'no kernel events: {cats}'
+print('OK', cats.most_common(5))
+"
+```
+
+Do **not** trust `torch_spyre.profiler.is_available()` as a health
+signal — it is hardcoded to `return False` regardless of build flags
+(comment: "more to be implemented later").
 
 ---
 
-## 2. Enabling profiling — new stack
+## 2. Enabling profiling
 
-The new stack's vLLM runs the worker **in the same process** as user
-code (via `distributed_executor_backend="external_launcher"`). This
-lets `torch.profiler.profile(...)` wrap `llm.generate()` directly.
+vLLM in `spyre-inference` runs the worker **in the same process** as
+user code (via `distributed_executor_backend="external_launcher"`).
+This lets `torch.profiler.profile(...)` wrap `llm.generate()`
+directly.
 
 ### 2.1 Minimum example
 
@@ -157,9 +197,10 @@ os._exit(0)  # avoids TimestampCalibrator abort at teardown
 
 | Argument | Purpose |
 |---|---|
-| `activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]` | Which event streams to record. `PrivateUse1` is PyTorch's generic slot for third-party accelerators; Spyre registers under it. Without the kineto-patched wheel this slot is a no-op. |
+| `activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]` | Which event streams to record. `PrivateUse1` is PyTorch's generic slot for third-party accelerators; Spyre registers under it. Without a torch-spyre wheel built with `USE_SPYRE_PROFILER=1` (see §1.3), this slot is a no-op — the trace file is written but contains zero Spyre-device events. |
 | `on_trace_ready=torch.profiler.tensorboard_trace_handler("logs/")` | Callback that fires when the profiler context exits. Writes a Chrome/Perfetto-format JSON file (`.pt.trace.json`) into `logs/` with a timestamped filename. Despite the "tensorboard" name, output is Chrome trace JSON — the name is a historical artefact. |
 | `record_shapes=True` | Capture input tensor shapes for each op, so the Perfetto trace shows e.g. `aten::mm [4096, 128] x [128, 4096]` rather than just `aten::mm`. Small overhead, useful for identifying which shape bucket each attention call landed in. |
+| `with_stack=True` | Optional: capture Python call stacks per op. Event names then embed absolute source paths and line numbers, which makes the trace self-authenticating — you can tell after the fact which branch/tree it came from. Adds noticeable overhead; drop it for tight measurement runs. |
 | `acc_events=True` | Retain events in memory after the trace is written, so `prof.key_averages().table(...)` works after the context exits. Drop it if you only care about the trace file. |
 
 ### 2.3 Load-bearing environment variables
@@ -183,7 +224,7 @@ Contents of the script and why each entry matters:
 |---|---|---|
 | (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the venv's `python` and packages on `PATH`. This is a deployment-style path; for a local `uv sync` install use `source .venv/bin/activate`. |
 | `VLLM_PLUGINS` | `spyre_inference` | Required for vLLM to load the Spyre platform plugin |
-| (kineto check) | — | Inspects `torch.__version__` and warns if the stock wheel is installed instead of the `+aiu.kineto` patched build; prints the install command to fix it |
+| (AIUPTI check) | — | Warns if `torch_spyre/_C.so` was not built with `USE_SPYRE_PROFILER=1` — verify via `ldd .../_C.so \| grep libaiupti` and presence of `AiuptiActivityProfilerSession` symbols. Do **not** inspect `torch.__version__` for a `+aiu.kineto` suffix; that flow was retired by torch-spyre PR #1856. See §1.3. |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |
 | `OPENBLAS_NUM_THREADS` | `1` | Pin OpenBLAS thread pool (same rationale) |
 | `MKL_NUM_THREADS` | `1` | Pin MKL thread pool (same rationale) |
@@ -195,7 +236,7 @@ these where the run is launched:
 
 | Variable | Value | Purpose |
 |---|---|---|
-| `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | `1800` | Safety margin so cumulative D2H sync stalls do not kill the run mid-generate (see §5.2) |
+| `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | `1800` | Safety margin so cumulative D2H sync stalls do not kill the run mid-generate (see §4.2) |
 | `RANK` | `0` | Torchrun-style distributed rank. `distributed_executor_backend="external_launcher"` reads it from env; set explicitly for single-process use |
 | `LOCAL_RANK` | `0` | Torchrun-style local rank; same rationale as `RANK` |
 | `WORLD_SIZE` | `1` | Total number of ranks in the job |
@@ -218,7 +259,7 @@ missing from the trace, set this to `0` manually.
 
 ### 2.4 Why warmup matters
 
-The new stack uses `torch.compile` with an Inductor cache. Each unique
+`spyre-inference` uses `torch.compile` with an Inductor cache. Each unique
 `(num_blocks, query_len)` combination compiles to its own kernel
 bundle. If the profiled `llm.generate()` call hits a shape bucket
 that was not compiled during warmup, an ~3-second
@@ -232,79 +273,7 @@ long-prompt prefill followed by a decode).
 
 ---
 
-## 3. Enabling profiling — old stack
-
-The old stack's vLLM launches the worker in a **separate process**.
-`torch.profiler.profile(...)` wrapped around `llm.generate()` in user
-code would only see the launcher process — the actual model execution
-and Spyre kernels would be invisible.
-
-Instead, the profiler configuration is passed to `LLM(...)` at
-construction time via `ProfilerConfig`, and toggled with
-`llm.start_profile()` / `llm.stop_profile()`. These are remote-procedure
-calls that tell the already-running worker to start/stop its internally
-constructed profiler context.
-
-### 3.1 Minimum example
-
-```python
-import os
-from vllm import LLM, SamplingParams
-from vllm.config.profiler import ProfilerConfig
-
-llm = LLM(
-    model="ibm-granite/granite-3.3-8b-instruct",
-    dtype="float16",
-    max_model_len=1024,
-    max_num_seqs=1,
-    num_gpu_blocks_override=64,
-    profiler_config=ProfilerConfig(
-        profiler="torch",
-        torch_profiler_dir="logs/",
-        torch_profiler_record_shapes=True,
-    ),
-)
-
-prompts = ["What do you know about Zurich?"]
-samplings = [SamplingParams(max_tokens=4, temperature=0.0)]
-
-# No warmup — old stack has no Inductor cache; compilation is part of the run
-
-llm.start_profile()
-try:
-    outputs = llm.generate(prompts, samplings)
-finally:
-    llm.stop_profile()
-
-os._exit(0)  # avoids TimestampCalibrator abort at teardown
-```
-
-### 3.2 `ProfilerConfig` field reference
-
-| Field | Purpose |
-|---|---|
-| `profiler="torch"` | Selects the torch.profiler backend (the only supported option today). |
-| `torch_profiler_dir="logs/"` | Directory where the worker will write the `.pt.trace.json` file. |
-| `torch_profiler_record_shapes=True` | Same effect as `record_shapes=True` on the new stack — captures input tensor shapes per op. |
-| `torch_profiler_with_stack=True` | Optional: captures Python call stacks for each op, so Perfetto can show the source-line origin. Adds noticeable overhead. |
-
-The worker constructs the underlying `torch.profiler.profile()` with
-`activities=[CPU, PrivateUse1]` automatically — user code cannot
-override the activity list on this path.
-
-### 3.3 Load-bearing environment variables
-
-| Variable | Value | Purpose |
-|---|---|---|
-| `VLLM_PLUGINS` | `sendnn_inference` | Required for vLLM to load the sendnn platform plugin. Without it, `current_platform.device_type` is empty and `LLM(...)` aborts with `RuntimeError: Device string must not be empty`. |
-| `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` | `1800` | Safety margin for cumulative sync stalls |
-
-`HOME` must point to a directory writable by the running user (for
-Hugging Face weight caching).
-
----
-
-## 4. Viewing traces
+## 3. Viewing traces
 
 Traces are written as `.pt.trace.json` (or `.pt.trace.json.gz` if
 compressed). Open them in the Perfetto UI:
@@ -313,7 +282,7 @@ compressed). Open them in the Perfetto UI:
 
 The trace shows CPU thread rows on top and one Spyre device row below.
 
-For a terminal summary (new stack only, `acc_events=True` required):
+For a terminal summary (`acc_events=True` required):
 
 ```python
 prof.key_averages().table(sort_by="cpu_time_total", row_limit=20).replace("CUDA", "AIU")
@@ -326,12 +295,12 @@ call is a display fix.
 
 ---
 
-## 5. Known runtime issues (not profiler-specific)
+## 4. Known runtime issues (not profiler-specific)
 
 These affect any Spyre run, but appear most frequently during profiling
 because profile runs are longer and more numerous than smoke tests.
 
-### 5.1 libflex lost-wakeup wedge
+### 4.1 libflex lost-wakeup wedge
 
 **Symptom:** `RuntimeStream::synchronize()` warning at 60s, escalating
 to 120s, 180s, ... with `in_flight_=1` and no recovery. Process
@@ -354,7 +323,7 @@ The system `libflex.so` typically lives at
 `/opt/ibm/spyre/runtime/lib/libflex.so`; `LD_PRELOAD` is used because
 that directory is often read-only.
 
-### 5.2 60-second D2H stall
+### 4.2 60-second D2H stall
 
 **Symptom:** `RuntimeStream::synchronize() still waiting after 60000ms:
 in_flight_=0` followed by `completed after 60000ms`. Recovers on its
@@ -375,7 +344,7 @@ come from cold-start flakes and compile-mode warmup drain.
 os.environ.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "1800")
 ```
 
-### 5.3 VFIO DMA mapping exhaustion
+### 4.3 VFIO DMA mapping exhaustion
 
 **Symptom:** `RAS::VFIO::MapDMAFailed / "No space left on device"`.
 
@@ -403,7 +372,7 @@ which will drastically reduce both the total tensor count and the
 number of VFIO DMA mappings the cache consumes. The sizing guidance
 above will remain correct until then.
 
-### 5.4 `TimestampCalibrator` abort at exit
+### 4.4 `TimestampCalibrator` abort at exit
 
 **Symptom:** abort message printed at process exit.
 
@@ -414,9 +383,36 @@ destructor to fail its own invariants at teardown.
 **Fix:** call `os._exit(0)` at end of `main()` to bypass Python's
 normal C++ destructor chain.
 
+### 4.5 AIU trace buffer exhaustion — truncated device timeline
+
+**Symptom:** stderr line
+`Exceeded max AIU buffer count (5 > 5) - terminating tracing`
+during a profiled run. The trace file is still written and still opens
+in Perfetto, but the device row is truncated: kernels appear up to
+some point mid-run and then abruptly stop, while the CPU rows keep
+going.
+
+**Cause:** the AIUPTI backend allocates a fixed pool of trace buffers
+(hardcoded max 5) and terminates capture when the pool fills. Even a
+4-token smoke test can trip this once compilation flushes are
+included; anything longer will trip it deterministically.
+
+**Fix:** no environment knob is exposed as of PR #1856. Mitigations:
+
+- Keep the profiled window as short as possible — profile a single
+  `generate()` call, not the warmup passes.
+- Use `with_stack=False` and `record_shapes=False` when hunting a
+  timeline scope issue; both add per-event overhead.
+- For a permanent lift, patch `AiuptiActivityApi.cpp` (search for
+  the buffer-count constant) and rebuild torch-spyre, or file an
+  upstream request for an env knob.
+
+Do **not** interpret an empty tail on the device row as "the workload
+went idle" — check stderr for the exhaustion message first.
+
 ---
 
-## 6. Monitoring device utilization with `aiu-smi`
+## 5. Monitoring device utilization with `aiu-smi`
 
 Kineto captures per-op timings inside a bounded profiling window;
 `aiu-smi` complements it by streaming per-second AIU hardware counters
@@ -424,7 +420,7 @@ Kineto captures per-op timings inside a bounded profiling window;
 across the whole run. This surfaces long idle gaps, DMA saturation,
 and thermal throttling that a short profiler window would miss.
 
-### 6.1 Two-terminal recipe
+### 5.1 Two-terminal recipe
 
 `aiu-smi` reads counters from a metric file that the workload process
 writes. `SENLIB_DEVEL_CONFIG_FILE` must be exported in **both**
@@ -458,7 +454,7 @@ Sample output:
   0 20260715  11:45:28    828.3     5.2   75     42   87    4.2    3.1    0.8    0.2     1.2     0.9     512
 ```
 
-### 6.2 Column reference
+### 5.2 Column reference
 
 | Column | Meaning |
 |---|---|
@@ -470,7 +466,7 @@ Sample output:
 | `rsvmem` | Reserved HBM (MB). Under-reports in `aiu-monitor` 1.0.0. |
 | `hostcpu` | Host CPU %, summed across cores (~800% on 8 cores is normal). |
 
-### 6.3 Useful options
+### 5.3 Useful options
 
 ```bash
 aiu-smi -d 2               # poll every 2 seconds (default 1s)
@@ -483,7 +479,7 @@ CSV output pairs well with a Kineto trace: run `aiu-smi -s -f run.csv`
 alongside a profiled `generate()` and the row timestamps align to the
 Perfetto trace window.
 
-### 6.4 Known limitations
+### 5.4 Known limitations
 
 - PF (physical-function) mode only; VF mode is unsupported by
   `aiu-monitor` 1.0.0.

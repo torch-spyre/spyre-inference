@@ -51,6 +51,26 @@ else
 JUNIT_ARGS :=
 endif
 
+# --- Coverage ---------------------------------------------------------------
+# Opt-in via COVERAGE=1: run-one exports COVERAGE_PROCESS_START so every
+# interpreter it spawns (pytest + vLLM workers) starts coverage. coverage's
+# shipped a1_coverage.pth startup hook fires on that env var, so no PYTHONPATH
+# bootstrap is needed. As a command-line var, COVERAGE propagates to the
+# fan-out sub-makes automatically.
+COVERAGE ?=
+COVERAGE_RC := $(CURDIR)/.coveragerc
+# `coverage` tool for the coverage target. Standalone hosts without the venv
+# (e.g. GHA's fan-in) override COVERAGE_TOOL=coverage.
+COVERAGE_TOOL ?= uv run --no-sync coverage
+# Dir of .coverage.* files to combine. Empty = current dir.
+COVERAGE_DATA ?=
+
+ifneq ($(COVERAGE),)
+COVERAGE_ENV := COVERAGE_PROCESS_START="$(COVERAGE_RC)"
+else
+COVERAGE_ENV :=
+endif
+
 # Map TEST_TYPE to a pytest -m marker expression. regression -> no filter
 # (all tests). MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
 # need a marker expression finer than the 3 coarse tiers (e.g. CI splitting
@@ -71,6 +91,9 @@ MARK_EXPR :=
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
+# Single-invocation integration = the union of the CI smoke + compile jobs, so
+# `make tests TEST_TYPE=integration` locally keeps the compile coverage that CI
+# splits into its own job. (compile is not attention-marked, so it stays in.)
 MARK_EXPR := -m "not (distributed or upstream or attention)"
 else ifeq ($(TEST_TYPE),unit)
 MARK_EXPR := -m "not upstream"
@@ -85,16 +108,19 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests print-test-type \
+.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-attention test-distributed \
-        test-upstream test-upstream-distributed test-upstream-model
+        test-upstream test-upstream-distributed test-upstream-model \
+        tests-single-card tests-multi-card
 
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
 	@echo "Variables: TEST_TYPE=unit|integration|regression|trunk|perf (default regression), MARK_OVERRIDE (raw -m expr, bypasses TEST_TYPE),"
 	@echo "  PYTEST_ARGS (default '$(PYTEST_ARGS)'), JUNIT_XML (single-run path; unset = no JUnit file),"
-	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)')"
+	@echo "  RESULTS_DIR (aggregate JUnit output dir for TEST_TYPE=regression/trunk, default '$(RESULTS_DIR)'),"
+	@echo "  COVERAGE=1 (measure coverage during test runs), then \`make coverage\` to aggregate"
+	@echo "  (COVERAGE_DATA=dir of data files, COVERAGE_TOOL=coverage for a standalone runner)"
 
 print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_test_matrix.yaml) resolve TEST_TYPE via `make -s print-test-type TEST_TYPE=...` without duplicating this Makefile's validation logic.
 	@echo "$(TEST_TYPE)"
@@ -133,13 +159,19 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
 
-test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention)' JUNIT_XML=$(JUNIT_XML)
+test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile).
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile)' JUNIT_XML=$(JUNIT_XML)
 
-test-attention: ## Run the attention-only marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+test-compile: ## Run the torch.compile marker combo (its own job; slow).
+	$(MAKE) run-one MARK_OVERRIDE='compile and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split).
+	$(MAKE) run-one MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
+	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
 test-distributed: ## Run the distributed marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='distributed and not upstream' JUNIT_XML=$(JUNIT_XML)
@@ -152,6 +184,26 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 
 test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
+
+# Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
+# Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
+tests-single-card: ## Run the non-distributed marker combos (smoke/compile/attention/encoder-attention/upstream/upstream-model). Needs 1 card.
+	mkdir -p "$(RESULTS_DIR)"; \
+	rc=0; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-smoke" && $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke/junit-test-smoke.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-compile" && $(MAKE) test-compile JUNIT_XML="$(RESULTS_DIR)/junit-test-compile/junit-test-compile.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-attention" && $(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-attention/junit-test-attention.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-upstream" && $(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream/junit-test-upstream.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-model" && $(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-model/junit-test-upstream-model.xml" || rc=1; \
+	exit $$rc
+
+tests-multi-card: ## Run the distributed marker combos (distributed/upstream-distributed). Needs 2 cards.
+	mkdir -p "$(RESULTS_DIR)"; \
+	rc=0; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-distributed" && $(MAKE) test-distributed JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed/junit-test-distributed.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-distributed" && $(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-distributed/junit-test-upstream-distributed.xml" || rc=1; \
+	exit $$rc
 
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
 # coverage), GHA's _test_matrix.yaml runs this as 6 separate marker-combo
@@ -166,16 +218,21 @@ tests: ## Run tests. TEST_TYPE=unit|integration|regression|trunk|perf (default r
 	else \
 	  mkdir -p "$(RESULTS_DIR)"; \
 	  rc=0; \
-	  $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/smoke.xml" || rc=1; \
-	  $(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/attention.xml" || rc=1; \
-	  $(MAKE) test-distributed JUNIT_XML="$(RESULTS_DIR)/distributed.xml" || rc=1; \
-	  $(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/upstream.xml" || rc=1; \
-	  $(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/upstream-distributed.xml" || rc=1; \
-	  $(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/upstream-model.xml" || rc=1; \
+	  $(MAKE) tests-single-card RESULTS_DIR="$(RESULTS_DIR)" || rc=1; \
+	  $(MAKE) tests-multi-card RESULTS_DIR="$(RESULTS_DIR)" || rc=1; \
 	  exit $$rc; \
 	fi
 
 test: tests  ## Alias for `tests`, matching torch-spyre's Makefile target name.
+
+# Combine COVERAGE=1 data into one dataset ([paths] maps across runners) and
+# emit a log table, coverage.xml, htmlcov/, and coverage.md.
+coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.xml + htmlcov/ + coverage.md.
+	$(COVERAGE_TOOL) combine --keep --rcfile=$(COVERAGE_RC) $(COVERAGE_DATA)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --show-missing
+	$(COVERAGE_TOOL) xml --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) html --rcfile=$(COVERAGE_RC)
+	$(COVERAGE_TOOL) report --rcfile=$(COVERAGE_RC) --format=markdown > coverage.md
 
 # On some arches (notably s390x) `uv run` refuses to reuse the prebaked image
 # venv: it re-resolves the project, cannot find an s390x torch/vllm wheel
@@ -193,9 +250,18 @@ else
 BENCH_PY := python3
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
+# Optional benchmark filters (empty = run everything). MODELS narrows to a
+# comma-separated set of model names -- CI passes the per-model matrix entry
+# here so each job benches a single model. BENCH_TYPES narrows to a subset of
+# latency,throughput,serve for quick local iteration.
+MODELS ?=
+BENCH_TYPES ?=
+
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
 	mkdir -p "$(RESULTS_DIR)"
 	$(AIU_SETUP_CMD); \
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
-		--results-dir "$(RESULTS_DIR)"
+		--results-dir "$(RESULTS_DIR)" \
+		--models "$(MODELS)" \
+		--bench-types "$(BENCH_TYPES)"

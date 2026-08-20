@@ -103,13 +103,19 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
 
 
 def select_rows(hidden_states: torch.Tensor, row_indices_cpu: torch.Tensor) -> torch.Tensor:
-    """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``)."""
-    if hidden_states.device.type != "spyre":
-        return torch.index_select(hidden_states, 0, row_indices_cpu.to(hidden_states.device))
+    """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
-    # int32 indices: Spyre has no int64; sync before read (non_blocking H2D).
-    indices = convert(row_indices_cpu.to(torch.int32), hidden_states.device)
-    torch.spyre.synchronize(hidden_states.device)
+    ``row_indices_cpu`` may be 1-D (CLS/LAST, unpack) or ``[B, L]`` (pack).
+    """
+    flat_idx = row_indices_cpu.reshape(-1)
+    if hidden_states.device.type != "spyre":
+        return torch.index_select(
+            hidden_states, 0, flat_idx.to(device=hidden_states.device, dtype=torch.long)
+        )
+
+    # Spyre has no int64 index kernel. convert() H2D is blocking
+    # (copy_tensor non_blocking=False); no extra synchronize.
+    indices = convert(flat_idx.to(torch.int32), hidden_states.device)
     return torch.index_select(hidden_states, 0, indices)
 
 

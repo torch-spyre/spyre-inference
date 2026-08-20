@@ -29,7 +29,9 @@ repos:
     ]
     exclude: '.*\.inc\.md'
 - repo: https://github.com/rhysd/actionlint
-  rev: v1.7.7
+  # v1.7.10+ knows workflow_dispatch now allows 25 inputs (was 10); older
+  # actionlint flags a >10-input dispatch as a false positive.
+  rev: v1.7.12
   hooks:
   - id: actionlint
 - repo: local

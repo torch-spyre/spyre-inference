@@ -89,12 +89,8 @@ class _SpyreRotaryMixin:
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime
-        # the device rotation cache here (before torch.compile traces forward_oot). _apply
-        # passes only `fn`, not a device, and we have no moved tensor to read it off, so
-        # probe `fn`; dtype-only casts (.half()/.float()) stay on CPU and skip priming.
-        device = fn(torch.zeros(1, dtype=self.dtype)).device
-        if device.type != "cpu":
-            self._get_device_rotation_cache(device)
+        # the device rotation cache here (before torch.compile traces forward_oot).
+        self._device_rotation_cache = fn(self._get_device_rotation_cache())
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
@@ -117,14 +113,12 @@ class _SpyreRotaryMixin:
             self._rotation_cache = cache
         return self._rotation_cache
 
-    def _get_device_rotation_cache(self, device: torch.device) -> torch.Tensor:
+    def _get_device_rotation_cache(self) -> torch.Tensor:
         """Device-resident copy of the 4D rotation cache ``[max_pos, 2, 2, padded]``,
         built once from the CPU cache so the per-pass gather runs on-device via
         ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = convert(
-                self._get_rotation_cache().contiguous(), device=device, dtype=self.dtype
-            )
+            self._device_rotation_cache = self._get_rotation_cache().contiguous()
         return self._device_rotation_cache
 
     def forward_oot(
@@ -134,7 +128,7 @@ class _SpyreRotaryMixin:
         key: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Cache was primed in _apply before compile, so only the index_select is traced.
-        cache = self._get_device_rotation_cache(query.device)
+        cache = self._get_device_rotation_cache()
         rot = cache.index_select(0, positions.flatten())
         out_query = _rotate_neox_2x2(
             query,  # ty: ignore[invalid-argument-type]

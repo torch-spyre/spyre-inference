@@ -40,8 +40,6 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
 
-from .utils import convert
-
 logger = init_logger(__name__)
 
 

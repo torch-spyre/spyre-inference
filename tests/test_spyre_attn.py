@@ -352,6 +352,7 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    tile_kv_heads: int | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
@@ -440,6 +441,7 @@ def _run_spyre_attn_test(
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
+        tile_kv_heads=tile_kv_heads,
     )
 
     output = torch.empty_like(query).to(cache_device)
@@ -580,6 +582,53 @@ def test_spyre_attn_force_compile_attn_multi_seq(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "tile_kv_heads",
+    [
+        pytest.param(1, id="tile_kv_heads(1)"),
+        pytest.param(2, id="tile_kv_heads(2)"),
+        pytest.param(4, id="tile_kv_heads(4)"),
+        pytest.param(8, id="tile_kv_heads(8)"),
+    ],
+)
+def test_spyre_attn_tiling(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    tile_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Hkv coarse-tiling must not change results (num_kv_heads=8 divisible by all)."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        tile_kv_heads=tile_kv_heads,
     )
 
 

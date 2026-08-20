@@ -15,6 +15,8 @@
 """Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
 import functools
+import json
+import contextlib
 from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
 
@@ -84,8 +86,57 @@ QUERY_CHUNK_SIZE = 32
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
-# SpyreAttentionMetadata.page_index_tables.
+# SpyreAttentionMetadata.page_index_table.
 INT32_ELEMS_PER_STICK = 32
+
+# Directory of tuned coarse-tile configs, one JSON per attention shape signature
+# (see _attn_tile_config_filename). Emitted by scripts/tune_attn_tiling.py.
+_TILE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
+
+
+def _attn_tile_config_filename(
+    head_size: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    block_size: int,
+) -> str:
+    return (
+        f"head_size={head_size},num_kv_heads={num_kv_heads},"
+        f"num_queries_per_kv={num_queries_per_kv},block_size={block_size}.json"
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_attn_tile_config(
+    head_size: int,
+    num_kv_heads: int,
+    num_queries_per_kv: int,
+    block_size: int,
+) -> dict:
+    """Load the tuned coarse-tile config for this shape, or a no-op fallback.
+
+    Fallback is {"tile_kv_heads": 1} (no tiling), so an absent or invalid config
+    leaves the kernel byte-identical to the untuned path. tile_kv_heads must divide
+    num_kv_heads evenly (the compiler asserts even divisibility); a value that
+    does not is dropped back to 1 with a warning.
+    """
+    fname = _attn_tile_config_filename(
+        head_size, num_kv_heads, num_queries_per_kv, block_size
+    )
+    path = os.path.join(_TILE_CONFIG_DIR, fname)
+    if not os.path.exists(path):
+        logger.debug_once(f"No attention tile config at {path}; tiling disabled")
+        return {"tile_kv_heads": 1}
+    with open(path) as f:
+        cfg = json.load(f)
+    tile_kv_heads = int(cfg.get("tile_kv_heads", 1))
+    if tile_kv_heads < 1 or num_kv_heads % tile_kv_heads != 0:
+        logger.warning(
+            f"Ignoring tile_kv_heads={tile_kv_heads} from {path}: must be >=1 and divide "
+            f"num_kv_heads={num_kv_heads} evenly; disabling tiling"
+        )
+        return {"tile_kv_heads": 1}
+    return {"tile_kv_heads": tile_kv_heads}
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -161,16 +212,45 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
 # ---------------------------------------------------------------------------
 
 
+@contextlib.contextmanager
+def _kv_head_tile_scope(tile_kv_heads: int, num_kv_heads: int):
+    """Coarse-tile the enclosed per-block ops along the KV-head dim (Hkv).
+
+    No-op when tile_kv_heads <= 1 or torch_spyre's hint API is unavailable (e.g. the
+    CPU-only path), so the default kernel stays byte-identical. Requires the
+    "kv_head" dim to be declared so the hint can bind to a loop var.
+    """
+    if tile_kv_heads <= 1:
+        yield
+        return
+    try:
+        from torch_spyre._inductor import spyre_hint
+        from torch_spyre._inductor.wsr.propagate_named_dims import declare_tensor_dim
+    except ImportError:
+        yield
+        return
+    declare_tensor_dim("kv_head", num_kv_heads)
+    with spyre_hint(num_tiles_per_dim={"kv_head": tile_kv_heads}):
+        yield
+
+
 def _create_compilable_page_attn(
     num_blocks: int,
     padded_query_len: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
+    tile_kv_heads: int = 1,
+    num_kv_heads: int = 0,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
-    logits_soft_cap are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
+    logits_soft_cap, and tile_kv_heads are closure constants.
+
+    tile_kv_heads > 1 wraps the per-block compute in a coarse-tile hint over the
+    leading KV-head dim (Hkv), shrinking the score/prob transients so the fused
+    chain stays resident and avoids spill/refill IO. tile_kv_heads == 1 emits no
+    hints. Supplied by the tuned config (see _get_attn_tile_config).
     """
 
     def specialized_paged_attn_kernel(
@@ -204,50 +284,57 @@ def _create_compilable_page_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            # index_select, not `k_pages[page_idx]`: subscripting lowers to
-            # aten.index, which upcasts the int32 index to int64 and fails eager.
-            page_idx = page_index_table[i, 0:1]
-            k_page = k_pages.index_select(0, page_idx)
-            v_page = v_pages.index_select(0, page_idx)
-            # Token-major page to head-major for the matmuls; permutes on device.
-            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            with _kv_head_tile_scope(tile_kv_heads, num_kv_heads):
+                # The page gather and permutes stay inside the tile scope so the
+                # gathered page is loop_internal scratch (resident on-chip) rather
+                # than a full buffer written back to HBM and re-read per tile. The
+                # gather indexes the outermost block dim (layout-compliant); the
+                # kv_head tiling only divides the consuming matmul/softmax chain.
+                #
+                # index_select, not `k_pages[page_idx]`: subscripting lowers to
+                # aten.index, which upcasts the int32 index to int64 and fails eager.
+                page_idx = page_index_table[i, 0:1]
+                k_page = k_pages.index_select(0, page_idx)
+                v_page = v_pages.index_select(0, page_idx)
+                # Token-major page to head-major for the matmuls; permutes on device.
+                k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+                v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
-            mask_tile = mask_tiles[i]
+                mask_tile = mask_tiles[i]
 
-            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-            if logits_soft_cap > 0.0:
-                # Pull logits into (-cap, +cap) before the mask add so masked
-                # positions still map cleanly to -inf. Applied before the ALiBi
-                # bias so the positional term is not squashed by the tanh.
-                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-            if has_alibi:
-                # ALiBi bias slope[h] * (kv_pos - context_len). The additive
-                # mask_tile below uses finfo.min for masked positions, so this
-                # bias cannot un-mask them.
-                assert alibi_bias_tiles is not None
-                scores = scores + alibi_bias_tiles[i]
-            scores = scores + mask_tile
-            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+                scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+                if logits_soft_cap > 0.0:
+                    # Pull logits into (-cap, +cap) before the mask add so masked
+                    # positions still map cleanly to -inf. Applied before the ALiBi
+                    # bias so the positional term is not squashed by the tanh.
+                    scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+                if has_alibi:
+                    # ALiBi bias slope[h] * (kv_pos - context_len). The additive
+                    # mask_tile below uses finfo.min for masked positions, so this
+                    # bias cannot un-mask them.
+                    assert alibi_bias_tiles is not None
+                    scores = scores + alibi_bias_tiles[i]
+                scores = scores + mask_tile
+                scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-            if i == 0:
-                tile_max = scores_max
-                tile_probs = torch.exp(scores - tile_max)
-                tile_output = torch.matmul(tile_probs, v_page_4d)
-                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-            else:
-                # i > 0 only reachable after the i == 0 branch initialized these.
-                assert tile_max is not None
-                assert tile_sum is not None
-                assert tile_output is not None
-                new_max = torch.maximum(tile_max, scores_max)
-                rescale = torch.exp(tile_max - new_max)
-                tile_output = tile_output * rescale
-                tile_sum = tile_sum * rescale
-                tile_probs = torch.exp(scores - new_max)
-                tile_output += torch.matmul(tile_probs, v_page_4d)
-                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-                tile_max = new_max
+                if i == 0:
+                    tile_max = scores_max
+                    tile_probs = torch.exp(scores - tile_max)
+                    tile_output = torch.matmul(tile_probs, v_page_4d)
+                    tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+                else:
+                    # i > 0 only reachable after the i == 0 branch initialized these.
+                    assert tile_max is not None
+                    assert tile_sum is not None
+                    assert tile_output is not None
+                    new_max = torch.maximum(tile_max, scores_max)
+                    rescale = torch.exp(tile_max - new_max)
+                    tile_output = tile_output * rescale
+                    tile_sum = tile_sum * rescale
+                    tile_probs = torch.exp(scores - new_max)
+                    tile_output += torch.matmul(tile_probs, v_page_4d)
+                    tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                    tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
         return tile_output / tile_sum
@@ -822,6 +909,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        tile_kv_heads: int | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -830,6 +918,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.num_queries_per_kv = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+
+        # Coarse-tile count for the KV-head dim in the online-softmax kernel.
+        # None -> resolved lazily per block_size from the tuned config
+        # (_get_attn_tile_config); an explicit value overrides the config (tests).
+        # Must divide num_kv_heads evenly.
+        if tile_kv_heads is not None and (tile_kv_heads < 1 or num_kv_heads % tile_kv_heads != 0):
+            raise ValueError(
+                f"tile_kv_heads={tile_kv_heads} must be >=1 and divide num_kv_heads={num_kv_heads}"
+            )
+        self._tile_kv_heads_override = tile_kv_heads
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -856,17 +954,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
-        self._attn_fns: dict[tuple[int, int], object] = {}
+        # Compiled attention loops, keyed by
+        # (num_blocks, padded_query_len, tile_kv_heads).
+        self._attn_fns: dict[tuple[int, int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+    def _resolve_tile_kv_heads(self, block_size: int) -> int:
+        """Tile count for the KV-head dim: explicit override, else tuned config."""
+        if self._tile_kv_heads_override is not None:
+            return self._tile_kv_heads_override
+        return _get_attn_tile_config(
+            self.head_size, self.num_kv_heads, self.num_queries_per_kv, block_size
+        )["tile_kv_heads"]
+
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int, block_size: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len)
+        # tile_kv_heads can vary with block_size (config is shape-keyed), so it is.
+        tile_kv_heads = self._resolve_tile_kv_heads(block_size)
+        key = (num_blocks, padded_query_len, tile_kv_heads)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -874,6 +983,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     padded_query_len,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
+                    tile_kv_heads=tile_kv_heads,
+                    num_kv_heads=self.num_kv_heads,
                 )
             )
         return self._attn_fns[key]
@@ -1105,7 +1216,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
+            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len, block_size)
             result = attn_fn(
                 q_dev,
                 k_pages,

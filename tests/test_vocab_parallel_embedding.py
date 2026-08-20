@@ -148,13 +148,14 @@ def test_fake_tp2_forward_matches_reference(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Spyre's inductor backend rejects int64 Python-int constants in "
-        "comparisons: `Constant(value=N, dtype=torch.int64) to greaterequal`. "
-        "This is the load-bearing limitation behind SpyreVocabParallelEmbedding's "
-        "CPU bounce — upstream `get_masked_input_and_mask` runs `input_ >= "
-        "org_vocab_start_index` under @torch.compile. A 0-D-tensor workaround "
-        "compiles but produces silently-wrong values, so CPU bounce is the only "
-        "correct path. When this flips to passing, delete the CPU bounce in "
+        "Spyre's inductor backend rejects int64 comparisons: `Spyre backend "
+        "does not support: torch.bool result of operand with device format "
+        "DataFormats.IEEE_INT32`. This is the load-bearing limitation behind "
+        "SpyreVocabParallelEmbedding's CPU bounce — upstream "
+        "`get_masked_input_and_mask` runs `input_ >= org_vocab_start_index` "
+        "under @torch.compile. A 0-D-tensor workaround compiles but produces "
+        "silently-wrong values, so CPU bounce is the only correct path. When "
+        "this flips to passing, delete the CPU bounce in "
         "SpyreVocabParallelEmbedding.forward and let the upstream forward path "
         "run on-device."
     ),

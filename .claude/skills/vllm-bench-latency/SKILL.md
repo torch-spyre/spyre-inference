@@ -86,7 +86,7 @@ Report the model + exact params, then numbers from the JSON:
 - **Single run**: avg latency + p50/p90/p99 (s). Optionally decode throughput = `output-len × batch-size / avg_latency` tok/s (decode only — ignores prefill).
 - **Compare mode**: a small table (branch vs main) of avg latency + key percentiles, the absolute and % change (`(branch − main) / main × 100`), and which is faster. Label each column with its branch/sha.
 
-```
+```text
 model: <model>   params: in<N>/out<N>/bs<N>/max<N>/iters<N>/warmup<N>/<MODE>
                         main (<sha>)   <branch> (<sha>)   Δ
 avg latency (s)         <a>            <b>                <b−a>  (<pct>%, <faster/slower>)

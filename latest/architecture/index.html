@@ -2005,7 +2005,7 @@ ops injected via OOT registration.</p>
 <tr>
 <td><code>vllm.general_plugins</code></td>
 <td><code>spyre_inference:register_ops</code></td>
-<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the opaque <code>spyre_rope_rot</code> and <code>spyre_convert</code> custom ops</td>
+<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the <code>spyre_convert</code> and <code>spyre_vocab_mask</code> custom ops (RoPE registers no op — its rotation runs in-graph)</td>
 </tr>
 <tr>
 <td><code>vllm.general_plugins</code></td>
@@ -2030,10 +2030,10 @@ kernel in pure PyTorch.</p>
 <h2 id="custom-op-replacement">Custom Op Replacement<a class="headerlink" href="#custom-op-replacement" title="Permanent link">&para;</a></h2>
 <p>Each layer that requires Spyre-specific handling is replaced via vLLM's
 <code>@ClassName.register_oot()</code> decorator. Most replacements are pure class swaps that run
-when the ops package is imported; two layers (rotary embedding, the <code>convert</code> helper)
-also register an opaque custom op via <code>register_all()</code> — <code>spyre_convert</code> keeps device
-transfers invisible to <code>torch.compile</code>, and <code>spyre_rope_rot</code> keeps the forward-context
-read of the gathered rotation slice out of the compiled graph.</p>
+when the ops package is imported. A couple also register a custom op via <code>register_all()</code>:
+<code>spyre_convert</code> (the <code>convert</code> helper) keeps device transfers invisible to <code>torch.compile</code>,
+and <code>spyre_vocab_mask</code> runs the vocab shard mask on CPU. RoPE registers no op — its
+rotation-cache gather and 2×2 rotation run directly in the compiled graph (see below).</p>
 <table>
 <thead>
 <tr>
@@ -2053,14 +2053,14 @@ read of the gathered rotation slice out of the compiled graph.</p>
 <tr>
 <td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>
 <td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code></td>
-<td>Spyre (<code>index_select</code> on CPU)</td>
-<td>2×2 rotation-matrix formulation runs on Spyre; only the frequency-cache <code>index_select</code> (<code>gather_rotation</code>) runs on CPU before the forward, then the gathered slice is moved to Spyre and read back through the opaque <code>spyre_rope_rot</code> op. Only neox-style full rotary is supported (other configs raise <code>NotImplementedError</code> at construction)</td>
+<td>Spyre</td>
+<td>Fully on-device, no opaque op. A device-resident 4D rotation cache (<code>[max_pos, 2, 2, rotary_dim//2]</code>) is built from <code>cos_sin_cache</code> and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 inner dim <code>rotary_dim//2</code> must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below)</td>
 </tr>
 <tr>
 <td><code>VocabParallelEmbedding</code></td>
 <td><code>SpyreVocabParallelEmbedding</code></td>
-<td>CPU → Spyre</td>
-<td>The weight is pinned to CPU (<code>_apply</code> is a no-op — <code>F.embedding</code> has no Spyre kernel), so the gather runs CPU-to-CPU on the CPU-<code>convert</code>ed input; TP shard mask is computed on CPU (Spyre inductor rejects int64 constants); only the gathered output is <code>convert</code>ed back to Spyre; <code>all_reduce</code> when TP&gt;1</td>
+<td>Spyre (mask on CPU when TP&gt;1)</td>
+<td>The weight moves to Spyre with the model and the embedding gather runs on-device (<code>aten.embedding</code> now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP&gt;1, only the shard mask runs on CPU via the <code>spyre_vocab_mask</code> op (Spyre inductor rejects the upstream int64-vs-Python-int comparisons); <code>masked_input</code>/<code>keep</code> are <code>convert</code>ed back to Spyre before the gather and <code>all_reduce</code></td>
 </tr>
 <tr>
 <td><code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>, <code>ReplicatedLinear</code></td>
@@ -2215,18 +2215,19 @@ call boundary:</p>
   Spyre for the <code>SpyreParallelLMHead</code> matmul, which then returns logits on CPU</li>
 </ul>
 <p><code>SpyreVocabParallelEmbedding</code> inherits weight loading and shard arithmetic from upstream
-and overrides <code>forward</code> to compute the TP shard mask on CPU (the upstream helper does
+and overrides <code>forward</code>. The weight moves to Spyre with the rest of the model, and the
+embedding gather runs on-device now that <code>aten.embedding</code> has a Spyre kernel
+(<a href="https://github.com/torch-spyre/torch-spyre/issues/420">torch-spyre#420</a>) — this
+replaces the earlier silent D2H/H2D CPU fallback that copied the full <code>[vocab, hidden]</code>
+weight on every decode step. The one remaining CPU round-trip is the TP shard mask: when
+TP&gt;1, <code>forward</code> runs the upstream <code>get_masked_input_and_mask</code> helper on CPU (it does
 int64 comparisons against Python int constants, which the Spyre inductor backend
-rejects). Because <code>F.embedding</code> has no Spyre kernel, its <code>_apply</code> override is a no-op
-that pins the weight to CPU: the input is <code>convert</code>ed to CPU, the gather runs
-CPU-to-CPU, and only the gathered output is <code>convert</code>ed back to Spyre. This replaces the
-earlier silent D2H/H2D CPU fallback of <code>aten.embedding</code>
-(<a href="https://github.com/torch-spyre/torch-spyre/issues/420">torch-spyre#420</a>), which
-copied the full <code>[vocab, hidden]</code> weight on every decode step.</p>
+rejects), then <code>convert</code>s <code>masked_input</code>/<code>keep</code> back to Spyre before the on-device gather
+and <code>all_reduce</code>.</p>
 <p>Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
-operations that Spyre doesn't yet support natively (the embedding gather, the rotary
-frequency-cache <code>index_select</code>, q/k/v slicing, the per-sequence attention varlen loop,
-logits indexing).</p>
+operations that Spyre doesn't yet support natively (the per-sequence
+attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
+gather both run on-device now, so neither is among them.</p>
 <h2 id="hf-adapters-transformers-backend">HF-adapters Transformers backend<a class="headerlink" href="#hf-adapters-transformers-backend" title="Permanent link">&para;</a></h2>
 <p>When <code>model_impl="transformers"</code>, the <code>register_hf_adapters</code> general plugin swaps vLLM's
 <code>TransformersForCausalLM</code> for <code>HfAdaptersForCausalLM</code> (<code>spyre_inference/hf_adapters.py</code>).

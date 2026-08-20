@@ -172,6 +172,30 @@ def test_int64_compiled_compare_against_python_int(tp_group) -> None:
     torch.testing.assert_close(out.cpu(), expected)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Spyre's inductor backend rejects int32 subtraction: `Spyre backend "
+        "does not support: sub on DataFormats.IEEE_INT32`. Upstream "
+        "`get_masked_input_and_mask` also runs `input_ - valid_offset` under "
+        "@torch.compile, so this is a second load-bearing limitation behind "
+        "SpyreVocabParallelEmbedding's lookup-table workaround. When this "
+        "flips to passing, the on-device arithmetic path can be reconsidered."
+    ),
+)
+def test_int32_compiled_subtract_against_python_int(tp_group) -> None:
+    @torch.compile
+    def sub(x, c):
+        return x - c
+
+    cpu = torch.arange(16, dtype=torch.int32)
+    on_spyre = cpu.to(torch.device("spyre:0"))
+
+    out = sub(on_spyre, 8)
+    expected = cpu - 8
+    torch.testing.assert_close(out.cpu(), expected)
+
+
 @pytest.mark.vocab_parallel_embedding
 def test_embedding_does_not_fall_back_to_cpu() -> None:
     """torch-spyre handles aten.embedding.default on-device (no CPU fallback), so a

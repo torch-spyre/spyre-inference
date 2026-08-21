@@ -972,7 +972,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _across_seqs_preconditions_met(
         self,
         attn_metadata: "SpyreAttentionMetadata",
-        query_cpu: torch.Tensor | None,
     ) -> bool:
         """Decode-only precondition for the bmm-across-sequences fast path.
 
@@ -981,7 +980,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
           - every seq has query_len == 1 (max_query_len == 1)
           - no ALiBi, no logits soft-cap (kernel doesn't handle these yet)
           - no sliding window (active_block_indices_all is None)
-          - query_cpu is present (multi-seq batches always take that path today)
         """
         if attn_metadata.num_seqs < 2:
             return False
@@ -993,11 +991,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return False
         if attn_metadata.active_block_indices is not None:
             return False
-        return query_cpu is not None
+        return True
 
     def _run_across_seqs_dispatch(
         self,
-        query_cpu: torch.Tensor,
+        query_dev: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         attn_metadata: "SpyreAttentionMetadata",
@@ -1012,8 +1010,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         into `output` at each seq's q_start position, matching the per-seq
         loop's writeback contract.
 
-        Every device tensor passed to the compiled kernel starts at
-        storage_offset == 0 (torch-spyre#3770 workaround, same discipline as
+        Every device tensor passed to the compiled kernel is materialized
+        at storage_offset == 0 via `.clone()` (same discipline as
         SpyreAttentionMetadata.page_index_tables).
         """
         head_size = self.head_size
@@ -1042,34 +1040,33 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         for tier_nb, seq_idxs in tiers.items():
             tier_n = len(seq_idxs)
 
-            # --- Query: gather this tier's rows from query_cpu (each seq has
-            # exactly one row, decode-only precondition), pad to
-            # aligned_max_query_len, reshape to
-            # [tier_n * num_kv_heads, num_queries_per_kv, Q, head_size].
-            q_rows_cpu = torch.empty(tier_n, num_heads, head_size, dtype=query_cpu.dtype)
-            for j, s in enumerate(seq_idxs):
-                q_start_s = int(query_start_loc_list[s])
-                q_rows_cpu[j] = query_cpu[q_start_s]
-            # -> [tier_n, num_kv_heads, num_queries_per_kv, 1, head_size]
-            q = q_rows_cpu.reshape(tier_n, num_kv_heads, num_queries_per_kv, 1, head_size)
+            # Gather this tier's query rows on device — one row per seq
+            # (decode-only precondition) — then pad along the query-length
+            # axis and reshape to the kernel's expected packed layout.
+            q_row_ids_cpu = torch.tensor(
+                [int(query_start_loc_list[s]) for s in seq_idxs], dtype=torch.int32
+            )
+            q_row_ids_dev = convert(q_row_ids_cpu, device=_target_device).clone()
+            q_rows_dev = query_dev.index_select(0, q_row_ids_dev)
+            q_rows_dev = q_rows_dev.reshape(
+                tier_n, num_kv_heads, num_queries_per_kv, 1, head_size
+            )
             if aligned_max_query_len > 1:
-                pad_q = torch.zeros(
+                pad = torch.zeros(
                     tier_n,
                     num_kv_heads,
                     num_queries_per_kv,
                     aligned_max_query_len - 1,
                     head_size,
-                    dtype=q.dtype,
+                    dtype=q_rows_dev.dtype,
+                    device=_target_device,
                 )
-                q = torch.cat([q, pad_q], dim=3)
-            # Fold tier_n into the leading batch axis and transfer.
-            # `.clone()` on the device tensor materializes it at
-            # storage_offset == 0 so the compiled kernel dereferences the right
-            # bytes (torch-spyre#3770).
-            q_packed = q.reshape(
+                q = torch.cat([q_rows_dev, pad], dim=3)
+            else:
+                q = q_rows_dev
+            q_packed_dev = q.reshape(
                 tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
-            ).contiguous()
-            q_packed_dev = convert(q_packed, device=_target_device).clone()
+            ).contiguous().clone()
 
             # --- Per-block K/V gather (built on device from the dense cache).
             # Invariant: sequences in a tier share the same `num_blocks_needed`,
@@ -1080,7 +1077,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # to the [tier_n * num_kv_heads, 1, block_size, head_size] shape the
             # kernel expects (matches the per-seq path's k_page_4d layout).
             # Every device tensor the compiled kernel receives is `.clone()`d
-            # to force storage_offset == 0 (torch-spyre#3770).
+            # to force storage_offset == 0.
             k_list_dev: list[torch.Tensor] = []
             v_list_dev: list[torch.Tensor] = []
             for i in range(tier_nb):
@@ -1162,7 +1159,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # --- Scatter tier outputs back into `output`. query_len is 1 per
             # seq (decode-only precondition); the .clone() is the same
-            # workaround for torch-spyre#3826 the per-seq loop uses.
+            # workaround the per-seq loop uses.
             for j, s in enumerate(seq_idxs):
                 q_start_s = int(query_start_loc_list[s])
                 output[q_start_s : q_start_s + 1] = result[j, 0:1, :, :].clone()
@@ -1299,11 +1296,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # and a decode-only precondition (see the helper for the full list).
         # Returns True when it handled the whole batch; the per-seq loop below
         # runs only when this path declines.
-        if _BMM_ACROSS_SEQS and self._across_seqs_preconditions_met(attn_metadata, query_cpu):
-            # Precondition helper guarantees query_cpu is not None here.
-            assert query_cpu is not None
+        if _BMM_ACROSS_SEQS and self._across_seqs_preconditions_met(attn_metadata):
             self._run_across_seqs_dispatch(
-                query_cpu, k_pages, v_pages, attn_metadata, output, _target_device
+                query_dev, k_pages, v_pages, attn_metadata, output, _target_device
             )
             return output
 

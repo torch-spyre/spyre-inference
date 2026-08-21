@@ -49,6 +49,7 @@ def configure_device(request, monkeypatch):
     return device_mode
 
 
+@pytest.fixture()
 def bmm_across_seqs(request, monkeypatch):
     """Flip the SPYRE_BMM_ACROSS_SEQS gate; the env var is only read at import."""
     monkeypatch.setattr(spyre_attn, "_BMM_ACROSS_SEQS", request.param)

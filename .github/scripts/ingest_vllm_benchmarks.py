@@ -269,7 +269,6 @@ def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
         "CLICKHOUSE_HOST": os.environ.get("CLICKHOUSE_HOST"),
         "CLICKHOUSE_USER": os.environ.get("CLICKHOUSE_USER"),
         "CLICKHOUSE_PASS": os.environ.get("CLICKHOUSE_PASS"),
-        "CLICKHOUSE_DB": os.environ.get("CLICKHOUSE_DB"),
     }
     missing = [k for k, v in clickhouse_env_vars.items() if not v]
     if missing:
@@ -279,7 +278,7 @@ def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
     port = int(os.environ.get("CLICKHOUSE_PORT") or "8123")
     user = clickhouse_env_vars["CLICKHOUSE_USER"]
     password = clickhouse_env_vars["CLICKHOUSE_PASS"]
-    database = clickhouse_env_vars["CLICKHOUSE_DB"]
+    database = os.environ.get("CLICKHOUSE_DB") or "spyre"
 
     client = clickhouse_connect.get_client(
         host=host,

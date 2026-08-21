@@ -97,17 +97,49 @@ def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> tor
     return new.reshape(hidden, n_heads * padded)
 
 
+def _pad_fused_qkv(
+    w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
+) -> torch.Tensor:
+    """Pre-fused q/k/v (Phi3): vLLM narrows a shard-id-less load at padded-head_size offsets."""
+    q, k, v = w.split([n_heads * orig, n_kv_heads * orig, n_kv_heads * orig])
+    return torch.cat(
+        [
+            _pad_qk_interleaved(q, n_heads, orig, padded),
+            _pad_qk_interleaved(k, n_kv_heads, orig, padded),
+            _pad_output_end(v, n_kv_heads, orig, padded),
+        ]
+    )
+
+
+def _require_width(name: str, w: torch.Tensor, dim: int, expected: int) -> None:
+    if w.shape[dim] != expected:
+        raise ValueError(
+            f"Head padding cannot reshape {name} of shape {tuple(w.shape)}: expected "
+            f"{expected} elements on dim {dim} at the unpadded head_dim."
+        )
+
+
 def _pad_weight(
     name: str, w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
-    """Dispatch a single checkpoint tensor to the right padding by its name."""
-    if name.endswith(("q_proj.weight", "q_proj.bias")):
-        return _pad_qk_interleaved(w, n_heads, orig, padded)
-    if name.endswith(("k_proj.weight", "k_proj.bias")):
-        return _pad_qk_interleaved(w, n_kv_heads, orig, padded)
-    if name.endswith(("v_proj.weight", "v_proj.bias")):
-        return _pad_output_end(w, n_kv_heads, orig, padded)
-    if name.endswith("o_proj.weight"):
+    """Dispatch a checkpoint tensor to its padding by name component; note that
+    ``qkv_proj.weight`` also ends with ``v_proj.weight``."""
+    head, _, param = name.rpartition(".")
+    proj = head.rpartition(".")[2]
+    if param not in ("weight", "bias"):
+        return w
+    if proj == "qkv_proj":
+        _require_width(name, w, 0, (n_heads + 2 * n_kv_heads) * orig)
+        return _pad_fused_qkv(w, n_heads, n_kv_heads, orig, padded)
+    if proj in ("q_proj", "k_proj", "v_proj"):
+        n = n_heads if proj == "q_proj" else n_kv_heads
+        _require_width(name, w, 0, n * orig)
+        if proj == "v_proj":
+            return _pad_output_end(w, n, orig, padded)
+        return _pad_qk_interleaved(w, n, orig, padded)
+    # o_proj's bias is over the hidden size, not head_dim, so weight only.
+    if proj == "o_proj" and param == "weight":
+        _require_width(name, w, 1, n_heads * orig)
         return _pad_input_end(w, n_heads, orig, padded)
     return w
 
@@ -138,8 +170,14 @@ def install_padded_head_dim(model_config) -> None:
 
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     model_cls, _ = model_config.registry.resolve_model_cls(architectures, model_config=model_config)
-    module = sys.modules.get(model_cls.__module__)
-    if module is None:
+    # A thin subclass (vLLM's Phi3ForCausalLM) declares no attention class of its own.
+    module_names = {model_cls.__module__} | {
+        base.__module__
+        for base in model_cls.__mro__
+        if issubclass(base, torch.nn.Module) and base is not torch.nn.Module
+    }
+    modules = [m for m in map(sys.modules.get, sorted(module_names)) if m is not None]
+    if not modules:
         logger.warning("Cannot locate module for %s; head_dim not shimmed.", model_cls)
         return
 
@@ -160,28 +198,41 @@ def install_padded_head_dim(model_config) -> None:
         prop.fget._spyre_shim = (orig, padded)
         return prop
 
-    patched = []
-    for name, obj in vars(module).items():
-        # Model-level attention classes only. The shared vLLM attention *layers* are
-        # imported into the same namespace but are handed an already-padded
-        # head_size, and patching them would mutate a class the whole process uses.
-        if (
-            not isinstance(obj, type)
-            or not name.endswith("Attention")
-            or obj.__module__.startswith("vllm.model_executor.layers")
-        ):
-            continue
-        existing = vars(obj).get("head_dim")
-        # Replace a shim left by an earlier model in this process (its widths may
-        # differ); leave anything the model itself defines alone.
-        if (
-            existing is not None
-            and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
-        ):
-            continue
-        obj.head_dim = _make_head_dim_property(orig, padded)
-        patched.append(name)
-    logger.info("Shimmed head_dim %d -> %d on: %s", orig, padded, ", ".join(patched))
+    patched: dict[int, str] = {}
+    for module in modules:
+        for name, obj in vars(module).items():
+            # Model-level attention classes only. The shared vLLM attention *layers* are
+            # imported into the same namespace but are handed an already-padded
+            # head_size, and patching them would mutate a class the whole process uses.
+            if (
+                not isinstance(obj, type)
+                or not name.endswith("Attention")
+                or obj.__module__.startswith("vllm.model_executor.layers")
+                or id(obj) in patched  # same class re-exported into a base's namespace
+            ):
+                continue
+            existing = vars(obj).get("head_dim")
+            # Replace a shim left by an earlier model in this process (its widths may
+            # differ); leave anything the model itself defines alone.
+            if (
+                existing is not None
+                and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
+            ):
+                continue
+            obj.head_dim = _make_head_dim_property(orig, padded)
+            patched[id(obj)] = f"{obj.__module__.rpartition('.')[2]}.{name}"
+    if not patched:
+        logger.warning(
+            "Found no attention class to shim head_dim %d -> %d in %s; attention sizing "
+            "itself from hidden_size // num_heads would build at the unpadded width.",
+            orig,
+            padded,
+            ", ".join(sorted(module_names)),
+        )
+        return
+    logger.info(
+        "Shimmed head_dim %d -> %d on: %s", orig, padded, ", ".join(sorted(patched.values()))
+    )
 
 
 def verify_padded_head_dim(model, hf_config) -> None:

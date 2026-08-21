@@ -267,9 +267,11 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
-        # Route TP collectives through the opaque `torch.ops.vllm.{all_reduce,
-        # all_gather,...}` custom ops rather than plain `dist.*`.
-        return True
+        # `False` reaches `device_communicator.<op>` directly, which dynamo inlines
+        # so the reduction compiles into the graph. The `torch.ops.vllm.*` wrappers
+        # are opaque to inductor, and their no-mutation declaration is wrong for the
+        # in-place `dist.all_reduce` they wrap, which corrupted compiled TP output.
+        return False
 
     @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
@@ -371,6 +373,15 @@ class TorchSpyrePlatform(CpuPlatform):
             raise ValueError(
                 f"Spyre does not support data_parallel_size > 1 "
                 f"(got {parallel_config.data_parallel_size})."
+            )
+
+        # The collectives torch-spyre lowers to reduce over the whole comms world
+        # and ignore the group name they are handed, so the TP group must *be* the
+        # world: with DP already rejected, pipeline parallelism has to go too.
+        if parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                f"Spyre does not support pipeline_parallel_size > 1 "
+                f"(got {parallel_config.pipeline_parallel_size})."
             )
 
         # ---- worker ----

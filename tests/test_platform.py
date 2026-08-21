@@ -455,3 +455,22 @@ def test_enforce_eager_is_the_only_eager_switch():
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
     assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+
+
+def test_collectives_bypass_the_vllm_custom_op_wrappers():
+    """Collectives must reach `SpyreCommunicator` directly, not via torch.ops.vllm.*."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    assert TorchSpyrePlatform.use_custom_op_collectives() is False
+
+
+@pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+def test_only_tensor_parallelism_is_accepted(field):
+    """DP and PP are rejected: the device collectives require TP group == world."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    setattr(vllm_config.parallel_config, field, 2)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)

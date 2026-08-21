@@ -296,7 +296,7 @@ def test_num_gpu_blocks_override_skipped_for_hybrid():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def _fake_pad_config(head_dim=64, num_heads=8, **rope_attrs):
+def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 
     hf_config and hf_text_config share one object (the common case). Returns
@@ -312,7 +312,7 @@ def _fake_pad_config(head_dim=64, num_heads=8, **rope_attrs):
         hf_config=hf_config,
         hf_text_config=hf_config,
         model_arch_config=SimpleNamespace(head_size=head_dim),
-        using_transformers_backend=lambda: False,
+        using_transformers_backend=lambda: transformers_backend,
     )
     return SimpleNamespace(model_config=model_config), hf_config, model_config
 
@@ -332,6 +332,23 @@ def test_pad_head_dim_full_rotary_pads():
 
     assert hf.head_dim == 128
     assert hf._spyre_orig_head_dim == 64
+    assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_pads_on_the_transformers_backend():
+    """Regression for #597: this used to return early for the Transformers backend."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        head_dim=4,
+        num_heads=4,
+        transformers_backend=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 128
+    assert hf._spyre_orig_head_dim == 4
     assert mc.model_arch_config.head_size == 128
 
 

@@ -26,6 +26,8 @@ import pytest
 import torch
 
 from spyre_inference.custom_ops.head_pad import (
+    _pad_weight,
+    fix_padded_attention_scale,
     install_padded_head_dim,
     reject_padded_qk_norm,
     verify_padded_head_dim,
@@ -56,7 +58,7 @@ class _ReadsConfigHeadDim(torch.nn.Module):
         self.head_dim = config_head_dim
 
 
-def _fake_model_config(monkeypatch, *, padded=True, classes=None):
+def _fake_model_config(monkeypatch, *, padded=True, classes=None, transformers_backend=False):
     """A model_config whose registry resolves to a throwaway module of attention classes."""
     module_name = "spyre_test_fake_model_module"
     module = ModuleType(module_name)
@@ -73,6 +75,7 @@ def _fake_model_config(monkeypatch, *, padded=True, classes=None):
         hf_config._spyre_orig_head_dim = _ORIG
     return SimpleNamespace(
         hf_config=hf_config,
+        using_transformers_backend=lambda: transformers_backend,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
         ),
@@ -138,9 +141,22 @@ def test_shim_skips_the_shared_vllm_attention_layers(monkeypatch):
     )
     model_config = SimpleNamespace(
         hf_config=hf_config,
+        using_transformers_backend=lambda: False,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
         ),
+    )
+
+    install_padded_head_dim(model_config)
+
+    assert "head_dim" not in vars(cls)
+
+
+def test_shim_skipped_on_the_transformers_backend(monkeypatch):
+    """HF attention reads config.head_dim directly, so there is nothing to shim."""
+    cls = type("FakeAttention", (_DerivesOwnHeadDim,), {})
+    model_config = _fake_model_config(
+        monkeypatch, classes={"FakeAttention": cls}, transformers_backend=True
     )
 
     install_padded_head_dim(model_config)
@@ -198,3 +214,81 @@ def test_reject_qk_norm_allows_norms_of_other_widths():
     hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
 
     reject_padded_qk_norm(model, hf_config)
+
+
+def test_verify_checks_the_transformers_backend_attention_dict():
+    """The backend's Attention layers live in a plain dict, invisible to named_modules()."""
+    model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.impl = object()
+    layer.head_size = _ORIG
+    model.attention_instances = {0: layer}
+    hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+
+    assert list(model.named_modules()) == [("", model)]
+    with pytest.raises(RuntimeError, match="would load truncated"):
+        verify_padded_head_dim(model, hf_config)
+
+
+def _attention_with_scale(*, impl_scale=None, hf_scaling=None):
+    """One attention layer, optionally carrying a vLLM impl scale and/or HF's scaling."""
+    model = torch.nn.Module()
+    layer = torch.nn.Module()
+    if impl_scale is not None:
+        layer.impl = SimpleNamespace(scale=impl_scale)
+    if hf_scaling is not None:
+        layer.scaling = hf_scaling
+    model.add_module("self_attn", layer)
+    return model, layer
+
+
+def test_fix_scale_resets_the_padded_default_on_the_vllm_layer():
+    model, layer = _attention_with_scale(impl_scale=_PADDED**-0.5)
+
+    fix_padded_attention_scale(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert layer.impl.scale == pytest.approx(_ORIG**-0.5)
+
+
+def test_fix_scale_resets_the_hf_module_scaling():
+    """``vllm_attention_forward`` copies it onto impl.scale every forward."""
+    model, layer = _attention_with_scale(impl_scale=_PADDED**-0.5, hf_scaling=_PADDED**-0.5)
+
+    fix_padded_attention_scale(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert layer.scaling == pytest.approx(_ORIG**-0.5)
+
+
+def test_fix_scale_leaves_a_head_dim_independent_scale_alone():
+    """Granite's ``attention_multiplier`` was never corrupted by the width override."""
+    model, layer = _attention_with_scale(impl_scale=0.5, hf_scaling=0.5)
+
+    fix_padded_attention_scale(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert layer.impl.scale == 0.5
+    assert layer.scaling == 0.5
+
+
+def test_pad_weight_splits_a_fused_qkv_projection():
+    """Each fused slice needs its own rule, and "qkv_proj" must not hit the v branch."""
+    n_heads, n_kv, hidden = 4, 2, 8
+    rows = (n_heads + 2 * n_kv) * _ORIG
+    w = torch.arange(float(rows * hidden)).reshape(rows, hidden)
+
+    out = _pad_weight("layers.0.self_attn.qkv_proj.weight", w, n_heads, n_kv, _ORIG, _PADDED)
+
+    assert out.shape == ((n_heads + 2 * n_kv) * _PADDED, hidden)
+    q, _, v = out.split([n_heads * _PADDED, n_kv * _PADDED, n_kv * _PADDED])
+
+    # Q is interleaved so the RoPE half-split still pairs the real dims.
+    half, padded_half = _ORIG // 2, _PADDED // 2
+    q_src = w[: n_heads * _ORIG].view(n_heads, _ORIG, hidden)
+    q_out = q.view(n_heads, _PADDED, hidden)
+    assert torch.equal(q_out[:, :half], q_src[:, :half])
+    assert torch.equal(q_out[:, padded_half : padded_half + half], q_src[:, half:])
+
+    # V carries no RoPE, so it is end-padded with zeros.
+    v_src = w[(n_heads + n_kv) * _ORIG :].view(n_kv, _ORIG, hidden)
+    v_out = v.view(n_kv, _PADDED, hidden)
+    assert torch.equal(v_out[:, :_ORIG], v_src)
+    assert not v_out[:, _ORIG:].any()

@@ -53,6 +53,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -60,6 +61,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
 )
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -73,6 +75,14 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.encoder_buckets import (
+    EncoderBucketPad,
+    encoder_bucket_valid_row_indices,
+    expand_packed_to_encoder_bucket,
+    pooling_warmup_pad_query_lens,
+    pooling_warmup_shapes,
+    runtime_encoder_bucket,
+)
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -82,8 +92,25 @@ from spyre_inference.v1.pool import (
 
 logger = init_logger(__name__)
 
-# Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
+# Eager pooling dummy stays tiny (compile is a no-op; avoids a large DMA).
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
+
+
+def compilation_disabled_reason(enforce_eager: bool, mode: CompilationMode) -> str | None:
+    """Why ``torch.compile`` is skipped, or ``None`` if we should compile.
+
+    Spyre stays eager when ``compilation_config.mode`` is unset/NONE even if
+    ``enforce_eager=False`` (vLLM's default). Do not report that as
+    ``enforce_eager=True``.
+    """
+    if enforce_eager:
+        return "enforce_eager=True"
+    if mode is CompilationMode.NONE:
+        return (
+            "compilation mode is NONE; pass compilation_config "
+            "mode=STOCK_TORCH_COMPILE to enable compile"
+        )
+    return None
 
 
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
@@ -321,6 +348,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
+        # Set during pooling execute_model when the batch is expanded to (B, L).
+        self._encoder_bucket: EncoderBucketPad | None = None
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -444,8 +473,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 f"are supported."
             )
 
-        if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
-            logger.info("Compilation disabled (enforce_eager=True)")
+        reason = compilation_disabled_reason(self.vllm_config.model_config.enforce_eager, mode)
+        if reason:
+            logger.info("Compilation disabled (%s)", reason)
             return
 
         # Trigger whole-model compile:
@@ -464,25 +494,31 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def warming_up_model(self) -> None:
-        """Run a dummy forward pass to warm up kernels and optional compile.
+        """Warm kernels / compile.
 
-        In eager mode, pooling models cap token count
-        (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1``.
-        Compiled mode uses the normal warmup size so shapes match torch.compile.
+        Eager pooling: one short dummy (DMA-safe; compile is off).
+        Compiled pooling: dummy each encoder bucket at full ``B × L``, then
+        again at ``L-2`` / ``L-1`` so pad leftovers compile. Upstream dummy
+        skips encoder attention unless ``force_attention=True``.
         """
         logger.info("Warming up model...")
         t0 = time.time()
-        num_tokens = min(
-            max(16, self.max_num_reqs),
-            self.scheduler_config.max_num_batched_tokens,
-        )
         with _set_spyre_compilation_settings(self.vllm_config):
-            use_eager_pooling_warmup = (
-                self.model_config.runner_type == "pooling"
-                and self.vllm_config.model_config.enforce_eager
+            is_pooling = self.model_config.runner_type == "pooling"
+            compiled = (
+                not self.vllm_config.model_config.enforce_eager
+                and self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE
             )
-            if use_eager_pooling_warmup:
-                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+            if is_pooling and compiled:
+                self._warmup_pooling_bucket_shapes()
+            elif is_pooling:
+                # Eager: no graph to specialize, so dummy size is not a
+                # batch-size policy. Compiled warmup uses
+                # SPYRE_ENCODER_BUCKET_{LENS,BATCH_SIZES} instead.
+                num_tokens = min(
+                    SPYRE_ENCODER_WARMUP_MAX_TOKENS,
+                    self.scheduler_config.max_num_batched_tokens,
+                )
                 saved_max_num_seqs = self.scheduler_config.max_num_seqs
                 try:
                     self.scheduler_config.max_num_seqs = 1
@@ -495,12 +531,138 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 finally:
                     self.scheduler_config.max_num_seqs = saved_max_num_seqs
             else:
+                num_tokens = min(
+                    max(16, self.max_num_reqs),
+                    self.scheduler_config.max_num_batched_tokens,
+                )
                 self._dummy_run(num_tokens)
         logger.info("Warmup done in %.3fs.", time.time() - t0)
 
+    def _warmup_pooling_bucket_shapes(self) -> None:
+        """Dummy each ``(B, L)`` at full size, then ``L-2`` / ``L-1`` pad leftovers."""
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+        )
+        if not shapes:
+            logger.warning("No pooling warmup shapes; falling back to a single dummy run")
+            self._dummy_run(
+                min(16, self.scheduler_config.max_num_batched_tokens),
+                force_attention=True,
+            )
+            return
+
+        saved_max_num_seqs = self.scheduler_config.max_num_seqs
+        try:
+            for batch_size, prompt_len in shapes:
+                self.scheduler_config.max_num_seqs = batch_size
+                num_tokens = batch_size * prompt_len
+                logger.info(
+                    "Pooling warmup: batch_size=%d prompt_len=%d (%d tokens)",
+                    batch_size,
+                    prompt_len,
+                    num_tokens,
+                )
+                hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
+                self._dummy_pooler_run(hidden_states)
+                for orig_len in pooling_warmup_pad_query_lens(prompt_len):
+                    orig_tokens = batch_size * orig_len
+                    logger.info(
+                        "Pooling warmup: batch_size=%d prompt_len=%d "
+                        "(dummy %d seqs × %d tokens, pad to %d)",
+                        batch_size,
+                        prompt_len,
+                        batch_size,
+                        orig_len,
+                        num_tokens,
+                    )
+                    self._seed_pooling_bucket_dummy(batch_size, prompt_len, orig_len)
+                    try:
+                        hidden_states, _ = self._dummy_run(orig_tokens, force_attention=True)
+                        hidden_states = self._unpad_encoder_hidden(hidden_states, orig_tokens)
+                        self._dummy_pooler_run(hidden_states)
+                    finally:
+                        self._encoder_bucket = None
+        finally:
+            self.scheduler_config.max_num_seqs = saved_max_num_seqs
+
+    def _encoder_pad_token_id(self) -> int:
+        pad_token_id = getattr(self.model_config.hf_config, "pad_token_id", None)
+        return 0 if pad_token_id is None else int(pad_token_id)
+
+    def _write_encoder_bucket_inputs(self, padded_ids: list[int], padded_pos: list[int]) -> None:
+        num_tokens = len(padded_ids)
+        self.input_ids.cpu[:num_tokens].copy_(
+            torch.tensor(padded_ids, dtype=self.input_ids.cpu.dtype)
+        )
+        if self.input_ids.gpu is not self.input_ids.cpu:
+            self.input_ids.copy_to_gpu(num_tokens)
+        self.positions[:num_tokens].copy_(
+            torch.tensor(
+                padded_pos,
+                dtype=self.positions.dtype,
+                device=self.positions.device,
+            )
+        )
+
+    def _seed_pooling_bucket_dummy(self, batch_size: int, prompt_len: int, orig_len: int) -> None:
+        orig_lens = [orig_len] * batch_size
+        orig_tokens = orig_len * batch_size
+        positions = [offset for _ in range(batch_size) for offset in range(orig_len)]
+        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
+            [0] * orig_tokens,
+            positions,
+            orig_lens,
+            batch_size,
+            prompt_len,
+            pad_token_id=self._encoder_pad_token_id(),
+        )
+        self._write_encoder_bucket_inputs(padded_ids, padded_pos)
+        self._encoder_bucket = EncoderBucketPad(
+            batch_bucket=batch_size,
+            len_bucket=prompt_len,
+            orig_query_lens=orig_lens,
+            orig_num_tokens=orig_tokens,
+            orig_num_reqs=batch_size,
+        )
+        self._apply_encoder_bucket_attn_layout(self._encoder_bucket)
+
+    def _apply_encoder_bucket_attn_layout(self, bucket: EncoderBucketPad) -> None:
+        """Packed ``query_start_loc`` is ``B`` rows of ``L``; ``seq_lens`` stay real."""
+        num_tokens = bucket.num_tokens
+        batch_bucket = bucket.batch_bucket
+        len_bucket = bucket.len_bucket
+        num_reqs = bucket.orig_num_reqs
+        qsl = np.arange(0, num_tokens + 1, len_bucket, dtype=self.query_start_loc.np.dtype)
+        self.query_start_loc.np[: batch_bucket + 1] = qsl
+        self.query_start_loc.np[batch_bucket + 1 :].fill(num_tokens)
+        self.query_start_loc.copy_to_gpu()
+
+        orig = torch.tensor(bucket.orig_query_lens, dtype=self.optimistic_seq_lens_cpu.dtype)
+        self.optimistic_seq_lens_cpu[:num_reqs] = orig
+        self.seq_lens[:num_reqs] = orig.to(device=self.seq_lens.device)
+        dummy = torch.full(
+            (batch_bucket - num_reqs,),
+            len_bucket,
+            dtype=self.optimistic_seq_lens_cpu.dtype,
+        )
+        self.optimistic_seq_lens_cpu[num_reqs:batch_bucket] = dummy
+        self.seq_lens[num_reqs:batch_bucket] = dummy.to(device=self.seq_lens.device)
+        self.optimistic_seq_lens_cpu[batch_bucket:].fill_(0)
+        self.seq_lens[batch_bucket:].fill_(0)
+
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
-        """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
+        """Force D2H during dummy forward (upstream logits index is CPU).
+
+        Pooling must pass ``force_attention=True``. Upstream skips attention
+        metadata unless that flag or a FULL cudagraph is set; encoder impl
+        then does ``if attn_metadata is None: return output`` and never
+        compiles pack/SDPA. Real ``execute_model`` always has metadata.
+        """
+        if self.model_config.runner_type == "pooling":
+            kwargs.setdefault("force_attention", True)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:
@@ -518,8 +680,191 @@ class TorchSpyreModelRunner(GPUModelRunner):
             and hidden_states.device.type != "spyre"
         ):
             hidden_states = convert(hidden_states, self._spyre_device)
-        # Sampler warmup only needs last_hidden_states on CPU.
         return hidden_states, last_hidden_states
+
+    def execute_model(self, scheduler_output, intermediate_tensors=None):
+        self._encoder_bucket = None
+        try:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        finally:
+            self._encoder_bucket = None
+
+    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        self._maybe_expand_pooling_inputs_to_encoder_bucket(num_scheduled_tokens)
+        return result
+
+    def _maybe_expand_pooling_inputs_to_encoder_bucket(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> None:
+        """Rewrite packed inputs to ``B`` sequences of length ``L`` (``T = B×L``).
+
+        Linear/LN compile on the flat token count; attention compiles on
+        ``[B, H, L, D]``. One warmup per ``(B, L)`` covers both when the
+        runtime batch is padded the same way. Attention still masks with the
+        original lengths (kept in ``seq_lens``).
+        """
+        self._encoder_bucket = None
+        if self.model_config.runner_type != "pooling":
+            return
+
+        num_reqs = self.input_batch.num_reqs
+        orig_lens = [int(n) for n in num_scheduled_tokens[:num_reqs]]
+        orig_tokens = int(sum(orig_lens))
+        if orig_tokens <= 0:
+            return
+
+        bucket = runtime_encoder_bucket(
+            num_seqs=num_reqs,
+            max_query_len=max(orig_lens),
+            max_num_seqs=self.scheduler_config.max_num_seqs,
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+        )
+        if bucket is None:
+            return
+        batch_bucket, len_bucket = bucket
+        if (
+            batch_bucket == num_reqs
+            and orig_tokens == batch_bucket * len_bucket
+            and all(length == len_bucket for length in orig_lens)
+        ):
+            return
+
+        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
+            self.input_ids.cpu[:orig_tokens].tolist(),
+            self.positions[:orig_tokens].detach().cpu().tolist(),
+            orig_lens,
+            batch_bucket,
+            len_bucket,
+            pad_token_id=self._encoder_pad_token_id(),
+        )
+        self._write_encoder_bucket_inputs(padded_ids, padded_pos)
+        self._encoder_bucket = EncoderBucketPad(
+            batch_bucket=batch_bucket,
+            len_bucket=len_bucket,
+            orig_query_lens=orig_lens,
+            orig_num_tokens=orig_tokens,
+            orig_num_reqs=num_reqs,
+        )
+        self._apply_encoder_bucket_attn_layout(self._encoder_bucket)
+
+    def _get_slot_mappings(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+        ubatch_slices=None,
+    ):
+        bucket = self._encoder_bucket
+        if bucket is not None:
+            num_tokens_padded = bucket.num_tokens
+            num_reqs_padded = bucket.batch_bucket
+            num_tokens_unpadded = bucket.num_tokens
+        return super()._get_slot_mappings(
+            num_tokens_padded,
+            num_reqs_padded,
+            num_tokens_unpadded,
+            ubatch_slices,
+        )
+
+    def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:
+        if self._encoder_bucket is not None:
+            return self._encoder_bucket.num_tokens
+        return super()._pad_for_sequence_parallelism(num_scheduled_tokens)
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        bucket = self._encoder_bucket
+        if bucket is not None:
+            # dummy_run overwrites query_start_loc / seq_lens; restore (B, L).
+            self._apply_encoder_bucket_attn_layout(bucket)
+            kwargs["num_tokens"] = bucket.num_tokens
+            kwargs["num_reqs"] = bucket.batch_bucket
+            kwargs["max_query_len"] = bucket.len_bucket
+            kwargs["num_tokens_padded"] = bucket.num_tokens
+            kwargs["num_reqs_padded"] = bucket.batch_bucket
+            args = ()
+        return super()._build_attention_metadata(*args, **kwargs)
+
+    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        bucket = self._encoder_bucket
+        saved_pos = None
+        if bucket is not None:
+            saved_pos = self.positions[: bucket.num_tokens].clone()
+        result = super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        if saved_pos is None:
+            return result
+        self.positions[: saved_pos.shape[0]].copy_(saved_pos)
+        input_ids, inputs_embeds, _positions, *rest = result
+        return (input_ids, inputs_embeds, self.positions[:num_input_tokens], *rest)
+
+    def _unpad_encoder_hidden(
+        self, hidden_states: torch.Tensor, num_scheduled_tokens: int
+    ) -> torch.Tensor:
+        """Gather real tokens out of a ``B×L`` packed hidden state."""
+        bucket = self._encoder_bucket
+        if bucket is None:
+            if hidden_states.shape[0] != num_scheduled_tokens:
+                hidden_states = select_rows(
+                    hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
+                )
+            return hidden_states
+        indices = encoder_bucket_valid_row_indices(bucket.orig_query_lens, bucket.len_bucket)
+        return select_rows(hidden_states, torch.tensor(indices, dtype=torch.int64))
+
+    def _restore_orig_query_start_loc(self) -> None:
+        bucket = self._encoder_bucket
+        if bucket is None:
+            return
+        cu = np.cumsum([0, *bucket.orig_query_lens], dtype=self.query_start_loc.np.dtype)
+        num_reqs = bucket.orig_num_reqs
+        self.query_start_loc.np[: num_reqs + 1] = cu
+        self.query_start_loc.np[num_reqs + 1 :].fill(cu[-1])
+        self.query_start_loc.copy_to_gpu()
+
+    def _dummy_pooler_run_task(
+        self,
+        hidden_states: torch.Tensor,
+        task: PoolingTask,
+    ) -> PoolerOutput:
+        """Same as GPU dummy pooler, but the cursor stays on CPU like ``_pool``."""
+        if not self._pooling_on_spyre:
+            return super()._dummy_pooler_run_task(hidden_states, task)
+
+        num_tokens = hidden_states.shape[0]
+        max_num_reqs = self.scheduler_config.max_num_seqs
+        num_reqs = min(num_tokens, max_num_reqs)
+        min_tokens_per_req = num_tokens // num_reqs
+        num_scheduled_tokens_np = np.full(num_reqs, min_tokens_per_req)
+        num_scheduled_tokens_np[-1] += num_tokens % num_reqs
+        assert np.sum(num_scheduled_tokens_np) == num_tokens
+        assert len(num_scheduled_tokens_np) == num_reqs
+
+        req_num_tokens = num_tokens // num_reqs
+        dummy_prompt_lens = torch.from_numpy(num_scheduled_tokens_np)
+        dummy_token_ids = torch.zeros(
+            (num_reqs, req_num_tokens), dtype=torch.int32, device=self.device
+        )
+
+        model = cast(VllmModelForPooling, self.get_model())
+        dummy_pooling_params = PoolingParams(task=task)
+        dummy_pooling_params.verify(self.model_config)
+        to_update = model.pooler.get_pooling_updates(task)
+        to_update.apply(dummy_pooling_params)
+
+        dummy_metadata = PoolingMetadata(
+            prompt_lens=dummy_prompt_lens,
+            prompt_token_ids=dummy_token_ids,
+            prompt_token_ids_cpu=dummy_token_ids.cpu(),
+            pooling_params=[dummy_pooling_params] * num_reqs,
+            pooling_states=[PoolingStates() for i in range(num_reqs)],
+        )
+        dummy_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np,
+            seq_lens_cpu=dummy_prompt_lens,
+            device=torch.device("cpu"),
+        )
+        return model.pooler(hidden_states=hidden_states, pooling_metadata=dummy_metadata)
 
     def get_supported_pooling_tasks(self) -> list[PoolingTask]:
         """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""
@@ -555,8 +900,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         if not self._pooling_on_spyre:
+            hidden_states = self._unpad_encoder_hidden(
+                convert(hidden_states, "cpu"), num_scheduled_tokens
+            )
+            self._restore_orig_query_start_loc()
             return super()._pool(
-                convert(hidden_states, "cpu"),
+                hidden_states,
                 num_scheduled_tokens,
                 num_scheduled_tokens_np,
                 kv_connector_output,
@@ -577,10 +926,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Crop via index_select — Spyre dim-0 slice views are unsafe.
         hidden_states = convert(hidden_states, self._spyre_device)
-        if hidden_states.shape[0] != num_scheduled_tokens:
-            hidden_states = select_rows(
-                hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
-            )
+        hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
+        self._restore_orig_query_start_loc()
 
         # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
         # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1

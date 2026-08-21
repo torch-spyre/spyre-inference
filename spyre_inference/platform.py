@@ -402,13 +402,18 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Pin the on-device KV cache to what's needed to fill the batch area:
         # max_num_seqs × ceil(max_model_len / block_size) blocks. This
-        # single-group formula only holds for homogeneous models; hybrid models
-        # build several KV cache groups whose block count depends on vLLM's
-        # internal layer-grouping (not knowable here), so we skip the cap and
-        # let vLLM size the cache from the profiled memory budget instead.
+        # single-group formula only holds for homogeneous decoder models.
+        # Pooling / encoder-only models have no KV cache — do not size one.
+        # Hybrid models build several KV cache groups whose block count depends
+        # on vLLM's internal layer-grouping (not knowable here), so we skip the
+        # cap and let vLLM size the cache from the profiled memory budget.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
-            if cls._is_hybrid_attention(vllm_config):
+            if cls._is_pooling_model(vllm_config):
+                logger.info(
+                    "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
+                )
+            elif cls._is_hybrid_attention(vllm_config):
                 logger.info(
                     "Hybrid attention model detected; leaving num_gpu_blocks "
                     "to vLLM (skipping the single-group block-count override)."
@@ -424,6 +429,12 @@ class TorchSpyrePlatform(CpuPlatform):
                     max_num_seqs,
                     blocks_per_seq,
                 )
+
+    @staticmethod
+    def _is_pooling_model(vllm_config: VllmConfig) -> bool:
+        """Encoder / embedding / scoring models (no paged KV cache)."""
+        model_config = vllm_config.model_config
+        return getattr(model_config, "runner_type", None) == "pooling"
 
     @staticmethod
     def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:

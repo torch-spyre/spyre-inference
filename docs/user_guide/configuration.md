@@ -28,6 +28,40 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Encoder / pooling compile buckets
+
+Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
+`--enforce-eager` to disable it. Each new encoder shape is a new graph (~60s):
+SDPA specializes `[B, H, L, D]`, and Linear / LN specialize the flat token
+count `[T, …]`.
+
+At runtime the plugin pads **each sequence** to the next length bucket `L` and
+the **batch** to `B`, so `T = B × L`. Attention still masks to the real prompt
+lengths; pooling gathers the real tokens before CLS / LAST / MEAN.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `SPYRE_ENCODER_BUCKET_LENS` | `64,128,256,512,1024,2048` | Prompt-length ladder (rounded up to a multiple of 64) |
+| `SPYRE_ENCODER_BUCKET_BATCH_SIZES` | `1, 2, 4, …, max_num_seqs` | Batch ladder |
+
+A 30-token, 3-seq request with `--max-num-seqs 4` is padded to `(B=4, L=64)`
+(`T=256`) and reuses that warmed graph. If `(B, L)` would exceed
+`--max-num-batched-tokens`, the batch is left unpadded (a new compile).
+
+Compiled pooling warmup dummies each `(B, L)` three ways: full `B × L`, then
+`L-2` and `L-1` padded onto `T = B × L`. (`--random-input-len L` subtracts
+tokenizer specials, often 2.) Eager pooling (`--enforce-eager`) still uses one
+16-token dummy.
+
+Example:
+
+```bash
+SPYRE_ENCODER_BUCKET_LENS=64,256 \
+SPYRE_ENCODER_BUCKET_BATCH_SIZES=1,4 \
+vllm serve ibm-granite/granite-embedding-125m-english \
+  --runner pooling --max-num-seqs 4
+```
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

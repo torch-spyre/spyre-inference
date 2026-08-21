@@ -754,6 +754,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1507,6 +1518,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1889,6 +1911,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#compilation-granularity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compilation Granularity
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#attention-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2114,6 +2147,38 @@ pass — so that no fused output ever had to be sliced; one fused GEMM is faster
 so that pass is gone. The remaining slicing constraint is narrower than it was and lives
 in the attention backend, where offset &gt; 0 views still corrupt on transfer (see
 <a href="#attention-backend">Attention Backend</a>).</p>
+<h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
+<p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of
+the model's block <code>ModuleList</code> in place via <code>block.compile(backend="inductor",
+fullgraph=True, dynamic=False)</code>. In place matters: rebinding the list entry to the
+<code>OptimizedModule</code> that <code>torch.compile</code> returns would re-parent the block under an
+<code>_orig_mod</code> child and rename every parameter, breaking weight save/reload.</p>
+<p>Blocks are found structurally — a <code>ModuleList</code> whose non-<code>PPMissingLayer</code> entries own an
+<code>Attention</code> somewhere, and are not themselves <code>Attention</code> layers — so decoder stacks
+(<code>model.layers</code>) and encoder stacks (<code>bert.encoder.layer</code>) are both covered, as are
+hybrid Mamba+attention stacks that mix layer classes in one list. A <code>ModuleList</code> of bare
+<code>Attention</code> layers (Zamba2's shared <code>dpa_list</code>) is skipped: it is not a block stack.
+Models whose attention is not a vLLM <code>Attention</code> — MLA (DeepSeek, Kimi), vision-tower
+attention — match nothing and fall back to a whole-model graph.</p>
+<p>Blocks of one class share one <code>forward</code> code object, so Dynamo traces the first and the
+rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
+backend compile count is independent of depth, but it is not 1: layer 0 specializes
+separately because <code>residual is None</code> there, so a Llama-shaped stack yields two
+artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
+and full attention, giving four. A fresh <code>num_tokens</code> tier then costs one block recompile
+rather than a whole-model one. Note that <code>num_tokens</code> is the block graph's <em>only</em> shape
+dependence: kv-cache length and the <code>KV_LENGTH_ALIGNMENT</code> tiers live inside
+<code>unified_attention_with_output</code>, which is opaque to this graph and compiles its own
+kernels (see <a href="../user_guide/kineto_profiling.html">Kineto profiling</a>).</p>
+<p>Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
+which needs torch &gt;= 2.11 and <code>VLLM_USE_LAYERNAME=1</code>. Without it each block bakes in its
+own layer name and compiles separately, which is worse than the whole-model graph; the
+runner logs a warning when it detects this. Inductor freezing (enabled by <code>max_autotune</code>)
+defeats sharing the same way, by folding each block's weights into its own graph.</p>
+<p>Embeddings and the final norm sit outside the block list and stay eager. <code>lm_head</code> was
+never in the compiled region; <code>compute_logits</code> is a separate call on the wrapper.</p>
+<p><code>SPYRE_COMPILE_GRANULARITY=model</code> restores the whole-model fullgraph, whose compile cost
+grows with layer count.</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
 <p>The <code>SpyreAttentionBackend</code> implements paged attention using pure PyTorch operations
 (no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,

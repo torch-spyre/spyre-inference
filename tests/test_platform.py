@@ -490,3 +490,102 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
     src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
+
+
+def _sliding_window_vllm_config(max_model_len=128, block_size=64):
+    """A config for a uniformly sliding-window model."""
+    model_config = ModelConfig(
+        model="yujiepan/mistral-tiny-random",
+        max_model_len=max_model_len,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+
+def test_blocks_per_seq_full_attention_uses_cache_block_size():
+    """Full-attention models keep the plain ceil(max_model_len / block_size) count."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    expected = math.ceil(
+        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
+    )
+    assert TorchSpyrePlatform._blocks_per_seq(vllm_config) == expected
+
+
+def test_blocks_per_seq_sliding_window_matches_vllm_accounting():
+    """Sliding-window layers need more blocks than --block-size implies."""
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    from spyre_inference.platform import SPYRE_MIN_KERNEL_BLOCK_SIZE, TorchSpyrePlatform
+
+    vllm_config = _sliding_window_vllm_config()
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    model_config = vllm_config.model_config
+    sliding_window = model_config.get_sliding_window()
+    assert sliding_window is not None, "fixture must be a sliding-window model"
+
+    spec = SlidingWindowSpec(
+        block_size=SPYRE_MIN_KERNEL_BLOCK_SIZE,
+        num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+        head_size=model_config.get_head_size(),
+        dtype=torch.float16,
+        sliding_window=sliding_window,
+    )
+    expected = spec.max_memory_usage_bytes(vllm_config) // spec.page_size_bytes
+
+    assert TorchSpyrePlatform._blocks_per_seq(vllm_config) == expected
+    # The bug in #598: sizing off cache_config.block_size under-counts.
+    assert expected > math.ceil(model_config.max_model_len / vllm_config.cache_config.block_size)
+
+
+def test_num_gpu_blocks_override_admits_one_max_len_request():
+    """The pinned block count must admit one max_model_len request (issue #598)."""
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_configs
+    from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowSpec
+
+    from spyre_inference.platform import SPYRE_MIN_KERNEL_BLOCK_SIZE, TorchSpyrePlatform
+
+    vllm_config = _sliding_window_vllm_config()
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    model_config = vllm_config.model_config
+    # Worst case: a single sequence still has to fit.
+    vllm_config.cache_config.num_gpu_blocks_override = TorchSpyrePlatform._blocks_per_seq(
+        vllm_config
+    )
+
+    spec: dict[str, KVCacheSpec] = {
+        f"model.layers.{i}.self_attn.attn": SlidingWindowSpec(
+            block_size=SPYRE_MIN_KERNEL_BLOCK_SIZE,
+            num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+            head_size=model_config.get_head_size(),
+            dtype=torch.float16,
+            sliding_window=model_config.get_sliding_window(),
+        )
+        for i in range(model_config.get_num_layers(vllm_config.parallel_config))
+    }
+
+    # Raises ValueError if the pinned cache cannot serve one max-len request.
+    configs = get_kv_cache_configs(
+        vllm_config, [spec], [vllm_config.cache_config.kv_cache_memory_bytes]
+    )
+    assert configs[0].num_blocks >= vllm_config.cache_config.num_gpu_blocks_override

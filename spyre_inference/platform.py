@@ -48,6 +48,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Spyre stick size is 128 bytes / 2 bytes per fp16 element. Mirrors
+# SpyreAttentionBackend.get_supported_kernel_block_sizes().
+SPYRE_MIN_KERNEL_BLOCK_SIZE = 64
+
 
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
@@ -401,7 +405,7 @@ class TorchSpyrePlatform(CpuPlatform):
         super().check_and_update_config(vllm_config)
 
         # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
+        # max_num_seqs × the blocks one max-length request needs. This
         # single-group formula only holds for homogeneous models; hybrid models
         # build several KV cache groups whose block count depends on vLLM's
         # internal layer-grouping (not knowable here), so we skip the cap and
@@ -415,8 +419,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-                max_model_len = vllm_config.model_config.max_model_len
-                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+                blocks_per_seq = cls._blocks_per_seq(vllm_config)
                 cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
                 logger.info(
                     "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
@@ -424,6 +427,36 @@ class TorchSpyrePlatform(CpuPlatform):
                     max_num_seqs,
                     blocks_per_seq,
                 )
+
+    @staticmethod
+    def _blocks_per_seq(vllm_config: VllmConfig) -> int:
+        """Blocks one max_model_len request needs, per vLLM's admission accounting."""
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+
+        model_config = vllm_config.model_config
+        num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        head_size = model_config.get_head_size()
+        sliding_window = model_config.get_sliding_window()
+
+        if sliding_window is None:
+            spec = FullAttentionSpec(
+                block_size=vllm_config.cache_config.block_size,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=torch.float16,
+            )
+        else:
+            # Sliding-window layers ignore --block-size: vLLM sizes them at the
+            # smallest block the backend supports, plus one block for a window that
+            # does not start on a block boundary.
+            spec = SlidingWindowSpec(
+                block_size=SPYRE_MIN_KERNEL_BLOCK_SIZE,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                dtype=torch.float16,
+                sliding_window=sliding_window,
+            )
+        return math.ceil(spec.max_memory_usage_bytes(vllm_config) / spec.page_size_bytes)
 
     @staticmethod
     def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:

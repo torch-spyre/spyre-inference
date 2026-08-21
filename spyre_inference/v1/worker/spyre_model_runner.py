@@ -718,10 +718,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         one-element device tensor, so the page read is a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
-        from spyre_inference.v1.attention.backends.spyre_attn import (
-            SpyrePagedKVCache,
-            slot_major_kv_layout,
-        )
+        from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
         spec_by_layer = {
@@ -738,25 +735,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
-
             k_pages = torch.zeros(
                 num_blocks,
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
                 dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                device=self._spyre_device,
+            )
             v_pages = torch.zeros(
                 num_blocks,
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
                 dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+                device=self._spyre_device,
+            )
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

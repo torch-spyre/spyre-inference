@@ -1004,27 +1004,12 @@ def patch_backend_list(request, monkeypatch):
         kv_cache_dtype="auto",
     ):
         if backend == AttentionBackendEnum.CUSTOM:
-
-            def pin_slot_major(blocks):
-                # The KV write needs the slot-outermost layout, not the default.
-                if blocks.device.type != "spyre":
-                    return blocks
-                from spyre_inference.v1.attention.backends.spyre_attn import (
-                    slot_major_kv_layout,
-                )
-
-                nb, bs, nkvh, hs = blocks.shape
-                return blocks.cpu().to(
-                    blocks.device,
-                    device_layout=slot_major_kv_layout(nb * bs, nkvh, hs, blocks.dtype),
-                )
-
             # K and V are concatenated on the last dim.
             head_size = kv_cache.shape[-1] // 2
             kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (pin_slot_major(k_blocks), pin_slot_major(v_blocks))
+            kv_cache = (k_blocks, v_blocks)
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,

@@ -103,20 +103,6 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
-def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
-    """Slot-axis-outermost layout; without it the indirect store silently
-    writes to the wrong rows (torch-spyre#3705)."""
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
-
-    eps = get_elem_in_stick(dtype)
-    sticks = (head_size + eps - 1) // eps
-    return SpyreTensorLayout(
-        device_size=[num_slots, num_kv_heads, sticks, eps],
-        stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
-        device_dtype=get_device_dtype(dtype),
-    )
-
-
 def _overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -1130,7 +1116,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result = convert(result, dtype=output.dtype)
             result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
             result = result.transpose(1, 2).contiguous()
-            # Keep the .clone() until torch-spyre#3826 is fixed.
-            output[q_start:q_end] = result[0, :query_len, :, :].clone()
+            output[q_start:q_end] = result[0, :query_len, :, :]
 
         return output

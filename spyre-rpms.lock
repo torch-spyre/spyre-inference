@@ -1,17 +1,23 @@
-# Pinned Spyre RPM package names, one per line.
-# Lines starting with # are ignored.
-# Specify exact versions to pin (e.g. ibm-deeptools-1.2.3-1.el8).
-# The cache key is derived from this file's hash. Changing any entry
-# invalidates the GHA RPM cache and triggers a fresh download.
-#
-ibm-aiu-toolbox-e2e-2.0.0-0.main.27+27.4f086064.58752228cfc4.4f08606.el10
-ibm-deeptools-2.0.0-0.master.2245+2245.85f94326.83161f90364d.85f9432.el10
-ibm-deeptools-devel-2.0.0-0.master.2245+2245.85f94326.83161f90364d.85f9432.el10
-ibm-flex-2.0.0-0.main.477+477.c717aa5a.5559701e38ae.c717aa5.el10
-ibm-flex-devel-2.0.0-0.main.477+477.c717aa5a.5559701e38ae.c717aa5.el10
-ibm-libaiupti-2.0.0-0.main.20+20.932bdf54.986ec0f502fe.932bdf5.el10
-ibm-senlib-core-2.0.0-0.main.1+236.ef4dc48_200.15d6a25cc83f.el10
-ibm-senlib-dd2-2.0.0-0.main.1+236.ef4dc48_200.15d6a25cc83f.el10
-ibm-senlib-headers-2.0.0-0.main.1+236.ef4dc48_200.15d6a25cc83f.el10
-ibm-spyre-comms-1.0.0-0.main.120+120.503dab8c.15dffbf5e264.503dab8.el10
-ibm-spyre-comms-devel-1.0.0-0.main.120+120.503dab8c.15dffbf5e264.503dab8.el10
+# Pinned Spyre RPM baseline for CI. Regenerate with `upgrade-torch-spyre`.
+# Each `version` pins a commit, not a filename (the per-arch `_<buildnum>`
+# diverges); .github/scripts/resolve_rpms.py resolves the build per arch.
+
+version = 1
+
+[defaults]
+# Artifactory subdir (<repo>/<tree>/<arch>/); "" is the base tree.
+tree = ""
+
+[packages]
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+27.4f08606" }
+ibm-deeptools         = { version = "2.0.0-0.main.1+2245.85f9432" }
+ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2245.85f9432" }
+ibm-flex              = { version = "2.0.0-0.main.1+477.c717aa5" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+477.c717aa5" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+236.ef4dc48" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+236.ef4dc48" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+236.ef4dc48" }
+ibm-spyre-comms       = { version = "1.0.0-0.main.1+120.503dab8" }
+ibm-spyre-comms-devel = { version = "1.0.0-0.main.1+120.503dab8" }
+# only published in the `next` tree; its name embeds a build hash (the `*`).
+ibm-libaiupti         = { version = "2.0.0-0.main.20+20.*.932bdf5", tree = "next" }

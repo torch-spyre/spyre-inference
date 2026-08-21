@@ -989,9 +989,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return False
         if self.logits_soft_cap != 0.0:
             return False
-        if attn_metadata.active_block_indices is not None:
-            return False
-        return True
+        return attn_metadata.active_block_indices is None
 
     def _run_across_seqs_dispatch(
         self,
@@ -1048,9 +1046,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
             q_row_ids_dev = convert(q_row_ids_cpu, device=_target_device).clone()
             q_rows_dev = query_dev.index_select(0, q_row_ids_dev)
-            q_rows_dev = q_rows_dev.reshape(
-                tier_n, num_kv_heads, num_queries_per_kv, 1, head_size
-            )
+            q_rows_dev = q_rows_dev.reshape(tier_n, num_kv_heads, num_queries_per_kv, 1, head_size)
             if aligned_max_query_len > 1:
                 pad = torch.zeros(
                     tier_n,
@@ -1064,9 +1060,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 q = torch.cat([q_rows_dev, pad], dim=3)
             else:
                 q = q_rows_dev
-            q_packed_dev = q.reshape(
-                tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
-            ).contiguous().clone()
+            q_packed_dev = (
+                q.reshape(
+                    tier_n * num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
+                )
+                .contiguous()
+                .clone()
+            )
 
             # --- Per-block K/V gather (built on device from the dense cache).
             # Invariant: sequences in a tier share the same `num_blocks_needed`,

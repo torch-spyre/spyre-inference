@@ -296,6 +296,46 @@ def test_num_gpu_blocks_override_skipped_for_hybrid():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
+def test_num_gpu_blocks_override_skipped_for_pooling():
+    """Encoder/pooling models have no KV cache — do not invent a block count."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    object.__setattr__(model_config, "runner_type", "pooling")
+
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+
+def test_compilation_disabled_reason_does_not_blame_enforce_eager():
+    """Unset compile mode is NONE, not enforce_eager=True."""
+    from vllm.config import CompilationMode
+
+    from spyre_inference.v1.worker.spyre_model_runner import compilation_disabled_reason
+
+    assert compilation_disabled_reason(True, CompilationMode.NONE) == "enforce_eager=True"
+    reason = compilation_disabled_reason(False, CompilationMode.NONE)
+    assert reason is not None
+    assert "enforce_eager=True" not in reason
+    assert "NONE" in reason
+    assert compilation_disabled_reason(False, CompilationMode.STOCK_TORCH_COMPILE) is None
+
+
 def _fake_pad_config(head_dim=64, num_heads=8, **rope_attrs):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 

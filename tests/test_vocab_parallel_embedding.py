@@ -148,13 +148,14 @@ def test_fake_tp2_forward_matches_reference(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Spyre's inductor backend rejects int64 Python-int constants in "
-        "comparisons: `Constant(value=N, dtype=torch.int64) to greaterequal`. "
-        "This is the load-bearing limitation behind SpyreVocabParallelEmbedding's "
-        "CPU bounce — upstream `get_masked_input_and_mask` runs `input_ >= "
-        "org_vocab_start_index` under @torch.compile. A 0-D-tensor workaround "
-        "compiles but produces silently-wrong values, so CPU bounce is the only "
-        "correct path. When this flips to passing, delete the CPU bounce in "
+        "Spyre's inductor backend rejects int64 comparisons: `Spyre backend "
+        "does not support: torch.bool result of operand with device format "
+        "DataFormats.IEEE_INT32`. This is the load-bearing limitation behind "
+        "SpyreVocabParallelEmbedding's CPU bounce — upstream "
+        "`get_masked_input_and_mask` runs `input_ >= org_vocab_start_index` "
+        "under @torch.compile. A 0-D-tensor workaround compiles but produces "
+        "silently-wrong values, so CPU bounce is the only correct path. When "
+        "this flips to passing, delete the CPU bounce in "
         "SpyreVocabParallelEmbedding.forward and let the upstream forward path "
         "run on-device."
     ),
@@ -169,6 +170,30 @@ def test_int64_compiled_compare_against_python_int(tp_group) -> None:
 
     out = cmp_ge(on_spyre, 8)
     expected = cpu >= 8
+    torch.testing.assert_close(out.cpu(), expected)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Spyre's inductor backend rejects int32 subtraction: `Spyre backend "
+        "does not support: sub on DataFormats.IEEE_INT32`. Upstream "
+        "`get_masked_input_and_mask` also runs `input_ - valid_offset` under "
+        "@torch.compile, so this is a second load-bearing limitation behind "
+        "SpyreVocabParallelEmbedding's lookup-table workaround. When this "
+        "flips to passing, the on-device arithmetic path can be reconsidered."
+    ),
+)
+def test_int32_compiled_subtract_against_python_int(tp_group) -> None:
+    @torch.compile
+    def sub(x, c):
+        return x - c
+
+    cpu = torch.arange(16, dtype=torch.int32)
+    on_spyre = cpu.to(torch.device("spyre:0"))
+
+    out = sub(on_spyre, 8)
+    expected = cpu - 8
     torch.testing.assert_close(out.cpu(), expected)
 
 

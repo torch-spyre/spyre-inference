@@ -59,7 +59,7 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (mask on CPU when TP>1) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, only the shard mask runs on CPU via the `spyre_vocab_mask` op (Spyre inductor rejects the upstream int64-vs-Python-int comparisons); `masked_input`/`keep` are `convert`ed back to Spyre before the gather and `all_reduce` |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
-| `ParallelLMHead` | `SpyreParallelLMHead` | Spyre → CPU | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP `all_gather` |
+| `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
 
 ### Transposed linear weights
@@ -67,19 +67,22 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 `F.linear(x, W)` computes `x @ Wᵀ` however `W` is laid out, and on Spyre that transposed
 matmul is ~3.5× slower than a plain `x @ A`
 ([torch-spyre#3512](https://github.com/torch-spyre/torch-spyre/issues/3512)).
-`SpyreUnquantizedLinearMethod` (`custom_ops/linear.py`) closes that gap in two overrides:
+`SpyreTransposedWeightMethod` (`custom_ops/linear.py`) is the shared base that closes that gap
+in two overrides:
 
 - `process_weights_after_loading` replaces the loaded `[out, in]` weight with a contiguous
-  `[in, out]` `Wᵀ`, so the transpose is paid once at load time rather than every forward.
+  `[in, out]` `Wᵀ` (optionally padding the output rows first), so the transpose is paid once at
+  load time rather than every forward.
 - `apply` runs `spyre_linear_t` — `torch.matmul(x, Wᵀ)` plus optional bias — instead of
-  `F.linear`.
+  `F.linear`, dropping any trailing pad columns with an eager on-device un-pad slice.
 
-The five linear subclasses install it in `__init__`, but only when `quant_method` is an
+`SpyreUnquantizedLinearMethod` uses the base defaults (transpose in place, no padding); the five
+linear subclasses install it in `__init__`, but only when `quant_method` is an
 `UnquantizedLinearMethod`; quantized layers keep their own method and the slower
 `F.linear` path. This is the pure-PyTorch equivalent of torch-spyre's `[1,0]` weight
 layout, which only fires for `nn.Linear` and so misses every vLLM parallel-linear.
-`SpyreParallelLMHead` stores its own `padded_weight_t` for the same reason and reuses
-`spyre_linear_t`, so the fast path is defined once.
+`SpyreUnquantizedLMHeadMethod` reuses the same base with `WEIGHT_T_ATTR="padded_weight_t"` and
+`ROW_ALIGN=64*32`, so the fast path and the padding/un-pad logic are defined once.
 
 Fused projections stay fused. `SpyreQKVParallelLinear` returns the whole `[..., q+k+v]`
 tensor and the unmodified upstream idiom `q, k, v = qkv.split(...)` slices it, exactly as
@@ -206,7 +209,7 @@ call boundary:
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
 - **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling)
 - **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which then returns logits on CPU
+  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the

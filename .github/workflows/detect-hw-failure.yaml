@@ -1,0 +1,137 @@
+name: detect-hw-failure
+
+# After a test run fails, classify whether a Spyre card faulted (a RAS error
+# aborted the process) rather than the code, and if so raise a neutral Check run
+# on the PR head naming the node + RAS code. Detection only; nothing is retried.
+#
+# workflow_run, like push-to-clickhouse.yaml: it needs a completed run to pull
+# logs from and runs with base-repo permissions so the Check run works even for
+# fork PRs, whose in-workflow token is read-only.
+on:
+  workflow_run:
+    workflows:
+      - test_each_commit
+      - integration-tests
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      gha_run_id:
+        description: GHA run ID to (re)classify
+        required: true
+        default: ''
+
+concurrency:
+  group: detect-hw-${{ github.event.workflow_run.id || inputs.gha_run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read # download the triggering run's logs
+  checks: write # create the hardware-fault Check run
+
+jobs:
+  detect:
+    name: Classify failure as hardware fault
+    # Cardless pool: this job only reads logs and calls the GitHub API.
+    runs-on:
+      - x86_64
+      - spyre_pf_x0
+      - linux
+    timeout-minutes: 15
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
+
+    env:
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # workflow_run runs the default-branch copy, so this pulls the canonical
+      # detector regardless of which ref triggered the run.
+      - name: Checkout detector script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: |
+            .github/scripts/detect_hw_failure.py
+          sparse-checkout-cone-mode: false
+
+      - name: Install gh CLI
+        run: |
+          # curl, not wget: not every node in the spyre runner pool has wget.
+          curl -fsSL https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz \
+            -o gh_2.92.0_linux_amd64.tar.gz
+          tar -xzf gh_2.92.0_linux_amd64.tar.gz
+          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
+          gh_2.92.0_linux_amd64/bin/gh --version
+
+      - name: Resolve run metadata
+        id: meta
+        run: |
+          # From the API, not workflow_run context, which is absent on dispatch.
+          SHA=$(gh api "/repos/${REPO}/actions/runs/${RUN_ID}" --jq '.head_sha')
+          URL=$(gh api "/repos/${REPO}/actions/runs/${RUN_ID}" --jq '.html_url')
+          echo "Run ${RUN_ID}: sha=${SHA} url=${URL}"
+          {
+            echo "sha=${SHA}"
+            echo "url=${URL}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Download run logs
+        run: |
+          # The logs endpoint 302s to a signed zip; gh follows it to stdout.
+          gh api "/repos/${REPO}/actions/runs/${RUN_ID}/logs" > logs.zip
+          mkdir -p logs
+          unzip -o -q logs.zip -d logs
+          echo "Unzipped $(find logs -name '*.txt' | wc -l) log file(s)"
+
+      - name: Classify
+        id: detect
+        run: |
+          python3 .github/scripts/detect_hw_failure.py \
+            --log-dir logs \
+            --run-url "${{ steps.meta.outputs.url }}" \
+            --github-output "${GITHUB_OUTPUT}" \
+            --check-output check_output.json
+
+      - name: Create hardware-fault Check run
+        if: ${{ steps.detect.outputs.hw_fault == 'true' }}
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+          URL: ${{ steps.meta.outputs.url }}
+        run: |
+          # conclusion=neutral: the real test check already reports the failure,
+          # so this is an informational signal, not a second failing gate.
+          python3 - <<'PY'
+          import json, os
+          out = json.load(open("check_output.json"))
+          body = {
+              "name": "Hardware fault detector",
+              "head_sha": os.environ["SHA"],
+              "status": "completed",
+              "conclusion": "neutral",
+              "details_url": os.environ["URL"],
+              "output": out,
+          }
+          json.dump(body, open("check_body.json", "w"))
+          PY
+          gh api -X POST "/repos/${REPO}/check-runs" --input check_body.json \
+            --jq '"Created check run: " + .html_url'
+
+      - name: Summary
+        if: always()
+        run: |-
+          {
+            echo "### Hardware-fault detection"
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Triggering run | [${RUN_ID}](${{ steps.meta.outputs.url }}) |"
+            echo "| Commit | \`${{ steps.meta.outputs.sha }}\` |"
+            echo "| Hardware fault | ${{ steps.detect.outputs.hw_fault || 'unknown' }} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          if [[ -f check_output.json ]]; then
+            echo '' >> "${GITHUB_STEP_SUMMARY}"
+            python3 -c 'import json;print(json.load(open("check_output.json"))["summary"])' \
+              >> "${GITHUB_STEP_SUMMARY}"
+          fi

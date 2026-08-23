@@ -2110,8 +2110,8 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 <tr>
 <td><code>ParallelLMHead</code></td>
 <td><code>SpyreParallelLMHead</code></td>
-<td>Spyre → CPU</td>
-<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32; logits returned on CPU for the downstream TP <code>all_gather</code></td>
+<td>Spyre</td>
+<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; <code>apply</code> runs <code>x @ Wᵀ</code> then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP <code>all_gather</code></td>
 </tr>
 <tr>
 <td><code>LogitsProcessor</code></td>
@@ -2125,19 +2125,22 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 <p><code>F.linear(x, W)</code> computes <code>x @ Wᵀ</code> however <code>W</code> is laid out, and on Spyre that transposed
 matmul is ~3.5× slower than a plain <code>x @ A</code>
 (<a href="https://github.com/torch-spyre/torch-spyre/issues/3512">torch-spyre#3512</a>).
-<code>SpyreUnquantizedLinearMethod</code> (<code>custom_ops/linear.py</code>) closes that gap in two overrides:</p>
+<code>SpyreTransposedWeightMethod</code> (<code>custom_ops/linear.py</code>) is the shared base that closes that gap
+in two overrides:</p>
 <ul>
 <li><code>process_weights_after_loading</code> replaces the loaded <code>[out, in]</code> weight with a contiguous
-  <code>[in, out]</code> <code>Wᵀ</code>, so the transpose is paid once at load time rather than every forward.</li>
+  <code>[in, out]</code> <code>Wᵀ</code> (optionally padding the output rows first), so the transpose is paid once at
+  load time rather than every forward.</li>
 <li><code>apply</code> runs <code>spyre_linear_t</code> — <code>torch.matmul(x, Wᵀ)</code> plus optional bias — instead of
-  <code>F.linear</code>.</li>
+  <code>F.linear</code>, dropping any trailing pad columns with an eager on-device un-pad slice.</li>
 </ul>
-<p>The five linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
+<p><code>SpyreUnquantizedLinearMethod</code> uses the base defaults (transpose in place, no padding); the five
+linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
 <code>UnquantizedLinearMethod</code>; quantized layers keep their own method and the slower
 <code>F.linear</code> path. This is the pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight
 layout, which only fires for <code>nn.Linear</code> and so misses every vLLM parallel-linear.
-<code>SpyreParallelLMHead</code> stores its own <code>padded_weight_t</code> for the same reason and reuses
-<code>spyre_linear_t</code>, so the fast path is defined once.</p>
+<code>SpyreUnquantizedLMHeadMethod</code> reuses the same base with <code>WEIGHT_T_ATTR="padded_weight_t"</code> and
+<code>ROW_ALIGN=64*32</code>, so the fast path and the padding/un-pad logic are defined once.</p>
 <p>Fused projections stay fused. <code>SpyreQKVParallelLinear</code> returns the whole <code>[..., q+k+v]</code>
 tensor and the unmodified upstream idiom <code>q, k, v = qkv.split(...)</code> slices it, exactly as
 <code>SpyreMergedColumnParallelLinear</code>'s <code>[..., 2*d]</code> output feeds <code>SpyreSiluAndMul</code>, which
@@ -2277,7 +2280,7 @@ call boundary:</p>
 <li><strong>Input</strong>: CPU <code>int32</code>/<code>int64</code> tensors → Spyre <code>int64</code> (for embedding lookup)</li>
 <li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling)</li>
 <li><strong><code>compute_logits</code></strong>: moves the CPU-sliced <code>hidden_states[logits_indices]</code> back onto
-  Spyre for the <code>SpyreParallelLMHead</code> matmul, which then returns logits on CPU</li>
+  Spyre for the <code>SpyreParallelLMHead</code> matmul, which returns logits on Spyre</li>
 </ul>
 <p><code>SpyreVocabParallelEmbedding</code> inherits weight loading and shard arithmetic from upstream
 and overrides <code>forward</code>. The weight moves to Spyre with the rest of the model, and the

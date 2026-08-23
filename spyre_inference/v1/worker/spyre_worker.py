@@ -14,6 +14,7 @@
 
 """A Torch Spyre worker class."""
 
+import glob
 import os
 from contextlib import AbstractContextManager, nullcontext
 
@@ -40,6 +41,33 @@ from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
+
+
+def _is_spyre_pci_device(address: str) -> bool:
+    class_path = f"/sys/bus/pci/devices/{address}/class"
+    if not os.path.exists(class_path):
+        return False
+    with open(class_path, encoding="utf-8") as file:
+        return file.read().strip() == "0x120000"
+
+
+def _get_spyre_pcie_address(local_rank: int) -> str:
+    spyre_devices = sorted(path.rsplit("/", 1)[-1] for path in glob.glob("/sys/bus/pci/devices/*"))
+    spyre_devices = [address for address in spyre_devices if _is_spyre_pci_device(address)]
+
+    requested_devices = os.environ.get("SPYRE_DEVICES")
+    if requested_devices:
+        requested_indices = [
+            int(index.strip()) for index in requested_devices.split(",") if index.strip()
+        ]
+        if local_rank < len(requested_indices):
+            requested_index = requested_indices[local_rank]
+            if requested_index < len(spyre_devices):
+                return spyre_devices[requested_index]
+
+    if local_rank < len(spyre_devices):
+        return spyre_devices[local_rank]
+    return "unknown"
 
 
 def monkey_patch_torch_profiler_activity_map():
@@ -105,6 +133,13 @@ class TorchSpyreWorker(Worker):
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.
         torch.spyre.set_device(self.local_rank)
+        logger.info(
+            "Spyre worker device selection: "
+            "local_rank=%d requested SPYRE_DEVICES=%r pcie_address=%s",
+            self.local_rank,
+            os.environ.get("SPYRE_DEVICES"),
+            _get_spyre_pcie_address(self.local_rank),
+        )
 
         # Register all the custom ops here when a worker is created.
         # This has to happen before the model is loaded, so that all the

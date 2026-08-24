@@ -236,8 +236,7 @@ def _qk_norm_model():
 
 
 def test_install_qk_norm_rejection_fires_before_weights_load():
-    """The wrap must reject a QK-norm model before load_weights runs (the real
-    load would otherwise die on default_weight_loader's size assertion first)."""
+    """The wrap must reject before load_weights runs, else the size assertion wins."""
     loader = _FakeLoader()
     hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
 

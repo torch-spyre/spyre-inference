@@ -422,9 +422,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
-        # Reject QK-norm-over-head_dim before weights load: the check needs the
-        # built module tree, but the padded q_norm/k_norm param would otherwise
-        # trip default_weight_loader's size assertion before it could run.
         install_qk_norm_rejection(model_loader, self.model_config.hf_config)
 
         # Load model on CPU

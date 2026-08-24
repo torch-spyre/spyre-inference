@@ -7,7 +7,7 @@
 ## Architecture
 
 - Registers as the `spyre_inference` vLLM platform plugin via entry points (`spyre_inference:register`).
-- `TorchSpyrePlatform` extends `CpuPlatform`, forcing `torch.float16` and eager execution (torch.compile is incompatible with the current CPU fallback ops).
+- `TorchSpyrePlatform` extends `CpuPlatform`, forcing `torch.float16`. `--enforce-eager` is the only compile switch: set → `CompilationMode.NONE`; default → `STOCK_TORCH_COMPILE` (whole model + attention).
 
 **Key modules:**
 
@@ -43,7 +43,7 @@ Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`). Env vars
 - **Head size** must be a multiple of 64 (128-byte stick / 2 bytes for fp16).
 - **dtype**: float16 only (enforced in `platform.py`).
 - **Tensor parallelism**: TP≥1 supported; `all_reduce` is provided natively by `libspyre_comms` (no longer overridden in `SpyreCommunicator`). **DP>1 is rejected** in `TorchSpyrePlatform.check_and_update_config` — the spyre-comms global rank space isn't validated for DP×TP.
-- **Compilation**: platform compile is `CompilationMode.NONE`. Caveat: under the pytest `default_vllm_config` fixture, `cfg.mode` is Python `None` (not the `NONE=0` enum), so per-module gates like `_maybe_compile` may still wrap kernels with `torch.compile(..., dynamic=False)`. Don't assume "eager in tests."
+- **Compilation**: default is compiled (`STOCK_TORCH_COMPILE`), not eager. Attention compiles in its own domain: `SpyreAttentionImpl` reads `get_current_vllm_config().compilation_config.mode` at construction, so building it outside a `set_current_vllm_config` context raises. Tests force `enforce_eager=True` where they want eager — don't assume "eager in tests." `STOCK_TORCH_COMPILE` compiles one transformer block at a time; `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model graph.
 - **Single accelerator**: the device is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/xdist, no parallel `uv run pytest`, no backgrounding one Spyre test while starting another. Parallel runs hang, corrupt device state, or corrupt the compile cache.
 
 ## Iterating on a Local `torch-spyre` Checkout
@@ -66,6 +66,10 @@ For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware inte
 - **Avoid trivial helpers** — don't wrap 1-2 LOC used once.
 - **Prefer simplicity** and match existing patterns/architecture when uncertain.
 - Assume general vLLM familiarity in the reader.
+
+## Opening a PR
+
+Always use the `prepare-pull-request` skill to clean up the current branch and open a pull request.
 
 ## DCO (Developer Certificate of Origin)
 

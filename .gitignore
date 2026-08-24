@@ -45,3 +45,6 @@ htmlcov/
 # mkdocs documentation
 /site
 docs/examples
+
+# PR body drafts (prepare-pull-request skill)
+.pr_drafts/

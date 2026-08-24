@@ -6,7 +6,7 @@
     SPYRE_DEVICES: '0'
   parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    tensor_parallel_size: 1 # TP is not supported; SpyreCommunicator: allreduce is not natively available
+    tensor_parallel_size: 1
     dtype: float16
     load_format: auto
     input-len: 64
@@ -14,4 +14,22 @@
     batch-size: 1
     num-iters-warmup: 1
     num-iters: 2
+    max-model-len: 128
+- test_name: latency_granite33-8b_tp1_in64_out64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    # Allow long compilation
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-3.3-8b-instruct
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 64
+    batch-size: 1
+    num-iters-warmup: 2
+    num-iters: 10
     max-model-len: 128

@@ -35,19 +35,35 @@ pytestmark = pytest.mark.compile
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
+    """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
+
+    No compilation_config is passed: the platform defaults a non-eager run to
+    STOCK_TORCH_COMPILE (one transformer block at a time + attention kernel).
+    """
+    model, ref_output = model_ref_output
+    _assert_compiled_output(model, ref_output, monkeypatch)
+
+
+def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole-model graph still produces the same tokens."""
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "\n\nIBMs main businesses are the companies that provide the services of the",
+        monkeypatch,
+    )
+
+
+def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm import LLM, SamplingParams
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     prompt = "What are IBMs main businesses?"
 
-    model, ref_output = model_ref_output
-
     engine = LLM(
         model=model,
         enforce_eager=False,
-        compilation_config={"mode": "STOCK_TORCH_COMPILE"},
         max_model_len=128,
         max_num_seqs=2,
     )

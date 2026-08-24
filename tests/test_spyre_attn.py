@@ -23,12 +23,10 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
-    slot_major_kv_layout,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
@@ -47,13 +45,6 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
-
-
-@pytest.fixture()
-def force_compile_attn(request, monkeypatch):
-    """Flip the SPYRE_FORCE_COMPILE_ATTN gate; the env var is only read at import."""
-    monkeypatch.setattr(spyre_attn, "_FORCE_COMPILE_ATTN", request.param)
-    return request.param
 
 
 @pytest.fixture()
@@ -86,20 +77,6 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
-
-
-def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre
-    exactly as the model runner allocates it."""
-    if device.type != "spyre":
-        return cache_cpu.to(device)
-    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
-    return cache_cpu.to(
-        device,
-        device_layout=slot_major_kv_layout(
-            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
-        ),
-    )
 
 
 def _fused_qkv_kv_views(
@@ -354,10 +331,12 @@ def _run_spyre_attn_test(
     head_size: int = 128,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
-    # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
-    # "missing device_tensor_layout on graph input arg0_1"
-    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
-        pytest.skip("STOCK + device_spyre, currently fails.")
+    # The compiled attention kernel targets the Spyre device. On CPU it routes
+    # through Inductor's C++ backend, whose codegen for the kernel's indirect
+    # index_select + transpose pattern is broken ("use of undeclared identifier
+    # tmpN"). CPU is only the eager reference here, so skip the compiled+CPU combo.
+    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "cpu":
+        pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
 
     num_blocks = 256
     dtype = torch.float16
@@ -416,8 +395,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = _to_cache_device(k_pages_cpu, cache_device)
-    v_pages = _to_cache_device(v_pages_cpu, cache_device)
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -550,10 +529,9 @@ def test_spyre_attn_core(
 )
 @pytest.mark.parametrize(
     "configure_compilation",
-    [pytest.param("NONE", id="compilation_NONE")],
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
     indirect=True,
 )
-@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
 @pytest.mark.parametrize(
     "seq_lens",
     [
@@ -562,17 +540,16 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
     ],
 )
-def test_spyre_attn_force_compile_attn_multi_seq(
+def test_spyre_attn_compiled_multi_seq(
     default_vllm_config,
-    force_compile_attn: bool,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """SPYRE_FORCE_COMPILE_ATTN=1 over a multi-sequence batch.
+    """Compiled attention (STOCK_TORCH_COMPILE) over a multi-sequence batch on device.
 
     Sequences past batch slot 0 silently gathered slot 0's KV pages
-    (torch-spyre#3770); only a real batch on device catches it.
+    (torch-spyre#3770); only a real compiled batch on device catches it.
     """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
@@ -1304,8 +1281,8 @@ def test_reshape_and_cache_scatter(
         k_expected[block][offset] = key[t]
         v_expected[block][offset] = value[t]
 
-    k_actual = _to_cache_device(fresh_pages(), cache_device)
-    v_actual = _to_cache_device(fresh_pages(), cache_device)
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
 
     if source_layout == "qkv_split":
         query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)

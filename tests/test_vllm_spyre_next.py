@@ -25,6 +25,7 @@ def test_basic_model_load():
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         max_model_len=128,
         max_num_seqs=2,
+        enforce_eager=True,
         attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
     )
 
@@ -54,6 +55,7 @@ def test_long_context_model_load():
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
         max_model_len=131072,
         max_num_seqs=8,
+        enforce_eager=True,
         attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
     )
 

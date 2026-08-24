@@ -117,3 +117,37 @@ def register():
         dispatch_key="CompositeExplicitAutograd",
     )
     logger.debug_once("Registered custom op: spyre_convert")
+
+
+def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
+    """Move a 2D gather source to device with its rows outermost."""
+    # TODO(tdoublep): can this be moved upstream?
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    # fn cannot carry a device_layout, so probe it on one row to learn the destination.
+    probe = fn(src[:1])
+    if probe.device.type != "spyre":
+        return fn(src)
+
+    num_rows, row_width = src.shape
+    # Spyre needs a gather's indexed dim at device position 0, and a row must fill
+    # whole sticks: 64 elements for fp16 (128-byte stick / 2 bytes per element).
+    elems_per_stick = get_elem_in_stick(probe.dtype)
+    if row_width % elems_per_stick:
+        logger.warning_once(
+            "%s: row width %d is not a multiple of %d, keeping the default layout (slower gather).",
+            name,
+            row_width,
+            elems_per_stick,
+        )
+        return fn(src)
+
+    return src.to(  # ty: ignore[no-matching-overload]
+        probe.device,
+        dtype=probe.dtype,
+        device_layout=SpyreTensorLayout(
+            device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
+            stride_map=[row_width, elems_per_stick, 1],
+            device_dtype=get_device_dtype(probe.dtype),
+        ),
+    )

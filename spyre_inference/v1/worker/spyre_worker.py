@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environmen
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference.custom_ops import register_all
+from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -96,6 +97,10 @@ class TorchSpyreWorker(Worker):
         import torch_spyre
 
         torch_spyre._autoload()
+
+        # torch_spyre's autoload sets cache_size_limit=1024, undoing the limits
+        # platform.py raised at import.
+        _raise_dynamo_recompile_limits()
 
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.

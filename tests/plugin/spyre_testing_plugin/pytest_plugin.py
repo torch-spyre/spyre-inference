@@ -782,6 +782,29 @@ def default_vllm_config(monkeypatch):
     yield from _spyre_default_vllm_config(monkeypatch)
 
 
+def _force_eager_vllm_runner(fixturedef):
+    """Wrap the upstream ``vllm_runner`` so runners default to eager — otherwise
+    every upstream model test compiles (STOCK) and CI time balloons. A test can
+    still opt into compilation explicitly; its ``enforce_eager`` kwarg wins.
+    """
+    if getattr(fixturedef.func, "_spyre_eager_default", False):
+        return
+
+    orig_func = fixturedef.func
+
+    def _eager_runner_fixture(*args, **kwargs):
+        runner_cls = orig_func(*args, **kwargs)
+
+        def _make(*r_args, **r_kwargs):
+            r_kwargs.setdefault("enforce_eager", True)
+            return runner_cls(*r_args, **r_kwargs)
+
+        return _make
+
+    _eager_runner_fixture._spyre_eager_default = True
+    fixturedef.func = _eager_runner_fixture
+
+
 @pytest.fixture(scope="session")
 def _distributed_init(_spyre_session_config):
     """Initialize torch.distributed with gloo backend once per test session.
@@ -1036,6 +1059,8 @@ def pytest_fixture_setup(fixturedef, request):
     elif fixturedef.argname == "should_do_global_cleanup_after_test":
         fixturedef.func = lambda: False
         fixturedef.argnames = ()
+    elif fixturedef.argname == "vllm_runner":
+        _force_eager_vllm_runner(fixturedef)
 
 
 @pytest.hookimpl(hookwrapper=True)

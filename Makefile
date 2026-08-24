@@ -38,6 +38,12 @@ $(info ::error::Invalid test_type '$(TEST_TYPE)'. Valid: $(VALID_TEST_TYPES_DISP
 $(error Invalid TEST_TYPE '$(TEST_TYPE)')
 endif
 
+# torch-spyre#3707's HBM pool planner corrupts compiled output and leaks HBM
+# across fallback boundaries. spyre_inference sets this too, but only takes
+# effect if nothing imported torch_spyre first, so export it for every recipe.
+HBM_POOL_PLANNING ?= 0
+export HBM_POOL_PLANNING
+
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
 PYTEST_ARGS ?= -s -vvv
@@ -250,9 +256,18 @@ else
 BENCH_PY := python3
 endif
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
+# Optional benchmark filters (empty = run everything). MODELS narrows to a
+# comma-separated set of model names -- CI passes the per-model matrix entry
+# here so each job benches a single model. BENCH_TYPES narrows to a subset of
+# latency,throughput,serve for quick local iteration.
+MODELS ?=
+BENCH_TYPES ?=
+
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
 	mkdir -p "$(RESULTS_DIR)"
 	$(AIU_SETUP_CMD); \
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
-		--results-dir "$(RESULTS_DIR)"
+		--results-dir "$(RESULTS_DIR)" \
+		--models "$(MODELS)" \
+		--bench-types "$(BENCH_TYPES)"

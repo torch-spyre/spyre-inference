@@ -62,23 +62,13 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile, run in eager mode",
-    )
-    parser.add_argument(
-        "--force-compile-attn",
-        action="store_true",
-        dest="force_compile_attn",
-        help="Compile the attention kernel (specialized_paged_attn_kernel, off by default).",
+        help="Skip torch.compile (whole model and attention kernel), run in eager mode",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
-    # Note: SPYRE_FORCE_COMPILE_ATTN=1 only compiles the
-    # specialized_paged_attn_kernel, not the complete attention.
-    os.environ["SPYRE_FORCE_COMPILE_ATTN"] = "1" if args.force_compile_attn else "0"
 
     if platform.machine() == "arm64":
         print(
@@ -135,9 +125,8 @@ def main():
         SamplingParams(max_tokens=m, temperature=0.0, ignore_eos=True) for m in max_tokens
     ]
 
-    # Set STOCK_TORCH_COMPILE as the compile mode for Spyre if not running eager.
-    compilation_config = None if args.enforce_eager else {"mode": "STOCK_TORCH_COMPILE"}
-
+    # The platform derives the compile mode from enforce_eager, so no explicit
+    # compilation_config is needed.
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
@@ -147,14 +136,12 @@ def main():
         max_num_batched_tokens=args.max_num_batched_tokens,
         dtype="float16",
         enforce_eager=args.enforce_eager,
-        compilation_config=compilation_config,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
 
-    # When compiling (whole-model or attention kernel), run an untimed warmup
-    # pass first so any lazy per-shape Inductor recompiles happen outside the
-    # timed GENERATE window below.
-    if not args.enforce_eager or args.force_compile_attn:
+    # When compiling, run an untimed warmup pass first so any lazy per-shape
+    # Inductor recompiles happen outside the timed GENERATE window below.
+    if not args.enforce_eager:
         print("=============== WARMUP")
         t_warm = time.time()
         llm.generate(prompts, sampling_params)

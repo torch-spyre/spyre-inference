@@ -15,7 +15,7 @@ inputs:
   runner_labels:
     description: |
       The runner-label selectors the caller requested in its `runs-on`
-      (a JSON array string, e.g. '["x86_64","spyre_pf_x1__pvc_1tb_x1",
+      (a JSON array string, e.g. '["x86_64","spyre_pf_x1",
       "linux","image_torch_spyre_pinned"]'). The matrix strategy
       parameterizes these per job, so echoing them shows which labels
       routed this specific run. Optional: when empty, only the resolved

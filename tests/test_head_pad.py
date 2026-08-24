@@ -29,6 +29,7 @@ from spyre_inference.custom_ops.head_pad import (
     _pad_weight,
     fix_padded_attention_scale,
     install_padded_head_dim,
+    install_qk_norm_rejection,
     reject_padded_qk_norm,
     verify_padded_head_dim,
 )
@@ -214,6 +215,58 @@ def test_reject_qk_norm_allows_norms_of_other_widths():
     hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
 
     reject_padded_qk_norm(model, hf_config)
+
+
+class _FakeLoader:
+    """A model loader whose load_weights records whether it was reached."""
+
+    def __init__(self):
+        self.loaded = False
+
+    def load_weights(self, model, model_config):
+        self.loaded = True
+
+
+def _qk_norm_model():
+    model = torch.nn.Module()
+    layer = torch.nn.Module()
+    layer.add_module("q_norm", torch.nn.LayerNorm(_PADDED))
+    model.add_module("attn", layer)
+    return model
+
+
+def test_install_qk_norm_rejection_fires_before_weights_load():
+    """The wrap must reject a QK-norm model before load_weights runs (the real
+    load would otherwise die on default_weight_loader's size assertion first)."""
+    loader = _FakeLoader()
+    hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+
+    install_qk_norm_rejection(loader, hf_config)
+
+    with pytest.raises(NotImplementedError, match="normalizes over head_dim"):
+        loader.load_weights(_qk_norm_model(), None)
+    assert not loader.loaded
+
+
+def test_install_qk_norm_rejection_passes_clean_models_through():
+    """A model without head_dim QK-norm loads normally through the wrap."""
+    loader = _FakeLoader()
+    hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+
+    install_qk_norm_rejection(loader, hf_config)
+    loader.load_weights(_model_with_attention(_PADDED), None)
+
+    assert loader.loaded
+
+
+def test_install_qk_norm_rejection_noop_without_padding():
+    """Unpadded models are never wrapped, so even a QK-norm model loads through."""
+    loader = _FakeLoader()
+
+    install_qk_norm_rejection(loader, SimpleNamespace(head_dim=_ORIG))
+    loader.load_weights(_qk_norm_model(), None)
+
+    assert loader.loaded
 
 
 def test_verify_checks_the_transformers_backend_attention_dict():

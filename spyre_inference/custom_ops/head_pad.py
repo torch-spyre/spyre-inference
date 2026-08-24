@@ -251,6 +251,12 @@ def reject_padded_qk_norm(model, hf_config) -> None:
     Padding fills the extra dims with zeros, which is invisible to the QK dot
     product and to V/O, but an RMSNorm taken over the padded head_dim divides by
     the RMS of 128 values of which half are zero — silently rescaling Q/K.
+
+    Must run on the built-but-not-yet-loaded module tree (see
+    ``install_qk_norm_rejection``): the q_norm/k_norm params are sized at the
+    padded head_dim, but their checkpoint tensors keep the original width, so
+    waiting until after weights load lets vLLM's ``default_weight_loader`` die on
+    a bare size assertion before this friendlier error can surface.
     """
     if not head_padding_active(hf_config):
         return
@@ -265,6 +271,29 @@ def reject_padded_qk_norm(model, hf_config) -> None:
                     f"alignment, but {name}.{norm_attr} normalizes over head_dim; "
                     "zero-padded dims would change the RMS and rescale Q/K."
                 )
+
+
+def install_qk_norm_rejection(model_loader, hf_config) -> None:
+    """Run ``reject_padded_qk_norm`` on the model before its weights are loaded.
+
+    ``load_model`` builds the module tree and loads weights in one call, so a
+    post-load check is never reached for a QK-norm model: the padded q_norm/k_norm
+    param meets its original-width checkpoint tensor and vLLM's
+    ``default_weight_loader`` raises a bare size assertion first. Wrapping
+    ``load_weights`` (the step ``load_model`` runs after ``initialize_model``)
+    lets the check see the fully built module tree — params already sized at the
+    padded head_dim — and reject with the intended message before any tensor loads.
+    """
+    if not head_padding_active(hf_config):
+        return
+
+    original_load_weights = model_loader.load_weights
+
+    def load_weights_with_qk_norm_check(model, model_config) -> None:
+        reject_padded_qk_norm(model, hf_config)
+        return original_load_weights(model, model_config)
+
+    model_loader.load_weights = load_weights_with_qk_norm_check
 
 
 def install_head_pad_weight_loader(model_loader, hf_config) -> None:

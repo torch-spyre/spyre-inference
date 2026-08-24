@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -45,6 +46,13 @@ def configure_device(request, monkeypatch):
     if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
+
+
+@pytest.fixture()
+def bucketed_decode(request, monkeypatch):
+    """Flip the SPYRE_BUCKETED_DECODE gate; the env var is only read at import."""
+    monkeypatch.setattr(spyre_attn, "_BUCKETED_DECODE", request.param)
+    return request.param
 
 
 @pytest.fixture()
@@ -1498,3 +1506,134 @@ def test_install_patches_layers_not_the_attention_class():
     # No cache bound, so there is no device to mirror onto and nothing to publish.
     holder.publish_null(8)
     assert holder.slots is None
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize("bucketed_decode", [True], indirect=True)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Probe: N=8 exact, all seqs have num_blocks_needed=1 → bucket (8, 1).
+        # Isolates whether the Mod(d0, 4) failure is specifically about
+        # bucket_num_blocks=4 (Bblocks) or something else at bucket_num_seqs=8.
+        pytest.param(
+            [(1, 64)] * 8,
+            id="probe_bucket(8_1)",
+        ),
+        # Bucket-boundary cases: N=5 (rounds to bucket 8), N=8 (exact),
+        # N=9 (rounds to 16). All decode-only, all within NUM_BLOCKS_BUCKETS
+        # ceiling. Bit-exact vs per-seq reference on Spyre.
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
+            id="bucket_pad(N=5_bucket=8)",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (1, 512), (1, 128), (1, 384)],
+            id="bucket_exact(N=8)",
+        ),
+        pytest.param(
+            [
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+            ],
+            id="bucket_pad(N=9_bucket=16)",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (1, 512), (1, 128), (1, 384)] * 4,
+            id="bucket_exact(N=32)",
+        ),
+    ],
+)
+def test_spyre_attn_bucketed_decode_correctness(
+    default_vllm_config,
+    bucketed_decode: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """SPYRE_BUCKETED_DECODE=1: whole batch handled by one compiled kernel.
+
+    Preconditions (Layer 0 builder + Layer 3 helper): every query_len == 1,
+    no sliding window, no ALiBi, no soft-cap, N within NUM_SEQS_BUCKETS and
+    max_num_blocks within NUM_BLOCKS_BUCKETS. When all met, the padded
+    (B_seqs, B_blocks) batch runs through one _get_bucketed_decode_kernel
+    dispatch; the padded seq/block slots are -inf-masked. Bit-exact vs the
+    compiled per-seq reference on Spyre.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize("bucketed_decode", [True], indirect=True)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Precondition-violating batches — SPYRE_BUCKETED_DECODE=1 must
+        # silently fall back to the per-seq loop and match the reference.
+        pytest.param([(1, 512)], id="single_seq(fallback)"),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 128)],
+            id="below_min_seqs(N=3_fallback)",
+        ),
+        pytest.param(
+            [(32, 256), (64, 512)],
+            id="prefill_max_query_len_gt_1(fallback)",
+        ),
+        pytest.param(
+            [(1, 256), (32, 256), (1, 256), (32, 256)],
+            id="mixed_decode_prefill(fallback)",
+        ),
+    ],
+)
+def test_spyre_attn_bucketed_decode_fallback(
+    default_vllm_config,
+    bucketed_decode: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """SPYRE_BUCKETED_DECODE=1 on batches that violate the fast-path preconditions.
+
+    Guards the silent-fallback contract: the flag must have no observable
+    effect on correctness for single-seq (below _MIN_SEQS via NUM_SEQS_BUCKETS[0]),
+    prefill, or mixed batches — the per-seq loop still runs and results still
+    match the per-seq reference.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )

@@ -106,12 +106,8 @@ def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> tor
 def _pad_qk_norm_weight(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     """Pad a per-head QK-norm weight ``[orig] -> [padded]`` to match padded Q/K.
 
-    The norm multiplies the interleave-padded per-head Q/K element-wise, so its
-    ``[head_dim]`` weight must land in the same ``[first_half | zeros | second_half
-    | zeros]`` layout. The RMS is then taken over ``padded`` dims of which only
-    ``orig`` are nonzero, so it divides by ``padded`` instead of ``orig`` — folding
-    ``sqrt(orig/padded)`` into the weight restores the original scale (the padded
-    dims stay zero, so the summed energy is unchanged; only the divisor was wrong).
+    RMS over the padded head divides by ``padded`` not ``orig``; folding
+    ``sqrt(orig/padded)`` into the weight restores the original scale.
     """
     return _pad_qk_interleaved(w * math.sqrt(orig / padded), 1, orig, padded)
 
@@ -145,8 +141,7 @@ def _pad_weight(
         return _pad_output_end(w, n_kv_heads, orig, padded)
     if name.endswith("o_proj.weight"):
         return _pad_input_end(w, n_heads, orig, padded)
-    # QK-norm (Qwen3): a per-head RMSNorm over head_dim. Only a head_dim-width norm
-    # is padded; a q_norm/k_norm taken over some other width is left untouched.
+    # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
     if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:
         return _pad_qk_norm_weight(w, orig, padded)
     return w

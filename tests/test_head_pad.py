@@ -207,7 +207,6 @@ def test_pad_weight_lays_out_qk_norm_interleaved_and_zeros_the_pad():
     assert out.shape == (_PADDED,)
     half, padded_half = _ORIG // 2, _PADDED // 2
     scale = (_ORIG / _PADDED) ** 0.5
-    # Real dims land in the two half-blocks (scaled); everything else is zero.
     assert torch.allclose(out[:half], w[:half] * scale)
     assert torch.allclose(out[padded_half : padded_half + half], w[half:] * scale)
     assert not out[half:padded_half].any()
@@ -220,11 +219,9 @@ def test_pad_weight_qk_norm_reproduces_the_original_rmsnorm():
     q = torch.randn(_ORIG)
     w = torch.randn(_ORIG)
 
-    # Original: RMSNorm over the native head_dim.
     ref = _rms_norm(q, w)
 
-    # Padded: q interleave-padded like q_proj, norm weight padded by _pad_weight,
-    # then RMSNorm over the full padded width (padded dims are zero).
+    # q and its norm weight are padded exactly as the loader pads q_proj / q_norm.
     q_padded = _pad_weight("q_proj.weight", q.view(_ORIG, 1), 1, 1, _ORIG, _PADDED).view(_PADDED)
     w_padded = _pad_weight("q_norm.weight", w, 1, 1, _ORIG, _PADDED)
     out = _rms_norm(q_padded, w_padded)

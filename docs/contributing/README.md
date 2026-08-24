@@ -16,6 +16,14 @@ uv sync --group dev
 
 This includes `pytest`, `pyyaml`, and the `spyre-testing-plugin` for running the test suite.
 
+If you already have a local `torch-spyre` checkout installed (e.g. editable, for `torch-spyre` development), a plain `uv sync` will rebuild and reinstall the pinned git rev from `pyproject.toml`, discarding it. To keep your local install instead:
+
+```bash
+uv sync --group dev --no-install-package torch-spyre --inexact
+```
+
+`--no-install-package torch-spyre` skips resolving and rebuilding the pinned rev; `--inexact` stops uv from uninstalling the now-unreferenced local package. Note this only affects `uv sync` itself — any subsequent plain `uv run` will still re-sync and revert it, so use `uv run --no-sync …` for those (see `CLAUDE.md`'s "Iterating on a Local `torch-spyre` Checkout" section).
+
 ### Linting
 
 When submitting a PR, please make sure your code passes all linting checks. We use prek with a .pre-commit-config.yaml file to run checks on every commit.

@@ -43,6 +43,4 @@ class SpyreGemmaRMSNorm(GemmaRMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is not None:
-            return self._forward(x, residual)
-        return self._forward(x)
+        return self._forward(x, residual)

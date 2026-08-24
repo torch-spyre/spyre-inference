@@ -1855,11 +1855,10 @@
 <h1 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h1>
 <h2 id="plugin-setup">Plugin Setup<a class="headerlink" href="#plugin-setup" title="Permanent link">&para;</a></h2>
 <p>To load the plugin, set the <code>VLLM_PLUGINS</code> environment variable before running vLLM:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_PLUGINS</span><span class="o">=</span>spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_PLUGINS</span><span class="o">=</span>spyre_inference,spyre_inference_ops
 </span></code></pre></div>
-<p><code>spyre_inference</code> activates the platform, <code>spyre_inference_ops</code> registers the OOT custom
-ops, and <code>spyre_inference_hf_adaptor</code> swaps in the hf-adapters Transformers backend
-(needed for <code>model_impl="transformers"</code>).</p>
+<p><code>spyre_inference</code> activates the platform, and <code>spyre_inference_ops</code> registers the OOT
+custom ops plus the Spyre Transformers backend (used for <code>model_impl="transformers"</code>).</p>
 <h2 id="usage">Usage<a class="headerlink" href="#usage" title="Permanent link">&para;</a></h2>
 <p>You can then use vLLM as usual:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
@@ -1890,9 +1889,8 @@ ops, and <code>spyre_inference_hf_adaptor</code> swaps in the hf-adapters Transf
 <div class="language-toml highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="k">[tool.uv.sources]</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">vllm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/vllm-project/vllm"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
 </span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/torch-spyre/torch-spyre"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
-</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">hf-adapters-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/torch-spyre/hf-adapters.git"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
 </span></code></pre></div>
-<p>This ensures that torch-spyre, hf-adapters, and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.</p>
+<p>This ensures that torch-spyre and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.</p>
 <h3 id="pytorch-cpu-index">PyTorch CPU Index<a class="headerlink" href="#pytorch-cpu-index" title="Permanent link">&para;</a></h3>
 <div class="language-toml highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="k">[[tool.uv.index]]</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"pytorch-cpu"</span>

@@ -21,64 +21,33 @@ Spyre Device Constraints:
       Other quantization methods raise NotImplementedError.
 """
 
-import torch
-import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
 
-from .linear import spyre_linear_t
+from .linear import SpyreTransposedWeightMethod
 
 
 logger = init_logger(__name__)
 
 
-class SpyreUnquantizedLMHeadMethod(UnquantizedEmbeddingMethod):
-    """Routes lm_head computation through SpyreParallelLMHead.forward_oot()."""
+class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMethod):
+    """LM-head projection via the shared transposed-weight fast path."""
 
-    def apply(self, layer, x, bias=None):
-        return layer.forward_oot(x, bias)
-
-    def process_weights_after_loading(self, layer):
-        super().process_weights_after_loading(layer)
-
-        # torch-spyre currently has a limitation with the work division of larger
-        # matmuls. The shapes needs to be a multiple of 64 * (k * 32), where k is
-        # an integer.
-        # With TP>1, layer.weight.shape[0] is the per-rank vocab partition size.
-        ALIGN = 64 * 32
-        size = layer.weight.shape[0]
-        layer.padding = (-size) % ALIGN
-
-        if layer.padding > 0:
-            padded = F.pad(layer.weight.data, (0, 0, 0, layer.padding))
-            logger.warning_once(
-                "%s: weights padded from %d to %d (torch-spyre limitation) "
-                "expect numerical differences to upstream vLLM.",
-                layer.__class__.__name__,
-                size,
-                padded.shape[0],
-            )
-        else:
-            padded = layer.weight.data
-
-        # Store transposed ([hidden, padded_vocab]) so forward_oot's GEMM is the
-        # Spyre-fast `x @ A` (torch-spyre #3512). `.t().contiguous()` gives
-        # INDEPENDENT storage from `weight`; with tie_word_embeddings `weight` IS
-        # `embed_tokens.weight`, which must keep its own (gather) layout.
-        layer.padded_weight_t = Parameter(padded.t().contiguous())
+    WEIGHT_T_ATTR = "padded_weight_t"
+    ROW_ALIGN = 64 * 32
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
-    """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device."""
+    """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device.
 
-    padding: int
-    padded_weight_t: torch.Tensor
+    The projection lives in `SpyreUnquantizedLMHeadMethod.apply`, reached via
+    `LogitsProcessor._apply_head` -> `lm_head.quant_method.apply`. The base
+    `ParallelLMHead.forward` raises and is unused.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -94,21 +63,3 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
-
-    def forward_oot(self, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        """OOT forward pass.
-
-        Args:
-            x: Hidden states tensor [num_tokens, hidden_dim]
-            bias: Optional bias tensor
-
-        Returns:
-            Logits tensor [num_tokens, num_embeddings_per_partition] on the input device
-        """
-        out = spyre_linear_t(x, self.padded_weight_t.data, bias)
-        # Slice off the padding rows that process_weights_after_loading added
-        # (they appear as trailing logit columns).
-        if self.padding > 0:
-            out = out[:, : -self.padding]
-        # Logits stay on the Spyre device.
-        return out

@@ -36,11 +36,12 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 
 from hf_adapters.hf_common import (
-    BLOCK_SIZE,
+    InvFreqShim,
     PrecomputedRotaryEmbedding,
     apply_rope_matmul,
     get_backbone,
 )
+from spyre_inference.custom_ops.head_pad import original_head_dim
 from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
 
@@ -70,49 +71,27 @@ class _SpyreRotaryEmbedding(nn.Module):
         return self._pre(x, position_ids), None
 
 
-def _qk_expand_matrix(orig_hd: int, padded_hd: int) -> torch.Tensor:
-    """Interleaved expand matrix for Q/K (RoPE-compatible half-split)."""
-    half, phalf = orig_hd // 2, padded_hd // 2
-    m = torch.zeros(orig_hd, padded_hd)
-    m[:half, :phalf] = torch.eye(half, phalf)
-    m[half:, phalf:] = torch.eye(half, phalf)
-    return m
+def _spyre_apply_rotary(q, k, cos, sin=None, *args, **kwargs):
+    """Matmul RoPE; ``cos`` carries [B, L, 2, 2, D/2] rotation matrices, ``sin`` unused."""
+    return apply_rope_matmul(q, cos), apply_rope_matmul(k, cos)
 
 
-def _make_spyre_apply_rotary(original_fn, qk_expand=None):
-    """Replace apply_rotary_pos_emb with matmul-based RoPE.
+_spyre_apply_rotary._spyre_patched = True
 
-    When *qk_expand* is provided (head_dim/2 is not stick-aligned), Q/K are
-    temporarily padded into the stick-aligned dimension for the rotation,
-    then contracted back to the original size.
+
+def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> InvFreqShim:
+    """Rebuild ``inv_freq``/``attention_scaling`` at the pre-pad head_dim.
+
+    HF derived them from the widened ``config.head_dim``, giving one frequency per
+    padded pair instead of per real pair.
     """
-    qk_contract = qk_expand.t().contiguous() if qk_expand is not None else None
-    _cached: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
-
-    @torch.no_grad()
-    def wrapper(q, k, cos, sin=None, *args, **kwargs):
-        if qk_expand is not None:
-            assert qk_contract is not None  # set together with qk_expand above
-            dev = q.device
-            if dev not in _cached:
-                _cached[dev] = (
-                    qk_expand.to(device=dev, dtype=q.dtype),
-                    qk_contract.to(device=dev, dtype=q.dtype),
-                )
-            exp, con = _cached[dev]
-            q = torch.matmul(q, exp)
-            k = torch.matmul(k, exp)
-
-        q, k = apply_rope_matmul(q, cos), apply_rope_matmul(k, cos)
-
-        if qk_expand is not None:
-            q = torch.matmul(q, con)
-            k = torch.matmul(k, con)
-
-        return q, k
-
-    wrapper._spyre_patched = True
-    return wrapper
+    padded = cfg.head_dim
+    cfg.head_dim = orig_head_dim
+    try:
+        ref = type(rope)(config=cfg)
+    finally:
+        cfg.head_dim = padded
+    return InvFreqShim(ref.inv_freq, ref.attention_scaling)
 
 
 class HfAdaptersForCausalLM(TransformersForCausalLM):
@@ -171,30 +150,23 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
     def _patch_rope(self):
         """Replace RoPE with matmul-based rotation.
 
-        When head_dim/2 is not stick-aligned (not a multiple of BLOCK_SIZE),
-        an expand/contract matrix pair is built and passed to the patched
-        ``apply_rotary_pos_emb`` so that Q/K are temporarily padded into
-        a stick-aligned dimension for the rotation, then contracted back.
-        Attention and the KV cache keep using the original head_dim.
+        head_dim is already a 128-multiple (the platform pads it), so the rotation
+        needs no expand/contract here — only the pre-pad frequencies, identity-padded
+        back out to the padded width.
         """
 
         cfg = self.model.config
-        orig_head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-
-        stick_aligned = ((orig_head_dim + 2 * BLOCK_SIZE - 1) // (2 * BLOCK_SIZE)) * (
-            2 * BLOCK_SIZE
-        )
-        padded_head_dim = stick_aligned if stick_aligned > orig_head_dim else None
-
-        qk_exp = (
-            _qk_expand_matrix(orig_head_dim, padded_head_dim)
-            if padded_head_dim is not None
-            else None
-        )
+        orig_head_dim = original_head_dim(cfg)
 
         backbone = get_backbone(self.model)
+        rope_source = backbone.rotary_emb
+        padded_head_dim = None
+        if orig_head_dim is not None:
+            padded_head_dim = cfg.head_dim
+            rope_source = _rope_at_original_head_dim(cfg, backbone.rotary_emb, orig_head_dim)
+
         spyre_rope = PrecomputedRotaryEmbedding(
-            backbone.rotary_emb,
+            rope_source,
             padded_head_dim=padded_head_dim,
         )
 
@@ -227,10 +199,10 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
             mod = sys.modules.get(type(module).__module__)
             if mod is None or id(mod) in patched_mods:
                 continue
-            orig = getattr(mod, "apply_rotary_pos_emb", None)
-            if orig is None or getattr(orig, "_spyre_patched", False):
+            existing = getattr(mod, "apply_rotary_pos_emb", None)
+            if existing is None or getattr(existing, "_spyre_patched", False):
                 continue
-            mod.apply_rotary_pos_emb = _make_spyre_apply_rotary(orig, qk_exp)
+            mod.apply_rotary_pos_emb = _spyre_apply_rotary
             patched_mods.add(id(mod))
 
 

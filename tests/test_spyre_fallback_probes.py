@@ -174,8 +174,8 @@ def test_spyre_index_select_for_rope(spyre_device):
     """index_select rows from a cache (RoPE cos/sin gather primitive).
 
     torch-spyre has a multi-row index_select kernel. The single-row case now works
-    too (torch-spyre#3418; see test_spyre_single_row_index_select), so
-    SpyreRotaryEmbedding.gather_rotation gathers on-device."""
+    too (torch-spyre#3418; see test_spyre_single_row_index_select), so the RoPE
+    per-token rotation gather runs on-device in the compile graph."""
     cos_sin_cache = torch.randn(2048, 64, dtype=torch.float16, device=spyre_device)
     positions = torch.arange(32, device=spyre_device)
     out = cos_sin_cache.index_select(0, positions)
@@ -186,8 +186,8 @@ def test_spyre_index_select_for_rope(spyre_device):
 def test_spyre_single_row_index_select(spyre_device):
     """A one-row index_select over the 4D RoPE rotation cache (single-token decode).
 
-    Fixed by torch-spyre#3418; this now guards the on-device gather in
-    SpyreRotaryEmbedding.gather_rotation."""
+    Fixed by torch-spyre#3418; this now guards the on-device RoPE rotation-cache
+    gather run inside the compile graph."""
     cache = torch.randn(2048, 2, 2, 64, dtype=torch.float16, device=spyre_device)
     idx = torch.zeros(1, dtype=torch.int64, device=spyre_device)
     out = cache.index_select(0, idx)

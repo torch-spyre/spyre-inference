@@ -391,8 +391,9 @@ jobs:
         run: |
           find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
 
+      # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
       - name: Build spyre-inference
-        if: ${{ steps.gate.outputs.run == 'true' }}
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
         env:
           TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
         run: |
@@ -412,6 +413,15 @@ jobs:
           uv pip show torch
           uv pip freeze
 
+      # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
+      - name: Activate the freshly-built venv
+        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
+        # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
+        run: |
+          rm -rf /home/senuser/.venv
+          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
       # Slim the cache for setup-uv's post-job save without discarding the
       # compiled torch-spyre/vllm wheels. Must run after the build's uv sync.
       - name: Prune uv cache (safe)
@@ -423,6 +433,11 @@ jobs:
         env:
           HF_HUB_OFFLINE: '0'
         run: uv run .github/cache_config/manage_cache.py --public
+
+      - name: Use a job-scoped torch inductor compile cache dir
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
+        run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ strategy.job-index }}-${{ github.run_id }}" >> "$GITHUB_ENV"
 
       - name: Run tests
         if: ${{ steps.gate.outputs.run == 'true' }}
@@ -608,7 +623,7 @@ jobs:
           # Echo the exact runner-label selectors this job's runs-on used
           # (mirrors the perf runs-on expression: the fixed pool labels plus
           # the per-PR runner_label override, or the standing image label).
-          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1__pvc_1tb_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
+          runner_labels: ${{ format('["{0}","{1}"]', 'x86_64","spyre_pf_x1","linux', inputs.runner_label || 'image_torch_spyre') }}
 
       - name: Build spyre-inference
         env:

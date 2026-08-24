@@ -21,13 +21,17 @@ Spyre Device Constraints:
       Other quantization methods raise NotImplementedError.
 """
 
+import torch
+import torch.nn as nn
+from typing import cast
+
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
 
-from .linear import SpyreTransposedWeightMethod
+from .linear import SpyreTransposedWeightMethod, spyre_linear_t
 
 
 logger = init_logger(__name__)
@@ -38,6 +42,25 @@ class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbed
 
     WEIGHT_T_ATTR = "padded_weight_t"
     ROW_ALIGN = 64 * 32
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # The transposed matmul already emits logits in the padded vocab shape
+        # because the weight was padded during process_weights_after_loading.
+        out = spyre_linear_t(x, getattr(layer, self.WEIGHT_T_ATTR), bias)
+        padding = cast(int, layer.spyre_row_padding)
+        # Single-card path: drop the trailing pad columns on-device and
+        # return the real vocab width (the caller will move to CPU).
+        # TP path: keep the padding so the all_gather sees a stick-aligned last
+        # dimension.  The base LogitsProcessor._get_logits strips the overall
+        # vocab padding after the gather with `logits[..., :org_vocab_size]`.
+        if padding and getattr(layer, "tp_size", 1) <= 1:
+            out = out[:, :-padding]
+        return out
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")

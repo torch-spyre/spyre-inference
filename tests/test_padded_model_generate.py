@@ -31,10 +31,11 @@ import pytest
 _PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode("utf-8"))
 
 # Greedy continuation from transformers CPU (fp32, unpadded) on the same byte-id
-# prompt, confirmed to match the Spyre fp16 padded run for these first tokens.
-# Only the leading tokens are pinned: fp16 padded greedy decode can drift from
-# the fp32 reference after a few steps on a model this small.
-_REFERENCE_TOKEN_IDS = [32, 111, 99]
+# prompt. The leading [32, 111, 99] were confirmed to match the Spyre fp16 padded
+# run; the tail is the fp32 reference. If fp16 padded greedy drifts from fp32 on
+# device (plausible on a model this small, where top logits sit close together),
+# trim this list back to the confirmed prefix.
+_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32, 115, 195, 165, 103, 32, 104, 111]
 
 
 @pytest.mark.uses_subprocess

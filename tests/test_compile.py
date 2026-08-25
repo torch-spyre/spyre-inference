@@ -66,6 +66,7 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
         enforce_eager=False,
         max_model_len=128,
         max_num_seqs=2,
+        max_num_batched_tokens=8,
     )
 
     output = engine.generate(

@@ -50,6 +50,8 @@ Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`). Env vars
 
 `uv run` re-syncs deps from `pyproject.toml` (which pins `torch-spyre` to a git rev) on every invocation, silently reverting a hand-installed local build. **Always use `uv run --no-sync …`** when iterating on a locally installed dependency. Symptom of forgetting: `Uninstalled 1 package … Installed 1 package …` near the top of pytest output, and your changes appear to have no effect. The wheel build takes ~50s, so batch source edits before each rebuild.
 
+To run `uv sync` itself (e.g. to pick up other dependency changes) without touching an already-installed local `torch-spyre`, add `--no-install-package torch-spyre --inexact`: the first flag skips resolving/rebuilding the pinned git rev, the second stops uv from uninstalling the now-unreferenced local package.
+
 ## Debugging
 
 Invoke the `debug-spyre` skill for numerical mismatches, `spyre` compile errors, or silent CPU fallbacks.

@@ -103,8 +103,10 @@ class SpyrePagedKVCache(NamedTuple):
 
 
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
-    """Slot-axis-outermost layout; without it the indirect store silently
-    writes to the wrong rows (torch-spyre#3705)."""
+    """Slot-axis-outermost layout. The default tiled layout spreads the slot index
+    across two device dims, so a 1-KV-head cache cannot be work-divided under the
+    256 MB per-core span limit; it also makes the indirect store write to the wrong
+    rows (torch-spyre#3705)."""
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
     eps = get_elem_in_stick(dtype)
@@ -1106,11 +1108,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
 
             assert result.dtype == output.dtype
-            if query_len < aligned_max_query_len:
-                # Writing a prefix view copies its whole extent and overruns the
-                # destination (torch-spyre#3826), so copy it first.
-                output[q_start:q_end] = result[:query_len].clone()
-            else:
-                output[q_start:q_end] = result
+            output[q_start:q_end] = result[:query_len]
 
         return output

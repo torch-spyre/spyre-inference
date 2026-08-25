@@ -49,7 +49,9 @@ from torch.utils._pytree import tree_map
 
 import numpy as np
 
-from vllm.config import VllmConfig, CompilationMode
+from vllm.compilation.cuda_graph import CUDAGraphStat
+from vllm.config import VllmConfig, CompilationMode, CUDAGraphMode
+from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
@@ -81,6 +83,8 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer
+
 
 logger = init_logger(__name__)
 
@@ -126,7 +130,6 @@ def _compute_slot_mapping_impl(
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
     kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
 
-    # KV manager block, then the kernel block within it.
     token_positions = positions[:num_tokens]
     virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
     local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
@@ -142,7 +145,7 @@ def _compute_slot_mapping_impl(
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
     slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
-    if max_num_tokens > num_tokens:
+    if num_tokens < max_num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
 
@@ -387,6 +390,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.use_cuda_graph = False
         self.cascade_attn_enabled = False
 
+        # Shape bucketer for runtime dispatch (initialized after model load)
+        self.spyre_shape_bucketer: SpyreShapeBucketer | None = None
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
@@ -395,7 +401,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
     @staticmethod
     def _install_pooling_model_patches(model_config) -> None:
@@ -472,6 +478,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
             keep_outputs_on_device=self._pooling_on_spyre,
         )
 
+        # Initialize bucket dispatcher for shape bucketing at runtime.
+        self.spyre_shape_bucketer = self._create_shape_bucketer()
+
+    def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
+        """Create SpyreShapeBucketer if compilation with bucketing is active.
+
+        Returns None when enforce_eager=True, mode is NONE, or no
+        compile_sizes are configured (e.g. pooling models skip bucketing
+        because their token counts depend on variable input sequence lengths).
+        """
+        if self.vllm_config.model_config.enforce_eager:
+            logger.info("Grarph Recorder disabled (enforce_eager=True)")
+            return None
+
+        if not self.compilation_config.compile_sizes:
+            logger.info("Grarph Recorder disabled (no compile_sizes configured)")
+            return None
+
+        return SpyreShapeBucketer(self.vllm_config)
+
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.
 
@@ -547,35 +573,112 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         In eager mode, pooling models cap token count
         (``SPYRE_ENCODER_WARMUP_MAX_TOKENS``) and force ``max_num_seqs=1``.
-        Compiled mode uses the normal warmup size so shapes match torch.compile.
+        Compile mode uses the normal warmup size so shapes match torch.compile.
         """
-        logger.info("Warming up model...")
-        t0 = time.time()
-        num_tokens = min(
-            max(16, self.max_num_reqs),
-            self.scheduler_config.max_num_batched_tokens,
-        )
-        with _set_spyre_compilation_settings(self.vllm_config):
-            use_eager_pooling_warmup = (
-                self.model_config.runner_type == "pooling"
-                and self.vllm_config.model_config.enforce_eager
+        if self.spyre_shape_bucketer is None:
+            logger.info("Running single warmup pass (graph manager Disabled)...")
+            t0 = time.time()
+            num_tokens = min(
+                max(16, self.max_num_reqs),
+                self.scheduler_config.max_num_batched_tokens,
             )
-            if use_eager_pooling_warmup:
-                num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
-                saved_max_num_seqs = self.scheduler_config.max_num_seqs
-                try:
-                    self.scheduler_config.max_num_seqs = 1
-                    logger.info(
-                        "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
-                        num_tokens,
-                        saved_max_num_seqs,
-                    )
+            with _set_spyre_compilation_settings(self.vllm_config):
+                use_eager_pooling_warmup = (
+                    self.model_config.runner_type == "pooling"
+                    and self.vllm_config.model_config.enforce_eager
+                )
+                if use_eager_pooling_warmup:
+                    # Match single-sequence embed metadata; cap tokens for DMA.
+                    num_tokens = min(num_tokens, SPYRE_ENCODER_WARMUP_MAX_TOKENS)
+                    saved_max_num_seqs = self.scheduler_config.max_num_seqs
+                    try:
+                        self.scheduler_config.max_num_seqs = 1
+                        logger.info(
+                            "Pooling warmup (eager): %d tokens, max_num_seqs=1 (was %d)",
+                            num_tokens,
+                            saved_max_num_seqs,
+                        )
+                        self._dummy_run(num_tokens)
+                    finally:
+                        self.scheduler_config.max_num_seqs = saved_max_num_seqs
+                else:
                     self._dummy_run(num_tokens)
-                finally:
-                    self.scheduler_config.max_num_seqs = saved_max_num_seqs
-            else:
-                self._dummy_run(num_tokens)
-        logger.info("Warmup done in %.3fs.", time.time() - t0)
+            logger.info("Warmup done in %.3fs.", time.time() - t0)
+            return
+
+        bucket_sizes = self.spyre_shape_bucketer.bucket_sizes
+        logger.info(
+            "Warming up model with %d bucket sizes [%d..%d]...",
+            len(bucket_sizes),
+            bucket_sizes[0] if bucket_sizes else 0,
+            bucket_sizes[-1] if bucket_sizes else 0,
+        )
+        t0 = time.time()
+        with _set_spyre_compilation_settings(self.vllm_config):
+            # Compile largest bucket first: Inductor's internal caches benefit
+            # from seeing the most complex shape first, so subsequent smaller
+            # shapes compile faster via partial cache hits.
+            for size in sorted(bucket_sizes, reverse=True):
+                self._dummy_run(size)
+        self.spyre_shape_bucketer.mark_warmed_up()
+        logger.info(
+            "Warmup complete in %.3fs for %d buckets.",
+            time.time() - t0,
+            len(bucket_sizes),
+        )
+
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
+        max_num_scheduled_tokens: int,
+        use_cascade_attn: bool,
+        allow_microbatching: bool = True,
+        force_eager: bool = False,
+        force_uniform_decode: bool | None = None,
+        force_has_lora: bool | None = None,
+        force_num_active_loras: int | None = None,
+        num_encoder_reqs: int = 0,
+    ) -> tuple[
+        CUDAGraphMode,
+        BatchDescriptor,
+        bool,
+        torch.Tensor | None,
+        CUDAGraphStat | None,
+    ]:
+        """Inject bucket padding via upstream's padding mechanism.
+
+        Upstream uses this method to determine CUDA graph padding. We reuse
+        the same interface to return our shape-bucketed padding so that the
+        rest of execute_model (slot_mapping, attention metadata, _preprocess)
+        handles padded vs unpadded counts correctly without mutating
+        scheduler_output.total_num_scheduled_tokens.
+        """
+        if self.spyre_shape_bucketer is not None and self.spyre_shape_bucketer.is_warmed_up:
+            desc = self.spyre_shape_bucketer.dispatch(num_tokens)
+            if desc is not None:
+                return (
+                    CUDAGraphMode.NONE,
+                    BatchDescriptor(num_tokens=desc.padded_num_tokens),
+                    False,
+                    None,
+                    None,
+                )
+
+        return super()._determine_batch_execution_and_padding(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            use_cascade_attn=use_cascade_attn,
+            allow_microbatching=allow_microbatching,
+            force_eager=force_eager,
+            force_uniform_decode=force_uniform_decode,
+            force_has_lora=force_has_lora,
+            force_num_active_loras=force_num_active_loras,
+            num_encoder_reqs=num_encoder_reqs,
+        )
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):

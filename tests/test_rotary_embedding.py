@@ -250,7 +250,7 @@ def test_rotary_sel_cache_isolated_across_layers(default_vllm_config, head_size)
 @pytest.mark.parametrize("head_size", HEAD_SIZES)
 def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_size):
     """forward_oot's in-graph gather (index_select over the device-resident rotation
-    cache) returns the per-token [T, 2, 2, rotary_dim//2] slice on Spyre."""
+    cache) returns the per-token row on Spyre, viewable as [T, 2, 2, rotary_dim//2]."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
     max_position, num_tokens = 2048, 32
@@ -261,7 +261,9 @@ def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_
     cache = rope._get_device_rotation_cache()
     rot = cache.index_select(0, positions.flatten())
     assert rot.device.type == "spyre"
-    assert tuple(rot.shape) == (num_tokens, 2, 2, rope.rotary_dim // 2)
+    assert tuple(rot.shape) == (num_tokens, 2 * head_size)
+    inner = rope.rotary_dim // 2
+    assert tuple(rot.view(-1, 2, 2, inner).shape) == (num_tokens, 2, 2, inner)
 
 
 @pytest.mark.rotary
@@ -442,3 +444,61 @@ def test_yarn_cos_sin_cache_has_mscale(default_vllm_config, head_size):
     assert not torch.allclose(
         rope_yarn.cos_sin_cache[:2048], rope_base.cos_sin_cache[:2048], atol=1e-4
     ), "YaRN cos_sin_cache should differ from base RoPE due to mscale and freq blending"
+
+
+def _fresh_rope(**kwargs):
+    """get_rope memoizes instances globally; these tests need an unprimed one."""
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
+
+    _ROPE_DICT.clear()
+    return get_rope(**kwargs)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+def test_device_rotation_cache_is_2d_row_gathered(default_vllm_config, head_size):
+    """The device cache is flattened to 2D so it can be stickified rows-outermost."""
+    max_position = 2048
+    rope = _fresh_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        dtype=torch.float16,
+    )
+    rope.to("spyre")
+
+    assert rope._rotation_cache.shape == (max_position, 2, 2, head_size // 2)
+    assert rope._device_rotation_cache.shape == (max_position, 2 * head_size)
+    assert rope._device_rotation_cache.device.type == "spyre"
+
+
+@pytest.mark.rotary
+def test_rotary_matches_native_at_high_positions(default_vllm_config):
+    """Positions far above a served context still rotate correctly: the whole cache
+    stays addressable, so no bound on max_model_len is implied."""
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(11)
+    max_position, num_tokens, num_heads, head_size = 131072, 16, 4, 128
+    rope = _fresh_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        dtype=torch.float16,
+    )
+    rope.to("spyre")
+
+    positions = torch.randint(max_position - 1024, max_position, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, True)
+
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+    expected_query, expected_key = RotaryEmbedding.forward_native(
+        rope, positions, query.clone(), key.clone()
+    )
+
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)

@@ -27,7 +27,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
-    slot_major_kv_layout,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
@@ -78,20 +77,6 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
-
-
-def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre
-    exactly as the model runner allocates it."""
-    if device.type != "spyre":
-        return cache_cpu.to(device)
-    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
-    return cache_cpu.to(
-        device,
-        device_layout=slot_major_kv_layout(
-            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
-        ),
-    )
 
 
 def _fused_qkv_kv_views(
@@ -410,8 +395,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = _to_cache_device(k_pages_cpu, cache_device)
-    v_pages = _to_cache_device(v_pages_cpu, cache_device)
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -1296,8 +1281,8 @@ def test_reshape_and_cache_scatter(
         k_expected[block][offset] = key[t]
         v_expected[block][offset] = value[t]
 
-    k_actual = _to_cache_device(fresh_pages(), cache_device)
-    v_actual = _to_cache_device(fresh_pages(), cache_device)
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
 
     if source_layout == "qkv_split":
         query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)

@@ -25,6 +25,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareGemmaRMSNorm
 
 logger = init_logger(__name__)
 
@@ -58,3 +59,9 @@ class SpyreGemmaRMSNorm(GemmaRMSNorm):
         if residual is None:
             return x
         return x, residual
+
+
+# See the SpyreTPAwareRMSNorm note in rms_norm.py.
+@GemmaRMSNorm.register_oot(name="TPAwareGemmaRMSNorm")
+class SpyreTPAwareGemmaRMSNorm(TPAwareGemmaRMSNorm, SpyreGemmaRMSNorm):
+    """Spyre GemmaRMSNorm that reconstructs a TP-sharded input before normalizing."""

@@ -17,6 +17,7 @@
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
@@ -27,7 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .utils import place_row_gathered
 
 logger = init_logger(__name__)
 
@@ -44,23 +45,92 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
+        if self.tp_size > 1:
+            self.register_buffer(
+                "_spyre_reindex_table",
+                self._build_reindex_table(),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_spyre_keep_table",
+                self._build_keep_table(),
+                persistent=False,
+            )
+        else:
+            self._spyre_reindex_table = None
+            self._spyre_keep_table = None
+
+    def _build_reindex_table(self) -> torch.Tensor:
+        """Build a vocab-sized lookup table that maps input ids to shard-local
+        embedding indices.
+
+        The upstream ``get_masked_input_and_mask`` computes
+        ``masked_input = vocab_mask * (input_ - valid_offset)`` on the host.
+        Instead, we pre-compute the same per-vocab value on CPU once and gather
+        it on-device with ``index_select``, avoiding the per-forward CPU
+        comparison.
+
+        The table has two columns because torch-spyre currently rejects a
+        single-column int64 ``index_select`` result; the second column is a
+        harmless padding dimension.
+        """
+        vocab_size = self.num_embeddings
+        table = torch.zeros(vocab_size, 2, dtype=torch.int64)
+        for i in range(vocab_size):
+            masked_input, _ = get_masked_input_and_mask(
+                torch.tensor([i], dtype=torch.int64),
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            table[i, 0] = masked_input.item()
+        return table
+
+    def _build_keep_table(self) -> torch.Tensor:
+        """Build a vocab-sized lookup table that maps input ids to the ``keep``
+        multiplier used after the embedding gather.
+
+        The upstream ``get_masked_input_and_mask`` returns ``input_mask`` where
+        True means the token is outside this rank's shard. ``keep`` is
+        ``(~input_mask).to(dtype).unsqueeze(-1)``.
+
+        Two columns are used so the gather result matches the shape expected by
+        torch-spyre; only column 0 carries the keep value.
+        """
+        vocab_size = self.num_embeddings
+        table = torch.zeros(vocab_size, 2, dtype=torch.float16)
+        for i in range(vocab_size):
+            _, input_mask = get_masked_input_and_mask(
+                torch.tensor([i], dtype=torch.int64),
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+            table[i, 0] = 0.0 if input_mask.item() else 1.0
+        return table
+
+    def _apply(self, fn, recurse=True):
+        weight = self._parameters.get("weight")
+
+        def place(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is weight:
+                return place_row_gathered(tensor.data, fn, "vocab table")
+            return fn(tensor)
+
+        return super()._apply(place, recurse)
+
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
-            # The per-rank mask still runs on CPU: upstream get_masked_input_and_mask
-            # does `input_ >= start` under torch.compile, which Spyre's inductor backend
-            # rejects for int64 constants (see test_int64_compiled_compare_against_python_int).
-            # The embedding gather itself runs on-device below.
-            masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-                convert(input_, device="cpu"),
-                self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.added_vocab_start_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
-                self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
-            )
-            masked_input = convert(masked_input, device=input_.device)
-            keep = convert(keep, device=input_.device)
+            reindex_table = self._spyre_reindex_table
+            keep_table = self._spyre_keep_table
+            assert reindex_table is not None and keep_table is not None
+            keep = F.embedding(input_, keep_table)[:, 0]
+            masked_input = torch.index_select(reindex_table, 0, input_.flatten())[:, 0]
+            masked_input = masked_input.view(input_.shape)
         else:
             masked_input = input_
             keep = None
@@ -68,7 +138,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         output = self.quant_method.embedding(self, masked_input.long())
 
         if keep is not None:
-            output = output * keep
+            output = output * keep.unsqueeze(-1)
             output = tensor_model_parallel_all_reduce(output)
         return output
 

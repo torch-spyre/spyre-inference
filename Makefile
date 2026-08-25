@@ -38,6 +38,12 @@ $(info ::error::Invalid test_type '$(TEST_TYPE)'. Valid: $(VALID_TEST_TYPES_DISP
 $(error Invalid TEST_TYPE '$(TEST_TYPE)')
 endif
 
+# torch-spyre#3707's HBM pool planner corrupts compiled output and leaks HBM
+# across fallback boundaries. spyre_inference sets this too, but only takes
+# effect if nothing imported torch_spyre first, so export it for every recipe.
+HBM_POOL_PLANNING ?= 0
+export HBM_POOL_PLANNING
+
 # Flags passed verbatim to pytest. Mirrors the CI invocation so `make test`
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
 PYTEST_ARGS ?= -s -vvv

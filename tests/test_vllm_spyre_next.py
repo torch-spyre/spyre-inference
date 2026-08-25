@@ -65,3 +65,49 @@ def test_long_context_model_load():
     )
 
     assert len(output[0].outputs[0].text) > 0
+
+
+# End-to-end counterpart to the CPU-only pad-shim unit tests in test_head_pad.py
+# and test_mlp_pad.py: a model that trips BOTH pads at once must still decode the
+# correct tokens on device. qwrt/Swedish0.1M is the smallest public model that hits
+# head_dim 16 -> 128 (QK-norm attention path) and intermediate_size 160 -> 192
+# (SwiGLU MLP path) together.
+#
+# It ships a broken tokenizer stub (Qwen2Tokenizer, vocab_size=1, returns [] for
+# everything). The model itself is byte-level (vocab 256), so the prompt is fed as
+# raw UTF-8 byte ids rather than through the tokenizer.
+_PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode("utf-8"))
+
+# Greedy continuation from transformers CPU (fp32, unpadded) on the same byte-id
+# prompt. The leading [32, 111, 99] were confirmed to match the Spyre fp16 padded
+# run; the tail is the fp32 reference. If fp16 padded greedy drifts from fp32 on
+# device (plausible on a model this small, where top logits sit close together),
+# trim this list back to the confirmed prefix.
+_PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32, 115, 195, 165, 103, 32, 104, 111]
+
+
+@pytest.mark.uses_subprocess
+def test_padded_head_dim_and_intermediate_size_generate() -> None:
+    """Loading the model fires both pads; greedy decode matches the unpadded
+    reference token ids."""
+    llm = LLM(
+        model="qwrt/Swedish0.1M",
+        dtype="float16",
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_seqs=1,
+    )
+
+    # Both padding passes must have run during check_and_update_config.
+    hf_config = llm.llm_engine.model_config.hf_config
+    assert hf_config.head_dim == 128
+    assert hf_config._spyre_orig_head_dim == 16
+    assert hf_config.intermediate_size == 192
+    assert hf_config._spyre_orig_intermediate_size == 160
+
+    sp = SamplingParams(temperature=0.0, max_tokens=len(_PADDED_REFERENCE_TOKEN_IDS))
+    outputs = llm.generate(
+        {"prompt_token_ids": _PADDED_PROMPT_TOKEN_IDS}, sp, use_tqdm=False
+    )
+
+    assert list(outputs[0].outputs[0].token_ids) == _PADDED_REFERENCE_TOKEN_IDS

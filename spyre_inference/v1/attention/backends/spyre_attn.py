@@ -1025,11 +1025,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 _q = query_dev.unbind(dim=0)[q_start].reshape(
                     num_kv_heads, num_queries_per_kv, 1, head_size
                 )
-                # Force canonical heads-outer physical layout via opaque_copy_
-                # before the score matmul. .contiguous() is a no-op here:
-                # logical strides are already canonical, so PyTorch detects no
-                # non-contiguity — the heads-inner physical Spyre layout is
-                # invisible to stride checks. Mirrors torch-spyre #3926.
+                # .contiguous() cannot force the canonical layout here: the
+                # heads-inner physical Spyre layout is invisible to stride
+                # checks. See torch-spyre#3926.
                 q_dev = torch.ops.spyre.opaque_copy_(
                     _q,  # ty: ignore[invalid-argument-type]
                     torch.zeros(  # ty: ignore[invalid-argument-type]

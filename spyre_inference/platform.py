@@ -330,6 +330,40 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _maybe_pad_intermediate_size(cls, vllm_config: VllmConfig) -> None:
+        """Round hf_config.intermediate_size up to a 64-multiple when it is not
+        stick-aligned, stashing the original as ``_spyre_orig_intermediate_size``.
+
+        A SwiGLU MLP whose ``intermediate_size`` is not a multiple of the fp16
+        stick fuses gate+up and slices the up half at an unaligned offset, which
+        Spyre inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3`` read
+        ``config.intermediate_size`` directly, so overriding the config value
+        before the model is built widens the modules with no per-class shim.
+
+        No-op when already 64-aligned or unset. Zero-padding is arithmetically
+        inert for SwiGLU (see ``custom_ops.mlp_pad``); dense MLPs only — MoE
+        experts (``moe_intermediate_size``) are out of scope.
+        """
+        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
+
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+        orig = getattr(hf_config, "intermediate_size", None)
+        if not orig or orig % BLOCK_SIZE == 0:
+            return
+
+        padded = ((orig + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+            cfg._spyre_orig_intermediate_size = orig
+            cfg.intermediate_size = padded
+        logger.info(
+            "Padding MLP intermediate_size %d -> %d for Spyre stick alignment "
+            "(original preserved as _spyre_orig_intermediate_size).",
+            orig,
+            padded,
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -343,6 +377,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Pad attention head_dim up to a stick-aligned size on the native path.
         cls._maybe_pad_head_dim(vllm_config)
+
+        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size (native path).
+        cls._maybe_pad_intermediate_size(vllm_config)
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The Spyre paged attention backend requires 64-element stick alignment for

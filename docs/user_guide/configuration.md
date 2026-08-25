@@ -27,6 +27,44 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Host sampler (async noise + log-space Gumbel)
+
+Spyre replaces vLLM's default host sampler with a Spyre-optimized path
+ported from [sendnn-inference#1046](https://github.com/torch-spyre/sendnn-inference/pull/1046)
+(Holtz), in three stages:
+
+1. **Async noise ring buffer** — Exp(1) log-noise is filled on a background
+   thread; the decode loop borrows zero-copy rows instead of calling
+   `exponential_()` on the critical path.
+2. **TP rank-0 sampling** — when tensor-parallel and logits are on CPU, only
+   rank 0 samples and broadcasts token ids (and logprobs) to the other ranks.
+3. **Log-space Gumbel** — sample as `argmax(logits - log_noise)` instead of
+   `argmax(probs / noise)`, which removes softmax from the hot path while
+   preserving token order / distribution.
+
+If `vllm_config` lacks `max_num_seqs` or vocab size, the runner falls back to
+vLLM's default `Sampler` (same as sendnn). Sampling still runs on the **CPU**.
+
+### Configuration (`spyre_inference.envs`)
+
+All host-sampler knobs live in `spyre_inference/envs.py` (vLLM-style lazy
+module with defaults, docs, optional `enable_envs_cache()`, and `is_set()` for
+override detection). Prefer `import spyre_inference.envs as envs` over
+scattered `os.environ.get` calls.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPYRE_USE_SPYRE_SAMPLER` | `1` | Set to `0` to force upstream `Sampler` |
+| `SPYRE_ASYNC_NOISE_SCALE` | `4` | Ring depth = scale × `max_num_seqs` (must be ≥ 2) |
+
+Do **not** inject sampler timing into the production path. Measure with the
+[Kineto / Spyre profiler](kineto_profiling.md) instead.
+
+```bash
+SPYRE_ASYNC_NOISE_SCALE=8 \
+  python examples/offline_inference/torch_spyre_inference.py
+```
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

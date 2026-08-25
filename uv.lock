@@ -4371,7 +4371,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=b7537ad7da2b1b079af9ba2d1d0f9004b1522a2e" },
+    { name = "torch-spyre", git = "https://github.com/torch-spyre/torch-spyre?rev=a31289852145a59099edccc3e506cf5336e8e2e0" },
     { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.27.1" },
 ]
 
@@ -4737,7 +4737,7 @@ wheels = [
 [[package]]
 name = "torch-spyre"
 version = "0.0.1"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=b7537ad7da2b1b079af9ba2d1d0f9004b1522a2e#b7537ad7da2b1b079af9ba2d1d0f9004b1522a2e" }
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=a31289852145a59099edccc3e506cf5336e8e2e0#a31289852145a59099edccc3e506cf5336e8e2e0" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },

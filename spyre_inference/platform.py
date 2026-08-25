@@ -231,20 +231,25 @@ class TorchSpyrePlatform(CpuPlatform):
             # Pooling models skip bucketing (their token counts depend on
             # variable input sequence lengths, not the decode heuristic).
             if vllm_config.model_config.runner_type != "pooling":
-                # max_capture_size is the largest bucket we compile for.
-                # Bounded by max_num_batched_tokens (scheduler limit) and
-                # 512 (max supported shape for torch-spyre).
-                max_capture_size = min(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    512,
-                )
+                if vllm_config.compilation_config.compile_sizes:
+                    compile_sizes = vllm_config.compilation_config.compile_sizes
+                else:
+                    # max_capture_size is the largest bucket we compile for.
+                    # Bounded by max_num_batched_tokens (scheduler limit) and
+                    # 512 (max supported shape for torch-spyre).
+                    max_capture_size = min(
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                        512,
+                    )
 
-                compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
-                if max_capture_size >= 8:
-                    compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
-                if max_capture_size >= 256:
-                    compile_sizes += list(range(256, max_capture_size + 1, 16))
-                vllm_config.compilation_config.compile_sizes = compile_sizes
+                    compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
+                    if max_capture_size >= 8:
+                        compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
+                    if max_capture_size >= 256:
+                        compile_sizes += list(range(256, max_capture_size + 1, 16))
+                    vllm_config.compilation_config.compile_sizes = compile_sizes
+
+                max_capture_size = max(compile_sizes)
 
                 # Ensure the scheduler never sends more tokens than the
                 # largest compiled bucket to avoid runtime recompilation.
@@ -442,9 +447,10 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
                 max_model_len = vllm_config.model_config.max_model_len
                 blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                # +1 for BlockPool's reserved null block, which is never allocatable.
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq + 1
                 logger.info(
-                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq + 1 null block)",
                     cache_config.num_gpu_blocks_override,
                     max_num_seqs,
                     blocks_per_seq,

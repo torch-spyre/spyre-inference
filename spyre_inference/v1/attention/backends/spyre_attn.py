@@ -144,11 +144,13 @@ def _create_compilable_page_attn(
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
+    store_mode: str = "none",
+    store_len: int = 0,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
-    logits_soft_cap are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
+    logits_soft_cap, store_mode, and store_len are closure constants.
     """
 
     def specialized_paged_attn_kernel(
@@ -159,6 +161,8 @@ def _create_compilable_page_attn(
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
+        out=None,
+        out_rows=None,
     ):
         """
         This kernels specializes for num_blocks and padded_query_len.
@@ -177,7 +181,11 @@ def _create_compilable_page_attn(
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
 
-        Returns [padded_query_len, num_heads, head_size].
+            out: with store_mode != "none", the caller's buffer to write into.
+            out_rows: with store_mode == "index", the destination rows in `out`.
+
+        Returns [padded_query_len, num_heads, head_size], or ``out`` when this
+        kernel stored the result itself.
         """
         tile_max = None
         tile_sum = None
@@ -232,7 +240,16 @@ def _create_compilable_page_attn(
         assert tile_output is not None and tile_sum is not None
         attn = tile_output / tile_sum
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-        return attn.reshape(padded_query_len, num_heads, head_size)
+        attn = attn.reshape(padded_query_len, num_heads, head_size)
+        if store_mode == "copy":
+            assert out is not None
+            out.copy_(attn[:store_len])
+            return out
+        if store_mode == "index":
+            assert out is not None and out_rows is not None
+            out.index_copy_(0, out_rows, attn[:store_len])
+            return out
+        return attn
 
     return specialized_paged_attn_kernel
 
@@ -326,6 +343,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+
+    # Destination rows in the output buffer, one per sequence, filled once per step.
+    # Each needs its own offset-0 tensor rather than a slice of one arange, for the
+    # same reason as page_index_tables (torch-spyre#3770).
+    output_row_tables: list[torch.Tensor] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -851,17 +873,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
-        self._attn_fns: dict[tuple[int, int], object] = {}
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len, store_mode, store_len)
+        self._attn_fns: dict[tuple[int, int, str, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+    def _get_attn_fn(
+        self,
+        num_blocks: int,
+        padded_query_len: int,
+        store_mode: str = "none",
+        store_len: int = 0,
+    ):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len)
+        key = (num_blocks, padded_query_len, store_mode, store_len)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -871,6 +899,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
+                    store_mode=store_mode,
+                    store_len=store_len,
                 ),
                 self._compile_attn,
             )
@@ -920,6 +950,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
             attn_metadata.attention_mask_tiles_device = [
                 [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
+            ]
+        if (
+            self._compile_attn
+            and attn_metadata.num_seqs > 1
+            and attn_metadata.output_row_tables is None
+        ):
+            qsl = attn_metadata.query_start_loc
+            attn_metadata.output_row_tables = [
+                convert(
+                    torch.arange(int(qsl[s].item()), int(qsl[s + 1].item()), dtype=torch.int32),
+                    device=_target_device,
+                )
+                for s in range(attn_metadata.num_seqs)
             ]
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
@@ -1006,6 +1049,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
+        # Folds the per-layer eager slice-assign into the attention jobplan.
+        # Re-checked per call: vLLM hands out a fresh buffer per layer.
+        fused_store_ok = (
+            self._compile_attn
+            and output.dtype == query_dev.dtype
+            # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
+            and output.storage_offset() == 0
+            and output.is_contiguous()
+        )
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
@@ -1095,8 +1147,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
+            store_mode = "none"
+            out_rows = None
+            if fused_store_ok:
+                if output.shape[0] == query_len:
+                    # Owns every row, so the store is a plain copy_: no index, and
+                    # no relayout of the destination.
+                    store_mode = "copy"
+                elif output.shape[0] > 1 and attn_metadata.output_row_tables is not None:
+                    # Owns only a slice, so the store must be indirect. A single-row
+                    # destination is excluded: index_copy_ writes nothing there
+                    # (torch-spyre#4007).
+                    store_mode = "index"
+                    out_rows = attn_metadata.output_row_tables[seq_idx]
+
             # Run attention on target device
-            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
+            attn_fn = self._get_attn_fn(
+                len(active_bs),
+                aligned_max_query_len,
+                store_mode=store_mode,
+                store_len=query_len,
+            )
             result = attn_fn(
                 q_dev,
                 k_pages,
@@ -1105,9 +1176,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,
+                out=output if store_mode != "none" else None,
+                out_rows=out_rows,
             )
 
             assert result.dtype == output.dtype
+            if store_mode != "none":
+                # The kernel wrote `output` itself; `result` is that same buffer.
+                continue
             output[q_start:q_end] = result[:query_len]
 
         return output

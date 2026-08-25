@@ -42,6 +42,18 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 logger = init_logger(__name__)
 
 
+def _get_spyre_pcie_address(local_rank: int) -> str:
+    requested_devices = os.environ.get("SPYRE_DEVICES")
+    if not requested_devices:
+        return "unknown"
+
+    requested_indices = [index.strip() for index in requested_devices.split(",") if index.strip()]
+    if local_rank >= len(requested_indices):
+        return "unknown"
+
+    return os.environ.get(f"AIU_WORLD_RANK_{requested_indices[local_rank]}", "unknown")
+
+
 def monkey_patch_torch_profiler_activity_map():
     """This function monkey-patches vLLM's TorchProfilerActivityMap to include PrivateUse1.
 
@@ -105,6 +117,13 @@ class TorchSpyreWorker(Worker):
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.
         torch.spyre.set_device(self.local_rank)
+        logger.info(
+            "Spyre worker device selection: "
+            "local_rank=%d requested SPYRE_DEVICES=%r pcie_address=%s",
+            self.local_rank,
+            os.environ.get("SPYRE_DEVICES"),
+            _get_spyre_pcie_address(self.local_rank),
+        )
 
         # Register all the custom ops here when a worker is created.
         # This has to happen before the model is loaded, so that all the

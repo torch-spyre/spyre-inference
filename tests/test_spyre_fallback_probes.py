@@ -768,3 +768,29 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
     written = got.ne(0).any(-1).any(-1).nonzero().flatten().tolist()
     assert written == sorted(slots.tolist()), f"scatter hit the wrong rows: {written}"
     torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 9. Scalar pow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
+        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
+        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
+        "torch-spyre#4009."
+    ),
+)
+def test_spyre_scalar_pow_cube(spyre_device):
+    """torch.pow with exponent 3 on a device-produced tensor."""
+    # x has to come from an on-device op: a host-copied tensor of unaligned width
+    # is re-tiled and the comparison stops being meaningful.
+    a = torch.randn(8, 256, dtype=torch.float16, device=spyre_device)
+    b = torch.randn(256, 3072, dtype=torch.float16, device=spyre_device) / 32
+    x = a @ b
+
+    expected = x.cpu().float() ** 3
+    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)

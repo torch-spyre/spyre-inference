@@ -16,8 +16,8 @@
 
 CPU-only: these cover the per-tensor padding and the post-build guard, neither of
 which touches the device. The end-to-end check that a padded model decodes
-correctly is test_padded_model_generate.py (qwrt/Swedish0.1M, intermediate_size=160),
-which runs on Spyre hardware.
+correctly is test_padded_head_dim_and_intermediate_size_generate in
+test_vllm_spyre_next.py (qwrt/Swedish0.1M), which runs on Spyre hardware.
 """
 
 from types import SimpleNamespace

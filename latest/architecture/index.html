@@ -793,6 +793,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#encoder-embedding-models-target-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: target state
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#device-placement-strategy" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1557,6 +1568,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#encoder-embedding-models-target-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: target state
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#device-placement-strategy" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1950,6 +1972,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#encoder-embedding-models-target-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Encoder / embedding models: target state
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#device-placement-strategy" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2253,6 +2286,26 @@ the full sequence — so it skips the paged-cache machinery entirely and instead
 <li>Scatters the unpadded results back to CPU, then writes them per token into the Spyre
    output buffer.</li>
 </ol>
+<h2 id="encoder-embedding-models-target-state">Encoder / embedding models: target state<a class="headerlink" href="#encoder-embedding-models-target-state" title="Permanent link">&para;</a></h2>
+<p>Everything above describes what is implemented today. The diagram below is a <strong>target
+state</strong> — where the encoder path is heading once the compile-mode work lands, and not a
+description of current behaviour.</p>
+<p>The shape of that target: the model body compiled once per token bucket, attention
+shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
+both shape ladders so nothing compiles on the first request.</p>
+<figure>
+  <img alt="Encoder target state" src="encoder-ideal-state.svg" style="width: 140%; max-width: 1400px; margin-left: -20%" />
+<br />
+<figcaption>
+    Target architecture for encoder / embedding models under
+    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
+    token count <code>T</code> for the model body, and <code>(S, L)</code> for
+    attention's dense grid — they are decoupled because attention builds its grid by
+    gathering rows rather than by being handed a reshaped tensor. The foot of the
+    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
+    which would collapse the second axis and converge on the upstream design.
+  </figcaption>
+</figure>
 <h2 id="device-placement-strategy">Device Placement Strategy<a class="headerlink" href="#device-placement-strategy" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyreModelRunner</code> inherits from vLLM's <code>GPUModelRunner</code> and treats Spyre as the
 "GPU" in the <code>CpuGpuBuffer</code> pattern. Buffers are created via a <code>SpyreCpuGpuBuffer</code>

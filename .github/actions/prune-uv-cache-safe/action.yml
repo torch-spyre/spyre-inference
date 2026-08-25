@@ -14,8 +14,8 @@ description: |
   The problem: `uv cache prune --ci` also deletes torch-spyre and vllm, which
   cost ~50s+ each to compile from source. uv's docs promise `--ci` "retains any
   wheels that were built from source", and it DOES for ordinary source builds
-  (verified: a plain git-built markupsafe wheel and the pure-python
-  hf-adapters-spyre wheel both survive). But torch-spyre and vllm are built with
+  (verified: a plain git-built markupsafe wheel survives). But torch-spyre and
+  vllm are built with
   custom build settings -- `[tool.uv.extra-build-dependencies]` for torch-spyre,
   `extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty",
   CMAKE_ARGS = "--fresh" } }` for vllm. uv nests wheels built with custom build

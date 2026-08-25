@@ -240,7 +240,7 @@ def test_is_hybrid_attention_missing_layer_types():
 
 
 def test_num_gpu_blocks_override_homogeneous():
-    """Non-hybrid models get the plain seqs × blocks/seq pinned block count."""
+    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     model_config = ModelConfig(
@@ -264,7 +264,7 @@ def test_num_gpu_blocks_override_homogeneous():
     blocks_per_seq = math.ceil(
         vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
     )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq
+    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
 
 
 def test_num_gpu_blocks_override_skipped_for_hybrid():
@@ -507,3 +507,68 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
     src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
     assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
+
+
+def test_compile_sizes_default_generated():
+    """When user doesn't set compile_sizes, the platform generates default buckets."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    sizes = vllm_config.compilation_config.compile_sizes
+    assert sizes, "compile_sizes should not be empty"
+    assert sizes == sorted(sizes), "compile_sizes should be sorted ascending"
+    assert sizes[0] == 1, "smallest bucket should be 1"
+    assert max(sizes) <= 512
+
+
+def test_compile_sizes_user_provided_respected():
+    """User-supplied compile_sizes must not be overwritten."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    user_sizes = [32, 64, 128]
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = user_sizes
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == user_sizes
+
+
+def test_compile_sizes_user_provided_caps_scheduler():
+    """max_num_batched_tokens is capped to max(user-supplied compile_sizes)."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    user_sizes = [16, 32, 64]
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = user_sizes
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 64
+
+
+def test_compile_sizes_default_caps_at_max_num_batched_tokens():
+    """Default bucket generation respects max_num_batched_tokens as upper bound."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_batched_tokens = 32
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    sizes = vllm_config.compilation_config.compile_sizes
+    assert max(sizes) <= 32
+    assert vllm_config.scheduler_config.max_num_batched_tokens == max(sizes)
+
+
+def test_compile_sizes_not_set_when_eager():
+    """--enforce-eager should skip compile_sizes generation entirely."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert not vllm_config.compilation_config.compile_sizes

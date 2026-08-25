@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="utf-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1700" height="1620" viewBox="0 0 1700 1620" preserveAspectRatio="xMinYMin meet">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="12" refX="7" refY="6" viewBox="0 0 10 12" orient="auto" markerUnits="userSpaceOnUse">
+      <polygon points="0,0 10,6 0,12" fill="#37474f" />
+    </marker>
+    <marker id="arrow-dash" markerWidth="10" markerHeight="12" refX="7" refY="6" viewBox="0 0 10 12" orient="auto" markerUnits="userSpaceOnUse">
+      <polygon points="0,0 10,6 0,12" fill="#0d47a1" />
+    </marker>
+    <style type="text/css"><![CDATA[
+      .t { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+      .hd { font-size: 29px; font-weight: 700; fill: #0A0F25; }
+      .sub { font-size: 14px; fill: #676C7E; }
+      .sect { font-size: 17px; font-weight: 700; fill: #212121; }
+      .bt { font-size: 16px; font-weight: 700; fill: #ffffff; }
+      .bd { font-size: 12.5px; fill: #CFD2DD; }
+      .bdl { font-size: 12.5px; fill: #D6E4F7; }
+      .it { font-size: 13px; font-weight: 700; fill: #0A0F25; }
+      .id { font-size: 11.5px; fill: #37474f; }
+      .src { font-size: 10.5px; fill: #5c6bc0; }
+      .lg { font-size: 12px; fill: #212121; }
+      .note { font-size: 11.5px; fill: #5d4037; }
+      .edge { stroke: #37474f; stroke-width: 2; fill: none; }
+    ]]></style>
+  </defs>
+
+  <rect x="0" y="0" width="1700" height="1620" fill="#FFFFFF" />
+
+  <text class="t hd" x="34" y="48">Encoder / embedding models on Spyre: target state</text>
+  <text class="t sub" x="34" y="76">Model used: multilingual-e5-large &#160;·&#160; Compile Mode: True</text>
+
+  <!-- ================= LEFT: per-step serving path ================= -->
+  <rect x="26" y="98" width="1010" height="1012" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="46" y="126">Per-step serving path</text>
+
+  <rect x="46" y="142" width="970" height="74" rx="8" fill="#37474f" stroke="#263238" stroke-width="2" />
+  <text class="t bt" x="531" y="170" text-anchor="middle">vLLM Scheduler, used as-is</text>
+  <text class="t bd" x="531" y="194" text-anchor="middle">batches S requests carrying T tokens in total · chunked prefill off · never subclassed, its output never mutated</text>
+
+  <path class="edge" d="M 531 216 V 246" marker-end="url(#arrow)" />
+
+  <rect x="46" y="250" width="970" height="96" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="531" y="278" text-anchor="middle">Token-count bucket dispatch</text>
+  <text class="t bdl" x="531" y="302" text-anchor="middle">override of _determine_batch_execution_and_padding → round T up to the next compiled bucket, giving T_padded</text>
+  <text class="t bdl" x="531" y="324" text-anchor="middle">upstream this hook pads to a captured CUDA graph; here to a compiled shape · pad rows zeroed · also cuts torch-spyre per-op recompiles</text>
+
+  <path class="edge" d="M 531 346 V 376" marker-end="url(#arrow)" />
+
+  <rect x="46" y="380" width="970" height="196" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="531" y="408" text-anchor="middle">Compiled model body: one graph per token bucket &#160;(fullgraph, dynamic=False)</text>
+  <text class="t bdl" x="531" y="430" text-anchor="middle">sees only the flat token list [T_padded, hidden], with no request boundaries · all layers share op shapes, so cost scales with distinct T, not with depth</text>
+
+  <rect x="70" y="444" width="922" height="52" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="531" y="466" text-anchor="middle">Embeddings → N × [ Q · K · V projections (un-fused) · output projection · FFN ×2 · LayerNorm ×2 ]</text>
+  <text class="t id" x="531" y="485" text-anchor="middle">N = 24 for multilingual-e5-large · 6 matrix multiplies per layer, 5 of them outside attention</text>
+
+  <rect x="70" y="506" width="922" height="52" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="2" stroke-dasharray="7 5" />
+  <text class="t it" x="531" y="527" text-anchor="middle">torch.ops.vllm.unified_attention_with_output &#160;·&#160; opaque boundary</text>
+  <text class="t src" x="531" y="546" text-anchor="middle">Dynamo does not trace inside. Selected by the platform's opaque_attention_op() → True, which TorchSpyrePlatform inherits from CpuPlatform</text>
+
+  <path class="edge" d="M 531 576 V 606" marker-end="url(#arrow)" />
+
+  <rect x="46" y="610" width="970" height="240" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="531" y="638" text-anchor="middle">Encoder attention: the only request-aware stage</text>
+  <text class="t bdl" x="531" y="660" text-anchor="middle">dense-grid strategy (compared with the planned flash variant at the foot of this diagram) · rounds up its own grid: S to a power of two, L already 64-aligned</text>
+
+  <rect x="70" y="674" width="922" height="52" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="531" y="695" text-anchor="middle">Batch-shape tables, built once per step and carried on the attention metadata</text>
+  <text class="t id" x="531" y="714" text-anchor="middle">additive mask + three gather index lists · derived from S and the per-request lengths, so identical for every layer</text>
+
+  <rect x="70" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="217" y="758" text-anchor="middle">gather_pack</text>
+  <text class="t id" x="217" y="776" text-anchor="middle">[T, H, D] → [S, H, L, D]</text>
+  <text class="t id" x="217" y="791" text-anchor="middle">pad slots point at a zero row</text>
+
+  <rect x="384" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="531" y="758" text-anchor="middle">SDPA on device</text>
+  <text class="t id" x="531" y="776" text-anchor="middle">bidirectional, additive mask</text>
+  <text class="t id" x="531" y="791" text-anchor="middle">one fused kernel per (S, L)</text>
+
+  <rect x="698" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="845" y="758" text-anchor="middle">gather_unpack</text>
+  <text class="t id" x="845" y="776" text-anchor="middle">[S, H, L, D] → [T, H, D]</text>
+  <text class="t id" x="845" y="791" text-anchor="middle">single bulk output copy</text>
+
+  <text class="t bdl" x="531" y="826" text-anchor="middle">tables on the metadata instead of rebuilt per layer ⇒ roughly 4 host/device barriers per pass, not one set per layer</text>
+
+  <path class="edge" d="M 531 850 V 880" marker-end="url(#arrow)" />
+
+  <rect x="46" y="884" width="970" height="78" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="531" y="911" text-anchor="middle">Pooler on device: CLS / LAST / MEAN</text>
+  <text class="t bdl" x="531" y="933" text-anchor="middle">row gather via index_select · L2 normalize via rsqrt · reads only real rows, using the per-request offsets</text>
+  <text class="t bdl" x="531" y="952" text-anchor="middle">eager today · spyre_pooler.py subclasses the upstream poolers; compiling it is its own work item, not a warmup</text>
+
+  <rect x="46" y="968" width="970" height="30" rx="6" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
+  <text class="t note" x="531" y="988" text-anchor="middle">MEAN on device needs a compile-safe segment sum and torch-spyre#3507 (index_add). Until both land, MEAN pools on the host and the hidden state crosses each step.</text>
+
+  <path class="edge" d="M 531 998 V 1026" marker-end="url(#arrow)" />
+
+  <rect x="46" y="1030" width="970" height="62" rx="8" fill="#37474f" stroke="#263238" stroke-width="2" />
+  <text class="t bt" x="531" y="1056" text-anchor="middle">Pooled vectors → host</text>
+  <text class="t bd" x="531" y="1078" text-anchor="middle">only [num_reqs, hidden] crosses the boundary · padded rows are discarded, never pooled</text>
+
+  <!-- ================= RIGHT 1: shape vocabulary ================= -->
+  <rect x="1056" y="98" width="618" height="300" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="1076" y="126">Shape vocabulary</text>
+
+  <rect x="1076" y="142" width="578" height="62" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="1365" y="163" text-anchor="middle">T &#160;·&#160; tokens in the step</text>
+  <text class="t id" x="1365" y="182" text-anchor="middle">sum of the batched prompt lengths · bucketed to 64 / 128 / 256 / 512 tokens</text>
+
+  <rect x="1076" y="210" width="578" height="62" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="1365" y="231" text-anchor="middle">S &#160;·&#160; requests in the step</text>
+  <text class="t id" x="1365" y="250" text-anchor="middle">how many prompts are batched together · bucketed to 1 / 2 / 4 / 8 …</text>
+
+  <rect x="1076" y="278" width="578" height="68" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="1365" y="299" text-anchor="middle">L &#160;·&#160; the width of attention's grid</text>
+  <text class="t id" x="1365" y="317" text-anchor="middle">every request gets one row of L columns; L = align_up(longest prompt, 64)</text>
+  <text class="t id" x="1365" y="333" text-anchor="middle">short requests leave their remaining columns as padding</text>
+
+  <rect x="1076" y="352" width="578" height="40" rx="6" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
+  <text class="t note" x="1365" y="369" text-anchor="middle" font-weight="700">Worked example, prompts of 40, 12 and 58 tokens:</text>
+  <text class="t note" x="1365" y="385" text-anchor="middle">T = 110 → T_padded = 128 · S = 3 → 4 · L = 64 · grid = 4 × 64. Note S × L ≠ T.</text>
+
+  <!-- ================= RIGHT 2: compilation mode ================= -->
+  <rect x="1056" y="412" width="618" height="178" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="1076" y="440">Compilation mode</text>
+
+  <rect x="1076" y="456" width="578" height="74" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="1365" y="481" text-anchor="middle">CompilationMode.STOCK_TORCH_COMPILE</text>
+  <text class="t bdl" x="1365" y="502" text-anchor="middle">torch.compile(model, backend="inductor",</text>
+  <text class="t bdl" x="1365" y="520" text-anchor="middle">fullgraph=True, dynamic=False)</text>
+
+  <text class="t id" x="1076" y="552">dynamic=False → sizes are baked in as constants. A graph built for</text>
+  <text class="t id" x="1076" y="570">128 tokens works only for 128; a new count means a new compile.</text>
+
+  <!-- ================= RIGHT 3: warmup ================= -->
+  <rect x="1056" y="604" width="618" height="236" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="1076" y="632">Startup: warmup walks both ladders</text>
+
+  <rect x="1076" y="648" width="578" height="52" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="1365" y="672" text-anchor="middle">for T in token buckets: _dummy_run(T)</text>
+  <text class="t bdl" x="1365" y="691" text-anchor="middle">one compiled body graph per bucket</text>
+
+  <rect x="1076" y="710" width="578" height="66" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="1365" y="733" text-anchor="middle">for (S, L): _dummy_run(force_attention=True)</text>
+  <text class="t bdl" x="1365" y="752" text-anchor="middle">without the flag no attention metadata is built,</text>
+  <text class="t bdl" x="1365" y="768" text-anchor="middle">so the attention path is never traced or compiled</text>
+
+  <rect x="1076" y="786" width="578" height="48" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
+  <text class="t bt" x="1365" y="807" text-anchor="middle">_dummy_pooler_run(hidden_states)</text>
+  <text class="t bdl" x="1365" y="825" text-anchor="middle">warms pooler shapes · upstream's version is only a memory probe</text>
+
+  <path d="M 1056 718 H 1030 V 470 H 1000" stroke="#0d47a1" stroke-width="2" stroke-dasharray="7 5" fill="none" marker-end="url(#arrow-dash)" />
+  <text class="t id" x="1026" y="710" text-anchor="end" fill="#0d47a1">warms</text>
+
+  <!-- ================= RIGHT 4: invariants ================= -->
+  <rect x="1056" y="854" width="618" height="116" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="1076" y="882">Design invariants</text>
+
+  <text class="t id" x="1076" y="904">· The attention metadata always describes the real batch, so no</text>
+  <text class="t id" x="1076" y="920">&#160;&#160;padded row is ever gathered into a request or pooled.</text>
+
+  <text class="t id" x="1076" y="942">· Padding the body is safe because each layer treats every token</text>
+  <text class="t id" x="1076" y="958">&#160;&#160;row on its own.</text>
+
+  <!-- ================= BOTTOM: attention strategy comparison ================= -->
+  <rect x="26" y="1130" width="1648" height="470" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t sect" x="46" y="1158">Attention shape strategy: the dense grid used above, and how flash attention would change it</text>
+
+  <rect x="46" y="1174" width="790" height="252" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="2" />
+  <text class="t it" x="66" y="1198">A · Dense grid, the strategy shown above</text>
+  <text class="t id" x="66" y="1222">Pack the ragged flat list into a rectangle, so every shape is fixed at compile time.</text>
+  <text class="t id" x="66" y="1242">Needed because an offset computed from data does not lower under compilation</text>
+  <text class="t id" x="66" y="1260">(torch-spyre#3508) — and that arithmetic is exactly what flash relies on. Eager</text>
+  <text class="t id" x="66" y="1278">tolerates it; compiled mode, our target, does not.</text>
+  <text class="t id" x="66" y="1304">· build an additive mask [S, 1, L, L] marking padding and cross-request slots</text>
+  <text class="t id" x="66" y="1324">· build three index lists, then gather Q / K / V into [S, H, L, D]</text>
+  <text class="t id" x="66" y="1344">· one fused SDPA kernel per (S, L), then gather the results back out</text>
+  <text class="t id" x="66" y="1370" font-weight="700">Shape axes: T for the body, (S, L) for attention. Two ladders to warm.</text>
+  <text class="t id" x="66" y="1392">Costs: the mask grows with L² · index lists and a barrier per gather.</text>
+  <text class="t id" x="66" y="1414">Works today. This is the current implementation.</text>
+
+  <rect x="858" y="1174" width="790" height="252" rx="8" fill="#E8F5E9" stroke="#2e7d32" stroke-width="2" />
+  <text class="t it" x="878" y="1198">B · Flash-style attention, planned</text>
+  <text class="t id" x="878" y="1222">Never materialise the rectangle. Each block of queries reads its request's offset from the</text>
+  <text class="t id" x="878" y="1242">metadata at runtime and works directly on the flat list, carrying a running softmax maximum</text>
+  <text class="t id" x="878" y="1260">and sum — the online-softmax structure the Spyre decoder path already uses over KV pages.</text>
+  <text class="t id" x="878" y="1286">· no [S, 1, L, L] mask; request boundaries are the offsets</text>
+  <text class="t id" x="878" y="1306">· no gather_pack / gather_unpack; the kernel reads the flat list directly</text>
+  <text class="t id" x="878" y="1326">· no per-layer index lists, so no per-gather barriers</text>
+  <text class="t id" x="878" y="1352" font-weight="700">Shape axis: block count, bucketed like the decoder's page loop. L disappears.</text>
+  <text class="t src" x="878" y="1376">Both upstream backends already work this way: flash attention consumes the flat list with</text>
+  <text class="t src" x="878" y="1392">cu_seqlens_q = query_start_loc, and the CPU backend passes query[:num_actual_tokens]</text>
+  <text class="t src" x="878" y="1408">straight to a C++ kernel. Neither pads into a rectangle.</text>
+
+  <rect x="46" y="1442" width="1180" height="142" rx="8" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
+  <text class="t it" x="66" y="1464">If flash attention lands, the diagram above simplifies and converges on the upstream design:</text>
+  <text class="t note" x="66" y="1486">· the second shape axis collapses; bucket T and a block count, which is much closer to upstream's single axis</text>
+  <text class="t note" x="66" y="1504">· the "batch-shape tables" box disappears, and with it the per-layer rebuild problem and its host/device barriers</text>
+  <text class="t note" x="66" y="1522">· gather_pack / SDPA / gather_unpack collapse into one blocked-attention kernel</text>
+  <text class="t note" x="66" y="1540">· the mask's L² growth at long prompts disappears, today's largest untested risk at realistic prompt lengths</text>
+  <text class="t note" x="66" y="1560" font-weight="700">Open question: whether a Spyre kernel can do the runtime offset arithmetic this depends on. If it cannot, the block</text>
+  <text class="t note" x="66" y="1578">count stays bucketed. Everything else holds either way: padding seam, unpadded metadata, warmup, compilation mode.</text>
+
+  <rect x="1246" y="1442" width="428" height="142" rx="8" fill="#FFFFFF" stroke="#CFD2DD" stroke-width="2" />
+  <text class="t it" x="1266" y="1466">Legend</text>
+  <rect x="1266" y="1479" width="14" height="14" rx="3" fill="#37474f" stroke="#263238" />
+  <text class="t lg" x="1290" y="1490">Upstream vLLM, used as-is</text>
+  <rect x="1266" y="1501" width="14" height="14" rx="3" fill="#1565c0" stroke="#0d47a1" />
+  <text class="t lg" x="1290" y="1512">spyre-inference component</text>
+  <rect x="1266" y="1523" width="14" height="14" rx="3" fill="#E3E9FD" stroke="#0d47a1" />
+  <text class="t lg" x="1290" y="1534">Internal step · dense-grid path</text>
+  <rect x="1266" y="1545" width="14" height="14" rx="3" fill="#E8F5E9" stroke="#2e7d32" />
+  <text class="t lg" x="1290" y="1556">Planned flash-attention path</text>
+  <rect x="1266" y="1567" width="14" height="14" rx="3" fill="#FFF8E1" stroke="#F9A825" />
+  <text class="t lg" x="1290" y="1578">Note or upstream dependency</text>
+</svg>

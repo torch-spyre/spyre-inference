@@ -23,9 +23,10 @@ QK-norm weights of models that normalize over head_dim) and restore the two thin
 the width override would otherwise corrupt — the RoPE frequencies and the attention
 scale.
 
-Ported from hf-adapters' ``pad_attention_heads`` / ``PrecomputedRotaryEmbedding``
-(interleaved RoPE-compatible padding for Q/K, end-padding for V/O, original-
-frequency rotation cache), adapted to vLLM's fused/TP-sharded checkpoint stream.
+Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
+rotation cache keeps the original frequencies. The Transformers backend shares the
+weight passes here; it rebuilds its own rotation cache in ``transformers_backend``,
+since HF's rotary module is not the one ``fix_padded_rope`` reaches.
 """
 
 from __future__ import annotations

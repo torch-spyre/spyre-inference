@@ -25,6 +25,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
 logger = init_logger(__name__)
 
@@ -65,3 +66,10 @@ class SpyreRMSNorm(RMSNorm):
             return x
         else:
             return x, residual
+
+
+# The norm fuser instantiates TPAwareRMSNorm and OOT dispatch keys on the concrete class
+# name, so the fused norm needs its own entry.
+@RMSNorm.register_oot(name="TPAwareRMSNorm")
+class SpyreTPAwareRMSNorm(TPAwareRMSNorm, SpyreRMSNorm):
+    """Spyre RMSNorm that reconstructs a TP-sharded input before normalizing."""

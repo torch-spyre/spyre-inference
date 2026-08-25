@@ -17,7 +17,6 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
-    "hf-adapters-spyre"
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -33,7 +32,6 @@ spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
 spyre_inference_ops = "spyre_inference:register_ops"
-spyre_inference_hf_adaptor = "spyre_inference:register_hf_adapters"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -103,8 +101,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8d4f43bb3493d13c33cbb2608558dfcdf44774c" }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a31289852145a59099edccc3e506cf5336e8e2e0" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

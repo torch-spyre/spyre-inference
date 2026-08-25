@@ -33,6 +33,15 @@ on:
         required: false
         type: boolean
         default: false
+      clickhouse_env:
+        description: >
+          ClickHouse instance to ingest into: "prod" (the CLICKHOUSE_* secret
+          set) or "dev" (the CLICKHOUSE_*_DEV set). A push to main always uses
+          prod; this input only applies to a manual dispatch.
+        required: false
+        type: choice
+        options: [prod, dev]
+        default: prod
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' && inputs.vllm_branch != '' && inputs.vllm_branch) || github.ref }}
@@ -167,19 +176,21 @@ jobs:
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
       - name: Install ClickHouse ingest dependencies
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           set -eux
           uv pip install -r .github/scripts/requirements-benchmark.txt
 
       - name: Ingest benchmark results into ClickHouse
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
-          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
-          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
-          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
-          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
-          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+          # A push to main has no clickhouse_env input, so the selector resolves
+          # to prod. A manual dispatch can pick dev with the *_DEV secret set.
+          CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
+          CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
+          CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
+          CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
+          CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
           BENCHMARK_BRANCH: ${{ github.ref_name }}
           BENCHMARK_SHA: ${{ github.sha }}
           PR_NUMBER: "0"

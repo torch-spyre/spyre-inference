@@ -83,6 +83,9 @@ class SpyreCommunicator(DeviceCommunicatorBase):
     # the gather and strip the padding afterward. (E.g. TP=2 vocab-parallel
     # logits with per-rank width 24608 = 384*64 + 32 previously shifted rank 1
     # down by 32, corrupting the argmax for its half of the vocab.)
+    # As of ibm-spyre-comms 121 an unpadded shard also faults the card (RAS
+    # ComputeHardwareError 0x7b1b / lost DMA completion in
+    # AllGatherV_RingExchange) and needs a device recovery, so do not drop it.
     _GATHER_ALIGN = 64
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -107,11 +110,17 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             return torch.cat(output_list, dim=dim)
 
         # Pad this rank's contribution up to a 64 multiple so the transfer does
-        # not round off its tail. Strip the padding and re-concatenate on CPU
+        # not round off its tail. Padding on device writes the tail at a stick
+        # offset, which torch-spyre's layout pass rejects ("no offset-free
+        # alternative stick dim for mutation target"), so pad on CPU. Strip the
+        # padding and re-concatenate on CPU too
         # (Spyre slicing/narrow corrupts memory — see spyre_attn.py), restoring
         # the exact per-rank shard layout the caller expects.
         pad_spec = [0, 0] * (input_.dim() - dim - 1) + [0, pad]
-        padded = torch.nn.functional.pad(input_, pad_spec).contiguous()
+        padded = convert(
+            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec).contiguous(),
+            device=input_.device,
+        )
         output_list = [torch.empty_like(padded) for _ in range(self.world_size)]
         dist.all_gather(  # ty: ignore[possibly-missing-attribute]
             output_list, padded, group=self.device_group

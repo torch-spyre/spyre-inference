@@ -20,13 +20,12 @@ ops injected via OOT registration.
   </figcaption>
 </figure>
 
-The plugin registers via three entry points:
+The plugin registers via two entry points:
 
 | Entry Point | Target | Purpose |
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
-| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the `spyre_convert` and `spyre_vocab_mask` custom ops (RoPE registers no op — its rotation runs in-graph) |
-| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
+| `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the `spyre_convert` and `spyre_vocab_mask` custom ops (RoPE registers no op — its rotation runs in-graph). Also overrides vLLM's `TransformersForCausalLM` with `SpyreTransformersForCausalLM` |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
@@ -184,6 +183,29 @@ the full sequence — so it skips the paged-cache machinery entirely and instead
 3. Scatters the unpadded results back to CPU, then writes them per token into the Spyre
    output buffer.
 
+## Encoder / embedding models: target state
+
+Everything above describes what is implemented today. The diagram below is a **target
+state** — where the encoder path is heading once the compile-mode work lands, and not a
+description of current behaviour.
+
+The shape of that target: the model body compiled once per token bucket, attention
+shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
+both shape ladders so nothing compiles on the first request.
+
+<figure markdown="span">
+  ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
+  <figcaption>
+    Target architecture for encoder / embedding models under
+    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
+    token count <code>T</code> for the model body, and <code>(S, L)</code> for
+    attention's dense grid — they are decoupled because attention builds its grid by
+    gathering rows rather than by being handed a reshaped tensor. The foot of the
+    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
+    which would collapse the second axis and converge on the upstream design.
+  </figcaption>
+</figure>
+
 ## Device Placement Strategy
 
 `TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
@@ -227,16 +249,26 @@ operations that Spyre doesn't yet support natively (the per-sequence
 attention varlen loop, logits indexing). RoPE's rotation-cache gather and the embedding
 gather both run on-device now, so neither is among them.
 
-## HF-adapters Transformers backend
+## Transformers backend
 
-When `model_impl="transformers"`, the `register_hf_adapters` general plugin swaps vLLM's
-`TransformersForCausalLM` for `HfAdaptersForCausalLM` (`spyre_inference/hf_adapters.py`).
-vLLM's stock Transformers backend still handles model creation, weight loading, attention
-routing, the KV cache, and scheduling; the Spyre OOT layers above apply automatically at
-instantiation. The adapter's main job is to replace HF's `RotaryEmbedding` with a
-matmul-based RoPE (`apply_rope_matmul`), padding Q/K into a stick-aligned dimension for
-the rotation when `head_dim/2` is not a multiple of the Spyre block size and contracting
-back afterward.
+When `model_impl="transformers"`, `register_ops` swaps vLLM's `TransformersForCausalLM`
+for `SpyreTransformersForCausalLM` (`spyre_inference/transformers_backend.py`). vLLM's
+stock Transformers backend still handles model creation, weight loading, attention
+routing, the KV cache, and scheduling, and its fusers replace HF's linear/norm/GLU
+modules with vLLM layers — which the OOT registrations above then pick up automatically.
+
+The subclass covers what upstream leaves to HF's module code. There is no RoPE fuser, so
+HF's `rotary_emb` survives and would derive cos/sin inside the forward from int64
+`position_ids`, a cast torch-spyre cannot lower. It is replaced with a precomputed
+`[max_model_len, 2, 2, head_dim/2]` rotation cache — built on the host and moved to the
+device before compile, leaving only an `index_select` in the graph — plus a matmul-based
+`apply_rotary_pos_emb`. Head padding is shared with the native path: the platform widens
+`head_dim` and the weight passes in `head_pad.py` pad Q/K interleaved, so this backend
+only has to rebuild the rotation cache at the pre-pad frequencies.
+
+Because the fusers key on class names, the OOT registry also covers the fused norms
+(`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`); otherwise they fall back to
+`forward_native` and its fp32 promotion.
 
 ## Distributed (TP)
 

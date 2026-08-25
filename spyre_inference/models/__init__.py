@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Model-specific Spyre adaptations (hf-adapters-style, per architecture)."""
+"""Model-specific Spyre adaptations, per architecture."""
 
 from __future__ import annotations
 

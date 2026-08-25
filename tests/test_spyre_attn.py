@@ -27,7 +27,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
-    slot_major_kv_layout,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
@@ -78,20 +77,6 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
-
-
-def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre
-    exactly as the model runner allocates it."""
-    if device.type != "spyre":
-        return cache_cpu.to(device)
-    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
-    return cache_cpu.to(
-        device,
-        device_layout=slot_major_kv_layout(
-            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
-        ),
-    )
 
 
 def _fused_qkv_kv_views(
@@ -201,6 +186,15 @@ def assert_close_outliers(
         outlier_rtol: relative tolerance for outlier elements.
         msg: additional context for the failure message.
     """
+    # `NaN > tol` is False, so a non-finite actual scores zero outliers and passes
+    # the check below. Attention output is always finite, so reject it up front.
+    n_nonfinite = int((~torch.isfinite(actual)).sum())
+    if n_nonfinite:
+        raise AssertionError(
+            f"{n_nonfinite}/{actual.numel()} element(s) of actual are non-finite "
+            f"(NaN or inf); the value was never written or the kernel diverged."
+        )
+
     diff = (actual - expected).abs()
     tol = atol + rtol * expected.abs()
     outlier_mask = diff > tol
@@ -344,6 +338,7 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    expect_fused_store: bool | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -410,8 +405,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = _to_cache_device(k_pages_cpu, cache_device)
-    v_pages = _to_cache_device(v_pages_cpu, cache_device)
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -436,7 +431,9 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
-    output = torch.empty_like(query).to(cache_device)
+    # NaN, not empty_like: every row is expected to be written, so a store that
+    # lands nowhere fails below instead of passing on whatever the allocator gave.
+    output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     # The impl expects q/k/v already on device, as in production (QKV runs
@@ -450,6 +447,14 @@ def _run_spyre_attn_test(
         attn_metadata=attn_metadata,
         output=output,
     )
+
+    if expect_fused_store is not None:
+        # Kernel cache keys are (num_blocks, padded_query_len, store_mode, store_len).
+        fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
+        assert fused_used == expect_fused_store, (
+            f"fused output store: expected {expect_fused_store}, got {fused_used} "
+            f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
+        )
 
     ref_output = ref_attn(
         query=query,
@@ -572,6 +577,46 @@ def test_spyre_attn_compiled_multi_seq(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("configure_compilation", "seq_lens", "expect_fused_store"),
+    [
+        pytest.param("STOCK_TORCH_COMPILE", [(1, 512)], True, id="STOCK-decode(1seq)-fused"),
+        pytest.param("STOCK_TORCH_COMPILE", [(32, 256)], True, id="STOCK-prefill(1seq)-fused"),
+        pytest.param(
+            "STOCK_TORCH_COMPILE",
+            [(1, 256), (1, 512)],
+            True,
+            id="STOCK-decode(2seqs)-fused",
+        ),
+        pytest.param("NONE", [(1, 512)], False, id="NONE-decode(1seq)-eager"),
+    ],
+    indirect=["configure_compilation"],
+)
+def test_spyre_attn_fused_output_store(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    expect_fused_store: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Assert both the output and which store path ran, so a guard that stops
+    engaging cannot leave these cases green on the eager store alone.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_fused_store=expect_fused_store,
     )
 
 
@@ -1296,8 +1341,8 @@ def test_reshape_and_cache_scatter(
         k_expected[block][offset] = key[t]
         v_expected[block][offset] = value[t]
 
-    k_actual = _to_cache_device(fresh_pages(), cache_device)
-    v_actual = _to_cache_device(fresh_pages(), cache_device)
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
 
     if source_layout == "qkv_split":
         query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)

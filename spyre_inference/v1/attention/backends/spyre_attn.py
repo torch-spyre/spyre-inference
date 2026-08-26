@@ -14,11 +14,11 @@
 
 """Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
+import bisect
 import functools
+import os
 from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
-
-import os
 
 import torch
 
@@ -82,45 +82,31 @@ QUERY_CHUNK_SIZE = 32
 INT32_ELEMS_PER_STICK = 32
 
 
-# Master gate for the bucketed decode fast path. Off by default; setting the
-# env var to "1" opts in. Read once at module import; runtime toggling requires
-# a fresh interpreter.
-_BUCKETED_DECODE = os.environ.get("SPYRE_BUCKETED_DECODE", "0") == "1"
-
-# Bucket lattice for the decode-only bucketed fast path. Every decode batch is
-# padded up to the nearest (num_seqs, num_blocks) bucket, so one compiled kernel
-# per bucket handles a whole family of real batch shapes. Tunable via env for
-# benchmarking; see _parse_bucket_env().
-#
-# NUM_SEQS_BUCKETS: bucket sizes for `attn_metadata.num_seqs`. The smallest
-#   bucket sets the minimum batch size at which the fast path is enabled; below
-#   that, decode falls back to the per-seq loop (bmm-across-seqs regresses at
-#   low N because the batched matmul is memory-bandwidth-bound on the AIU).
-# NUM_BLOCKS_BUCKETS: bucket sizes for `max(num_blocks_needed_per_seq)`, i.e.
-#   the longest sequence's active-block count within a tier. Aligned so bucket
-#   growth roughly matches KV_LENGTH_ALIGNMENT-tier growth.
+# Minimum batch size at which the bucketed decode fast path is enabled. Below
+# this, decode falls back to the per-seq loop: the batched matmul across seqs
+# has to pad to the nearest bucket, and at small N the mostly-masked rows cost
+# more than running a per-seq matmul on the real rows only.
+_MIN_SEQS_BUCKET = 4
 
 
-def _parse_bucket_env(env_name: str, default: tuple[int, ...]) -> tuple[int, ...]:
-    val = os.environ.get(env_name)
-    if not val:
-        return default
-    return tuple(sorted({int(x) for x in val.split(",") if x.strip()}))
+def _powers_of_two_up_to(n: int) -> tuple[int, ...]:
+    """Powers of 2 in [1, n], plus n itself if it is not already a power of 2."""
+    if n < 1:
+        return ()
+    result = []
+    v = 1
+    while v < n:
+        result.append(v)
+        v *= 2
+    result.append(n)
+    return tuple(result)
 
 
-NUM_SEQS_BUCKETS = _parse_bucket_env("SPYRE_DECODE_BUCKETS_SEQS", (8, 16, 32))
-NUM_BLOCKS_BUCKETS = _parse_bucket_env("SPYRE_DECODE_BUCKETS_BLOCKS", (1, 2, 4, 8, 16))
-
-
-def _bucket_up(n: int, buckets: tuple[int, ...]) -> int | None:
-    """Return the smallest bucket >= n, or None when n exceeds the top bucket.
-
-    None signals "outside the lattice" — callers fall back to the per-seq path
-    rather than compiling a wider kernel on the fly.
-    """
-    for b in buckets:
-        if n <= b:
-            return b
+def _find_bucket(n: int, buckets: tuple[int, ...]) -> int | None:
+    """Smallest bucket >= n, or None when n exceeds the top bucket."""
+    idx = bisect.bisect_left(buckets, n)
+    if idx < len(buckets):
+        return buckets[idx]
     return None
 
 
@@ -617,6 +603,18 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
+        # Bucket lattices for the decode-only bucketed fast path, derived from
+        # engine config. Every eligible decode batch is padded up to the nearest
+        # (num_seqs, num_blocks) bucket, so one compiled kernel per bucket
+        # handles a whole family of real batch shapes.
+        # TODO: expose these as engine args if configurability is needed.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        max_num_blocks_per_seq = (
+            model_config.max_model_len + self.block_size - 1
+        ) // self.block_size
+        self._num_seqs_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_seqs)
+        self._num_blocks_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_blocks_per_seq)
+
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
 
@@ -962,9 +960,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_row_ids_cpu = None
         block_ids_padded_cpu = None
         attn_mask_padded_cpu = None
-        if max_query_len == 1 and self.sliding_window is None and num_seqs >= NUM_SEQS_BUCKETS[0]:
-            b_seqs = _bucket_up(num_seqs, NUM_SEQS_BUCKETS)
-            b_blocks = _bucket_up(max(num_active), NUM_BLOCKS_BUCKETS)
+        if (
+            max_query_len == 1
+            and self.sliding_window is None
+            and num_seqs >= _MIN_SEQS_BUCKET
+        ):
+            b_seqs = _find_bucket(num_seqs, self._num_seqs_buckets)
+            b_blocks = _find_bucket(max(num_active), self._num_blocks_buckets)
             if b_seqs is not None and b_blocks is not None:
                 bucket_num_seqs = b_seqs
                 bucket_num_blocks = b_blocks
@@ -1198,8 +1200,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Bucketed decode kernel cache, keyed by (bucket_num_seqs,
         # bucket_num_blocks). Populated on demand by _get_bucketed_decode_kernel
-        # when a batch falls into a new bucket. With the default lattice
-        # NUM_SEQS_BUCKETS × NUM_BLOCKS_BUCKETS = 4 × 5 = 20 entries total.
+        # when a batch falls into a new bucket.
         self._decode_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
@@ -1634,12 +1635,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
-        # Bucketed decode fast path. Gated on SPYRE_BUCKETED_DECODE=1 and a
-        # decode-only precondition (see the helper for the full list). Handles
-        # the whole batch in one compiled-kernel call when eligible; returns
-        # the caller's output buffer. The per-seq loop below runs only when
-        # this path declines.
-        if _BUCKETED_DECODE and self._bucketed_decode_preconditions_met(attn_metadata):
+        # Bucketed decode fast path. Handles the whole batch in one compiled-
+        # kernel call when the decode-only precondition holds (see the helper
+        # for the full list); returns the caller's output buffer. The per-seq
+        # loop below runs only when this path declines.
+        if self._bucketed_decode_preconditions_met(attn_metadata):
             self._run_bucketed_decode_dispatch(
                 query_dev, k_pages, v_pages, attn_metadata, output, _target_device
             )

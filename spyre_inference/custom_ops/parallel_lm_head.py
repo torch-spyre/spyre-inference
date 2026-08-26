@@ -27,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .linear import SpyreTransposedWeightMethod, SpyreTransposedWeightModule
+from .linear import SpyreTransposedWeightMethod
 
 
 logger = init_logger(__name__)
@@ -41,13 +41,24 @@ class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbed
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
-class SpyreParallelLMHead(SpyreTransposedWeightModule, ParallelLMHead):
+class SpyreParallelLMHead(ParallelLMHead):
     """Out-of-tree (OOT) ParallelLMHead implementation for IBM's Spyre device.
 
     The projection lives in `SpyreUnquantizedLMHeadMethod.apply`, reached via
     `LogitsProcessor._apply_head` -> `lm_head.quant_method.apply`. The base
     `ParallelLMHead.forward` raises and is unused.
     """
+
+    def _apply(self, fn, recurse=True):
+        # The projection GEMM reads `padded_weight_t`, so the loaded `weight` is
+        # runtime-dead here; keep it off-device during `model.to(spyre)` (a tied
+        # head's real table is placed by the embedding).
+        weight = self._parameters.pop("weight", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if weight is not None:
+                self._parameters["weight"] = weight
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

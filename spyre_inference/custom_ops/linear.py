@@ -115,25 +115,7 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
     """
 
 
-class SpyreTransposedWeightModule:
-    """Skip the runtime-dead `weight` during `model.to(spyre)` when the quant method
-    keeps its transpose under a distinct `WEIGHT_T_ATTR` (the GEMM reads that; a tied
-    head's real table is placed by the embedding). No-op when `WEIGHT_T_ATTR == "weight"`.
-    """
-
-    def _apply(self, fn, recurse=True):
-        quant_method = getattr(self, "quant_method", None)
-        if getattr(quant_method, "WEIGHT_T_ATTR", "weight") == "weight":
-            return super()._apply(fn, recurse=recurse)
-        weight = self._parameters.pop("weight", None)
-        try:
-            return super()._apply(fn, recurse=recurse)
-        finally:
-            if weight is not None:
-                self._parameters["weight"] = weight
-
-
-class _SpyreTransposedLinearMixin(SpyreTransposedWeightModule):
+class _SpyreTransposedLinearMixin:
     """Swaps in `SpyreUnquantizedLinearMethod` for unquantized linear layers.
 
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the

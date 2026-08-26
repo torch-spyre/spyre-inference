@@ -1074,8 +1074,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if query_len == 1:
                 # Decode: the single real token goes at row 0 of the padded
                 # buffer; the trailing padded rows are masked out downstream.
-                q_dev = query_dev.unbind(dim=0)[q_start].reshape(
+                _q = query_dev.unbind(dim=0)[q_start].reshape(
                     num_kv_heads, num_queries_per_kv, 1, head_size
+                )
+                # .contiguous() cannot force the canonical layout here: the
+                # heads-inner physical Spyre layout is invisible to stride
+                # checks. See torch-spyre#3926.
+                q_dev = torch.ops.spyre.opaque_copy_(
+                    _q,  # ty: ignore[invalid-argument-type]
+                    torch.zeros(  # ty: ignore[invalid-argument-type]
+                        (num_kv_heads, num_queries_per_kv, 1, head_size),
+                        device=_q.device,
+                        dtype=_q.dtype,
+                    ),
                 )
                 if aligned_max_query_len > 1:
                     q_dev = torch.nn.functional.pad(q_dev, (0, 0, 0, aligned_max_query_len - 1))

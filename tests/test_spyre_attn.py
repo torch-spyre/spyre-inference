@@ -558,6 +558,7 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+        pytest.param([(1, 128), (1, 256), (1, 128)], id="probe_decode_3seqs_kv128"),
     ],
 )
 def test_spyre_attn_compiled_multi_seq(

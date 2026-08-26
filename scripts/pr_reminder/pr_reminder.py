@@ -87,10 +87,12 @@ STALE_HOURS = float(os.environ.get("STALE_HOURS") or "24")
 # backlog item any more, it is abandoned, and stale.yml already chases those.
 # Set to 0 to disable the upper bound.
 MAX_IDLE_DAYS = float(os.environ.get("MAX_IDLE_DAYS") or "30")
+# Normalized like titles so one entry covers "do-not-merge", "do not merge" and
+# "Do Not Merge" — GitHub label names carry spaces the exact string wouldn't match.
 EXEMPT_LABELS = {
-    label.strip().lower()
+    normalized
     for label in (os.environ.get("EXEMPT_LABELS") or "keep-open,stale,do-not-merge").split(",")
-    if label.strip()
+    if (normalized := normalize_title(label))
 }
 # Authors flag "not ready" in the title far more often than with a label, so the
 # title is checked too. Patterns are matched against a normalized title, which
@@ -182,7 +184,7 @@ def select_stale(prs: list[dict], now: datetime) -> tuple[list[dict], int]:
     for pr in prs:
         if pr.get("draft"):
             continue
-        labels = {label["name"].lower() for label in pr.get("labels") or []}
+        labels = {normalize_title(label["name"]) for label in pr.get("labels") or []}
         if labels & EXEMPT_LABELS:
             continue
         title_key = normalize_title(pr["title"])

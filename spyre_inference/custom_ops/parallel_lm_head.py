@@ -47,9 +47,6 @@ class SpyreParallelLMHead(SpyreTransposedWeightModule, ParallelLMHead):
     The projection lives in `SpyreUnquantizedLMHeadMethod.apply`, reached via
     `LogitsProcessor._apply_head` -> `lm_head.quant_method.apply`. The base
     `ParallelLMHead.forward` raises and is unused.
-
-    `SpyreTransposedWeightModule` keeps the runtime-dead `weight` off-device
-    during placement (the logits GEMM reads `padded_weight_t`).
     """
 
     def __init__(self, *args, **kwargs):

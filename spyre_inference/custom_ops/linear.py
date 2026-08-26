@@ -116,19 +116,9 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
 
 
 class SpyreTransposedWeightModule:
-    """Module-side complement to `SpyreTransposedWeightMethod`.
-
-    When the quant method stores the transposed weight under a distinct attribute
-    (`WEIGHT_T_ATTR != "weight"`), the source `weight` is never read at runtime —
-    the forward GEMM reads `WEIGHT_T_ATTR`. Skip it during `model.to(spyre)` so it
-    is not redundantly copied to HBM: a tied lm-head's real table is placed by the
-    embedding (same Parameter), and an untied head derives its transposed weight on
-    CPU. Mixed in before a concrete vLLM module so `super()._apply` reaches the
-    normal recursion.
-
-    Driven entirely by the quant method's `WEIGHT_T_ATTR`, so this is a no-op for
-    the in-place case (`"weight"`) and any future distinct-attribute layer that
-    mixes it in inherits the correct behavior with no per-module override.
+    """Skip the runtime-dead `weight` during `model.to(spyre)` when the quant method
+    keeps its transpose under a distinct `WEIGHT_T_ATTR` (the GEMM reads that; a tied
+    head's real table is placed by the embedding). No-op when `WEIGHT_T_ATTR == "weight"`.
     """
 
     def _apply(self, fn, recurse=True):

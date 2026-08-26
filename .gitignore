@@ -48,3 +48,8 @@ docs/examples
 
 # PR body drafts (prepare-pull-request skill)
 .pr_drafts/
+
+# tmp files of agent harness
+.plans/
+.kilo/
+

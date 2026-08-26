@@ -24,7 +24,7 @@ from pathlib import Path
 
 from sentence_transformers import SentenceTransformer
 
-# Model ids must match tests/test_encoder_models.py.
+# Model ids must match tests/e2e/test_encoder_models.py.
 EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-125m-english",
     "ibm-granite/granite-embedding-278m-multilingual",

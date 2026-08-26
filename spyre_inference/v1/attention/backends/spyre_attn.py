@@ -339,7 +339,7 @@ def _create_compilable_bucketed_decode_attn(num_seqs: int, num_blocks: int):
     Inputs are pre-gathered, pre-padded, and pre-masked by the caller
     (`_run_bucketed_decode_dispatch`) using the amortized metadata that
     `SpyreAttentionMetadataBuilder.build()` produces (query_row_ids_dev,
-    block_ids_padded_dev, attn_mask_padded_dev). Padded sequences and
+    block_ids_padded_dev, mask_by_block_dev). Padded sequences and
     padded blocks are `-inf`-masked, so their compute is a well-defined
     no-op and the caller drops the padded rows during scatter.
     """
@@ -530,23 +530,25 @@ class SpyreAttentionMetadata(AttentionMetadata):
     #   buffer; row s of the logical (B_seqs, B_blocks) grid lives at
     #   offset [s * B_blocks : (s+1) * B_blocks]. Real seqs on the
     #   [:num_seqs, :num_blocks_max] prefix; zero elsewhere. Padded
-    #   positions are masked out by attn_mask_padded_cpu, so the value
+    #   positions are masked out by mask_by_block_cpu, so the value
     #   doesn't matter. Kept 1D (not [B_seqs, B_blocks]) so the Spyre
     #   inductor never has to lower a 2D→1D reshape whose inner dim is
     #   narrower than the stick width — see _run_bucketed_decode_dispatch
     #   for the full rationale.
-    # attn_mask_padded_cpu: [B_seqs, B_blocks, block_size] fp16 — combined
-    #   kv_len tail mask AND padded-seq/block mask. Positions the compiled
-    #   kernel must ignore hold -inf; positions to attend to hold 0. Q=1 by
-    #   construction, so there is no query-length axis.
+    # mask_by_block_cpu: [B_blocks, B_seqs, block_size] fp16 — combined
+    #   kv_len tail mask AND padded-seq/block mask, pre-permuted with the
+    #   block axis outermost for cheap axis-0 slicing in the dispatch.
+    #   Positions the compiled kernel must ignore hold -inf; positions to
+    #   attend to hold 0. Q=1 by construction, so there is no query-length
+    #   axis. Layer-agnostic — built once per step, reused across layers.
     bucket_num_seqs: int | None = None
     bucket_num_blocks: int | None = None
     query_row_ids_cpu: torch.Tensor | None = None
     query_row_ids_dev: torch.Tensor | None = None
     block_ids_padded_cpu: torch.Tensor | None = None
     block_ids_padded_dev: torch.Tensor | None = None
-    attn_mask_padded_cpu: torch.Tensor | None = None
-    attn_mask_padded_dev: torch.Tensor | None = None
+    mask_by_block_cpu: torch.Tensor | None = None
+    mask_by_block_dev: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -959,7 +961,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         bucket_num_blocks = None
         query_row_ids_cpu = None
         block_ids_padded_cpu = None
-        attn_mask_padded_cpu = None
+        mask_by_block_cpu = None
         if (
             max_query_len == 1
             and self.sliding_window is None
@@ -1000,7 +1002,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # [s * b_blocks : (s+1) * b_blocks] of the flat buffer. Padded
                 # slots (past num_active[s] within a real seq, and all slots
                 # of padded seqs) hold 0 and are -inf-masked by
-                # attn_mask_padded, so the value there doesn't matter.
+                # mask_by_block, so the value there doesn't matter.
                 #
                 # Flat-from-birth (not [B_seqs, B_blocks].reshape(-1)) is
                 # load-bearing: on Spyre, reshaping a 2D device tensor whose
@@ -1016,7 +1018,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         s, :n_use
                     ]
 
-                # Padded mask: [B_seqs, B_blocks, block_size] fp16. Combines
+                # Padded mask, pre-permuted to [B_blocks, B_seqs, block_size]
+                # fp16 for cheap axis-0 slicing in the dispatch. Combines
                 # per-seq kv_len tail masking (last active block may have
                 # unused positions) and inactive-seq/block masking.
                 #   - Real seq s, real block b: copy from attention_mask_tiles
@@ -1026,7 +1029,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 #   - Padded seq (s >= num_seqs): -inf everywhere.
                 # Only builds under Q=1 decode with sliding_window=None, so
                 # attention_mask_tiles[s] is indexed by absolute block index.
-                attn_mask_padded_cpu = torch.full(
+                mask_bs_bb = torch.full(
                     (b_seqs, b_blocks, block_size),
                     float("-inf"),
                     dtype=torch.float16,
@@ -1034,12 +1037,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 for s in range(num_seqs):
                     n_use = min(num_active[s], b_blocks)
                     for b in range(n_use):
-                        # attention_mask_tiles[s][b] shape:
-                        #   [aligned_max_query_len, block_size]
-                        # Under Q=1, aligned_max_query_len == QUERY_CHUNK_SIZE
-                        # (32) but only row 0 carries useful mask; the rest
-                        # would be -inf'd out anyway on the per-seq path.
-                        attn_mask_padded_cpu[s, b] = attention_mask_tiles[s][b][0]
+                        mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
+                mask_by_block_cpu = mask_bs_bb.permute(1, 0, 2).contiguous()
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -1063,7 +1062,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             bucket_num_blocks=bucket_num_blocks,
             query_row_ids_cpu=query_row_ids_cpu,
             block_ids_padded_cpu=block_ids_padded_cpu,
-            attn_mask_padded_cpu=attn_mask_padded_cpu,
+            mask_by_block_cpu=mask_by_block_cpu,
         )
 
 
@@ -1321,15 +1320,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata.bucket_num_seqs is not None and attn_metadata.query_row_ids_dev is None:
             assert attn_metadata.query_row_ids_cpu is not None
             assert attn_metadata.block_ids_padded_cpu is not None
-            assert attn_metadata.attn_mask_padded_cpu is not None
+            assert attn_metadata.mask_by_block_cpu is not None
             attn_metadata.query_row_ids_dev = convert(
                 attn_metadata.query_row_ids_cpu.contiguous(), device=_target_device
             )
             attn_metadata.block_ids_padded_dev = convert(
                 attn_metadata.block_ids_padded_cpu.contiguous(), device=_target_device
             )
-            attn_metadata.attn_mask_padded_dev = convert(
-                attn_metadata.attn_mask_padded_cpu.contiguous(), device=_target_device
+            attn_metadata.mask_by_block_dev = convert(
+                attn_metadata.mask_by_block_cpu.contiguous(), device=_target_device
             )
 
         output = self._online_softmax_attention(
@@ -1450,7 +1449,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert b_seqs is not None and b_blocks is not None
         assert attn_metadata.query_row_ids_dev is not None
         assert attn_metadata.block_ids_padded_dev is not None
-        assert attn_metadata.attn_mask_padded_dev is not None
+        assert attn_metadata.mask_by_block_dev is not None
 
         # 1. Gather K/V for the whole padded batch in ONE index_select, then
         # slice into a Python list of per-block tensors. The kernel indexes
@@ -1486,6 +1485,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             .permute(1, 0, 3, 2, 4)
             .contiguous()
         )
+        # `.clone()` is load-bearing: `k_by_block[i]` and `v_by_block[i]` are
+        # views into a contiguous buffer with storage_offset > 0 for i > 0. A
+        # compiled Spyre kernel reads its inputs from storage_offset == 0
+        # (torch-spyre#3770), so a view would read bytes from offset 0,
+        # silently attending block 0's KV data instead of block i's.
+        # TODO: pre-allocate a [B_blocks, B_seqs * KV, 1, block_size, D] buffer
+        # in the metadata builder and slice into it here, avoiding B_blocks
+        # copies per layer per step. See follow-up issue.
         k_list_dev = [
             k_by_block[i].reshape(b_seqs * num_kv_heads, 1, block_size, head_size).clone()
             for i in range(b_blocks)
@@ -1517,28 +1524,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # 3. Split the padded mask into per-block tiles with the folded
         # leading axis and the Q=1 broadcast axis pre-inserted so the kernel
-        # doesn't have to reshape.
-        # attn_mask_padded_dev: [B_seqs, B_blocks, block_size] fp16.
+        # doesn't have to reshape. Mask is layer-agnostic and pre-permuted
+        # to [B_blocks, B_seqs, block_size] in the metadata builder — one
+        # build per step, reused across layers. The KV-broadcast still runs
+        # per layer because num_kv_heads is not known to the builder.
         # Per-block target: [B_seqs * KV, 1, 1, block_size].
-        # We broadcast the mask across KV since the mask is per-seq/per-block,
-        # not per-head — expand + contiguous so the kernel sees a real KV
-        # axis rather than a broadcast stride.
-        mask_padded = attn_metadata.attn_mask_padded_dev  # [B_seqs, B_blocks, block_size]
-        # Permute to [B_blocks, B_seqs, block_size] for cheap axis-0 slicing,
-        # then broadcast to KV inside the list comp.
-        mask_by_block = mask_padded.permute(1, 0, 2).contiguous()
+        # .reshape across an expanded dim forces materialization, so `.clone()`
+        # alone (of a non-contiguous input) produces the contiguous
+        # storage_offset==0 tensor the compiled kernel needs. No redundant
+        # `.contiguous()` before `.clone()`.
+        mask_by_block = attn_metadata.mask_by_block_dev  # [B_blocks, B_seqs, block_size]
         mask_list_dev = [
-            (
-                mask_by_block[i]  # [B_seqs, block_size]
-                .unsqueeze(1)  # [B_seqs, 1, block_size]
-                .expand(b_seqs, num_kv_heads, block_size)  # [B_seqs, KV, block_size]
-                .reshape(b_seqs * num_kv_heads, 1, 1, block_size)  # kernel shape
-                # .reshape across an expanded dim forces materialization, so
-                # `.clone()` alone (of a non-contiguous input) produces the
-                # contiguous storage_offset==0 tensor the compiled kernel
-                # needs. No redundant `.contiguous()` before `.clone()`.
-                .clone()
-            )
+            mask_by_block[i]  # [B_seqs, block_size]
+            .unsqueeze(1)  # [B_seqs, 1, block_size]
+            .expand(b_seqs, num_kv_heads, block_size)  # [B_seqs, KV, block_size]
+            .reshape(b_seqs * num_kv_heads, 1, 1, block_size)  # kernel shape
+            .clone()
             for i in range(b_blocks)
         ]
 

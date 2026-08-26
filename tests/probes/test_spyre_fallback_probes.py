@@ -96,7 +96,7 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
         "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
         "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
         "Fails in both eager and compile. "
-        "When supported, please adapt tests/test_mlp.py::test_replicated_matches_reference"
+        "When supported, please adapt tests/custom_ops/test_mlp.py::test_replicated_matches_reference"
     ),
 )
 def test_spyre_matmul_output_dim_1(spyre_device, mode):
@@ -196,7 +196,7 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 # Note: the embedding single-row probe lives in
-# tests/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
+# tests/custom_ops/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
 # It is intentionally not duplicated here.
 
 

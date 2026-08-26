@@ -26,7 +26,7 @@ Coverage:
      passing, this custom op can likely be deleted.
 
 Real TP=2 collective correctness on hardware lives in
-`tests/test_distributed_tp2.py`.
+`tests/e2e/test_distributed_tp2.py`.
 """
 
 import sys

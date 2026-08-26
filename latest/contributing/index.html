@@ -1122,6 +1122,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#one-venv-for-both-repos" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One venv for both repos
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#linting" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1735,6 +1746,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#one-venv-for-both-repos" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One venv for both repos
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#linting" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1927,6 +1949,17 @@
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
+  <a href="#one-venv-for-both-repos" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One venv for both repos
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#linting" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2100,65 +2133,78 @@
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev<span class="w"> </span>--no-install-package<span class="w"> </span>torch-spyre<span class="w"> </span>--inexact
 </span></code></pre></div>
 <p><code>--no-install-package torch-spyre</code> skips resolving and rebuilding the pinned rev; <code>--inexact</code> stops uv from uninstalling the now-unreferenced local package. Note this only affects <code>uv sync</code> itself — any subsequent plain <code>uv run</code> will still re-sync and revert it, so use <code>uv run --no-sync …</code> for those (see <code>CLAUDE.md</code>'s "Iterating on a Local <code>torch-spyre</code> Checkout" section).</p>
+<h3 id="one-venv-for-both-repos">One venv for both repos<a class="headerlink" href="#one-venv-for-both-repos" title="Permanent link">&para;</a></h3>
+<p>To work on a <code>torch-spyre</code> bug and validate against both test suites, build on this repo's venv — it already carries the pinned <code>torch</code> and <code>vllm</code> — then add your <code>torch-spyre</code> checkout and its dev dependencies:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nb">cd</span><span class="w"> </span>spyre-inference
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>uv<span class="w"> </span>sync<span class="w"> </span>--group<span class="w"> </span>dev<span class="w"> </span>--no-install-package<span class="w"> </span>torch-spyre<span class="w"> </span>--inexact
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-e<span class="w"> </span>~/torch-spyre
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--group<span class="w"> </span>~/torch-spyre/pyproject.toml:dev
+</span></code></pre></div>
+<p><code>spyre-testing-plugin</code> is scoped to this repo — it is activated by an <code>addopts</code> entry in our <code>pyproject.toml</code> rather than a global <code>pytest11</code> entry point — so <code>pytest</code> inside <code>torch-spyre</code> behaves exactly as it does without spyre-inference installed. Run each suite from its own checkout.</p>
 <h3 id="linting">Linting<a class="headerlink" href="#linting" title="Permanent link">&para;</a></h3>
 <p>When submitting a PR, please make sure your code passes all linting checks. We use prek with a .pre-commit-config.yaml file to run checks on every commit.</p>
 <p>The <code>format.sh</code> script will run prek from an isolated virtual environment using <a href="https://docs.astral.sh/uv/guides/tools/">uvx</a>. The only requirement is that you have <code>uv</code> installed.</p>
-<div class="language-sh highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>bash<span class="w"> </span>format.sh
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>bash<span class="w"> </span>format.sh
 </span></code></pre></div>
 <p>Alternatively, you can <a href="https://github.com/j178/prek?tab=readme-ov-file#installation">install prek</a> and set up a git hook to run it on every commit with:</p>
-<div class="language-sh highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>prek<span class="w"> </span>install
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>prek<span class="w"> </span>install
 </span></code></pre></div>
 <h3 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h3>
 <p>The project includes both local tests (located in <code>tests/</code>) for spyre-inference specific functionality, and upstream vLLM tests automatically cloned from the vLLM repository at the commit specified in <code>pyproject.toml</code>, for compatibility verification.</p>
 <h4 id="test-markers">Test Markers<a class="headerlink" href="#test-markers" title="Permanent link">&para;</a></h4>
 <p>The test suite uses pytest markers to categorize tests:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">markers</span> <span class="o">=</span> <span class="p">[</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>    <span class="s2">"distributed: Tests requiring multiple spyre cards"</span><span class="p">,</span>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>    <span class="s2">"upstream: Tests coming from upstream vLLM"</span><span class="p">,</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>    <span class="s2">"attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job"</span><span class="p">,</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>    <span class="s2">"encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job"</span><span class="p">,</span>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>    <span class="s2">"compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job"</span><span class="p">,</span>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>    <span class="s2">"rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)"</span><span class="p">,</span>
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)"</span><span class="p">,</span>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="p">]</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">markers</span> <span class="o">=</span> <span class="p">[</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>    <span class="s2">"distributed: Tests requiring multiple spyre cards"</span><span class="p">,</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>    <span class="s2">"upstream: Tests coming from upstream vLLM"</span><span class="p">,</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>    <span class="s2">"attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job"</span><span class="p">,</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="s2">"encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job"</span><span class="p">,</span>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="s2">"compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job"</span><span class="p">,</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="s2">"rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)"</span><span class="p">,</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)"</span><span class="p">,</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="p">]</span>
 </span></code></pre></div>
-<p>Some useful overrides:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Run only local tests</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>pytest
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="c1"># Run all upstream tests</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>pytest<span class="w"> </span>-m<span class="w"> </span>upstream
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>
-</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="c1"># Run attention tests from upstream only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention"</span>
+<p>Upstream vLLM tests are opt-in: they are cloned and collected only when the <code>-m</code> expression names the <code>upstream</code> marker, or <code>--upstream</code> is passed. A negative mention doesn't count, so <code>-m "not upstream"</code> and <code>-m "attention and not upstream"</code> skip the clone entirely.</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Run only local tests (no vLLM clone)</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>pytest
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="c1"># Run all upstream tests</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>pytest<span class="w"> </span>-m<span class="w"> </span>upstream
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="c1"># Run upstream attention tests only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention and upstream"</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="c1"># Run local AND upstream attention tests: --upstream adds them to a marker</span>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="c1"># expression that doesn't name `upstream` itself</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>pytest<span class="w"> </span>--upstream<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention"</span>
 </span></code></pre></div>
 <h4 id="upstream-test-integration">Upstream Test Integration<a class="headerlink" href="#upstream-test-integration" title="Permanent link">&para;</a></h4>
-<p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference,spyre_inference_ops</code> set automatically. See <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> for implementation details.</p>
+<p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. The clone happens on demand, the first time a run asks for upstream tests (see the marker gate above). Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference,spyre_inference_ops</code> set automatically. Pointing the plugin at a vLLM checkout instead of the cache is the one case that still needs the flag by hand: <code>pytest -p spyre_testing_plugin.pytest_plugin -m upstream</code> from the checkout root. See <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> for implementation details.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>To force a re-clone, remove <code>~/.cache/vllm-upstream-tests</code>.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>rm<span class="w"> </span>-rf<span class="w"> </span>~/.cache/vllm-upstream-tests
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>rm<span class="w"> </span>-rf<span class="w"> </span>~/.cache/vllm-upstream-tests
 </span></code></pre></div>
 </div>
 <h4 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h4>
-<p><strong>SKIP_UPSTREAM_TESTS</strong>: Skip upstream tests entirely. Accepts <code>1</code>, <code>true</code>, or <code>yes</code>.</p>
+<p><strong>--upstream</strong>: Collect upstream tests even when the <code>-m</code> expression doesn't name the <code>upstream</code> marker.</p>
+<p><strong>SKIP_UPSTREAM_TESTS</strong>: Skip upstream tests entirely, overriding both the <code>-m</code> expression and <code>--upstream</code>. Accepts <code>1</code>, <code>true</code>, or <code>yes</code>.</p>
 <p><strong>VLLM_COMMIT</strong>: Override the vLLM commit SHA from <code>pyproject.toml</code>.</p>
 <p><strong>VLLM_REPO_URL</strong>: Override the vLLM repository URL. Defaults to <code>https://github.com/vllm-project/vllm</code>.</p>
 <p><strong>UPSTREAM_TESTS_PATHS</strong>: Not currently consumed by the plugin — the set of upstream test paths is auto-derived from the <code>rel_path</code> entries in <code>tests/plugin/spyre_testing_plugin/upstream_tests.yaml</code>.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
-<p>Environment variables can be passed directly to the <code>pytest</code> command, e.g. <code>VLLM_COMMIT=abc123def456 pytest</code>.</p>
+<p>Environment variables can be passed directly to the <code>pytest</code> command, e.g. <code>VLLM_COMMIT=abc123def456 pytest -m upstream</code>.</p>
 </div>
 <h3 id="docs">Docs<a class="headerlink" href="#docs" title="Permanent link">&para;</a></h3>
 <p>Install MkDocs along with the <a href="https://github.com/torch-spyre/spyre-inference/blob/main/mkdocs.yaml">plugins</a> used in the Spyre Inference documentation.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements-docs.txt
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements-docs.txt
 </span></code></pre></div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Ensure that your Python version is compatible with the plugins (e.g., <code>mkdocs-awesome-nav</code> requires Python 3.10+)</p>
 </div>
 <p>MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it. Make sure you're in the same directory as the <code>mkdocs.yaml</code> configuration file and run:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>mkdocs<span class="w"> </span>serve
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>mkdocs<span class="w"> </span>serve
 </span></code></pre></div>
 <p>Open up <a href="http://127.0.0.1:8000/">http://127.0.0.1:8000/</a> in your browser to see a live preview. For additional features and advanced configurations, refer to the official <a href="https://www.mkdocs.org/">MkDocs Documentation</a>.</p>
 <h2 id="issues">Issues<a class="headerlink" href="#issues" title="Permanent link">&para;</a></h2>

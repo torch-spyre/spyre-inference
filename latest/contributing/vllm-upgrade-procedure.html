@@ -1808,7 +1808,7 @@
 <p>If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kernel-specific behaviour), block-list it in <code>upstream_tests.yaml</code> rather than papering over with a tolerance bump.</p>
 <h2 id="step-4-full-sweep-format">Step 4: Full Sweep + Format<a class="headerlink" href="#step-4-full-sweep-format" title="Permanent link">&para;</a></h2>
 <p>Once each category is green individually, run the full suite to catch any cross-test interactions:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header<span class="w"> </span>--upstream
 </span></code></pre></div>
 <p>Roughly 16 minutes on a Spyre host. Then format:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>bash<span class="w"> </span>format.sh

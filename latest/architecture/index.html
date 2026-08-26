@@ -2378,7 +2378,7 @@ backend still stubs <code>_allgather_base</code> (so <code>dist.all_gather_into_
 </ul>
 <p><code>all_reduce</code> and <code>gather</code> are no longer overridden — they now work natively via
 <code>libspyre_comms</code>. Each remaining fallback is
-tagged <code>REPLACE-WITH-NATIVE</code>; the <code>tests/test_spyre_comms_native_probes.py</code> xfail-strict
+tagged <code>REPLACE-WITH-NATIVE</code>; the <code>tests/probes/test_spyre_comms_native_probes.py</code> xfail-strict
 suite is the canonical signal: when a probe flips green, delete the corresponding
 override.</p>
 <p>The worker (<code>TorchSpyreWorker</code>) inherits directly from vLLM's <code>Worker</code> (gpu_worker), not

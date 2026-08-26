@@ -21,6 +21,8 @@ elementwise ops that lower -- mirroring hf-adapters#293. Routing is already done
 by the Gemma4 custom routing function, so ``topk_weights`` is the final combine.
 """
 
+from typing import Any
+
 import torch
 import torch.nn.functional as F
 
@@ -39,7 +41,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # Modular path: base is_monolithic would deref a None kernel.
         return False
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: Any) -> None:
         """Split stacked ``w13_weight`` [E, 2I, H] into contiguous gate/up halves.
 
         An offset slice ``w13[:, I:, :]`` is a stick-unaligned partial-stick
@@ -62,7 +64,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def forward_oot(
         self,
-        layer: torch.nn.Module,
+        layer: Any,
         x: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,

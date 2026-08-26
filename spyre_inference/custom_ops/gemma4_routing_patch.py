@@ -27,6 +27,8 @@ Two upstream seams do not lower on Spyre:
    re-tile, so ``.to(float32)`` returns garbage; keep weights fp16 throughout.
 """
 
+from typing import Any, cast
+
 import torch
 
 from vllm.logger import init_logger
@@ -92,15 +94,18 @@ def _spyre_compute_routing(
 
 
 def _patch() -> None:
+    # Rebinding a def-bound global / class method trips ty's invalid-assignment
+    # ("implicit shadowing"); assign through cast(Any, ...) so the target is not
+    # a re-narrowable local.
     current = getattr(_gemma4, "gemma4_routing_function_torch", None)
     if current is not None and not getattr(current, "_spyre_patched", False):
         _spyre_gemma4_routing_function_torch._spyre_patched = True
-        _gemma4.gemma4_routing_function_torch = _spyre_gemma4_routing_function_torch
+        cast(Any, _gemma4).gemma4_routing_function_torch = _spyre_gemma4_routing_function_torch
         logger.info("Patched gemma4_routing_function_torch for Spyre (dense [T,E]).")
 
     if not getattr(CustomRoutingRouter._compute_routing, "_spyre_patched", False):
         _spyre_compute_routing._spyre_patched = True
-        CustomRoutingRouter._compute_routing = _spyre_compute_routing
+        cast(Any, CustomRoutingRouter)._compute_routing = _spyre_compute_routing
         logger.info("Patched CustomRoutingRouter._compute_routing for Spyre (fp16).")
 
 

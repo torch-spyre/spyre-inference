@@ -203,18 +203,16 @@ def test_spyre_single_row_index_select(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Tensor.index_add_ / aten::index_add is unimplemented on Spyre "
-        "(torch-spyre#3507). Upstream MeanPool uses index_add_ for segment "
-        "sums; until this works we keep MEAN pooling on CPU. When this probe "
-        "passes, add SpyreMeanPool (or drop MEAN from the unsupported list in "
-        "configure_pooling_for_spyre) and keep the pooler on Spyre like CLS/LAST."
+        "Spyre index_add (#3753) is unique-index only (gather-add-scatter). "
+        "MEAN segment ids repeat per sequence, so SpyreMeanPool uses pack+sum "
+        "instead of index_add_."
     ),
 )
 def test_spyre_index_add_for_mean_pooling(spyre_device):
-    """Segment sum via index_add_ (MEAN pooling primitive).
+    """Duplicate-index segment sum via index_add_ (upstream MeanPool shape).
 
-    Shape mirrors a small pooled batch: values [T, H], segment ids [T] →
-    out [B, H] with out.index_add_(0, ids, values).
+    #3753 is correct only when ids are unique; this probe keeps the duplicate
+    case documented. SpyreMeanPool does not use this path.
     """
     num_tokens, hidden, num_seqs = 12, 64, 3
     values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)

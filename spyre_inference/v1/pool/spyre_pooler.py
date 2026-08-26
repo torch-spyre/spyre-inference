@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre pooler: CLS/LAST via index_select, L2 via rsqrt. MEAN stays CPU (#3507)."""
+"""Spyre pooler: CLS/LAST via index_select, MEAN via pack+sum, L2 via rsqrt."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import (
     CLSPool,
     LastPool,
+    MeanPool,
     SequencePoolingMethod,
 )
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
@@ -137,6 +138,56 @@ class SpyreLastPool(LastPool):
         return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
 
 
+def _mean_pack_indices(prompt_lens: list[int], pad_row: int) -> torch.Tensor:
+    """``[B, L]`` row indices into packed hidden states; pad slots use ``pad_row``."""
+    max_len = max(prompt_lens, default=0)
+    batch = len(prompt_lens)
+    indices = torch.full((batch, max_len), pad_row, dtype=torch.int64)
+    start = 0
+    for seq_idx, length in enumerate(prompt_lens):
+        if length > 0:
+            indices[seq_idx, :length] = torch.arange(start, start + length, dtype=torch.int64)
+        start += length
+    return indices
+
+
+class SpyreMeanPool(MeanPool):
+    """MEAN via ``index_select`` pack + masked sum. No ``index_add_``.
+
+    torch-spyre#3753 implements ``index_add`` as gather-add-scatter and is
+    wrong when segment ids repeat (one sequence, many tokens). Pack to
+    ``[B, L, H]``, zero pad rows, then ``sum(1) / lens``.
+    """
+
+    def forward(self, hidden_states, pooling_metadata):
+        cursor = pooling_metadata.get_pooling_cursor()
+        if cursor.is_partial_prefill():
+            raise RuntimeError("partial prefill is not supported with MEAN pooling")
+
+        prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
+        num_seqs = int(prompt_lens.numel())
+        hidden_size = hidden_states.shape[-1]
+        if num_seqs == 0:
+            return hidden_states.new_empty((0, hidden_size))
+
+        lens_list = [int(n) for n in prompt_lens.tolist()]
+        max_len = max(lens_list)
+        pack_idx = _mean_pack_indices(lens_list, pad_row=hidden_states.shape[0])
+        hidden_ext = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))
+        packed = select_rows(hidden_ext, pack_idx).view(num_seqs, max_len, hidden_size)
+
+        pos = torch.arange(max_len, dtype=torch.int64)
+        mask = (pos.unsqueeze(0) < prompt_lens.unsqueeze(1)).to(dtype=hidden_states.dtype)
+        if packed.device.type == "spyre":
+            mask = convert(mask, packed.device)
+        else:
+            mask = mask.to(device=packed.device)
+
+        sums = (packed * mask.unsqueeze(-1)).sum(dim=1)
+        denom = prompt_lens.clamp(min=1).to(dtype=sums.dtype, device=sums.device).unsqueeze(1)
+        return sums / denom
+
+
 class SpyreNormalize(PoolerNormalize):
     """L2 via ``rsqrt``; ``clamp_min`` missing. ``finfo.tiny`` keeps fp16 zeros."""
 
@@ -192,19 +243,22 @@ def patch_embedding_heads_for_spyre(pooler: nn.Module) -> int:
 
 
 def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
-    """Swap CLS/LAST to Spyre forms. Returns ``(n_patched, unsupported)`` e.g. MEAN (#3507)."""
+    """Swap CLS/LAST/MEAN to Spyre forms. Returns ``(n_patched, unsupported)``."""
     num_patched = 0
     unsupported: list[str] = []
 
     if isinstance(pooler, SequencePooler):
         pooling = pooler.pooling
-        if isinstance(pooling, SpyreCLSPool | SpyreLastPool):
+        if isinstance(pooling, SpyreCLSPool | SpyreLastPool | SpyreMeanPool):
             num_patched += 1  # already swapped (shared under DispatchPooler)
         elif isinstance(pooling, CLSPool):
             pooler.pooling = SpyreCLSPool()
             num_patched += 1
         elif isinstance(pooling, LastPool):
             pooler.pooling = SpyreLastPool()
+            num_patched += 1
+        elif isinstance(pooling, MeanPool):
+            pooler.pooling = SpyreMeanPool()
             num_patched += 1
         elif isinstance(pooling, SequencePoolingMethod):
             unsupported.append(type(pooling).__name__)
@@ -218,7 +272,7 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
 
 
 def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) -> bool:
-    """Patch pooler for Spyre. True if on-device; False if MEAN/unknown/FP32 head → CPU."""
+    """Patch pooler for Spyre. True if on-device; False if unknown/FP32 head → CPU."""
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
@@ -238,7 +292,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
 
     classifier = getattr(model, "classifier", None)
     # Spyre has no FP32 batch matmul (reranker RobertaClassificationHead is
-    # float32 via head_dtype). Run pooler + classifier on CPU like MEAN.
+    # float32 via head_dtype). Run pooler + classifier on CPU.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
@@ -258,7 +312,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
     if classifier is not None:
         on_spyre.append("classifier")
     logger.info(
-        "Pooling: keeping %s on %s (%d CLS/LAST method(s) on "
+        "Pooling: keeping %s on %s (%d CLS/LAST/MEAN method(s) on "
         "index_select, %d normalize head(s) on rsqrt, %d embed head(s) "
         "with CPU dtype cast)",
         ", ".join(on_spyre),

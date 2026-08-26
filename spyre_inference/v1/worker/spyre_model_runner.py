@@ -460,7 +460,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
+        # CLS/LAST/MEAN on Spyre via v1.pool; FP32 heads stay CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
@@ -726,11 +726,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         """Pool on the activation device; D2H only the pooled vectors.
 
-        MEAN / FP32 heads keep the pooler on CPU — delegate to
-        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
-        hook: dim-0 crop must use ``index_select`` (not ``[:n]``), and pooled
-        D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU). Drop this once
-        those ops are safe (fallback probes / #3507–#3508).
+        FP32 heads keep the pooler on CPU — delegate to
+        ``GPUModelRunner._pool``. On-Spyre CLS/LAST/MEAN still overrides the
+        private hook: dim-0 crop must use ``index_select`` (not ``[:n]``), and
+        pooled D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"

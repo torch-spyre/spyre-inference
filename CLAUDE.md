@@ -31,7 +31,7 @@ uv run ty                      # type check
 Runs are slow (~3 min) due to vLLM startup — prefer single-test invocations while iterating. Parametrize IDs contain `()`, `=`, `,`, which break `pytest -k`; list node IDs first, then quote the full ID:
 
 ```bash
-uv run pytest 'tests/test_spyre_attn.py::test_spyre_attn[<id>]' -m "not upstream"
+uv run pytest 'tests/attention/test_spyre_attn.py::test_spyre_attn[<id>]' -m "not upstream"
 ```
 
 Prefer `-m "not upstream"` for subsets — broad selectors otherwise match tests pulled in by `spyre-testing-plugin`. Tests needing real hardware guard themselves with `spyre_available()` and skip on CPU-only hosts, so "all green" on a non-Spyre machine does **not** mean the change works.

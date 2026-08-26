@@ -289,7 +289,7 @@ backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't 
 
 `all_reduce` and `gather` are no longer overridden — they now work natively via
 `libspyre_comms`. Each remaining fallback is
-tagged `REPLACE-WITH-NATIVE`; the `tests/test_spyre_comms_native_probes.py` xfail-strict
+tagged `REPLACE-WITH-NATIVE`; the `tests/probes/test_spyre_comms_native_probes.py` xfail-strict
 suite is the canonical signal: when a probe flips green, delete the corresponding
 override.
 

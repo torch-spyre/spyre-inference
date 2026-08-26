@@ -29,7 +29,7 @@ Remaining per-op blockers (REPLACE-WITH-NATIVE markers below):
                  can use `dist.all_gather_into_tensor` directly).
   - reduce     : libspyre_comms native reduce (not on the TP forward path).
 
-The companion test file `tests/test_spyre_comms_native_probes.py` runs
+The companion test file `tests/probes/test_spyre_comms_native_probes.py` runs
 each native collective on a real spyreccl device_group and is xfail-strict.
 When a comms RPM lands an impl, the corresponding probe flips to passing,
 the strict-xfail fails CI, and that's the signal to delete the override

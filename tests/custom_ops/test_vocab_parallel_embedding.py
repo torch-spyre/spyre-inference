@@ -89,7 +89,7 @@ def test_fake_tp2_forward_matches_reference(
     swapping `tensor_model_parallel_all_reduce` for a passthrough and
     summing per-rank outputs in the test. Each rank zeroes tokens
     outside its shard, so the sum over ranks equals the full-vocab
-    reference. Real-collective correctness is in test_distributed_tp2.py.
+    reference. Real-collective correctness is in e2e/test_distributed_tp2.py.
     """
     import spyre_inference.custom_ops.vocab_parallel_embedding as svpe
     from vllm.model_executor.layers import vocab_parallel_embedding as upstream

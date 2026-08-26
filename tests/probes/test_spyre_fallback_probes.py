@@ -20,7 +20,7 @@ xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
 All tests run against the real Spyre device when available; otherwise they
-skip silently (the same pattern used by test_spyre_attn.py).
+skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
 import pytest

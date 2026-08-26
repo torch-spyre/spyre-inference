@@ -50,11 +50,8 @@ class SpyreParallelLMHead(ParallelLMHead):
     """
 
     def _apply(self, fn, recurse=True):
-        # The projection GEMM reads `padded_weight_t`, so the loaded `weight` is
-        # runtime-dead here; keep it off-device during `model.to(spyre)` (a tied
-        # head's real table is placed by the embedding). Requires that
-        # `padded_weight_t` already exists, i.e. process_weights_after_loading
-        # ran before the device move.
+        # The GEMM reads `padded_weight_t`, so the loaded `weight` is runtime-dead;
+        # skip it during `model.to(spyre)`. Requires process_weights_after_loading first.
         weight = self._parameters.pop("weight", None)
         try:
             return super()._apply(fn, recurse=recurse)

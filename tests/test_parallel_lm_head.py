@@ -187,13 +187,8 @@ def test_lm_head_fp8_config_accepted(tp_group):
 
 @pytest.mark.parallel_lm_head
 def test_lm_head_apply_skips_dead_weight(tp_group):
-    """SpyreParallelLMHead._apply excludes the runtime-dead `weight` from the move.
-
-    The projection GEMM reads `padded_weight_t`, so moving `weight` to Spyre would
-    waste a full vocab×hidden table. Device-independent guard: `_apply` (invoked by
-    `model.to(spyre)`) must hand `padded_weight_t` to `fn` but skip `weight`, and
-    restore `weight` as the same Parameter afterwards (tied heads share that object).
-    """
+    """`_apply` hands `padded_weight_t` to `fn` but skips the dead `weight`, and
+    restores `weight` as the same Parameter afterwards."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -218,14 +213,8 @@ def test_lm_head_apply_skips_dead_weight(tp_group):
 
 @pytest.mark.parallel_lm_head
 def test_lm_head_tied_weight_moved_once_by_embedding(tp_group):
-    """A tied head skips its `weight`, but the shared table is still placed once.
-
-    When the head's `weight` IS `embed_tokens.weight` (tied models), the head must
-    not move it — the embedding owns and places the shared table. Device-independent
-    guard: over a whole-model `_apply`, the shared Parameter is handed to `fn`
-    exactly once (by the embedding, not the head), `padded_weight_t` is moved, and
-    the head's `weight` is restored as that same shared object.
-    """
+    """When the head's `weight` is tied to the embedding's table, the head skips it so
+    the shared Parameter is moved exactly once (by the embedding, not the head)."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -261,10 +250,7 @@ def test_lm_head_tied_weight_moved_once_by_embedding(tp_group):
 @pytest.mark.parallel_lm_head
 def test_lm_head_weight_stays_on_cpu_after_to_spyre(tp_group):
     """After `layer.to(spyre)`, the dead `weight` stays on CPU; `padded_weight_t` moves.
-
-    End-to-end hardware guard for the off-device optimization. Skipped on CPU-only
-    hosts, where "off-device" is not observable.
-    """
+    Skipped on CPU-only hosts, where off-device is not observable."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 

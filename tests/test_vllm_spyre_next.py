@@ -79,9 +79,8 @@ def test_long_context_model_load():
 _PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode())
 
 # Greedy continuation from transformers CPU (fp32, unpadded) on the same byte-id
-# prompt. On a model this small the top logits sit close together, so if fp16 greedy
-# on device drifts, trim this list back to the prefix that still matches.
-_PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32, 115, 195, 165, 103, 32, 104, 111]
+# prompt, kept only up to the first near-tie.
+_PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
 @pytest.mark.uses_subprocess

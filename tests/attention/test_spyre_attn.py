@@ -23,7 +23,6 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -1514,14 +1513,10 @@ def test_install_patches_layers_not_the_attention_class():
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        # Probe: N=8 exact, all seqs have num_blocks_needed=1 → bucket (8, 1).
         pytest.param(
             [(1, 64)] * 8,
             id="probe_bucket(8_1)",
         ),
-        # Bucket-boundary cases: N=5 (rounds to bucket 8), N=8 (exact),
-        # N=9 (rounds to 16). All decode-only, all within the block-bucket
-        # ceiling. Bit-exact vs per-seq reference on Spyre.
         pytest.param(
             [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
             id="bucket_pad(N=5_bucket=8)",
@@ -1556,15 +1551,7 @@ def test_spyre_attn_bucketed_decode_correctness(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode fast path: whole batch handled by one compiled kernel.
-
-    Preconditions (Layer 0 builder + Layer 3 helper): every query_len == 1,
-    no sliding window, no ALiBi, no soft-cap, N within the seqs-bucket lattice
-    and max_num_blocks within the blocks-bucket lattice. When all met, the
-    padded (B_seqs, B_blocks) batch runs through one _get_bucketed_decode_kernel
-    dispatch; the padded seq/block slots are -inf-masked. Bit-exact vs the
-    compiled per-seq reference on Spyre.
-    """
+    """Bucketed decode fast path: bit-exact vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1587,8 +1574,6 @@ def test_spyre_attn_bucketed_decode_correctness(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        # Precondition-violating batches — the fast path must silently fall
-        # back to the per-seq loop and match the reference.
         pytest.param([(1, 512)], id="single_seq(fallback)"),
         pytest.param(
             [(1, 128), (1, 256), (1, 128)],
@@ -1610,12 +1595,7 @@ def test_spyre_attn_bucketed_decode_fallback(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Batches that violate the bucketed decode fast-path preconditions.
-
-    Guards the silent-fallback contract: the per-seq loop still runs and
-    results still match the per-seq reference for single-seq (below the
-    smallest seqs bucket), prefill, or mixed batches.
-    """
+    """Precondition-violating batches: fast path silently falls back."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,

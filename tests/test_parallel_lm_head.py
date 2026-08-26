@@ -217,6 +217,48 @@ def test_lm_head_apply_skips_dead_weight(tp_group):
 
 
 @pytest.mark.parallel_lm_head
+def test_lm_head_tied_weight_moved_once_by_embedding(tp_group):
+    """A tied head skips its `weight`, but the shared table is still placed once.
+
+    When the head's `weight` IS `embed_tokens.weight` (tied models), the head must
+    not move it — the embedding owns and places the shared table. Device-independent
+    guard: over a whole-model `_apply`, the shared Parameter is handed to `fn`
+    exactly once (by the embedding, not the head), `padded_weight_t` is moved, and
+    the head's `weight` is restored as that same shared object.
+    """
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    embed = VocabParallelEmbedding(128, 64, params_dtype=torch.float16)
+    head = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(head, SpyreParallelLMHead)
+
+    # Tie the head to the embedding's table, as vLLM does for tied-embedding models.
+    head.weight = embed.weight
+    shared = embed.weight
+    head.quant_method.process_weights_after_loading(head)
+
+    model = torch.nn.Module()
+    model.embed = embed
+    model.head = head
+
+    seen: list[torch.Tensor] = []
+
+    def track(t):
+        seen.append(t)
+        return t
+
+    model._apply(track)
+
+    assert sum(t is shared for t in seen) == 1, "tied table must be moved exactly once"
+    assert any(t is head.padded_weight_t for t in seen), "padded_weight_t was not moved"
+    assert head.weight is shared, "head weight must be restored as the shared object"
+
+
+@pytest.mark.parallel_lm_head
 def test_lm_head_weight_stays_on_cpu_after_to_spyre(tp_group):
     """After `layer.to(spyre)`, the dead `weight` stays on CPU; `padded_weight_t` moves.
 

@@ -15,7 +15,11 @@
 """Cheap unit tests for ``configure_pooling_for_spyre`` patching.
 
 No Spyre hardware: builds minimal ``SequencePooler`` / ``DispatchPooler`` graphs
-and checks CLS/LAST/MEAN become Spyre forms. FP32 heads stay on CPU.
+and checks CLS/LAST/MEAN become Spyre forms. FP32 linear heads stay on CPU.
+
+Numeric MEAN tests here are host arithmetic (fp32 correctness, fp16
+accumulator, empty-batch dtype). On-device ``convert`` / ``index_select`` is
+``test_spyre_fallback_probes.test_spyre_mean_pool_on_device_matches_cpu_fp32``.
 """
 
 from __future__ import annotations
@@ -103,9 +107,9 @@ def test_configure_pooling_dispatch_patches_embed_last():
 
 def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
     model = _model_with_pooler(_embed_pooler(CLSPool()))
-    model.classifier = nn.Linear(8, 2)  # float32 params → no Spyre batchmatmul
+    model.classifier = nn.Linear(8, 2)  # float32 linear still not on Spyre
     assert configure_pooling_for_spyre(model, _SPYRE) is False
-    # CLS was patched before the FP32 check; on-Spyre is still False.
+    # CLS is swapped first; the FP32 linear still forces CPU.
     assert isinstance(model.pooler.pooling, SpyreCLSPool)
 
 
@@ -114,7 +118,11 @@ def test_configure_pooling_no_pooler_returns_false():
 
 
 def test_spyre_mean_pool_matches_per_seq_mean():
-    """Packed [3, 2] tokens → same vectors as a host mean per sequence."""
+    """Host arithmetic: varlen [3, 2] tokens vs a CPU mean per sequence.
+
+    Does not exercise Spyre ``index_select`` / ``convert``. See
+    ``test_spyre_mean_pool_on_device_matches_cpu_fp32``.
+    """
     from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
 
     hidden = torch.tensor(
@@ -144,6 +152,91 @@ def test_spyre_mean_pool_matches_per_seq_mean():
         [
             hidden[:3].mean(0),
             hidden[3:].mean(0),
+        ]
+    )
+    torch.testing.assert_close(out, expected)
+
+
+def test_spyre_mean_pool_empty_batch_is_float32():
+    """Upstream MeanPool returns float32 for an empty batch, not activation dtype."""
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    hidden = torch.empty((0, 4), dtype=torch.float16)
+
+    class _Cursor:
+        prompt_lens_cpu = torch.tensor([], dtype=torch.int64)
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    out = SpyreMeanPool().forward(hidden, _Meta())
+    assert out.dtype == torch.float32
+    assert out.shape == (0, 4)
+
+
+def test_spyre_mean_pool_accumulates_in_float32():
+    """fp16 hidden states must not accumulate in fp16.
+
+    ``2048 + 1`` is a tie in fp16 and rounds back to ``2048``, so an fp16 sum
+    of one large row plus many small ones drops the small ones entirely.
+    """
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    num_small = 512
+    hidden = torch.cat(
+        [
+            torch.full((1, 2), 2048.0, dtype=torch.float16),
+            torch.ones((num_small, 2), dtype=torch.float16),
+        ]
+    )
+    lens = torch.tensor([num_small + 1], dtype=torch.int64)
+
+    class _Cursor:
+        prompt_lens_cpu = lens
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    out = SpyreMeanPool().forward(hidden, _Meta())
+
+    assert out.dtype == torch.float32
+    expected = hidden.to(torch.float32).mean(0, keepdim=True)
+    torch.testing.assert_close(out, expected)
+    # An fp16 accumulator would land near 2048/513 instead of 2560/513.
+    assert out[0, 0].item() > 4.9
+
+
+def test_spyre_mean_pool_skewed_lengths_do_not_pad_to_max():
+    """A long seq plus short ones must not allocate ``num_seqs × max_len``."""
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    hidden = torch.arange(10, dtype=torch.float32).view(10, 1).expand(10, 2).contiguous()
+    lens = torch.tensor([8, 1, 1], dtype=torch.int64)
+
+    class _Cursor:
+        prompt_lens_cpu = lens
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    out = SpyreMeanPool().forward(hidden, _Meta())
+    expected = torch.stack(
+        [
+            hidden[:8].mean(0),
+            hidden[8:9].mean(0),
+            hidden[9:].mean(0),
         ]
     )
     torch.testing.assert_close(out, expected)

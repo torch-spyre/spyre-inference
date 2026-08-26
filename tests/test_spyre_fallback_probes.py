@@ -203,16 +203,14 @@ def test_spyre_single_row_index_select(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Spyre index_add (#3753) is unique-index only (gather-add-scatter). "
-        "MEAN segment ids repeat per sequence, so SpyreMeanPool uses pack+sum "
-        "instead of index_add_."
+        "SpyreMeanPool gathers each sequence and sums in float32. "
+        "This probe still uses index_add_ with repeated ids and is expected to fail."
     ),
 )
 def test_spyre_index_add_for_mean_pooling(spyre_device):
-    """Duplicate-index segment sum via index_add_ (upstream MeanPool shape).
+    """index_add_ with many tokens per sequence (upstream MeanPool shape).
 
-    #3753 is correct only when ids are unique; this probe keeps the duplicate
-    case documented. SpyreMeanPool does not use this path.
+    SpyreMeanPool does not use this path; it gathers each sequence and sums.
     """
     num_tokens, hidden, num_seqs = 12, 64, 3
     values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
@@ -228,6 +226,71 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
     expected = torch.zeros(num_seqs, hidden, dtype=torch.float16)
     expected.index_add_(0, segment_ids.cpu(), values.cpu())
     torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+def _mean_cursor(lens: torch.Tensor):
+    class _Cursor:
+        prompt_lens_cpu = lens
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    return _Meta()
+
+
+def test_spyre_mean_pool_on_device_matches_cpu_fp32(spyre_device):
+    """SpyreMeanPool on fp16 Spyre activations vs host fp32 mean.
+
+    Hits ``index_select`` + ``convert`` of the divisor, not the CPU branches
+    in ``test_spyre_pooler_config``.
+    """
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    hidden_cpu = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [10.0, 20.0],
+            [30.0, 40.0],
+        ],
+        dtype=torch.float16,
+    )
+    hidden = hidden_cpu.to(spyre_device)
+    out = SpyreMeanPool().forward(hidden, _mean_cursor(torch.tensor([3, 2], dtype=torch.int64)))
+    expected = torch.stack(
+        [
+            hidden_cpu[:3].to(torch.float32).mean(0),
+            hidden_cpu[3:].to(torch.float32).mean(0),
+        ]
+    )
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
+def test_spyre_mean_pool_fp32_sum_on_device(spyre_device):
+    """fp16 Spyre sum must use a float32 accumulator (2048+1 rounds in fp16)."""
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    num_small = 512
+    hidden_cpu = torch.cat(
+        [
+            torch.full((1, 2), 2048.0, dtype=torch.float16),
+            torch.ones((num_small, 2), dtype=torch.float16),
+        ]
+    )
+    hidden = hidden_cpu.to(spyre_device)
+    out = SpyreMeanPool().forward(
+        hidden, _mean_cursor(torch.tensor([num_small + 1], dtype=torch.int64))
+    )
+    expected = hidden_cpu.to(torch.float32).mean(0, keepdim=True)
+    assert out.dtype == torch.float32
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+    assert out[0, 0].item() > 4.9
 
 
 @pytest.mark.xfail(

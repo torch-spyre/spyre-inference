@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre pooler: CLS/LAST via index_select, MEAN via pack+sum, L2 via rsqrt."""
+"""Spyre pooler: CLS/LAST via index_select, MEAN via per-seq sum, L2 via rsqrt."""
 
 from __future__ import annotations
 
@@ -138,25 +138,20 @@ class SpyreLastPool(LastPool):
         return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
 
 
-def _mean_pack_indices(prompt_lens: list[int], pad_row: int) -> torch.Tensor:
-    """``[B, L]`` row indices into packed hidden states; pad slots use ``pad_row``."""
-    max_len = max(prompt_lens, default=0)
-    batch = len(prompt_lens)
-    indices = torch.full((batch, max_len), pad_row, dtype=torch.int64)
-    start = 0
-    for seq_idx, length in enumerate(prompt_lens):
-        if length > 0:
-            indices[seq_idx, :length] = torch.arange(start, start + length, dtype=torch.int64)
-        start += length
-    return indices
-
-
 class SpyreMeanPool(MeanPool):
-    """MEAN via ``index_select`` pack + masked sum. No ``index_add_``.
+    """MEAN pooling on Spyre, same as CLS and LAST.
 
-    torch-spyre#3753 implements ``index_add`` as gather-add-scatter and is
-    wrong when segment ids repeat (one sequence, many tokens). Pack to
-    ``[B, L, H]``, zero pad rows, then ``sum(1) / lens``.
+    Hidden states are already packed varlen ``[T, H]``. Each sequence is
+    gathered with ``index_select`` and reduced in float32, so a mixed-length
+    batch is O(tokens·H) rather than a dense ``[num_seqs, max_len, H]`` pad.
+    ``index_add_`` is unique-index only on Spyre; ``cumsum`` is a CPU fallback,
+    so a prefix-sum segment reduction would D2H the activations.
+
+    The sum uses ``dtype=float32`` like upstream: adding hundreds of fp16
+    activations loses mantissa bits, and fp16 stops representing integer
+    lengths exactly above 2048. Division is on the host too: Spyre supports
+    float32 add/sum but not ``ReStickifyOpHBM`` for float32 layout ops.
+    Returns float32 on the host.
     """
 
     def forward(self, hidden_states, pooling_metadata):
@@ -168,24 +163,32 @@ class SpyreMeanPool(MeanPool):
         num_seqs = int(prompt_lens.numel())
         hidden_size = hidden_states.shape[-1]
         if num_seqs == 0:
-            return hidden_states.new_empty((0, hidden_size))
+            return torch.empty((0, hidden_size), dtype=torch.float32)
 
         lens_list = [int(n) for n in prompt_lens.tolist()]
-        max_len = max(lens_list)
-        pack_idx = _mean_pack_indices(lens_list, pad_row=hidden_states.shape[0])
-        hidden_ext = torch.nn.functional.pad(hidden_states, (0, 0, 0, 1))
-        packed = select_rows(hidden_ext, pack_idx).view(num_seqs, max_len, hidden_size)
+        if max(lens_list, default=0) == 0:
+            return torch.zeros((num_seqs, hidden_size), dtype=torch.float32)
 
-        pos = torch.arange(max_len, dtype=torch.int64)
-        mask = (pos.unsqueeze(0) < prompt_lens.unsqueeze(1)).to(dtype=hidden_states.dtype)
-        if packed.device.type == "spyre":
-            mask = convert(mask, packed.device)
-        else:
-            mask = mask.to(device=packed.device)
+        # One gather+sum per sequence. Peak extra activation is max_len×H,
+        # not num_seqs×max_len×H. Pooler runs outside the compiled encoder.
+        sums: list[torch.Tensor] = []
+        start = 0
+        for length in lens_list:
+            if length == 0:
+                sums.append(
+                    torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
+                )
+            else:
+                idx = torch.arange(start, start + length, dtype=torch.int64)
+                chunk = select_rows(hidden_states, idx)
+                sums.append(chunk.sum(dim=0, dtype=torch.float32))
+            start += length
 
-        sums = (packed * mask.unsqueeze(-1)).sum(dim=1)
-        denom = prompt_lens.clamp(min=1).to(dtype=sums.dtype, device=sums.device).unsqueeze(1)
-        return sums / denom
+        pooled = torch.stack(sums, dim=0)
+        denom_cpu = prompt_lens.clamp(min=1).to(dtype=torch.float32).unsqueeze(1)
+        if pooled.device.type == "spyre":
+            return convert(pooled, "cpu") / denom_cpu
+        return pooled / denom_cpu.to(device=pooled.device)
 
 
 class SpyreNormalize(PoolerNormalize):
@@ -243,7 +246,7 @@ def patch_embedding_heads_for_spyre(pooler: nn.Module) -> int:
 
 
 def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
-    """Swap CLS/LAST/MEAN to Spyre forms. Returns ``(n_patched, unsupported)``."""
+    """Install Spyre CLS, LAST, and MEAN. Returns ``(n_patched, unsupported)``."""
     num_patched = 0
     unsupported: list[str] = []
 
@@ -272,7 +275,7 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
 
 
 def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) -> bool:
-    """Patch pooler for Spyre. True if on-device; False if unknown/FP32 head → CPU."""
+    """Keep CLS/LAST/MEAN on Spyre. False if the method is unknown or the head is FP32 linear."""
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
@@ -291,8 +294,8 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
         return False
 
     classifier = getattr(model, "classifier", None)
-    # Spyre has no FP32 batch matmul (reranker RobertaClassificationHead is
-    # float32 via head_dtype). Run pooler + classifier on CPU.
+    # torch-spyre has FP32 for add/mul/sum/mean, but not for linear /
+    # batchmatmul. Reranker heads stay float32, so those stay on CPU.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
@@ -300,10 +303,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
         pooler.to("cpu")
         if classifier is not None:
             classifier.to("cpu")
-        logger.info(
-            "Pooling: FP32 classifier/head unsupported on Spyre "
-            "(no FP32 batchmatmul); running pooler on CPU"
-        )
+        logger.info("Pooling: FP32 linear head unsupported on Spyre; running pooler on CPU")
         return False
 
     num_norm = patch_normalize_for_spyre(pooler)
@@ -312,9 +312,8 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
     if classifier is not None:
         on_spyre.append("classifier")
     logger.info(
-        "Pooling: keeping %s on %s (%d CLS/LAST/MEAN method(s) on "
-        "index_select, %d normalize head(s) on rsqrt, %d embed head(s) "
-        "with CPU dtype cast)",
+        "Pooling: keeping %s on %s (%d CLS/LAST/MEAN method(s), "
+        "%d normalize head(s), %d embed head(s) with CPU dtype cast)",
         ", ".join(on_spyre),
         spyre_device,
         num_patched,

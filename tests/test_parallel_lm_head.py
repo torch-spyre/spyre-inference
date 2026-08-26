@@ -22,6 +22,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from spyre_testing_plugin.pytest_plugin import spyre_available
+
 
 def reference_lm_head(
     x: torch.Tensor,
@@ -181,6 +183,60 @@ def test_lm_head_fp8_config_accepted(tp_group):
 
     assert isinstance(layer, SpyreParallelLMHead)
     assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+
+
+@pytest.mark.parallel_lm_head
+def test_lm_head_apply_skips_dead_weight(tp_group):
+    """SpyreParallelLMHead._apply excludes the runtime-dead `weight` from the move.
+
+    The projection GEMM reads `padded_weight_t`, so moving `weight` to Spyre would
+    waste a full vocab×hidden table. Device-independent guard: `_apply` (invoked by
+    `model.to(spyre)`) must hand `padded_weight_t` to `fn` but skip `weight`, and
+    restore `weight` as the same Parameter afterwards (tied heads share that object).
+    """
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(layer, SpyreParallelLMHead)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    original_weight = layer.weight
+    seen: list[torch.Tensor] = []
+
+    def track(t):
+        seen.append(t)
+        return t
+
+    layer._apply(track)
+
+    assert any(t is layer.padded_weight_t for t in seen), "padded_weight_t was not moved"
+    assert not any(t is original_weight for t in seen), "dead weight should be skipped"
+    assert layer.weight is original_weight, "weight must be restored as the same object"
+    assert "weight" in layer._parameters
+
+
+@pytest.mark.parallel_lm_head
+def test_lm_head_weight_stays_on_cpu_after_to_spyre(tp_group):
+    """After `layer.to(spyre)`, the dead `weight` stays on CPU; `padded_weight_t` moves.
+
+    End-to-end hardware guard for the off-device optimization. Skipped on CPU-only
+    hosts, where "off-device" is not observable.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(layer, SpyreParallelLMHead)
+    layer.quant_method.process_weights_after_loading(layer)
+
+    layer.to("spyre")
+
+    assert layer.weight.device.type == "cpu"
+    assert layer.padded_weight_t.device.type == "spyre"
 
 
 @pytest.mark.parallel_lm_head

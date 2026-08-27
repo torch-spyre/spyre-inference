@@ -142,16 +142,19 @@ class SpyreMeanPool(MeanPool):
     """MEAN pooling on Spyre, same as CLS and LAST.
 
     Hidden states are already packed varlen ``[T, H]``. Each sequence is
-    gathered with ``index_select`` and reduced in float32, so a mixed-length
-    batch is O(tokens·H) rather than a dense ``[num_seqs, max_len, H]`` pad.
-    ``index_add_`` is unique-index only on Spyre; ``cumsum`` is a CPU fallback,
-    so a prefix-sum segment reduction would D2H the activations.
+    gathered with ``index_select`` on Spyre, then reduced on the host in
+    float32, so a mixed-length batch is O(tokens·H) rather than a dense
+    ``[num_seqs, max_len, H]`` pad. ``index_add_`` is unique-index only on
+    Spyre; ``cumsum`` is a CPU fallback, so a prefix-sum segment reduction
+    would D2H the activations.
 
     The sum uses ``dtype=float32`` like upstream: adding hundreds of fp16
     activations loses mantissa bits, and fp16 stops representing integer
-    lengths exactly above 2048. Division is on the host too: Spyre supports
-    float32 add/sum but not ``ReStickifyOpHBM`` for float32 layout ops.
-    Returns float32 on the host.
+    lengths exactly above 2048. The reduction is on the host, not on Spyre:
+    float32 Spyre tensors do not D2H correctly (``ReStickifyOpHBM`` is
+    unsupported, and convert yields interleaved garbage — MiniLM cosine
+    ~0.21 vs HF). Gather stays on device; only the small per-seq chunk is
+    copied. Returns float32 on the host.
     """
 
     def forward(self, hidden_states, pooling_metadata):
@@ -169,26 +172,24 @@ class SpyreMeanPool(MeanPool):
         if max(lens_list, default=0) == 0:
             return torch.zeros((num_seqs, hidden_size), dtype=torch.float32)
 
-        # One gather+sum per sequence. Peak extra activation is max_len×H,
+        # Gather on Spyre, sum on host. Peak extra activation is max_len×H,
         # not num_seqs×max_len×H. Pooler runs outside the compiled encoder.
         sums: list[torch.Tensor] = []
         start = 0
         for length in lens_list:
             if length == 0:
-                sums.append(
-                    torch.zeros(hidden_size, dtype=torch.float32, device=hidden_states.device)
-                )
+                sums.append(torch.zeros(hidden_size, dtype=torch.float32))
             else:
                 idx = torch.arange(start, start + length, dtype=torch.int64)
                 chunk = select_rows(hidden_states, idx)
+                if chunk.device.type == "spyre":
+                    chunk = convert(chunk, "cpu")
                 sums.append(chunk.sum(dim=0, dtype=torch.float32))
             start += length
 
         pooled = torch.stack(sums, dim=0)
-        denom_cpu = prompt_lens.clamp(min=1).to(dtype=torch.float32).unsqueeze(1)
-        if pooled.device.type == "spyre":
-            return convert(pooled, "cpu") / denom_cpu
-        return pooled / denom_cpu.to(device=pooled.device)
+        denom = prompt_lens.clamp(min=1).to(dtype=torch.float32).unsqueeze(1)
+        return pooled / denom
 
 
 class SpyreNormalize(PoolerNormalize):

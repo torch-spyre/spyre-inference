@@ -204,14 +204,14 @@ def test_spyre_single_row_index_select(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "SpyreMeanPool gathers each sequence and sums in float32. "
+        "SpyreMeanPool gathers each sequence on Spyre and sums in float32 on the host. "
         "This probe still uses index_add_ with repeated ids and is expected to fail."
     ),
 )
 def test_spyre_index_add_for_mean_pooling(spyre_device):
     """index_add_ with many tokens per sequence (upstream MeanPool shape).
 
-    SpyreMeanPool does not use this path; it gathers each sequence and sums.
+    SpyreMeanPool does not use this path; it gathers each sequence then sums on host.
     """
     num_tokens, hidden, num_seqs = 12, 64, 3
     values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
@@ -244,10 +244,10 @@ def _mean_cursor(lens: torch.Tensor):
 
 
 def test_spyre_mean_pool_on_device_matches_cpu_fp32(spyre_device):
-    """SpyreMeanPool on fp16 Spyre activations vs host fp32 mean.
+    """SpyreMeanPool: Spyre ``index_select`` + fp16 D2H + host fp32 mean.
 
-    Hits ``index_select`` + ``convert`` of the divisor, not the CPU branches
-    in ``test_spyre_pooler_config``.
+    Hits ``index_select`` and ``convert`` of the gathered chunk, not the CPU
+    branches in ``test_spyre_pooler_config``.
     """
     from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
 
@@ -274,7 +274,10 @@ def test_spyre_mean_pool_on_device_matches_cpu_fp32(spyre_device):
 
 
 def test_spyre_mean_pool_fp32_sum_on_device(spyre_device):
-    """fp16 Spyre sum must use a float32 accumulator (2048+1 rounds in fp16)."""
+    """fp16 activations must still use a float32 accumulator (2048+1 rounds in fp16).
+
+    Sum runs on the host after fp16 D2H; the gather still hits Spyre.
+    """
     from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
 
     num_small = 512

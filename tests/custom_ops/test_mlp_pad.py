@@ -34,20 +34,11 @@ from spyre_inference.custom_ops.mlp_pad import (
 _ORIG, _PADDED, _HIDDEN = 160, 192, 64
 
 
-def test_pad_weight_end_pads_gate_rows_with_zeros():
+@pytest.mark.parametrize("proj", ["gate_proj", "up_proj"])
+def test_pad_weight_end_pads_rows_with_zeros(proj):
     w = torch.arange(1.0, _ORIG * _HIDDEN + 1).reshape(_ORIG, _HIDDEN)
 
-    out = _pad_weight("layers.0.mlp.gate_proj.weight", w, _ORIG, _PADDED)
-
-    assert out.shape == (_PADDED, _HIDDEN)
-    assert torch.equal(out[:_ORIG], w)
-    assert not out[_ORIG:].any()
-
-
-def test_pad_weight_end_pads_up_rows_with_zeros():
-    w = torch.arange(1.0, _ORIG * _HIDDEN + 1).reshape(_ORIG, _HIDDEN)
-
-    out = _pad_weight("layers.0.mlp.up_proj.weight", w, _ORIG, _PADDED)
+    out = _pad_weight(f"layers.0.mlp.{proj}.weight", w, _ORIG, _PADDED)
 
     assert out.shape == (_PADDED, _HIDDEN)
     assert torch.equal(out[:_ORIG], w)

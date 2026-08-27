@@ -50,10 +50,8 @@ class SpyreParallelLMHead(ParallelLMHead):
     """
 
     def _apply(self, fn, recurse=True):
-        # The GEMM reads `padded_weight_t`, built by `process_weights_after_loading`;
-        # once it exists the loaded `weight` is runtime-dead, so skip it during
-        # `model.to(spyre)`. Before it exists (any `_apply`-before-load reorder or
-        # lazy-init path) fall back to moving `weight` so it is never stranded on host.
+        # The GEMM reads `padded_weight_t`; once it exists `weight` is runtime-dead, so
+        # skip moving it to device. Until then `weight` is still live: don't skip it.
         if not hasattr(self, "padded_weight_t"):
             return super()._apply(fn, recurse=recurse)
         weight = self._parameters.pop("weight", None)

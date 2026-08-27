@@ -213,10 +213,8 @@ def test_lm_head_apply_skips_dead_weight(tp_group):
 
 @pytest.mark.parallel_lm_head
 def test_lm_head_apply_before_process_weights_moves_weight(tp_group):
-    """If `_apply` runs before `process_weights_after_loading`, `padded_weight_t` does
-    not exist yet, so the head must NOT skip `weight`: skipping would strand it on the
-    host and the GEMM would later hit a device mismatch. The skip is only safe once the
-    transposed weight exists."""
+    """Before `process_weights_after_loading`, `padded_weight_t` is absent and `weight`
+    is still live, so the head must move it rather than strand it on host."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -238,15 +236,8 @@ def test_lm_head_apply_before_process_weights_moves_weight(tp_group):
 
 @pytest.mark.parallel_lm_head
 def test_lm_head_skips_tied_weight(tp_group):
-    """When the head's `weight` is tied to the embedding's table, the head skips it so
-    the shared table is moved once — by the embedding, not the head — and the tie holds.
-
-    The embedding routes the shared table through `place_row_gathered`, which hands `fn`
-    the tensor's `.data` (plus a one-row probe view), never the `Parameter` itself. So the
-    invariant is that the shared `Parameter` never reaches `fn` *via the head*, not a raw
-    call-count on the object: without the head's `_apply` skip, the head would pass the
-    `Parameter` to `fn` and the table would be moved a second time.
-    """
+    """A tied head skips its `weight` so the shared table is moved only by the embedding,
+    and the tie survives `_apply`."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -274,15 +265,13 @@ def test_lm_head_skips_tied_weight(tp_group):
 
     model._apply(track)
 
-    # The head skips its dead `weight`: the shared Parameter never reaches `fn` through
-    # the head. The embedding is the only mover, and it passes `weight.data`, not the
-    # Parameter — so the Parameter object itself is never seen.
+    # The embedding moves the table via `weight.data`, never the Parameter, so we assert
+    # on storage identity, not object identity.
     assert not any(t is shared for t in seen), "head must not move the tied weight"
     assert any(t.untyped_storage() is shared.untyped_storage() for t in seen), (
         "embedding must still move the shared table"
     )
     assert any(t is head.padded_weight_t for t in seen), "padded_weight_t was not moved"
-    # The tie survives `_apply`: the head restores the shared Parameter it was given.
     assert head.weight is embed.weight is shared, "tie must survive _apply"
 
 

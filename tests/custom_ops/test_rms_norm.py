@@ -27,16 +27,8 @@ def reference_rms_norm(
     eps: float,
     residual: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Golden reference: RMSNorm in eager PyTorch, in the op's own fp16.
-
-    Mirrors ``SpyreRMSNorm.forward_oot`` exactly: NO fp32 upcast (the Spyre op
-    deliberately drops the upstream ``forward_native`` promotion, which torch-spyre
-    cannot yet lower at the S=64 prefill). Running the identical fp16 math on CPU
-    makes this an oracle for the *device lowering* -- a mismatch means torch-spyre
-    lowered the pow/mean/rsqrt/mul(+residual) chain wrong, not that fp16 drifted from
-    fp32. Comparing against an fp32 reference would instead test float precision the
-    op does not promise and would flake at larger hidden sizes.
-    """
+    """fp16 RMSNorm reference (no fp32 upcast): an oracle for the device lowering,
+    not for fp16-vs-fp32 precision the op does not promise."""
     if residual is not None:
         x = x + residual
         residual = x
@@ -55,14 +47,7 @@ def reference_rms_norm(
 @pytest.mark.parametrize("hidden_size", [64, 128, 256, 512])
 @pytest.mark.parametrize("use_residual", [False, True])
 def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
-    """SpyreRMSNorm.forward_oot on device matches the eager fp16 reference.
-
-    Isolates the custom op: exercises the numerical/lowering correctness of the
-    hand-written fp16 kernel (and its residual path), which the end-to-end tests only
-    cover transitively. It does NOT reproduce the mixed-EA compile bug -- that is a
-    whole-model phenomenon and lives in
-    ``tests/e2e/test_compile.py::test_native_rmsnorm_prefill_s64_lowers``.
-    """
+    """SpyreRMSNorm.forward_oot on device matches the eager fp16 reference."""
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     eps = 1e-6
@@ -74,10 +59,8 @@ def test_spyre_rmsnorm_matches_reference(batch_size, hidden_size, use_residual):
     layer = SpyreRMSNorm(hidden_size, eps=eps).to(dtype)
     residual = torch.randn(batch_size, hidden_size, dtype=dtype) if use_residual else None
 
-    # Reference: identical fp16 math, eager on CPU.
     expected = reference_rms_norm(x, layer.weight.data, eps, residual)
 
-    # Actual: run forward_oot on the Spyre device.
     layer.to(device)
     actual = layer.forward_oot(x.to(device), residual.to(device) if use_residual else None)
 

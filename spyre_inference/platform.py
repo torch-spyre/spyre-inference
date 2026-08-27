@@ -373,8 +373,10 @@ class TorchSpyrePlatform(CpuPlatform):
         before the model is built widens the modules with no per-class shim.
 
         No-op when already 64-aligned or unset. Zero-padding is arithmetically
-        inert for SwiGLU (see ``custom_ops.mlp_pad``); dense MLPs only — MoE
-        experts (``moe_intermediate_size``) are out of scope.
+        inert for SwiGLU (see ``custom_ops.mlp_pad``); dense SwiGLU MLPs only.
+        MoE (experts read ``moe_intermediate_size``) and non-SiLU MLPs (whose
+        projections the loader can't reach) are left unpadded — SiLU/swish is the
+        one activation unique to the gated SwiGLU this pad handles.
         """
         from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
 
@@ -382,6 +384,13 @@ class TorchSpyrePlatform(CpuPlatform):
         hf_config = model_config.hf_config
         orig = getattr(hf_config, "intermediate_size", None)
         if not orig or orig % BLOCK_SIZE == 0:
+            return
+        moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
+        is_moe = any(getattr(hf_config, a, None) for a in moe_attrs)
+        act = getattr(hf_config, "hidden_act", None) or getattr(
+            hf_config, "hidden_activation", None
+        )
+        if is_moe or act not in ("silu", "swish"):
             return
 
         padded = ((orig + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE

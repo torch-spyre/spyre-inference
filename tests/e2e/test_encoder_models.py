@@ -53,7 +53,7 @@ RERANKER_MODELS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-_REF_PATH = Path(__file__).parent / "data" / "encoder_embed_refs.json"
+_REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
 
 

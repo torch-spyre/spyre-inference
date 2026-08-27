@@ -201,15 +201,70 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-compile
-          - cfg: Spyre attention tests
-            # Decoder attention only; the encoder split runs below.
+          # Decoder attention, sharded across parallel jobs. The compiled
+          # (STOCK on device) cases dominate runtime and grow HBM within a
+          # process, so each shard is its own job on its own card: wall-clock
+          # drops to the slowest shard and per-process HBM growth stays bounded
+          # (each shard holds only ~1/N of the compiled cases). The plugin owns
+          # the weighted partition; ATTN_SHARDS (Makefile default) is the count.
+          # Adding/removing a shard = add/remove an entry here and bump that
+          # default. The encoder split runs below.
+          - cfg: Spyre attention tests (shard 1/7)
             test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-attention
+            test_target: test-attention-shard-0
+          - cfg: Spyre attention tests (shard 2/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-1
+          - cfg: Spyre attention tests (shard 3/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-2
+          - cfg: Spyre attention tests (shard 4/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-3
+          - cfg: Spyre attention tests (shard 5/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-4
+          - cfg: Spyre attention tests (shard 6/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-5
+          - cfg: Spyre attention tests (shard 7/7)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-6
           - cfg: Encoder attention tests
             test_types: unit regression trunk
             runs_on:

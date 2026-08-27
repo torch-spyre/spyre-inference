@@ -449,7 +449,8 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Kernel cache keys are (num_blocks, padded_query_len, store_mode, store_len).
+        # Kernel cache keys are
+        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather).
         fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
@@ -558,6 +559,7 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+        pytest.param([(1, 128), (1, 128)], id="batch_decode_shared_variant(2seqs)"),
         pytest.param([(1, 128), (1, 256), (1, 128)], id="probe_decode_3seqs_kv128"),
     ],
 )

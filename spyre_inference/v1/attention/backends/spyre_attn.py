@@ -137,24 +137,47 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
 # ---------------------------------------------------------------------------
 
 
+def _build_query_row_tables(
+    attn_metadata: "SpyreAttentionMetadata", device: torch.device
+) -> list[torch.Tensor]:
+    num_seqs = attn_metadata.num_seqs
+    aligned = attn_metadata.aligned_max_query_len
+    index_len = (
+        (aligned + INT32_ELEMS_PER_STICK - 1) // INT32_ELEMS_PER_STICK * INT32_ELEMS_PER_STICK
+    )
+    starts = attn_metadata.query_start_loc[:num_seqs].cpu()
+    lens = attn_metadata.query_start_loc[1 : num_seqs + 1].cpu() - starts
+    q_pos = torch.arange(aligned)
+    rows = torch.zeros(num_seqs, index_len, dtype=torch.int32)
+    rows[:, :aligned] = (
+        starts.unsqueeze(1) + torch.minimum(q_pos.unsqueeze(0), (lens - 1).unsqueeze(1))
+    ).to(torch.int32)
+    return [convert(rows[s].contiguous(), device=device) for s in range(num_seqs)]
+
+
 def _create_compilable_page_attn(
     num_blocks: int,
     padded_query_len: int,
     num_heads: int,
+    num_kv_heads: int,
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
     store_mode: str = "none",
     store_len: int = 0,
+    needs_gather: bool = True,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
-    logits_soft_cap, store_mode, and store_len are closure constants.
+    logits_soft_cap, store_mode, store_len, and needs_gather are closure constants.
     """
 
+    num_queries_per_kv = num_heads // num_kv_heads
+
     def specialized_paged_attn_kernel(
-        q,
+        query,
+        query_row_index,
         k_pages,
         v_pages,
         page_index_table,
@@ -162,13 +185,15 @@ def _create_compilable_page_attn(
         scale,
         alibi_bias_tiles=None,
         out=None,
-        out_rows=None,
     ):
         """
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            q: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+            query: [num_tokens, num_heads, head_size], the whole batch's query
+            query_row_index: int32 device tensor whose first padded_query_len
+                entries are this sequence's absolute query rows. None only when
+                neither the gather nor an indexed store needs it.
             k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
@@ -182,11 +207,23 @@ def _create_compilable_page_attn(
                 _online_softmax_attention.
 
             out: with store_mode != "none", the caller's buffer to write into.
-            out_rows: with store_mode == "index", the destination rows in `out`.
 
         Returns [padded_query_len, num_heads, head_size], or ``out`` when this
         kernel stored the result itself.
         """
+        # A compiled region reads a view from offset 0, ignoring storage_offset
+        # (torch-spyre#3770), so the rows are gathered here rather than sliced outside.
+        # A gather selecting its whole source instead faults the device
+        # (RAS ComputeHardwareError 0x7b1b, torch-spyre#4033), hence needs_gather.
+        q_rows = (
+            query.index_select(0, query_row_index[:padded_query_len]) if needs_gather else query
+        )
+        q = (
+            q_rows.unsqueeze(0)
+            .transpose(1, 2)
+            .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+        )
+
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -246,8 +283,9 @@ def _create_compilable_page_attn(
             out.copy_(attn[:store_len])
             return out
         if store_mode == "index":
-            assert out is not None and out_rows is not None
-            out.index_copy_(0, out_rows, attn[:store_len])
+            # `out` and `query` are both indexed by absolute token row.
+            assert out is not None and query_row_index is not None
+            out.index_copy_(0, query_row_index[:store_len], attn[:store_len])
             return out
         return attn
 
@@ -338,16 +376,16 @@ class SpyreAttentionMetadata(AttentionMetadata):
     page_index_table_cpu: torch.Tensor | None = None
     page_index_tables: list[torch.Tensor] | None = None
 
+    # Absolute query rows per sequence: gather sources in `query`, and store
+    # destinations in `output`. One offset-0 tensor each, as above. Rows past
+    # query_len repeat the sequence's last real row; the mask discards them.
+    query_row_tables: list[torch.Tensor] | None = None
+
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
-
-    # Destination rows in the output buffer, one per sequence, filled once per step.
-    # Each needs its own offset-0 tensor rather than a slice of one arange, for the
-    # same reason as page_index_tables (torch-spyre#3770).
-    output_row_tables: list[torch.Tensor] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -873,8 +911,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len, store_mode, store_len)
-        self._attn_fns: dict[tuple[int, int, str, int], object] = {}
+        # Compiled attention loops, keyed by
+        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather)
+        self._attn_fns: dict[tuple[int, int, str, int, bool], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -886,21 +925,24 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         padded_query_len: int,
         store_mode: str = "none",
         store_len: int = 0,
+        needs_gather: bool = True,
     ):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len, store_mode, store_len)
+        key = (num_blocks, padded_query_len, store_mode, store_len, needs_gather)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
                     num_blocks,
                     padded_query_len,
                     self.num_heads,
+                    self.num_kv_heads,
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
                     store_mode=store_mode,
                     store_len=store_len,
+                    needs_gather=needs_gather,
                 ),
                 self._compile_attn,
             )
@@ -950,19 +992,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
             attn_metadata.attention_mask_tiles_device = [
                 [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
-            ]
-        if (
-            self._compile_attn
-            and attn_metadata.num_seqs > 1
-            and attn_metadata.output_row_tables is None
-        ):
-            qsl = attn_metadata.query_start_loc
-            attn_metadata.output_row_tables = [
-                convert(
-                    torch.arange(int(qsl[s].item()), int(qsl[s + 1].item()), dtype=torch.int32),
-                    device=_target_device,
-                )
-                for s in range(attn_metadata.num_seqs)
             ]
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
@@ -1030,16 +1059,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        Query is assembled on device into the padded 4D tensor
-        [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
-        the kernel expects.
+        The whole query buffer is passed through; each kernel gathers its own
+        sequence's rows and reshapes them to the 4D form it expects.
 
         Args:
             query_dev: Query on the target device, [num_tokens, num_heads, D].
         """
-        head_size = self.head_size
-        num_kv_heads = self.num_kv_heads
-        num_queries_per_kv = self.num_queries_per_kv
         block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
@@ -1070,44 +1095,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
-
-            if query_len == 1:
-                # Decode: the single real token goes at row 0 of the padded
-                # buffer; the trailing padded rows are masked out downstream.
-                _q = query_dev.unbind(dim=0)[q_start].reshape(
-                    num_kv_heads, num_queries_per_kv, 1, head_size
-                )
-                # .contiguous() cannot force the canonical layout here: the
-                # heads-inner physical Spyre layout is invisible to stride
-                # checks. See torch-spyre#3926.
-                q_dev = torch.ops.spyre.opaque_copy_(
-                    _q,  # ty: ignore[invalid-argument-type]
-                    torch.zeros(  # ty: ignore[invalid-argument-type]
-                        (num_kv_heads, num_queries_per_kv, 1, head_size),
-                        device=_q.device,
-                        dtype=_q.dtype,
-                    ),
-                )
-                if aligned_max_query_len > 1:
-                    q_dev = torch.nn.functional.pad(q_dev, (0, 0, 0, aligned_max_query_len - 1))
-            else:
-                q_seq = query_dev[q_start:q_end]
-
-                # Pad query to global aligned_max_query_len (uniform for all seqs)
-                if aligned_max_query_len > query_len:
-                    q_seq = torch.nn.functional.pad(
-                        q_seq,
-                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                        mode="constant",
-                        value=0.0,
-                    )
-
-                # Reshape: [padded_query_len, num_heads, head_size]
-                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-                q_dev = q.reshape(
-                    num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
-                )
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
 
@@ -1158,19 +1145,32 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
+            # Selecting the whole buffer faults the device; see the kernel's gather.
+            needs_gather = not (
+                q_start == 0
+                and query_len == aligned_max_query_len
+                and query_dev.shape[0] == aligned_max_query_len
+            )
+
             store_mode = "none"
-            out_rows = None
             if fused_store_ok:
                 if output.shape[0] == query_len:
                     # Owns every row, so the store is a plain copy_: no index, and
                     # no relayout of the destination.
                     store_mode = "copy"
-                elif output.shape[0] > 1 and attn_metadata.output_row_tables is not None:
+                elif output.shape[0] > 1:
                     # Owns only a slice, so the store must be indirect. A single-row
                     # destination is excluded: index_copy_ writes nothing there
                     # (torch-spyre#4007).
                     store_mode = "index"
-                    out_rows = attn_metadata.output_row_tables[seq_idx]
+
+            row_table = None
+            if needs_gather or store_mode == "index":
+                if attn_metadata.query_row_tables is None:
+                    attn_metadata.query_row_tables = _build_query_row_tables(
+                        attn_metadata, _target_device
+                    )
+                row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device
             attn_fn = self._get_attn_fn(
@@ -1178,9 +1178,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 aligned_max_query_len,
                 store_mode=store_mode,
                 store_len=query_len,
+                needs_gather=needs_gather,
             )
             result = attn_fn(
-                q_dev,
+                query_dev,
+                row_table,
                 k_pages,
                 v_pages,
                 page_index_table,
@@ -1188,7 +1190,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,
                 out=output if store_mode != "none" else None,
-                out_rows=out_rows,
             )
 
             assert result.dtype == output.dtype

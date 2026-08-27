@@ -77,6 +77,7 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -412,6 +413,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         install_pooling_model_patches()
 
+    @staticmethod
+    def _install_decoder_model_patches() -> None:
+        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
+
+        A no-op unless the matching architecture is built (import-guarded + idempotent).
+        """
+        from spyre_inference.models import install_decoder_model_patches
+
+        install_decoder_model_patches()
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -422,6 +433,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_loader = get_model_loader(self.load_config)
 
         self._install_pooling_model_patches(self.model_config)
+        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
         # stream in, when the platform overrode head_dim (e.g. head_size=64).
@@ -534,8 +546,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = self._compile_blocks()
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
-                    "Embeddings and the final norm stay eager.",
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
                     num_blocks,
                     model_name,
                 )
@@ -683,6 +694,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
         """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
+        # Read out of the passthrough rather than named in the signature, which would
+        # pin this override to upstream's parameter order across vLLM bumps.
+        num_tokens = kwargs.get("num_tokens", args[0] if args else None)
+        if num_tokens is not None:
+            attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

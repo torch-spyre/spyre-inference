@@ -19,7 +19,6 @@ from functools import lru_cache
 from . import activation  # noqa: F401
 from . import fused_moe  # noqa: F401
 from . import gate_linear  # noqa: F401
-from . import gemma4_embed_scale  # noqa: F401
 from . import gemma4_routing_patch  # noqa: F401
 from . import gemma_rms_norm  # noqa: F401
 from . import logits_processor  # noqa: F401

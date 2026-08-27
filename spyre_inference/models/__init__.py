@@ -23,3 +23,10 @@ def install_pooling_model_patches() -> None:
 
     bert.install_spyre_patches()
     roberta.install_spyre_patches()
+
+
+def install_decoder_model_patches() -> None:
+    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
+    from spyre_inference.models import gemma4
+
+    gemma4.install_spyre_patches()

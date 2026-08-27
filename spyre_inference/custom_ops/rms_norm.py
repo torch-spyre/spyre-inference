@@ -27,11 +27,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
+
 logger = init_logger(__name__)
 
 
 @RMSNorm.register_oot(name="RMSNorm")
-class SpyreRMSNorm(RMSNorm):
+class SpyreRMSNorm(CompileOutermost, RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
     def __init__(self, *args, **kwargs):
@@ -42,6 +44,7 @@ class SpyreRMSNorm(RMSNorm):
             "expect numerical differences to upstream vLLM."
         )
 
+    @compile_when_outermost
     def forward_oot(
         self,
         x: torch.Tensor,

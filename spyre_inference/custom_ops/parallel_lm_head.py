@@ -63,13 +63,3 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
-
-    def _apply(self, fn, recurse=True):
-        # `weight` is unused at runtime (the logits GEMM uses `padded_weight_t`); keep it
-        # on CPU to avoid a redundant HBM copy of the (when tied, already on-device) table.
-        weight = self._parameters.pop("weight", None)
-        try:
-            return super()._apply(fn, recurse=recurse)
-        finally:
-            if weight is not None:
-                self._parameters["weight"] = weight

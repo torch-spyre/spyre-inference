@@ -436,6 +436,14 @@ def _run_spyre_attn_test(
     output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+    # The attention layer, not forward(), owns the KV write (see attn_layer.py).
+    attn_impl.do_kv_cache_update(
+        None,
+        key_src,
+        value_src,
+        kv_cache,
+        convert(attn_metadata.slot_mapping, cache_device),
+    )
     # The impl expects q/k/v already on device, as in production (QKV runs
     # on-device); the CPU `query` still feeds the reference below.
     attn_impl.forward(
@@ -449,7 +457,8 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Kernel cache keys are (num_blocks, padded_query_len, store_mode, store_len).
+        # Kernel cache keys are
+        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather).
         fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
@@ -558,6 +567,8 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+        pytest.param([(1, 128), (1, 128)], id="batch_decode_shared_variant(2seqs)"),
+        pytest.param([(1, 128), (1, 256), (1, 128)], id="probe_decode_3seqs_kv128"),
     ],
 )
 def test_spyre_attn_compiled_multi_seq(
@@ -1361,11 +1372,11 @@ def test_reshape_and_cache_scatter(
     with warnings.catch_warnings(record=True) as caught:
         # "always": torch-spyre shows each fallback warning only once per session.
         warnings.simplefilter("always", FallbackWarning)
-        attn_impl._reshape_and_cache(
+        attn_impl.do_kv_cache_update(
+            None,
             key_src,
             value_src,
-            k_actual,
-            v_actual,
+            SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual),
             convert(torch.tensor(slots, dtype=torch.int64), cache_device),
         )
 
@@ -1384,3 +1395,106 @@ def test_reshape_and_cache_scatter(
         import gc
 
         gc.collect()
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    ["cpu", "spyre"],
+    ids=["device_cpu", "device_spyre"],
+    indirect=True,
+)
+def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device: str):
+    """The traced scatter: correct pages and no CPU fallback."""
+    set_random_seed(0)
+    num_tokens, num_kv_heads, head_size, block_size, num_pages = 4, 8, 128, 64, 3
+    cache_device = torch.device(configure_device)
+    slots = [0, block_size + 5, 2 * block_size + 1, 7]
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+
+    def fresh_pages():
+        return torch.full(
+            (num_pages, block_size, num_kv_heads, head_size), -7.0, dtype=torch.float16
+        )
+
+    k_expected, v_expected = fresh_pages(), fresh_pages()
+    for t, slot in enumerate(slots):
+        k_expected[slot // block_size][slot % block_size] = key[t]
+        v_expected[slot // block_size][slot % block_size] = value[t]
+
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
+
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+
+    kv_cache = SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual)
+    # Production primes the slot-major views at bind time, before any tracing.
+    attn_impl.kv_slot_views(kv_cache)
+
+    def scatter(key, value, slot_mapping):
+        attn_impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
+
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        torch.compile(scatter, dynamic=False)(
+            convert(key, cache_device),
+            convert(value, cache_device),
+            convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+        )
+
+    fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not any("index_copy" in m or "index_put" in m for m in fallback_msgs), (
+        f"the traced KV scatter fell back to CPU: {fallback_msgs}"
+    )
+
+    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
+
+    if configure_device == "spyre":
+        del k_actual, v_actual
+        import gc
+
+        gc.collect()
+
+
+class _StubAttentionLayer:
+    """Enough of `Attention` for `attn_layer.install` to decide and patch."""
+
+    def __init__(self, attn_type: str):
+        self.attn_type = attn_type
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.kv_sharing_target_layer_name = None
+        self.query_quant = None
+        self.calculate_kv_scales = False
+        self.kv_cache: list[torch.Tensor] = []
+
+
+def test_install_patches_layers_not_the_attention_class():
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention import attn_layer
+
+    class_forward = Attention.forward
+    decoder = _StubAttentionLayer(AttentionType.DECODER)
+    encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
+
+    holder = attn_layer.install([decoder, encoder])
+
+    assert Attention.forward is class_forward
+    assert decoder.spyre_slots is holder
+    assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
+    assert not hasattr(encoder, "spyre_slots")
+    assert not hasattr(encoder, "forward")
+
+    # No cache bound, so there is no device to mirror onto and nothing to publish.
+    holder.publish_null(8)
+    assert holder.slots is None

@@ -212,6 +212,31 @@ def test_lm_head_apply_skips_dead_weight(tp_group):
 
 
 @pytest.mark.parallel_lm_head
+def test_lm_head_apply_before_process_weights_moves_weight(tp_group):
+    """If `_apply` runs before `process_weights_after_loading`, `padded_weight_t` does
+    not exist yet, so the head must NOT skip `weight`: skipping would strand it on the
+    host and the GEMM would later hit a device mismatch. The skip is only safe once the
+    transposed weight exists."""
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(layer, SpyreParallelLMHead)
+    assert not hasattr(layer, "padded_weight_t")
+
+    weight = layer.weight
+    seen: list[torch.Tensor] = []
+
+    def track(t):
+        seen.append(t)
+        return t
+
+    layer._apply(track)
+
+    assert any(t is weight for t in seen), "weight must move when padded_weight_t is absent"
+
+
+@pytest.mark.parallel_lm_head
 def test_lm_head_skips_tied_weight(tp_group):
     """When the head's `weight` is tied to the embedding's table, the head skips it so
     the shared table is moved once — by the embedding, not the head — and the tie holds.

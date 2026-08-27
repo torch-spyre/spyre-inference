@@ -253,7 +253,7 @@ A fix that clears the baseline probe is a strong signal, not a finish line. Befo
 
 ## Reproducing a single failure
 
-Full test runs are slow (~3 minutes) because of vLLM startup. Use single-test invocations. **Always pass `-m "not upstream"`** so a broad selector doesn't accidentally match an upstream vLLM test pulled in by the testing plugin.
+Full test runs are slow (~3 minutes) because of vLLM startup. Use single-test invocations. Upstream vLLM tests are opt-in (the `-m` expression has to name `upstream`, or pass `--upstream`), so a broad selector won't pull them in on its own.
 
 Parametrize IDs frequently contain `(`, `=`, and `,`, which `-k` cannot parse (pytest evaluates `-k` as a Python-ish expression, and those characters produce syntax errors or silent zero matches). Two options:
 

@@ -107,7 +107,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a31289852145a59099edccc3e506cf5336e8e2e0" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "e6aa948241db265ccd69e44dbb825691a4cc423c" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -238,6 +238,9 @@ skip_gitignore = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Scopes spyre-testing-plugin to this repo; a pytest11 entry point would also load it
+# into unrelated pytest runs sharing the venv (e.g. a sibling torch-spyre checkout).
+addopts = ["-p", "spyre_testing_plugin.pytest_plugin"]
 asyncio_default_fixture_loop_scope = "function"
 # A card acquisition that blocks in the kernel yields no output, so the test
 # must be cut off from outside. "thread" dumps every thread's stack on expiry,
@@ -252,11 +255,11 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
-    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py, tests/test_spyre_encoder_attn.py); slow, runs in its own CI job",
-    "encoder_attention: encoder-attention subset (tests/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
-    "compile: torch.compile end-to-end tests (tests/test_compile.py); slow, runs in its own CI job",
-    "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
-    "fp8: FP8 quantization tests (tests/test_fp8.py)",
+    "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
+    "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
+    "compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job",
+    "rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)",
+    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
 ]
 # --8<-- [end:test-markers-definition]
 

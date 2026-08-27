@@ -24,6 +24,19 @@ uv sync --group dev --no-install-package torch-spyre --inexact
 
 `--no-install-package torch-spyre` skips resolving and rebuilding the pinned rev; `--inexact` stops uv from uninstalling the now-unreferenced local package. Note this only affects `uv sync` itself — any subsequent plain `uv run` will still re-sync and revert it, so use `uv run --no-sync …` for those (see `CLAUDE.md`'s "Iterating on a Local `torch-spyre` Checkout" section).
 
+### One venv for both repos
+
+To work on a `torch-spyre` bug and validate against both test suites, build on this repo's venv — it already carries the pinned `torch` and `vllm` — then add your `torch-spyre` checkout and its dev dependencies:
+
+```bash
+cd spyre-inference
+uv sync --group dev --no-install-package torch-spyre --inexact
+uv pip install -e ~/torch-spyre
+uv pip install --group ~/torch-spyre/pyproject.toml:dev
+```
+
+`spyre-testing-plugin` is scoped to this repo — it is activated by an `addopts` entry in our `pyproject.toml` rather than a global `pytest11` entry point — so `pytest` inside `torch-spyre` behaves exactly as it does without spyre-inference installed. Run each suite from its own checkout.
+
 ### Linting
 
 When submitting a PR, please make sure your code passes all linting checks. We use prek with a .pre-commit-config.yaml file to run checks on every commit.
@@ -52,22 +65,26 @@ The test suite uses pytest markers to categorize tests:
 --8<-- "pyproject.toml:test-markers-definition"
 ```
 
-Some useful overrides:
+Upstream vLLM tests are opt-in: they are cloned and collected only when the `-m` expression names the `upstream` marker, or `--upstream` is passed. A negative mention doesn't count, so `-m "not upstream"` and `-m "attention and not upstream"` skip the clone entirely.
 
 ```bash
-# Run only local tests
+# Run only local tests (no vLLM clone)
 pytest
 
 # Run all upstream tests
 pytest -m upstream
 
-# Run attention tests from upstream only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)
-pytest -m "attention"
+# Run upstream attention tests only (see tests/plugin/spyre_testing_plugin/upstream_tests.yaml for markers on upstream tests)
+pytest -m "attention and upstream"
+
+# Run local AND upstream attention tests: --upstream adds them to a marker
+# expression that doesn't name `upstream` itself
+pytest --upstream -m "attention"
 ```
 
 #### Upstream Test Integration
 
-Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference,spyre_inference_ops` set automatically. See `tests/plugin/spyre_testing_plugin/pytest_plugin.py` for implementation details.
+Upstream tests are cloned from the vLLM repository at the commit pinned in `pyproject.toml`, fetching only the `tests/` directory. The clone happens on demand, the first time a run asks for upstream tests (see the marker gate above). Cloned tests are cached in `~/.cache/vllm-upstream-tests` (or `$XDG_CACHE_HOME/vllm-upstream-tests`) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with `VLLM_PLUGINS=spyre_inference,spyre_inference_ops` set automatically. Pointing the plugin at a vLLM checkout instead of the cache is the one case that still needs the flag by hand: `pytest -p spyre_testing_plugin.pytest_plugin -m upstream` from the checkout root. See `tests/plugin/spyre_testing_plugin/pytest_plugin.py` for implementation details.
 
 !!! tip
     To force a re-clone, remove `~/.cache/vllm-upstream-tests`.
@@ -78,7 +95,9 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
 
 #### Configuration
 
-**SKIP_UPSTREAM_TESTS**: Skip upstream tests entirely. Accepts `1`, `true`, or `yes`.
+**--upstream**: Collect upstream tests even when the `-m` expression doesn't name the `upstream` marker.
+
+**SKIP_UPSTREAM_TESTS**: Skip upstream tests entirely, overriding both the `-m` expression and `--upstream`. Accepts `1`, `true`, or `yes`.
 
 **VLLM_COMMIT**: Override the vLLM commit SHA from `pyproject.toml`.
 
@@ -87,7 +106,7 @@ Upstream tests are cloned from the vLLM repository at the commit pinned in `pypr
 **UPSTREAM_TESTS_PATHS**: Not currently consumed by the plugin — the set of upstream test paths is auto-derived from the `rel_path` entries in `tests/plugin/spyre_testing_plugin/upstream_tests.yaml`.
 
 !!! tip
-    Environment variables can be passed directly to the `pytest` command, e.g. `VLLM_COMMIT=abc123def456 pytest`.
+    Environment variables can be passed directly to the `pytest` command, e.g. `VLLM_COMMIT=abc123def456 pytest -m upstream`.
 
 ### Docs
 

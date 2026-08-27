@@ -28,13 +28,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
 from .utils import place_row_gathered
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
-class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
+class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
@@ -123,6 +124,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
 
         return super()._apply(place, recurse)
 
+    @compile_when_outermost
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
             reindex_table = self._spyre_reindex_table

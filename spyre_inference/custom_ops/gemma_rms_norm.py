@@ -27,11 +27,13 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareGemmaRMSNorm
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
+
 logger = init_logger(__name__)
 
 
 @GemmaRMSNorm.register_oot(name="GemmaRMSNorm")
-class SpyreGemmaRMSNorm(GemmaRMSNorm):
+class SpyreGemmaRMSNorm(CompileOutermost, GemmaRMSNorm):
     """Out-of-tree (OOT) GemmaRMSNorm implementation for IBM's Spyre."""
 
     def __init__(self, *args, **kwargs):
@@ -42,12 +44,13 @@ class SpyreGemmaRMSNorm(GemmaRMSNorm):
             "expect numerical differences to upstream vLLM."
         )
 
+    @compile_when_outermost
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """GemmaRMSNorm kernel for Spyre. Compiled separately via maybe_compile."""
+        """GemmaRMSNorm kernel for Spyre."""
         if residual is not None:
             x = x + residual
             residual = x

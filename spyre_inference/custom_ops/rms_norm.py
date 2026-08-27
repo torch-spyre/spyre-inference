@@ -14,8 +14,11 @@
 
 """Spyre OOT replacement for RMSNorm.
 
-The fp16->fp32 upcast is correct only through torch-spyre's compile-time EA
-propagation (PR #2927), broken in eager. Hence force compiling here.
+Spyre constraints:
+    - No dtype promotion to float32 (not yet supported in torch-spyre)
+
+References:
+    - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
 """
 
 import torch
@@ -36,11 +39,6 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # With fullgraph compile enabled, forward_native is compiled anyway.
-        self._forward = self.forward_native
-        if not torch.compiler.is_dynamo_compiling():
-            self._forward = torch.compile(self.forward_native, dynamic=False)
-
         logger.warning_once(
             "SpyreRMSNorm: no dtype promotion is performed, "
             "expect numerical differences to upstream vLLM."
@@ -52,7 +50,25 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self._forward(x, residual)
+        """RMSNorm kernel for Spyre."""
+
+        if self.variance_size_override is not None:
+            raise NotImplementedError("TODO: variance_size_override not yet implemented")
+
+        if residual is not None:
+            x = x + residual
+            residual = x
+
+        variance = x.pow(2).mean(dim=-1, keepdim=True)
+
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+
+        if self.has_weight:
+            x = x * self.weight
+        if residual is None:
+            return x
+        else:
+            return x, residual
 
 
 # The norm fuser instantiates TPAwareRMSNorm and OOT dispatch keys on the concrete class

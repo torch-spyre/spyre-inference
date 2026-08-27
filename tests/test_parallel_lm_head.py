@@ -212,9 +212,16 @@ def test_lm_head_apply_skips_dead_weight(tp_group):
 
 
 @pytest.mark.parallel_lm_head
-def test_lm_head_tied_weight_moved_once_by_embedding(tp_group):
+def test_lm_head_skips_tied_weight(tp_group):
     """When the head's `weight` is tied to the embedding's table, the head skips it so
-    the shared Parameter is moved exactly once (by the embedding, not the head)."""
+    the shared table is moved once — by the embedding, not the head — and the tie holds.
+
+    The embedding routes the shared table through `place_row_gathered`, which hands `fn`
+    the tensor's `.data` (plus a one-row probe view), never the `Parameter` itself. So the
+    invariant is that the shared `Parameter` never reaches `fn` *via the head*, not a raw
+    call-count on the object: without the head's `_apply` skip, the head would pass the
+    `Parameter` to `fn` and the table would be moved a second time.
+    """
     from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -242,9 +249,16 @@ def test_lm_head_tied_weight_moved_once_by_embedding(tp_group):
 
     model._apply(track)
 
-    assert sum(t is shared for t in seen) == 1, "tied table must be moved exactly once"
+    # The head skips its dead `weight`: the shared Parameter never reaches `fn` through
+    # the head. The embedding is the only mover, and it passes `weight.data`, not the
+    # Parameter — so the Parameter object itself is never seen.
+    assert not any(t is shared for t in seen), "head must not move the tied weight"
+    assert any(t.untyped_storage() is shared.untyped_storage() for t in seen), (
+        "embedding must still move the shared table"
+    )
     assert any(t is head.padded_weight_t for t in seen), "padded_weight_t was not moved"
-    assert head.weight is shared, "head weight must be restored as the shared object"
+    # The tie survives `_apply`: the head restores the shared Parameter it was given.
+    assert head.weight is embed.weight is shared, "tie must survive _apply"
 
 
 @pytest.mark.parallel_lm_head

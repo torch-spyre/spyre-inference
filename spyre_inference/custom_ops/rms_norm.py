@@ -20,10 +20,13 @@ propagation (PR #2927), broken in eager. Hence force compiling here.
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
+
+logger = init_logger(__name__)
 
 
 @RMSNorm.register_oot(name="RMSNorm")
@@ -37,7 +40,7 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
         self._forward = self.forward_native
         if not torch.compiler.is_dynamo_compiling():
             self._forward = torch.compile(self.forward_native, dynamic=False)
-            
+
         logger.warning_once(
             "SpyreRMSNorm: no dtype promotion is performed, "
             "expect numerical differences to upstream vLLM."

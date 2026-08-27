@@ -431,9 +431,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
-
-        # Zero-pad SwiGLU MLP gate/up/down weights to the stick-aligned
-        # intermediate_size when the platform overrode it (e.g. 160 -> 192).
         install_mlp_pad_weight_loader(model_loader, self.model_config.hf_config)
 
         # Load model on CPU
@@ -455,12 +452,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
         verify_padded_head_dim(self.model, self.model_config.hf_config)
+        verify_padded_intermediate_size(self.model, self.model_config.hf_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
-
-        # Guard that every SwiGLU MLP built at the padded intermediate_size (no
-        # rope/scale analogue is needed — zero-padding is arithmetically inert).
-        verify_padded_intermediate_size(self.model, self.model_config.hf_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not

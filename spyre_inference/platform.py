@@ -410,7 +410,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # Pad attention head_dim up to a stick-aligned size on the native path.
         cls._maybe_pad_head_dim(vllm_config)
 
-        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size (native path).
+        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
         cls._maybe_pad_intermediate_size(vllm_config)
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.

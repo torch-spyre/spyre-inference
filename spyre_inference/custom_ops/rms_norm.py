@@ -23,9 +23,11 @@ import torch
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
+
 
 @RMSNorm.register_oot(name="RMSNorm")
-class SpyreRMSNorm(RMSNorm):
+class SpyreRMSNorm(CompileOutermost, RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
     def __init__(self, *args, **kwargs):
@@ -35,7 +37,13 @@ class SpyreRMSNorm(RMSNorm):
         self._forward = self.forward_native
         if not torch.compiler.is_dynamo_compiling():
             self._forward = torch.compile(self.forward_native, dynamic=False)
+            
+        logger.warning_once(
+            "SpyreRMSNorm: no dtype promotion is performed, "
+            "expect numerical differences to upstream vLLM."
+        )
 
+    @compile_when_outermost
     def forward_oot(
         self,
         x: torch.Tensor,

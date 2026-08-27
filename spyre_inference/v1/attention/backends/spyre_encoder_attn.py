@@ -283,6 +283,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     """Encoder-only (no KV cache) variant of the Spyre backend."""
 
+    # These layers have no KV cache, but vLLM still hands encoder-only specs a
+    # zero-filled slot mapping, so upstream must skip `unified_kv_cache_update` entirely.
+    forward_includes_kv_cache_update: bool = True
+
     @staticmethod
     def get_impl_cls() -> type[SpyreEncoderAttentionImpl]:
         return SpyreEncoderAttentionImpl

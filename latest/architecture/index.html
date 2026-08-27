@@ -2109,7 +2109,7 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 <td><code>RMSNorm</code></td>
 <td><code>SpyreRMSNorm</code></td>
 <td>Spyre</td>
-<td><code>forward_oot</code> runs a <code>maybe_compile</code>d kernel directly on Spyre; no float32 promotion (torch-spyre limitation)</td>
+<td><code>forward_oot</code> runs a <code>torch.compile</code>d <code>forward_native</code> on Spyre since EA propagation (PR #2927) is correct compiled, but broken eager.</td>
 </tr>
 <tr>
 <td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>

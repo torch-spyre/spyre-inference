@@ -69,6 +69,20 @@ def test_pad_weight_splits_and_pads_a_fused_gate_up_projection():
     assert not up[_ORIG:].any()
 
 
+def test_pad_weight_splits_and_pads_a_fused_gate_up_bias():
+    """A fused bias must split and end-pad like the weight, not fall through unpadded."""
+    b = torch.arange(1.0, 2 * _ORIG + 1)
+
+    out = _pad_weight("layers.0.mlp.gate_up_proj.bias", b, _ORIG, _PADDED)
+
+    assert out.shape == (2 * _PADDED,)
+    gate, up = out.split([_PADDED, _PADDED])
+    assert torch.equal(gate[:_ORIG], b[:_ORIG])
+    assert torch.equal(up[:_ORIG], b[_ORIG:])
+    assert not gate[_ORIG:].any()
+    assert not up[_ORIG:].any()
+
+
 def test_pad_weight_leaves_an_already_aligned_width_untouched():
     """A 64-aligned intermediate never gets stashed, so padded==orig is a no-op."""
     w = torch.arange(1.0, _PADDED * _HIDDEN + 1).reshape(_PADDED, _HIDDEN)

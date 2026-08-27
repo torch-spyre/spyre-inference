@@ -65,8 +65,8 @@ def _pad_cols_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
 
 def _pad_weight(name: str, w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right end-padding by its name."""
-    # Must precede the up_proj test: "gate_up_proj.weight" also ends with "up_proj.weight".
-    if name.endswith("gate_up_proj.weight") and w.shape[0] == 2 * orig:
+    # Must precede the up_proj test: "gate_up_proj.*" also ends with "up_proj.*".
+    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")) and w.shape[0] == 2 * orig:
         gate, up = w.chunk(2, dim=0)
         return torch.cat([_pad_rows_end(gate, orig, padded), _pad_rows_end(up, orig, padded)])
     if name.endswith(("gate_proj.weight", "gate_proj.bias", "up_proj.weight", "up_proj.bias")):

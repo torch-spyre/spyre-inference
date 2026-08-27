@@ -108,7 +108,9 @@ def _pad_qk_norm_weight(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor
     """Pad a per-head QK-norm weight ``[orig] -> [padded]`` to match padded Q/K.
 
     RMS over the padded head divides by ``padded`` not ``orig``; folding
-    ``sqrt(orig/padded)`` into the weight restores the original scale.
+    ``sqrt(orig/padded)`` into the weight restores the original scale. Exact but
+    for the eps term (the wider divisor scales it by ``padded/orig``), which is
+    negligible at the usual eps=1e-6.
     """
     return _pad_qk_interleaved(w * math.sqrt(orig / padded), 1, orig, padded)
 

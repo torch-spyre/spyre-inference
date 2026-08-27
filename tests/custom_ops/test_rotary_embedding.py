@@ -271,37 +271,111 @@ def test_rope_device_cache_gather_returns_spyre_slice(default_vllm_config, head_
     "head_size,partial_rotary_factor",
     [
         (128, 0.5),  # partial AND unaligned: rotary_dim=64 -> inner dim 32
-        (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> rejected for being partial
+        (256, 0.5),  # partial but inner-aligned: rotary_dim=128 -> still partial
+        (64, 0.5),  # GLM-OCR shape: head_size=64, rotary_dim=32
     ],
 )
-def test_rotary_partial_config_raises(default_vllm_config, head_size, partial_rotary_factor):
-    """Partial rotary raises NotImplementedError at construction (no CPU fallback),
-    whether or not its inner dim is stick-aligned."""
+def test_rotary_partial_config_falls_back(default_vllm_config, head_size, partial_rotary_factor):
+    """Partial rotary (rotary_dim < head_size) constructs without error and routes
+    forward_oot to the native RotaryEmbedding path instead of the 2x2 kernel."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
-    with pytest.raises(NotImplementedError):
-        get_rope(
-            head_size=head_size,
-            max_position=2048,
-            is_neox_style=True,
-            rope_parameters={"partial_rotary_factor": partial_rotary_factor},
-            dtype=torch.float16,
-        )
+    rope = get_rope(
+        head_size=head_size,
+        max_position=2048,
+        is_neox_style=True,
+        rope_parameters={"partial_rotary_factor": partial_rotary_factor},
+        dtype=torch.float16,
+    )
+    assert rope.rotary_dim < rope.head_size
+    assert rope._spyre_native_fallback
+    assert not hasattr(rope, "_rotation_cache")
 
 
 @pytest.mark.rotary
-def test_rotary_non_neox_config_raises(default_vllm_config):
-    """gptj/interleaved (is_neox_style=False) full rotary is rejected at construction:
-    only the neox 2x2 kernel is implemented."""
+def test_rotary_non_neox_config_falls_back(default_vllm_config):
+    """gptj/interleaved (is_neox_style=False) full rotary constructs without error and
+    routes forward_oot to the native path: only the neox 2x2 kernel is on-device."""
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
-    with pytest.raises(NotImplementedError):
-        get_rope(
-            head_size=128,
-            max_position=2048,
-            is_neox_style=False,
-            dtype=torch.float16,
-        )
+    rope = get_rope(
+        head_size=128,
+        max_position=2048,
+        is_neox_style=False,
+        dtype=torch.float16,
+    )
+    assert rope._spyre_native_fallback
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size,partial_rotary_factor", [(128, 0.5), (64, 0.5)])
+def test_partial_rotary_forward_oot_matches_native_cpu(
+    default_vllm_config, head_size, partial_rotary_factor
+):
+    """CPU-only: forward_oot on a partial-rotary rope delegates to forward_native, so its
+    output matches RotaryEmbedding.forward_native exactly (only the rotary_dim prefix of
+    each head is rotated; the pass-through tail is untouched)."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(13)
+    max_position, num_tokens, num_heads = 2048, 16, 4
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={"partial_rotary_factor": partial_rotary_factor},
+        dtype=torch.float16,
+    )
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+
+    actual_query, actual_key = rope.forward_oot(positions, query.clone(), key.clone())
+    expected_query, expected_key = RotaryEmbedding.forward_native(
+        rope, positions, query.clone(), key.clone()
+    )
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size,partial_rotary_factor", [(128, 0.5), (64, 0.5)])
+def test_partial_rotary_forward_oot_on_spyre(default_vllm_config, head_size, partial_rotary_factor):
+    """The partial-rotary fallback runs on Spyre: forward_oot rotates on the host inside
+    the opaque spyre_partial_rotary op and returns device tensors, matching the CPU
+    reference. cos_sin_cache stays CPU-pinned (the op reads it directly)."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(7)
+    max_position, num_tokens, num_heads = 2048, 16, 4
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters={"partial_rotary_factor": partial_rotary_factor},
+        dtype=torch.float16,
+    )
+    rope.to("spyre")
+    assert rope.cos_sin_cache.device.type == "cpu"
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+    assert actual_query.device.type == "spyre"
+    expected_query, expected_key = RotaryEmbedding.forward_native(
+        rope, positions.cpu(), query.clone(), key.clone()
+    )
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.rotary

@@ -372,11 +372,9 @@ class TorchSpyrePlatform(CpuPlatform):
         ``config.intermediate_size`` directly, so overriding the config value
         before the model is built widens the modules with no per-class shim.
 
-        No-op when already 64-aligned or unset. Zero-padding is arithmetically
-        inert for SwiGLU (see ``custom_ops.mlp_pad``); dense SwiGLU MLPs only.
-        MoE (experts read ``moe_intermediate_size``) and non-SiLU MLPs (whose
-        projections the loader can't reach) are left unpadded — SiLU/swish is the
-        one activation unique to the gated SwiGLU this pad handles.
+        Dense SwiGLU only (SiLU/swish is unique to it); MoE and other MLPs are
+        left unpadded, as the loader can't reach their projections. Zero-padding
+        is inert for SwiGLU (see ``custom_ops.mlp_pad``).
         """
         from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
 

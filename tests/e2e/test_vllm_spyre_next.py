@@ -67,15 +67,11 @@ def test_long_context_model_load():
     assert len(output[0].outputs[0].text) > 0
 
 
-# End-to-end counterpart to the CPU-only pad-shim unit tests in test_head_pad.py
-# and test_mlp_pad.py: a model that trips BOTH pads at once must still decode the
-# correct tokens on device. qwrt/Swedish0.1M is the smallest public model that hits
-# head_dim 16 -> 128 (QK-norm attention path) and intermediate_size 160 -> 192
-# (SwiGLU MLP path) together.
-#
-# It ships a broken tokenizer stub (Qwen2Tokenizer, vocab_size=1, returns [] for
-# everything). The model itself is byte-level (vocab 256), so the prompt is fed as
-# raw UTF-8 byte ids rather than through the tokenizer.
+# On-device counterpart to the CPU pad-shim unit tests: qwrt/Swedish0.1M is the
+# smallest public model that trips BOTH pads at once — head_dim 16 -> 128 (QK-norm)
+# and intermediate_size 160 -> 192 (SwiGLU) — and must still decode correctly.
+# Its tokenizer stub is broken (returns [] for everything); the model is byte-level
+# (vocab 256), so the prompt is fed as raw UTF-8 byte ids, not through the tokenizer.
 _PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode())
 
 # Greedy continuation from transformers CPU (fp32, unpadded) on the same byte-id

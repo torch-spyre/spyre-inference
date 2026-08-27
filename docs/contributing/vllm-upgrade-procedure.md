@@ -122,9 +122,9 @@ Don't run the full `pytest` first — vLLM startup is ~30s per test file, and th
 ### 3a. Custom Ops (No vLLM Engine)
 
 ```bash
-uv run --no-sync pytest tests/test_platform.py tests/test_mlp.py tests/test_rms_norm.py \
-  tests/test_silu_and_mul.py tests/test_parallel_lm_head.py \
-  tests/test_vocab_parallel_embedding.py -m "not upstream" --no-header
+uv run --no-sync pytest tests/runtime/test_platform.py tests/custom_ops/test_mlp.py tests/custom_ops/test_rms_norm.py \
+  tests/custom_ops/test_silu_and_mul.py tests/custom_ops/test_parallel_lm_head.py \
+  tests/custom_ops/test_vocab_parallel_embedding.py -m "not upstream" --no-header
 ```
 
 These exercise the linear/RMSNorm/embedding/silu_and_mul ops against a CPU reference. Failures here usually mean a vLLM layer's constructor signature changed (new kwarg, renamed parameter) or a `vocab_parallel_embedding`-style helper was moved. Fix in `spyre_inference/custom_ops/`.
@@ -132,7 +132,7 @@ These exercise the linear/RMSNorm/embedding/silu_and_mul ops against a CPU refer
 ### 3b. Attention Backend
 
 ```bash
-uv run --no-sync pytest tests/test_spyre_attn.py -m "not upstream" --no-header
+uv run --no-sync pytest tests/attention/test_spyre_attn.py -m "not upstream" --no-header
 ```
 
 ~10 minutes. If this fails, likely culprits:
@@ -144,7 +144,7 @@ uv run --no-sync pytest tests/test_spyre_attn.py -m "not upstream" --no-header
 ### 3c. End-to-End vLLM (Single-Process)
 
 ```bash
-uv run --no-sync pytest tests/test_vllm_spyre_next.py -m "not upstream" --no-header
+uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py -m "not upstream" --no-header
 ```
 
 This is the most common place to hit OOT platform traps (see above). Fix those with surgical `TorchSpyreWorker` overrides as described.
@@ -180,7 +180,7 @@ If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kern
 Once each category is green individually, run the full suite to catch any cross-test interactions:
 
 ```bash
-uv run --no-sync pytest --no-header
+uv run --no-sync pytest --no-header --upstream
 ```
 
 Roughly 16 minutes on a Spyre host. Then format:

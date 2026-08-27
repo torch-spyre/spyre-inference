@@ -5,7 +5,7 @@ Companion to `SKILL.md`. Read this when the failing surface is the Spyre attenti
 ## Files that matter for attention
 
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — the backend, `SpyreAttentionImpl`, `SpyreAttentionMetadataBuilder`. The module docstring enumerates every torch-spyre limitation the backend routes around.
-- `tests/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, calls `SpyreAttentionImpl.forward` on a Spyre device, compares against a CPU reference (`ref_attn`). Tolerances are loose (`atol=0.3, rtol=5.0` for prefill; `atol=0.2, rtol=0.2` for decode) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
+- `tests/attention/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, calls `SpyreAttentionImpl.forward` on a Spyre device, compares against a CPU reference (`ref_attn`). Tolerances are loose (`atol=0.3, rtol=5.0` for prefill; `atol=0.2, rtol=0.2` for decode) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
 
 ## Attention-specific limitations
 

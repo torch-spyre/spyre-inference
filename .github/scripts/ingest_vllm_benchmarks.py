@@ -151,12 +151,15 @@ def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
 
 def _model_from_record(record: dict[str, Any], filename: str) -> str:
     """Best-effort model name from a benchmark record, falling back to the file."""
+    # vLLM-native JSON writes "model" as a top-level string
+    raw_model = record.get("model")
+    if isinstance(raw_model, str) and raw_model:
+        return raw_model
+
     benchmark = record.get("benchmark", {})
     if not isinstance(benchmark, dict):
         benchmark = {}
-    model_info = record.get("model", {})
-    if not isinstance(model_info, dict):
-        model_info = {}
+    model_info = raw_model if isinstance(raw_model, dict) else {}
     return (
         benchmark.get("model")
         or benchmark.get("model_name")

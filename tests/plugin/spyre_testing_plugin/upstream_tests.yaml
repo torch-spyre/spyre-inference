@@ -56,7 +56,7 @@ tests:
     #       tests/models/transformers/test_backend.py in v0.27.1. Re-enabling also needs
     #       test_models' HF-CPU reference to be reconcilable with fp16 on Spyre: it
     #       compares 32 tokens of logprobs via check_logprobs_close. Until then,
-    #       tests/test_transformers_backend.py covers the same ground against the native
+    #       tests/e2e/test_transformers_backend.py covers the same ground against the native
     #       Spyre path.
     # - rel_path: tests/models/test_transformers.py
     #   allow_list:

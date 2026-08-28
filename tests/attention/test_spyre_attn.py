@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    _KV_HEAD_TILE_MAX_WORKING_SET,
+    KV_HEAD_TILE_THRESHOLD,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -338,6 +340,8 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    tile_kv_heads: int | None = None,
+    tile_q_heads: int | None = None,
     expect_fused_store: bool | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
@@ -429,6 +433,8 @@ def _run_spyre_attn_test(
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
+        tile_kv_heads=tile_kv_heads,
+        tile_q_heads=tile_q_heads,
     )
 
     # NaN, not empty_like: every row is expected to be written, so a store that
@@ -458,8 +464,9 @@ def _run_spyre_attn_test(
 
     if expect_fused_store is not None:
         # Kernel cache keys are
-        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather).
-        fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
+        # (num_blocks, padded_query_len, tile_kv_heads, tile_q_heads,
+        #  store_mode, store_len, needs_gather).
+        fused_used = any(key[4] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
             f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
@@ -533,6 +540,7 @@ def _run_spyre_attn_test(
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(64, 512), (32, 256)], id="batch_prefill(2seqs_swapped)"),
         pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+        pytest.param([(1024, 1024)], id="long_prefill(q=1024,kv=1024)"),
     ],
 )
 def test_spyre_attn_core(
@@ -589,6 +597,102 @@ def test_spyre_attn_compiled_multi_seq(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
     )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "tile_kv_heads",
+    [pytest.param(2, id="tile_kv_heads(2)"), pytest.param(4, id="tile_kv_heads(4)")],
+)
+def test_spyre_attn_kv_head_tiling(
+    default_vllm_config,
+    tile_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """kv_head coarse-tiling (query_len >= KV_HEAD_TILE_THRESHOLD) matches the
+    reference. kv_head is the only tileable axis: the query axes (qpk, lq) are
+    broadcast onto the K/V pages by the matmuls, so tiling them forces an
+    unresolvable slot-major->head-major page read-copy. kv_head is native to the
+    page, so with both pages hoisted the tiled read-copy is a clean slice.
+    """
+    _run_spyre_attn_test(
+        seq_lens=[(1024, 1024)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        tile_kv_heads=tile_kv_heads,
+    )
+
+
+def _tiling_gate_impl() -> SpyreAttentionImpl:
+    return SpyreAttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=8,
+        kv_cache_dtype="auto",
+        tile_kv_heads=2,
+        tile_q_heads=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("padded_query_len", "expected_kv_tile"),
+    [
+        pytest.param(512, 1, id="below_threshold"),
+        pytest.param(KV_HEAD_TILE_THRESHOLD, 2, id="at_threshold"),
+        pytest.param(2048, 2, id="above_threshold"),
+    ],
+)
+def test_kv_head_tile_query_len_threshold(
+    default_vllm_config,
+    padded_query_len: int,
+    expected_kv_tile: int,
+) -> None:
+    """`_resolve_tile_counts` forces tile_kv_heads=1 below KV_HEAD_TILE_THRESHOLD
+    (short prefill/decode, where tiling is measured harmful). num_blocks is kept
+    small so the hoist budget is not the deciding gate. Pure-Python, no device.
+    """
+    impl = _tiling_gate_impl()
+    kv_heads, q_heads = impl._resolve_tile_counts(
+        block_size=128, padded_query_len=padded_query_len, num_blocks=8
+    )
+    assert kv_heads == expected_kv_tile
+    assert q_heads == 1
+
+
+def test_kv_head_tile_working_set_ceiling(default_vllm_config) -> None:
+    """`_resolve_tile_counts` disables tiling once the estimated tiled working set
+    exceeds _KV_HEAD_TILE_MAX_WORKING_SET — the OOM guard for extreme prefill —
+    without risking the OOM (pure-Python, no device). padded_query_len is held in
+    the tiling window so num_blocks alone crosses the ceiling.
+    """
+    impl = _tiling_gate_impl()
+    block_size = 128
+    padded_query_len = 2048
+    # working set = num_blocks * num_heads * padded_query_len * block_size
+    per_block = impl.num_heads * padded_query_len * block_size
+    ceiling_blocks = _KV_HEAD_TILE_MAX_WORKING_SET // per_block
+
+    kv_at, _ = impl._resolve_tile_counts(
+        block_size=block_size, padded_query_len=padded_query_len, num_blocks=ceiling_blocks
+    )
+    kv_over, _ = impl._resolve_tile_counts(
+        block_size=block_size, padded_query_len=padded_query_len, num_blocks=ceiling_blocks + 1
+    )
+    assert kv_at == 2, "working set exactly at the ceiling should still tile"
+    assert kv_over == 1, "working set over the ceiling must fall back to untiled"
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,4 @@
+{
+  "tile_kv_heads": 2,
+  "tile_q_heads": 1
+}

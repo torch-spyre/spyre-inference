@@ -49,6 +49,15 @@ else:
 logger = init_logger(__name__)
 
 
+# Largest prefill-chunk bucket (max_num_batched_tokens) we compile/warm up for;
+# chunked prefill splits longer prompts to this, bounding the attention kernel's
+# padded_query_len. Capped at 4096: above it the tiled attention path OOMs (see
+# _KV_HEAD_TILE_MAX_WORKING_SET in v1/attention/backends/spyre_attn.py) and each
+# bucket is a slow warmup compile. TODO: exposed as an env var for experiments;
+# drop the override and hardcode 4096 if no one needs to tune it.
+SPYRE_MAX_PREFILL_CHUNK = int(os.environ.get("SPYRE_MAX_PREFILL_CHUNK", "4096"))
+
+
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
     # raise "Cannot access accelerator device when none is available." Our OOT
@@ -234,19 +243,31 @@ class TorchSpyrePlatform(CpuPlatform):
                 if vllm_config.compilation_config.compile_sizes:
                     compile_sizes = vllm_config.compilation_config.compile_sizes
                 else:
-                    # max_capture_size is the largest bucket we compile for.
-                    # Bounded by max_num_batched_tokens (scheduler limit) and
-                    # 512 (max supported shape for torch-spyre).
+                    # max_capture_size is the largest prefill-chunk bucket we
+                    # compile for. Bounded by max_num_batched_tokens (scheduler
+                    # limit) and SPYRE_MAX_PREFILL_CHUNK (4096): above ~4096 the
+                    # kv_head-tiled attention path OOMs the card (the tiled
+                    # per-block transients are co-allocated across the unrolled
+                    # page loop; see _KV_HEAD_TILE_MAX_WORKING_SET in
+                    # v1/attention/backends/spyre_attn.py), and every extra bucket
+                    # is a slow warmup compile.
                     max_capture_size = min(
                         vllm_config.scheduler_config.max_num_batched_tokens,
-                        512,
+                        SPYRE_MAX_PREFILL_CHUNK,
                     )
 
                     compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
                     if max_capture_size >= 8:
                         compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
+                    # 256..512 stays dense (16-token steps: the common prefill
+                    # regime); above 512 use a coarse 512-token step so raising the
+                    # chunk cap to 4096 adds only a handful of extra warmup buckets
+                    # (512, 1024, ... 4096) instead of hundreds.
                     if max_capture_size >= 256:
-                        compile_sizes += list(range(256, max_capture_size + 1, 16))
+                        dense_hi = min(max_capture_size, 512)
+                        compile_sizes += list(range(256, dense_hi + 1, 16))
+                        if max_capture_size > 512:
+                            compile_sizes += list(range(1024, max_capture_size + 1, 512))
                     vllm_config.compilation_config.compile_sizes = compile_sizes
 
                 max_capture_size = max(compile_sizes)

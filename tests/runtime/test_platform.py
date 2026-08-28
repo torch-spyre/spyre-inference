@@ -511,7 +511,7 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
 def test_compile_sizes_default_generated():
     """When user doesn't set compile_sizes, the platform generates default buckets."""
-    from spyre_inference.platform import TorchSpyrePlatform
+    from spyre_inference.platform import SPYRE_MAX_PREFILL_CHUNK, TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
@@ -520,7 +520,29 @@ def test_compile_sizes_default_generated():
     assert sizes, "compile_sizes should not be empty"
     assert sizes == sorted(sizes), "compile_sizes should be sorted ascending"
     assert sizes[0] == 1, "smallest bucket should be 1"
-    assert max(sizes) <= 512
+    assert max(sizes) <= SPYRE_MAX_PREFILL_CHUNK
+
+
+def test_compile_sizes_high_tier_is_coarse_up_to_4k():
+    """Above 512 the default buckets step coarsely (512-token stride) up to the
+    4096 prefill-chunk cap, so raising the chunk cap adds only a few warmup
+    buckets rather than hundreds. The <=512 tier stays dense (unchanged)."""
+    from spyre_inference.platform import SPYRE_MAX_PREFILL_CHUNK, TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_batched_tokens = 4096
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    sizes = vllm_config.compilation_config.compile_sizes
+
+    assert max(sizes) == min(4096, SPYRE_MAX_PREFILL_CHUNK)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == max(sizes)
+    high = [s for s in sizes if s > 512]
+    # Coarse 512-stride tier; well under the ~220 buckets a 16-stride would give.
+    assert high == [1024, 1536, 2048, 2560, 3072, 3584, 4096]
+    # The <=512 tier is unchanged: dense 16-stride from 256.
+    assert 512 in sizes and 496 in sizes
 
 
 def test_compile_sizes_user_provided_respected():

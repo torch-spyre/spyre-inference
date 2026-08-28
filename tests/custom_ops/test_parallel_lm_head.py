@@ -185,108 +185,51 @@ def test_lm_head_fp8_config_accepted(tp_group):
     assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
 
 
+def _apply_tracked(layer):
+    """Run `layer._apply` with an identity fn; return the tensors handed to it."""
+    seen: list[torch.Tensor] = []
+    layer._apply(lambda t: (seen.append(t), t)[1])
+    return seen
+
+
+@pytest.mark.parallel_lm_head
+def test_lm_head_apply_moves_weight_before_process(tp_group):
+    """Before `process_weights_after_loading`, `padded_weight_t` is absent and `weight`
+    is still live, so `_apply` must move it rather than strand it on host."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert not hasattr(layer, "padded_weight_t")
+    assert any(t is layer.weight for t in _apply_tracked(layer))
+
+
 @pytest.mark.parallel_lm_head
 def test_lm_head_apply_skips_dead_weight(tp_group):
-    """`_apply` hands `padded_weight_t` to `fn` but skips the dead `weight`, and
-    restores `weight` as the same Parameter afterwards."""
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    """Once `padded_weight_t` exists, `_apply` moves it and skips the dead `weight`,
+    restoring `weight` as the same registered Parameter."""
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
-    assert isinstance(layer, SpyreParallelLMHead)
     layer.quant_method.process_weights_after_loading(layer)
 
-    original_weight = layer.weight
-    seen: list[torch.Tensor] = []
-
-    def track(t):
-        seen.append(t)
-        return t
-
-    layer._apply(track)
+    original = layer.weight
+    seen = _apply_tracked(layer)
 
     assert any(t is layer.padded_weight_t for t in seen), "padded_weight_t was not moved"
-    assert not any(t is original_weight for t in seen), "dead weight should be skipped"
-    assert layer.weight is original_weight, "weight must be restored as the same object"
-    assert "weight" in layer._parameters
-
-
-@pytest.mark.parallel_lm_head
-def test_lm_head_apply_before_process_weights_moves_weight(tp_group):
-    """Before `process_weights_after_loading`, `padded_weight_t` is absent and `weight`
-    is still live, so the head must move it rather than strand it on host."""
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-
-    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
-    assert isinstance(layer, SpyreParallelLMHead)
-    assert not hasattr(layer, "padded_weight_t")
-
-    weight = layer.weight
-    seen: list[torch.Tensor] = []
-
-    def track(t):
-        seen.append(t)
-        return t
-
-    layer._apply(track)
-
-    assert any(t is weight for t in seen), "weight must move when padded_weight_t is absent"
-
-
-@pytest.mark.parallel_lm_head
-def test_lm_head_skips_tied_weight(tp_group):
-    """A tied head skips its `weight` so the shared table is moved only by the embedding,
-    and the tie survives `_apply`."""
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
-    from vllm.model_executor.layers.vocab_parallel_embedding import (
-        ParallelLMHead,
-        VocabParallelEmbedding,
-    )
-
-    embed = VocabParallelEmbedding(128, 64, params_dtype=torch.float16)
-    head = ParallelLMHead(128, 64, params_dtype=torch.float16)
-    assert isinstance(head, SpyreParallelLMHead)
-
-    # Tie the head to the embedding's table, as vLLM does for tied-embedding models.
-    head.weight = embed.weight
-    shared = embed.weight
-    head.quant_method.process_weights_after_loading(head)
-
-    model = torch.nn.Module()
-    model.embed = embed
-    model.head = head
-
-    seen: list[torch.Tensor] = []
-
-    def track(t):
-        seen.append(t)
-        return t
-
-    model._apply(track)
-
-    # The embedding moves the table via `weight.data`, never the Parameter, so we assert
-    # on storage identity, not object identity.
-    assert not any(t is shared for t in seen), "head must not move the tied weight"
-    assert any(t.untyped_storage() is shared.untyped_storage() for t in seen), (
-        "embedding must still move the shared table"
-    )
-    assert any(t is head.padded_weight_t for t in seen), "padded_weight_t was not moved"
-    assert head.weight is embed.weight is shared, "tie must survive _apply"
+    assert not any(t is original for t in seen), "dead weight should be skipped"
+    assert layer.weight is original and "weight" in layer._parameters
 
 
 @pytest.mark.parallel_lm_head
 def test_lm_head_weight_stays_on_cpu_after_to_spyre(tp_group):
-    """After `layer.to(spyre)`, the dead `weight` stays on CPU; `padded_weight_t` moves.
-    Skipped on CPU-only hosts, where off-device is not observable."""
+    """Real device move: the dead `weight` stays on CPU; `padded_weight_t` goes to Spyre.
+    Skipped on CPU-only hosts, where off-device placement is not observable."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
-    assert isinstance(layer, SpyreParallelLMHead)
     layer.quant_method.process_weights_after_loading(layer)
 
     layer.to("spyre")

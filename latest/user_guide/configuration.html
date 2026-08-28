@@ -1874,12 +1874,12 @@ custom ops plus the Spyre Transformers backend (used for <code>model_impl="trans
 <p>The <code>pyproject.toml</code> includes several key build configurations:</p>
 <h3 id="build-configuration">Build Configuration<a class="headerlink" href="#build-configuration" title="Permanent link">&para;</a></h3>
 <div class="language-toml highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">[tool.uv]</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">build-constraint-dependencies</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.11.0"</span><span class="p">]</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">build-constraint-dependencies</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
 </span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">extra-build-variables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">vllm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">VLLM_TARGET_DEVICE</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"empty"</span><span class="p">,</span><span class="w"> </span><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"--fresh"</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
 </span></code></pre></div>
 <p>These settings ensure:</p>
 <ul>
-<li>All packages are built with the same PyTorch version (2.11.0)</li>
+<li>All packages are built with the same PyTorch version (2.13.0)</li>
 <li>vLLM is built with the <strong>empty</strong> backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on <code>vllm._C</code>
   (whose CPU-optimized ops we don't need; Spyre provides its own)</li>

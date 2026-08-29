@@ -14,9 +14,10 @@
 
 """Unit tests for SpyreShapeBucketer."""
 
-import pytest
 from dataclasses import FrozenInstanceError
 from unittest.mock import MagicMock
+
+import pytest
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,

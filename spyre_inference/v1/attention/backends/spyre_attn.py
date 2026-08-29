@@ -15,19 +15,14 @@
 """Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
 
-import os
-
 import torch
-
-from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.attention import attn_layer
-
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
-from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -40,6 +35,9 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
 
 logger = init_logger(__name__)
 

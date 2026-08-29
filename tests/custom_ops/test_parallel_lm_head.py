@@ -43,8 +43,9 @@ def test_spyre_parallel_lm_head_matches_reference(tp_group, num_tokens, vocab_si
     layer.weight, padded_weight_t is materialized in process_weights_after_loading,
     and quant_method.apply runs the Spyre matmul and eagerly unpads the logits.
     """
-    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
 
     torch.manual_seed(42)
 
@@ -146,11 +147,12 @@ def test_padded_weight_reflects_loaded_weight(
 @pytest.mark.parallel_lm_head
 def test_lm_head_oot_dispatch(tp_group):
     """Verify ParallelLMHead OOT registration: class swap + quant_method swap."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
     from spyre_inference.custom_ops.parallel_lm_head import (
         SpyreParallelLMHead,
         SpyreUnquantizedLMHeadMethod,
     )
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
 
@@ -172,6 +174,7 @@ def test_lm_head_fp8_config_accepted(tp_group):
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
     from spyre_inference.custom_ops.parallel_lm_head import (
         SpyreParallelLMHead,
         SpyreUnquantizedLMHeadMethod,
@@ -248,6 +251,7 @@ def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
     """
 
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
+
     from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
 
     torch.manual_seed(42)

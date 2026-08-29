@@ -49,7 +49,7 @@ import re
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 
 import requests
 from slack_sdk import WebClient

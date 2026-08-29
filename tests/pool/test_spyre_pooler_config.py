@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool

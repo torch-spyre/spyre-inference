@@ -29,7 +29,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 
 from .linear import SpyreTransposedWeightMethod
 
-
 logger = init_logger(__name__)
 
 

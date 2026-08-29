@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from vllm import LLM, RequestOutput, SamplingParams
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.config import AttentionConfig
-
 import pytest
+from vllm import LLM, RequestOutput, SamplingParams
+from vllm.config import AttentionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 
 @pytest.mark.uses_subprocess

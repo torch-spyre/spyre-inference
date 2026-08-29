@@ -28,7 +28,6 @@ import warnings
 
 import pytest
 import torch
-
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 # Derived from torch rather than torch-spyre internals so collection stays

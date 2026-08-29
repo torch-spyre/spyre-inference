@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-
 # When running this plugin on a Mac, we assume it's for local development
 # purposes. However, due to a compatibility issue with vLLM, which overrides
 # the Triton module with a placeholder, vLLM may fail to load on macOS. To

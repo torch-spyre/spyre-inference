@@ -18,10 +18,8 @@ import math
 from types import SimpleNamespace
 
 import pytest
-
 import torch
-
-from vllm.config import VllmConfig, ModelConfig, CacheConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationConfig
 
 

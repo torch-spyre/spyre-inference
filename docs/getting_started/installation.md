@@ -21,7 +21,7 @@ This command will:
 1. Install all project dependencies
 2. Build vLLM from source with the empty backend (`VLLM_TARGET_DEVICE=empty`, no device-specific C kernels)
 3. Build torch-spyre from source
-4. Install PyTorch 2.11.0 from the CPU-specific index
+4. Install PyTorch 2.13.0 from the CPU-specific index
 
 ## Verification
 

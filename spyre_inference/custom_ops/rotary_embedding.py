@@ -29,7 +29,6 @@ Only neox-style full rotary is supported; other configs raise ``NotImplementedEr
 """
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,

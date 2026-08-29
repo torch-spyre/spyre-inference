@@ -30,7 +30,6 @@ from argparse import ArgumentParser
 from typing import Any
 
 import clickhouse_connect
-
 from utils import read_benchmark_results
 
 logging.basicConfig(level=logging.INFO)

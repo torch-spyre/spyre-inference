@@ -31,7 +31,6 @@ from typing import cast
 
 import torch
 from torch.nn.parameter import Parameter
-
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import register_linear_kernel
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (

@@ -26,13 +26,12 @@ from collections.abc import Iterable
 from typing import cast
 
 import torch
-
-from spyre_inference.custom_ops.utils import convert
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
+
+from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 

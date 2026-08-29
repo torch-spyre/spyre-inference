@@ -35,7 +35,6 @@ import sys
 from collections.abc import Iterable
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
 

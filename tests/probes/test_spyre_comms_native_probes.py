@@ -32,9 +32,7 @@ plumbing lives in the `run_tp_probe` fixture in
 
 from __future__ import annotations
 
-
 import pytest
-
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
 

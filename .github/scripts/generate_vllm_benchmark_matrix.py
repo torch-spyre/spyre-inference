@@ -20,9 +20,9 @@ import logging
 import os
 from argparse import Action, ArgumentParser, Namespace
 from logging import warning
+from typing import Any
 
 import yaml
-from typing import Any
 
 logging.basicConfig(level=logging.INFO)
 

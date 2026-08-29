@@ -18,13 +18,13 @@ import warnings
 
 import pytest
 import torch
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 from spyre_inference.custom_ops.fp8_linear_kernel import (
     FP8_E4M3FN_MAX,
     SpyreFp8LinearKernel,
     register_spyre_fp8_linear_kernel,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available
 
 FP8_E4M3FN_MIN = -FP8_E4M3FN_MAX
 

@@ -74,7 +74,6 @@ import traceback
 import torch
 from torch.spyre import SpyreTensorLayout, get_device_dtype  # type: ignore[import-not-found]
 
-
 DEVICE = torch.device("spyre")
 
 # ---------------------------------------------------------------------------

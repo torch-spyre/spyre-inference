@@ -18,17 +18,17 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
+from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
-from vllm.utils.torch_utils import set_random_seed
+
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pytestmark = pytest.mark.attention
 
@@ -51,8 +51,8 @@ def configure_device(request, monkeypatch):
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
     import torch
-    from vllm.config.compilation import CompilationMode
     from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
 
     mode_name = request.param
     compilation_mode = getattr(CompilationMode, mode_name)
@@ -873,6 +873,50 @@ def test_spyre_attn_soft_cap(
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        # Chunked prefill: query_len > 1 over a non-empty prefix (context_len > 0).
+        # context_len on a block boundary vs. mid-block hits different boundary tiles.
+        pytest.param([(64, 256)], id="chunk_on_block_boundary(ctx=192)"),
+        pytest.param([(64, 200)], id="chunk_mid_block(ctx=136)"),
+        # Chunk not a multiple of QUERY_CHUNK_SIZE (32).
+        pytest.param([(48, 300)], id="unaligned_chunk(ctx=252)"),
+        pytest.param([(64, 256), (1, 256)], id="batch_chunk+decode"),
+    ],
+)
+def test_spyre_attn_chunked_prefill(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Chunked prefill: multi-token query attending over a pre-existing context."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
     ],
@@ -943,7 +987,7 @@ def test_block_size_validation():
     for proper stick alignment during torch.compile. This test verifies the
     validation raises ValueError for invalid block sizes and accepts valid ones.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
     model_config = ModelConfig(
@@ -1018,7 +1062,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     contract (KV transfer, future tests, Mamba zeroing via
     get_kv_cache_block_dim) will allocate a transposed cache.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
@@ -1026,6 +1070,7 @@ def test_kv_cache_shape_matches_runner_allocation():
         KVCacheGroupSpec,
         KVCacheTensor,
     )
+
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 

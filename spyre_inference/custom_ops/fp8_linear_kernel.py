@@ -33,6 +33,12 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import register_linear_kernel
+from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+    FP8ScaledMMLinearLayerConfig,
+    ScaledMMLinearKernel,
+)
 from vllm.platforms import PlatformEnum
 
 logger = init_logger(__name__)
@@ -167,158 +173,129 @@ def _pad_m(x: torch.Tensor, need_m: int) -> torch.Tensor:
     return torch.cat([x, pad], dim=0)
 
 
-try:
-    from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
-        FP8ScaledMMLinearKernel,
-        FP8ScaledMMLinearLayerConfig,
-        ScaledMMLinearKernel,
-    )
-except ImportError:
-    FP8ScaledMMLinearKernel = None  # type: ignore[misc, assignment]
+class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
+    @classmethod
+    def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+        return True, None
 
-
-if FP8ScaledMMLinearKernel is not None:
-
-    class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
-        @classmethod
-        def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
+    @classmethod
+    def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        gs = c.weight_quant_key.scale.group_shape
+        if gs.is_per_tensor() or gs.is_per_channel():
             return True, None
+        return False, "requires per-tensor or per-channel weight scales"
 
-        @classmethod
-        def can_implement(cls, c: FP8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
-            gs = c.weight_quant_key.scale.group_shape
-            if gs.is_per_tensor() or gs.is_per_channel():
-                return True, None
-            return False, "requires per-tensor or per-channel weight scales"
+    def __init__(self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]) -> None:
+        # Skip CUDA QuantFP8 in FP8ScaledMMLinearKernel.__init__.
+        self._per_token_act = c.activation_quant_key.scale.group_shape.is_per_token()
+        ScaledMMLinearKernel.__init__(self, c, layer_param_names)
 
-        def __init__(
-            self, c: FP8ScaledMMLinearLayerConfig, layer_param_names: Sequence[str]
-        ) -> None:
-            # Skip CUDA QuantFP8 in FP8ScaledMMLinearKernel.__init__.
-            self._per_token_act = c.activation_quant_key.scale.group_shape.is_per_token()
-            ScaledMMLinearKernel.__init__(self, c, layer_param_names)
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = cast(torch.Tensor, layer.weight)
+        weight_scale = cast(torch.Tensor, layer.weight_scale)
+        scale = _normalize_weight_scale(weight, weight_scale)
+        layer.weight = Parameter(weight.contiguous(), requires_grad=False)
+        layer.weight_scale = Parameter(scale, requires_grad=False)
 
-        def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            weight = cast(torch.Tensor, layer.weight)
-            weight_scale = cast(torch.Tensor, layer.weight_scale)
-            scale = _normalize_weight_scale(weight, weight_scale)
-            layer.weight = Parameter(weight.contiguous(), requires_grad=False)
-            layer.weight_scale = Parameter(scale, requires_grad=False)
+    def _weight_splits(
+        self, layer: torch.nn.Module, w: torch.Tensor
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        n_parts = _n_tiles(int(w.shape[1]))
+        splits = getattr(layer, "_fp8_n_weight_splits", None)
+        if splits is None or len(splits) != len(n_parts):
+            splits = _n_weight_splits(w, cast(torch.Tensor, layer.weight_scale), n_parts)
+            layer._fp8_n_weight_splits = splits
+        return splits
 
-        def _weight_splits(
-            self, layer: torch.nn.Module, w: torch.Tensor
-        ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-            n_parts = _n_tiles(int(w.shape[1]))
-            splits = getattr(layer, "_fp8_n_weight_splits", None)
-            if splits is None or len(splits) != len(n_parts):
-                splits = _n_weight_splits(w, cast(torch.Tensor, layer.weight_scale), n_parts)
-                layer._fp8_n_weight_splits = splits
-            return splits
+    # Not an untraceable op. The GEMM is already Dynamo/Inductor:
+    # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
+    # ``recursive=False`` keeps that nested compile. This wrapper stays
+    # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
+    # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
+    # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
+    # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
+    # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
+    # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
+    # Drop this when those shapes compile as one graph.
+    @torch._dynamo.disable(recursive=False)
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        orig_shape = x.shape
+        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+        orig_m = x2d.shape[0]
 
-        # Not an untraceable op. The GEMM is already Dynamo/Inductor:
-        # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
-        # ``recursive=False`` keeps that nested compile. This wrapper stays
-        # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
-        # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
-        # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
-        # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
-        # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
-        # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
-        # Drop this when those shapes compile as one graph.
-        @torch._dynamo.disable(recursive=False)
-        def apply_weights(
-            self,
-            layer: torch.nn.Module,
-            x: torch.Tensor,
-            bias: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            orig_shape = x.shape
-            x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-            orig_m = x2d.shape[0]
-
-            w = getattr(layer, "_fp16_for_qfp8wt", None)
-            if w is None or w.device != x2d.device:
-                w = _fp16_weight_for_qfp8wt(
-                    cast(torch.Tensor, layer.weight),
-                    cast(torch.Tensor, layer.weight_scale),
-                    x2d.device,
-                )
-                layer._fp16_for_qfp8wt = w
-
-            k, n = int(w.shape[0]), int(w.shape[1])
-            splits = self._weight_splits(layer, w)
-            wide = max(k, n) >= _WIDE or len(splits) > 1
-            if wide:
-                m_parts = _m_tiles(orig_m, k, n)
-                x2d = _pad_m(x2d, sum(m_parts))
-            else:
-                # 128-wide: pad M to a torch-spyre-tested size (1–4 or 128).
-                if orig_m not in _SMALL_M and orig_m % _M_ALIGN:
-                    x2d = _pad_m(x2d, ((orig_m + _M_ALIGN - 1) // _M_ALIGN) * _M_ALIGN)
-                m_parts = [x2d.shape[0]]
-
-            row_outs = []
-            i = 0
-            for mt in m_parts:
-                xi = x2d[i : i + mt].clone()
-                i += mt
-                col_outs = []
-                col = 0
-                for wj, sj in splits:
-                    ns = wj.shape[1]
-                    bj = None if bias is None else bias[col : col + ns].clone()
-                    col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
-                    col += ns
-                row_outs.append(_join(col_outs, dim=-1))
-            out = _join(row_outs, dim=0)[:orig_m]
-            if x.dim() > 2:
-                out = out.reshape(*orig_shape[:-1], out.shape[-1])
-            return out.clone()
-
-        def apply_scaled_mm(
-            self,
-            *,
-            A: torch.Tensor,
-            B: torch.Tensor,
-            out_dtype: torch.dtype,
-            As: torch.Tensor,
-            Bs: torch.Tensor,
-            bias: torch.Tensor | None,
-            output_shape: list,
-        ) -> torch.Tensor:
-            # Required: FP8ScaledMMLinearKernel marks this abstract. Unused on Spyre.
-            # Upstream Torch only overrides this hook because parent apply_weights
-            # quantizes then calls it with already-FP8 A/B. We replace apply_weights
-            # (tiling + in-graph qfp8ch/qfp8wt), so this is never entered. Do not
-            # wrap _fp8_mm here: that helper expects FP16 x/W, not pre-quantized A/B.
-            raise RuntimeError(
-                "SpyreFp8LinearKernel runs only through apply_weights "
-                "(tiled qfp8ch/qfp8wt graph). apply_scaled_mm is unused."
+        w = getattr(layer, "_fp16_for_qfp8wt", None)
+        if w is None or w.device != x2d.device:
+            w = _fp16_weight_for_qfp8wt(
+                cast(torch.Tensor, layer.weight),
+                cast(torch.Tensor, layer.weight_scale),
+                x2d.device,
             )
+            layer._fp16_for_qfp8wt = w
 
-    SpyreFp8DequantLinearKernel = SpyreFp8LinearKernel
+        k, n = int(w.shape[0]), int(w.shape[1])
+        splits = self._weight_splits(layer, w)
+        wide = max(k, n) >= _WIDE or len(splits) > 1
+        if wide:
+            m_parts = _m_tiles(orig_m, k, n)
+            x2d = _pad_m(x2d, sum(m_parts))
+        else:
+            # 128-wide: pad M to a torch-spyre-tested size (1–4 or 128).
+            if orig_m not in _SMALL_M and orig_m % _M_ALIGN:
+                x2d = _pad_m(x2d, ((orig_m + _M_ALIGN - 1) // _M_ALIGN) * _M_ALIGN)
+            m_parts = [x2d.shape[0]]
 
-else:
-    SpyreFp8LinearKernel = None
-    SpyreFp8DequantLinearKernel = None
+        row_outs = []
+        i = 0
+        for mt in m_parts:
+            xi = x2d[i : i + mt].clone()
+            i += mt
+            col_outs = []
+            col = 0
+            for wj, sj in splits:
+                ns = wj.shape[1]
+                bj = None if bias is None else bias[col : col + ns].clone()
+                col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
+                col += ns
+            row_outs.append(_join(col_outs, dim=-1))
+        out = _join(row_outs, dim=0)[:orig_m]
+        if x.dim() > 2:
+            out = out.reshape(*orig_shape[:-1], out.shape[-1])
+        return out.clone()
+
+    def apply_scaled_mm(
+        self,
+        *,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: torch.dtype,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None,
+        output_shape: list,
+    ) -> torch.Tensor:
+        # Required: FP8ScaledMMLinearKernel marks this abstract. Unused on Spyre.
+        # Upstream Torch only overrides this hook because parent apply_weights
+        # quantizes then calls it with already-FP8 A/B. We replace apply_weights
+        # (tiling + in-graph qfp8ch/qfp8wt), so this is never entered. Do not
+        # wrap _fp8_mm here: that helper expects FP16 x/W, not pre-quantized A/B.
+        raise RuntimeError(
+            "SpyreFp8LinearKernel runs only through apply_weights "
+            "(tiled qfp8ch/qfp8wt graph). apply_scaled_mm is unused."
+        )
+
+
+SpyreFp8DequantLinearKernel = SpyreFp8LinearKernel
 
 
 def register_spyre_fp8_linear_kernel() -> bool:
     global _REGISTERED
     if _REGISTERED:
         return True
-    if SpyreFp8LinearKernel is None:
-        logger.warning(
-            "Spyre FP8 linear kernel not registered: vLLM FP8 kernel base is unavailable"
-        )
-        return False
-    try:
-        from vllm.model_executor.kernels.linear import register_linear_kernel
-    except ImportError:
-        logger.warning(
-            "Spyre FP8 linear kernel not registered: register_linear_kernel is unavailable"
-        )
-        return False
     register_linear_kernel(SpyreFp8LinearKernel, PlatformEnum.OOT, kernel_type="fp8")
     _REGISTERED = True
     logger.info("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)")

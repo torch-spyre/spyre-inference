@@ -495,9 +495,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
 
         def _is_fp8_kernel(obj: object) -> bool:
-            if SpyreFp8LinearKernel is not None and isinstance(obj, SpyreFp8LinearKernel):
-                return True
-            return SpyreFp8LinearKernel is not None and isinstance(
+            return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
                 getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
             )
 

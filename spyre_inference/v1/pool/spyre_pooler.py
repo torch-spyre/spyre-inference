@@ -295,10 +295,10 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
         return False
 
     classifier = getattr(model, "classifier", None)
-    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul.
-    # Reranker / classifier heads stay float32, so those stay on CPU.
-    # Probe: test_spyre_fp32_linear_for_pooling_heads. Support may already
-    # exist on a newer torch-spyre; upgrades are blocked on spyre-comms#349.
+    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
+    # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
+    # stay on CPU. Probe: test_spyre_fp32_linear_for_pooling_heads. Stack
+    # upgrades that may already include this are blocked on spyre-comms#349.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )

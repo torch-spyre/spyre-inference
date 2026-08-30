@@ -891,20 +891,18 @@ def test_spyre_scalar_pow_cube(spyre_device):
 # 10. FP32 linear / batchmatmul (pooling classifier heads)
 # ---------------------------------------------------------------------------
 #
-# torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul, so
-# F.linear on float32 classifier / reranker heads stays on CPU
-# (configure_pooling_for_spyre). Support may already exist on a newer
-# torch-spyre; stack upgrades are blocked on spyre-comms#349.
-# No dedicated torch-spyre issue was found; file one for "add batchmatmul
-# to SPYRE_FP32_OPS" and put the number here.
+# torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
+# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
+# stays on CPU (configure_pooling_for_spyre). Stack upgrades that may
+# already include this are blocked on spyre-comms#349.
 
 
 _FP32_BMM_REASON = (
     "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
-    "batchmatmul / F.linear. Pooling classifier heads stay float32, so "
-    "configure_pooling_for_spyre keeps them on CPU. Stack upgrades that may "
-    "already include this are blocked on spyre-comms#349. When this XPASS-es, "
-    "drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
+    "float32, so configure_pooling_for_spyre keeps them on CPU. Stack upgrades "
+    "that may already include this are blocked on spyre-comms#349. When this "
+    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
 )
 
 

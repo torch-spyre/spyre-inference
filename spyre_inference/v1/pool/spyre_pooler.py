@@ -170,9 +170,7 @@ class SpyreMeanPool(MeanPool):
 
         total = sum(lens_list)
         if hidden_states.shape[0] > total:
-            hidden_states = select_rows(
-                hidden_states, torch.arange(total, dtype=torch.int64)
-            )
+            hidden_states = select_rows(hidden_states, torch.arange(total, dtype=torch.int64))
         if hidden_states.device.type == "spyre":
             hidden_states = convert(hidden_states, "cpu")
 

@@ -18,8 +18,8 @@ No Spyre hardware: builds minimal ``SequencePooler`` / ``DispatchPooler`` graphs
 and checks CLS/LAST/MEAN become Spyre forms. FP32 linear heads stay on CPU.
 
 Numeric MEAN tests here are host arithmetic (fp32 correctness, fp16
-accumulator, empty-batch dtype). On-device ``convert`` / ``index_select`` is
-``test_spyre_fallback_probes.test_spyre_mean_pool_on_device_matches_cpu_fp32``.
+accumulator, empty-batch dtype). One packed ``convert`` on a Spyre tensor is
+``test_spyre_fallback_probes.test_spyre_mean_pool_packed_d2h_matches_cpu_fp32``.
 """
 
 from __future__ import annotations
@@ -120,8 +120,8 @@ def test_configure_pooling_no_pooler_returns_false():
 def test_spyre_mean_pool_matches_per_seq_mean():
     """Host arithmetic: varlen [3, 2] tokens vs a CPU mean per sequence.
 
-    Does not exercise Spyre ``index_select`` / ``convert``. See
-    ``test_spyre_mean_pool_on_device_matches_cpu_fp32``.
+    Does not exercise Spyre ``convert``. See
+    ``test_spyre_mean_pool_packed_d2h_matches_cpu_fp32``.
     """
     from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
 
@@ -240,3 +240,32 @@ def test_spyre_mean_pool_skewed_lengths_do_not_pad_to_max():
         ]
     )
     torch.testing.assert_close(out, expected)
+
+
+def test_spyre_mean_pool_ignores_trailing_pad_rows():
+    """Encoder pad past ``sum(lens)`` must not enter the mean."""
+    from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
+
+    hidden = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [99.0, 99.0],
+            [99.0, 99.0],
+        ],
+        dtype=torch.float32,
+    )
+    lens = torch.tensor([2], dtype=torch.int64)
+
+    class _Cursor:
+        prompt_lens_cpu = lens
+
+        def is_partial_prefill(self) -> bool:
+            return False
+
+    class _Meta:
+        def get_pooling_cursor(self):
+            return _Cursor()
+
+    out = SpyreMeanPool().forward(hidden, _Meta())
+    torch.testing.assert_close(out, hidden[:2].mean(0, keepdim=True))

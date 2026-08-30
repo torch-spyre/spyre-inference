@@ -460,7 +460,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST/MEAN on Spyre; FP32 linear heads stay on CPU.
+        # CLS/LAST gather on Spyre; MEAN copies packed activations once.
+        # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
@@ -727,8 +728,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Pool on the activation device; copy only the pooled vectors back.
 
         FP32 linear heads keep the pooler on CPU and use
-        ``GPUModelRunner._pool``. On-Spyre CLS/LAST/MEAN crop with
-        ``index_select`` and copy back with ``convert``.
+        ``GPUModelRunner._pool``. CLS/LAST crop with ``index_select``.
+        MEAN copies the packed activations once and reduces on the host.
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"

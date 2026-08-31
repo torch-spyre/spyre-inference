@@ -14,8 +14,7 @@
 
 
 from vllm.logger import init_logger
-
-from spyre_inference.v1.kv_offload.base import (
+from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingWorker,

@@ -40,6 +40,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreMeanPool,
     SpyreNormalize,
     configure_pooling_for_spyre,
+    mean_pooler_owns_packed_hidden_states,
 )
 
 _SPYRE = torch.device("cpu")  # configure only needs a device label for logging
@@ -115,6 +116,30 @@ def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
 
 def test_configure_pooling_no_pooler_returns_false():
     assert configure_pooling_for_spyre(nn.Module(), _SPYRE) is False
+
+
+def test_mean_pooler_owns_packed_hidden_states():
+    """Runner crop is MEAN's job; CLS/LAST and mixed dispatch keep it."""
+    assert mean_pooler_owns_packed_hidden_states(None) is False
+    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(MeanPool())) is True
+    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(SpyreMeanPool())) is True
+    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(CLSPool())) is False
+    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(LastPool())) is False
+    assert (
+        mean_pooler_owns_packed_hidden_states(DispatchPooler({"embed": _embed_pooler(MeanPool())}))
+        is True
+    )
+    assert (
+        mean_pooler_owns_packed_hidden_states(
+            DispatchPooler(
+                {
+                    "embed": _embed_pooler(MeanPool()),
+                    "score": _embed_pooler(CLSPool()),
+                }
+            )
+        )
+        is False
+    )
 
 
 def test_spyre_mean_pool_matches_per_seq_mean():

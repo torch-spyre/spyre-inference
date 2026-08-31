@@ -189,6 +189,29 @@ class SpyreMeanPool(MeanPool):
         return pooled / denom
 
 
+def _iter_pooling_methods(pooler: nn.Module):
+    if isinstance(pooler, SequencePooler):
+        yield pooler.pooling
+    elif isinstance(pooler, DispatchPooler):
+        for sub in pooler.poolers_by_task.values():
+            yield from _iter_pooling_methods(sub)
+
+
+def mean_pooler_owns_packed_hidden_states(pooler: nn.Module | None) -> bool:
+    """True when every pooling method is MEAN and will crop + D2H itself.
+
+    The runner's prefix ``index_select`` is for CLS/LAST (on-device gather
+    plus the ``shape[0] == num_scheduled_tokens`` invariant). MEAN already
+    drops compile padding and copies the packed activations in ``forward``,
+    so that gather would copy every scheduled row and then D2H the same
+    bytes. Mixed CLS+MEAN under ``DispatchPooler`` stays on the runner crop.
+    """
+    if pooler is None:
+        return False
+    methods = list(_iter_pooling_methods(pooler))
+    return bool(methods) and all(isinstance(m, MeanPool) for m in methods)
+
+
 class SpyreNormalize(PoolerNormalize):
     """L2 via ``rsqrt``; ``clamp_min`` missing. ``finfo.tiny`` keeps fp16 zeros."""
 

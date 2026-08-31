@@ -18,6 +18,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
+    mean_pooler_owns_packed_hidden_states,
     select_rows,
 )
 
@@ -25,5 +26,6 @@ __all__ = [
     "TOKEN_POOLING_TASKS",
     "configure_pooling_for_spyre",
     "copy_pooler_output_to_cpu",
+    "mean_pooler_owns_packed_hidden_states",
     "select_rows",
 ]

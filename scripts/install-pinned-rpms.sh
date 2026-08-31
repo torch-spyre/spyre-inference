@@ -20,6 +20,7 @@ Usage: $0 [options]
   -p, --prefix DIR    unpack destination (default: \$SPYRE_LIBS or ~/spyre-libs)
   -c, --cache DIR     RPM download cache (default: ~/.cache/spyre-rpms)
   -f, --force         re-unpack even if the destination already matches the lock
+  -r, --rebuild       rebuild torch-spyre against the unpacked libraries
   -h, --help          show this message
 
 Requires ARTIFACTORY_TOKEN plus either ARTIFACTORY_BASE_URL/ARTIFACTORY_RPM_PATH
@@ -37,6 +38,7 @@ LOCK="${REPO_ROOT}/spyre-rpms.lock"
 PREFIX="${SPYRE_LIBS:-${HOME}/spyre-libs}"
 CACHE="${RPM_CACHE_DIR:-${HOME}/.cache/spyre-rpms}"
 FORCE=0
+REBUILD=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         -p|--prefix) PREFIX="$2"; shift 2 ;;
         -c|--cache) CACHE="$2"; shift 2 ;;
         -f|--force) FORCE=1; shift ;;
+        -r|--rebuild) REBUILD=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
@@ -103,6 +106,22 @@ export _IBM_AIU_SETUP=
 source /etc/profile.d/ibm-aiu-setup.sh
 EOF
 
+# A wheel built against a different RPM set aborts at import with an undefined
+# ibm-* symbol. uv keys its built-wheel cache on the git rev alone, so the cache
+# clean is what forces an actual recompile.
+if [[ $REBUILD -eq 1 ]]; then
+    echo
+    echo "rebuilding torch-spyre against ${BASE_INSTALL_DIR}"
+    (
+        cd "$REPO_ROOT"
+        # shellcheck disable=SC1090
+        source "${PREFIX}/env.sh"
+        export SEN_COMMON_HEADERS="${SENTIENT_BASE_INSTALL_DIR}/runtime/include"
+        uv cache clean torch-spyre
+        uv sync --group dev --reinstall-package torch-spyre
+    )
+fi
+
 cat <<EOF
 
 unpacked ${#RPMS[@]} package(s) into ${PREFIX}
@@ -113,3 +132,16 @@ then confirm the pinned libraries are the ones resolved:
 
   ldd "\$(command -v dxp_standalone)" | grep libdxp
 EOF
+
+if [[ $REBUILD -eq 0 ]]; then
+    cat <<EOF
+
+torch-spyre must be rebuilt against these libraries or it will fail at import
+with an undefined flex::/senlib:: symbol. Re-run with --rebuild, or:
+
+  source ${PREFIX}/env.sh
+  export SEN_COMMON_HEADERS="\${SENTIENT_BASE_INSTALL_DIR}/runtime/include"
+  uv cache clean torch-spyre
+  uv sync --group dev --reinstall-package torch-spyre
+EOF
+fi

@@ -13,13 +13,14 @@
 # limitations under the License.
 
 
+from vllm.logger import init_logger
+
 from spyre_inference.v1.kv_offload.base import (
     GPULoadStoreSpec,
     LoadStoreSpec,
     OffloadingWorker,
     TransferResult,
 )
-from vllm.logger import init_logger
 
 # M1-S1: In progress on other branch:
 
@@ -29,13 +30,25 @@ logger = init_logger(__name__)
 
 class SpyreOffloadingWorker(OffloadingWorker):
     def submit_store(job_id, src_spec: GPULoadStoreSpec, dst_spec: LoadStoreSpec) -> bool:
+        """
+        Start an async copy for device to host.
+        """
         pass
 
     def submit_load(job_id, src_spec: LoadStoreSpec, dst_spec: GPULoadStoreSpec) -> bool:
+        """
+        Start an async copy for host to device.
+        """
         pass
 
     def get_finished(self) -> list[TransferResult]:
+        """
+        Returns all the TransferResults the jobs that are completed.
+        """
         pass
 
     def wait(job_ids: set[int]) -> None:
+        """
+        Block until those specific job ids are done.
+        """
         pass

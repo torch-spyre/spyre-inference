@@ -34,7 +34,6 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
-
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)

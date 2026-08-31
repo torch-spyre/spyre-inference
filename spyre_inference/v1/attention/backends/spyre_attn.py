@@ -1123,6 +1123,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return self._decode_fns[key]
 
     def _bucketed_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+        # Off by default: the bucketed matmul pads every sequence row up to the
+        # bucket width, and that overhead is uncharacterised at the smallest
+        # bucket (num_seqs == _MIN_SEQS_BUCKET), where there is no headroom.
+        # Set SPYRE_BUCKETED_DECODE=1 to restore the path.
+        if not envs.SPYRE_BUCKETED_DECODE:
+            return False
         # Layer 0's builder gates on max_query_len, sliding_window, and the
         # bucket lattice; we add ALiBi / soft-cap which the bucketed kernel
         # doesn't implement.

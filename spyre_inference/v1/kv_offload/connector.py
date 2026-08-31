@@ -134,11 +134,11 @@ def _unpack_paged_cache(layer_name: str, cache: object) -> tuple[torch.Tensor, t
             f"{type(cache).__name__}"
         )
     k_pages, v_pages = cache
-    for name, pages in (("k_pages", k_pages), ("v_pages", v_pages)):
-        if not isinstance(pages, torch.Tensor):
-            raise TypeError(
-                f"layer {layer_name!r}: {name} is {type(pages).__name__}, expected a Tensor"
-            )
+    if not isinstance(k_pages, torch.Tensor) or not isinstance(v_pages, torch.Tensor):
+        raise TypeError(
+            f"layer {layer_name!r}: expected Tensor k/v pages, got "
+            f"{type(k_pages).__name__}/{type(v_pages).__name__}"
+        )
     if k_pages.shape != v_pages.shape or k_pages.dtype != v_pages.dtype:
         raise ValueError(
             f"layer {layer_name!r}: k/v pages disagree — "

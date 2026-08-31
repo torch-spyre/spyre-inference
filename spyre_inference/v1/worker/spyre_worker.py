@@ -35,6 +35,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
@@ -43,7 +44,7 @@ logger = init_logger(__name__)
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:
-    requested_devices = os.environ.get("SPYRE_DEVICES")
+    requested_devices = envs.SPYRE_DEVICES
     if not requested_devices:
         return "unknown"
 

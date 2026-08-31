@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import torch
-
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from .utils import convert

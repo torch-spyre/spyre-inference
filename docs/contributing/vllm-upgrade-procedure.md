@@ -180,7 +180,7 @@ If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kern
 Once each category is green individually, run the full suite to catch any cross-test interactions:
 
 ```bash
-uv run --no-sync pytest --no-header
+uv run --no-sync pytest --no-header --upstream
 ```
 
 Roughly 16 minutes on a Spyre host. Then format:

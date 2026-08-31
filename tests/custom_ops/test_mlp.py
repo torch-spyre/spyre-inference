@@ -30,7 +30,6 @@ def test_merged_column_matches_reference(
 ):
     """A fused gate_up_proj on Spyre matches the upstream CPU F.linear."""
     import torch.nn as nn
-
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
@@ -96,6 +95,7 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     CPU-side unfusing.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
+
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
 
     dtype = torch.float16
@@ -155,6 +155,7 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
     transposed (Wᵀ) so the forward GEMM is the Spyre-fast `x @ A`.
     """
     from vllm.model_executor.layers.linear import RowParallelLinear
+
     from spyre_inference.custom_ops.linear import SpyreRowParallelLinear
 
     dtype = torch.float16
@@ -221,6 +222,7 @@ def test_replicated_matches_reference(tp_group, num_tokens, input_size, output_s
     torch-spyre's batchmatmul cannot stickify a size-1 output dimension.
     """
     from vllm.model_executor.layers.linear import ReplicatedLinear
+
     from spyre_inference.custom_ops.linear import SpyreReplicatedLinear
 
     dtype = torch.float16
@@ -268,6 +270,7 @@ def test_linear_oot_registration(tp_group):
         ReplicatedLinear,
         RowParallelLinear,
     )
+
     from spyre_inference.custom_ops.linear import (
         SpyreColumnParallelLinear,
         SpyreMergedColumnParallelLinear,

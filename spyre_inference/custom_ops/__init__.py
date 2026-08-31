@@ -16,16 +16,20 @@
 
 from functools import lru_cache
 
-from . import activation  # noqa: F401
-from . import gemma_rms_norm  # noqa: F401
-from . import logits_processor  # noqa: F401
-from . import parallel_lm_head
-from . import rms_norm
-from . import rotary_embedding
-from . import linear
-from . import utils
-from . import vocab_parallel_embedding  # noqa: F401
 from vllm.logger import init_logger
+
+from . import (
+    activation,  # noqa: F401
+    gemma_rms_norm,  # noqa: F401
+    linear,
+    logits_processor,  # noqa: F401
+    parallel_lm_head,
+    rms_norm,
+    rotary_embedding,
+    utils,
+    vocab_parallel_embedding,  # noqa: F401
+)
+from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
 
 logger = init_logger(__name__)
 
@@ -33,5 +37,6 @@ logger = init_logger(__name__)
 @lru_cache(maxsize=1)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
+    register_spyre_fp8_linear_kernel()
     utils.register()
     vocab_parallel_embedding.register()

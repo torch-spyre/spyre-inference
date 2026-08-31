@@ -350,7 +350,6 @@ def test_mistral_format_repo_parses_to_a_config_hf_cannot_build_from(tmp_path):
     config.json, vLLM checks Mistral first and ends at a bare PretrainedConfig."""
     from transformers import AutoModel
     from transformers.configuration_utils import PretrainedConfig
-
     from vllm.transformers_utils.config import get_config
 
     hf_config = get_config(_model_repo(tmp_path, mistral_format=True), trust_remote_code=False)

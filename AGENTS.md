@@ -22,8 +22,9 @@
 
 ```bash
 uv sync --group dev            # dev install with test deps
-uv run pytest                  # all tests (cached in ~/.cache/vllm-upstream-tests)
-uv run pytest -m upstream      # upstream vLLM compat tests
+uv run pytest                  # local tests only
+uv run pytest -m upstream      # upstream vLLM compat tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest --upstream       # local + upstream
 bash format.sh                 # format (prek via uvx)
 uv run ty                      # type check
 ```
@@ -34,9 +35,9 @@ Runs are slow (~3 min) due to vLLM startup — prefer single-test invocations wh
 uv run pytest 'tests/attention/test_spyre_attn.py::test_spyre_attn[<id>]' -m "not upstream"
 ```
 
-Prefer `-m "not upstream"` for subsets — broad selectors otherwise match tests pulled in by `spyre-testing-plugin`. Tests needing real hardware guard themselves with `spyre_available()` and skip on CPU-only hosts, so "all green" on a non-Spyre machine does **not** mean the change works.
+Upstream vLLM tests are opt-in: they are only cloned and collected when the `-m` expression names the `upstream` marker (a negative mention like `-m "not upstream"` doesn't count) or `--upstream` is passed, so a bare `pytest` won't pull them into a broad selector. Tests needing real hardware guard themselves with `spyre_available()` and skip on CPU-only hosts, so "all green" on a non-Spyre machine does **not** mean the change works.
 
-Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`). Env vars: `SKIP_UPSTREAM_TESTS=1`, `VLLM_COMMIT=<sha>`, `UPSTREAM_TESTS_PATHS=<comma-separated paths>`. After a vLLM bump, resync deps with `uv run sync-upstream-test-deps`.
+Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`), which is loaded by the `addopts` entry in `pyproject.toml` — not a global `pytest11` entry point — so it stays inert in sibling repos sharing the venv (e.g. a local `torch-spyre` checkout). Env vars: `SKIP_UPSTREAM_TESTS=1` (hard off-switch, overrides `--upstream`), `VLLM_COMMIT=<sha>`, `UPSTREAM_TESTS_PATHS=<comma-separated paths>`. After a vLLM bump, resync deps with `uv run sync-upstream-test-deps`.
 
 ## Spyre-Specific Constraints
 

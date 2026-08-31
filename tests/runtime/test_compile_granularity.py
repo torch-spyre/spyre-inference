@@ -26,7 +26,6 @@ import types
 import pytest
 import torch
 import torch.nn as nn
-
 from vllm.config import CompilationMode
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.utils import PPMissingLayer

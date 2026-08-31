@@ -19,7 +19,6 @@ from __future__ import annotations
 import gc
 
 import pytest
-
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
 

@@ -18,17 +18,17 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
+from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
-from vllm.utils.torch_utils import set_random_seed
+
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available
 
 pytestmark = pytest.mark.attention
 
@@ -51,8 +51,8 @@ def configure_device(request, monkeypatch):
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
     import torch
-    from vllm.config.compilation import CompilationMode
     from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
 
     mode_name = request.param
     compilation_mode = getattr(CompilationMode, mode_name)
@@ -436,6 +436,14 @@ def _run_spyre_attn_test(
     output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+    # The attention layer, not forward(), owns the KV write (see attn_layer.py).
+    attn_impl.do_kv_cache_update(
+        None,
+        key_src,
+        value_src,
+        kv_cache,
+        convert(attn_metadata.slot_mapping, cache_device),
+    )
     # The impl expects q/k/v already on device, as in production (QKV runs
     # on-device); the CPU `query` still feeds the reference below.
     attn_impl.forward(
@@ -449,7 +457,8 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Kernel cache keys are (num_blocks, padded_query_len, store_mode, store_len).
+        # Kernel cache keys are
+        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather).
         fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
@@ -558,6 +567,7 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+        pytest.param([(1, 128), (1, 128)], id="batch_decode_shared_variant(2seqs)"),
         pytest.param([(1, 128), (1, 256), (1, 128)], id="probe_decode_3seqs_kv128"),
     ],
 )
@@ -863,6 +873,50 @@ def test_spyre_attn_soft_cap(
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        # Chunked prefill: query_len > 1 over a non-empty prefix (context_len > 0).
+        # context_len on a block boundary vs. mid-block hits different boundary tiles.
+        pytest.param([(64, 256)], id="chunk_on_block_boundary(ctx=192)"),
+        pytest.param([(64, 200)], id="chunk_mid_block(ctx=136)"),
+        # Chunk not a multiple of QUERY_CHUNK_SIZE (32).
+        pytest.param([(48, 300)], id="unaligned_chunk(ctx=252)"),
+        pytest.param([(64, 256), (1, 256)], id="batch_chunk+decode"),
+    ],
+)
+def test_spyre_attn_chunked_prefill(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Chunked prefill: multi-token query attending over a pre-existing context."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
     ],
@@ -933,7 +987,7 @@ def test_block_size_validation():
     for proper stick alignment during torch.compile. This test verifies the
     validation raises ValueError for invalid block sizes and accepts valid ones.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
 
     model_config = ModelConfig(
@@ -1008,7 +1062,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     contract (KV transfer, future tests, Mamba zeroing via
     get_kv_cache_block_dim) will allocate a transposed cache.
     """
-    from vllm.config import VllmConfig, ModelConfig, CacheConfig
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
     from vllm.v1.kv_cache_interface import (
         AttentionSpec,
@@ -1016,6 +1070,7 @@ def test_kv_cache_shape_matches_runner_allocation():
         KVCacheGroupSpec,
         KVCacheTensor,
     )
+
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
     from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -1362,11 +1417,11 @@ def test_reshape_and_cache_scatter(
     with warnings.catch_warnings(record=True) as caught:
         # "always": torch-spyre shows each fallback warning only once per session.
         warnings.simplefilter("always", FallbackWarning)
-        attn_impl._reshape_and_cache(
+        attn_impl.do_kv_cache_update(
+            None,
             key_src,
             value_src,
-            k_actual,
-            v_actual,
+            SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual),
             convert(torch.tensor(slots, dtype=torch.int64), cache_device),
         )
 
@@ -1385,3 +1440,211 @@ def test_reshape_and_cache_scatter(
         import gc
 
         gc.collect()
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    ["cpu", "spyre"],
+    ids=["device_cpu", "device_spyre"],
+    indirect=True,
+)
+def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device: str):
+    """The traced scatter: correct pages and no CPU fallback."""
+    set_random_seed(0)
+    num_tokens, num_kv_heads, head_size, block_size, num_pages = 4, 8, 128, 64, 3
+    cache_device = torch.device(configure_device)
+    slots = [0, block_size + 5, 2 * block_size + 1, 7]
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+
+    def fresh_pages():
+        return torch.full(
+            (num_pages, block_size, num_kv_heads, head_size), -7.0, dtype=torch.float16
+        )
+
+    k_expected, v_expected = fresh_pages(), fresh_pages()
+    for t, slot in enumerate(slots):
+        k_expected[slot // block_size][slot % block_size] = key[t]
+        v_expected[slot // block_size][slot % block_size] = value[t]
+
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
+
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+
+    kv_cache = SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual)
+    # Production primes the slot-major views at bind time, before any tracing.
+    attn_impl.kv_slot_views(kv_cache)
+
+    def scatter(key, value, slot_mapping):
+        attn_impl.do_kv_cache_update(None, key, value, kv_cache, slot_mapping)
+
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        torch.compile(scatter, dynamic=False)(
+            convert(key, cache_device),
+            convert(value, cache_device),
+            convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+        )
+
+    fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not any("index_copy" in m or "index_put" in m for m in fallback_msgs), (
+        f"the traced KV scatter fell back to CPU: {fallback_msgs}"
+    )
+
+    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
+
+    if configure_device == "spyre":
+        del k_actual, v_actual
+        import gc
+
+        gc.collect()
+
+
+class _StubAttentionLayer:
+    """Enough of `Attention` for `attn_layer.install` to decide and patch."""
+
+    def __init__(self, attn_type: str):
+        self.attn_type = attn_type
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.kv_sharing_target_layer_name = None
+        self.query_quant = None
+        self.calculate_kv_scales = False
+        self.kv_cache: list[torch.Tensor] = []
+
+
+def test_install_patches_layers_not_the_attention_class():
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention import attn_layer
+
+    class_forward = Attention.forward
+    decoder = _StubAttentionLayer(AttentionType.DECODER)
+    encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
+
+    holder = attn_layer.install([decoder, encoder])
+
+    assert Attention.forward is class_forward
+    assert decoder.spyre_slots is holder
+    assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
+    assert not hasattr(encoder, "spyre_slots")
+    assert not hasattr(encoder, "forward")
+
+    # No cache bound, so there is no device to mirror onto and nothing to publish.
+    holder.publish_null(8)
+    assert holder.slots is None
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param(
+            [(1, 64)] * 8,
+            id="probe_bucket(8_1)",
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
+            id="bucket_pad(N=5_bucket=8)",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (1, 512), (1, 128), (1, 384)],
+            id="bucket_exact(N=8)",
+        ),
+        pytest.param(
+            [
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+            ],
+            id="bucket_pad(N=9_bucket=16)",
+        ),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (1, 512), (1, 128), (1, 384)] * 4,
+            id="bucket_exact(N=32)",
+        ),
+    ],
+)
+def test_spyre_attn_bucketed_decode_correctness(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Bucketed decode fast path: bit-exact vs the per-seq reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 512)], id="single_seq(fallback)"),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 128)],
+            id="below_min_seqs(N=3_fallback)",
+        ),
+        pytest.param(
+            [(32, 256), (64, 512)],
+            id="prefill_max_query_len_gt_1(fallback)",
+        ),
+        pytest.param(
+            [(1, 256), (32, 256), (1, 256), (32, 256)],
+            id="mixed_decode_prefill(fallback)",
+        ),
+    ],
+)
+def test_spyre_attn_bucketed_decode_fallback(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Precondition-violating batches: fast path silently falls back."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )

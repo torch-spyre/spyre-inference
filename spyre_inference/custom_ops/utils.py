@@ -22,7 +22,6 @@ dtype conversion.
 from functools import lru_cache
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 

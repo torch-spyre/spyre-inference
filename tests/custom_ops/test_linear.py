@@ -140,6 +140,7 @@ def test_unquantized_layers_get_spyre_method(tp_group):
     slow-but-correct F.linear method untouched.
     """
     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
     from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
 
     hidden, inter = 128, 256

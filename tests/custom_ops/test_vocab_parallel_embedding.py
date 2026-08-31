@@ -40,11 +40,12 @@ import torch.nn.functional as F
 @pytest.mark.vocab_parallel_embedding
 def test_vocab_parallel_embedding_oot_dispatch(tp_group):
     """VocabParallelEmbedding(...) instantiates SpyreVocabParallelEmbedding."""
-    from spyre_inference.custom_ops.vocab_parallel_embedding import (
-        SpyreVocabParallelEmbedding,
-    )
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.vocab_parallel_embedding import (
+        SpyreVocabParallelEmbedding,
     )
 
     layer = VocabParallelEmbedding(128, 64, params_dtype=torch.float16)
@@ -91,8 +92,9 @@ def test_fake_tp2_forward_matches_reference(
     outside its shard, so the sum over ranks equals the full-vocab
     reference. Real-collective correctness is in e2e/test_distributed_tp2.py.
     """
-    import spyre_inference.custom_ops.vocab_parallel_embedding as svpe
     from vllm.model_executor.layers import vocab_parallel_embedding as upstream
+
+    import spyre_inference.custom_ops.vocab_parallel_embedding as svpe
 
     monkeypatch.setattr(svpe, "tensor_model_parallel_all_reduce", lambda x: x)
 

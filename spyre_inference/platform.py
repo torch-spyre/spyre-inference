@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-
 # When running this plugin on a Mac, we assume it's for local development
 # purposes. However, due to a compatibility issue with vLLM, which overrides
 # the Triton module with a placeholder, vLLM may fail to load on macOS. To
@@ -304,6 +303,11 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def supports_fp8(cls) -> bool:
+        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        return True
+
+    @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
         is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
@@ -362,6 +366,47 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _maybe_pad_intermediate_size(cls, vllm_config: VllmConfig) -> None:
+        """Round hf_config.intermediate_size up to a 64-multiple when it is not
+        stick-aligned, stashing the original as ``_spyre_orig_intermediate_size``.
+
+        A SwiGLU MLP whose ``intermediate_size`` is not a multiple of the fp16
+        stick fuses gate+up and slices the up half at an unaligned offset, which
+        Spyre inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3`` read
+        ``config.intermediate_size`` directly, so overriding the config value
+        before the model is built widens the modules with no per-class shim.
+
+        Dense SwiGLU only (SiLU/swish is unique to it); MoE and other MLPs are
+        left unpadded, as the loader can't reach their projections. Zero-padding
+        is inert for SwiGLU (see ``custom_ops.mlp_pad``).
+        """
+        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
+
+        model_config = vllm_config.model_config
+        hf_config = model_config.hf_config
+        orig = getattr(hf_config, "intermediate_size", None)
+        if not orig or orig % BLOCK_SIZE == 0:
+            return
+        moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
+        is_moe = any(getattr(hf_config, a, None) for a in moe_attrs)
+        act = getattr(hf_config, "hidden_act", None) or getattr(
+            hf_config, "hidden_activation", None
+        )
+        if is_moe or act not in ("silu", "swish"):
+            return
+
+        padded = ((orig + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+            cfg._spyre_orig_intermediate_size = orig
+            cfg.intermediate_size = padded
+        logger.info(
+            "Padding MLP intermediate_size %d -> %d for Spyre stick alignment "
+            "(original preserved as _spyre_orig_intermediate_size).",
+            orig,
+            padded,
+        )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -375,6 +420,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Pad attention head_dim up to a stick-aligned size on the native path.
         cls._maybe_pad_head_dim(vllm_config)
+
+        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
+        cls._maybe_pad_intermediate_size(vllm_config)
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The Spyre paged attention backend requires 64-element stick alignment for
@@ -402,6 +450,12 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"Spyre does not support data_parallel_size > 1 "
                 f"(got {parallel_config.data_parallel_size})."
             )
+
+        # Clamp CPU threading env vars before workers fork so they inherit the
+        # corrected values. DP is rejected above, so world_size is the worker count.
+        from spyre_inference.threading_config import configure_threading
+
+        configure_threading(parallel_config.world_size)
 
         # ---- worker ----
         if parallel_config.worker_cls == "auto":

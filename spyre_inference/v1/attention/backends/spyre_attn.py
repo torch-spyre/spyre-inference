@@ -369,8 +369,9 @@ def _create_compilable_bucketed_decode_attn(
         # q: [num_seqs * KV, QPK, 1, D]
         # k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache)
         # block_ids: [num_blocks * num_seqs] flat int32, block-major
-        # mask_by_block: [num_blocks, num_seqs * KV, 1, 1, block_size], already
-        #   broadcast across KV heads by the builder (#654).
+        # mask_by_block: [num_blocks, num_seqs * KV, 1, block_size], already
+        #   broadcast across KV heads by the builder (#654); 4-D so the per-block
+        #   dim-0 slice stays layout-legal.
         # block_ids is block-major (see the builder), so the gather is already
         # contiguous in [num_blocks, num_seqs, block_size, KV, D] order. No permute:
         # a dim-0 slice of this is a stride-preserving sub-region of a contiguous
@@ -392,9 +393,10 @@ def _create_compilable_bucketed_decode_attn(
             # into one axis so the matmul stays 4-D.
             k_page = k_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
             v_page = v_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
-            # Already [num_seqs * KV, 1, 1, block_size]: the builder broadcasts the
-            # mask across KV heads once per step (#654), so no in-graph expand.
-            mask_tile = mask_by_block[i]
+            # [num_seqs * KV, 1, block_size] from the builder, which broadcasts
+            # across KV heads once per step (#654). One unsqueeze gives the
+            # [.., 1, 1, block_size] the scores add wants.
+            mask_tile = mask_by_block[i].unsqueeze(1)
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = scores + mask_tile
@@ -528,7 +530,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     query_row_ids_dev: torch.Tensor | None = None
     block_ids_padded_cpu: torch.Tensor | None = None  # [B_seqs * B_blocks] int32
     block_ids_padded_dev: torch.Tensor | None = None
-    mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, 1, block_size] fp16
+    mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, block_size] fp16
     mask_by_block_dev: torch.Tensor | None = None
 
     @property
@@ -968,7 +970,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
-                # kernel input shape [B_blocks, B_seqs * KV, 1, 1, block_size].
+                # kernel input shape [B_blocks, B_seqs * KV, 1, block_size].
                 mask_bs_bb = torch.full(
                     (b_seqs, b_blocks, block_size),
                     float("-inf"),
@@ -978,12 +980,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     n_use = min(num_active[s], b_blocks)
                     for b in range(n_use):
                         mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
+                # 4-D, not 5-D: the kernel slices this along dim 0 per block, and a
+                # dim-0 slice of a 5-D base fails torch-spyre layout propagation
+                # ("Incompatible host_size and dim_order"). The kernel adds the
+                # remaining singleton axis with one unsqueeze.
                 mask_by_block_cpu = (
                     mask_bs_bb.permute(1, 0, 2)
                     .unsqueeze(2)
-                    .unsqueeze(3)
-                    .expand(b_blocks, b_seqs, self.num_kv_heads, 1, block_size)
-                    .reshape(b_blocks, b_seqs * self.num_kv_heads, 1, 1, block_size)
+                    .expand(b_blocks, b_seqs, self.num_kv_heads, block_size)
+                    .reshape(b_blocks, b_seqs * self.num_kv_heads, 1, block_size)
                     .contiguous()
                 )
 

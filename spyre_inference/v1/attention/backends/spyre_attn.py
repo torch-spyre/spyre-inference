@@ -130,9 +130,8 @@ class SpyrePagedKVCache(NamedTuple):
 
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
     """Slot-axis-outermost layout. The default tiled layout spreads the slot index
-    across two device dims, so a 1-KV-head cache cannot be work-divided under the
-    256 MB per-core span limit; it also makes the indirect store write to the wrong
-    rows (torch-spyre#3705)."""
+    across two device dims, making the indirect store write to the wrong rows
+    (torch-spyre#3705)."""
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
     eps = get_elem_in_stick(dtype)

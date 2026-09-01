@@ -320,6 +320,33 @@ class TorchSpyrePlatform(CpuPlatform):
         # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
         return True
 
+    @staticmethod
+    def _resolve_head_dim(hf_config) -> int | None:
+        """Read ``hf_config.head_dim`` even when it is a per-layer attribute.
+
+        transformers 5.x marks attention attributes (including ``head_dim``) as
+        per-layer on heterogeneous models (e.g. gemma-4-31B, whose ``layer_types``
+        mixes sliding and full attention). Reading the global ``config.head_dim``
+        then raises ``AmbiguousGlobalPerLayerAttributeError`` (a ``RuntimeError``,
+        so a ``getattr`` default does not swallow it). Resolve per layer instead
+        and require the value be uniform, because the pad below rewrites a single
+        global ``head_dim``: a genuinely per-layer-varying head_dim cannot be
+        expressed that way.
+        """
+        if not getattr(hf_config, "is_heterogeneous", False) or (
+            "head_dim" not in (hf_config.per_layer_attributes or set())
+        ):
+            return getattr(hf_config, "head_dim", None)
+
+        values = {layer.head_dim for layer in hf_config.per_layer_config}
+        if len(values) > 1:
+            raise NotImplementedError(
+                f"Spyre head_dim padding needs a single head_dim, but this model "
+                f"varies it per layer ({sorted(values)}). Per-layer head_dim "
+                f"padding is not yet supported."
+            )
+        return values.pop()
+
     @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
@@ -351,7 +378,7 @@ class TorchSpyrePlatform(CpuPlatform):
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
+        orig = cls._resolve_head_dim(hf_config) or hidden_size // num_heads
         if orig % 128 == 0:
             return
 
@@ -366,6 +393,9 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
         for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
             cfg._spyre_orig_head_dim = orig
+            # `head_dim` is a per-layer attribute on heterogeneous configs; a bare
+            # assignment sets the global value, which the resolve above already
+            # verified is uniform across layers, so the global write is correct.
             cfg.head_dim = padded
         # ModelConfig snapshots head_size into model_arch_config in __post_init__,
         # before this hook runs; keep it in sync or get_head_size() (and the KV

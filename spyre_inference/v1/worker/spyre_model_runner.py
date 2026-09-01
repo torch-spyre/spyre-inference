@@ -83,8 +83,6 @@ from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
-    mean_pooler_owns_packed_hidden_states,
-    select_rows,
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import SpyreShapeBucketer
 
@@ -373,8 +371,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
-        # MEAN crops + D2Hs packed activations in SpyreMeanPool.forward.
-        self._mean_owns_packed_hidden_states = False
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -468,13 +464,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # CLS/LAST gather on Spyre; MEAN copies packed activations once.
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
-        self._mean_owns_packed_hidden_states = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
-            if self._pooling_on_spyre:
-                self._mean_owns_packed_hidden_states = mean_pooler_owns_packed_hidden_states(
-                    getattr(self.model, "pooler", None)
-                )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
@@ -780,9 +771,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Pool on the activation device; copy only the pooled vectors back.
 
         FP32 linear heads keep the pooler on CPU and use
-        ``GPUModelRunner._pool``. CLS/LAST crop with ``index_select``.
-        MEAN crops + D2Hs the packed activations in ``SpyreMeanPool`` — skip
-        the runner gather so we do not copy every scheduled row twice.
+        ``GPUModelRunner._pool``. Do not crop here: Spyre dim-0 slices are
+        unsafe, and each method gathers itself (CLS/LAST rows, MEAN prefix).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
@@ -809,16 +799,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "runs on Spyre."
                 )
 
-        # Crop via index_select — Spyre dim-0 slice views are unsafe.
-        # MEAN already drops compile padding and D2Hs in SpyreMeanPool.forward.
-        if not self._mean_owns_packed_hidden_states:
-            hidden_states = convert(hidden_states, self._spyre_device)
-            if hidden_states.shape[0] != num_scheduled_tokens:
-                hidden_states = select_rows(
-                    hidden_states, torch.arange(num_scheduled_tokens, dtype=torch.int64)
-                )
-
-        # Mirror GPUModelRunner._pool after crop. Build the cursor on CPU:
+        # Mirror GPUModelRunner._pool after the GPU ``[:n]`` crop. Build the
+        # cursor on CPU:
         # upstream does ``cumsum[1:] - 1`` for last_token_indices; that offset-1
         # view is not stick-aligned on Spyre (copy_from_d2d fails). SpyreCLS/Last
         # only read host ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.

@@ -27,10 +27,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise.heads import (
-    ClassifierPoolerHead,
-    EmbeddingPoolerHead,
-)
+from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
@@ -42,7 +39,6 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreMeanPool,
     SpyreNormalize,
     configure_pooling_for_spyre,
-    mean_pooler_owns_packed_hidden_states,
 )
 
 _SPYRE = torch.device("cpu")  # configure only needs a device label for logging
@@ -53,10 +49,6 @@ def _embed_pooler(pooling) -> SequencePooler:
         pooling=pooling,
         head=EmbeddingPoolerHead(activation=PoolerNormalize()),
     )
-
-
-def _classify_pooler(pooling) -> SequencePooler:
-    return SequencePooler(pooling=pooling, head=ClassifierPoolerHead())
 
 
 def _model_with_pooler(pooler: nn.Module) -> nn.Module:
@@ -122,32 +114,6 @@ def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
 
 def test_configure_pooling_no_pooler_returns_false():
     assert configure_pooling_for_spyre(nn.Module(), _SPYRE) is False
-
-
-def test_mean_pooler_owns_packed_hidden_states():
-    """Runner crop is MEAN's job; CLS/LAST and mixed dispatch keep it."""
-    assert mean_pooler_owns_packed_hidden_states(None) is False
-    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(MeanPool())) is True
-    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(SpyreMeanPool())) is True
-    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(CLSPool())) is False
-    assert mean_pooler_owns_packed_hidden_states(_embed_pooler(LastPool())) is False
-    assert (
-        mean_pooler_owns_packed_hidden_states(DispatchPooler({"embed": _embed_pooler(MeanPool())}))
-        is True
-    )
-    assert (
-        mean_pooler_owns_packed_hidden_states(
-            DispatchPooler(
-                {
-                    "embed": _embed_pooler(MeanPool()),
-                    # EmbeddingPoolerHead only supports embed; classify+CLS
-                    # is the valid mixed dispatch DispatchPooler will accept.
-                    "classify": _classify_pooler(CLSPool()),
-                }
-            )
-        )
-        is False
-    )
 
 
 def test_spyre_mean_pool_matches_per_seq_mean():

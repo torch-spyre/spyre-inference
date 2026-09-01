@@ -25,7 +25,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,

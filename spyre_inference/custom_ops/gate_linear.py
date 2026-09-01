@@ -21,7 +21,6 @@ in fp16 throughout.
 """
 
 import torch
-
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 
 

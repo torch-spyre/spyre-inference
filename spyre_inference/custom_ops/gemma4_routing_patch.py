@@ -30,7 +30,6 @@ Two upstream seams do not lower on Spyre:
 from typing import Any, cast
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.router.custom_routing_router import (
     CustomRoutingRouter,

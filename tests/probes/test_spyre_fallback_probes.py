@@ -29,7 +29,6 @@ from contextlib import contextmanager
 import pytest
 import torch
 import torch.nn.functional as F
-
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
 

@@ -35,10 +35,10 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
-
-from spyre_inference.custom_ops.head_pad import original_head_dim
 from vllm.logger import init_logger
 from vllm.model_executor.models.transformers import TransformersForCausalLM
+
+from spyre_inference.custom_ops.head_pad import original_head_dim
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

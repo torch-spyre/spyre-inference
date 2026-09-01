@@ -21,7 +21,6 @@ References:
 import math
 
 import torch
-
 from vllm.model_executor.layers.activation import NewGELU
 
 

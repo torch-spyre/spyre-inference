@@ -67,16 +67,15 @@ import sys
 import tempfile
 import time
 import tomllib
-import torch.distributed as dist
-import torch.testing
-
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.testing
+import yaml
 from _pytest.mark.expression import IDENT_PREFIX, Expression
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-import yaml
 
 from spyre_testing_plugin.models import (
     AllowEntry,
@@ -644,69 +643,66 @@ def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply YAML-based filtering to upstream tests and reorder tests."""
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
-    if not upstream_tests_base:
-        # Still reorder tests even if not running upstream tests
-        _reorder_tests_by_name(items)
-        return
+    if upstream_tests_base:
+        upstream_tests_base = Path(upstream_tests_base).resolve()
+        upstream_repo_root = upstream_tests_base.parent
+        file_configs = {
+            (upstream_repo_root / fc.rel_path).resolve(): fc for fc in _UPSTREAM_CONFIG.files
+        }
 
-    upstream_tests_base = Path(upstream_tests_base).resolve()
-    upstream_repo_root = upstream_tests_base.parent
-    file_configs = {
-        (upstream_repo_root / fc.rel_path).resolve(): fc for fc in _UPSTREAM_CONFIG.files
-    }
+        upstream_marker = pytest.mark.upstream
 
-    upstream_marker = pytest.mark.upstream
+        for item in items:
+            test_path = Path(item.fspath).resolve()
+            if not test_path.is_relative_to(upstream_tests_base):
+                continue
 
-    for item in items:
-        test_path = Path(item.fspath).resolve()
-        if not test_path.is_relative_to(upstream_tests_base):
-            continue
+            item.add_marker(upstream_marker)
 
-        item.add_marker(upstream_marker)
+            fc = _find_file_config(test_path, file_configs)
+            if fc is None:
+                item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
+                continue
 
-        fc = _find_file_config(test_path, file_configs)
-        if fc is None:
-            item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
-            continue
+            test_name = item.originalname or item.name
+            if _matches_block_list(test_name, fc.block_list):
+                item.add_marker(pytest.mark.skip(reason=f"blocked by {_YAML_FILENAME}"))
+                continue
 
-        test_name = item.originalname or item.name
-        if _matches_block_list(test_name, fc.block_list):
-            item.add_marker(pytest.mark.skip(reason=f"blocked by {_YAML_FILENAME}"))
-            continue
+            allow_entry = _find_allow_entry(test_name, fc.allow_list)
 
-        allow_entry = _find_allow_entry(test_name, fc.allow_list)
+            if allow_entry:
+                for tag in allow_entry.tags:
+                    item.add_marker(getattr(pytest.mark, tag))
 
-        if allow_entry:
-            for tag in allow_entry.tags:
-                item.add_marker(getattr(pytest.mark, tag))
+            if allow_entry is None:
+                item.add_marker(pytest.mark.skip(reason="not in allow_list"))
+                continue
 
-        if allow_entry is None:
-            item.add_marker(pytest.mark.skip(reason="not in allow_list"))
-            continue
+            if _should_skip_params(item, allow_entry):
+                item.add_marker(pytest.mark.skip(reason="param skipped"))
+                continue
 
-        if _should_skip_params(item, allow_entry):
-            item.add_marker(pytest.mark.skip(reason="param skipped"))
-            continue
+            if allow_entry.mode == "skip":
+                item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
+                continue
 
-        if allow_entry.mode == "skip":
-            item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
-            continue
+            if allow_entry.mode == "xfail":
+                item.add_marker(pytest.mark.xfail(strict=False))
+            elif allow_entry.mode == "xfail_strict":
+                item.add_marker(pytest.mark.xfail(strict=True))
 
-        if allow_entry.mode == "xfail":
-            item.add_marker(pytest.mark.xfail(strict=False))
-        elif allow_entry.mode == "xfail_strict":
-            item.add_marker(pytest.mark.xfail(strict=True))
+            # Store tolerances on item for fixture access
+            if allow_entry.tolerances:
+                item._spyre_tolerances = allow_entry.tolerances
+            # Inject fixtures for tests that have fixture_names defined
+            for fixture_name in allow_entry.fixture_names:
+                item.fixturenames.append(fixture_name)
 
-        # Store tolerances on item for fixture access
-        if allow_entry.tolerances:
-            item._spyre_tolerances = allow_entry.tolerances
-        # Inject fixtures for tests that have fixture_names defined
-        for fixture_name in allow_entry.fixture_names:
-            item.fixturenames.append(fixture_name)
-
-    # Reorder tests so that tests with "uses_subprocess" marker run first
+    # Must run for local selections too: the shard jobs run `not upstream`, so gating
+    # this on upstream_tests_base makes the partition a silent no-op (every shard runs
+    # the whole suite).
     _reorder_tests_by_name(items)
-
     _apply_attention_shard(config, items)
 
 
@@ -883,7 +879,7 @@ def _spyre_session_config():
 
     type(current_platform)._enum = PlatformEnum.OOT
 
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.forward_context import set_forward_context
 
@@ -897,10 +893,10 @@ def _spyre_session_config():
 
 
 def _spyre_default_vllm_config(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
-    from vllm.platforms import PlatformEnum, current_platform
     from vllm.forward_context import set_forward_context
+    from vllm.platforms import PlatformEnum, current_platform
 
     monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
 
@@ -982,8 +978,8 @@ def tp_group(_distributed_init):
     Tests that create vLLM linear layers should use this fixture instead of
     (or in addition to) `default_vllm_config`.
     """
-    from vllm.distributed.parallel_state import GroupCoordinator
     import vllm.distributed.parallel_state as ps
+    from vllm.distributed.parallel_state import GroupCoordinator
 
     group = GroupCoordinator(
         group_ranks=[[0]],

@@ -32,11 +32,14 @@ os.environ.setdefault("LOCAL_WORLD_SIZE", "1")
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
 os.environ.setdefault("MASTER_PORT", "29500")
 
+# workaround for https://github.com/torch-spyre/torch-spyre/issues/4083 in VF-mode
+os.environ.setdefault("HBM_POOL_PLANNING", "0")
+
 import torch
 from torch.profiler import ProfilerActivity, profile
 from vllm import LLM, SamplingParams
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.config import AttentionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 llm = LLM(
     model="ibm-granite/granite-3.3-8b-instruct",

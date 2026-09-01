@@ -21,12 +21,11 @@ os.environ["TORCH_SENDNN_LOG"] = "DEBUG"
 # os.environ["DTLOG_LEVEL"] = "debug"
 
 import torch
-from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 #########################################
 # debugging
-
 import torch._logging
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 # Enable graph code printing
 # torch._logging.set_logs(graph_code=True)

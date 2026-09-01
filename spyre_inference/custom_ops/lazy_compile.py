@@ -27,7 +27,6 @@ from collections.abc import Callable
 from typing import TypeVar, cast
 
 import torch
-
 from vllm.config import CompilationMode, get_cached_compilation_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform

@@ -11,7 +11,7 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "torch-spyre",
+    "torch-spyre[cpsat]",
     "vllm>=0.27.1,<0.28",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
@@ -72,6 +72,10 @@ override-dependencies = [
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "pyarrow; platform_machine not in 's390x, ppc64le'",
 
+    # torch-spyre's [cpsat] solver needs ortools, which has no ppc64le/s390x wheels
+    # (nor aarch64 across our Python range); its own extra only drops s390x. Pin x86_64.
+    "ortools>=9.0; platform_machine == 'x86_64'",
+
     # Runtime pin here must match the `uv.extra-build-dependencies.torch-spyre` pin.
     # Compatible with torch-spyre's `~=2.13.0`
     "torch==2.13.0",
@@ -107,7 +111,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "e6aa948241db265ccd69e44dbb825691a4cc423c" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "3358f39e91e2a34e855d488b1b9fce3c2f0d4c2f" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -179,6 +183,8 @@ select = [
     "E",
     # Pyflakes
     "F",
+    # isort
+    "I",
     # pyupgrade
     "UP",
     # flake8-bugbear

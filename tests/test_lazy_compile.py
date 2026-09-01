@@ -25,7 +25,6 @@ import types
 import pytest
 import torch
 import torch.nn as nn
-
 from vllm.config import CompilationMode
 
 from spyre_inference.custom_ops import lazy_compile

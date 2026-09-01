@@ -35,13 +35,13 @@ The `pyproject.toml` includes several key build configurations:
 
 ```toml
 [tool.uv]
-build-constraint-dependencies = ["torch==2.11.0"]
+build-constraint-dependencies = ["torch==2.13.0"]
 extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
 ```
 
 These settings ensure:
 
-- All packages are built with the same PyTorch version (2.11.0)
+- All packages are built with the same PyTorch version (2.13.0)
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`
   (whose CPU-optimized ops we don't need; Spyre provides its own)

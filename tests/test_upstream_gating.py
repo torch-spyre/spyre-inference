@@ -19,7 +19,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from spyre_testing_plugin.pytest_plugin import _markexpr_selects_upstream
 
 REQUESTS_UPSTREAM = [

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert

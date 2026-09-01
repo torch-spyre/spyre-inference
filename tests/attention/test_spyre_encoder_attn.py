@@ -16,10 +16,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-
+from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
-from vllm.utils.torch_utils import set_random_seed
+
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -28,7 +29,6 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
 )
-from spyre_testing_plugin.pytest_plugin import spyre_available
 
 # extra `encoder_attention` mark so CI can split this into its own job
 # because these tests are pretty slow.
@@ -53,8 +53,8 @@ def configure_device(request, monkeypatch):
 def configure_compilation(request, monkeypatch):
     """Configure torch.compile mode for tests."""
     import torch
-    from vllm.config.compilation import CompilationMode
     from vllm.config import get_cached_compilation_config
+    from vllm.config.compilation import CompilationMode
 
     mode_name = request.param
     compilation_mode = getattr(CompilationMode, mode_name)

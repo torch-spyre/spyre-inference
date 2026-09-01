@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )

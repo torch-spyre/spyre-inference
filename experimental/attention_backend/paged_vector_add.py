@@ -21,9 +21,8 @@ os.environ["SPYRE_INDUCTOR_LOG_LEVEL"] = "DEBUG"
 # os.environ["DTLOG_LEVEL"] = "debug"
 
 import torch
-from torch.profiler import profile, ProfilerActivity
-
 import torch._logging
+from torch.profiler import ProfilerActivity, profile
 
 # Enable graph code printing
 # torch._logging.set_logs(graph_code=True)

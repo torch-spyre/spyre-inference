@@ -16,22 +16,41 @@
 
 from __future__ import annotations
 
-import torch
+from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
 
 
-def install_spyre_patches() -> None:
-    """Scale Gemma-4 embeddings by a Python float instead of the 0-d ``normalizer``.
+def force_text_backbone(engine_args: EngineArgs) -> None:
+    """Default gemma-4 to its text-only backbone (it ships multimodal).
 
-    ``model.to("spyre")`` leaves ``Gemma4SelfDecoderLayers``' aliased ``normalizer`` on a
-    0-d CPU tensor that torch-spyre cannot tile ("does not have FixedTiledLayout"). A
-    scalar multiply lowers to ``aten.mul.Scalar`` with no 0-d operand and is numerically
-    identical. The float is precomputed in ``__init__`` because ``forward`` is
-    ``@support_torch_compile`` — computing it there would lift the 0-d tensor back into
-    the traced graph.
+    Sets ``hf_overrides["architectures"]`` so ``create_model_config`` resolves
+    ``Gemma4ForCausalLM`` instead of the multimodal default. Skipped when the user
+    already pinned an architecture (dict or callable ``hf_overrides``).
+    """
+    ov = engine_args.hf_overrides
+    user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
+    if "gemma-4" in (engine_args.model or "").lower() and not user_arch and isinstance(ov, dict):
+        overrides = cast("dict[str, Any]", ov)
+        overrides["architectures"] = ["Gemma4ForCausalLM"]
+        logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
+
+
+def install_spyre_patches() -> None:
+    """Register Gemma-4's aliased ``normalizer`` as a buffer so it follows the model.
+
+    ``Gemma4SelfDecoderLayers`` stores ``normalizer`` as a plain tensor attribute
+    aliased from ``Gemma4Model``'s buffer. ``model.to("spyre")`` rebinds the parent's
+    buffer to a device tensor but leaves this alias on CPU, so the compiled
+    ``embed_input_ids`` feeds a 0-d CPU tensor into Inductor, which has no notion of a
+    live CPU graph input. Re-registering it as a buffer restores the parent's documented
+    intent (move with the model, interact with torch.compile) and needs no change to the
+    embedding math. A device-side 0-d scalar lowers fine.
     """
     from vllm.model_executor.models.gemma4 import Gemma4SelfDecoderLayers
 
@@ -42,15 +61,13 @@ def install_spyre_patches() -> None:
 
     def __init__(self, *args, **kwargs) -> None:
         orig_init(self, *args, **kwargs)
-        self._spyre_normalizer_scale = float(self.normalizer)
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids) * self._spyre_normalizer_scale
+        normalizer = self.normalizer
+        del self.normalizer
+        self.register_buffer("normalizer", normalizer, persistent=False)
 
     Gemma4SelfDecoderLayers.__init__ = __init__  # ty: ignore[invalid-assignment]
-    Gemma4SelfDecoderLayers.embed_input_ids = embed_input_ids  # ty: ignore[invalid-assignment]
     Gemma4SelfDecoderLayers._spyre_patched = True
     logger.info(
-        "Spyre: Gemma-4 embeddings scaled by a precomputed Python float "
-        "(avoids a 0-d CPU normalizer tensor, eager and torch.compile)."
+        "Spyre: Gemma-4 normalizer registered as a buffer so it follows the model to "
+        "device (upstream aliases it as a plain CPU attribute)."
     )

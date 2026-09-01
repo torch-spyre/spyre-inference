@@ -22,7 +22,6 @@ References:
 """
 
 import torch
-
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareGemmaRMSNorm

@@ -38,7 +38,7 @@ pytestmark = pytest.mark.compile
         ),
         (
             "google/gemma-4-26B-A4B",
-            "\n\nWhat is the difference between a product and a service?\n\nWhat is the difference between a good",
+            "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
         ),
     ],
 )

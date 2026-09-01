@@ -115,6 +115,14 @@ def select_rows(hidden_states: torch.Tensor, row_indices_cpu: torch.Tensor) -> t
     # Spyre has no int64 index kernel. convert() H2D is blocking
     # (copy_tensor non_blocking=False); no extra synchronize.
     indices = convert(flat_idx.to(torch.int32), hidden_states.device)
+
+    # hidden_states is typically a slice of a larger persistent buffer (e.g. one
+    # request's rows out of the batch buffer). Slicing (as opposed to narrow())
+    # leaves view metadata pointing into the parent buffer that the native
+    # scheduler can't map for index_select ("0_identity" DtException), even
+    # though the slice is already contiguous -- .contiguous() is then a no-op
+    # and doesn't help. .clone() forces a real copy that clears it.
+    hidden_states = hidden_states.clone()
     return torch.index_select(hidden_states, 0, indices)
 
 

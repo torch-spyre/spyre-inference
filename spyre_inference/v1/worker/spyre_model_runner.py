@@ -350,6 +350,51 @@ class _SpyreModelWrapper:
         hidden_states = convert(hidden_states, device=self._spyre_device)
         return self._model.compute_logits(hidden_states, *args, **kwargs)
 
+    def embed_multimodal(self, **kwargs):
+        """Move multimodal encoder inputs (e.g. pixel_values) onto Spyre.
+
+        _execute_mm_encoder calls this directly on `self.model`, bypassing
+        __call__, so it needs its own CPU <-> Spyre boundary conversion.
+        `group_and_batch_mm_kwargs` batches multimodal kwargs onto
+        self.device=CPU, but the vision tower's weights live on Spyre.
+        """
+
+        def _to_spyre(t):
+            return convert(t, device=self._spyre_device) if isinstance(t, torch.Tensor) else t
+
+        def _to_cpu(t):
+            return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
+
+        kwargs_converted = {key: _to_spyre(val) for key, val in kwargs.items()}
+        result = self._model.embed_multimodal(**kwargs_converted)
+        return tree_map(_to_cpu, result)
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        """Move input_ids/is_multimodal/multimodal_embeddings onto Spyre.
+
+        gpu_model_runner._preprocess calls this directly on `self.model`,
+        bypassing __call__, so it needs its own CPU <-> Spyre boundary
+        conversion: input_ids and is_multimodal are CPU buffers, and
+        multimodal_embeddings come back from embed_multimodal already
+        converted to CPU, but the text embedding table (and the merge with
+        multimodal_embeddings) lives on Spyre.
+        """
+
+        def _to_spyre(t):
+            return convert(t, device=self._spyre_device) if isinstance(t, torch.Tensor) else t
+
+        def _to_cpu(t):
+            return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
+
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        is_multimodal = _to_spyre(is_multimodal)
+        multimodal_embeddings = tree_map(_to_spyre, multimodal_embeddings)
+
+        result = self._model.embed_input_ids(
+            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
+        return tree_map(_to_cpu, result)
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 

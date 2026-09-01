@@ -20,9 +20,12 @@ from vllm.logger import init_logger
 
 from . import (
     activation,  # noqa: F401
+    conv,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
+    layer_norm,
     linear,
     logits_processor,  # noqa: F401
+    multimodal_merge,
     parallel_lm_head,
     rms_norm,
     rotary_embedding,
@@ -40,3 +43,5 @@ def register_all():
     register_spyre_fp8_linear_kernel()
     utils.register()
     vocab_parallel_embedding.register()
+    layer_norm.register()
+    multimodal_merge.register()

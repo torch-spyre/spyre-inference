@@ -28,6 +28,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _build_query_row_tables,
 )
 
 pytestmark = pytest.mark.attention
@@ -471,7 +472,7 @@ def _run_spyre_attn_test(
 
     if expect_fused_store is not None:
         # Kernel cache keys are
-        # (num_blocks, padded_query_len, store_mode, store_len, needs_gather).
+        # (num_blocks, padded_query_len, store_mode, needs_gather).
         fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
@@ -1663,3 +1664,184 @@ def test_spyre_attn_bucketed_decode_fallback(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
     )
+
+
+def _padded_mask_metadata(
+    seq_lens: list[tuple[int, int]],
+    block_size: int = 64,
+    sliding_window: int | None = None,
+    num_query_heads: int = 32,
+    num_kv_heads: int = 8,
+    head_size: int = 128,
+):
+    """Build metadata on CPU for a list of (query_len, kv_len) sequences."""
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [kv for _, kv in seq_lens]
+    num_seqs = len(seq_lens)
+
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
+    max_num_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_table = torch.arange(num_seqs * max_num_blocks, dtype=torch.int32).reshape(
+        num_seqs, max_num_blocks
+    )
+    slot_mapping = torch.arange(sum(query_lens), dtype=torch.int64)
+
+    return _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=kv_lens_tensor,
+        query_start_loc=cu_query_lens,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        sliding_window=sliding_window,
+    )
+
+
+def _seq_mask(metadata, seq_idx: int) -> torch.Tensor:
+    """Concatenate a sequence's per-block mask tiles into [aligned_q, num_blocks*block]."""
+    return torch.cat(metadata.attention_mask_tiles[seq_idx], dim=-1)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(7, 256)], id="prefill_q7_pads_to_32"),
+        pytest.param([(1, 256)], id="decode_q1_clamp_lower_bound"),
+        pytest.param([(33, 512)], id="prefill_q33_pads_to_64"),
+        pytest.param([(32, 256)], id="prefill_q32_exact_no_padding"),
+    ],
+)
+def test_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
+    """Padded query rows carry row query_len-1's mask, not a fully-masked row."""
+    torch.set_default_device("cpu")
+    query_len = seq_lens[0][0]
+    metadata = _padded_mask_metadata(seq_lens)
+
+    aligned = metadata.aligned_max_query_len
+    if query_len == 1:
+        # A decode-only batch skips query padding entirely.
+        assert aligned == 1
+        return
+    assert aligned >= query_len
+
+    mask = _seq_mask(metadata, 0)
+    last_real = mask[query_len - 1]
+    for row in range(query_len, aligned):
+        assert torch.equal(mask[row], last_real), (
+            f"padded row {row} differs from last real row {query_len - 1}"
+        )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(7, 256)], id="prefill_q7"),
+        pytest.param([(1, 320)], id="decode_q1"),
+        pytest.param([(40, 512)], id="prefill_q40"),
+    ],
+)
+def test_padded_mask_rows_are_not_fully_masked(default_vllm_config, seq_lens):
+    """No mask row is fully masked: attn = tile_output / tile_sum would be NaN."""
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata(seq_lens)
+    mask = _seq_mask(metadata, 0)
+    mask_min = torch.finfo(torch.float16).min
+
+    open_per_row = (mask > mask_min).sum(dim=-1)
+    assert (open_per_row > 0).all(), f"fully-masked row(s) at {(open_per_row == 0).nonzero()}"
+
+
+def test_padded_mask_rows_isolated_across_sequences(default_vllm_config):
+    """A packed batch's padded rows never take a neighbour's mask."""
+    torch.set_default_device("cpu")
+    seq_lens = [(7, 256), (33, 512), (1, 128)]
+    metadata = _padded_mask_metadata(seq_lens)
+    aligned = metadata.aligned_max_query_len
+
+    for seq_idx, (query_len, _) in enumerate(seq_lens):
+        mask = _seq_mask(metadata, seq_idx)
+        last_real = mask[query_len - 1]
+        for row in range(query_len, aligned):
+            assert torch.equal(mask[row], last_real), (
+                f"seq {seq_idx} padded row {row} does not match its own row {query_len - 1}"
+            )
+
+
+def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
+    """The gather's row table and the mask clamp padded rows to the same row."""
+    torch.set_default_device("cpu")
+    seq_lens = [(7, 256), (33, 512)]
+    metadata = _padded_mask_metadata(seq_lens)
+    aligned = metadata.aligned_max_query_len
+
+    row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
+    starts = metadata.query_start_loc[:-1].tolist()
+
+    for seq_idx, (query_len, _) in enumerate(seq_lens):
+        rows = row_tables[seq_idx][:aligned].tolist()
+        expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
+        assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(7, 256)], id="prefill_q7"),
+        pytest.param([(33, 512)], id="prefill_q33"),
+    ],
+)
+def test_sliding_window_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
+    """Same padded-row invariant on the sliding-window path (_build_single_tile)."""
+    torch.set_default_device("cpu")
+    query_len = seq_lens[0][0]
+    metadata = _padded_mask_metadata(seq_lens, sliding_window=128)
+
+    aligned = metadata.aligned_max_query_len
+    mask = _seq_mask(metadata, 0)
+    last_real = mask[query_len - 1]
+    for row in range(query_len, aligned):
+        assert torch.equal(mask[row], last_real), (
+            f"padded row {row} differs from last real row {query_len - 1}"
+        )
+
+
+def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
+    """Clamping padded rows forward must not change which blocks stay active."""
+    torch.set_default_device("cpu")
+    block_size, window = 64, 128
+    query_len, kv_len = 7, 512
+    metadata = _padded_mask_metadata(
+        [(query_len, kv_len)], block_size=block_size, sliding_window=window
+    )
+
+    context_len = kv_len - query_len
+    first_active = max(0, context_len - window + 1) // block_size
+    num_blocks = (kv_len + block_size - 1) // block_size
+    assert metadata.active_block_indices is not None
+    assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
+
+
+def test_attn_fn_cache_key_is_shape_only(default_vllm_config):
+    """Query lengths in the same bucket must share one compiled kernel."""
+    torch.set_default_device("cpu")
+    impl = SpyreAttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=8,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    impl._get_attn_fn(4, 32, store_mode="index", needs_gather=True)
+    impl._get_attn_fn(4, 32, store_mode="index", needs_gather=True)
+    assert list(impl._attn_fns) == [(4, 32, "index", True)]
+
+    impl._get_attn_fn(4, 64, store_mode="index", needs_gather=True)
+    assert len(impl._attn_fns) == 2

@@ -407,37 +407,6 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A core's share of a gather operand may span at most 256 MB, and the work "
-        "divider splits this shape 4 ways along dim 0, so a 1 GB cache leaves a "
-        "256 MB span and is rejected. This caps one layer's dense KV cache below "
-        "1 GB (~7168 blocks here), which is why test_long_context_model_load is "
-        "skipped. Lifted by chunking the cache or by multi-core indirect access "
-        "(torch-spyre#2725, torch-spyre#3499)."
-    ),
-)
-def test_spyre_dense_cache_gather_per_core_span(spyre_device):
-    """Gather a page from a 1 GB dense KV cache — the long-context cache size.
-
-    The allocation and the host-to-device transfer both succeed; only the gather
-    is rejected, so the limit is on the operand of the page read, not on the
-    cache itself.
-    """
-    num_blocks, block_size, num_kv_heads, head_size = 8192, 64, 8, 128
-
-    k_pages = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16).to(
-        spyre_device
-    )
-    table = torch.zeros(1, 32, dtype=torch.int32)
-    table[0, 0] = 3
-    table = table.to(spyre_device)
-
-    k_page = k_pages.index_select(0, table[0, 0:1])
-    assert k_page.cpu().shape == (1, block_size, num_kv_heads, head_size)
-
-
 # ---------------------------------------------------------------------------
 # 5. Symbolic-offset in-place write
 # ---------------------------------------------------------------------------

@@ -335,29 +335,66 @@ def _create_compilable_page_attn(
     return specialized_paged_attn_kernel
 
 
-def _create_compilable_bucketed_decode_attn(num_seqs: int, num_blocks: int):
-    """Bucketed decode-only kernel factory. Closes over num_seqs and num_blocks;
-    inputs are pre-gathered / pre-padded / pre-masked by _run_bucketed_decode_dispatch.
+def _create_compilable_bucketed_decode_attn(
+    num_seqs: int,
+    num_blocks: int,
+    num_kv_heads: int,
+    block_size: int,
+    head_size: int,
+):
+    """Bucketed decode-only kernel factory. Closes over the batch/page shape.
 
-    Spyre constraints: per-block Python list (not .select) so the block index
-    stays at Dynamo-trace time (torch-spyre would emit Mod(d0, num_blocks) sticks
-    otherwise); (num_seqs, num_kv_heads) folded into one leading axis so the
-    matmul stays 4-D (lower_bmm rejects 5-D).
+    The kernel gathers K/V from the page cache *itself*, one `index_select` per
+    tensor for the whole padded batch, then slices per block inside the graph.
+    Doing the gather in-graph is what keeps this free of torch-spyre#3770: an
+    `index_select` result is a fresh offset-0 allocation, and an in-graph slice of
+    it is owned by the inductor rather than handed in as a graph input with a
+    nonzero `storage_offset`. The previous shape (pre-split Python lists) needed a
+    `.clone()` per block per layer to force offset 0 — 3*num_blocks + 2 device
+    copies per layer per step.
+
+    One gather per tensor, not one per block: two multi-element `index_select`s on
+    the same tensor in a single graph exhaust every candidate output layout in
+    torch-spyre's `_multi_arg_pointwise_layouts` and fail to compile.
+
+    Spyre constraints: the per-block index stays at Dynamo-trace time (a runtime
+    index would emit Mod(d0, num_blocks) sticks the inductor rejects);
+    (num_seqs, num_kv_heads) is folded into one leading axis so the matmul stays
+    4-D (lower_bmm rejects 5-D).
     """
 
-    def specialized_bucketed_decode_kernel(
-        q, k_pages_per_block, v_pages_per_block, mask_tiles, scale
-    ):
-        # q: [num_seqs * KV, QPK, 1, D]; k/v_pages_per_block[i]: same first three
-        # dims with block_size in place of 1; mask_tiles[i]: [num_seqs*KV, 1, 1, block_size].
+    lead = num_seqs * num_kv_heads
+
+    def specialized_bucketed_decode_kernel(q, k_pages, v_pages, block_ids, mask_by_block, scale):
+        # q: [num_seqs * KV, QPK, 1, D]
+        # k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache)
+        # block_ids: [num_blocks * num_seqs] flat int32, block-major
+        # mask_by_block: [num_blocks, num_seqs * KV, 1, 1, block_size], already
+        #   broadcast across KV heads by the builder (#654).
+        # block_ids is block-major (see the builder), so the gather is already
+        # contiguous in [num_blocks, num_seqs, block_size, KV, D] order. No permute:
+        # a dim-0 slice of this is a stride-preserving sub-region of a contiguous
+        # base, the one view geometry torch-spyre's layout pass derives correctly.
+        k_gath = k_pages.index_select(0, block_ids).reshape(
+            num_blocks, num_seqs, block_size, num_kv_heads, head_size
+        )
+        v_gath = v_pages.index_select(0, block_ids).reshape(
+            num_blocks, num_seqs, block_size, num_kv_heads, head_size
+        )
+
         tile_max = None
         tile_sum = None
         tile_output = None
 
         for i in range(num_blocks):
-            k_page = k_pages_per_block[i]
-            v_page = v_pages_per_block[i]
-            mask_tile = mask_tiles[i]
+            # k_gath[i] is [num_seqs, block_size, KV, D] (token-major). Move the
+            # KV-head axis ahead of tokens for the matmul, then fold (num_seqs, KV)
+            # into one axis so the matmul stays 4-D.
+            k_page = k_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
+            v_page = v_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
+            # Already [num_seqs * KV, 1, 1, block_size]: the builder broadcasts the
+            # mask across KV heads once per step (#654), so no in-graph expand.
+            mask_tile = mask_by_block[i]
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = scores + mask_tile
@@ -913,16 +950,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Guards the identity scatter used by _run_bucketed_decode_dispatch.
                 assert query_row_ids_cpu[:num_seqs].tolist() == list(range(num_seqs))
 
-                # Flat-from-birth (not [B_seqs, B_blocks].reshape(-1)): reshaping
-                # a 2D tensor whose inner dim is narrower than the stick width
-                # (32) emits a Mod(d0, b_blocks) stick expression the Spyre
-                # inductor rejects.
-                block_ids_padded_cpu = torch.zeros(b_seqs * b_blocks, dtype=torch.int32)
+                # Block-major ([b * B_seqs + s], outer=block, inner=sequence) so the
+                # in-graph gather lands already contiguous in [B_blocks, B_seqs, ...]
+                # order. A per-block dim-0 slice of that is then a stride-preserving
+                # sub-region of a contiguous base, which is the only view geometry
+                # torch-spyre's layout pass derives correctly; sequence-major would
+                # need a 5-D permute, and offset slices of a permuted base get wrong
+                # device layouts (block 0 alone is offset-free and comes out right).
+                # Flat-from-birth (not 2D.reshape(-1)): reshaping a 2D tensor whose
+                # inner dim is narrower than the stick width (32) emits a
+                # Mod(d0, ...) stick expression the Spyre inductor rejects.
+                block_ids_padded_cpu = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
                 for s, n in enumerate(num_active):
                     n_use = min(n, b_blocks)
-                    block_ids_padded_cpu[s * b_blocks : s * b_blocks + n_use] = block_table[
-                        s, :n_use
-                    ]
+                    for b in range(n_use):
+                        block_ids_padded_cpu[b * b_seqs + s] = block_table[s, b]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
@@ -1103,7 +1145,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._kv_slots: SpyrePagedKVCache | None = None
 
         # Bucketed decode kernel cache, keyed by (bucket_num_seqs, bucket_num_blocks).
-        self._decode_fns: dict[tuple[int, int], object] = {}
+        self._decode_fns: dict[tuple[int, int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1138,11 +1180,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._attn_fns[key]
 
-    def _get_bucketed_decode_kernel(self, bucket_num_seqs: int, bucket_num_blocks: int):
-        key = (bucket_num_seqs, bucket_num_blocks)
+    def _get_bucketed_decode_kernel(
+        self, bucket_num_seqs: int, bucket_num_blocks: int, block_size: int
+    ):
+        # block_size is part of the key: it is a closure constant of the kernel
+        # (it sizes the in-graph reshape), so a different block_size needs a
+        # different compiled graph.
+        key = (bucket_num_seqs, bucket_num_blocks, block_size)
         if key not in self._decode_fns:
             self._decode_fns[key] = _maybe_compile(
-                _create_compilable_bucketed_decode_attn(bucket_num_seqs, bucket_num_blocks),
+                _create_compilable_bucketed_decode_attn(
+                    bucket_num_seqs,
+                    bucket_num_blocks,
+                    self.num_kv_heads,
+                    block_size,
+                    self.head_size,
+                ),
                 self._compile_attn,
             )
         return self._decode_fns[key]
@@ -1307,40 +1360,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.block_ids_padded_dev is not None
         assert attn_metadata.mask_by_block_dev is not None
 
-        # Gather K/V for the whole padded batch, then split into a per-block
-        # Python list. block_ids_padded_dev is flat by construction (see builder).
+        # K/V are NOT gathered here: the kernel does it in-graph. Gathering
+        # outside and slicing per block produced views with storage_offset > 0,
+        # which a compiled Spyre kernel reads from offset 0 (torch-spyre#3770), so
+        # every block needed a .clone() — 3*b_blocks + 2 device copies per layer
+        # per step. In-graph, the index_select result is a fresh offset-0
+        # allocation owned by the inductor and the copies are unnecessary.
         block_ids_flat = attn_metadata.block_ids_padded_dev
-        with _record_block("spyre_attn::bucketed_k_gather_reshape"):
-            k_gath = k_pages.index_select(0, block_ids_flat)
-            k_by_block = (
-                k_gath.reshape(b_seqs, b_blocks, block_size, num_kv_heads, head_size)
-                .permute(1, 0, 3, 2, 4)
-                .contiguous()
-            )
-            # .clone() is load-bearing: k_by_block[i] has storage_offset > 0 for
-            # i > 0, and a compiled Spyre kernel reads from offset 0
-            # (torch-spyre#3770). Pre-allocated staging tensors were profiled
-            # (2026-08-26): aten::clone budget = 7.00% of forward, but ~75% of
-            # that is memcpy which copy_() doesn't eliminate. Net saving ~1.75%
-            # of forward. Structural cost unjustified; keeping .clone() per-block.
-            k_list_dev = [
-                k_by_block[i].reshape(b_seqs * num_kv_heads, 1, block_size, head_size).clone()
-                for i in range(b_blocks)
-            ]
-        with _record_block("spyre_attn::bucketed_v_gather_reshape"):
-            v_gath = v_pages.index_select(0, block_ids_flat)
-            v_by_block = (
-                v_gath.reshape(b_seqs, b_blocks, block_size, num_kv_heads, head_size)
-                .permute(1, 0, 3, 2, 4)
-                .contiguous()
-            )
-            v_list_dev = [
-                v_by_block[i].reshape(b_seqs * num_kv_heads, 1, block_size, head_size).clone()
-                for i in range(b_blocks)
-            ]
 
         # Gather query rows and fold (B_seqs, KV) into the leading axis so the
-        # kernel's matmul stays 4-D.
+        # kernel's matmul stays 4-D. The .clone() here is a separate case from the
+        # K/V/mask ones: q_gath is an index_select result reshaped twice, not a
+        # per-block slice, and is left as-is.
         q_gath = query_dev.index_select(0, attn_metadata.query_row_ids_dev)
         q_packed = (
             q_gath.reshape(b_seqs, num_kv_heads, num_queries_per_kv, head_size)
@@ -1348,14 +1379,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             .clone()
         )
 
-        # Mask is already broadcast to KV heads and shaped by the builder;
-        # the per-block .clone() gives each slice offset 0 (torch-spyre#3770).
-        with _record_block("spyre_attn::bucketed_mask_list"):
-            mask_by_block = attn_metadata.mask_by_block_dev
-            mask_list_dev = [mask_by_block[i].clone() for i in range(b_blocks)]
-
-        kernel = self._get_bucketed_decode_kernel(b_seqs, b_blocks)
-        result = kernel(q_packed, k_list_dev, v_list_dev, mask_list_dev, self.scale)
+        kernel = self._get_bucketed_decode_kernel(b_seqs, b_blocks, block_size)
+        result = kernel(
+            q_packed,
+            k_pages,
+            v_pages,
+            block_ids_flat,
+            attn_metadata.mask_by_block_dev,
+            self.scale,
+        )
 
         # Q=1 makes query_row_ids_cpu[:num_seqs] == range(num_seqs), so the
         # scatter is a contiguous prefix write at (0, 0). Neither per-row

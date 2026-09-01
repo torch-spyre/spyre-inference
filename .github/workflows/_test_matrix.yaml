@@ -310,6 +310,8 @@ jobs:
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.
     runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
+    # Don't let one failed config fail this job outright -- test_result decides pass/fail after test_retry gets a shot on a fresh pod.
+    continue-on-error: true
     timeout-minutes: 720
     env:
       # The CI env var is very important.
@@ -323,10 +325,6 @@ jobs:
       # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
       # against a gated repo 401s even when the model is on the PVC.
       HF_HUB_OFFLINE: '1'
-      # torch-spyre#3707's HBM pool planner corrupts compiled output and leaks
-      # HBM across fallback boundaries; spyre_inference sets this too, but only if
-      # nothing has imported torch_spyre before it, so pin it for the whole job.
-      HBM_POOL_PLANNING: '0'
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -398,37 +396,19 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Install the baseline RPMs from spyre-rpms.lock. Skipped when
-      # use_prebaked_image is true, so the run uses the image's Spyre stack
-      # as-is. See issue #543.
-      - name: Install Spyre RPMs
-        id: spyre-rpms
-        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
-        uses: ./.github/actions/spyre-rpm-install
-
-      - name: Set up uv
+      # Runs the actual build+test for this leg via the shared composite action, so test_retry below can reuse the exact same steps for a fresh-pod retry instead of duplicating them.
+      - name: Run matrix config
         if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: ./.github/actions/run-matrix-config
         with:
-          enable-cache: true
-          # Invalidate only on lock changes; setup-uv's default glob also hashes
-          # pyproject.toml, so config-only edits would needlessly bust the cache.
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          # Use local runner temp to avoid ownership/permission issues on $HOME.
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # See prune-uv-cache-safe
-          prune-cache: false
-          # Never save cache for ephemeral merge queue branches
-          save-cache: ${{ github.event_name != 'merge_group' }}
-
-      # Layer override RPMs on top of the baseline only when the dispatch flow
-      # supplied some (rpm_names). The PR flow leaves rpm_names empty -> skipped.
-      - name: Install override Spyre RPMs
-        if: ${{ steps.gate.outputs.run == 'true' && inputs.rpm_names != '' }}
-        uses: ./.github/actions/override-spyre-rpms
-        with:
+          cfg: ${{ matrix.cfg }}
+          test_target: ${{ matrix.test_target }}
+          # Echo the exact runner-label selectors this job's runs-on used (matrix.runs_on plus the per-PR runner_label override, or the standing matrix.image_label).
+          runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
+          job_slot: ${{ strategy.job-index }}
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
           artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
@@ -436,115 +416,105 @@ jobs:
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
-      - name: Gather runner info
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        uses: ./.github/actions/gather-runner-info
+      # Records this leg's matrix entry as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
+      - name: Save suite descriptor for pod-level retry
+        if: failure()
+        run: |
+          mkdir -p "${RUNNER_TEMP}/failed_suite"
+          cat > "${RUNNER_TEMP}/failed_suite/suite.json" <<'JSONEOF'
+          ${{ toJSON(matrix) }}
+          JSONEOF
+
+      # github.run_attempt in the name: the artifacts REST API is run-scoped not attempt-scoped, so a re-run's descriptors from a prior attempt would otherwise retry a suite that already passed.
+      - name: Upload failed-suite descriptor
+        if: failure()
+        uses: actions/upload-artifact@v4
         with:
-          # Echo the exact runner-label selectors this job's runs-on used
-          # (mirrors the runs-on expression: matrix.runs_on plus the per-PR
-          # runner_label override, or the standing matrix.image_label).
+          name: failed-suite-${{ github.run_attempt }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/failed_suite/suite.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # Collect suites that need a pod-level retry: reads the failed-suite-* artifacts uploaded above and rebuilds a retry matrix for test_retry below to consume via fromJSON.
+  collect_failed_suites:
+    name: Collect suites for pod-level retry
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.collect.outputs.matrix }}
+      has_failed: ${{ steps.collect.outputs.has_failed }}
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Download failed-suite descriptors and build retry matrix
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/collect_failed_suites.py
+
+  # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running); a config that fails again here is a genuine failure.
+  test_retry:
+    name: 'build and run tests (${{ matrix.cfg }}) (pod-level retry)'
+    needs: collect_failed_suites
+    if: ${{ !cancelled() && needs.collect_failed_suites.outputs.has_failed == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.collect_failed_suites.outputs.matrix) }}
+    runs-on: ${{ fromJSON(format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label)) }}
+    timeout-minutes: 720
+    env:
+      CI: ''
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      HF_HUB_OFFLINE: '1'
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      # Same composite action the `test` job uses -- a pod-level retry runs the exact same steps, just on a fresh pod, so there is no separate copy to keep in sync here.
+      - name: Run matrix config (pod-level retry)
+        uses: ./.github/actions/run-matrix-config
+        with:
+          cfg: ${{ matrix.cfg }}
+          test_target: ${{ matrix.test_target }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
+          job_slot: retry-${{ strategy.job-index }}
+          retry: 'true'
+          use_prebaked_image: ${{ inputs.use_prebaked_image }}
+          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
+          rpm_names: ${{ inputs.rpm_names }}
+          rpm_location: ${{ inputs.rpm_location }}
+          artifactory_user: ${{ secrets.ARTIFACTORY_USER }}
+          artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
+          artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
 
-      - name: Dump UV cache info
-        if: ${{ steps.gate.outputs.run == 'true' }}
+  # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
+  test_result:
+    name: Test matrix result
+    needs: [collect_failed_suites, test_retry]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate combined result
         run: |
-          find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
-
-      # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
-      - name: Build spyre-inference
-        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
-        env:
-          TORCH_SPYRE_REF: "${{ inputs.torch_spyre_ref }}"
-        run: |
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
-          if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            # Build torch-spyre from the dispatched ref straight from GitHub;
-            # --frozen skips resolution during add, the non-frozen sync below
-            # resolves everything.
-            uv add --frozen \
-              "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
-            uv sync --verbose --group dev
-          else
-            uv sync --frozen --verbose --group dev
+          echo "Suites retried: ${{ needs.collect_failed_suites.outputs.has_failed }}"
+          echo "test_retry result: ${{ needs.test_retry.result }}"
+          if [[ "${{ needs.collect_failed_suites.outputs.has_failed }}" == "true" && \
+                "${{ needs.test_retry.result }}" != "success" ]]; then
+            echo "::error::One or more configs still failed after pod-level retry."
+            exit 1
           fi
-          # Print the resolved torch install for log visibility.
-          uv pip show torch
-          uv pip freeze
-
-      # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
-      - name: Activate the freshly-built venv
-        if: ${{ steps.gate.outputs.run == 'true' && !inputs.use_prebaked_image }}
-        # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
-        run: |
-          rm -rf /home/senuser/.venv
-          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
-          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
-
-      # Slim the cache for setup-uv's post-job save without discarding the
-      # compiled torch-spyre/vllm wheels. Must run after the build's uv sync.
-      - name: Prune uv cache (safe)
-        if: ${{ steps.gate.outputs.run == 'true' && github.event_name != 'merge_group' }}
-        uses: ./.github/actions/prune-uv-cache-safe
-
-      - name: Ensure public HF models cached
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        env:
-          HF_HUB_OFFLINE: '0'
-        run: uv run .github/cache_config/manage_cache.py --public
-
-      - name: Use a job-scoped torch inductor compile cache dir
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
-        run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ strategy.job-index }}-${{ github.run_id }}" >> "$GITHUB_ENV"
-
-      - name: Run tests
-        if: ${{ steps.gate.outputs.run == 'true' }}
-        # Marker expression and coverage wiring both live in the Makefile
-        # test_target. COVERAGE=1 drops .coverage.* data files for the fan-in.
-        #
-        # Bounded so a wedged card acquisition cannot hang silently: a blocking
-        # open() on a contended /dev/vfio device emits no output, so the runner
-        # stops heartbeating and the job is reaped server-side with an
-        # unfinalized log (no conclusion, no diagnosis). Failing here instead
-        # keeps the step's own log and lets the post steps publish JUnit.
-        timeout-minutes: 90
-        run: |
-          echo "Running tests for config: ${{ matrix.cfg }}..."
-          make ${{ matrix.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ matrix.test_target }}.xml
-          echo "tests done"
-
-      # Raw per-process data files; their host/pid suffixes are unique across
-      # jobs, so the fan-in's `make coverage` combines them without a per-job
-      # step. if-no-files-found=ignore covers configs that measured nothing.
-      - name: Upload coverage data
-        if: ${{ always() && steps.gate.outputs.run == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-${{ strategy.job-index }}
-          path: .coverage.*
-          include-hidden-files: true  # .coverage.* are dotfiles
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload JUnit results
-        if: ${{ always() && steps.gate.outputs.run == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: junit-${{ matrix.test_target }}
-          path: junit-${{ matrix.test_target }}.xml
-          retention-days: 14
-
-      - name: Publish JUnit test report
-        if: ${{ always() && steps.gate.outputs.run == 'true' }}
-        uses: dorny/test-reporter@v1
-        with:
-          name: 'Test report (${{ matrix.cfg }})'
-          path: junit-${{ matrix.test_target }}.xml
-          # dorny/test-reporter@v1 has no python-specific reporter; java-junit
-          # parses the generic JUnit-XML schema pytest's --junit-xml emits.
-          reporter: java-junit
-          fail-on-error: false
+          echo "All configs passed (directly or after pod-level retry)."
 
   # ---------------------------------------------------------------------------
   # Coverage fan-in: combine every job's data into one report. Stock runner
@@ -554,7 +524,7 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage:
     name: Aggregate coverage
-    needs: test
+    needs: [test, test_retry]
     if: always()
     # Informational -- must never fail the reusable workflow (and thus the
     # callers' required-check gate).
@@ -640,10 +610,6 @@ jobs:
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
-      # torch-spyre#3707's HBM pool planner corrupts compiled output and leaks
-      # HBM across fallback boundaries; spyre_inference sets this too, but only if
-      # nothing has imported torch_spyre before it, so pin it for the whole job.
-      HBM_POOL_PLANNING: '0'
       RESULTS_DIR: benchmark-results
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

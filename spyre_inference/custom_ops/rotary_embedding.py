@@ -34,6 +34,9 @@ from vllm.model_executor.layers.rotary_embedding.base import (
     RotaryEmbedding,
     RotaryEmbeddingBase,
 )
+from vllm.model_executor.layers.rotary_embedding.gemma4_rope import (
+    Gemma4RotaryEmbedding,
+)
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
@@ -155,5 +158,16 @@ class SpyreLlama3RotaryEmbedding(_SpyreRotaryMixin, Llama3RotaryEmbedding):
 @RotaryEmbeddingBase.register_oot(name="YaRNScalingRotaryEmbedding")
 class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedding):
     """OOT YaRNScalingRotaryEmbedding that applies the rotation on Spyre."""
+
+    pass
+
+
+@RotaryEmbeddingBase.register_oot(name="Gemma4RotaryEmbedding")
+class SpyreGemma4RotaryEmbedding(_SpyreRotaryMixin, Gemma4RotaryEmbedding):
+    """OOT Gemma4RotaryEmbedding (proportional RoPE) that applies the rotation on Spyre.
+
+    ``partial_rotary_factor < 1`` but ``rotary_dim == head_size`` with the non-rotated
+    frequencies identity-padded, so the neox full-rotary path applies unchanged.
+    """
 
     pass

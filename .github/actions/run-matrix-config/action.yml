@@ -1,0 +1,187 @@
+name: Run matrix test config
+description: >-
+  Builds spyre-inference and runs one _test_matrix.yaml matrix leg (RPM
+  install through JUnit publish). Shared by the `test` and `test_retry`
+  jobs so the pod-level retry doesn't need its own copy of every step.
+
+inputs:
+  cfg:
+    description: Display name of this matrix config (matrix.cfg)
+    required: true
+  test_target:
+    description: Makefile target to run (matrix.test_target)
+    required: true
+  runner_labels:
+    description: JSON array string of the runs-on labels the caller resolved to, forwarded to gather-runner-info
+    required: true
+  job_slot:
+    description: Unique per-job-attempt slot (e.g. strategy.job-index, or retry-<index>) used to scope the inductor cache dir and the coverage-data artifact name
+    required: true
+  retry:
+    description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact
+    required: false
+    default: 'false'
+  use_prebaked_image:
+    description: When 'true', skip the RPM install + spyre-inference build and use the runner image's stack as-is
+    required: true
+  is_merge_group:
+    description: "'true' on a merge_group event -- skips the uv cache save/prune (ephemeral branch, never worth caching)"
+    required: true
+  torch_spyre_ref:
+    description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
+    required: false
+    default: ''
+  rpm_names:
+    description: Space-separated list of override RPM names to download and install (empty = baseline only)
+    required: false
+    default: ''
+  rpm_location:
+    description: The Artifactory location to download override RPMs from
+    required: false
+    default: ''
+  artifactory_user:
+    required: false
+    default: ''
+  artifactory_api_key:
+    required: false
+    default: ''
+  artifactory_base_url:
+    required: false
+    default: ''
+  artifactory_rpm_path:
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    # Install the baseline RPMs from spyre-rpms.lock; skipped when use_prebaked_image is true, so the run uses the image's Spyre stack as-is (see issue #543).
+    - name: Install Spyre RPMs
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      uses: ./.github/actions/spyre-rpm-install
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+      with:
+        enable-cache: true
+        # Invalidate only on lock changes; setup-uv's default glob also hashes pyproject.toml, so config-only edits would needlessly bust the cache.
+        cache-dependency-glob: |
+          uv.lock
+          spyre-rpms.lock
+        # Use local runner temp to avoid ownership/permission issues on $HOME.
+        cache-local-path: ${{ runner.temp }}/setup-uv-cache
+        # See prune-uv-cache-safe
+        prune-cache: false
+        # Never save cache for ephemeral merge queue branches
+        save-cache: ${{ inputs.is_merge_group != 'true' }}
+
+    # Layer override RPMs on top of the baseline only when the dispatch flow supplied some (rpm_names); the PR flow leaves rpm_names empty -> skipped.
+    - name: Install override Spyre RPMs
+      if: ${{ inputs.rpm_names != '' }}
+      uses: ./.github/actions/override-spyre-rpms
+      with:
+        rpm_names: ${{ inputs.rpm_names }}
+        rpm_location: ${{ inputs.rpm_location }}
+        artifactory_user: ${{ inputs.artifactory_user }}
+        artifactory_api_key: ${{ inputs.artifactory_api_key }}
+        artifactory_base_url: ${{ inputs.artifactory_base_url }}
+        artifactory_rpm_path: ${{ inputs.artifactory_rpm_path }}
+
+    - name: Gather runner info
+      uses: ./.github/actions/gather-runner-info
+      with:
+        runner_labels: ${{ inputs.runner_labels }}
+
+    - name: Dump UV cache info
+      shell: bash
+      run: |
+        find "$(uv cache dir)" -name '*.whl' -printf '%f\n' | sort -u
+
+    # Skipped when use_prebaked_image is true: the image already has the pinned stack, and on ppc64le/s390x a uv sync here can't even complete one (Makefile:153-155).
+    - name: Build spyre-inference
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      shell: bash
+      env:
+        TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        if [[ -n "$TORCH_SPYRE_REF" ]]; then
+          # Build torch-spyre from the dispatched ref straight from GitHub; --frozen skips resolution during add, the non-frozen sync below resolves everything.
+          uv add --frozen \
+            "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
+          uv sync --verbose --group dev
+        else
+          uv sync --frozen --verbose --group dev
+        fi
+        # Print the resolved torch install for log visibility.
+        uv pip show torch
+        uv pip freeze
+
+    # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
+    - name: Activate the freshly-built venv
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      shell: bash
+      # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
+      run: |
+        rm -rf /home/senuser/.venv
+        echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+        echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
+
+    # Slim the cache for setup-uv's post-job save without discarding the compiled torch-spyre/vllm wheels; must run after the build's uv sync.
+    - name: Prune uv cache (safe)
+      if: ${{ inputs.is_merge_group != 'true' }}
+      uses: ./.github/actions/prune-uv-cache-safe
+
+    - name: Ensure public HF models cached
+      shell: bash
+      env:
+        HF_HUB_OFFLINE: '0'
+      run: uv run .github/cache_config/manage_cache.py --public
+
+    # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
+    - name: Use a job-scoped torch inductor compile cache dir
+      shell: bash
+      run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+
+    # Marker expression and coverage wiring both live in the Makefile test_target; COVERAGE=1 drops .coverage.* data files for the fan-in.
+    # Bounded so a wedged card acquisition (a blocking open() on a contended /dev/vfio device) cannot hang the job silently -- failing here keeps the step's log and lets the post steps publish JUnit.
+    # Composite action steps don't support the `timeout-minutes` step key, so the same bound is enforced with the shell `timeout` command instead.
+    - name: Run tests
+      shell: bash
+      run: |
+        echo "Running tests for config: ${{ inputs.cfg }}${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}..."
+        timeout --signal=TERM --kill-after=1m 90m \
+          make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+        echo "tests done"
+
+    # Raw per-process data files; their host/pid suffixes are unique across jobs, so the fan-in's `make coverage` combines them without a per-job step. if-no-files-found=ignore covers configs that measured nothing.
+    - name: Upload coverage data
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-${{ inputs.job_slot }}
+        path: .coverage.*
+        include-hidden-files: true # .coverage.* are dotfiles
+        if-no-files-found: ignore
+        retention-days: 14
+
+    # overwrite: on a pod-level retry, replaces the failed first attempt's report (same name) so downstream consumers see only the corrected result.
+    - name: Upload JUnit results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: junit-${{ inputs.test_target }}
+        path: junit-${{ inputs.test_target }}.xml
+        retention-days: 14
+        overwrite: ${{ inputs.retry }}
+
+    - name: Publish JUnit test report
+      if: always()
+      uses: dorny/test-reporter@v1
+      with:
+        name: "Test report (${{ inputs.cfg }})${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}"
+        path: junit-${{ inputs.test_target }}.xml
+        # dorny/test-reporter@v1 has no python-specific reporter; java-junit parses the generic JUnit-XML schema pytest's --junit-xml emits.
+        reporter: java-junit
+        fail-on-error: false

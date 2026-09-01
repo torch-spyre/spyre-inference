@@ -37,6 +37,18 @@ YARN_ROPE_PARAMS = {
     "beta_slow": 1,
 }
 
+# Gemma-4 full-attention "proportional" RoPE: partial_rotary_factor<1, but
+# Gemma4RotaryEmbedding sets rotary_dim==head_size and identity-pads the rest, so the
+# neox full-rotary path applies unchanged. (partial=0.25, theta=1e6 = real 31B config.)
+GEMMA4_ROPE_PARAMS = {
+    "rope_type": "proportional",
+    "partial_rotary_factor": 0.25,
+    "rope_theta": 1_000_000.0,
+}
+# head_size values for the proportional path; the 2x2 inner dim head_size//2 is
+# stick-aligned for both (512->256, 256->128).
+GEMMA4_HEAD_SIZES = [512, 256]
+
 # head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). On the native
 # path the platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE
 # only ever sees stick-aligned inners.
@@ -414,6 +426,103 @@ def test_yarn_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flatte
 
     actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
     expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
+        rope, positions.cpu(), query.cpu(), key.cpu()
+    )
+
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", GEMMA4_HEAD_SIZES)
+def test_gemma4_rotary_oot_registration(default_vllm_config, head_size):
+    """Verify get_rope(rope_type='proportional') resolves to SpyreGemma4RotaryEmbedding
+    and sets rotary_dim==head_size (satisfying the mixin's guard, not raising)."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    from spyre_inference.custom_ops.rotary_embedding import SpyreGemma4RotaryEmbedding
+
+    rope = get_rope(
+        head_size=head_size,
+        max_position=8192,
+        is_neox_style=True,
+        rope_parameters=GEMMA4_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+
+    assert isinstance(rope, SpyreGemma4RotaryEmbedding), (
+        f"Expected SpyreGemma4RotaryEmbedding, got {type(rope).__name__}"
+    )
+    assert rope.rotary_dim == rope.head_size == head_size
+    # Proportional: only rope_angles pairs are rotated; the rest are identity-padded.
+    assert rope.rope_angles == int(head_size * 0.25) // 2
+    assert rope.nope_angles == head_size // 2 - rope.rope_angles
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", GEMMA4_HEAD_SIZES)
+def test_gemma4_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
+    """CPU-only: host gather + _rotate_neox_2x2 match forward_native for the
+    proportional (partial-rotary, identity-padded) config, so the 2x2 cache carries the
+    non-rotated identity frequencies. Runs where the forward_oot test skips."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
+
+    torch.manual_seed(31)
+    max_position, num_tokens, num_heads = 2048, 32, 4
+    rope = get_rope(
+        head_size,
+        max_position,
+        is_neox_style=True,
+        rope_parameters=GEMMA4_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+
+    rot = rope._get_rotation_cache().index_select(0, positions).to(torch.float16)
+    assert rot.device.type == "cpu"
+    actual_query = _rotate_neox_2x2(query, rot, head_size)
+    actual_key = _rotate_neox_2x2(key, rot, head_size)
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", GEMMA4_HEAD_SIZES)
+@pytest.mark.parametrize("flatten", [True, False])
+def test_gemma4_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flatten):
+    """Proportional RoPE runs on Spyre and matches forward_native across head_size and
+    2D/3D layouts, inheriting the partial-rotary identity padding via the MRO (the real
+    Gemma-4-31B full-attn RoPE path)."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    torch.manual_seed(42)
+    max_position, num_tokens, num_heads = 8192, 32, 4
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters=GEMMA4_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+
+    rope.to("spyre")
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
+    query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)
+
+    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
+    expected_query, expected_key = RotaryEmbedding.forward_native(
         rope, positions.cpu(), query.cpu(), key.cpu()
     )
 

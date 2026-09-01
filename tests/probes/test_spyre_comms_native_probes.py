@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native libspyre_comms collective probes.
+"""Spyre collective probes.
 
-Each test attempts a *native* base-class collective on a real spyreccl
-device_group at TP=2. Probes that are still blocked are marked
-xfail(strict=True) so when libspyre_comms gains the native impl and a
-comms RPM is rebuilt, the probe flips to passing, the strict-xfail
-fails CI, and that's the signal to delete the matching manual fallback
-in `spyre_inference.distributed.spyre_communicator`.
+Each test attempts one collective on a real spyreccl device_group at TP=2,
+covering both routes a call site can take: plain `dist.*`, and
+`_c10d_functional.*` (lowered to a native device op under `torch.compile`).
+
+Blocked probes are xfail(strict=True): when the missing piece lands they flip to
+passing, the strict-xfail fails CI, and that is the signal to delete the matching
+workaround in `spyre_inference.distributed.spyre_communicator`.
 
 These tests are cheap to maintain but each spawns its own pair of
 subprocesses, which is slow. They are gated on `>=2` Spyre cards so
@@ -84,3 +85,95 @@ def test_native_all_gather_list_works(run_tp_probe) -> None:
 )
 def test_native_gather_works(run_tp_probe) -> None:
     run_tp_probe("native_gather", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_functional_all_reduce_eager_works(run_tp_probe) -> None:
+    """`SpyreCommunicator.all_reduce` uses this form under `--enforce-eager` too."""
+    run_tp_probe("functional_all_reduce_eager", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_compiled_all_reduce_works(run_tp_probe) -> None:
+    """The row-parallel-linear reduction as it appears in the compiled graph."""
+    run_tp_probe("compiled_all_reduce", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_compiled_all_reduce_multi_round_works(run_tp_probe) -> None:
+    """64 sequential compiled all_reduces sharing one WSI."""
+    run_tp_probe("compiled_all_reduce_multi_round", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_compiled_all_reduce_multi_block_works(run_tp_probe) -> None:
+    """32 separately-compiled block fns × 2 all_reduces, mimicking STOCK_TORCH_COMPILE."""
+    run_tp_probe("compiled_all_reduce_multi_block", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+def test_compiled_all_gather_works(run_tp_probe) -> None:
+    """vLLM's concat-style all_gather, compiled, on a stick-aligned width."""
+    run_tp_probe("compiled_all_gather_lastdim", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Eager `_c10d_functional.all_gather_into_tensor` routes to "
+        "allgather_into_tensor_coalesced, which the spyreccl backend rejects. "
+        "Blocker 1 of 2 for making SpyreCommunicator.all_gather functional."
+    ),
+)
+def test_functional_all_gather_eager_works(run_tp_probe) -> None:
+    run_tp_probe("functional_all_gather_eager", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "`spyre::all_gather_async` reassembles by narrowing the output along "
+        "dim 0, so rank r writes at storage offset r * per_rank_numel, which "
+        "copy_from_d2d requires to be 64-aligned. Blocker 2 of 2, and the reason "
+        "SpyreCommunicator.all_gather pads on CPU."
+    ),
+)
+def test_compiled_all_gather_unaligned_works(run_tp_probe) -> None:
+    run_tp_probe("compiled_all_gather_lastdim_unaligned", world_size=2)

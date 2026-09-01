@@ -22,5 +22,7 @@ public_models:
   - BAAI/bge-reranker-v2-m3
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
+  - ibm-granite/granite-3.3-8b-instruct
+  - ibm-granite/granite-4.1-8b
   - google/gemma-4-31B
   - qwrt/Swedish0.1M

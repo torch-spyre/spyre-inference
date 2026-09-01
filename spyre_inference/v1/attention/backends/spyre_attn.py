@@ -342,25 +342,11 @@ def _create_compilable_bucketed_decode_attn(
     block_size: int,
     head_size: int,
 ):
-    """Bucketed decode-only kernel factory. Closes over the batch/page shape.
-
-    The kernel gathers K/V from the page cache *itself*, one `index_select` per
-    tensor for the whole padded batch, then slices per block inside the graph.
-    Doing the gather in-graph is what keeps this free of torch-spyre#3770: an
-    `index_select` result is a fresh offset-0 allocation, and an in-graph slice of
-    it is owned by the inductor rather than handed in as a graph input with a
-    nonzero `storage_offset`. The previous shape (pre-split Python lists) needed a
-    `.clone()` per block per layer to force offset 0 — 3*num_blocks + 2 device
-    copies per layer per step.
+    """Bucketed decode kernel factory; gathers K/V from the page cache in-graph.
 
     One gather per tensor, not one per block: two multi-element `index_select`s on
-    the same tensor in a single graph exhaust every candidate output layout in
+    the same tensor in one graph exhaust every candidate output layout in
     torch-spyre's `_multi_arg_pointwise_layouts` and fail to compile.
-
-    Spyre constraints: the per-block index stays at Dynamo-trace time (a runtime
-    index would emit Mod(d0, num_blocks) sticks the inductor rejects);
-    (num_seqs, num_kv_heads) is folded into one leading axis so the matmul stays
-    4-D (lower_bmm rejects 5-D).
     """
 
     lead = num_seqs * num_kv_heads
@@ -369,13 +355,10 @@ def _create_compilable_bucketed_decode_attn(
         # q: [num_seqs * KV, QPK, 1, D]
         # k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache)
         # block_ids: [num_blocks * num_seqs] flat int32, block-major
-        # mask_by_block: [num_blocks, num_seqs * KV, 1, block_size], already
-        #   broadcast across KV heads by the builder (#654); 4-D so the per-block
-        #   dim-0 slice stays layout-legal.
-        # block_ids is block-major (see the builder), so the gather is already
-        # contiguous in [num_blocks, num_seqs, block_size, KV, D] order. No permute:
-        # a dim-0 slice of this is a stride-preserving sub-region of a contiguous
-        # base, the one view geometry torch-spyre's layout pass derives correctly.
+        # mask_by_block: [num_blocks, num_seqs * KV, 1, block_size], pre-broadcast
+        #   across KV heads by the builder
+        # block_ids is block-major, so this is contiguous and the per-block dim-0
+        # slice below keeps a layout torch-spyre can derive.
         k_gath = k_pages.index_select(0, block_ids).reshape(
             num_blocks, num_seqs, block_size, num_kv_heads, head_size
         )
@@ -388,14 +371,10 @@ def _create_compilable_bucketed_decode_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            # k_gath[i] is [num_seqs, block_size, KV, D] (token-major). Move the
-            # KV-head axis ahead of tokens for the matmul, then fold (num_seqs, KV)
-            # into one axis so the matmul stays 4-D.
+            # Token-major to head-major, folded to 4-D: lower_bmm rejects 5-D.
             k_page = k_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
             v_page = v_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
-            # [num_seqs * KV, 1, block_size] from the builder, which broadcasts
-            # across KV heads once per step (#654). One unsqueeze gives the
-            # [.., 1, 1, block_size] the scores add wants.
+            # Builder already broadcast across KV heads; add the QPK axis.
             mask_tile = mask_by_block[i].unsqueeze(1)
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
@@ -952,16 +931,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Guards the identity scatter used by _run_bucketed_decode_dispatch.
                 assert query_row_ids_cpu[:num_seqs].tolist() == list(range(num_seqs))
 
-                # Block-major ([b * B_seqs + s], outer=block, inner=sequence) so the
-                # in-graph gather lands already contiguous in [B_blocks, B_seqs, ...]
-                # order. A per-block dim-0 slice of that is then a stride-preserving
-                # sub-region of a contiguous base, which is the only view geometry
-                # torch-spyre's layout pass derives correctly; sequence-major would
-                # need a 5-D permute, and offset slices of a permuted base get wrong
-                # device layouts (block 0 alone is offset-free and comes out right).
-                # Flat-from-birth (not 2D.reshape(-1)): reshaping a 2D tensor whose
-                # inner dim is narrower than the stick width (32) emits a
-                # Mod(d0, ...) stick expression the Spyre inductor rejects.
+                # Block-major so the kernel's in-graph gather is contiguous: only a
+                # dim-0 slice of a contiguous base gets a correct device layout.
+                # Flat, not 2D: an inner dim narrower than the stick width (32)
+                # emits a Mod(d0, ...) stick expression the inductor rejects.
                 block_ids_padded_cpu = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
                 for s, n in enumerate(num_active):
                     n_use = min(n, b_blocks)
@@ -980,10 +953,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     n_use = min(num_active[s], b_blocks)
                     for b in range(n_use):
                         mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
-                # 4-D, not 5-D: the kernel slices this along dim 0 per block, and a
-                # dim-0 slice of a 5-D base fails torch-spyre layout propagation
-                # ("Incompatible host_size and dim_order"). The kernel adds the
-                # remaining singleton axis with one unsqueeze.
+                # 4-D, not 5-D: the kernel slices dim 0 per block, and a dim-0 slice
+                # of a 5-D base fails torch-spyre layout propagation.
                 mask_by_block_cpu = (
                     mask_bs_bb.permute(1, 0, 2)
                     .unsqueeze(2)
@@ -1150,7 +1121,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._kv_slots: SpyrePagedKVCache | None = None
 
         # Bucketed decode kernel cache, keyed by (bucket_num_seqs, bucket_num_blocks).
-        self._decode_fns: dict[tuple[int, int, int], object] = {}
+        self._decode_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1188,10 +1159,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _get_bucketed_decode_kernel(
         self, bucket_num_seqs: int, bucket_num_blocks: int, block_size: int
     ):
-        # block_size is part of the key: it is a closure constant of the kernel
-        # (it sizes the in-graph reshape), so a different block_size needs a
-        # different compiled graph.
-        key = (bucket_num_seqs, bucket_num_blocks, block_size)
+        # block_size is fixed by the KV cache spec, so it is passed to the factory
+        # but not keyed on.
+        key = (bucket_num_seqs, bucket_num_blocks)
         if key not in self._decode_fns:
             self._decode_fns[key] = _maybe_compile(
                 _create_compilable_bucketed_decode_attn(
@@ -1365,18 +1335,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.block_ids_padded_dev is not None
         assert attn_metadata.mask_by_block_dev is not None
 
-        # K/V are NOT gathered here: the kernel does it in-graph. Gathering
-        # outside and slicing per block produced views with storage_offset > 0,
-        # which a compiled Spyre kernel reads from offset 0 (torch-spyre#3770), so
-        # every block needed a .clone() — 3*b_blocks + 2 device copies per layer
-        # per step. In-graph, the index_select result is a fresh offset-0
-        # allocation owned by the inductor and the copies are unnecessary.
+        # K/V are gathered in-graph by the kernel: an out-of-graph per-block slice
+        # has storage_offset > 0, which a compiled kernel reads as 0
+        # (torch-spyre#3770), so each block needed a .clone().
         block_ids_flat = attn_metadata.block_ids_padded_dev
 
         # Gather query rows and fold (B_seqs, KV) into the leading axis so the
-        # kernel's matmul stays 4-D. The .clone() here is a separate case from the
-        # K/V/mask ones: q_gath is an index_select result reshaped twice, not a
-        # per-block slice, and is left as-is.
+        # kernel's matmul stays 4-D.
         q_gath = query_dev.index_select(0, attn_metadata.query_row_ids_dev)
         q_packed = (
             q_gath.reshape(b_seqs, num_kv_heads, num_queries_per_kv, head_size)

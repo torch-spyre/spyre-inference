@@ -27,7 +27,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
+from vllm.model_executor.layers.pooler.seqwise.heads import (
+    ClassifierPoolerHead,
+    EmbeddingPoolerHead,
+)
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
@@ -50,6 +53,10 @@ def _embed_pooler(pooling) -> SequencePooler:
         pooling=pooling,
         head=EmbeddingPoolerHead(activation=PoolerNormalize()),
     )
+
+
+def _classify_pooler(pooling) -> SequencePooler:
+    return SequencePooler(pooling=pooling, head=ClassifierPoolerHead())
 
 
 def _model_with_pooler(pooler: nn.Module) -> nn.Module:
@@ -133,7 +140,9 @@ def test_mean_pooler_owns_packed_hidden_states():
             DispatchPooler(
                 {
                     "embed": _embed_pooler(MeanPool()),
-                    "score": _embed_pooler(CLSPool()),
+                    # EmbeddingPoolerHead only supports embed; classify+CLS
+                    # is the valid mixed dispatch DispatchPooler will accept.
+                    "classify": _classify_pooler(CLSPool()),
                 }
             )
         )

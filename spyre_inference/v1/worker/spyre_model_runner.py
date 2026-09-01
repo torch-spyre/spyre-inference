@@ -900,9 +900,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         unsafe, and each method gathers itself (CLS/LAST rows, MEAN prefix,
         token AllPool ranges).
         """
-        assert (
-            not self.use_async_scheduling
-        ), "async scheduling is unsupported while pooling on Spyre"
+        assert not self.use_async_scheduling, (
+            "async scheduling is unsupported while pooling on Spyre"
+        )
 
         if not self._pooling_on_spyre:
             hidden_states = self._unpad_encoder_hidden(
@@ -916,9 +916,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
 
         num_reqs = self.input_batch.num_reqs
-        assert num_reqs == len(
-            self.input_batch.pooling_params
-        ), "Either all or none of the requests in a batch must be pooling request"
+        assert num_reqs == len(self.input_batch.pooling_params), (
+            "Either all or none of the requests in a batch must be pooling request"
+        )
 
         # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
         # would need index_select (Spyre dim-0 slice views are unsafe) and

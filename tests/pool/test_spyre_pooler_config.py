@@ -18,8 +18,8 @@ No Spyre hardware: builds minimal ``SequencePooler`` / ``DispatchPooler`` graphs
 and checks CLS/LAST/MEAN become Spyre forms. FP32 linear heads stay on CPU.
 
 Numeric MEAN tests here are host arithmetic (fp32 correctness, fp16
-accumulator, empty-batch dtype). One packed ``convert`` on a Spyre tensor is
-``test_spyre_fallback_probes.test_spyre_mean_pool_packed_d2h_matches_cpu_fp32``.
+accumulator, empty-batch dtype). Packed Spyre ``convert`` lives in
+``tests/pool/test_spyre_mean_pool.py``.
 """
 
 from __future__ import annotations
@@ -154,7 +154,7 @@ def test_spyre_mean_pool_matches_per_seq_mean():
     """Host arithmetic: varlen [3, 2] tokens vs a CPU mean per sequence.
 
     Does not exercise Spyre ``convert``. See
-    ``test_spyre_mean_pool_packed_d2h_matches_cpu_fp32``.
+    ``tests/pool/test_spyre_mean_pool.py``.
     """
     from spyre_inference.v1.pool.spyre_pooler import SpyreMeanPool
 

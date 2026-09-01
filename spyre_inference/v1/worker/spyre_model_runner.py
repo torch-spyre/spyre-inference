@@ -38,7 +38,6 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
-import os
 import time
 from contextlib import contextmanager
 from typing import cast
@@ -66,13 +65,17 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
     install_head_pad_weight_loader,
     install_padded_head_dim,
-    reject_padded_qk_norm,
     verify_padded_head_dim,
+)
+from spyre_inference.custom_ops.mlp_pad import (
+    install_mlp_pad_weight_loader,
+    verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
@@ -221,7 +224,7 @@ SPYRE_COMPILE_GRANULARITIES = ("block", "model")
 
 
 def _compile_granularity() -> str:
-    granularity = os.environ.get("SPYRE_COMPILE_GRANULARITY") or "block"
+    granularity = envs.SPYRE_COMPILE_GRANULARITY
     if granularity not in SPYRE_COMPILE_GRANULARITIES:
         raise ValueError(
             f"Unsupported SPYRE_COMPILE_GRANULARITY={granularity!r}. "
@@ -432,11 +435,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._install_pooling_model_patches(self.model_config)
         self._install_decoder_model_patches()
 
-        # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
-        # stream in, when the platform overrode head_dim (e.g. head_size=64).
+        # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
+        # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
         # Must run before load_model builds+loads the (now 128-wide) params.
         install_padded_head_dim(self.model_config)
         install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
+        install_mlp_pad_weight_loader(model_loader, self.model_config.hf_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -457,7 +461,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Restore original RoPE frequencies and attention scale corrupted by the
         # head_dim width override (no-op unless the platform padded head_dim).
         verify_padded_head_dim(self.model, self.model_config.hf_config)
-        reject_padded_qk_norm(self.model, self.model_config.hf_config)
+        verify_padded_intermediate_size(self.model, self.model_config.hf_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
@@ -490,6 +494,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
+    @staticmethod
+    def _model_has_spyre_fp8(model: nn.Module) -> bool:
+        """True if the model has Spyre FP8 linears.
+
+        ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
+        Granite ``compressed-tensors`` stores it on the scheme
+        (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
+        Checkpoint FP8 weights are the fallback: ``process_weights_after_loading``
+        keeps ``float8_e4m3fn``.
+        """
+        from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
+
+        def _is_fp8_kernel(obj: object) -> bool:
+            return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
+                getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
+            )
+
+        for module in model.modules():
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
+                return True
+            quant_method = getattr(module, "quant_method", None)
+            if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
+                getattr(quant_method, "scheme", None)
+            ):
+                return True
+            if _is_fp8_kernel(getattr(module, "scheme", None)):
+                return True
+        return False
+
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create SpyreShapeBucketer if compilation with bucketing is active.
 
@@ -511,6 +545,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Install torch.compile wrappers; tracing happens on the first forward.
 
         `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
+        FP8 apply is dynamo-disabled, so ``fullgraph=False`` when the model has
+        Spyre FP8 linears.
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -529,6 +565,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
+        # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
+        # stays isolated. fullgraph=True cannot graph-break.
+        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
+        fullgraph = not uses_fp8
         model_name = type(self.model).__name__
 
         if granularity == "block":
@@ -540,12 +580,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
                     defeated_by,
                 )
-            num_blocks = self._compile_blocks()
+            num_blocks = self._compile_blocks(fullgraph=fullgraph)
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
+                    "(fullgraph=%s).",
                     num_blocks,
                     model_name,
+                    fullgraph,
                 )
                 return
             logger.warning(
@@ -558,12 +600,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = torch.compile(
             self.model,
             backend="inductor",
-            fullgraph=True,
+            fullgraph=fullgraph,
             dynamic=False,
         )
-        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
+        logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
-    def _compile_blocks(self) -> int:
+    def _compile_blocks(self, fullgraph: bool = True) -> int:
         num_blocks = 0
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
@@ -572,7 +614,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
-                block.compile(backend="inductor", fullgraph=True, dynamic=False)
+                block.compile(backend="inductor", fullgraph=fullgraph, dynamic=False)
                 num_blocks += 1
         return num_blocks
 

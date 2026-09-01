@@ -24,12 +24,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from spyre_inference.custom_ops.head_pad import (
     _pad_weight,
     fix_padded_attention_scale,
     install_padded_head_dim,
-    reject_padded_qk_norm,
     verify_padded_head_dim,
 )
 
@@ -193,27 +193,49 @@ def test_verify_noop_without_padding():
     verify_padded_head_dim(_model_with_attention(_ORIG), SimpleNamespace(head_dim=_ORIG))
 
 
-def test_reject_qk_norm_over_padded_head_dim():
-    """Zero-padded dims change an RMS taken over head_dim, rescaling Q/K."""
-    model = torch.nn.Module()
-    layer = torch.nn.Module()
-    layer.add_module("q_norm", torch.nn.LayerNorm(_PADDED))
-    model.add_module("attn", layer)
-    hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+def test_pad_weight_lays_out_qk_norm_interleaved_and_zeros_the_pad():
+    """The norm weight must match the interleaved Q/K layout it multiplies."""
+    w = torch.arange(1.0, _ORIG + 1)
 
-    with pytest.raises(NotImplementedError, match="normalizes over head_dim"):
-        reject_padded_qk_norm(model, hf_config)
+    out = _pad_weight("layers.0.self_attn.q_norm.weight", w, 4, 2, _ORIG, _PADDED)
+
+    assert out.shape == (_PADDED,)
+    half, padded_half = _ORIG // 2, _PADDED // 2
+    scale = (_ORIG / _PADDED) ** 0.5
+    assert torch.allclose(out[:half], w[:half] * scale)
+    assert torch.allclose(out[padded_half : padded_half + half], w[half:] * scale)
+    assert not out[half:padded_half].any()
+    assert not out[padded_half + half :].any()
 
 
-def test_reject_qk_norm_allows_norms_of_other_widths():
-    """An RMSNorm over the hidden size (not head_dim) is untouched by padding."""
-    model = torch.nn.Module()
-    layer = torch.nn.Module()
-    layer.add_module("q_norm", torch.nn.LayerNorm(_PADDED * 7))
-    model.add_module("attn", layer)
-    hf_config = SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG)
+def test_pad_weight_qk_norm_reproduces_the_original_rmsnorm():
+    """End-to-end: RMSNorm over the padded, interleaved head equals the original."""
+    torch.manual_seed(0)
+    q = torch.randn(_ORIG)
+    w = torch.randn(_ORIG)
 
-    reject_padded_qk_norm(model, hf_config)
+    ref = F.rms_norm(q, (_ORIG,), w, eps=1e-6)
+
+    # q and its norm weight are padded exactly as the loader pads q_proj / q_norm.
+    q_padded = _pad_weight("q_proj.weight", q.view(_ORIG, 1), 1, 1, _ORIG, _PADDED).view(_PADDED)
+    w_padded = _pad_weight("q_norm.weight", w, 1, 1, _ORIG, _PADDED)
+    out = F.rms_norm(q_padded, (_PADDED,), w_padded, eps=1e-6)
+
+    half, padded_half = _ORIG // 2, _PADDED // 2
+    assert torch.allclose(out[:half], ref[:half], atol=1e-5)
+    assert torch.allclose(out[padded_half : padded_half + half], ref[half:], atol=1e-5)
+    # Padded dims stay zero, so they never reach the QK dot product or RoPE.
+    assert not out[half:padded_half].any()
+    assert not out[padded_half + half :].any()
+
+
+def test_pad_weight_leaves_a_norm_of_another_width_alone():
+    """A q_norm taken over a non-head_dim width is not a QK-norm and is untouched."""
+    w = torch.arange(float(_ORIG * 7))
+
+    out = _pad_weight("layers.0.self_attn.q_norm.weight", w, 4, 2, _ORIG, _PADDED)
+
+    assert torch.equal(out, w)
 
 
 def test_verify_checks_the_transformers_backend_attention_dict():

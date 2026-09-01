@@ -9,6 +9,7 @@ nav:
       - Offline Inference: examples/offline_inference
     - User Guide:
       - Configuration: user_guide/configuration.md
+      - Environment Variables: user_guide/env_vars.md
       - Kineto Profiling: user_guide/kineto_profiling.md
     - Developer Guide:
       - Contributing: contributing/README.md

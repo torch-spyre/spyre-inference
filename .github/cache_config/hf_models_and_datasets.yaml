@@ -23,3 +23,4 @@ public_models:
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
   - google/gemma-4-31B
+  - qwrt/Swedish0.1M

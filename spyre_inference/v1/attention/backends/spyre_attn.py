@@ -16,7 +16,6 @@
 
 import bisect
 import functools
-import os
 from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
 
@@ -37,6 +36,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 
@@ -44,7 +44,7 @@ logger = init_logger(__name__)
 
 # When set, wraps forward() and _online_softmax_attention()
 # in torch.profiler.record_function spans for kineto trace capture.
-_ATTN_PROFILING = os.environ.get("SPYRE_ATTN_PROFILING", "0") == "1"
+_ATTN_PROFILING = envs.SPYRE_ATTN_PROFILING
 
 
 def _record_function(name: str):
@@ -1123,6 +1123,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return self._decode_fns[key]
 
     def _bucketed_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+        # Off by default: the bucketed matmul pads every sequence row up to the
+        # bucket width, and that overhead is uncharacterised at the smallest
+        # bucket (num_seqs == _MIN_SEQS_BUCKET), where there is no headroom.
+        # Set SPYRE_BUCKETED_DECODE=1 to restore the path.
+        if not envs.SPYRE_BUCKETED_DECODE:
+            return False
         # Layer 0's builder gates on max_query_len, sliding_window, and the
         # bucket lattice; we add ALiBi / soft-cap which the bucketed kernel
         # doesn't implement.

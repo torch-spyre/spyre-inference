@@ -34,6 +34,19 @@ pytestmark = pytest.mark.attention
 
 
 @pytest.fixture()
+def enable_bucketed_decode(monkeypatch):
+    """Enable the bucketed decode kernel for tests that exercise it.
+
+    The path ships gated off (``SPYRE_BUCKETED_DECODE``, default "0") pending
+    performance characterisation at the smallest bucket. Without this fixture the
+    bucketed tests would silently fall back to the per-seq loop and pass while
+    testing nothing. The autouse cache-clearing fixture in ``tests/conftest.py``
+    makes the monkeypatched value visible to ``envs``.
+    """
+    monkeypatch.setenv("SPYRE_BUCKETED_DECODE", "1")
+
+
+@pytest.fixture()
 def configure_device(request, monkeypatch):
     """Configure overwrite_f and cache device based on the device_mode parameter.
 
@@ -1592,6 +1605,7 @@ def test_install_patches_layers_not_the_attention_class():
 )
 def test_spyre_attn_bucketed_decode_correctness(
     default_vllm_config,
+    enable_bucketed_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
@@ -1636,6 +1650,7 @@ def test_spyre_attn_bucketed_decode_correctness(
 )
 def test_spyre_attn_bucketed_decode_fallback(
     default_vllm_config,
+    enable_bucketed_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,

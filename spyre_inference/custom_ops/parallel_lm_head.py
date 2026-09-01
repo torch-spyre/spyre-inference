@@ -48,6 +48,18 @@ class SpyreParallelLMHead(ParallelLMHead):
     `ParallelLMHead.forward` raises and is unused.
     """
 
+    def _apply(self, fn, recurse=True):
+        # The GEMM reads `padded_weight_t`; once it exists `weight` is runtime-dead, so
+        # skip moving it to device. Until then `weight` is still live: don't skip it.
+        if not hasattr(self, "padded_weight_t"):
+            return super()._apply(fn, recurse=recurse)
+        weight = self._parameters.pop("weight", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if weight is not None:
+                self._parameters["weight"] = weight
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 

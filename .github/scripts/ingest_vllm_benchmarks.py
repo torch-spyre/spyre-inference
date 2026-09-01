@@ -148,6 +148,11 @@ def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     return [(metric_name, float(v)) for v in metric.get("benchmark_values", [])]
 
 
+def _test_name(filename: str) -> str:
+    """Strip .pytorch.json or .json suffix to get the bare test name."""
+    return filename.removesuffix(".pytorch.json").removesuffix(".json")
+
+
 def _model_from_record(record: dict[str, Any], filename: str) -> str:
     """Best-effort model name from a benchmark record, falling back to the file."""
     # vLLM-native JSON writes "model" as a top-level string
@@ -164,7 +169,7 @@ def _model_from_record(record: dict[str, Any], filename: str) -> str:
         or benchmark.get("model_name")
         or model_info.get("name")
         or record.get("model_id")
-        or filename.replace(".pytorch.json", "").replace(".json", "")
+        or _test_name(filename)
     )
 
 
@@ -207,7 +212,7 @@ def extract_rows(
                 "arch": arch,
                 "hardware_type": "IBM_Spyre",
                 "model": model,
-                "test_name": filename.replace(".pytorch.json", "").replace(".json", ""),
+                "test_name": _test_name(filename),
                 "head_sha": sha,
                 "pr_number": pr_number,
                 "value": value,
@@ -230,11 +235,19 @@ def extract_rows(
             }
         )
 
+    # Build a test_name -> model lookup from PyTorch files (which carry the
+    # model name). Native latency/throughput JSON has no model key, so we
+    # resolve it via the sibling .pytorch.json that shares the same test_name.
+    # Relies on SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 in CI; a deeper fix would
+    # inject the model into the native JSON at run time (run_vllm_benchmarks.py).
+    model_by_test: dict[str, str] = {}
+
     for file, extractor in [
         *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
         *[(f, extract_vllm_metrics) for f in native_files],
     ]:
         filename = os.path.basename(file)
+        test_name = _test_name(filename)
 
         try:
             records = read_benchmark_results(file)
@@ -252,6 +265,12 @@ def extract_rows(
             if not isinstance(record, dict):
                 continue
             model = _model_from_record(record, filename)
+            # Cache model from pytorch files; use cached model for native files
+            if filename.endswith(".pytorch.json"):
+                if model != test_name:
+                    model_by_test[test_name] = model
+            elif model == test_name and test_name in model_by_test:
+                model = model_by_test[test_name]
             for metric_name, value in extractor(record):
                 _emit(filename, model, metric_name, value)
 

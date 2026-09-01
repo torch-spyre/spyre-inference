@@ -15,6 +15,7 @@
 """Unit tests for platform.py configuration logic."""
 
 import math
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -570,3 +571,71 @@ def test_compile_sizes_not_set_when_eager():
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
     assert not vllm_config.compilation_config.compile_sizes
+
+
+def test_get_cpu_count_num_cpus_override(monkeypatch):
+    """SPYRE_NUM_CPUS takes precedence over any detection."""
+    from spyre_inference.threading_config import get_cpu_count
+
+    monkeypatch.setenv("SPYRE_NUM_CPUS", "6")
+    count, message = get_cpu_count()
+    assert count == 6.0
+    assert "SPYRE_NUM_CPUS" in message
+
+
+def _force_cpu_count(monkeypatch, value):
+    """Pin get_cpu_count so threading tests don't depend on the host."""
+    import spyre_inference.threading_config as tc
+
+    monkeypatch.setattr(tc, "get_cpu_count", lambda use_logical_cpus=False: (value, "forced"))
+
+
+def test_configure_threading_overrides_when_enabled(monkeypatch):
+    """Enabled (the default) → every threading env is set to cpus/worker."""
+    from spyre_inference.threading_config import THREADING_ENVS, configure_threading
+
+    monkeypatch.delenv("SPYRE_UPDATE_THREAD_CONFIG", raising=False)  # default = on
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")  # the "wildly high" k8s default
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=2)
+
+    for env in THREADING_ENVS:
+        assert os.environ[env] == "4", env  # ceil(8 / 2)
+
+
+def test_configure_threading_single_worker_uses_full_count(monkeypatch):
+    """TP=1 clamps to the detected budget, not the host core count."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=1)
+
+    assert os.environ["OMP_NUM_THREADS"] == "8"
+
+
+def test_configure_threading_warn_only_leaves_envs_untouched(monkeypatch):
+    """Disabled → the env is left as-is (only a warning is logged)."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "0")
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=1)
+
+    assert os.environ["OMP_NUM_THREADS"] == "128"
+
+
+def test_configure_threading_raises_when_undetectable(monkeypatch):
+    """Enabled but no CPU count detectable → fail loudly rather than guess."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    _force_cpu_count(monkeypatch, None)
+
+    with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
+        configure_threading(worker_count=1)

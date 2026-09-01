@@ -78,6 +78,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.models import prepare_decoder_model_weights
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -470,6 +471,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Relay out weights needing a non-default device layout (Gemma-4 MoE expert
+        # stacks). Before the move: these rewrite the CPU tensors, and the originals
+        # must never reach the device.
+        prepare_decoder_model_weights(cast(nn.Module, self.model))
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
@@ -580,14 +586,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
                     defeated_by,
                 )
-            num_blocks = self._compile_blocks(fullgraph=fullgraph)
-            if num_blocks:
+            num_blocks, num_self_compiled = self._compile_blocks(fullgraph=fullgraph)
+            if num_blocks or num_self_compiled:
                 logger.info(
                     "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
-                    "(fullgraph=%s).",
+                    "(fullgraph=%s); %d block(s) compile their own regions.",
                     num_blocks,
                     model_name,
                     fullgraph,
+                    num_self_compiled,
                 )
                 return
             logger.warning(
@@ -605,18 +612,29 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
-    def _compile_blocks(self, fullgraph: bool = True) -> int:
+    def _compile_blocks(self, fullgraph: bool = True) -> tuple[int, int]:
+        """Wrap each transformer block in its own graph.
+
+        Returns ``(wrapped, self_compiled)``. A self-compiling block (Gemma-4 MoE,
+        whose expert tiling needs eager context set between compilations) is left
+        alone, but still counts as found so the caller does not fall back to a
+        whole-model graph.
+        """
         num_blocks = 0
+        num_self_compiled = 0
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
                 if isinstance(block, PPMissingLayer):
+                    continue
+                if getattr(block, "spyre_compiles_own_regions", False):
+                    num_self_compiled += 1
                     continue
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
                 block.compile(backend="inductor", fullgraph=fullgraph, dynamic=False)
                 num_blocks += 1
-        return num_blocks
+        return num_blocks, num_self_compiled
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

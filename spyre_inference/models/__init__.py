@@ -19,6 +19,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch.nn as nn
     from vllm.engine.arg_utils import EngineArgs
 
 
@@ -39,7 +40,20 @@ def install_pooling_model_patches() -> None:
 
 
 def install_decoder_model_patches() -> None:
-    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
-    from spyre_inference.models import gemma4
+    """Install decoder/generative model adapters (Gemma-4 embed scale, MoE, …)."""
+    from spyre_inference.models import gemma4, gemma4_moe
 
     gemma4.install_spyre_patches()
+    gemma4_moe.install_spyre_patches()
+
+
+def prepare_decoder_model_weights(model: nn.Module) -> None:
+    """Relay out weights needing a non-default device layout (Gemma-4 MoE experts, …).
+
+    Called on the still-CPU-resident model, so the tensors being replaced never
+    reach the device; each rewrite moves its own result. A no-op for models with
+    nothing to rewrite.
+    """
+    from spyre_inference.models import gemma4_moe
+
+    gemma4_moe.prepare_experts_for_spyre(model)

@@ -126,6 +126,13 @@ own layer name and compiles separately, which is worse than the whole-model grap
 runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
 defeats sharing the same way, by folding each block's weights into its own graph.
 
+A block can opt out of this by setting `spyre_compiles_own_regions`, which makes
+`_compile_blocks` skip it (without falling back to a whole-model graph). Gemma-4's MoE
+decoder layer does: its expert matmul is tiled by torch-spyre `spyre_hint` scopes that
+resolve against named dims the driver has to declare *eagerly*, between compilations, so
+that layer keeps an eager `forward` that drives several compiled regions of its own — one
+graph for a decode step, four for a prefill chunk. See `models/gemma4_moe.py`.
+
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
 

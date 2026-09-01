@@ -36,6 +36,10 @@ pytestmark = pytest.mark.compile
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
         ),
+        (
+            "google/gemma-4-26B-A4B",
+            "\n\nWhat is the difference between a product and a service?\n\nWhat is the difference between a good",
+        ),
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:

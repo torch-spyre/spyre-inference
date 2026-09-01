@@ -295,6 +295,55 @@ def test_num_gpu_blocks_override_skipped_for_hybrid():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
+def test_num_gpu_blocks_override_skipped_for_pooling():
+    """Encoder/pooling models have no KV cache — do not invent a block count."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    object.__setattr__(model_config, "runner_type", "pooling")
+
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+
+def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
+    """Pooling body T lives on compile_sizes; attention L is independent."""
+    from unittest.mock import MagicMock
+
+    from vllm.config import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = MagicMock()
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.model_config.runner_type = "pooling"
+    vllm_config.model_config.max_model_len = 512
+    vllm_config.scheduler_config.max_num_batched_tokens = 512
+    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    vllm_config.compilation_config.custom_ops = ["all"]
+    # Empty list is falsy, so the platform generates pooling defaults.
+    # A MagicMock here is truthy and would skip that path (#638).
+    vllm_config.compilation_config.compile_sizes = []
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+
+
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
     """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
 

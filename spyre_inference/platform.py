@@ -239,37 +239,42 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Build bucket sizes for pre-compilation warmup.
-            # Pooling models skip bucketing (their token counts depend on
-            # variable input sequence lengths, not the decode heuristic).
-            if vllm_config.model_config.runner_type != "pooling":
-                if vllm_config.compilation_config.compile_sizes:
-                    compile_sizes = vllm_config.compilation_config.compile_sizes
-                else:
-                    # max_capture_size is the largest bucket we compile for.
-                    # Bounded by max_num_batched_tokens (scheduler limit) and
-                    # 512 (max supported shape for torch-spyre).
-                    max_capture_size = min(
-                        vllm_config.scheduler_config.max_num_batched_tokens,
-                        512,
-                    )
-
+            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
+            # is independent — see SpyreEncoderAttentionImpl gather-pack.
+            # Honor a user-set list (#638); otherwise generate defaults.
+            if vllm_config.compilation_config.compile_sizes:
+                compile_sizes = vllm_config.compilation_config.compile_sizes
+            else:
+                # Largest default bucket: scheduler limit and 512 (Spyre max).
+                max_capture_size = min(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    512,
+                )
+                if vllm_config.model_config.runner_type != "pooling":
                     compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
                     if max_capture_size >= 8:
                         compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
                     if max_capture_size >= 256:
                         compile_sizes += list(range(256, max_capture_size + 1, 16))
-                    vllm_config.compilation_config.compile_sizes = compile_sizes
+                else:
+                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        default_encoder_len_buckets,
+                    )
 
-                max_capture_size = max(compile_sizes)
+                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
+                    logger.info(
+                        "Pooling body token buckets (1D compile_sizes): %s",
+                        compile_sizes,
+                    )
+                vllm_config.compilation_config.compile_sizes = compile_sizes
 
-                # Ensure the scheduler never sends more tokens than the
-                # largest compiled bucket to avoid runtime recompilation.
-                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-                logger.warning(
-                    "Capping max_num_batched_tokens to %d ",
-                    max_capture_size,
-                )
+            max_capture_size = max(int(s) for s in compile_sizes)
+            # Scheduler must not send more tokens than the largest body bucket.
+            vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+            logger.warning(
+                "Capping max_num_batched_tokens to %d ",
+                max_capture_size,
+            )
 
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
@@ -505,13 +510,18 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Pin the on-device KV cache to what's needed to fill the batch area:
         # max_num_seqs × ceil(max_model_len / block_size) blocks. This
-        # single-group formula only holds for homogeneous models; hybrid models
-        # build several KV cache groups whose block count depends on vLLM's
-        # internal layer-grouping (not knowable here), so we skip the cap and
-        # let vLLM size the cache from the profiled memory budget instead.
+        # single-group formula only holds for homogeneous decoder models.
+        # Pooling / encoder-only models have no KV cache — do not size one.
+        # Hybrid models build several KV cache groups whose block count depends
+        # on vLLM's internal layer-grouping (not knowable here), so we skip the
+        # cap and let vLLM size the cache from the profiled memory budget.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
-            if cls._is_hybrid_attention(vllm_config):
+            if cls._is_pooling_model(vllm_config):
+                logger.info(
+                    "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
+                )
+            elif cls._is_hybrid_attention(vllm_config):
                 logger.info(
                     "Hybrid attention model detected; leaving num_gpu_blocks "
                     "to vLLM (skipping the single-group block-count override)."
@@ -528,6 +538,12 @@ class TorchSpyrePlatform(CpuPlatform):
                     max_num_seqs,
                     blocks_per_seq,
                 )
+
+    @staticmethod
+    def _is_pooling_model(vllm_config: VllmConfig) -> bool:
+        """Encoder / embedding / scoring models (no paged KV cache)."""
+        model_config = vllm_config.model_config
+        return getattr(model_config, "runner_type", None) == "pooling"
 
     @staticmethod
     def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:

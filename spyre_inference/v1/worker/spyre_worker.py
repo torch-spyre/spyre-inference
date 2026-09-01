@@ -154,8 +154,9 @@ class TorchSpyreWorker(Worker):
     def determine_available_memory(self) -> int:
         # Spyre's KV cache lives on-device with a fixed budget set by
         # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
-        # num_gpu_blocks_override is also set, so this value is only used as
-        # an upper bound sanity check by the engine.
+        # For decoder models num_gpu_blocks_override is also set; pooling /
+        # encoder models leave it unset (no KV cache). This return is an upper
+        # bound sanity check for the engine.
         assert self.cache_config.kv_cache_memory_bytes is not None
         return self.cache_config.kv_cache_memory_bytes
 

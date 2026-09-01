@@ -48,25 +48,9 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from torch_spyre._C import get_elem_in_stick
-from torch_spyre._inductor import config as spyre_config
-from torch_spyre._inductor.wsr.propagate_named_dims import (
-    declare_tensor_dim,
-    name_tensor_dims,
-)
-from torch_spyre._inductor.wsr.propagate_named_dims import reset as reset_named_dims
-from torch_spyre.model_utils import (
-    dma_moe_expert_weight_to_spyre,
-    dma_moe_per_expert_scale_to_spyre,
-)
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Elements per Spyre stick at the platform's forced compute dtype. Index and
-# scale tensors are widened onto a full stick before the compiler will gather
-# with them (a bare [T,K] integer tensor has no legal device layout).
-_STICK = get_elem_in_stick(torch.float16)
 
 # Row tiling for the gathered form's per-(token, slot) BMMs. The gather needs
 # tiles of at least two rows; the reference adapter uses 32.
@@ -99,7 +83,7 @@ def _topk(probs: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return weights[:tokens], indices[:tokens]
 
 
-def _gather_indices(indices: torch.Tensor, top_k: int) -> torch.Tensor:
+def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tensor:
     """Turn topk's fp16 expert ids into device int32 gather indices.
 
     The value has to travel through a full stick before the int32 cast: widen
@@ -113,8 +97,8 @@ def _gather_indices(indices: torch.Tensor, top_k: int) -> torch.Tensor:
     (``fmod(dsDim, size) == 0``).
     """
     tokens = indices.shape[0]
-    stick = indices[..., None].expand(tokens, top_k, _STICK).contiguous()
-    address = stick.to(torch.float32)[..., : _STICK // 2].to(torch.int32)
+    widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
+    address = widened.to(torch.float32)[..., : stick // 2].to(torch.int32)
     return address[..., 0]
 
 
@@ -126,6 +110,7 @@ def _moe_gathered(
     down: torch.Tensor,
     expert_scale_stick: torch.Tensor,
     top_k: int,
+    stick: int,
 ) -> torch.Tensor:
     """Expert FFN over the selected experts only: gather weights, BMM, combine.
 
@@ -137,7 +122,7 @@ def _moe_gathered(
     tokens, hidden = x.shape
     weights, indices = _topk(probs, top_k)
     weights = weights / weights.sum(-1, keepdim=True)
-    indices = _gather_indices(indices, top_k)
+    indices = _gather_indices(indices, top_k, stick)
 
     with spyre_hint(tiles={"row": _GATHER_ROW_TILE}):
         rows = tokens * top_k
@@ -163,6 +148,7 @@ def _moe_persistent_routing(
     expert_scale: torch.Tensor,
     route_identity: torch.Tensor,
     top_k: int,
+    stick: int,
 ) -> torch.Tensor:
     """Dense ``[T,E,1]`` routing weights: renormalized top-k probs, zero elsewhere."""
     _, selected = _topk(probs, top_k)
@@ -176,7 +162,7 @@ def _moe_persistent_routing(
     weights = weights * expert_scale
 
     # ReLU materializes the expansion; the identity matmul puts it on a stick.
-    packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, _STICK))
+    packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, stick))
     return (packed @ route_identity)[..., :1]
 
 
@@ -188,8 +174,17 @@ def _token_cores(tokens: int) -> int:
     holds when the token count is a multiple of it — vLLM's compile buckets
     (16, 24, 40, 56, …) are not, so take the largest legal divisor instead.
     """
+    from torch_spyre._inductor import config as spyre_config
+
     limit = min(tokens, spyre_config.sencores)
     return max(split for split in range(1, limit + 1) if tokens % split == 0)
+
+
+def _reset_named_dims() -> None:
+    """Drop the driver-declared named dims so they cannot leak into the next graph."""
+    from torch_spyre._inductor.wsr.propagate_named_dims import reset
+
+    reset()
 
 
 def _moe_persistent(
@@ -229,6 +224,11 @@ def _name_persistent_dims(
     eagerly, before the region is traced — which is why the layer keeps its FFN
     in a graph of its own.
     """
+    from torch_spyre._inductor.wsr.propagate_named_dims import (
+        declare_tensor_dim,
+        name_tensor_dims,
+    )
+
     experts, hidden, inter = gate.shape
     for name, extent in (
         ("E", experts),
@@ -296,7 +296,11 @@ def _persistent_route(layer: Any, probs: torch.Tensor) -> torch.Tensor:
     """
     moe = layer.moe
     return _moe_persistent_routing(
-        probs, moe.per_expert_scale, moe.spyre_route_identity, moe.spyre_top_k
+        probs,
+        moe.per_expert_scale,
+        moe.spyre_route_identity,
+        moe.spyre_top_k,
+        moe.spyre_stick,
     )
 
 
@@ -321,6 +325,7 @@ def _gathered_layer(layer: Any, positions: torch.Tensor, hidden_states: torch.Te
         moe.spyre_down,
         moe.spyre_expert_scale_stick,
         moe.spyre_top_k,
+        moe.spyre_stick,
     )
     return _combine_block(layer, residual, moe_out)
 
@@ -357,6 +362,8 @@ def _spyre_moe_layer_forward(
 ) -> tuple[torch.Tensor, None]:
     """Gemma-4 decoder layer on Spyre: gathered experts for a single-token decode
     step, all-expert persistent dispatch for anything wider."""
+    from torch_spyre._inductor import config as spyre_config
+
     if not self.enable_moe_block:
         return self._spyre_dense_forward(
             positions, hidden_states, residual, per_layer_input=per_layer_input, **kwargs
@@ -389,7 +396,7 @@ def _spyre_moe_layer_forward(
                 # form's named dims into the next region's compilation when this
                 # one is an Inductor cache hit.  In eager mode the names are never
                 # declared, and every single op would otherwise compile under them.
-                reset_named_dims()
+                _reset_named_dims()
             out = _spyre_region(self, "combine", _combine_block)(self, residual, moe_out)
     return out, None
 
@@ -442,6 +449,8 @@ def install_spyre_patches() -> None:
 
 def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
     """DMA an ``[E, C, F]`` expert stack in the gather- and matmul-friendly layout."""
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
     moved = dma_moe_expert_weight_to_spyre(weight)
     return moved if moved is not None else weight.contiguous().to("spyre")
 
@@ -458,8 +467,14 @@ def prepare_experts_for_spyre(model: Any) -> None:
     and ``w2`` as ``[E, H, M]``. The Spyre regions contract on the *second* axis,
     so gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``.
     """
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre.model_utils import dma_moe_per_expert_scale_to_spyre
     from vllm.model_executor.models.gemma4 import Gemma4MoE
 
+    # Elements per Spyre stick at the platform's forced compute dtype. Index and
+    # scale tensors are widened onto a full stick before the compiler will gather
+    # with them (a bare [T,K] integer tensor has no legal device layout).
+    stick = get_elem_in_stick(torch.float16)
     prepared = 0
     shape: tuple[int, int, int] = (0, 0, 0)
     for moe in model.modules():
@@ -468,11 +483,11 @@ def prepare_experts_for_spyre(model: Any) -> None:
         experts = _routed_experts(moe)
         assert experts is not None, "Gemma4MoE has no w13_weight/w2_weight to relay out"
         w13: torch.Tensor = experts.w13_weight.data
-        w2: torch.Tensor = experts.w2_weight.data
         num_experts, twice_inter, hidden = w13.shape
         inter = twice_inter // 2
-        assert w2.shape == (num_experts, hidden, inter), (
-            f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
+        assert experts.w2_weight.shape == (num_experts, hidden, inter), (
+            f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} "
+            f"w2={tuple(experts.w2_weight.shape)}"
         )
 
         moe.spyre_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2))
@@ -480,6 +495,7 @@ def prepare_experts_for_spyre(model: Any) -> None:
         # Drop each fused stack as soon as it is split, so the host holds one
         # layer's worth rather than the whole model's.
         del experts.w13_weight, w13
+        w2: torch.Tensor = experts.w2_weight.data
         moe.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
         del experts.w2_weight, w2
 
@@ -491,7 +507,8 @@ def prepare_experts_for_spyre(model: Any) -> None:
         moe.spyre_expert_scale_stick = scale_stick
         # Identity for the routing-weight restickify. It has to originate on the
         # host: Spyre has no on-device eye/diag kernel.
-        moe.spyre_route_identity = torch.eye(_STICK, dtype=scale.dtype).to("spyre")
+        moe.spyre_route_identity = torch.eye(stick, dtype=scale.dtype).to("spyre")
+        moe.spyre_stick = stick
         prepared += 1
         shape = (num_experts, hidden, inter)
 

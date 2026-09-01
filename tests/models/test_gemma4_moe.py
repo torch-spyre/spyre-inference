@@ -75,6 +75,7 @@ def test_gathered_matches_dense_reference(moe_weights):
     Single token only — that is the shape the form exists for, and the only one
     whose combine step has a legal device layout.
     """
+    from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
     from torch_spyre.model_utils import dma_moe_per_expert_scale_to_spyre
 
@@ -84,6 +85,7 @@ def test_gathered_matches_dense_reference(moe_weights):
     x, probs = _inputs(1)
     scale_stick = dma_moe_per_expert_scale_to_spyre(host["scale"])
     assert scale_stick is not None
+    stick = get_elem_in_stick(torch.float16)
 
     region = torch.compile(_moe_gathered, backend="inductor", fullgraph=True, dynamic=False)
     with spyre_config.patch({"frontend_pool_allocation": True}):
@@ -95,6 +97,7 @@ def test_gathered_matches_dense_reference(moe_weights):
             device["down"],
             scale_stick,
             TOP_K,
+            stick,
         )
 
     expected = _dense_reference(
@@ -112,11 +115,11 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     named-dims context. 24 tokens is there because it does not divide the core
     count, which the expert matmul's work-division hint has to cope with.
     """
+    from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
     from torch_spyre._inductor.wsr.propagate_named_dims import reset as reset_named_dims
 
     from spyre_inference.models.gemma4_moe import (
-        _STICK,
         _moe_persistent,
         _moe_persistent_routing,
         _name_persistent_dims,
@@ -125,7 +128,8 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     host, device = moe_weights
     x, probs = _inputs(num_tokens)
     x_dev = x.to("spyre")
-    identity = torch.eye(_STICK, dtype=torch.float16).to("spyre")
+    stick = get_elem_in_stick(torch.float16)
+    identity = torch.eye(stick, dtype=torch.float16).to("spyre")
 
     routing = torch.compile(
         _moe_persistent_routing, backend="inductor", fullgraph=True, dynamic=False
@@ -133,7 +137,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     experts = torch.compile(_moe_persistent, backend="inductor", fullgraph=True, dynamic=False)
 
     with spyre_config.patch({"frontend_pool_allocation": True}):
-        route = routing(probs.to("spyre"), host["scale"].to("spyre"), identity, TOP_K)
+        route = routing(probs.to("spyre"), host["scale"].to("spyre"), identity, TOP_K, stick)
         _name_persistent_dims(x_dev, device["gate"], device["up"], device["down"])
         try:
             with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):

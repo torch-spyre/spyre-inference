@@ -25,10 +25,6 @@ from typing import Any
 # library can't load before init_device runs.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
-# torch-spyre#3707's pool planner aliases allocations across a fallback boundary
-# and corrupts compiled output; our eager RoPE op makes every RoPE call one.
-os.environ.setdefault("HBM_POOL_PLANNING", "0")
-
 __version__ = importlib.metadata.version("spyre_inference")
 
 

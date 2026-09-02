@@ -80,7 +80,6 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.models import prepare_decoder_model_weights
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
@@ -473,11 +472,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
-        # Relay out weights needing a non-default device layout (Gemma-4 MoE expert
-        # stacks). Before the move: these rewrite the CPU tensors, and the originals
-        # must never reach the device.
-        prepare_decoder_model_weights(cast(nn.Module, self.model))
-
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
@@ -601,12 +595,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if num_blocks or num_self_compiled:
                 logger.info(
                     "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
-                    "(fullgraph=%s); %d block(s) compile their own regions.",
+                    "(fullgraph=%s).",
                     num_blocks,
                     model_name,
                     fullgraph,
-                    num_self_compiled,
                 )
+                if num_self_compiled:
+                    logger.info(
+                        "%d block(s) compile their own regions and were left uncompiled here.",
+                        num_self_compiled,
+                    )
                 return
             logger.warning(
                 "Found no attention-bearing block ModuleList in %s; falling back to a "

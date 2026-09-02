@@ -60,6 +60,8 @@ compiled graph (see below).
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
+| `UnquantizedFusedMoEMethod` | `SpyreFusedMoEMethod` | Spyre | Computes nothing — vLLM's OOT MoE backend builds no expert kernel, and the Gemma-4 decoder-layer patch calls its own regions instead. It exists for `process_weights_after_loading`, the one hook that runs after the checkpoint is loaded and before the model reaches the device: it rebuilds Gemma-4's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks as the `[E,H,M]` / `[E,M,H]` layout the MoE regions contract on, folds `per_expert_scale` into `down`, and frees each ~45 GB source stack as it goes (`models/gemma4_moe.py`) |
 
 ### Transposed linear weights
 

@@ -204,7 +204,7 @@ class TorchSpyreWorker(Worker):
                 self.profiler_config,
                 worker_name=trace_name,
                 local_rank=self.local_rank,
-                activities=["CPU", "PrivateUse1"],
+                activities=["CPU", "PrivateUse1"],  # ty: ignore[invalid-argument-type]
             )
             logger.debug("Starting torch profiler with trace name: %s", trace_name)
 

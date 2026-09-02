@@ -63,7 +63,8 @@ def _register_aliased_scalars(self) -> None:
     """Re-register the parent's aliased scalars as buffers so they reach the device.
 
     Inductor has no notion of a live CPU graph input, so a stale 0-d CPU alias fails to
-    lower where a device-side scalar is fine.
+    lower where a device-side scalar is fine. Can be removed once the upstream PR
+    https://github.com/vllm-project/vllm/pull/54213 lands.
     """
     for name in _ALIASED_SCALARS:
         value = getattr(self, name, None)

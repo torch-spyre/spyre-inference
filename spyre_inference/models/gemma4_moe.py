@@ -40,21 +40,24 @@ The persistent form needs four graphs, because its expert matmul is tiled by
 their own between the softmax and that context. So a Gemma-4 MoE layer compiles
 its own regions and opts out of the model runner's whole-block compile; each
 region documents its own boundary.
+
+Both forms read one shared device-resident expert stack, laid out by
+:class:`SpyreFusedMoEMethod` below.
 """
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 
 logger = init_logger(__name__)
-
-# Row tiling for the gathered form's per-(token, slot) BMMs. The gather needs
-# tiles of at least two rows; the reference adapter uses 32.
-_GATHER_ROW_TILE = 32
 
 # Compiler config for the MoE regions, matching the reference adapter.
 # ``frontend_pool_allocation`` has the front end allocate the scratch pool as a
@@ -108,7 +111,6 @@ def _moe_gathered(
     gate: torch.Tensor,
     up: torch.Tensor,
     down: torch.Tensor,
-    expert_scale_stick: torch.Tensor,
     top_k: int,
     stick: int,
 ) -> torch.Tensor:
@@ -116,36 +118,35 @@ def _moe_gathered(
 
     ``x`` is ``[T,H]``; ``gate``/``up`` are ``[E,H,M]`` and ``down`` is
     ``[E,M,H]``. Returns ``[T,H]``.
-    """
-    from torch_spyre._inductor.propagate_hints import spyre_hint
 
+    Unlike the reference adapter this needs no ``spyre_hint`` row tiling: measured
+    at the real shapes, every tile from 2 to 64 lands on the same 5.90 ms and the
+    region lowers without the scope at all.
+    """
     tokens, hidden = x.shape
     weights, indices = _topk(probs, top_k)
     weights = weights / weights.sum(-1, keepdim=True)
     indices = _gather_indices(indices, top_k, stick)
 
-    with spyre_hint(tiles={"row": _GATHER_ROW_TILE}):
-        rows = tokens * top_k
-        inter = gate.shape[-1]
-        # Materialize the K-batch stride: a stride-0 expand drops the batch dim
-        # from the BMM's layout order and the scheduler rejects the result.
-        inputs = x[:, None, :].expand(tokens, top_k, hidden).contiguous().reshape(rows, 1, hidden)
-        gate_out = torch.bmm(inputs, gate[indices].reshape(rows, hidden, inter))
-        up_out = torch.bmm(inputs, up[indices].reshape(rows, hidden, inter))
-        activated = F.gelu(gate_out, approximate="tanh") * up_out
-        expert_out = torch.bmm(activated, down[indices].reshape(rows, inter, hidden))
-        expert_out = expert_out.reshape(tokens, top_k, hidden)
+    rows = tokens * top_k
+    inter = gate.shape[-1]
+    # Materialize the K-batch stride: a stride-0 expand drops the batch dim from
+    # the BMM's layout order and the scheduler rejects the result.
+    inputs = x[:, None, :].expand(tokens, top_k, hidden).contiguous().reshape(rows, 1, hidden)
+    gate_out = torch.bmm(inputs, gate[indices].reshape(rows, hidden, inter))
+    up_out = torch.bmm(inputs, up[indices].reshape(rows, hidden, inter))
+    activated = F.gelu(gate_out, approximate="tanh") * up_out
+    expert_out = torch.bmm(activated, down[indices].reshape(rows, inter, hidden))
+    expert_out = expert_out.reshape(tokens, top_k, hidden)
 
-        # Fold both scalars into the H-carrying tensor: a bare [T,K] product has
-        # no legal layout. The stick-widened scale table gives the gather a
-        # physical stick to sit on; lane 0 carries the value.
-        expert_out = expert_out * weights[..., None] * expert_scale_stick[indices][..., :1]
-        return expert_out.sum(dim=1)
+    # The routing weight is folded into the H-carrying tensor: a bare [T,K] product
+    # has no legal layout. The per-expert output scale is already in ``down`` (see
+    # SpyreFusedMoEMethod), so nothing else joins it here.
+    return (expert_out * weights[..., None]).sum(dim=1)
 
 
 def _moe_persistent_routing(
     probs: torch.Tensor,
-    expert_scale: torch.Tensor,
     route_identity: torch.Tensor,
     top_k: int,
     stick: int,
@@ -159,7 +160,6 @@ def _moe_persistent_routing(
         0.0,  # ty: ignore[invalid-argument-type]
     )
     weights = weights / weights.sum(-1, keepdim=True)
-    weights = weights * expert_scale
 
     # ReLU materializes the expansion; the identity matmul puts it on a stick.
     packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, stick))
@@ -296,11 +296,7 @@ def _persistent_route(layer: Any, probs: torch.Tensor) -> torch.Tensor:
     """
     moe = layer.moe
     return _moe_persistent_routing(
-        probs,
-        moe.per_expert_scale,
-        moe.spyre_route_identity,
-        moe.spyre_top_k,
-        moe.spyre_stick,
+        probs, moe.spyre_route_identity, moe.spyre_top_k, moe.spyre_stick
     )
 
 
@@ -323,7 +319,6 @@ def _gathered_layer(layer: Any, positions: torch.Tensor, hidden_states: torch.Te
         moe.spyre_gate,
         moe.spyre_up,
         moe.spyre_down,
-        moe.spyre_expert_scale_stick,
         moe.spyre_top_k,
         moe.spyre_stick,
     )
@@ -427,10 +422,12 @@ def install_spyre_patches() -> None:
         self._spyre_compile = get_cached_compilation_config().mode is not CompilationMode.NONE
         self._spyre_regions: dict[str, Any] = {}
         self.moe.spyre_top_k = int(config.top_k_experts)
-        # fp16 router logits, matching the reference adapter: the fp32 out_dtype
-        # exists for CUDA routing kernels that Spyre does not use, and it would
-        # put the softmax and top-k in fp32 with no accuracy the routing needs.
-        self.router.proj.out_dtype = None
+        # The expert relayout runs in the RoutedExperts weight hook, which is handed
+        # that module alone; point it back at the Gemma4MoE that owns
+        # per_expert_scale and holds the relaid-out stacks the regions read. A
+        # weakref, because assigning a Module to one of its own descendants
+        # registers it as a submodule and every module walk then recurses forever.
+        _routed_experts(self.moe).spyre_moe_owner = weakref.ref(self.moe)
 
     Gemma4DecoderLayer.__init__ = __init__  # ty: ignore[invalid-assignment]
     Gemma4DecoderLayer._spyre_dense_forward = orig_forward
@@ -443,8 +440,16 @@ def install_spyre_patches() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Expert-weight preparation
+# Expert-weight layout
 # --------------------------------------------------------------------------- #
+
+
+def _routed_experts(moe: Any) -> Any:
+    """The ``RoutedExperts`` under a ``Gemma4MoE`` — the module owning w13/w2."""
+    for module in moe.modules():
+        if hasattr(module, "w13_weight") and hasattr(module, "w2_weight"):
+            return module
+    raise AssertionError("Gemma4MoE has no w13_weight/w2_weight to relay out")
 
 
 def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
@@ -455,75 +460,75 @@ def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
     return moved if moved is not None else weight.contiguous().to("spyre")
 
 
-def prepare_experts_for_spyre(model: Any) -> None:
-    """Rebuild Gemma-4 MoE expert weights on device, in place.
+@UnquantizedFusedMoEMethod.register_oot(name="UnquantizedFusedMoEMethod")
+class SpyreFusedMoEMethod(UnquantizedFusedMoEMethod):
+    """Rebuild Gemma-4's expert stacks on device, in the layout the regions read.
 
-    Must run *before* ``model.to("spyre")``: vLLM's ``w13_weight`` / ``w2_weight``
-    are ~45 GB for this checkpoint, and the device has no room to hold both them
-    and the relaid-out copies. Each layer is converted and freed before the next
-    one starts, so host peak stays at one layer's worth.
+    This class computes nothing: vLLM's out-of-tree MoE backend builds no expert
+    kernel, and Gemma-4 never asks it to — the decoder-layer patch above calls the
+    regions directly and ``FusedMoE.forward`` stays dead code. It exists for
+    ``process_weights_after_loading``, the one upstream hook that runs once the
+    checkpoint is loaded and before the model reaches the device, which is where a
+    device-specific expert layout has to happen.
+    """
 
-    Layout: ``FusedMoE`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows)
-    and ``w2`` as ``[E, H, M]``. The Spyre regions contract on the *second* axis,
-    so gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``.
+    def process_weights_after_loading(self, layer: Any) -> None:
+        super().process_weights_after_loading(layer)
+        owner = getattr(layer, "spyre_moe_owner", None)
+        if owner is None:
+            # Not a Gemma-4 MoE: no Spyre expert layout is defined for it, and its
+            # forward would already have failed on the empty OOT backend.
+            return
+        _relayout_experts(layer, owner())
+
+
+def _relayout_experts(experts: Any, moe: Any) -> None:
+    """Split, transpose and move one layer's expert stacks, freeing the originals.
+
+    ``FusedMoE`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows) and
+    ``w2`` as ``[E, H, M]``. The Spyre regions contract on the *second* axis, so
+    gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``. Gate and up stay
+    two stacks: fusing them into ``[E, H, 2M]`` is 7% better for the gathered form
+    and 6.5x worse for the persistent one, and there is only room for one layout.
+
+    The stacks are ~45 GB for this checkpoint and the device cannot hold both them
+    and the relaid-out copies, so each is converted and freed before the next one
+    starts; host peak stays at one layer's worth.
     """
     from torch_spyre._C import get_elem_in_stick
-    from torch_spyre.model_utils import dma_moe_per_expert_scale_to_spyre
-    from vllm.model_executor.models.gemma4 import Gemma4MoE
 
-    # Elements per Spyre stick at the platform's forced compute dtype. Index and
-    # scale tensors are widened onto a full stick before the compiler will gather
-    # with them (a bare [T,K] integer tensor has no legal device layout).
-    stick = get_elem_in_stick(torch.float16)
-    prepared = 0
-    shape: tuple[int, int, int] = (0, 0, 0)
-    for moe in model.modules():
-        if not isinstance(moe, Gemma4MoE):
-            continue
-        experts = _routed_experts(moe)
-        assert experts is not None, "Gemma4MoE has no w13_weight/w2_weight to relay out"
-        w13: torch.Tensor = experts.w13_weight.data
-        num_experts, twice_inter, hidden = w13.shape
-        inter = twice_inter // 2
-        assert experts.w2_weight.shape == (num_experts, hidden, inter), (
-            f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} "
-            f"w2={tuple(experts.w2_weight.shape)}"
-        )
+    w13: torch.Tensor = experts.w13_weight.data
+    num_experts, twice_inter, hidden = w13.shape
+    inter = twice_inter // 2
+    assert experts.w2_weight.shape == (num_experts, hidden, inter), (
+        f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} "
+        f"w2={tuple(experts.w2_weight.shape)}"
+    )
 
-        moe.spyre_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2))
-        moe.spyre_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2))
-        # Drop each fused stack as soon as it is split, so the host holds one
-        # layer's worth rather than the whole model's.
-        del experts.w13_weight, w13
-        w2: torch.Tensor = experts.w2_weight.data
-        moe.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
-        del experts.w2_weight, w2
+    moe.spyre_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2))
+    moe.spyre_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2))
+    del experts.w13_weight, w13
 
-        scale = moe.per_expert_scale.data.detach()
-        # [E] widened to one stick per expert so the decode gather has a stick to
-        # sit on; the persistent path reads the bare [E] parameter instead.
-        scale_stick = dma_moe_per_expert_scale_to_spyre(scale)
-        assert scale_stick is not None, "per-expert scale did not take the stick layout"
-        moe.spyre_expert_scale_stick = scale_stick
-        # Identity for the routing-weight restickify. It has to originate on the
-        # host: Spyre has no on-device eye/diag kernel.
-        moe.spyre_route_identity = torch.eye(stick, dtype=scale.dtype).to("spyre")
-        moe.spyre_stick = stick
-        prepared += 1
-        shape = (num_experts, hidden, inter)
+    w2: torch.Tensor = experts.w2_weight.data
+    # Fold the per-expert output scale into ``down`` instead of gathering it
+    # alongside the expert weights every step. It multiplies the already
+    # renormalized routing weight, so pushing it onto that expert's rows is
+    # exact; the checkpoint's values sit within 2% of 1.0, well inside fp16.
+    w2.mul_(moe.per_expert_scale.data.detach().to(w2.dtype).view(num_experts, 1, 1))
+    moe.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
+    del experts.w2_weight, w2
 
-    if prepared:
-        logger.info(
-            "Spyre: relaid out %d Gemma-4 MoE expert stacks (%d experts, "
-            "hidden=%d, intermediate=%d) for on-device gather and matmul.",
-            prepared,
-            *shape,
-        )
-
-
-def _routed_experts(moe: Any) -> Any | None:
-    """Find the module holding ``w13_weight`` under a ``Gemma4MoE`` (a MoERunner)."""
-    for module in moe.modules():
-        if hasattr(module, "w13_weight") and hasattr(module, "w2_weight"):
-            return module
-    return None
+    # Elements per Spyre stick at the platform's forced compute dtype. The top-k
+    # indices and the routing weights are both widened onto a full stick before
+    # the compiler will gather or restickify with them.
+    moe.spyre_stick = get_elem_in_stick(torch.float16)
+    # Identity for the routing-weight restickify. It has to originate on the
+    # host: Spyre has no on-device eye/diag kernel.
+    moe.spyre_route_identity = torch.eye(moe.spyre_stick, dtype=torch.float16).to("spyre")
+    logger.info_once(
+        "Spyre: relaid out the Gemma-4 MoE expert stacks (%d experts, hidden=%d, "
+        "intermediate=%d) for on-device gather and matmul.",
+        num_experts,
+        hidden,
+        inter,
+    )

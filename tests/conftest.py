@@ -32,6 +32,31 @@ def _clear_env_cache():
     envs.clear_env_cache()
 
 
+# Parametrize argnames whose value names the model under test. Scalars hold
+# the model id directly; `model_info` is a vLLM model-info object (its `.name`
+# is the id); `model_ref_output` is a `(model_id, expected_output)` tuple whose
+# first element is the id (tests/e2e/test_compile.py). Extend this as new
+# model-bearing param names appear rather than guessing from arbitrary tuples.
+_MODEL_PARAM_NAMES = ("model", "model_path", "model_info", "model_ref_output")
+
+
+def _model_from_params(params):
+    """Best-effort model id from a test's parametrization, or None."""
+    for name in _MODEL_PARAM_NAMES:
+        if name not in params:
+            continue
+        value = params[name]
+        if value is None:
+            continue
+        # (model_id, ...) tuple: the id is the first element.
+        if isinstance(value, (tuple, list)) and value:
+            value = value[0]
+        # vLLM model-info object: prefer its .name attribute.
+        name_attr = getattr(value, "name", None)
+        return name_attr if name_attr is not None else str(value)
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _emit_result_tags(request, record_property):
     """Stamp `model__<name>` and `testtype__<tier>` onto each test as JUnit
@@ -41,10 +66,7 @@ def _emit_result_tags(request, record_property):
     tier from the CI-resolved SPYRE_TEST_TIER. Both are optional: a test with
     no model param and a local run with no tier just emit nothing."""
     params = getattr(getattr(request.node, "callspec", None), "params", {})
-    model = params.get("model") or params.get("model_path")
-    if model is None and "model_info" in params:
-        info = params["model_info"]
-        model = getattr(info, "name", None) or str(info)
+    model = _model_from_params(params)
     if model:
         record_property("tag", f"model__{model}")
     if _TEST_TIER:

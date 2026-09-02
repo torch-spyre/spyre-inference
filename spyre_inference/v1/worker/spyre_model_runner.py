@@ -82,7 +82,6 @@ from spyre_inference.custom_ops.mlp_pad import (
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
-    TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
@@ -886,20 +885,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         return model.pooler(hidden_states=hidden_states, pooling_metadata=dummy_metadata)
 
-    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""
-        tasks = super().get_supported_pooling_tasks()
-        if not self._pooling_on_spyre:
-            return tasks
-
-        supported = [t for t in tasks if t not in TOKEN_POOLING_TASKS]
-        if tasks and not supported:
-            raise RuntimeError(
-                f"Model {self.model_config.model} supports only token-level "
-                "pooling, which is unsupported while the pooler runs on Spyre."
-            )
-        return supported
-
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -933,14 +918,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         assert num_reqs == len(self.input_batch.pooling_params), (
             "Either all or none of the requests in a batch must be pooling request"
         )
-
-        for params in self.input_batch.pooling_params.values():
-            if params.task in TOKEN_POOLING_TASKS:
-                raise NotImplementedError(
-                    f"Pooling task {params.task!r} returns per-sequence views "
-                    "of hidden_states, which is unsupported while the pooler "
-                    "runs on Spyre."
-                )
 
         # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
         # would need index_select (Spyre dim-0 slice views are unsafe) and

@@ -46,6 +46,53 @@ def test_tp2_llm_construction() -> None:
     )
 
 
+def _generate(
+    tp: int,
+    enforce_eager: bool,
+    compilation_config: dict | None = None,
+) -> list[list[int]]:
+    from vllm import LLM, SamplingParams
+
+    llm = LLM(
+        model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        tensor_parallel_size=tp,
+        dtype="float16",
+        enforce_eager=enforce_eager,
+        max_model_len=128,
+        max_num_seqs=2,
+        **({"compilation_config": compilation_config} if compilation_config is not None else {}),
+    )
+    outs = llm.generate(
+        ["Hello, world!", "The capital of France is"],
+        SamplingParams(max_tokens=8, temperature=0.0),
+    )
+    result = [list(o.outputs[0].token_ids) for o in outs]
+    # vllm has no explicit LLM.shutdown(); rely on GC + child-process reaping.
+    del llm
+    gc.collect()
+    return result
+
+
+def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:
+    """Each TP=2 sequence must share a >=2-token prefix with its TP=1 twin.
+
+    Later divergence is expected: fp16 reduction order differs between the paths.
+    """
+
+    def prefix_len(a: list[int], b: list[int]) -> int:
+        for i, (x, y) in enumerate(zip(a, b)):
+            if x != y:
+                return i
+        return min(len(a), len(b))
+
+    for i, (a, b) in enumerate(zip(tp1, tp2)):
+        n = prefix_len(a, b)
+        assert n >= 2, (
+            f"prompt {i}: tp1 and tp2 diverged at token {n} "
+            f"(expected >=2 matching tokens). tp1={a} tp2={b}"
+        )
+
+
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
 @pytest.mark.skipif(
@@ -53,46 +100,24 @@ def test_tp2_llm_construction() -> None:
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 def test_tp2_llm_generate_matches_tp1() -> None:
-    """TP=1 vs TP=2 greedy-decode prefix-match test on ibm-ai-platform/micro-g3.3-8b-instruct-1b.
+    """TP=1 vs TP=2 greedy-decode prefix match, eager."""
+    _assert_matches_tp1(_generate(tp=1, enforce_eager=True), _generate(tp=2, enforce_eager=True))
 
-    Runs identical prompts at TP=1 and TP=2 with `temperature=0` and
-    asserts the first 2 output tokens match per prompt. Later divergence
-    is expected from float16 reduction-order differences between the
-    TP=1 and TP=2 paths.
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+def test_tp2_compiled_llm_generate_matches_tp1() -> None:
+    """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.
+
+    compile_sizes capped at 5 buckets; full 35-bucket warmup exceeds the
+    pytest-timeout (1800 s) on cold-cache CI.
     """
-    from vllm import LLM, SamplingParams
-
-    prompts = ["Hello, world!", "The capital of France is"]
-    sp = SamplingParams(max_tokens=8, temperature=0.0)
-
-    def run(tp: int) -> list[list[int]]:
-        llm = LLM(
-            model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-            tensor_parallel_size=tp,
-            dtype="float16",
-            enforce_eager=True,
-            max_model_len=128,
-            max_num_seqs=2,
-        )
-        outs = llm.generate(prompts, sp)
-        result = [list(o.outputs[0].token_ids) for o in outs]
-        # vllm doesn't expose an explicit LLM.shutdown(); rely on GC +
-        # child-process reaping. Revisit if this flakes.
-        del llm
-        gc.collect()
-        return result
-
-    def _matching_prefix_len(a: list[int], b: list[int]) -> int:
-        for i, (x, y) in enumerate(zip(a, b)):
-            if x != y:
-                return i
-        return min(len(a), len(b))
-
-    tp1 = run(tp=1)
-    tp2 = run(tp=2)
-    for i, (a, b) in enumerate(zip(tp1, tp2)):
-        n = _matching_prefix_len(a, b)
-        assert n >= 2, (
-            f"prompt {i}: tp1 and tp2 diverged at token {n} "
-            f"(expected >=2 matching tokens). tp1={a} tp2={b}"
-        )
+    _cc = {"compile_sizes": [1, 2, 4, 8, 16]}
+    _assert_matches_tp1(
+        _generate(tp=1, enforce_eager=False, compilation_config=_cc),
+        _generate(tp=2, enforce_eager=False, compilation_config=_cc),
+    )

@@ -1532,7 +1532,6 @@ class _StubAttentionLayer:
         self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
         self.kv_sharing_target_layer_name = None
         self.query_quant = None
-        self.calculate_kv_scales = False
         self.kv_cache: list[torch.Tensor] = []
 
 

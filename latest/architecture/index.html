@@ -2099,7 +2099,7 @@ ops injected via OOT registration.</p>
 <tr>
 <td><code>vllm.general_plugins</code></td>
 <td><code>spyre_inference:register_ops</code></td>
-<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the <code>spyre_convert</code> and <code>spyre_vocab_mask</code> custom ops (RoPE registers no op — its rotation runs in-graph). Also overrides vLLM's <code>TransformersForCausalLM</code> with <code>SpyreTransformersForCausalLM</code></td>
+<td>Calls <code>register_all()</code> — importing the ops package triggers every <code>@register_oot()</code> layer swap, and <code>register_all()</code> additionally registers the <code>spyre_convert</code> custom op (RoPE registers no op — its rotation runs in-graph). Also overrides vLLM's <code>TransformersForCausalLM</code> with <code>SpyreTransformersForCausalLM</code></td>
 </tr>
 </tbody>
 </table>
@@ -2119,10 +2119,10 @@ kernel in pure PyTorch.</p>
 <h2 id="custom-op-replacement">Custom Op Replacement<a class="headerlink" href="#custom-op-replacement" title="Permanent link">&para;</a></h2>
 <p>Each layer that requires Spyre-specific handling is replaced via vLLM's
 <code>@ClassName.register_oot()</code> decorator. Most replacements are pure class swaps that run
-when the ops package is imported. A couple also register a custom op via <code>register_all()</code>:
-<code>spyre_convert</code> (the <code>convert</code> helper) keeps device transfers invisible to <code>torch.compile</code>,
-and <code>spyre_vocab_mask</code> runs the vocab shard mask on CPU. RoPE registers no op — its
-rotation-cache gather and 2×2 rotation run directly in the compiled graph (see below).</p>
+when the ops package is imported. <code>register_all()</code> additionally registers the <code>spyre_convert</code>
+custom op — the <code>convert</code> helper keeps device transfers invisible to <code>torch.compile</code>.
+RoPE registers no op — its rotation-cache gather and 2×2 rotation run directly in the
+compiled graph (see below).</p>
 <table>
 <thead>
 <tr>
@@ -2149,7 +2149,7 @@ rotation-cache gather and 2×2 rotation run directly in the compiled graph (see 
 <td><code>VocabParallelEmbedding</code></td>
 <td><code>SpyreVocabParallelEmbedding</code></td>
 <td>Spyre (mask on CPU when TP&gt;1)</td>
-<td>The weight moves to Spyre with the model and the embedding gather runs on-device (<code>aten.embedding</code> now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP&gt;1, only the shard mask runs on CPU via the <code>spyre_vocab_mask</code> op (Spyre inductor rejects the upstream int64-vs-Python-int comparisons); <code>masked_input</code>/<code>keep</code> are <code>convert</code>ed back to Spyre before the gather and <code>all_reduce</code></td>
+<td>The weight moves to Spyre with the model and the embedding gather runs on-device (<code>aten.embedding</code> now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP&gt;1, the shard mask is precomputed as CPU lookup tables once at load time and applied via on-device <code>index_select</code>/<code>embedding</code>/<code>all_reduce</code>; <code>masked_input</code>/<code>keep</code> are <code>convert</code>ed back to Spyre before the gather</td>
 </tr>
 <tr>
 <td><code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>, <code>ReplicatedLinear</code></td>

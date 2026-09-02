@@ -40,8 +40,11 @@ import pytest
 
 MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 
-# A moderately long shared prefix — long enough to fill at least one block
-# (Spyre block size is 64, so ~70+ tokens of prefix text is sufficient).
+# A long shared prefix that must cover at least one full KV-cache block.
+# Spyre (via CpuPlatform) sets block_size=128, so the prefix must tokenise
+# to well above 128 tokens.  At roughly 3-4 characters per BPE token for
+# Granite/LLaMA tokenisers, ~600 characters gives ~150-200 tokens, which
+# comfortably exceeds one block even with the block-size ceiling.
 _SHARED_PREFIX = (
     "You are a knowledgeable assistant specialised in world geography. "
     "Answer every question clearly and concisely. "
@@ -51,6 +54,11 @@ _SHARED_PREFIX = (
     "Japan is in East Asia and its capital is Tokyo. "
     "Australia is a continent and a country; its capital is Canberra. "
     "Brazil is the largest country in South America; its capital is Brasília. "
+    "Canada is the second largest country in the world; its capital is Ottawa. "
+    "China is the most populous country in Asia; its capital is Beijing. "
+    "India is the second most populous country in the world; its capital is New Delhi. "
+    "The United States of America spans North America; its capital is Washington D.C. "
+    "Russia is the largest country in the world by area; its capital is Moscow. "
     "Now answer the following question: "
 )
 
@@ -61,7 +69,7 @@ _QUESTIONS = [
 
 _PROMPTS = [_SHARED_PREFIX + q for q in _QUESTIONS]
 
-_SAMPLING_KWARGS = dict(temperature=0.0, max_tokens=8)
+_SAMPLING_KWARGS = dict(temperature=0.0, max_tokens=16)
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +84,17 @@ def _run(*, enable_prefix_caching: bool, warmup: bool) -> list:
     prompt to populate the prefix cache before the measured batch.
     """
     from vllm import LLM, SamplingParams
+    from vllm.config import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     llm = LLM(
         model=MODEL,
         enforce_eager=True,
         dtype="float16",
-        max_model_len=256,
+        max_model_len=512,
         max_num_seqs=4,
         enable_prefix_caching=enable_prefix_caching,
+        attention_config=AttentionConfig(backend=AttentionBackendEnum["CUSTOM"]),
     )
 
     sp = SamplingParams(**_SAMPLING_KWARGS)
@@ -141,7 +152,7 @@ def test_prefix_cache_hit_reported_after_warmup() -> None:
     outputs = _run(enable_prefix_caching=True, warmup=True)
 
     cached_counts = [o.num_cached_tokens for o in outputs]
-    assert any(c > 0 for c in cached_counts), (
+    assert any(c is not None and c > 0 for c in cached_counts), (
         "Expected at least one prompt to report a prefix-cache hit after "
         f"warmup, but got num_cached_tokens={cached_counts}"
     )

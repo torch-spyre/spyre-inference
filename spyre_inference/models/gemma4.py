@@ -20,6 +20,7 @@ KV-sharing). The KV-cache-group half of KV-sharing lives in ``TorchSpyreModelRun
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -39,8 +40,8 @@ _ALIASED_SCALARS = (
     "per_layer_projection_scale",
 )
 
-_orig_model_forward = None
-_orig_layer_forward = None
+_orig_model_forward: Callable[..., Any] | None = None
+_orig_layer_forward: Callable[..., Any] | None = None
 
 
 def force_text_backbone(engine_args: EngineArgs) -> None:
@@ -119,7 +120,7 @@ def _spyre_model_forward(
         or self.start_layer != 0
         or self.end_layer != len(self.layers)
     ):
-        return _orig_model_forward(
+        return cast("Callable[..., Any]", _orig_model_forward)(
             self,
             input_ids,
             positions,
@@ -151,7 +152,7 @@ def _spyre_layer_forward(self, positions, hidden_states, residual, per_layer_inp
     ple_dim = self.hidden_size_per_layer_input
     if per_layer_input is not None and per_layer_input.shape[-1] != ple_dim:
         per_layer_input = per_layer_input.narrow(1, self.layer_idx * ple_dim, ple_dim)
-    return _orig_layer_forward(
+    return cast("Callable[..., Any]", _orig_layer_forward)(
         self, positions, hidden_states, residual, per_layer_input=per_layer_input, **kwargs
     )
 

@@ -403,6 +403,7 @@ jobs:
         with:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
+          test_type: ${{ inputs.test_type }}
           # Echo the exact runner-label selectors this job's runs-on used (matrix.runs_on plus the per-PR runner_label override, or the standing matrix.image_label).
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
@@ -485,6 +486,7 @@ jobs:
         with:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
+          test_type: ${{ inputs.test_type }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'

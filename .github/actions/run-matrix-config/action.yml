@@ -11,6 +11,14 @@ inputs:
   test_target:
     description: Makefile target to run (matrix.test_target)
     required: true
+  test_type:
+    description: >-
+      Raw requested test tier (the reusable workflow's inputs.test_type). The
+      Run tests step resolves it via `make print-test-type` and exports it as
+      SPYRE_TEST_TIER so the conftest tag fixture can stamp testtype__<tier>.
+      Empty resolves to the Makefile default.
+    required: false
+    default: ''
   runner_labels:
     description: JSON array string of the runs-on labels the caller resolved to, forwarded to gather-runner-info
     required: true
@@ -149,8 +157,23 @@ runs:
     # Composite action steps don't support the `timeout-minutes` step key, so the same bound is enforced with the shell `timeout` command instead.
     - name: Run tests
       shell: bash
+      env:
+        RAW_TEST_TYPE: ${{ inputs.test_type }}
       run: |
         echo "Running tests for config: ${{ inputs.cfg }}${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}..."
+        # Resolve the tier through the Makefile (single source of truth) and
+        # expose it to the conftest tag fixture, which stamps testtype__<tier>.
+        # An empty raw type would fail the Makefile's validation (it rejects
+        # ""), so drop the arg entirely and let the Makefile default apply --
+        # `make print-test-type` with no TEST_TYPE gives the same tier the
+        # untagged run would use.
+        if [ -n "${RAW_TEST_TYPE}" ]; then
+          SPYRE_TEST_TIER="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
+        else
+          SPYRE_TEST_TIER="$(make -s print-test-type)"
+        fi
+        export SPYRE_TEST_TIER
+        echo "Resolved SPYRE_TEST_TIER=${SPYRE_TEST_TIER}"
         timeout --signal=TERM --kill-after=1m 90m \
           make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
         echo "tests done"

@@ -46,7 +46,17 @@ _COSINE_MIN = 0.99
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
         ),
+        (
+            "google/gemma-4-E2B",
+            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+        ),
+        (
+            "google/gemma-4-E4B",
+            "\n\nWhat is the IBM logo?\n\nWhat is the IBM slogan?\n\nWhat",
+        ),
     ],
+    # Named so `-k <model>` selects one row; default tuple ids are positional.
+    ids=["micro-g3.3-8b", "gemma-3-1b-it", "gemma-4-31B", "gemma-4-E2B", "gemma-4-E4B"],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.

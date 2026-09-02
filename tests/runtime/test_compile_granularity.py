@@ -193,7 +193,7 @@ def test_compile_blocks_wraps_every_block_in_place() -> None:
     model = _Model(num_layers=4)
     originals = list(model.model.layers)
 
-    assert _runner(model)._compile_blocks() == 4
+    assert _runner(model)._compile_blocks() == (4, 0)
 
     for i, original in enumerate(originals):
         assert model.model.layers[i] is original
@@ -215,8 +215,25 @@ def test_compile_blocks_preserves_parameter_names() -> None:
 
 def test_pp_missing_layers_are_not_compiled() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _runner(model)._compile_blocks() == 2
+    assert _runner(model)._compile_blocks() == (2, 0)
     assert all(isinstance(layer, PPMissingLayer) for layer in model.model.layers[2:])
+
+
+def test_self_compiling_blocks_are_left_alone_but_still_count() -> None:
+    """Gemma-4 MoE compiles its own regions; wrapping it would nest the graphs.
+
+    Such a block must still count as found, or the caller falls back to a
+    whole-model graph and undoes the block's own compilation.
+    """
+    model = _Model(num_layers=4)
+    for block in list(model.model.layers)[2:]:
+        block.spyre_compiles_own_regions = True
+
+    assert _runner(model)._compile_blocks() == (2, 2)
+
+    wrapped, self_compiled = list(model.model.layers)[:2], list(model.model.layers)[2:]
+    assert all(block._compiled_call_impl is not None for block in wrapped)
+    assert all(block._compiled_call_impl is None for block in self_compiled)
 
 
 def test_rejects_an_unknown_granularity_even_when_eager(monkeypatch) -> None:

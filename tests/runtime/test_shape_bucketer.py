@@ -319,6 +319,19 @@ class TestEncoderBuckets:
             (4, 128),
         ]
 
+    def test_warmup_shapes_fair_ab_max_model_len_64(self):
+        """``--max-num-seqs 1 --max-model-len 64`` warms only ``(1, 64)``.
+
+        Same 64-token prompts on ``--max-model-len 128`` still pick ``(1, 64)``
+        at runtime when that cell exists. Capping ``L`` isolates pad-up from
+        the sendnn stack gap.
+        """
+        assert pooling_warmup_shapes(
+            max_num_seqs=1,
+            max_model_len=64,
+            max_num_batched_tokens=512,
+        ) == [(1, 64)]
+
     def test_warmup_shapes_skip_over_token_budget(self):
         # 4*256 = 1024 and 2*256 = 512 both exceed 300; 4*64 = 256 still fits.
         assert pooling_warmup_shapes(

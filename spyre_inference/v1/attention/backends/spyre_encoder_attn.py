@@ -19,7 +19,8 @@ layers. Operates on direct Q/K/V tensors rather than the paged KV-cache path.
 
 Ragged→dense packing uses host-built indices + ``index_select`` (gather).
 Pad slots gather a trailing zero row so the dense batch stays zeros in the
-padding region.
+padding region. ``B=1`` with ``T == L`` skips gather (the body is already
+dense).
 """
 
 from __future__ import annotations
@@ -102,6 +103,14 @@ def _pad_head_dim_to_stick(flat: torch.Tensor, head_size_padded: int) -> torch.T
     return flat
 
 
+def _is_identity_row_map(indices: torch.Tensor, num_rows: int) -> bool:
+    """True when ``indices`` is ``0 .. num_rows-1`` (no pad gather). Host only."""
+    if indices.numel() != num_rows or indices.device.type != "cpu":
+        return False
+    flat = indices.reshape(-1)
+    return bool(torch.equal(flat, torch.arange(num_rows, dtype=flat.dtype)))
+
+
 def gather_pack(
     flat: torch.Tensor,
     pack_indices: torch.Tensor,
@@ -111,10 +120,17 @@ def gather_pack(
 
     ``pack_indices`` is host ``[B, L]`` int64. Head dim is padded to the stick
     (CPU for MiniLM D=32), then a zero token row is ``F.pad``'d on-device.
+
+    ``B=1`` with identity rows (``T == L`` and no pad slots) skips
+    ``index_select``: the body is already one dense sequence. ``B > 1`` still
+    gathers; that is the reverted pack-once path.
     """
     batch, aligned_len = pack_indices.shape
     _t, num_heads, _d = flat.shape
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
+    if batch == 1 and _is_identity_row_map(pack_indices, flat.shape[0]):
+        packed = flat.unsqueeze(0)
+        return packed.permute(0, 2, 1, 3).contiguous()
     flat_ext = F.pad(flat, (0, 0, 0, 0, 0, 1))
     gathered = select_rows(flat_ext, pack_indices)  # [B*L, H, Dp]
     packed = gathered.view(batch, aligned_len, num_heads, head_size_padded)
@@ -126,11 +142,17 @@ def gather_unpack(
     unpack_indices: torch.Tensor,
     head_size: int,
 ) -> torch.Tensor:
-    """Unpack padded ``[B, H, L, Dp]`` → flat ``[T, H, D]`` via ``index_select``."""
+    """Unpack padded ``[B, H, L, Dp]`` → flat ``[T, H, D]`` via ``index_select``.
+
+    Identity ``B=1`` (``T == B×L``) is a reshape; pad / multi-seq still gather.
+    """
     batch, num_heads, aligned_len, head_size_padded = attn_out.shape
     tokens = attn_out.permute(0, 2, 1, 3).contiguous()
     flat_padded = tokens.reshape(batch * aligned_len, num_heads, head_size_padded)
-    gathered = select_rows(flat_padded, unpack_indices)
+    if _is_identity_row_map(unpack_indices, flat_padded.shape[0]):
+        gathered = flat_padded
+    else:
+        gathered = select_rows(flat_padded, unpack_indices)
     if gathered.shape[-1] == head_size:
         return gathered
     # Crop is a slice, not pad. D=32 is half a stick; do it on CPU.

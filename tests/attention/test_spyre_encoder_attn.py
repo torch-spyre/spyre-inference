@@ -21,6 +21,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+from spyre_inference.v1.attention.backends import spyre_encoder_attn as encoder_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -28,6 +29,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     build_attention_mask,
+    gather_pack,
+    gather_unpack,
 )
 
 # extra `encoder_attention` mark so CI can split this into its own job
@@ -458,3 +461,71 @@ def test_spyre_encoder_attn(
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
     )
+
+
+def _count_select_rows(monkeypatch):
+    """Wrap ``select_rows`` so tests can assert identity B=1 skips gather."""
+    real = encoder_attn.select_rows
+    calls = {"n": 0}
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "select_rows", counting)
+    return calls
+
+
+def test_gather_pack_b1_identity_skips_index_select(monkeypatch):
+    """B=1 with ``T == L`` is already dense; do not ``index_select`` the full pack."""
+    calls = _count_select_rows(monkeypatch)
+    length, heads, dim = 4, 2, 8
+    flat = torch.arange(length * heads * dim, dtype=torch.float32).reshape(length, heads, dim)
+    pack_idx = torch.arange(length, dtype=torch.int64).view(1, length)
+
+    out = gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = flat.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
+    assert torch.equal(out, expected)
+
+
+def test_gather_unpack_b1_identity_skips_index_select(monkeypatch):
+    calls = _count_select_rows(monkeypatch)
+    batch, heads, length, dim = 1, 2, 4, 8
+    attn_out = torch.arange(batch * heads * length * dim, dtype=torch.float32).reshape(
+        batch, heads, length, dim
+    )
+    unpack_idx = torch.arange(length, dtype=torch.int64)
+
+    out = gather_unpack(attn_out, unpack_idx, dim)
+
+    assert calls["n"] == 0
+    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
+    assert torch.equal(out, expected)
+
+
+def test_gather_pack_b1_pad_slots_still_index_select(monkeypatch):
+    """Pad slots still gather the extra zero row; identity skip must not fire."""
+    calls = _count_select_rows(monkeypatch)
+    tokens, heads, dim = 3, 2, 8
+    flat = torch.arange(tokens * heads * dim, dtype=torch.float32).reshape(tokens, heads, dim)
+    # Last slot is the F.pad zero row (index == T).
+    pack_idx = torch.tensor([[0, 1, 2, tokens]], dtype=torch.int64)
+
+    out = gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 1
+    assert torch.equal(out[0, :, 3, :], torch.zeros(heads, dim))
+
+
+def test_gather_pack_multi_seq_still_index_select(monkeypatch):
+    """B>1 keeps per-layer gather even when rows are 0..T-1 (reverted pack-once)."""
+    calls = _count_select_rows(monkeypatch)
+    batch, length, heads, dim = 2, 4, 2, 8
+    flat = torch.randn(batch * length, heads, dim)
+    pack_idx = torch.arange(batch * length, dtype=torch.int64).view(batch, length)
+
+    gather_pack(flat, pack_idx, dim)
+
+    assert calls["n"] == 1

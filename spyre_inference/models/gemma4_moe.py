@@ -41,6 +41,11 @@ their own between the softmax and that context. So a Gemma-4 MoE layer compiles
 its own regions and opts out of the model runner's whole-block compile; each
 region documents its own boundary.
 
+Both forms require ``torch.compile``. ``--enforce-eager`` is rejected at layer
+construction: the persistent routing region's ``torch.ops.spyre.keep_by_index``
+exists only as an Inductor lowering and silently returns ``None`` when called
+eagerly.
+
 Both forms read one shared device-resident expert stack, laid out by
 :class:`SpyreFusedMoEMethod` below.
 """
@@ -338,11 +343,7 @@ def _spyre_region(layer: Any, name: str, fn: Any) -> Any:
     """
     region = layer._spyre_regions.get(name)
     if region is None:
-        region = (
-            torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
-            if layer._spyre_compile
-            else fn
-        )
+        region = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
         layer._spyre_regions[name] = region
     return region
 
@@ -379,18 +380,16 @@ def _spyre_moe_layer_forward(
             )
             route = _spyre_region(self, "route", _persistent_route)(self, probs)
             moe = self.moe
-            if self._spyre_compile:
-                _name_persistent_dims(expert_input, moe.spyre_gate, moe.spyre_up, moe.spyre_down)
+            _name_persistent_dims(expert_input, moe.spyre_gate, moe.spyre_up, moe.spyre_down)
             try:
                 with spyre_config.patch(_PERSISTENT_COMPILER_CONFIG):
                     moe_out = _spyre_region(self, "experts", _persistent_experts)(
                         self, expert_input, route
                     )
             finally:
-                # Unconditional: a stale _enabled flag would leak the persistent
-                # form's named dims into the next region's compilation when this
-                # one is an Inductor cache hit.  In eager mode the names are never
-                # declared, and every single op would otherwise compile under them.
+                # Unconditional: a stale _enabled flag would leak the persistent form's
+                # named dims into the next region's compilation whenever this one is an
+                # Inductor cache hit and never reaches the propagation pass.
                 _reset_named_dims()
             out = _spyre_region(self, "combine", _combine_block)(self, residual, moe_out)
     return out, None
@@ -419,7 +418,15 @@ def install_spyre_patches() -> None:
         # persistent path needs named-dims context set eagerly between two of its
         # compilations. See _spyre_moe_layer_forward.
         self.spyre_compiles_own_regions = True
-        self._spyre_compile = get_cached_compilation_config().mode is not CompilationMode.NONE
+        if get_cached_compilation_config().mode is CompilationMode.NONE:
+            # Fail here rather than with an AttributeError 30 layers deep: the
+            # persistent path's `torch.ops.spyre.keep_by_index` exists only as an
+            # Inductor lowering and returns None when called eagerly.
+            raise NotImplementedError(
+                "Spyre Gemma-4 MoE requires torch.compile — torch.ops.spyre.keep_by_index, "
+                "which builds the prefill routing weights, has no eager implementation. "
+                "Run without --enforce-eager."
+            )
         self._spyre_regions: dict[str, Any] = {}
         self.moe.spyre_top_k = int(config.top_k_experts)
         # The expert relayout runs in the RoutedExperts weight hook, which is handed

@@ -50,6 +50,15 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
 ]
 
+# Token classification: the model applies its own classifier after casting to
+# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
+# runs on Spyre instead of detouring through SpyreCpuClassifier.
+TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
+TOKEN_CLASSIFY_PROMPTS = [
+    "My name is Wolfgang and I live in Berlin",
+    "George Washington went to Washington",
+]
+
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
@@ -167,3 +176,36 @@ def test_encoder_rerank_models(model: str) -> None:
     scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
     assert len(scores) == 1
     assert math.isfinite(scores[0].outputs.score)
+
+
+@pytest.mark.uses_subprocess
+def test_encoder_token_classify() -> None:
+    """Per-token scores match softmax(HF fp32 logits) and agree on every label."""
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(TOKEN_CLASSIFY_MODEL)
+    hf = AutoModelForTokenClassification.from_pretrained(TOKEN_CLASSIFY_MODEL, dtype=torch.float32)
+    hf.eval()
+    with torch.inference_mode():
+        refs = [
+            hf(**tok(p, return_tensors="pt")).logits[0].float().softmax(-1)
+            for p in TOKEN_CLASSIFY_PROMPTS
+        ]
+
+    llm = LLM(
+        model=TOKEN_CLASSIFY_MODEL,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=2,
+        enforce_eager=True,
+    )
+    outputs = llm.encode(TOKEN_CLASSIFY_PROMPTS, pooling_task="token_classify")
+    assert len(outputs) == len(TOKEN_CLASSIFY_PROMPTS)
+
+    for prompt, out, ref in zip(TOKEN_CLASSIFY_PROMPTS, outputs, refs):
+        got = torch.as_tensor(out.outputs.data).float()
+        assert got.shape == ref.shape, f"{prompt!r}: {tuple(got.shape)} vs {tuple(ref.shape)}"
+        assert torch.equal(got.argmax(-1), ref.argmax(-1)), (
+            f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
+        )
+        assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"

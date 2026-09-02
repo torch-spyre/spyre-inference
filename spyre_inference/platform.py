@@ -49,16 +49,19 @@ logger = init_logger(__name__)
 
 
 def _disable_torch_accelerator() -> None:
-    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
-    # raise "Cannot access accelerator device when none is available." Our OOT
-    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
-    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
-    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
+    # empty_host_cache() raise "Cannot access accelerator device when none is
+    # available." Our OOT platform (not CPU) makes vLLM's
+    # cleanup_dist_env_and_memory() skip its is_cpu() guard and call these at
+    # EngineCore shutdown. Patch at import to cover every process; matches
+    # vLLM's CPU worker (issue #327).
     def _noop(*args, **kwargs) -> None:
         return None
 
     torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+    if hasattr(torch.accelerator, "empty_host_cache"):
+        torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -216,6 +219,11 @@ class TorchSpyrePlatform(CpuPlatform):
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
 
+        # A bare VllmConfig() (no model) reaches this hook too; every default below
+        # is model-specific.
+        if vllm_config.model_config is None:
+            return
+
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
         # subprocess), while enforce_eager persists, so it's the only stable signal.
@@ -251,11 +259,15 @@ class TorchSpyrePlatform(CpuPlatform):
                     512,
                 )
                 if vllm_config.model_config.runner_type != "pooling":
-                    compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
-                    if max_capture_size >= 8:
-                        compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
-                    if max_capture_size >= 256:
-                        compile_sizes += list(range(256, max_capture_size + 1, 16))
+                    # Decode packs one token per running sequence; prefill lands on
+                    # the single largest bucket. Denser sizes only cost warmup time.
+                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                    sizes = {max_capture_size, num_seqs}
+                    size = 1
+                    while size < num_seqs:
+                        sizes.add(size)
+                        size *= 2
+                    compile_sizes = sorted(sizes)
                 else:
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
                         default_encoder_len_buckets,
@@ -316,9 +328,11 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
-        # Route TP collectives through the opaque `torch.ops.vllm.{all_reduce,
-        # all_gather,...}` custom ops rather than plain `dist.*`.
-        return True
+        # `False` reaches `device_communicator.<op>` directly, which dynamo inlines
+        # so the reduction compiles into the graph. The `torch.ops.vllm.*` wrappers
+        # are opaque to inductor, and their no-mutation declaration is wrong for the
+        # in-place `dist.all_reduce` they wrap, which corrupted compiled TP output.
+        return False
 
     @classmethod
     def supports_fp8(cls) -> bool:
@@ -428,16 +442,19 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
-        # Check if the model dtype is different from float16,
-        # which is only currently supported in torch-spyre
-        if vllm_config.model_config.dtype != torch.float16:
-            raise ValueError(
-                f"The model dtype needs to be torch.float16 for spyre, "
-                f"but was specified to be {vllm_config.model_config.dtype}"
-            )
+        # A bare VllmConfig() (no model) reaches this hook too; guard each
+        # model_config access like upstream CpuPlatform.
+        if vllm_config.model_config is not None:
+            # Check if the model dtype is different from float16,
+            # which is only currently supported in torch-spyre
+            if vllm_config.model_config.dtype != torch.float16:
+                raise ValueError(
+                    f"The model dtype needs to be torch.float16 for spyre, "
+                    f"but was specified to be {vllm_config.model_config.dtype}"
+                )
 
-        # Pad attention head_dim up to a stick-aligned size on the native path.
-        cls._maybe_pad_head_dim(vllm_config)
+            # Pad attention head_dim up to a stick-aligned size on the native path.
+            cls._maybe_pad_head_dim(vllm_config)
 
         # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
         cls._maybe_pad_intermediate_size(vllm_config)
@@ -467,6 +484,15 @@ class TorchSpyrePlatform(CpuPlatform):
             raise ValueError(
                 f"Spyre does not support data_parallel_size > 1 "
                 f"(got {parallel_config.data_parallel_size})."
+            )
+
+        # The collectives torch-spyre lowers to reduce over the whole comms world
+        # and ignore the group name they are handed, so the TP group must *be* the
+        # world: with DP already rejected, pipeline parallelism has to go too.
+        if parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                f"Spyre does not support pipeline_parallel_size > 1 "
+                f"(got {parallel_config.pipeline_parallel_size})."
             )
 
         # Clamp CPU threading env vars before workers fork so they inherit the
@@ -514,7 +540,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
-        if cache_config.num_gpu_blocks_override is None:
+        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(
                     "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."

@@ -157,23 +157,28 @@ def test_torch_accelerator_ops_are_noop():
     # the real empty_cache() return None too, so assert on identity here.
     assert torch.accelerator.empty_cache.__name__ == "_noop"
     assert torch.accelerator.synchronize.__name__ == "_noop"
+    assert torch.accelerator.empty_host_cache.__name__ == "_noop"
 
     def _raise(*args, **kwargs):
         raise RuntimeError("Cannot access accelerator device when none is available.")
 
     saved_empty_cache = torch.accelerator.empty_cache
     saved_synchronize = torch.accelerator.synchronize
+    saved_empty_host_cache = torch.accelerator.empty_host_cache
     try:
         torch.accelerator.empty_cache = _raise
         torch.accelerator.synchronize = _raise
+        torch.accelerator.empty_host_cache = _raise
 
         _disable_torch_accelerator()
 
         assert torch.accelerator.empty_cache() is None
         assert torch.accelerator.synchronize() is None
+        assert torch.accelerator.empty_host_cache() is None
     finally:
         torch.accelerator.empty_cache = saved_empty_cache
         torch.accelerator.synchronize = saved_synchronize
+        torch.accelerator.empty_host_cache = saved_empty_host_cache
 
 
 def test_block_size_valid_no_override():
@@ -493,6 +498,25 @@ def test_enforce_eager_is_the_only_eager_switch():
     assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
 
 
+def test_collectives_bypass_the_vllm_custom_op_wrappers():
+    """Collectives must reach `SpyreCommunicator` directly, not via torch.ops.vllm.*."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    assert TorchSpyrePlatform.use_custom_op_collectives() is False
+
+
+@pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+def test_only_tensor_parallelism_is_accepted(field):
+    """DP and PP are rejected: the device collectives require TP group == world."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    setattr(vllm_config.parallel_config, field, 2)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_raise_dynamo_recompile_limits_survives_a_clobber():
     """torch_spyre's autoload lowers cache_size_limit to 1024; re-asserting must win."""
     import torch._dynamo
@@ -529,17 +553,27 @@ def test_worker_reasserts_recompile_limits_after_autoload():
 
 
 def test_compile_sizes_default_generated():
-    """When user doesn't set compile_sizes, the platform generates default buckets."""
+    """Defaults are powers of two up to max_num_seqs, plus one prefill bucket."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 4
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    sizes = vllm_config.compilation_config.compile_sizes
-    assert sizes, "compile_sizes should not be empty"
-    assert sizes == sorted(sizes), "compile_sizes should be sorted ascending"
-    assert sizes[0] == 1, "smallest bucket should be 1"
-    assert max(sizes) <= 512
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512]
+
+
+def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
+    """A max_num_seqs that is not a power of two still gets its own bucket."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 6
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 6, 512]
 
 
 def test_compile_sizes_user_provided_respected():
@@ -574,13 +608,13 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
     vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_seqs = 4
     vllm_config.scheduler_config.max_num_batched_tokens = 32
 
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    sizes = vllm_config.compilation_config.compile_sizes
-    assert max(sizes) <= 32
-    assert vllm_config.scheduler_config.max_num_batched_tokens == max(sizes)
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 32
 
 
 def test_compile_sizes_not_set_when_eager():

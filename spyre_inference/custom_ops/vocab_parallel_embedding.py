@@ -79,7 +79,7 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
         reindex_table = torch.zeros(vocab_size, 2, dtype=torch.int64)
         reindex_table[:, 0] = masked_input
         keep_table = torch.zeros(vocab_size, 2, dtype=torch.float16)
-        keep_table[:, 0] = _keep_from_mask(input_mask, keep_table.dtype).squeeze(-1)
+        keep_table[:, 0] = ~input_mask
         return reindex_table, keep_table
 
     def _apply(self, fn, recurse=True):
@@ -146,9 +146,9 @@ def promote_tied_lm_head(head: torch.nn.Module) -> None:
     logger.debug("Tied lm_head %s projects from a padded transposed weight", tuple(weight.shape))
 
 
-def _keep_from_mask(input_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Return the keep multiplier from the input mask produced by vLLM's helper."""
-    return (~input_mask).to(dtype=dtype).unsqueeze(-1)
+def _keep_from_mask(input_mask: torch.Tensor) -> torch.Tensor:
+    """Return the keep multiplier (as bool) from the input mask produced by vLLM's helper."""
+    return (~input_mask).unsqueeze(-1)
 
 
 def _vocab_mask_op_func(
@@ -169,7 +169,7 @@ def _vocab_mask_op_func(
         added_vocab_start_index,
         added_vocab_end_index,
     )
-    keep = _keep_from_mask(input_mask, dtype)
+    keep = _keep_from_mask(input_mask).to(dtype=dtype)
     return masked_input.to(device), keep.to(device)
 
 

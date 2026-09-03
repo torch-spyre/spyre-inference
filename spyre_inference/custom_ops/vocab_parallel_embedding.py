@@ -14,10 +14,11 @@
 
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
-from functools import lru_cache
+from typing import cast
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parameter import Parameter
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -25,10 +26,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
-from .utils import place_row_gathered
+from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
+from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
 
@@ -110,50 +111,34 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
         return output
 
 
-def _vocab_mask_op_func(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = input_.device
-    masked_input, input_mask = get_masked_input_and_mask(
-        input_,
-        org_vocab_start_index,
-        org_vocab_end_index,
-        num_org_vocab_padding,
-        added_vocab_start_index,
-        added_vocab_end_index,
+def promote_tied_lm_head(head: torch.nn.Module) -> None:
+    """Give a tied embedding a padded `Wᵀ` the first time it is asked for logits.
+
+    `tie_word_embeddings` does not say which table projects. Models express the tie
+    three ways: alias `lm_head = embed_tokens` (Qwen), tie a real `ParallelLMHead`
+    (Llama), or pass `embed_tokens` to the logits processor with no `lm_head` at all
+    (Gemma) -- and a model may hold gather-only tables under the same config, such as
+    Gemma 3n's per-layer embeddings. The module handed to `_apply_head` is the only
+    signal that identifies the projection in all three, so the decision is made here
+    rather than guessed at construction.
+
+    `weight` is left alone: it keeps the row-gathered layout the gather needs. The
+    gather and matmul layouts differ, so both tables stay resident -- the vocab-sized
+    saving upstream tying gets is deliberately given up to keep the transposed matmul.
+    """
+    # Exact type: SpyreParallelLMHead is a subclass and brings its own method.
+    if type(head) is not SpyreVocabParallelEmbedding:
+        return
+    if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
+        return
+
+    method = SpyreUnquantizedLMHeadMethod()
+    # Pad and transpose on the host: this runs after the device move, and relaying
+    # out a vocab-sized table on device costs far more than the round trip.
+    weight = cast(torch.Tensor, head.weight)
+    method.build_weight_t(head, convert(weight.data, device="cpu"))
+    head.padded_weight_t = Parameter(
+        convert(head.padded_weight_t.data, device=weight.device), requires_grad=False
     )
-    keep = (~input_mask).to(dtype=dtype).unsqueeze(-1)
-    return masked_input.to(device), keep.to(device)
-
-
-def _vocab_mask_op_fake(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    masked_input = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)
-    keep = torch.empty((*input_.shape, 1), dtype=dtype, device=input_.device)
-    return masked_input, keep
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register the spyre_vocab_mask custom op with vLLM."""
-    direct_register_custom_op(
-        op_name="spyre_vocab_mask",
-        op_func=_vocab_mask_op_func,
-        fake_impl=_vocab_mask_op_fake,
-        mutates_args=[],
-        dispatch_key="CPU",
-    )
-    logger.debug_once("Registered custom op: spyre_vocab_mask")
+    head.quant_method = method
+    logger.debug("Tied lm_head %s projects from a padded transposed weight", tuple(weight.shape))

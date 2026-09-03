@@ -16,9 +16,19 @@
 
 from __future__ import annotations
 
+import json
+import math
+from pathlib import Path
+
 import pytest
+import torch
+import torch.nn.functional as F
 
 pytestmark = pytest.mark.compile
+
+_POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
+_POOLING_REFS = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
+_COSINE_MIN = 0.99
 
 
 @pytest.mark.parametrize(
@@ -56,6 +66,40 @@ def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
         "\n\nIBMs main businesses are the companies that provide the services of the",
         monkeypatch,
     )
+
+
+def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compiled pooling pads to ``(B, L)`` and matches cached HF refs.
+
+    Two prompts at ``max_num_seqs=2`` / ``max_model_len=64`` warmup body ``T``
+    and attention ``(1, 64)`` / ``(2, 64)``. Runtime 1D-pads the body; SDPA
+    gathers onto ``(2, 64)``.
+    """
+    from vllm import LLM
+
+    refs = json.loads(_POOLING_REFS.read_text())[_POOLING_MODEL]
+    prompts = refs["prompts"]
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    engine = LLM(
+        model=_POOLING_MODEL,
+        runner="pooling",
+        enforce_eager=False,
+        max_model_len=64,
+        max_num_seqs=2,
+    )
+    outputs = engine.embed(prompts)
+    assert len(outputs) == len(prompts)
+    for out, ref_emb in zip(outputs, refs["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb)
+        assert all(math.isfinite(x) for x in emb)
+        sim = F.cosine_similarity(
+            torch.tensor(emb, dtype=torch.float32),
+            torch.tensor(ref_emb, dtype=torch.float32),
+            dim=0,
+        ).item()
+        assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
 def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:

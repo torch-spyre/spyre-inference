@@ -1,17 +1,56 @@
-# Pinned Spyre RPM package names, one per line.
-# Lines starting with # are ignored.
-# Specify exact versions to pin (e.g. ibm-deeptools-1.2.3-1.el8).
-# The cache key is derived from this file's hash. Changing any entry
-# invalidates the GHA RPM cache and triggers a fresh download.
+# Pinned Spyre RPM baseline for CI. Regenerate with `upgrade-torch-spyre`.
 #
-ibm-aiu-toolbox-e2e-2.0.0-0.main.28+28.47d9b916.366f8ab10638.47d9b91.el10
-ibm-deeptools-2.0.0-0.master.2369+2369.e84bd784.3e5c59c07453.e84bd78.el10
-ibm-deeptools-devel-2.0.0-0.master.2369+2369.e84bd784.3e5c59c07453.e84bd78.el10
-ibm-flex-2.0.0-0.main.509+509.d5217d0f.ccb795a758a4.d5217d0.el10
-ibm-flex-devel-2.0.0-0.main.509+509.d5217d0f.ccb795a758a4.d5217d0.el10
-ibm-libaiupti-2.0.0-0.main.21+21.bd7054db.6015544beded.bd7054d.el10
-ibm-senlib-core-2.0.0-0.main.1+255.36b471f_226.455803e90386.el10
-ibm-senlib-dd2-2.0.0-0.main.1+255.36b471f_226.455803e90386.el10
-ibm-senlib-headers-2.0.0-0.main.1+255.36b471f_226.455803e90386.el10
-ibm-spyre-comms-1.0.0-0.main.130+130.71d161ee.5bd0ae453aa2.71d161e.el10
-ibm-spyre-comms-devel-1.0.0-0.main.130+130.71d161ee.5bd0ae453aa2.71d161e.el10
+# All packages are published in the "prod" (base) tree. The `next` tree is 
+# available to use for dev preview builds.
+#
+# x86_64 is pinned to an exact build including the trailing `_<buildnum>`.
+# Power (ppc64le) and Z (s390x) pins should use the same commit, but are
+# left wildcarded: The build numbers differ across platforms. 
+
+version = 2
+
+[defaults]
+# Artifactory subdir (<repo>/<tree>/<arch>/); "" is the prod/base tree.
+tree = ""
+
+# x86_64
+[packages]
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+28.47d9b91_96" }
+ibm-deeptools         = { version = "2.0.0-0.main.1+2414.da394b3_325" }
+ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2414.da394b3_325" }
+ibm-flex              = { version = "2.0.0-0.main.1+529.a5453d3_355" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+529.a5453d3_355" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+261.531e4b5_237" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+261.531e4b5_237" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+261.531e4b5_237" }
+ibm-spyre-comms       = { version = "1.0.0-0.main.1+135.cf3c000_167" }
+ibm-spyre-comms-devel = { version = "1.0.0-0.main.1+135.cf3c000_167" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+22.9e597ab_3" }
+
+# Power
+[overrides.ppc64le]
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+28.47d9b91_*" }
+ibm-deeptools         = { version = "2.0.0-0.main.1+2414.da394b3_*" }
+ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2414.da394b3_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+529.a5453d3_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+529.a5453d3_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-spyre-comms       = { version = "1.0.0-0.main.1+135.cf3c000_*" }
+ibm-spyre-comms-devel = { version = "1.0.0-0.main.1+135.cf3c000_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+22.9e597ab_*" }
+
+# Z
+[overrides.s390x]
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+28.47d9b91_*" }
+ibm-deeptools         = { version = "2.0.0-0.main.1+2414.da394b3_*" }
+ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2414.da394b3_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+529.a5453d3_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+529.a5453d3_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+261.531e4b5_*" }
+ibm-spyre-comms       = { version = "1.0.0-0.main.1+135.cf3c000_*" }
+ibm-spyre-comms-devel = { version = "1.0.0-0.main.1+135.cf3c000_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+22.9e597ab_*" }

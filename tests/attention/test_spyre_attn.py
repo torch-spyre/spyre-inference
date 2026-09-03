@@ -1779,13 +1779,15 @@ def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
     metadata = _padded_mask_metadata(seq_lens)
     aligned = metadata.aligned_max_query_len
 
-    row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
+    row_table, row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
     starts = metadata.query_start_loc[:-1].tolist()
 
+    assert row_table.is_contiguous()
     for seq_idx, (query_len, _) in enumerate(seq_lens):
         rows = row_tables[seq_idx][:aligned].tolist()
         expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
         assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
+        assert row_tables[seq_idx].storage_offset() == 0
 
 
 @pytest.mark.parametrize(

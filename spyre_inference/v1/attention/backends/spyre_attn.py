@@ -181,7 +181,8 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
 
 def _build_query_row_tables(
     attn_metadata: "SpyreAttentionMetadata", device: torch.device
-) -> list[torch.Tensor]:
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Build query gather/dest row tables for the whole batch."""
     num_seqs = attn_metadata.num_seqs
     aligned = attn_metadata.aligned_max_query_len
     index_len = (
@@ -194,7 +195,9 @@ def _build_query_row_tables(
     rows[:, :aligned] = (
         starts.unsqueeze(1) + torch.minimum(q_pos.unsqueeze(0), (lens - 1).unsqueeze(1))
     ).to(torch.int32)
-    return [convert(rows[s].contiguous(), device=device) for s in range(num_seqs)]
+    rows_dev = convert(rows.contiguous(), device=device)
+    # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770).
+    return rows_dev, [rows_dev[s].clone() for s in range(num_seqs)]
 
 
 def _create_compilable_page_attn(
@@ -503,6 +506,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Absolute query rows per sequence: gather sources in `query`, and store
     # destinations in `output`. One offset-0 tensor each, as above. Rows past
     # query_len repeat the sequence's last real row; the mask discards them.
+    query_row_table: torch.Tensor | None = None
     query_row_tables: list[torch.Tensor] | None = None
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
@@ -1490,9 +1494,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             row_table = None
             if needs_gather or store_mode == "index":
                 if attn_metadata.query_row_tables is None:
-                    attn_metadata.query_row_tables = _build_query_row_tables(
-                        attn_metadata, _target_device
-                    )
+                    (
+                        attn_metadata.query_row_table,
+                        attn_metadata.query_row_tables,
+                    ) = _build_query_row_tables(attn_metadata, _target_device)
                 row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device

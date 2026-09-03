@@ -157,23 +157,28 @@ def test_torch_accelerator_ops_are_noop():
     # the real empty_cache() return None too, so assert on identity here.
     assert torch.accelerator.empty_cache.__name__ == "_noop"
     assert torch.accelerator.synchronize.__name__ == "_noop"
+    assert torch.accelerator.empty_host_cache.__name__ == "_noop"
 
     def _raise(*args, **kwargs):
         raise RuntimeError("Cannot access accelerator device when none is available.")
 
     saved_empty_cache = torch.accelerator.empty_cache
     saved_synchronize = torch.accelerator.synchronize
+    saved_empty_host_cache = torch.accelerator.empty_host_cache
     try:
         torch.accelerator.empty_cache = _raise
         torch.accelerator.synchronize = _raise
+        torch.accelerator.empty_host_cache = _raise
 
         _disable_torch_accelerator()
 
         assert torch.accelerator.empty_cache() is None
         assert torch.accelerator.synchronize() is None
+        assert torch.accelerator.empty_host_cache() is None
     finally:
         torch.accelerator.empty_cache = saved_empty_cache
         torch.accelerator.synchronize = saved_synchronize
+        torch.accelerator.empty_host_cache = saved_empty_host_cache
 
 
 def test_block_size_valid_no_override():

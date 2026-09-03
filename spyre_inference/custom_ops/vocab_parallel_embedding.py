@@ -14,7 +14,6 @@
 
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
-from functools import lru_cache
 from typing import cast
 
 import torch
@@ -27,7 +26,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
 from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
@@ -144,52 +142,3 @@ def promote_tied_lm_head(head: torch.nn.Module) -> None:
     )
     head.quant_method = method
     logger.debug("Tied lm_head %s projects from a padded transposed weight", tuple(weight.shape))
-
-
-def _vocab_mask_op_func(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = input_.device
-    masked_input, input_mask = get_masked_input_and_mask(
-        input_,
-        org_vocab_start_index,
-        org_vocab_end_index,
-        num_org_vocab_padding,
-        added_vocab_start_index,
-        added_vocab_end_index,
-    )
-    keep = (~input_mask).to(dtype=dtype).unsqueeze(-1)
-    return masked_input.to(device), keep.to(device)
-
-
-def _vocab_mask_op_fake(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    masked_input = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)
-    keep = torch.empty((*input_.shape, 1), dtype=dtype, device=input_.device)
-    return masked_input, keep
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register the spyre_vocab_mask custom op with vLLM."""
-    direct_register_custom_op(
-        op_name="spyre_vocab_mask",
-        op_func=_vocab_mask_op_func,
-        fake_impl=_vocab_mask_op_fake,
-        mutates_args=[],
-        dispatch_key="CPU",
-    )
-    logger.debug_once("Registered custom op: spyre_vocab_mask")

@@ -49,16 +49,19 @@ logger = init_logger(__name__)
 
 
 def _disable_torch_accelerator() -> None:
-    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
-    # raise "Cannot access accelerator device when none is available." Our OOT
-    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
-    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
-    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
+    # empty_host_cache() raise "Cannot access accelerator device when none is
+    # available." Our OOT platform (not CPU) makes vLLM's
+    # cleanup_dist_env_and_memory() skip its is_cpu() guard and call these at
+    # EngineCore shutdown. Patch at import to cover every process; matches
+    # vLLM's CPU worker (issue #327).
     def _noop(*args, **kwargs) -> None:
         return None
 
     torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+    if hasattr(torch.accelerator, "empty_host_cache"):
+        torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -215,6 +218,11 @@ class TorchSpyrePlatform(CpuPlatform):
     def apply_config_platform_defaults(cls, vllm_config: VllmConfig) -> None:
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
+
+        # A bare VllmConfig() (no model) reaches this hook too; every default below
+        # is model-specific.
+        if vllm_config.model_config is None:
+            return
 
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
@@ -434,16 +442,19 @@ class TorchSpyrePlatform(CpuPlatform):
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
-        # Check if the model dtype is different from float16,
-        # which is only currently supported in torch-spyre
-        if vllm_config.model_config.dtype != torch.float16:
-            raise ValueError(
-                f"The model dtype needs to be torch.float16 for spyre, "
-                f"but was specified to be {vllm_config.model_config.dtype}"
-            )
+        # A bare VllmConfig() (no model) reaches this hook too; guard each
+        # model_config access like upstream CpuPlatform.
+        if vllm_config.model_config is not None:
+            # Check if the model dtype is different from float16,
+            # which is only currently supported in torch-spyre
+            if vllm_config.model_config.dtype != torch.float16:
+                raise ValueError(
+                    f"The model dtype needs to be torch.float16 for spyre, "
+                    f"but was specified to be {vllm_config.model_config.dtype}"
+                )
 
-        # Pad attention head_dim up to a stick-aligned size on the native path.
-        cls._maybe_pad_head_dim(vllm_config)
+            # Pad attention head_dim up to a stick-aligned size on the native path.
+            cls._maybe_pad_head_dim(vllm_config)
 
         # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
         cls._maybe_pad_intermediate_size(vllm_config)
@@ -531,7 +542,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # on vLLM's internal layer-grouping (not knowable here), so we skip the
         # cap and let vLLM size the cache from the profiled memory budget.
         cache_config = vllm_config.cache_config
-        if cache_config.num_gpu_blocks_override is None:
+        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(
                     "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."

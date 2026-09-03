@@ -174,6 +174,32 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     v_slots.index_copy_(0, slot_mapping, value)
 
 
+def _mirror_mask_tiles(
+    tiles_cpu: list[list[torch.Tensor]], device: torch.device
+) -> list[list[torch.Tensor]]:
+    """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
+
+    `_get_zero_tile` hands the same CPU tensor to every interior block, so
+    keying on `id()` collapses those to a single H2D transfer instead of one
+    per block. `tiles_cpu` keeps strong references for the whole call, so no
+    id can be recycled mid-flight, and sharing one device buffer across blocks
+    is safe because mask tiles are read-only by contract (see
+    `_get_zero_tile`).
+    """
+    mirrored: dict[int, torch.Tensor] = {}
+    tiles_device: list[list[torch.Tensor]] = []
+    for seq_tiles in tiles_cpu:
+        row: list[torch.Tensor] = []
+        for tile in seq_tiles:
+            dev_tile = mirrored.get(id(tile))
+            if dev_tile is None:
+                dev_tile = convert(tile, device=device)
+                mirrored[id(tile)] = dev_tile
+            row.append(dev_tile)
+        tiles_device.append(row)
+    return tiles_device
+
+
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
@@ -348,6 +374,7 @@ def _create_compilable_bucketed_decode_attn(
     block_size: int,
     head_size: int,
     needs_gather: bool = True,
+    store_out: bool = False,
 ):
     """Bucketed decode kernel factory; gathers K/V and the query in-graph.
 
@@ -357,9 +384,10 @@ def _create_compilable_bucketed_decode_attn(
     """
 
     lead = num_seqs * num_kv_heads
+    num_heads = num_kv_heads * num_queries_per_kv
 
     def specialized_bucketed_decode_kernel(
-        query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, scale
+        query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, scale, out
     ):
         # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
         # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
@@ -414,7 +442,13 @@ def _create_compilable_bucketed_decode_attn(
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
-        return (tile_output / tile_sum).squeeze(2)
+        attn = (tile_output / tile_sum).squeeze(2)
+        if store_out:
+            # The destination prefix starts at offset 0, so torch-spyre#3770 does not
+            # apply; rows past the batch are don't-care and kept finite by the builder.
+            out[:num_seqs].copy_(attn.reshape(num_seqs, num_heads, head_size))
+            return out
+        return attn
 
     return specialized_bucketed_decode_kernel
 
@@ -957,6 +991,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     n_use = min(num_active[s], b_blocks)
                     for b in range(n_use):
                         mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
+                # A row past the batch is -inf in every block, so its softmax is NaN and
+                # the in-graph store would publish it. A real row always has a valid
+                # block 0, so its padded blocks can stay -inf and contribute zero.
+                mask_bs_bb[num_seqs:, 0] = torch.finfo(torch.float16).min
                 # 4-D, not 5-D: the kernel slices dim 0 per block, and a dim-0 slice
                 # of a 5-D base fails torch-spyre layout propagation.
                 mask_by_block_cpu = (
@@ -1124,8 +1162,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         self._kv_slots: SpyrePagedKVCache | None = None
 
-        # Keyed by (bucket_num_seqs, bucket_num_blocks, needs_gather).
-        self._decode_fns: dict[tuple[int, int, bool], object] = {}
+        # Keyed by (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out).
+        self._decode_fns: dict[tuple[int, int, bool, bool], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1159,11 +1197,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return self._attn_fns[key]
 
     def _get_bucketed_decode_kernel(
-        self, bucket_num_seqs: int, bucket_num_blocks: int, block_size: int, needs_gather: bool
+        self,
+        bucket_num_seqs: int,
+        bucket_num_blocks: int,
+        block_size: int,
+        needs_gather: bool,
+        store_out: bool,
     ):
         # block_size is fixed by the KV cache spec, so it is passed to the factory
-        # but not keyed on. needs_gather is a closure constant, so it is.
-        key = (bucket_num_seqs, bucket_num_blocks, needs_gather)
+        # but not keyed on. needs_gather and store_out are closure constants, so they are.
+        key = (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out)
         if key not in self._decode_fns:
             self._decode_fns[key] = _maybe_compile(
                 _create_compilable_bucketed_decode_attn(
@@ -1174,6 +1217,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     block_size,
                     self.head_size,
                     needs_gather=needs_gather,
+                    store_out=store_out,
                 ),
                 self._compile_attn,
             )
@@ -1224,18 +1268,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata.page_index_tables is None:
             table_cpu = attn_metadata.page_index_table_cpu
             assert table_cpu is not None
+            # `table_cpu[s]` is a row slice: contiguous but at a nonzero storage
+            # offset, which `.contiguous()` would not have reset anyway
+            # (torch-spyre#3770). The offset-0 buffer comes from the CPU->Spyre
+            # `convert` below: it cannot take `convert`'s same-device/same-dtype
+            # short-circuit, so it always allocates. Do not copy this pattern to
+            # a slice that is not followed by a cross-device transfer.
             attn_metadata.page_index_tables = [
-                convert(table_cpu[s].contiguous(), device=_target_device)
-                for s in range(table_cpu.shape[0])
+                convert(table_cpu[s], device=_target_device) for s in range(table_cpu.shape[0])
             ]
         if attn_metadata.attention_mask_tiles_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
                 "attention_mask_tiles must be precomputed by the metadata builder"
             )
-            attn_metadata.attention_mask_tiles_device = [
-                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
-            ]
+            attn_metadata.attention_mask_tiles_device = _mirror_mask_tiles(
+                tiles_cpu, _target_device
+            )
 
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
@@ -1345,7 +1394,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Short of b_seqs rows only when the runner's compile bucket is tighter than
         # the power-of-two seq bucket; the kernel slices a prefix otherwise.
         needs_gather = query_dev.shape[0] < b_seqs
-        kernel = self._get_bucketed_decode_kernel(b_seqs, b_blocks, block_size, needs_gather)
+        # The kernel writes b_seqs rows, so output must have them. Re-checked per call:
+        # vLLM hands out a fresh buffer per layer.
+        store_out = (
+            self._compile_attn
+            and not needs_gather
+            and output.shape[0] >= b_seqs
+            and output.dtype == query_dev.dtype
+            and output.storage_offset() == 0
+            and output.is_contiguous()
+        )
+        kernel = self._get_bucketed_decode_kernel(
+            b_seqs, b_blocks, block_size, needs_gather, store_out
+        )
         result = kernel(
             query_dev,
             attn_metadata.query_row_ids_dev if needs_gather else None,
@@ -1354,7 +1415,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             block_ids_flat,
             attn_metadata.mask_by_block_dev,
             self.scale,
+            output if store_out else None,
         )
+        if store_out:
+            return
 
         # Q=1 makes query_row_ids_cpu[:num_seqs] == range(num_seqs), so the
         # scatter is a contiguous prefix write at (0, 0). Neither per-row

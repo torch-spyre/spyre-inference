@@ -124,7 +124,7 @@ class _SpyreRotaryMixin:
         it can be stickified with the position axis outermost, and gathered on-device via
         ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = self._get_rotation_cache().flatten(1).contiguous()
+            self._device_rotation_cache = self._get_rotation_cache().flatten(1)
         return self._device_rotation_cache
 
     def forward_oot(

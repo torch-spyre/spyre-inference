@@ -758,3 +758,50 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
     expected = x.cpu().float() ** 3
     torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 10. Short-row matmul scheduling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
+        "same weight sustains with a full 8-row block, so padding the activation out "
+        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
+        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "constants it reads. Tracked by torch-spyre#4032."
+    ),
+)
+def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
+    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    import time
+
+    from torch_spyre.streams import synchronize
+
+    # granite-3.3-8b's gate_up_proj weight_t -- the shape the workaround targets.
+    weight = torch.randn(4096, 25600, dtype=torch.float16, device=spyre_device)
+    activations = {
+        m: torch.randn(m, 4096, dtype=torch.float16, device=spyre_device) for m in (1, 8)
+    }
+
+    def best_of(rows, reps=8):
+        best = float("inf")
+        for _ in range(reps):
+            start = time.perf_counter()
+            torch.matmul(activations[rows], weight)
+            synchronize()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    for rows in (1, 8):  # compile and warm both kernels before timing either
+        best_of(rows, reps=3)
+    one_row, full_block = best_of(1), best_of(8)
+
+    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
+    assert one_row <= 1.10 * full_block, (
+        f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
+        f"({100 * (one_row / full_block - 1):.0f}% slower)"
+    )

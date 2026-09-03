@@ -100,9 +100,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         combine = topk_weights.to(x.dtype)  # [T, E]
         num_tokens = x.shape[0]
 
-        # xb must be materialized contiguous: an expanded view into the batched
-        # matmul does not lower ("expected exactly 1 generated variable").
-        xb = x.unsqueeze(0).expand(num_experts, num_tokens, -1).contiguous()
+        xb = x.unsqueeze(0).expand(num_experts, num_tokens, -1)
         gate_out = torch.matmul(xb, w1.transpose(1, 2))  # [E, T, I]
         up_out = torch.matmul(xb, w3.transpose(1, 2))  # [E, T, I]
         activated = self._activate(gate_out, layer.activation) * up_out

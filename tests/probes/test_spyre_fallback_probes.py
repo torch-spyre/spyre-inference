@@ -880,17 +880,11 @@ def test_spyre_moe_scatter_dense_from_topk(spyre_device):
     torch.testing.assert_close(dense.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "An expanded (broadcast) view fed into a batched matmul does not lower "
-        "('expected exactly 1 generated variable'). forward_oot materializes the "
-        "per-expert input with .contiguous() first; drop that copy when the "
-        "expanded view lowers."
-    ),
-)
 def test_spyre_moe_expanded_view_matmul(spyre_device):
-    """Batched matmul whose lhs is an expanded view (per-expert token broadcast)."""
+    """Batched matmul whose lhs is an expanded view (per-expert token broadcast).
+
+    This now lowers; SpyreUnquantizedFusedMoEMethod.forward_oot no longer
+    materializes the per-expert input with .contiguous() first."""
     num_experts, num_tokens, hidden, inter = 8, 4, 64, 32
     x = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
     w = torch.randn(num_experts, inter, hidden, dtype=torch.float16, device=spyre_device)

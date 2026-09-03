@@ -1,6 +1,6 @@
 ---
 name: upgrade-torch-spyre
-description: Bump the pinned `torch-spyre` git rev in `pyproject.toml` and update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
+description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, refresh the full `uv.lock` (all transitive deps except `vllm`, which is held by its git-tag pin), update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the full lockfile refresh happens once on the settled commit (not inside the bisect loop, which must isolate the build-viability signal), that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
 ---
 
 # Upgrade torch-spyre
@@ -42,7 +42,7 @@ curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
   | jq .key
 ```
 
-If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §6. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
+If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §7. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
 
 ## Workflow
 
@@ -72,7 +72,7 @@ Skim the commit messages in the range. Flag commits that change *runtime* behavi
 - New op / quant support (e.g. "Add FP8 quantization and dequantization support")
 - Logging / observability rewrites ("Phase 1 new logging framework")
 - Import-time side effects ("Apply the Spyre tensor monkey-patch at autoload time")
-- Inductor / lowering pass changes that touch generated wrappers (any "Remove TensorArg.<field>" — see §4 below)
+- Inductor / lowering pass changes that touch generated wrappers (any "Remove TensorArg.<field>" — see §5 below)
 - Spec / format changes (SDSC, restickify, named-dim propagation)
 
 Ignore CI/cicd-only commits, test-yaml shuffles, and xfail→pass moves unless they hint at a behavior change. Aim for 3–6 bullets in the final PR description, not a dump of all 50+ messages.
@@ -127,6 +127,8 @@ chmod +x /tmp/spyre-bisect/try.sh
 
 Each invocation writes the full output to `/tmp/spyre-bisect/<short-sha>.log` so you can grep for the actual compile error (look for `error:` and `fatal`, not just `warning:`) without re-running the 50s build.
 
+> The helper uses a plain `uv lock` (minimal re-resolve of the rev change), **not** `uv lock --upgrade`. Keep the bisect loop that way: a full transitive upgrade at each iteration would confound the build-viability signal — a failure could be a transitive bump rather than the torch-spyre commit under test. The full lockfile refresh happens exactly once, on the settled commit, in §4.
+
 #### Bisect
 
 If the tip fails, binary-search:
@@ -148,7 +150,38 @@ This takes ≤ `log2(N)` iterations, ~5–7 builds for typical ranges (50–100 
 
 **State the bounds in chat after each iteration** ("Range [27, 55]. Next: index 41 = `a14b29e`.") so the user can interrupt early if they spot something off.
 
-### 4. Clear the inductor cache — mandatory
+### 4. Refresh the full lockfile
+
+Once the target commit is settled (the tip built, or the bisect landed on the latest building commit), do a **one-shot** refresh of the whole lockfile so transitive dependencies don't silently rot between bumps. The bisect helper only did a minimal `uv lock`; now upgrade everything:
+
+```bash
+uv lock --upgrade
+```
+
+**`vllm` is excluded automatically.** It's pinned to a git *tag* (`rev = "v0.28.0"`) in `[tool.uv.sources]`, and `--upgrade` only ignores pins in the *output* lockfile — not git-rev/tag pins in `pyproject.toml` sources. So `vllm` stays put (bump it with [[upgrade-vllm]], never here). `torch-spyre` likewise stays at the rev you just set. Confirm both held before continuing:
+
+```bash
+python3 - <<'PY'
+import tomllib
+with open("uv.lock", "rb") as f:
+    lock = tomllib.load(f)
+for pkg in lock["package"]:
+    if pkg["name"] in ("vllm", "torch-spyre"):
+        print(pkg["name"], pkg.get("version"), pkg.get("source", {}).get("git", "")[:70])
+PY
+```
+
+`vllm` must still read `0.28.0+empty …rev=v0.28.0` and `torch-spyre` your new rev. If `--upgrade` moved `vllm`, stop — something changed the source pin and that's out of scope for this skill.
+
+Skim the `Updated …` lines uv prints. A handful of transitives moving (pydantic, transformers, tiktoken, triton, …) is expected and desirable — that's the point of keeping the lock fresh. A **multi-version** package (e.g. `protobuf`, `scipy` resolved at two versions) can print what looks like a downgrade (`v7.x, v6.x -> v6.x`); that's a resolution consolidation, not a real rollback. Then re-sync against the fully-upgraded lock:
+
+```bash
+uv sync --frozen
+```
+
+This rebuilds torch-spyre *and* installs the new transitive versions, so the smoke test in §6 exercises the exact environment CI will lock to. List the notable transitive bumps in the PR description (§9).
+
+### 5. Clear the inductor cache — mandatory
 
 > **CRITICAL.** After torch-spyre is rebuilt, the next pytest run will hit cached inductor wrappers from the *previous* install. These wrappers contain literal references to torch-spyre internals (kwargs, dataclass fields, attribute names). If the bump renamed or removed any of them, the cached `.py` files crash during model load with `TypeError: <Class>.__init__() got an unexpected keyword argument '<name>'` — even though the freshly-built `.venv` is consistent.
 
@@ -162,7 +195,7 @@ rm -rf /tmp/torchinductor_*
 
 If you forget, the symptom is a `TypeError` referencing a kwarg or attribute that you can grep for and find *only* in `/tmp/torchinductor_*/**/*.py`, never in `.venv/lib/python3.12/site-packages/torch_spyre/`. That's the confirmation.
 
-### 5. Run a smoke test
+### 6. Run a smoke test
 
 The full test suite takes ~18 minutes and is better left to CI (which parallelizes across runners). Instead, run a single quick test to verify the build is functional:
 
@@ -172,7 +205,7 @@ uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py::test_basic_model_load
 
 This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
-**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§6) — the `next/` tree the lock resolves from publishes these link-time libs; the base `x86_64` tree does not.
+**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[packages]` entry — no need to reach into the `next` dev-preview tree.
 
 If the smoke test passes, tell the user:
 
@@ -182,19 +215,47 @@ Do **not** commit or push on behalf of the user. The human decides when to commi
 
 If it fails, triage:
 
-- **`TypeError: ...__init__() got an unexpected keyword argument ...`** during model load → stale inductor cache (you forgot §4). Clear it and re-run.
+- **`TypeError: ...__init__() got an unexpected keyword argument ...`** during model load → stale inductor cache (you forgot §5). Clear it and re-run.
 - **`ImportError` or `RuntimeError` referencing a missing symbol** → the bump pulled in a commit that needs newer RPMs than are installed. Bisect back.
 - Numerical mismatches, fallback-warning storms, compile errors on `spyre` → real regressions introduced by the bump. Hand to [[debug-spyre]].
 
-### 6. Update `spyre-rpms.lock`
+### 7. Update `spyre-rpms.lock`
 
-The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. Lock entries are exact Artifactory filenames minus the `.x86_64.rpm` suffix; `download_rpms.sh` appends `.<arch>.rpm` and prepends the subdir to build the URL.
+The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. `spyre-rpms.lock` is **TOML**. All packages live in the **prod** (base) tree — `<repo>/<arch>/` — so `[defaults].tree = ""` and there are no per-package tree overrides (`ibm-libaiupti` now ships to prod, so the `next` tree — still available for dev-preview builds — is no longer needed for the baseline). `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
 
-**The whole lock resolves from the `next/` subdir** (`<repo>/next/x86_64/`), not the base `<repo>/x86_64/` tree. `next/` is the only tree that publishes *every* lib we link against — including `ibm-libaiupti` (the torch-spyre profiler compiles under `-DHAS_AIUPTI -DUSE_KINETO` and links `-laiupti`), which the base tree doesn't carry at all. `download_rpms.sh --prefix` defaults to `next`, so entries are plain filenames with **no** prefix baked in.
+The lock encodes two kinds of pin:
 
-**The trap:** `next/` has no monotonic `_NNN` build suffix. Instead it publishes *many rebuilds of the same commit*, distinguished by a 12-hex build hash (e.g. `…a54c45fb.0b76d1bf564c.a54c45f.el10` — dozens of variants for a single commit). There's no ordering in the filename, so the resolution rule is **latest by Artifactory publication time** (`lastModified`), which the `?list` endpoint returns.
+- **`[packages]` — x86_64, EXACT build.** The trailing `_<buildnum>` is part of the pin. We have x86_64 CI, so we pin the exact build we tested; the build number matters — a newer build of the *same* commit can carry an ABI change that mismatches the compiled torch-spyre extension (we hit exactly this). `resolve_rpms.py` matches this filename verbatim; it does **not** resolve to a newer build.
+- **`[overrides.ppc64le]` / `[overrides.s390x]` — P and Z, same commit, build wildcarded.** We have no CI to validate an exact build on P/Z, so we pin the same commit as x86_64 with a `_*` where the build number goes; `resolve_rpms.py` picks the newest matching build. Tighten these to exact builds once P/Z CI exists.
 
-#### Step 1: Read installed RPMs (to get package name + commit SHA)
+```toml
+version = 2
+
+[defaults]
+tree = ""
+
+[packages]                                                        # x86_64 — exact build
+ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_322" }
+
+[overrides.ppc64le]                                               # P — same commit, any build
+ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_*" }
+
+[overrides.s390x]                                                 # Z — same commit, any build
+ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_*" }
+```
+
+The version-string anatomy:
+
+```text
+2.0.0-0.main.1+2403.cc6e4df_322.el10.x86_64.rpm
+└──────── version ────────┘└build┘
+             ^^^^ ^^^^^^^
+            count  sha7   ← the commit
+```
+
+For x86_64 you keep the whole `version`, including `_<build>`. For the P/Z overrides you keep up to the sha and replace `_<build>` with `_*`.
+
+#### Step 1: Read installed RPMs (name + full build)
 
 ```bash
 rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ibm-*' \
@@ -203,135 +264,114 @@ rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ibm-*' \
   | sort > /tmp/host-rpms.txt
 ```
 
-Each line is `NAME  VERSION-RELEASE`; the commit SHA is the 7-hex after `+<count>.` (e.g. `…1+2142.a54c45f_0.el10` → `a54c45f`). We match `next/` builds at that commit.
+Each line is `NAME  VERSION-RELEASE`, e.g. `ibm-deeptools 2.0.0-0.main.1+2403.cc6e4df_322.el10`. The x86_64 `version` you pin is everything before `.el10` (`…cc6e4df_322`, build included); the commit (for the P/Z overrides) is that string up to the 7-hex sha, with `_<build>` replaced by `_*`.
 
-#### Step 2: Resolve each package to its latest `next/` build (primary method)
+#### Step 2: Confirm the host build exists in prod on x86_64
+
+CI installs from prod, not from the host, so the *exact* host build must be published there (a locally-built RPM won't be). Query Artifactory for each one. `resolve_rpms.py` reads the same env vars (with `ARTIFACTORY_URL`/`ARTIFACTORY_RPM_REPO` accepted as fallbacks for `ARTIFACTORY_BASE_URL`/`ARTIFACTORY_RPM_PATH`).
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
+aql() {  # POST an AQL query, return raw JSON
+  curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+    -H "Content-Type: text/plain" \
+    -X POST "$ARTIFACTORY_URL/artifactory/api/search/aql" --data "$1"
+}
 
-# Timestamped listing of the next/ tree (the ?list endpoint returns lastModified)
-curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
-  "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_RPM_REPO/next/x86_64?list&deep=0" \
-  | jq -r '.files[] | "\(.lastModified)\t\(.uri)"' | sed 's|\t/|\t|' \
-  > /tmp/next-timestamped.txt
-
-# For each installed package, pick the newest next/ build at the host's commit.
-: > /tmp/resolved-rpms.txt
 while read -r name ver; do
-  sha=$(echo "$ver" | grep -oP '\+[0-9]+\.\K[0-9a-f]{7}')
-  fn=$(awk -F'\t' -v pat="^${name}-[0-9].*${sha}.*[.]el10[.]x86_64[.]rpm$" \
-        '$2 ~ pat' /tmp/next-timestamped.txt | sort -r | head -1 | cut -f2)
-  if [[ -n "$fn" ]]; then
-    echo "${fn%.x86_64.rpm}" >> /tmp/resolved-rpms.txt
-  else
-    echo "NOT IN next/: $name @ $sha" >&2
-  fi
+  build="${ver%.el10}"        # strip trailing .el10 → …cc6e4df_322
+  q='items.find({"repo":"'"$ARTIFACTORY_RPM_REPO"'","path":"x86_64",'
+  q+='"name":{"$match":"'"$name"'-'"$build"'.el10.x86_64.rpm"}})'
+  hit=$(aql "$q" | jq -r '.results[].name' | head -1)
+  echo "${hit:-MISSING: $name @ $build}"
 done < /tmp/host-rpms.txt
-cat /tmp/resolved-rpms.txt
 ```
 
-`sort -r` orders by the leading ISO-8601 timestamp (lexical = chronological), so `head -1` is the most recently published build — a stable, automatable choice among the rebuild variants.
+If a build prints `MISSING`, it wasn't published to prod (typically a local-only build). Pin the newest prod build of the **same commit** instead: query `"<name>-<…sha7>_*.el10.x86_64.rpm"`, `.sort({"$desc":["created"]})`, take the first, and note the substitution in the PR.
 
-If a package prints `NOT IN next/`, it isn't published there at the host commit. Decide per package:
+#### Step 3: Edit the lock
 
-- **Not needed for the build/link/runtime** (e.g. `ibm-spyre-comms-test` — ships only unit-test binaries under `bin/`, no `.so`, not installed on the host) → drop it from the lock.
-- **Actually needed** → stop and ask the user; do not fall back to the base tree silently (the goal is a single source).
-
-#### Fallback: Artifactory unavailable
-
-If the token is expired/missing and the user can't provide one immediately, fall back to scraping a recent `populate-rpm-cache` CI run's logs:
+Set each `[packages]` entry's `version` to the exact x86_64 build from step 2, and set the matching `[overrides.ppc64le]` and `[overrides.s390x]` entries to the same commit with `_*`. Keep the `-core`/`-dd2`/`-headers`/`-devel` sub-packages of a lib on the **same** commit as their base package (they're built together). Leave `[defaults]` and `version = 2` untouched. Then confirm it parses:
 
 ```bash
-gh run list --repo torch-spyre/spyre-inference \
-  --workflow populate-rpm-cache.yaml --limit 15 \
-  --json databaseId,status,conclusion,createdAt
-
-# Find a run that had a cache miss (actually listed RPMs):
-gh run view <RUN_ID> --log 2>/dev/null | grep -c "ibm-deeptools"
-# If > 0, extract filenames from its output. Note the CI listing has no
-# timestamps, so pick the build matching the host commit by hand.
+python3 .github/scripts/resolve_rpms.py names   # lists package names, no network
 ```
 
-This is less reliable — cache-hit runs won't have the listing, and you may need to trigger a fresh run with a dummy lock-file change.
+#### Step 4: Validate the pin resolves on **all** arches — mandatory
 
-#### Step 3: Sanity-check — no accidental downgrades
-
-Compare commit counts (the number after `+`) between old and new lock files. This works across `next/` naming schemes (`main.N+N`, `master.N+N`, `main.1+N`) because the count sits right after `+`:
-
-```text
-ibm-flex-2.0.0-0.main.456+456.33650c47.89b07ec13974.33650c4.el10
-                         ^^^
-                         commit count — monotonically increasing
-```
+A build/commit that's present on x86_64 but missing on P or Z must fail here, at upgrade time, not on a later per-arch run.
 
 ```bash
-parse_base() {
-  echo "$1" | grep -oP '^.+?(?=-\d+\.\d+\.\d+)'
-}
-parse_commit_count() {
-  echo "$1" | grep -oP '(?<=\+)\d+(?=\.)'
-}
+ARTIFACTORY_TOKEN="$ARTIFACTORY_TOKEN" \
+ARTIFACTORY_BASE_URL="${ARTIFACTORY_URL}" \
+ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
+  python3 .github/scripts/resolve_rpms.py validate
+```
 
-cp spyre-rpms.lock spyre-rpms.lock.old
-echo "=== Downgrade check ==="
-while IFS= read -r old_line; do
-  base=$(parse_base "$old_line")
-  old_num=$(parse_commit_count "$old_line")
-  new_line=$(grep "^${base}-[0-9]" /tmp/resolved-rpms.txt | head -1)
-  if [[ -z "$new_line" ]]; then
-    echo "WARNING: $base not found in new RPMs"
-    continue
-  fi
-  new_num=$(parse_commit_count "$new_line")
-  if [[ "$new_num" -lt "$old_num" ]]; then
-    echo "WARNING: $base downgraded: $old_num → $new_num"
-  else
-    echo "OK: $base $old_num → $new_num"
-  fi
-done < <(grep -v '^[[:space:]]*#' spyre-rpms.lock.old | grep -v '^[[:space:]]*$')
-rm spyre-rpms.lock.old
+Every line must print `OK`. A `FAIL … missing on: x86_64 (…_322)` means the exact build isn't in prod — fix per step 2. A `FAIL … missing on: ppc64le`/`s390x` means the pinned commit isn't published on that arch — pick a commit present on all arches, or ask the user. This is exactly the check CI's populate step runs before caching.
+
+#### Step 5: Sanity-check — no accidental downgrades
+
+Compare the commit count (the number right after `+`) of each new pin against the old lock. Both are TOML now, so read them with `tomllib`:
+
+```bash
+git show HEAD:spyre-rpms.lock > /tmp/spyre-rpms.lock.old
+python3 - <<'PY'
+import tomllib, re
+def counts(path):
+    with open(path, "rb") as f:
+        pkgs = tomllib.load(f).get("packages", {})
+    out = {}
+    for name, spec in pkgs.items():
+        m = re.search(r'\+(\d+)\.', spec["version"])
+        out[name] = int(m.group(1)) if m else None
+    return out
+old, new = counts("/tmp/spyre-rpms.lock.old"), counts("spyre-rpms.lock")
+for name in sorted(set(old) | set(new)):
+    o, n = old.get(name), new.get(name)
+    if o is None:   print(f"NEW:  {name} @ {n}")
+    elif n is None: print(f"DROP: {name} (was {o})")
+    elif n < o:     print(f"WARNING downgrade: {name} {o} → {n}")
+    else:           print(f"OK:   {name} {o} → {n}")
+PY
 ```
 
 Downgrade warnings are informational — the user may intentionally roll back — but confirm before proceeding.
 
-#### Step 4: Write the new lock file
+#### Step 6: Verify the download end-to-end
 
-```bash
-cat > spyre-rpms.lock <<'HEADER'
-# Pinned Spyre RPM package names, one per line.
-# Lines starting with # are ignored.
-# Specify exact versions to pin (e.g. ibm-deeptools-1.2.3-1.el8).
-# The cache key is derived from this file's hash. Changing any entry
-# invalidates the GHA RPM cache and triggers a fresh download.
-#
-HEADER
-cat /tmp/resolved-rpms.txt >> spyre-rpms.lock
-```
-
-Do **not** guess. If Artifactory (API or CI logs) can't confirm a filename, stop and ask the user. The `next/` build hashes are per-build and may be garbage-collected over time — always re-resolve to the latest build on each bump rather than assuming an old pin still exists.
-
-Verify the download end-to-end before handing off (this is what CI's populate step runs):
+Resolve the per-arch filenames and download them, mirroring exactly what `populate-rpm-cache` does:
 
 ```bash
 ARTIFACTORY_TOKEN="$ARTIFACTORY_TOKEN" \
-ARTIFACTORY_BASE_URL="${ARTIFACTORY_URL%/}" \
+ARTIFACTORY_BASE_URL="${ARTIFACTORY_URL}" \
 ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
-RPM_NAMES_TXT=spyre-rpms.lock RPMS_DOWNLOAD_DIR=/tmp/rpm-dl-check \
-  bash .github/scripts/download_rpms.sh
+  python3 .github/scripts/resolve_rpms.py resolve --arch x86_64 > /tmp/relpaths.txt
+cat /tmp/relpaths.txt   # one repo-relative <tree>/<arch>/<file> per package
+
+BASE="${ARTIFACTORY_URL}/artifactory/${ARTIFACTORY_RPM_REPO}"
+mkdir -p /tmp/rpm-dl-check
+while read -r rel; do
+  curl -fSL -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+    -o "/tmp/rpm-dl-check/$(basename "$rel")" "${BASE}/${rel}"
+done < /tmp/relpaths.txt
 ```
 
-All entries should download (exit 0). Spot-check that the link-time lib is present:
+All entries should download (exit 0). Spot-check that the link-time lib carries its `.so`:
 
 ```bash
 rpm2cpio /tmp/rpm-dl-check/ibm-libaiupti-*.rpm | cpio -t 2>/dev/null | grep -i '\.so'
 ```
 
+#### Fallback: Artifactory unavailable
+
+If the token is expired/missing and the user can't provide one, you cannot resolve or validate — the lock's pins can't be checked against (or, for P/Z, resolved into) real filenames without querying Artifactory. Tell the user the lock can't be updated/verified this session and leave `spyre-rpms.lock` unchanged (the existing pins stay valid until a real bump). Do **not** hand-write version strings from CI logs into the TOML — a wrong commit passes `python3 … names` but fails `validate` on the runner.
+
 #### Cache population
 
-The `populate-rpm-cache` workflow fires automatically via `pull_request_target` when `spyre-rpms.lock` changes, so no manual action is needed — opening the PR is sufficient.
+The `populate-rpm-cache` workflow fires automatically via `pull_request_target` when `spyre-rpms.lock` changes, so no manual action is needed — opening the PR is sufficient. It validates all arches, then downloads and caches the x86_64 build.
 
-### 7. Capture installed `ibm-*` package versions
+### 8. Capture installed `ibm-*` package versions
 
 For the PR description, snapshot the RPMs that defined the build boundary:
 
@@ -341,7 +381,7 @@ rpm -qa 'ibm-*' 2>/dev/null | sort
 
 This makes the build boundary reproducible — the next person bumping can tell at a glance whether their host has newer libs (and therefore should retry the commits this PR skipped).
 
-### 8. Write the PR description
+### 9. Write the PR description
 
 Write to `PR_torch_spyre_bump.md`. Follow `.github/pull_request_template.md`:
 
@@ -352,11 +392,15 @@ Use one of the two templates below depending on whether a bisect was needed:
 ````markdown
 ## Description
 
-Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits since the previous pin. The tip of `main` compiled cleanly against the currently-installed RPMs (no bisect needed).
+Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits since the previous pin. The tip of `main` compiled cleanly against the currently-installed RPMs (no bisect needed). Also refreshes the full `uv.lock` (`uv lock --upgrade`); `vllm` is held at its pinned git tag and intentionally **not** upgraded.
 
 ### Notable upstream changes in this range
 
 <3–6 curated bullets from §2>
+
+### Transitive dependency refresh
+
+<count> transitive packages moved via `uv lock --upgrade`; notable bumps: <e.g. transformers X → Y, triton X → Y, …>. `vllm` and `torch-spyre` unchanged (pinned).
 
 ### Installed `ibm-*` packages on the build host
 
@@ -367,6 +411,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 ## Test Plan
 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
+- [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
 - [x] Smoke test (`test_basic_model_load`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
@@ -380,11 +425,15 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 ````markdown
 ## Description
 
-Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream commits since the previous pin. The remaining <N-K> commits (starting with <#FIRST-FAILING> "<first-failing-title>") need matching `ibm-*` updates and fail the torch-spyre C++ extension build against the currently-installed RPMs.
+Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream commits since the previous pin. The remaining <N-K> commits (starting with <#FIRST-FAILING> "<first-failing-title>") need matching `ibm-*` updates and fail the torch-spyre C++ extension build against the currently-installed RPMs. Also refreshes the full `uv.lock` (`uv lock --upgrade`); `vllm` is held at its pinned git tag and intentionally **not** upgraded.
 
 ### Notable upstream changes in this range
 
 <3–6 curated bullets from §2>
+
+### Transitive dependency refresh
+
+<count> transitive packages moved via `uv lock --upgrade`; notable bumps: <e.g. transformers X → Y, triton X → Y, …>. `vllm` and `torch-spyre` unchanged (pinned).
 
 ### Binary search for the latest building commit
 
@@ -404,6 +453,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 ## Test Plan
 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
+- [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
 - [x] Smoke test (`test_basic_model_load`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
@@ -412,7 +462,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 **Reviewer note:** when pulling this branch onto an existing checkout, `rm -rf /tmp/torchinductor_*` before running tests — the cache bakes in references to internals that were renamed/removed across the bump.
 ````
 
-### 9. Stop — do not commit or push
+### 10. Stop — do not commit or push
 
 The skill's job ends here. Present the user with a summary of what changed and the draft PR description. The user will:
 
@@ -425,8 +475,8 @@ Do **not** run `git add`, `git commit`, `git push`, `gh pr create`, or any equiv
 ## Files touched (typical)
 
 - `pyproject.toml` (the rev string)
-- `uv.lock` (re-locked twice — once for the rev, plus uv may bump transitives)
-- `spyre-rpms.lock` (updated with correct artifactory build numbers)
+- `uv.lock` (re-locked for the rev during bisect, then fully refreshed with `uv lock --upgrade` on the settled commit — expect many transitive bumps; `vllm` held at its git tag)
+- `spyre-rpms.lock` (TOML — bumped x86_64 exact-build pins + P/Z commit overrides; resolved/validated via `.github/scripts/resolve_rpms.py`)
 - `PR_torch_spyre_bump.md` (scratch description for the user to paste)
 
 Nothing in `spyre_inference/` should change during a pure bump. If you find yourself editing the package, you've crossed into "the bump exposed a regression" territory — stop, save state, and triage with [[debug-spyre]].

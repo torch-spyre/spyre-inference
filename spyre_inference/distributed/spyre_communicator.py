@@ -14,26 +14,13 @@
 
 """DeviceCommunicator override for IBM Spyre devices.
 
-libspyre_comms natively implements: `barrier`, `broadcast`, `send`/`recv`,
-list-form `allgather`, `gather`, and `allreduce`. The `_allgather_base`
-entry point on the torch-spyre spyreccl backend side is still stubbed,
-so `dist.all_gather_into_tensor` does not work.
+`all_reduce` uses `torch.ops._c10d_functional`, which torch-spyre lowers to
+`spyre::all_reduce_async` inside a compiled graph and which falls through to
+eager spyreccl outside one, so the reduction compiles into the model graph
+without needing a separate eager path.
 
-This class supplies:
-  - An `all_gather` that uses native list-form `dist.all_gather` because
-    the base class routes through `dist.all_gather_into_tensor` (blocked
-    by the `_allgather_base` stub).
-
-Remaining per-op blockers (REPLACE-WITH-NATIVE markers below):
-  - all_gather : torch-spyre spyreccl `_allgather_base` (so the base class
-                 can use `dist.all_gather_into_tensor` directly).
-  - reduce     : libspyre_comms native reduce (not on the TP forward path).
-
-The companion test file `tests/probes/test_spyre_comms_native_probes.py` runs
-each native collective on a real spyreccl device_group and is xfail-strict.
-When a comms RPM lands an impl, the corresponding probe flips to passing,
-the strict-xfail fails CI, and that's the signal to delete the override
-here.
+`all_gather` cannot — see the method. `reduce_scatter` raises; `broadcast`,
+`send` and `recv` are inherited unchanged.
 """
 
 from __future__ import annotations
@@ -47,52 +34,47 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 from spyre_inference.custom_ops.utils import convert
 
 
-def _spyre_collective_unsupported_message(
-    op_name: str, world_size: int, blocker: str | None = None
-) -> str:
-    parts = [
-        f"SpyreCommunicator: {op_name} is not natively available in the "
-        "installed libspyre_comms (the corresponding "
-        f"SpyreCommsContext::{op_name} method throws). ",
-    ]
-    if blocker is not None:
-        parts.append(f"Blocked on: {blocker}. ")
-    parts.append(
-        f"No fallback is implemented for world_size={world_size}. Either "
-        "wait for the upstream implementation to land + a comms RPM rebuild, "
-        "or extend SpyreCommunicator with an additional manual fallback."
-    )
-    return "".join(parts)
-
-
 class SpyreCommunicator(DeviceCommunicatorBase):
-    """Spyre-specific DeviceCommunicator with manual fallbacks.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Resolved once: a ProcessGroup object in dynamo's path breaks the trace.
+        self._group_name: str | None = None
+        if self.device_group is not None:
+            from torch.distributed._functional_collectives import _resolve_group_name
 
-    See the module docstring for the full picture. In short:
-      - `all_gather` is overridden to use list-form `dist.all_gather`
-        because `dist.all_gather_into_tensor` is blocked by a spyreccl stub.
-      - Other broken collectives raise NotImplementedError describing
-        what's needed to unblock them.
-    """
+            self._group_name = _resolve_group_name(self.device_group)
 
-    # libspyre_comms allgather transfers each rank's buffer in 64-element
-    # chunks along the gathered dim; a shard whose size along `dim` is not a
-    # multiple of 64 gets its tail rounded off, so every following rank's data
-    # lands shifted. Pad each rank's contribution up to a 64 multiple before
-    # the gather and strip the padding afterward. (E.g. TP=2 vocab-parallel
-    # logits with per-rank width 24608 = 384*64 + 32 previously shifted rank 1
-    # down by 32, corrupting the argmax for its half of the vocab.)
-    # As of ibm-spyre-comms 121 an unpadded shard also faults the card (RAS
-    # ComputeHardwareError 0x7b1b / lost DMA completion in
-    # AllGatherV_RingExchange) and needs a device recovery, so do not drop it.
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if input_.device.type == "cpu" or self._group_name is None:
+            return super().all_reduce(input_)
+
+        # Out-of-place, unlike the base class's in-place `dist.all_reduce`: vLLM's
+        # `torch.ops.vllm.all_reduce` wrapper declares no mutation, so under
+        # torch.compile functionalization misses the overwrite and the graph
+        # computes garbage. Inductor's reinplacing pass recovers the in-place op.
+        out = torch.ops._c10d_functional.all_reduce(
+            input_,  # ty: ignore[invalid-argument-type]
+            "sum",  # ty: ignore[invalid-argument-type]
+            self._group_name,  # ty: ignore[invalid-argument-type]
+        )
+        return torch.ops._c10d_functional.wait_tensor(out)
+
+    # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
+    # along the gathered dim, so a shard whose size along `dim` is not a multiple
+    # of 64 has its tail rounded off and every later rank's data lands shifted.
+    # Worse, on comms build 121 such a gather faults the card and needs a device
+    # recovery, so do not drop this padding without re-checking on hardware.
     _GATHER_ALIGN = 64
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # The base class uses dist.all_gather_into_tensor which needs
-        # _allgather_base in spyreccl is still stubbed. Use list-form
-        # dist.all_gather instead (natively supported).
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
-        # delete this override and let the base class handle it.
+        # Two independent blockers keep this off the functional form `all_reduce`
+        # uses: in eager, `_c10d_functional.all_gather_into_tensor` routes to
+        # `allgather_into_tensor_coalesced`, which spyreccl rejects; compiled, it
+        # lowers to `spyre::all_gather_async`, whose reassembly narrows the output
+        # along dim 0 at a `rank * per_rank_numel` storage offset that
+        # `copy_from_d2d` requires to be 64-aligned.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
@@ -108,16 +90,13 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             )
             return torch.cat(output_list, dim=dim)
 
-        # Pad this rank's contribution up to a 64 multiple so the transfer does
-        # not round off its tail. Padding on device writes the tail at a stick
-        # offset, which torch-spyre's layout pass rejects ("no offset-free
-        # alternative stick dim for mutation target"), so pad on CPU. Strip the
-        # padding and re-concatenate on CPU too
-        # (Spyre slicing/narrow corrupts memory — see spyre_attn.py), restoring
-        # the exact per-rank shard layout the caller expects.
+        # Padded on CPU: on device the tail starts `orig_size % 64` elements into a
+        # stick, which torch-spyre's layout pass cannot express ("no offset-free
+        # alternative stick dim for mutation target"). Stripped and re-concatenated
+        # on CPU too, since Spyre narrow corrupts memory (see spyre_attn.py).
         pad_spec = [0, 0] * (input_.dim() - dim - 1) + [0, pad]
         padded = convert(
-            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec).contiguous(),
+            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec),
             device=input_.device,
         )
         output_list = [torch.empty_like(padded) for _ in range(self.world_size)]
@@ -132,8 +111,8 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if self.world_size == 1:
             return input_
         raise NotImplementedError(
-            _spyre_collective_unsupported_message("reduce_scatter", self.world_size)
+            f"SpyreCommunicator: reduce_scatter has no Spyre implementation and no "
+            f"fallback for world_size={self.world_size}. Either wait for the upstream "
+            f"comms implementation to land + a comms RPM rebuild, or extend "
+            f"SpyreCommunicator with a manual fallback."
         )
-
-    # `broadcast`, `send`, `recv` from DeviceCommunicatorBase route through
-    # ops that are implemented in libspyre_comms, so we leave them alone.

@@ -21,7 +21,7 @@ KV-sharing). The KV-cache-group half of KV-sharing lives in ``TorchSpyreModelRun
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.logger import init_logger

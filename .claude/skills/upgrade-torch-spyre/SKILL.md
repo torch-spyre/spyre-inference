@@ -1,6 +1,6 @@
 ---
 name: upgrade-torch-spyre
-description: Bump the pinned `torch-spyre` git rev in `pyproject.toml` and update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
+description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, refresh the full `uv.lock` (all transitive deps except `vllm`, which is held by its git-tag pin), update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the full lockfile refresh happens once on the settled commit (not inside the bisect loop, which must isolate the build-viability signal), that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
 ---
 
 # Upgrade torch-spyre
@@ -42,7 +42,7 @@ curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
   | jq .key
 ```
 
-If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §6. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
+If any vars are missing or the request returns a 401 (revoked/expired token), **warn the user** that Artifactory is unavailable and that you'll fall back to scraping CI logs in §7. Continue with the rest of the workflow — Artifactory is only needed for the `spyre-rpms.lock` resolution step.
 
 ## Workflow
 
@@ -72,7 +72,7 @@ Skim the commit messages in the range. Flag commits that change *runtime* behavi
 - New op / quant support (e.g. "Add FP8 quantization and dequantization support")
 - Logging / observability rewrites ("Phase 1 new logging framework")
 - Import-time side effects ("Apply the Spyre tensor monkey-patch at autoload time")
-- Inductor / lowering pass changes that touch generated wrappers (any "Remove TensorArg.<field>" — see §4 below)
+- Inductor / lowering pass changes that touch generated wrappers (any "Remove TensorArg.<field>" — see §5 below)
 - Spec / format changes (SDSC, restickify, named-dim propagation)
 
 Ignore CI/cicd-only commits, test-yaml shuffles, and xfail→pass moves unless they hint at a behavior change. Aim for 3–6 bullets in the final PR description, not a dump of all 50+ messages.
@@ -127,6 +127,8 @@ chmod +x /tmp/spyre-bisect/try.sh
 
 Each invocation writes the full output to `/tmp/spyre-bisect/<short-sha>.log` so you can grep for the actual compile error (look for `error:` and `fatal`, not just `warning:`) without re-running the 50s build.
 
+> The helper uses a plain `uv lock` (minimal re-resolve of the rev change), **not** `uv lock --upgrade`. Keep the bisect loop that way: a full transitive upgrade at each iteration would confound the build-viability signal — a failure could be a transitive bump rather than the torch-spyre commit under test. The full lockfile refresh happens exactly once, on the settled commit, in §4.
+
 #### Bisect
 
 If the tip fails, binary-search:
@@ -148,7 +150,38 @@ This takes ≤ `log2(N)` iterations, ~5–7 builds for typical ranges (50–100 
 
 **State the bounds in chat after each iteration** ("Range [27, 55]. Next: index 41 = `a14b29e`.") so the user can interrupt early if they spot something off.
 
-### 4. Clear the inductor cache — mandatory
+### 4. Refresh the full lockfile
+
+Once the target commit is settled (the tip built, or the bisect landed on the latest building commit), do a **one-shot** refresh of the whole lockfile so transitive dependencies don't silently rot between bumps. The bisect helper only did a minimal `uv lock`; now upgrade everything:
+
+```bash
+uv lock --upgrade
+```
+
+**`vllm` is excluded automatically.** It's pinned to a git *tag* (`rev = "v0.28.0"`) in `[tool.uv.sources]`, and `--upgrade` only ignores pins in the *output* lockfile — not git-rev/tag pins in `pyproject.toml` sources. So `vllm` stays put (bump it with [[upgrade-vllm]], never here). `torch-spyre` likewise stays at the rev you just set. Confirm both held before continuing:
+
+```bash
+python3 - <<'PY'
+import tomllib
+with open("uv.lock", "rb") as f:
+    lock = tomllib.load(f)
+for pkg in lock["package"]:
+    if pkg["name"] in ("vllm", "torch-spyre"):
+        print(pkg["name"], pkg.get("version"), pkg.get("source", {}).get("git", "")[:70])
+PY
+```
+
+`vllm` must still read `0.28.0+empty …rev=v0.28.0` and `torch-spyre` your new rev. If `--upgrade` moved `vllm`, stop — something changed the source pin and that's out of scope for this skill.
+
+Skim the `Updated …` lines uv prints. A handful of transitives moving (pydantic, transformers, tiktoken, triton, …) is expected and desirable — that's the point of keeping the lock fresh. A **multi-version** package (e.g. `protobuf`, `scipy` resolved at two versions) can print what looks like a downgrade (`v7.x, v6.x -> v6.x`); that's a resolution consolidation, not a real rollback. Then re-sync against the fully-upgraded lock:
+
+```bash
+uv sync --frozen
+```
+
+This rebuilds torch-spyre *and* installs the new transitive versions, so the smoke test in §6 exercises the exact environment CI will lock to. List the notable transitive bumps in the PR description (§9).
+
+### 5. Clear the inductor cache — mandatory
 
 > **CRITICAL.** After torch-spyre is rebuilt, the next pytest run will hit cached inductor wrappers from the *previous* install. These wrappers contain literal references to torch-spyre internals (kwargs, dataclass fields, attribute names). If the bump renamed or removed any of them, the cached `.py` files crash during model load with `TypeError: <Class>.__init__() got an unexpected keyword argument '<name>'` — even though the freshly-built `.venv` is consistent.
 
@@ -162,7 +195,7 @@ rm -rf /tmp/torchinductor_*
 
 If you forget, the symptom is a `TypeError` referencing a kwarg or attribute that you can grep for and find *only* in `/tmp/torchinductor_*/**/*.py`, never in `.venv/lib/python3.12/site-packages/torch_spyre/`. That's the confirmation.
 
-### 5. Run a smoke test
+### 6. Run a smoke test
 
 The full test suite takes ~18 minutes and is better left to CI (which parallelizes across runners). Instead, run a single quick test to verify the build is functional:
 
@@ -172,7 +205,7 @@ uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py::test_basic_model_load
 
 This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
-**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§6). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[packages]` entry — no need to reach into the `next` dev-preview tree.
+**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[packages]` entry — no need to reach into the `next` dev-preview tree.
 
 If the smoke test passes, tell the user:
 
@@ -182,11 +215,11 @@ Do **not** commit or push on behalf of the user. The human decides when to commi
 
 If it fails, triage:
 
-- **`TypeError: ...__init__() got an unexpected keyword argument ...`** during model load → stale inductor cache (you forgot §4). Clear it and re-run.
+- **`TypeError: ...__init__() got an unexpected keyword argument ...`** during model load → stale inductor cache (you forgot §5). Clear it and re-run.
 - **`ImportError` or `RuntimeError` referencing a missing symbol** → the bump pulled in a commit that needs newer RPMs than are installed. Bisect back.
 - Numerical mismatches, fallback-warning storms, compile errors on `spyre` → real regressions introduced by the bump. Hand to [[debug-spyre]].
 
-### 6. Update `spyre-rpms.lock`
+### 7. Update `spyre-rpms.lock`
 
 The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. `spyre-rpms.lock` is **TOML**. All packages live in the **prod** (base) tree — `<repo>/<arch>/` — so `[defaults].tree = ""` and there are no per-package tree overrides (`ibm-libaiupti` now ships to prod, so the `next` tree — still available for dev-preview builds — is no longer needed for the baseline). `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
 
@@ -338,7 +371,7 @@ If the token is expired/missing and the user can't provide one, you cannot resol
 
 The `populate-rpm-cache` workflow fires automatically via `pull_request_target` when `spyre-rpms.lock` changes, so no manual action is needed — opening the PR is sufficient. It validates all arches, then downloads and caches the x86_64 build.
 
-### 7. Capture installed `ibm-*` package versions
+### 8. Capture installed `ibm-*` package versions
 
 For the PR description, snapshot the RPMs that defined the build boundary:
 
@@ -348,7 +381,7 @@ rpm -qa 'ibm-*' 2>/dev/null | sort
 
 This makes the build boundary reproducible — the next person bumping can tell at a glance whether their host has newer libs (and therefore should retry the commits this PR skipped).
 
-### 8. Write the PR description
+### 9. Write the PR description
 
 Write to `PR_torch_spyre_bump.md`. Follow `.github/pull_request_template.md`:
 
@@ -359,11 +392,15 @@ Use one of the two templates below depending on whether a bisect was needed:
 ````markdown
 ## Description
 
-Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits since the previous pin. The tip of `main` compiled cleanly against the currently-installed RPMs (no bisect needed).
+Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits since the previous pin. The tip of `main` compiled cleanly against the currently-installed RPMs (no bisect needed). Also refreshes the full `uv.lock` (`uv lock --upgrade`); `vllm` is held at its pinned git tag and intentionally **not** upgraded.
 
 ### Notable upstream changes in this range
 
 <3–6 curated bullets from §2>
+
+### Transitive dependency refresh
+
+<count> transitive packages moved via `uv lock --upgrade`; notable bumps: <e.g. transformers X → Y, triton X → Y, …>. `vllm` and `torch-spyre` unchanged (pinned).
 
 ### Installed `ibm-*` packages on the build host
 
@@ -374,6 +411,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 ## Test Plan
 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
+- [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
 - [x] Smoke test (`test_basic_model_load`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
@@ -387,11 +425,15 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — all <N> upstream commits
 ````markdown
 ## Description
 
-Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream commits since the previous pin. The remaining <N-K> commits (starting with <#FIRST-FAILING> "<first-failing-title>") need matching `ibm-*` updates and fail the torch-spyre C++ extension build against the currently-installed RPMs.
+Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream commits since the previous pin. The remaining <N-K> commits (starting with <#FIRST-FAILING> "<first-failing-title>") need matching `ibm-*` updates and fail the torch-spyre C++ extension build against the currently-installed RPMs. Also refreshes the full `uv.lock` (`uv lock --upgrade`); `vllm` is held at its pinned git tag and intentionally **not** upgraded.
 
 ### Notable upstream changes in this range
 
 <3–6 curated bullets from §2>
+
+### Transitive dependency refresh
+
+<count> transitive packages moved via `uv lock --upgrade`; notable bumps: <e.g. transformers X → Y, triton X → Y, …>. `vllm` and `torch-spyre` unchanged (pinned).
 
 ### Binary search for the latest building commit
 
@@ -411,6 +453,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 ## Test Plan
 
 - [x] `uv lock` resolves cleanly to `<new-sha>`
+- [x] `uv lock --upgrade` refreshes all transitives (vllm held at its git tag)
 - [x] `uv sync --frozen` builds the torch-spyre C++ extension successfully
 - [x] Smoke test (`test_basic_model_load`) passes locally
 - [ ] Full CI suite passes (pushed for CI validation)
@@ -419,7 +462,7 @@ Bumps `torch-spyre` from `<old-sha>` to `<new-sha>` — <K> of the <N> upstream 
 **Reviewer note:** when pulling this branch onto an existing checkout, `rm -rf /tmp/torchinductor_*` before running tests — the cache bakes in references to internals that were renamed/removed across the bump.
 ````
 
-### 9. Stop — do not commit or push
+### 10. Stop — do not commit or push
 
 The skill's job ends here. Present the user with a summary of what changed and the draft PR description. The user will:
 
@@ -432,7 +475,7 @@ Do **not** run `git add`, `git commit`, `git push`, `gh pr create`, or any equiv
 ## Files touched (typical)
 
 - `pyproject.toml` (the rev string)
-- `uv.lock` (re-locked twice — once for the rev, plus uv may bump transitives)
+- `uv.lock` (re-locked for the rev during bisect, then fully refreshed with `uv lock --upgrade` on the settled commit — expect many transitive bumps; `vllm` held at its git tag)
 - `spyre-rpms.lock` (TOML — bumped x86_64 exact-build pins + P/Z commit overrides; resolved/validated via `.github/scripts/resolve_rpms.py`)
 - `PR_torch_spyre_bump.md` (scratch description for the user to paste)
 

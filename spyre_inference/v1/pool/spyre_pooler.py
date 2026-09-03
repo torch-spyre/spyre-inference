@@ -139,52 +139,21 @@ class SpyreLastPool(LastPool):
 class SpyreMeanPool(MeanPool):
     """MEAN after one packed D2H; the segment sum is not on Spyre.
 
-    Packed hidden states are already ``[T, H]`` in sequence order. A
-    per-sequence ``index_select`` + ``convert`` is just N host copies, not
-    an on-device reduction. Spyre cannot segment-sum yet (``index_add_``
-    is unique-index only, torch-spyre#3507) and float32 D2H is corrupt
-    (``ReStickifyOpHBM`` — MiniLM cosine ~0.21 vs HF). Copy the valid
-    prefix once (one ``index_select`` if the encoder padded past
-    ``sum(lens)``) and reduce in float32 on the host, matching upstream.
-
-    Returns float32 on the host. A dense ``[num_seqs, max_len, H]`` pad
-    is not used.
+    Device fp32 lives staggered (torch-spyre#2971). Raw ``convert`` of an
+    fp32 sum is garbage, and destagger via ``to(fp16)`` then convert then
+    upcast is also garbage (e5/roberta cosine ~-0.02). After cropping
+    encoder pad past ``sum(lens)``, copy the valid prefix as fp16 and let
+    ``MeanPool`` reduce — empty batch, fp32 accumulator, zero-length
+    ``nan``. ``convert`` is a no-op when the tensor is already on the host.
     """
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
-        if cursor.is_partial_prefill():
-            raise RuntimeError("partial prefill is not supported with MEAN pooling")
-
         prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
-        num_seqs = int(prompt_lens.numel())
-        hidden_size = hidden_states.shape[-1]
-        if num_seqs == 0:
-            return torch.empty((0, hidden_size), dtype=torch.float32)
-
-        lens_list = [int(n) for n in prompt_lens.tolist()]
-        if max(lens_list, default=0) == 0:
-            return torch.zeros((num_seqs, hidden_size), dtype=torch.float32)
-
-        total = sum(lens_list)
+        total = int(prompt_lens.sum().item()) if prompt_lens.numel() else 0
         if hidden_states.shape[0] > total:
             hidden_states = select_rows(hidden_states, torch.arange(total, dtype=torch.int64))
-        if hidden_states.device.type == "spyre":
-            hidden_states = convert(hidden_states, "cpu")
-
-        sums: list[torch.Tensor] = []
-        start = 0
-        for length in lens_list:
-            if length == 0:
-                sums.append(torch.zeros(hidden_size, dtype=torch.float32))
-            else:
-                chunk = hidden_states[start : start + length]
-                sums.append(chunk.sum(dim=0, dtype=torch.float32))
-            start += length
-
-        pooled = torch.stack(sums, dim=0)
-        denom = prompt_lens.clamp(min=1).to(dtype=torch.float32).unsqueeze(1)
-        return pooled / denom
+        return super().forward(convert(hidden_states, "cpu"), pooling_metadata)
 
 
 class SpyreNormalize(PoolerNormalize):
@@ -362,9 +331,12 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
 
 
 def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) -> bool:
-    """Keep CLS/LAST/MEAN/token AllPool on Spyre. MEAN copies packed activations once.
+    """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
-    False if the method is unknown or the head is an FP32 linear.
+    CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
+    reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
+    is garbage (torch-spyre#2971). False if the method is unknown or the
+    head is an FP32 linear.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
@@ -388,8 +360,7 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
 
     # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
     # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
-    # stay on CPU. Probe: test_spyre_fp32_linear_for_pooling_heads. Stack
-    # upgrades that may already include this are blocked on spyre-comms#349.
+    # stay on CPU.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
@@ -403,13 +374,12 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
 
     num_norm = patch_normalize_for_spyre(pooler)
     num_heads = patch_embedding_heads_for_spyre(pooler)
-    on_spyre = ["pooler"]
+    staying = ["hidden states"]
     if classifier is not None:
-        on_spyre.append("classifier")
+        staying.append("classifier")
     logger.info(
-        "Pooling: keeping %s on %s (%d CLS/LAST/MEAN/token method(s), "
-        "%d normalize head(s), %d embed head(s) with CPU dtype cast)",
-        ", ".join(on_spyre),
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads)",
+        ", ".join(staying),
         spyre_device,
         num_patched,
         num_norm,

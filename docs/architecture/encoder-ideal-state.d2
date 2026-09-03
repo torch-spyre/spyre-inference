@@ -349,7 +349,7 @@ upper: " " {
       }
     }
 
-    mean_dep: "MEAN on device needs a compile-safe segment sum and torch-spyre#3507 (index_add).\nUntil both land, MEAN pools on the host and the hidden state crosses each step." {
+    mean_dep: "MEAN copies packed [T, H] as fp16 and reduces with MeanPool on the host.\nDestagger of a device fp32 sum (to(fp16) then convert) is garbage (torch-spyre#2971). index_add_ (#3507) would let the reduce stay on the card." {
       style.fill: "#FFF8E1"
       style.stroke: "#F9A825"
       style.font-color: "#5d4037"

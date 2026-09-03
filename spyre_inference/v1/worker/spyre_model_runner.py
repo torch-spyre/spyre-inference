@@ -475,7 +475,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST gather on Spyre; MEAN copies packed activations once.
+        # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
@@ -897,8 +897,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         FP32 linear heads keep the pooler on CPU and use
         ``GPUModelRunner._pool``. Do not crop here: Spyre dim-0 slices are
-        unsafe, and each method gathers itself (CLS/LAST rows, MEAN prefix,
-        token AllPool ranges).
+        unsafe, and each method gathers itself (CLS/LAST rows, MEAN
+        per-request rows, token AllPool ranges).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"

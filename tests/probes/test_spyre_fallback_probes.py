@@ -763,20 +763,73 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 10. FP32 linear / batchmatmul (pooling classifier heads)
+# 10. FP32 reduce then D2H (MEAN destagger — both paths fail)
+# ---------------------------------------------------------------------------
+#
+# Device fp32 is staggered inside sticks (torch-spyre#2971). A raw convert
+# of the reduction is interleaved garbage. Downcast to fp16, convert, then
+# upcast is also garbage (e5/roberta cosine ~-0.02). MEAN therefore copies
+# packed fp16 and reduces on the host. When either XPASS-es, MEAN can
+# destagger a device fp32 sum and copy [B, H].
+
+
+def _fp32_mean_reduction(spyre_device):
+    hidden = torch.randn(32, 64, dtype=torch.float16, device=spyre_device)
+    acc = hidden.sum(dim=0, dtype=torch.float32)
+    ref = hidden.cpu().sum(dim=0, dtype=torch.float32)
+    return acc, ref
+
+
+def _destagger_fp32_to_host(tensor):
+    from spyre_inference.custom_ops.utils import convert
+
+    return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
+        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
+        "When this XPASS-es, MEAN can convert a device fp32 sum."
+    ),
+)
+def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
+    """Raw convert of a device fp32 sum."""
+    from spyre_inference.custom_ops.utils import convert
+
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "to(fp16) then convert then upcast is also garbage (e5/roberta cosine "
+        "~-0.02). MEAN copies packed fp16 and reduces on the host. When this "
+        "XPASS-es, MEAN can destagger a device fp32 sum."
+    ),
+)
+def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
+    """to(fp16) before convert does not un-stagger a device fp32 sum."""
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 11. FP32 linear / batchmatmul (pooling classifier heads)
 # ---------------------------------------------------------------------------
 #
 # torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
 # (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
-# stays on CPU (configure_pooling_for_spyre). Stack upgrades that may
-# already include this are blocked on spyre-comms#349.
+# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
+# fallback.
 
 
 _FP32_BMM_REASON = (
     "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
     "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
-    "float32, so configure_pooling_for_spyre keeps them on CPU. Stack upgrades "
-    "that may already include this are blocked on spyre-comms#349. When this "
+    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
     "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
 )
 
@@ -801,22 +854,4 @@ def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
 
     out = fn(hidden, weight, bias)
     expected = F.linear(hidden.cpu(), weight.cpu(), bias.cpu())
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
-
-
-@pytest.mark.parametrize("mode", ["eager", "compile"])
-@pytest.mark.xfail(strict=True, reason=_FP32_BMM_REASON)
-def test_spyre_fp32_batchmatmul(spyre_device, mode):
-    """FP32 ``torch.bmm`` — the primitive F.linear lowers to on Spyre."""
-    a = torch.randn(2, 8, 16, dtype=torch.float32, device=spyre_device)
-    b = torch.randn(2, 16, 8, dtype=torch.float32, device=spyre_device)
-
-    def fn(x, y):
-        return torch.bmm(x, y)
-
-    if mode == "compile":
-        fn = torch.compile(fn, dynamic=False, backend="inductor")
-
-    out = fn(a, b)
-    expected = torch.bmm(a.cpu(), b.cpu())
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)

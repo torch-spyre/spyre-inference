@@ -38,6 +38,12 @@ DECODER_MODELS = [
     "google/gemma-4-31B",
 ]
 
+MODEL_REVISIONS = {
+    "ibm-granite/granite-3.3-8b-instruct": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
+    "ibm-granite/granite-4.1-8b": "1504002f650e656a0a3789d99574df12e3e94ed0",
+    "google/gemma-4-31B": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",
+}
+
 # Must stay under MAX_NUM_BATCHED_TOKENS (test_model_quality.py) so each prefill lands
 # in a single compiled bucket.
 _TEMPLATE = (
@@ -69,9 +75,9 @@ _ROUND = 6
 OUT_PATH = Path(__file__).parent / "decoder_output_refs.json"
 
 
-def generate_reference(model_id: str, dtype: torch.dtype) -> dict[str, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+def generate_reference(model_id: str, revision: str, dtype: torch.dtype) -> dict[str, Any]:
+    tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
+    model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, dtype=dtype)
     model.eval()
     # The test runs with ignore_eos=True, so the reference needs all MAX_TOKENS steps.
     model.generation_config.eos_token_id = None
@@ -105,6 +111,7 @@ def generate_reference(model_id: str, dtype: torch.dtype) -> dict[str, Any]:
         print(f"  {prompt!r}\n    -> {results[-1]['text']!r}", flush=True)
 
     return {
+        "revision": revision,
         "max_tokens": MAX_TOKENS,
         "dtype": str(dtype).removeprefix("torch."),
         "results": results,
@@ -121,7 +128,9 @@ def main() -> None:
     data = json.loads(args.out.read_text()) if args.out.exists() else {}
     for model_id in args.models:
         print(f"Generating {model_id} ...", flush=True)
-        data[model_id] = generate_reference(model_id, getattr(torch, args.dtype))
+        data[model_id] = generate_reference(
+            model_id, MODEL_REVISIONS[model_id], getattr(torch, args.dtype)
+        )
         # Written per model: each one takes minutes and is easy to interrupt.
         args.out.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
         print(f"Wrote {args.out}", flush=True)

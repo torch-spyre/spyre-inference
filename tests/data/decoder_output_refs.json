@@ -2,6 +2,7 @@
   "google/gemma-4-31B": {
     "dtype": "float32",
     "max_tokens": 16,
+    "revision": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",
     "results": [
       {
         "logprobs": [
@@ -182,6 +183,7 @@
   "ibm-granite/granite-3.3-8b-instruct": {
     "dtype": "float32",
     "max_tokens": 16,
+    "revision": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
     "results": [
       {
         "logprobs": [
@@ -362,6 +364,7 @@
   "ibm-granite/granite-4.1-8b": {
     "dtype": "float32",
     "max_tokens": 16,
+    "revision": "1504002f650e656a0a3789d99574df12e3e94ed0",
     "results": [
       {
         "logprobs": [

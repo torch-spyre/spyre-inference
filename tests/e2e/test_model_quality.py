@@ -63,9 +63,12 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
 
     prompts = [result["prompt"] for result in ref["results"]]
     max_tokens = ref["max_tokens"]
+    revision = ref["revision"]
 
     engine = LLM(
         model=model,
+        revision=revision,
+        tokenizer_revision=revision,
         enforce_eager=False,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,

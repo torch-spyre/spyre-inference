@@ -65,7 +65,7 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
             self._spyre_keep_table = None
 
     def _build_reindex_and_keep_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the reindex and keep lookup tables in one pass."""
+        """Build the reindex and keep lookup tables (vectorized over the vocab)."""
         vocab_size = self.num_embeddings
         indices = torch.arange(vocab_size, dtype=torch.int64)
         masked_input, input_mask = get_masked_input_and_mask(

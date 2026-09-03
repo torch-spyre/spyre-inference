@@ -104,6 +104,7 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
 
 def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm import LLM, SamplingParams
+    from vllm.config import CompilationConfig
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
@@ -115,6 +116,7 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
         max_model_len=128,
         max_num_seqs=2,
         max_num_batched_tokens=8,
+        compilation_config=CompilationConfig(compile_sizes=[1, 8]),
     )
 
     output = engine.generate(

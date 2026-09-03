@@ -196,17 +196,7 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
 @pytest.mark.parametrize(
     "input_size,output_size",
     [
-        pytest.param(
-            128,
-            1,
-            marks=pytest.mark.xfail(
-                reason="torch-spyre batchmatmul cannot restickify an out=1 output dim "
-                "('cannot restickify any input layout of x to carry x_var=d1'); fails "
-                "in both eager and compile. Padding out=1->2 works, but the fix belongs "
-                "in torch-spyre. Tracked upstream.",
-                strict=True,
-            ),
-        ),
+        (128, 1),
         (256, 8),
         (1024, 512),
     ],
@@ -218,8 +208,8 @@ def test_replicated_matches_reference(tp_group, num_tokens, input_size, output_s
     Reaches Spyre as the `score` head of a sequence-classification model
     (`as_seq_cls_model` in vLLM's model adapters), which is why the tiny
     `output_size=1` case is covered: a single-column weight still has to survive
-    the `[out, in]` → `[in, out]` transpose. That out=1 case is currently xfail —
-    torch-spyre's batchmatmul cannot stickify a size-1 output dimension.
+    the `[out, in]` → `[in, out]` transpose. The out=1 case was strict-xfail until
+    torch-spyre#4206 taught batchmatmul to stickify a size-1 output dimension.
     """
     from vllm.model_executor.layers.linear import ReplicatedLinear
 

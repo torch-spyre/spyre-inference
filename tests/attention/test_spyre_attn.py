@@ -24,11 +24,13 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
+    _mirror_mask_tiles,
 )
 
 pytestmark = pytest.mark.attention
@@ -1347,6 +1349,65 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     mask_mixed_1 = metadata_mixed.attention_mask_tiles[1][0]
     attended_mixed_1 = (mask_mixed_1[0] == 0).nonzero().flatten().tolist()
     assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"
+
+
+def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, monkeypatch):
+    """Interior blocks sharing the zero tile must cost a single H2D transfer.
+
+    Guards against a regression back to one transfer per block, which is
+    invisible in outputs: the mirrored tiles compare equal either way, so only
+    the transfer count and the device-side object identity distinguish them.
+    """
+    torch.set_default_device("cpu")
+
+    block_size = 64
+    sliding_window = 256
+    kv_len = 512  # 8 blocks; blocks 5 and 6 are window interior
+
+    metadata = _build_metadata(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_size=128,
+        block_size=block_size,
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=torch.arange(kv_len // block_size, dtype=torch.int32).unsqueeze(0),
+        slot_mapping=torch.tensor([kv_len - 1], dtype=torch.int64),
+        sliding_window=sliding_window,
+    )
+
+    tiles_cpu = metadata.attention_mask_tiles
+    assert tiles_cpu is not None
+    seq_tiles = tiles_cpu[0]
+    num_distinct = len({id(t) for t in seq_tiles})
+    assert num_distinct < len(seq_tiles), (
+        "builder no longer shares one CPU tile across interior blocks, so this "
+        "test cannot observe the memoization"
+    )
+
+    # `convert` short-circuits same-device/same-dtype, so a real CPU->CPU call
+    # would hand back the input and make identity checks vacuous. Count the
+    # calls and return a distinct tensor from each instead.
+    calls: list[torch.Tensor] = []
+
+    def counting_convert(tensor, device=None, dtype=None):
+        calls.append(tensor)
+        return tensor.clone()
+
+    monkeypatch.setattr(spyre_attn, "convert", counting_convert)
+    tiles_device = _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
+
+    assert len(calls) == num_distinct, (
+        f"expected {num_distinct} transfers for {len(seq_tiles)} blocks, got {len(calls)}"
+    )
+
+    # Blocks that shared a CPU tile must share the mirrored device tensor.
+    for i, tile_i in enumerate(seq_tiles):
+        for j, tile_j in enumerate(seq_tiles):
+            if tile_i is tile_j:
+                assert tiles_device[0][i] is tiles_device[0][j]
+            else:
+                assert tiles_device[0][i] is not tiles_device[0][j]
 
 
 # ---------------------------------------------------------------------------

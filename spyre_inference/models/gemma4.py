@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 
@@ -26,19 +26,71 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def force_text_backbone(engine_args: EngineArgs) -> None:
-    """Default gemma-4 to its text-only backbone (it ships multimodal).
+# Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
+# mapped to the per-layer attribute of the same role it is rebuilt from.
+_GEMMA4_FULL_ATTENTION_ATTRS = {
+    "global_head_dim": "head_dim",
+    "num_global_key_value_heads": "num_key_value_heads",
+}
 
-    Sets ``hf_overrides["architectures"]`` so ``create_model_config`` resolves
-    ``Gemma4ForCausalLM`` instead of the multimodal default. Skipped when the user
-    already pinned an architecture (dict or callable ``hf_overrides``).
+
+def _gemma4_text_backbone_override(config: Any) -> Any:
+    # Module-level (not a closure) so it survives the pickle to EngineCore.
+    config.architectures = ["Gemma4ForCausalLM"]
+    text_config = getattr(config, "text_config", config)
+    # Let bare reads (config.head_dim, config.num_key_value_heads) return the
+    # sliding/global scalar, matching vLLM's sliding-layer path.
+    for cfg in {id(config): config, id(text_config): text_config}.values():
+        cfg.allow_global_per_layer_attribute_access = True
+    per_layer = getattr(text_config, "per_layer_config", None)
+    layer_types = getattr(text_config, "layer_types", None)
+    if per_layer is not None and layer_types:
+        full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+        for global_attr, src_attr in _GEMMA4_FULL_ATTENTION_ATTRS.items():
+            if hasattr(text_config, global_attr) or not full_idx:
+                continue
+            values = {getattr(per_layer[i], src_attr) for i in full_idx}
+            if len(values) == 1:
+                setattr(text_config, global_attr, values.pop())
+    return config
+
+
+# gemma-4 config model_types this fix applies to. Excludes the other gemma4_* types
+# (unified, dspark, mtp, audio, vision): they have their own vLLM builders and must
+# not be forced onto the text backbone.
+_GEMMA4_TEXT_MODEL_TYPES = {"gemma4", "gemma4_text"}
+
+
+def force_text_backbone(engine_args: EngineArgs) -> None:
+    """Default gemma-4 to its text-only backbone and repair its head-dim config.
+
+    transformers >=5.16 reclassifies gemma-4 as heterogeneous: a bare ``config.head_dim``
+    read then raises (crashing vLLM's ``get_head_size``) and the ``global_*`` head/kv-head
+    attributes vLLM needs are consumed into ``per_layer_config``. The override restores the
+    <=5.14 view before ``ModelConfig`` is built; skipped when the user set ``hf_overrides``.
     """
-    ov = engine_args.hf_overrides
-    user_arch = callable(ov) or (isinstance(ov, dict) and "architectures" in ov)
-    if "gemma-4" in (engine_args.model or "").lower() and not user_arch and isinstance(ov, dict):
-        overrides = cast("dict[str, Any]", ov)
-        overrides["architectures"] = ["Gemma4ForCausalLM"]
-        logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
+    if engine_args.hf_overrides:
+        return
+    from vllm.transformers_utils.config import get_config
+
+    # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
+    # medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
+    # failure, defer to ModelConfig, which loads the same config and raises the real error.
+    try:
+        hf_config = get_config(
+            engine_args.hf_config_path or engine_args.model,
+            engine_args.trust_remote_code,
+            engine_args.revision,
+            engine_args.code_revision,
+            engine_args.config_format,
+            token=engine_args.hf_token,
+        )
+    except Exception:
+        return
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return
+    engine_args.hf_overrides = _gemma4_text_backbone_override
+    logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
 def install_spyre_patches() -> None:

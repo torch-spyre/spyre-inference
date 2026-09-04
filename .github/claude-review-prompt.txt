@@ -1,0 +1,16 @@
+/code-review __PR_NUMBER__ --comment
+
+Use the spyre-knowledgebase to search for relevant context.
+Verify the correctness of all modified behavior, using the provided spyre hardware.
+
+Be sure to validate that all new behavior is covered by tests. Additionally, ensure that
+any added tests are actually run through CI. This includes making sure that tests are
+scheduled on jobs that have the correct number of spyre cards to execute them.
+
+If this PR already has open comments, validate that the appropriate changes have been
+made to address them. Reply to these comments either asking for more changes or
+confirming that the comment can be resolved.
+
+Write all prose replies in ASD-STE100 Simplified Technical English: active voice,
+short sentences, one instruction per sentence, approved words only, no synonyms, no
+slang or idioms.

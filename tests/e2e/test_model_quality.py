@@ -38,6 +38,21 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
+# Weight-only FP8 (compressed-tensors) checkpoints, each mapped to the unquantized sibling
+# whose reference entry it borrows prompts from -- the smoke test below compares no
+# output, it only needs prompts that fit a compiled prefill bucket. Both run end to end on
+# Spyre today, so the sibling entries are what gate the numerics.
+FP8_DECODER_MODELS = {
+    "ibm-granite/granite-3.3-8b-instruct-FP8": "ibm-granite/granite-3.3-8b-instruct",
+    "ibm-granite/granite-4.1-8b-fp8": "ibm-granite/granite-4.1-8b",
+}
+FP8_REVISIONS = {
+    "ibm-granite/granite-3.3-8b-instruct-FP8": "4b5990b8d402a75febe0086abbf1e490af494e3d",
+    "ibm-granite/granite-4.1-8b-fp8": "070021b3608433b6107a00733d561c9779b9937e",
+}
+# Short: nothing is compared, so the run only has to prove decode advances at all.
+FP8_MAX_TOKENS = 8
+
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are
 # compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
@@ -117,6 +132,57 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         f"near-tie and gate little -- see MODEL_PROMPTS in "
         f"tests/data/generate_decoder_output_refs.py."
     )
+
+
+@pytest.mark.parametrize("model", FP8_DECODER_MODELS)
+def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A compiled FP8 checkpoint loads and decodes.
+
+    Load-and-decode only, with no reference comparison: a reference for a
+    compressed-tensors checkpoint means dequantizing it on CPU first, which the generator
+    does not do. So this holds the FP8 weight load and the ``aten._scaled_mm`` kernel
+    (``custom_ops/fp8_linear_kernel.py``) to running at all rather than to a numerical
+    bound -- `test_decoder_model_output` gates the unquantized siblings' output.
+    """
+    base = FP8_DECODER_MODELS[model]
+    base_ref = _REFERENCES.get(base)
+    assert base_ref is not None, (
+        f"No HF reference for {base} in {_REF_PATH.name}, and {model} borrows its prompts; "
+        f"regenerate with `python tests/data/generate_decoder_output_refs.py --models {base}`"
+    )
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    prompts = [result["prompt"] for result in base_ref["results"]]
+    revision = FP8_REVISIONS[model]
+
+    _assert_prompts_fit_prefill_bucket(model, revision, prompts)
+
+    engine = LLM(
+        model=model,
+        revision=revision,
+        tokenizer_revision=revision,
+        enforce_eager=False,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=MAX_NUM_SEQS,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        compilation_config={"compile_sizes": COMPILE_SIZES},
+    )
+
+    outputs = engine.generate(
+        prompts,
+        SamplingParams(temperature=0.0, max_tokens=FP8_MAX_TOKENS, ignore_eos=True),
+        use_tqdm=False,
+    )
+
+    assert [output.prompt for output in outputs] == prompts, "Model output contained wrong prompt!"
+    for output in outputs:
+        completion = output.outputs[0]
+        print(f"\n{model}  prompt: {output.prompt!r}\n    Spyre: {completion.text!r}")
+        assert len(completion.token_ids) == FP8_MAX_TOKENS, (
+            f"{model}: generated {len(completion.token_ids)} of {FP8_MAX_TOKENS} tokens"
+        )
+        assert completion.text.strip(), f"{model}: empty completion for {output.prompt!r}"
 
 
 def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:

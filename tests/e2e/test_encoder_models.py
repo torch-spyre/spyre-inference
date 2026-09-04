@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre product embed tests vs cached HF refs and reranker smoke tests.
+"""Spyre product encoder tests vs cached HF refs: embeddings, reranker scores, labels.
 
-Regenerate embed refs: ``python tests/data/generate_encoder_embed_refs.py``
+Regenerate refs: ``python tests/data/generate_encoder_embed_refs.py`` and
+``python tests/data/generate_rerank_score_refs.py``
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -51,10 +53,12 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
-# Cross-encoder reranker smoke (classify / score path). One model is enough —
-# both BGE variants share XLMRobertaForSequenceClassification.
+# Cross-encoder rerankers (classify / score path). The two BGE variants share
+# XLMRobertaForSequenceClassification but not their weights or position table (514 vs
+# 8194 slots), so each is gated on its own cached scores.
 RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
+    "BAAI/bge-reranker-large",
 ]
 
 # Token classification: the model applies its own classifier after casting to
@@ -69,8 +73,22 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
+# Reranker references are sigmoid probabilities, and a bare absolute bound is a poor gate
+# for one: the scores sit near the rails, where it permits an arbitrary relative error.
+# Paired with a relative bound (stricter of the two wins, as in test_model_quality.py) a
+# saturated reference is held to a fraction instead. Worst measured drift on the reference
+# documents is 7e-3 absolute and 13% relative, both on bge-reranker-large, so each bound
+# keeps ~4x margin.
+SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
+SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
+
 _REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
+
+_RERANK_REF_PATH = Path(__file__).parent.parent / "data" / "rerank_score_refs.json"
+_RERANK_REFERENCES: dict = (
+    json.loads(_RERANK_REF_PATH.read_text()) if _RERANK_REF_PATH.exists() else {}
+)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -220,17 +238,56 @@ def test_encoder_embed_last_pooling() -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
 def test_encoder_rerank_models(model: str) -> None:
-    """Load reranker and return one finite score via LLM.score()."""
+    """Spyre reranker scores match the cached HF references within tolerance."""
+    _assert_rerank_scores_match_refs(model, enforce_eager=True)
+
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", RERANKER_MODELS)
+def test_encoder_rerank_models_compiled(model: str) -> None:
+    """Same models and references, compiled rather than eager."""
+    _assert_rerank_scores_match_refs(model, enforce_eager=False)
+
+
+def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
+    ref = _RERANK_REFERENCES.get(model)
+    if ref is None:
+        pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
+
+    documents = ref["documents"]
+    ref_scores = ref["scores"]
     llm = LLM(
         model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
     )
-    scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
-    assert len(scores) == 1
-    assert math.isfinite(scores[0].outputs.score)
+    outputs = llm.score(ref["query"], documents)
+    assert len(outputs) == len(documents)
+
+    scores = [out.outputs.score for out in outputs]
+    assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
+
+    # A reranker is used for its ordering, and every score can drift the same direction
+    # without disturbing that -- so the ranking is checked apart from the per-score bound,
+    # which conversely passes on a pair that has swapped inside the tolerance.
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    ref_order = sorted(range(len(ref_scores)), key=lambda i: ref_scores[i], reverse=True)
+    assert order == ref_order, (
+        f"{model}: ranked documents {order} vs cached HF {ref_order}; "
+        f"scores {scores} vs {ref_scores}"
+    )
+
+    for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
+        tol = min(SCORE_ABS_TOL, SCORE_REL_TOL * ref_score)
+        assert abs(score - ref_score) <= tol, (
+            f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
+            f"for {document!r}"
+        )
 
 
 @pytest.mark.uses_subprocess

@@ -1,0 +1,40 @@
+{
+  "BAAI/bge-reranker-large": {
+    "documents": [
+      "The capital of France is Paris.",
+      "France is a country in Western Europe with about 68 million inhabitants.",
+      "France moved its seat of government several times in its history.",
+      "Berlin is the capital of Germany.",
+      "The IBM Spyre accelerator runs AI inference workloads."
+    ],
+    "query": "What is the capital of France?",
+    "revision": "55611d7bca2a7133960a6d3b71e083071bbfc312",
+    "scores": [
+      0.99946493,
+      0.0866667,
+      0.00186743,
+      0.0005165,
+      7.623e-05
+    ]
+  },
+  "BAAI/bge-reranker-v2-m3": {
+    "documents": [
+      "The capital of France is Paris.",
+      "Paris is the largest city in France by population.",
+      "The Eiffel Tower stands on the Champ de Mars in Paris.",
+      "France is a country in Western Europe with about 68 million inhabitants.",
+      "Berlin is the capital of Germany.",
+      "The IBM Spyre accelerator runs AI inference workloads."
+    ],
+    "query": "What is the capital of France?",
+    "revision": "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e",
+    "scores": [
+      0.99996591,
+      0.9614659,
+      0.59719944,
+      0.04726163,
+      0.00421512,
+      1.604e-05
+    ]
+  }
+}

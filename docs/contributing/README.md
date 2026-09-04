@@ -87,7 +87,8 @@ pytest --upstream -m "attention"
 The `model_quality` marker gates the product models on their output: each is loaded
 **compiled** (the platform default) and compared against a CPU HF reference — greedy
 token ids plus per-token probabilities for the decoders
-(`tests/e2e/test_model_quality.py`), cosine similarity for the embedding models
+(`tests/e2e/test_model_quality.py`), cosine similarity for the embedding models and
+sigmoid scores plus document ranking for the cross-encoder rerankers
 (`tests/e2e/test_encoder_models.py`).
 
 ```bash
@@ -100,14 +101,27 @@ The models are too large to run through transformers in CI, so the references li
 ```bash
 python tests/data/generate_decoder_output_refs.py --models ibm-granite/granite-4.1-8b
 python tests/data/generate_encoder_embed_refs.py
+python tests/data/generate_rerank_score_refs.py
 ```
 
 Regenerate only when the *expected* output changes (new model or prompt), never to make a
 failing test pass — that is the regression the gate exists to catch. Prompts are per
-model: `MODEL_PROMPTS` in the generator says which models are restricted and why.
+model: `MODEL_PROMPTS` (decoders) and `MODEL_DOCUMENTS` (rerankers) in the generators say
+which models get their own inputs and why.
 `SPYRE_TEST_ABS_TOL` (default `0.08`) and `SPYRE_TEST_REL_TOL` (default `0.5`) set the
 decoder probability tolerance: the stricter of the two applies, so a low-confidence
 reference token is held to a fraction rather than to the same absolute margin.
+`SPYRE_TEST_SCORE_ABS_TOL` (default `0.03`) and `SPYRE_TEST_SCORE_REL_TOL` (default
+`0.5`) bound a reranker score the same stricter-of-the-two way, which matters more here
+than for the decoders because the scores are sigmoids sitting near the rails. The
+document ranking is checked separately: all scores can drift the same direction without
+reordering anything, and two documents can reorder while both stay inside the bound.
+
+The FP8 decoder checkpoints (`FP8_DECODER_MODELS`) are load-and-decode cases with no
+reference of their own — writing one means dequantizing a compressed-tensors checkpoint on
+CPU, which the generator does not do — so they gate the FP8 weight load and the Spyre
+`aten._scaled_mm` kernel against breaking outright, while the unquantized siblings gate the
+numerics. Each borrows its prompts from the sibling's reference entry.
 
 A greedy path that diverges from HF on a near-tie cannot be compared past the split, so
 each decoder case prints how many reference steps it actually matched

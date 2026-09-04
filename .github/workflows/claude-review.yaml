@@ -90,7 +90,9 @@ jobs:
       - name: Install Claude Code CLI
         env:
           DISABLE_AUTOUPDATER: '1'
-        run: npm install -g @anthropic-ai/claude-code@latest
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Claude review
         env:

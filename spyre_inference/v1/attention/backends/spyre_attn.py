@@ -962,14 +962,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # False, so the traced write keeps one shape per bucket, not one per token count.
         self._slot_mapping.publish(slot_mapping)
 
-        # Bucketed-decode precomputes: only when Q=1, no sliding window, and
-        # num_seqs within the lattice. None-valued fields signal fallback.
+        # None-valued fields signal fallback. Sliding-window batches are eligible:
+        # the kernel reads a precomputed mask, so a window only shrinks the active
+        # block set.
         bucket_num_seqs = None
         bucket_num_blocks = None
         query_row_ids_cpu = None
         block_ids_padded_cpu = None
         mask_by_block_cpu = None
-        if max_query_len == 1 and self.sliding_window is None and num_seqs >= _MIN_SEQS_BUCKET:
+        if max_query_len == 1 and num_seqs >= _MIN_SEQS_BUCKET:
             b_seqs = _find_bucket(num_seqs, self._num_seqs_buckets)
             b_blocks = _find_bucket(max(num_active), self._num_blocks_buckets)
             if b_seqs is not None and b_blocks is not None:
@@ -989,8 +990,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 block_ids_padded_cpu = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
                 for s, n in enumerate(num_active):
                     n_use = min(n, b_blocks)
-                    for b in range(n_use):
-                        block_ids_padded_cpu[b * b_seqs + s] = block_table[s, b]
+                    # Position i is the i-th ACTIVE block, matching the mask tiles.
+                    blocks_s = (
+                        range(n_use)
+                        if active_block_indices is None
+                        else active_block_indices[s][:n_use]
+                    )
+                    for b, abs_b in enumerate(blocks_s):
+                        block_ids_padded_cpu[b * b_seqs + s] = block_table[s, abs_b]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
@@ -1007,6 +1014,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.
+                # Holds under a window too: first_active <= num_blocks - 1.
                 mask_bs_bb[num_seqs:, 0] = torch.finfo(torch.float16).min
                 # 4-D, not 5-D: the kernel slices dim 0 per block, and a dim-0 slice
                 # of a 5-D base fails torch-spyre layout propagation.

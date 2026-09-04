@@ -1824,6 +1824,50 @@ def test_spyre_attn_bucketed_decode_fallback(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window"),
+    [
+        # kv_lens are chosen so first_active > 0, i.e. the active blocks are a
+        # strict suffix; covers_all is the first_active == 0 control.
+        pytest.param([(1, 768)] * 8, 512, id="window512_multiblock(N=8)"),
+        pytest.param(
+            [(1, 768), (1, 896), (1, 1024), (1, 1152), (1, 1280), (1, 768)],
+            512,
+            id="window512_mixed_offsets(N=6)",
+        ),
+        pytest.param([(1, 512)] * 8, 128, id="window128_single_active(N=8)"),
+        pytest.param([(1, 768)] * 8, 500, id="window500_unaligned(N=8)"),
+        pytest.param([(1, 256)] * 8, 4096, id="window_covers_all(N=8)"),
+    ],
+)
+def test_spyre_attn_bucketed_decode_sliding_window(
+    default_vllm_config,
+    enable_bucketed_decode,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Bucketed decode with a sliding window: matches the per-seq reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
 def _padded_mask_metadata(
     seq_lens: list[tuple[int, int]],
     block_size: int = 64,

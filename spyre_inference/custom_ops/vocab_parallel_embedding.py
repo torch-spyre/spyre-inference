@@ -19,7 +19,10 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
@@ -39,6 +42,9 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
+        # Match SpyreParallelLMHead: a tied model shares one table, so both layers
+        # must agree on the padded vocab size.
+        kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(

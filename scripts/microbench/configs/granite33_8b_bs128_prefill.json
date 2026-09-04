@@ -1,0 +1,162 @@
+{
+  "run_label": "granite33_8b_bs128_prefill",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 128,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "prefill_32",
+      "capture_type": "prefill",
+      "query_lens": [
+        32
+      ],
+      "seq_lens": [
+        32
+      ],
+      "extra_cols": {
+        "seqlen": 32,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_64",
+      "capture_type": "prefill",
+      "query_lens": [
+        64
+      ],
+      "seq_lens": [
+        64
+      ],
+      "extra_cols": {
+        "seqlen": 64,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_128",
+      "capture_type": "prefill",
+      "query_lens": [
+        128
+      ],
+      "seq_lens": [
+        128
+      ],
+      "extra_cols": {
+        "seqlen": 128,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_256",
+      "capture_type": "prefill",
+      "query_lens": [
+        256
+      ],
+      "seq_lens": [
+        256
+      ],
+      "extra_cols": {
+        "seqlen": 256,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_512",
+      "capture_type": "prefill",
+      "query_lens": [
+        512
+      ],
+      "seq_lens": [
+        512
+      ],
+      "extra_cols": {
+        "seqlen": 512,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_1024",
+      "capture_type": "prefill",
+      "query_lens": [
+        1024
+      ],
+      "seq_lens": [
+        1024
+      ],
+      "extra_cols": {
+        "seqlen": 1024,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_2048",
+      "capture_type": "prefill",
+      "query_lens": [
+        2048
+      ],
+      "seq_lens": [
+        2048
+      ],
+      "extra_cols": {
+        "seqlen": 2048,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_3000",
+      "capture_type": "prefill",
+      "query_lens": [
+        3000
+      ],
+      "seq_lens": [
+        3000
+      ],
+      "extra_cols": {
+        "seqlen": 3000,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_4096",
+      "capture_type": "prefill",
+      "query_lens": [
+        4096
+      ],
+      "seq_lens": [
+        4096
+      ],
+      "extra_cols": {
+        "seqlen": 4096,
+        "decode_share": 0.0
+      }
+    },
+    {
+      "name": "prefill_8192",
+      "capture_type": "prefill",
+      "query_lens": [
+        8192
+      ],
+      "seq_lens": [
+        8192
+      ],
+      "extra_cols": {
+        "seqlen": 8192,
+        "decode_share": 0.0
+      }
+    }
+  ],
+  "block_sizes": [
+    128
+  ]
+}

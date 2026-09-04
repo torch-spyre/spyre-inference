@@ -179,3 +179,87 @@ tests:
             skip:
               # input embeddings not yet supported on spyre
               enable_prompt_embeds: [true]
+
+    # ---------------------------------------------------------------------
+    # Multimodal (Pixtral vision tower + Ministral-3 decoder)
+    #
+    # All host-side (config + processor, no weights), so it runs card-less.
+    # Upstream's registry only lists the 3B, so `register_ministral_14b` adds the
+    # 14B this plugin is built against.
+    # ---------------------------------------------------------------------
+    # The only upstream test that exercises Pixtral itself: HF vs vLLM processor on
+    # the same inputs (patch-grid geometry, resizing, placeholder insertion) — the
+    # preprocessing that feeds the patched vision tower.
+    - rel_path: tests/models/multimodal/processing/test_common.py
+      allow_list:
+        - test: "test_processing_correctness"
+          mode: mandatory_pass
+          tags: [model, multimodal, upstream]
+          fixture_names:
+            - "register_ministral_14b"
+          params:
+            override:
+              model_id:
+                - mistralai/Ministral-3-14B-Instruct-2512-BF16
+
+    # Shared multimodal machinery: the layer that builds and batches the
+    # `MultiModalKwargs` our `embed_multimodal` / `embed_input_ids` receive.
+    # Only the prompt-update tests are taken; the rest of the file builds a
+    # ModelConfig for llava / Qwen2-VL and exercises no Pixtral code.
+    - rel_path: tests/multimodal/test_processing.py
+      allow_list:
+        - test: "test_find_*" # token/text matches, updates, mm placeholders
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+        - test: "test_iter_token_matches"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+        - test: "test_replace_token_matches"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+        - test: "test_apply_matches_*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    - rel_path: tests/multimodal/test_inputs.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    - rel_path: tests/multimodal/test_parse.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    - rel_path: tests/multimodal/test_hasher.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    - rel_path: tests/multimodal/test_image.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    - rel_path: tests/multimodal/test_utils.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [multimodal, upstream]
+
+    # End-to-end VLM generation, blocked on Spyre: `@large_gpu_test` needs CUDA,
+    # `dtype="bfloat16"` is hardcoded against our forced float16, and it asserts
+    # golden logprobs recorded on an H100 in bfloat16.
+    # tests/e2e/test_multimodal.py covers this ground against the Spyre path.
+    - rel_path: tests/models/multimodal/generation/test_pixtral.py
+      allow_list:
+        - test: "test_chat_consolidated"
+          mode: skip
+          tags: [model, multimodal, upstream, uses_subprocess]
+        - test: "test_chat" # Pixtral-12B, Mistral-Small-3.1-24B
+          mode: skip
+          tags: [model, multimodal, upstream, uses_subprocess]

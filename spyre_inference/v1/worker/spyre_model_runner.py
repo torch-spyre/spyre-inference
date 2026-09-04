@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import cast
 
 import numpy as np
@@ -80,6 +81,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     verify_padded_intermediate_size,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -97,6 +99,80 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 )
 
 logger = init_logger(__name__)
+
+
+# Single-slot cache holding `(key, positions, scale)`. See `_llama4_attn_scale_op`.
+_llama4_scale_cache: tuple | None = None
+
+
+def _llama4_attn_scale_op(
+    positions: torch.Tensor,
+    beta: float,
+    original_max_position_embeddings: int,
+) -> torch.Tensor:
+    """Opaque-op body: upstream's Llama-4 attention temperature scaling on CPU.
+
+    The formula needs an int64->float convert and torch-spyre's typecast table has no
+    int64 entry. Upstream's ``_get_llama_4_attn_scale`` is reused through a stub
+    because a custom op cannot take the module. Every decoder layer in a step gets
+    the same ``positions``, so one round trip is cached for all of them.
+    """
+    global _llama4_scale_cache
+    from types import SimpleNamespace
+
+    from vllm.model_executor.models.mistral import MistralAttention
+
+    # Endpoints are in the key, not just the identity: `positions` is freshly allocated
+    # each step today, but a persistent buffer mutated in place would otherwise hit.
+    pos_cpu = positions.to("cpu")
+    key = (
+        positions.data_ptr(),
+        tuple(positions.shape),
+        int(pos_cpu[0]),
+        int(pos_cpu[-1]),
+        beta,
+        original_max_position_embeddings,
+        str(positions.device),
+    )
+    if _llama4_scale_cache is not None and _llama4_scale_cache[0] == key:
+        return _llama4_scale_cache[2]
+
+    stub = SimpleNamespace(
+        llama_4_scaling_beta=beta,
+        llama_4_scaling_original_max_position_embeddings=original_max_position_embeddings,
+    )
+    scaling = MistralAttention._get_llama_4_attn_scale(
+        stub,  # ty: ignore[invalid-argument-type]
+        pos_cpu,
+    )
+    scaling = convert(scaling, device=positions.device, dtype=torch.float16)
+    # Hold `positions` so its storage cannot be freed and its address reused: the
+    # endpoints in the key do not pin down a batch whose interior differs.
+    _llama4_scale_cache = (key, positions, scaling)
+    return scaling
+
+
+def _llama4_attn_scale_fake(
+    positions: torch.Tensor,
+    beta: float,
+    original_max_position_embeddings: int,
+) -> torch.Tensor:
+    return torch.empty((positions.shape[0], 1), dtype=torch.float16, device=positions.device)
+
+
+@lru_cache(maxsize=1)
+def _register_llama4_attn_scale_op() -> None:
+    """Register ``torch.ops.vllm.spyre_llama4_attn_scale`` once. Called from
+    ``load_model`` (not import) so ``current_platform`` is resolved."""
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    direct_register_custom_op(
+        op_name="spyre_llama4_attn_scale",
+        op_func=_llama4_attn_scale_op,
+        fake_impl=_llama4_attn_scale_fake,
+        dispatch_key=current_platform.dispatch_key,
+    )
 
 
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
@@ -297,11 +373,13 @@ class _SpyreModelWrapper:
         model: nn.Module,
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
+        shape_bucketer: SpyreShapeBucketer | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64
@@ -339,6 +417,85 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    def embed_multimodal(self, **kwargs):
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+
+        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
+        input conversion, so pixel tensors would otherwise arrive on CPU while the
+        vision weights are on Spyre.
+        """
+
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=torch.float16, device=self._spyre_device)
+            return t
+
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        out = self._model.embed_multimodal(**kwargs)
+        return out
+
+    def embed_input_ids(
+        self,
+        input_ids,
+        multimodal_embeddings=None,
+        *,
+        is_multimodal=None,
+    ):
+        """Text-token embedding + multimodal merge, Spyre-aware.
+
+        Like ``embed_multimodal``, this is reached through ``__getattr__`` with
+        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
+        images are present the merge is done on CPU, because upstream scatters image
+        rows with a dim-0 boolean mask that Spyre cannot do.
+        """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        if has_mm and is_multimodal is None:
+            raise ValueError(
+                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
+                "CPU merge below needs the mask."
+            )
+        # The text lookup skips upstream's `masked_fill(is_multimodal, 0)`, so an
+        # out-of-vocab placeholder id would index the embedding table out of range.
+        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
+            raise NotImplementedError(
+                "SpyreModelWrapper.embed_input_ids does not support models with "
+                "out-of-vocab multimodal tokens; mask them before the text embedding."
+            )
+
+        # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
+        # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
+        # length, and some of those collective schedules fail to build. Pad on CPU and
+        # trim after; padding inside a compiled collective corrupts output.
+        num_tokens = input_ids.shape[0]
+        bucketer = self._shape_bucketer
+        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if padded_tokens is not None and padded_tokens != num_tokens:
+            input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - num_tokens))
+        else:
+            padded_tokens = None
+
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        inputs_embeds = self._model.embed_input_ids(input_ids)
+        if padded_tokens is not None:
+            inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
+
+        if not has_mm:
+            return inputs_embeds
+
+        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
+
+        inputs_embeds = convert(inputs_embeds, device="cpu")
+        mm_embeds_cpu = tree_map(
+            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+            multimodal_embeddings,
+        )
+        merged = _merge_multimodal_embeddings(
+            inputs_embeds=inputs_embeds,
+            multimodal_embeddings=mm_embeds_cpu,
+            is_multimodal=is_multimodal.to("cpu"),
+        )
+        return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -415,6 +572,83 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
+    def _patch_llama4_attn_scale(self) -> None:
+        """Run Llama-4 attention temperature scaling on CPU via an opaque op, and move
+        it before rope (see ``_make_forward``). Patches instances, so it must run after
+        load and before ``torch.compile``."""
+        # Gated on the modules, not an architecture allowlist: an allowlist silently
+        # skips the model it is for -- `"mistral" not in "Ministral3ForCausalLM"`.
+        modules = list(self.model.modules())
+        if not any(type(m).__name__ == "MistralAttention" for m in modules):
+            return
+
+        try:
+            from vllm.model_executor.models.mistral import MistralAttention
+        except ImportError:
+            logger.warning_once(
+                "Model has MistralAttention modules but "
+                "vllm.model_executor.models.mistral cannot be imported; the Spyre "
+                "llama-4 attention-scale patch is skipped and a model that needs the "
+                "scaling will run without it."
+            )
+            return
+
+        _register_llama4_attn_scale_op()
+
+        def _make_scale(module: MistralAttention):
+            beta = float(module.llama_4_scaling_beta)
+            orig_max = int(module.llama_4_scaling_original_max_position_embeddings)
+
+            def _get_llama_4_attn_scale(positions: torch.Tensor) -> torch.Tensor:
+                return torch.ops.vllm.spyre_llama4_attn_scale(
+                    positions,  # ty: ignore[invalid-argument-type]
+                    beta,  # ty: ignore[invalid-argument-type]
+                    orig_max,  # ty: ignore[invalid-argument-type]
+                )
+
+            return _get_llama_4_attn_scale
+
+        mistral_attns = [m for m in modules if isinstance(m, MistralAttention)]
+
+        # A non-scaled model still carries the attribute (False), so a missing one
+        # means upstream renamed it and the gate below would skip every layer.
+        if mistral_attns and not any(hasattr(m, "do_llama_4_scaling") for m in mistral_attns):
+            raise RuntimeError(
+                "MistralAttention has no 'do_llama_4_scaling' attribute — the Spyre "
+                "llama-4 attention-scale patch is stale for this vLLM version; update "
+                "_patch_llama4_attn_scale."
+            )
+
+        def _make_forward(module: MistralAttention):
+            """Upstream's forward with the scale moved to before rope.
+
+            Multiplying the rank-4 rope output by a rank-2 scale makes
+            ``SpyreTensorLayout`` raise "Incompatible host_size and dim_order". Rope is
+            a per-token linear rotation and the scale a per-token scalar, so
+            ``R(s*q) == s*R(q)`` and scaling first is exact. This copies upstream's
+            body, so diff it on every vLLM bump — a changed body goes stale silently.
+            """
+
+            def forward(positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+                qkv, _ = module.qkv_proj(hidden_states)
+                q, k, v = qkv.split([module.q_size, module.kv_size, module.kv_size], dim=-1)
+                q = (q * module._get_llama_4_attn_scale(positions)).to(q.dtype)
+                q, k = module.rotary_emb(positions, q, k)
+                attn_output = module.attn(q, k, v)
+                output, _ = module.o_proj(attn_output)
+                return output
+
+            return forward
+
+        n = 0
+        for module in mistral_attns:
+            if getattr(module, "do_llama_4_scaling", False):
+                module._get_llama_4_attn_scale = _make_scale(module)
+                module.forward = _make_forward(module)
+                n += 1
+        if n:
+            logger.info("Spyre: patched %d Llama-4 attention-scale module(s) to CPU.", n)
+
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -471,18 +705,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
 
+        # Both patch instances, so they run after load and before compile wraps
+        # modules in OptimizedModule and breaks traversal.
+        self._patch_llama4_attn_scale()
+        apply_multimodal_patches(self.model, self._spyre_device)
+
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
+
+        # Initialize bucket dispatcher for shape bucketing at runtime.
+        self.spyre_shape_bucketer = self._create_shape_bucketer()
 
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
             keep_outputs_on_device=self._pooling_on_spyre,
+            shape_bucketer=self.spyre_shape_bucketer,
         )
-
-        # Initialize bucket dispatcher for shape bucketing at runtime.
-        self.spyre_shape_bucketer = self._create_shape_bucketer()
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:

@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 
 from . import (
     activation,  # noqa: F401
+    conv,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
@@ -38,4 +39,5 @@ logger = init_logger(__name__)
 def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
+    rms_norm.register()
     utils.register()

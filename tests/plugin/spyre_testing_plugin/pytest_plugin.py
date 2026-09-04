@@ -1092,6 +1092,23 @@ def inference_mode():
 
 
 @pytest.fixture()
+def register_ministral_14b(request, monkeypatch):
+    """Make `mistralai/Ministral-3-14B-Instruct-2512-BF16` resolvable upstream.
+
+    Upstream's registry only knows the 3B, and `find_hf_info` raises for unknown ids,
+    so register the 14B as another extra on the same architecture entry. `setitem`
+    because `_HfExamplesInfo` is frozen — the `extras` dict is not.
+    """
+    hf_models = request.node.module.HF_EXAMPLE_MODELS.hf_models
+    info = hf_models["PixtralForConditionalGeneration"]
+    monkeypatch.setitem(
+        info.extras,
+        "ministral-3-14b",
+        "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    )
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 

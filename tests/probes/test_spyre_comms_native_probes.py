@@ -53,6 +53,76 @@ def test_native_all_reduce_works(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
+def test_all_reduce_vision_flattened_is_exact(run_tp_probe) -> None:
+    """Does the flatten workaround return the right values, not just compile?"""
+    run_tp_probe("all_reduce_vision_flattened", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "F.pad + all_reduce + index_select inside a compiled graph returns garbage "
+        "(32/32 blocks wrong, uninitialised-looking values) while the same ops in "
+        "eager are bit-exact. Plain [1, 5120] and [2, 5120] compile and reduce "
+        "correctly, which is why all_reduce no longer pads. Keep this as the record "
+        "of why; when it passes, padding inside a compiled collective is safe again."
+    ),
+)
+def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
+    """Padding a collective inside a compiled graph, alongside unpadded controls."""
+    run_tp_probe("compiled_all_reduce_padded", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "deeptools' L3 scheduler asserts 'Expect valid lower and upper bound "
+        "parameters' building the collective's sum kernel for a rank-3 "
+        "[1, 528, 1024] fp16 all_reduce; [1, 3120, 1024] builds. When this passes, "
+        "drop the flatten from SpyreCommunicator.all_reduce."
+    ),
+)
+def test_all_reduce_vision_rank3_works(run_tp_probe) -> None:
+    run_tp_probe("all_reduce_vision_rank3", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "spyre-comms cannot build a work schedule for an eager 5120-element fp16 "
+        "collective, so dxp_standalone exits 1. Compiled, the same shape lowers to "
+        "spyre::all_reduce_async and works, so this only bites --enforce-eager at "
+        "TP>1 with hidden 5120."
+    ),
+)
+def test_all_reduce_hidden5120_decode_works(run_tp_probe) -> None:
+    run_tp_probe("all_reduce_hidden5120_decode", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
 @pytest.mark.xfail(
     strict=True,
     reason=(

@@ -103,7 +103,10 @@ else ifeq ($(TEST_TYPE),integration)
 # model, far too slow for the integration tier.
 MARK_EXPR := -m "not (distributed or upstream or attention or probe or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
-MARK_EXPR := -m "not upstream"
+# Mirrors the CI jobs the `unit` tier schedules (_test_matrix.yaml test_types):
+# smoke + compile + attention + encoder-attention + distributed. model_quality is
+# regression/trunk only there, so it stays out here too.
+MARK_EXPR := -m "not (upstream or model_quality)"
 else
 # The validation above already rejected any type outside VALID_TEST_TYPES, so
 # a value that reaches here IS valid but has no marker mapping above -- i.e. a

@@ -265,7 +265,7 @@ markers = [
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
     "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
-    "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and test_encoder_models.py::test_encoder_embed_models_compiled); loads 8B-31B models, runs in its own CI job",
+    "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and test_encoder_models.py::test_encoder_embed_models_compiled); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
 ]

@@ -163,7 +163,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
     )
 
     for step, (hf_id, hf_logprob, token_id, logprob) in enumerate(
-        zip(hf_result["token_ids"], hf_result["logprobs"], token_ids, logprobs)
+        zip(hf_result["token_ids"], hf_result["logprobs"], token_ids, logprobs, strict=True)
     ):
         hf_prob, prob = math.exp(hf_logprob), math.exp(logprob)
         tol = _prob_tol(hf_prob)

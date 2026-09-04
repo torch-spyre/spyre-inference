@@ -17,9 +17,14 @@ on:
   # <<< END TEMPORARY
 
 concurrency:
-  # Spyre is single-accelerator: never let a PR's review race itself.
+  # Spyre is single-accelerator: the group key serializes a PR's reviews so
+  # two never hold the device at once. cancel-in-progress stays FALSE on
+  # purpose: a mid-compile run that gets SIGKILLed can leave a half-written
+  # torch-spyre compile cache under /storage-1 (CLAUDE.md: interrupted Spyre
+  # runs "corrupt device state, or corrupt the compile cache"). A newer trigger
+  # queues behind the in-flight review instead of killing it.
   group: claude-review-${{ github.event.issue.number || github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -35,9 +40,11 @@ permissions:
 jobs:
   review:
     # issue_comment path: a comment on a PR (not a plain issue), the trigger
-    # command, and a commenter with write access (author_association is the
-    # proxy -- OWNER/MEMBER for org maintainers, COLLABORATOR for outside
-    # collaborators with write; a fork author is CONTRIBUTOR/NONE, rejected).
+    # command, and a commenter that clears a cheap author_association pre-filter.
+    # author_association is NOT proof of write access -- COLLABORATOR also covers
+    # read/triage collaborators -- so it only avoids spinning the runner for
+    # obvious non-members here; the authoritative write-access check is the
+    # "Verify commenter has write access" step below, which asks the API.
     #
     # >>> TEMPORARY: the first clause shortcuts the guard for a same-repo branch
     # PR so you can iterate. Remove it (and the pull_request trigger) before merge.
@@ -63,9 +70,36 @@ jobs:
       HF_HUB_OFFLINE: '1'
 
     steps:
-      # Default ref = trusted default branch. We intentionally do NOT check out
-      # the PR head -- the diff is fetched as text by the review skill.
-      - name: Checkout (default branch, trusted)
+      # Authoritative access gate (see the if: comment). curl, not gh -- gh is
+      # installed further down. Rejects anything below write. Skipped on the
+      # TEMPORARY pull_request path, which has no commenter and is already
+      # restricted to same-repo branches.
+      - name: Verify commenter has write access
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          perm="$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/collaborators/${ACTOR}/permission" \
+            | grep -oP '"permission":\s*"\K[^"]+')"
+          echo "Commenter ${ACTOR} has permission: ${perm:-<none>}"
+          case "${perm}" in
+            admin|write) echo "Authorized." ;;
+            *) echo "::error::${ACTOR} lacks write access (${perm:-none}); refusing review." ; exit 1 ;;
+          esac
+
+      # issue_comment (the real trigger): checkout with no ref = the trusted
+      # default branch. The agent pulls the PR itself (gh pr checkout) when it
+      # must run the changed code on hardware.
+      # NB: under the TEMPORARY pull_request trigger above, checkout with no ref
+      # takes the PR MERGE REF instead, so during branch-PR testing this job
+      # runs PR-head code (spyre-rpm-install, uv sync, the prompt file) in the
+      # same job that holds the secrets. That exposure goes away with the
+      # TEMPORARY block before merge.
+      - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0

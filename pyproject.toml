@@ -263,7 +263,8 @@ markers = [
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
-    "compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job",
+    "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
+    "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
     "rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
 ]

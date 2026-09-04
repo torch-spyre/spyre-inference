@@ -13,8 +13,8 @@ In addition to the generic table in `SKILL.md`:
 
 | Limitation | Workaround |
 |---|---|
-| KV alignment to bucketed length | `KV_LENGTH_ALIGNMENT=256` so the same compiled kernel is reused as KV grows |
-| Query length must be bucketed | `QUERY_CHUNK_SIZE=32`; queries are chunked into multiples of this |
+| KV alignment to bucketed length | `SpyreAttnBucketer` kv buckets: powers of two from `block_size` to `max_model_len`, consumed as a padded block count, so the same compiled kernel is reused as KV grows |
+| Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; queries are padded up to a bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
 | MHA head config | Untested — the attention tests only exercise GQA (`_run_spyre_attn_test` hardcodes 32 q / 8 kv heads, head_size 128). MHA has not been verified. |
 | `num_seqs=1` only | The forward path assumes a single sequence at a time |
@@ -45,7 +45,7 @@ When the failing surface is attention, in addition to the generic starter set, a
 - **Attention mask off-by-one / wrong padded shape / wrong causal boundary.** `_build_attention_mask` pads to `padded_query_len` and `aligned_max_seq_len`. Off-by-one in causal/padding masking produces near-100 % mismatches that look like "random output." Print the mask for a small case and verify masked positions are `-65504` (fp16 -inf proxy), unmasked are `0`, and the causal boundary matches `context_lens + q_pos`.
 - **Scatter selectors wrong** (row/col one-hot mismatched with `slot_mapping`). A diff > 0 at the scatter step means the one-hot selectors are wrong.
 - **Gather selector picks physical blocks in wrong order** → compact KV order mismatch with mask. `_gather_from_device_cache` does `bmm(sel_mask, cache)` then reshapes to `[num_kv_heads, aligned_max_seq_len, head_size]`. If the physical block order in `sel_mask` is wrong, the gathered tokens are in the wrong order and the mask no longer matches — silent disaster.
-- **A shape that escapes the `KV_LENGTH_ALIGNMENT=256` / `QUERY_CHUNK_SIZE=32` buckets** dispatches to an untested kernel path (correctness, not just recompilation cost).
+- **A shape that escapes the `SpyreAttnBucketer` kv/query buckets** dispatches to an untested kernel path (correctness, not just recompilation cost).
 
 ## Pipeline bisection for `forward()`
 

@@ -552,7 +552,7 @@ static_shapes: |md
 }
     }
 
-    warmup: "Startup: warmup walks both ladders" {
+    warmup: "Startup: warmup walks both sets of buckets" {
       style.fill: "#EEF1F8"
       style.stroke: "#CFD2DD"
       style.font-color: "#212121"
@@ -716,7 +716,7 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
         results back out
 
         **Shape axes: T for the body, (S, L) for attention.  
-        Two ladders to warm.**
+        Two sets of buckets to warm.**
 
         Costs: the mask grows with L², plus index lists and a  
         barrier per gather.  

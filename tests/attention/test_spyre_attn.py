@@ -33,6 +33,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
 )
+from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
 
@@ -130,6 +131,9 @@ def _build_metadata(
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
     vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    # The builder asserts these agree, and derives its padding buckets from the
+    # cache_config one, so a test block_size has to be set in both places.
+    vllm_config.cache_config.block_size = block_size
 
     if sliding_window is not None:
         kv_cache_spec = FullAttentionSpec(
@@ -393,7 +397,17 @@ def _run_spyre_attn_test(
     )
     kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
 
+    # Widened to the recorder's num_blocks buckets, as a real engine's block
+    # table is, so build()'s padding isn't suppressed by an exactly-sized table.
+    # The extra entries point at garbage pages on purpose: padded blocks are
+    # fully masked and must not affect the result.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    from vllm.config import get_current_vllm_config
+
+    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
+    if padded_width is not None:
+        max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
     block_tables = torch.randint(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
@@ -550,6 +564,11 @@ def _run_spyre_attn_test(
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(64, 512), (32, 256)], id="batch_prefill(2seqs_swapped)"),
         pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+        # Unbucketed kv_lens: build() appends fully-masked padded blocks, which
+        # must leave the output bit-identical.
+        pytest.param([(1, 300)], id="kv_padded_decode(q=1,kv=300)"),
+        pytest.param([(32, 65)], id="kv_padded_prefill(q=32,kv=65)"),
+        pytest.param([(1, 100), (32, 300)], id="kv_padded_batch(2seqs)"),
     ],
 )
 def test_spyre_attn_core(
@@ -894,7 +913,7 @@ def test_spyre_attn_soft_cap(
         # context_len on a block boundary vs. mid-block hits different boundary tiles.
         pytest.param([(64, 256)], id="chunk_on_block_boundary(ctx=192)"),
         pytest.param([(64, 200)], id="chunk_mid_block(ctx=136)"),
-        # Chunk not a multiple of QUERY_CHUNK_SIZE (32).
+        # Chunk length that is not on a query bucket boundary.
         pytest.param([(48, 300)], id="unaligned_chunk(ctx=252)"),
         pytest.param([(64, 256), (1, 256)], id="batch_chunk+decode"),
     ],
@@ -1028,6 +1047,10 @@ def test_block_size_validation():
             cache_config=cache_config,
             compilation_config=compilation_config,
         )
+        # The platform's own check_and_update_config already rounds an invalid
+        # block_size up to a multiple of 64 during VllmConfig construction, so
+        # restore the invalid value here to exercise the builder's own check.
+        vllm_config.cache_config.block_size = block_size
         kv_cache_spec = AttentionSpec(
             block_size=block_size,
             num_kv_heads=2,
@@ -1831,8 +1854,14 @@ def _padded_mask_metadata(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    max_num_blocks: int | None = None,
 ):
-    """Build metadata on CPU for a list of (query_len, kv_len) sequences."""
+    """Build metadata on CPU for a list of (query_len, kv_len) sequences.
+
+    ``max_num_blocks`` is the block-table width build() pads onto; it defaults
+    to no headroom, so a test wanting padding to actually happen must pass a
+    wider table, as a real engine's is.
+    """
     query_lens = [q for q, _ in seq_lens]
     kv_lens = [kv for _, kv in seq_lens]
     num_seqs = len(seq_lens)
@@ -1841,7 +1870,8 @@ def _padded_mask_metadata(
         dim=0, dtype=torch.int32
     )
     kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
-    max_num_blocks = (max(kv_lens) + block_size - 1) // block_size
+    if max_num_blocks is None:
+        max_num_blocks = (max(kv_lens) + block_size - 1) // block_size
     block_table = torch.arange(num_seqs * max_num_blocks, dtype=torch.int32).reshape(
         num_seqs, max_num_blocks
     )
@@ -1901,12 +1931,19 @@ def test_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
         pytest.param([(7, 256)], id="prefill_q7"),
         pytest.param([(1, 320)], id="decode_q1"),
         pytest.param([(40, 512)], id="prefill_q40"),
+        # Unbucketed kv_lens, so build() appends fully-masked padded blocks
+        # (given a table with headroom -- see max_num_blocks above): 65 -> 2
+        # real blocks, already a bucket; 300 -> 5 real padded to 8; 513 -> 9
+        # real padded to 16.
+        pytest.param([(7, 65)], id="prefill_q7_padded_blocks"),
+        pytest.param([(1, 300)], id="decode_q1_padded_blocks"),
+        pytest.param([(40, 513)], id="prefill_q40_padded_blocks"),
     ],
 )
 def test_padded_mask_rows_are_not_fully_masked(default_vllm_config, seq_lens):
     """No mask row is fully masked: attn = tile_output / tile_sum would be NaN."""
     torch.set_default_device("cpu")
-    metadata = _padded_mask_metadata(seq_lens)
+    metadata = _padded_mask_metadata(seq_lens, max_num_blocks=_num_blocks_buckets()[-1])
     mask = _seq_mask(metadata, 0)
     mask_min = torch.finfo(torch.float16).min
 
@@ -2003,3 +2040,84 @@ def test_attn_fn_cache_key_is_shape_only(default_vllm_config):
 
     impl._get_attn_fn(4, 64, store_mode="index", needs_gather=True)
     assert len(impl._attn_fns) == 2
+
+
+def _num_blocks_buckets(block_size: int = 64) -> list[int]:
+    """The recorder's num_blocks buckets for the fixture's config."""
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.cache_config.block_size = block_size
+    return SpyreAttnBucketer(vllm_config).num_blocks_buckets
+
+
+@pytest.mark.parametrize(
+    ("kv_len", "expected"),
+    [
+        pytest.param(65, 2, id="kv65_to_2"),
+        pytest.param(300, 8, id="kv300_to_8"),
+        pytest.param(256, 4, id="kv256_exact_noop"),
+        pytest.param(1025, 32, id="kv1025_to_32"),
+    ],
+)
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+    torch.set_default_device("cpu")
+    buckets = _num_blocks_buckets()
+    assert expected in buckets
+
+    metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
+
+    assert metadata.padded_num_blocks == [expected]
+    assert len(metadata.attention_mask_tiles[0]) == expected
+    assert metadata.page_index_table_cpu.shape[1] == expected
+
+
+def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config):
+    """Padded blocks are exactly finfo.min; the real prefix is bit-identical
+    regardless of how much headroom the block table has beyond the bucket
+    build() actually pads to -- build() always pads to a bucket (no unpadded
+    fallback), so both tables here must have at least that much headroom."""
+    torch.set_default_device("cpu")
+    block_size = 64
+    kv_len, query_len = 300, 32
+    real_blocks = (kv_len + block_size - 1) // block_size
+    buckets = _num_blocks_buckets()
+
+    narrow = _padded_mask_metadata(
+        [(query_len, kv_len)], block_size=block_size, max_num_blocks=buckets[-1]
+    )
+    assert narrow.padded_num_blocks[0] > real_blocks
+
+    mask_min = torch.finfo(torch.float16).min
+    for b in range(real_blocks, narrow.padded_num_blocks[0]):
+        tile = narrow.attention_mask_tiles[0][b]
+        assert torch.equal(tile, torch.full_like(tile, mask_min)), f"block {b} is not finfo.min"
+
+    # The real prefix must be bit-identical regardless of extra table
+    # headroom past the bucket build() actually uses.
+    wide = _padded_mask_metadata(
+        [(query_len, kv_len)], block_size=block_size, max_num_blocks=buckets[-1] * 2
+    )
+    assert wide.padded_num_blocks == narrow.padded_num_blocks
+    for b in range(real_blocks):
+        assert torch.equal(narrow.attention_mask_tiles[0][b], wide.attention_mask_tiles[0][b]), (
+            f"real block {b} changed"
+        )
+
+
+def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
+    """Zero real blocks must not be padded: a fully-masked tile would divide by zero."""
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
+
+    assert metadata.padded_num_blocks[0] == 0
+    assert metadata.attention_mask_tiles[0] == []
+    assert metadata.padded_num_blocks[1] == 2
+
+
+def test_sliding_window_is_left_unpadded(default_vllm_config):
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata(
+        [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
+    )
+    assert metadata.padded_num_blocks is None

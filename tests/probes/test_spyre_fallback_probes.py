@@ -23,6 +23,9 @@ All tests run against the real Spyre device when available; otherwise they
 skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
+import warnings
+from contextlib import contextmanager
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -34,6 +37,22 @@ def spyre_device():
     if not spyre_available():
         pytest.skip("Spyre device not available")
     return torch.device("spyre")
+
+
+@contextmanager
+def _no_cpu_fallback():
+    """Turn a silent CPU fallback into an error.
+
+    A primitive that falls back to CPU returns correct values, so a plain
+    assert_close would let a still-unsupported op pass. Probes for ops whose
+    failure mode is a fallback (not a raise or wrong result) run under this so
+    they stay xfail until the op actually lowers on device.
+    """
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -758,3 +777,151 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
     expected = x.cpu().float() ** 3
     torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 10. Gemma4 MoE workarounds
+# ---------------------------------------------------------------------------
+#
+# Each probe guards one workaround in custom_ops/{gemma4_routing_patch,
+# gate_linear,fused_moe}.py: a primitive the MoE path needs that torch-spyre
+# cannot do yet. When one flips to XPASS, delete the matching workaround.
+# The routing patch runs eager per-op, so the routing probes are eager; the
+# expert compute is traced, so those compile.
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "topk on a single row [1, E] cannot be produced on device: the Inductor "
+        "topk layout pass fails ('AllSameNode.from_args: out_layouts is empty', "
+        "propagate_layouts._topk_layouts). A [2, E] input works. "
+        "gemma4_routing_patch expands a T==1 decode to two rows and slices back; "
+        "topk is the last blocker for that expand (single-row amax/sum reductions "
+        "already lower, emitting only a harmless RetileWarning), so drop the "
+        "expand when this passes."
+    ),
+)
+def test_spyre_moe_single_row_topk(spyre_device):
+    """Single-row top-k, the T==1 decode routing case."""
+    x = torch.randn(1, 128, dtype=torch.float16, device=spyre_device)
+    vals, _ = torch.topk(x, k=8, dim=-1)
+    expected = torch.topk(x.cpu(), k=8, dim=-1).values
+    torch.testing.assert_close(vals.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "aten.amin is unimplemented on Spyre and min falls back to CPU. The "
+        "routing k-th-largest threshold uses -(-x).amax as a substitute; replace "
+        "it with a direct amin (or kthvalue) in gemma4_routing_patch when this "
+        "passes."
+    ),
+)
+def test_spyre_moe_amin(spyre_device):
+    """amin over the expert axis (the k-th-largest threshold)."""
+    x = torch.randn(4, 8, dtype=torch.float16, device=spyre_device)
+    with _no_cpu_fallback():
+        out = x.amin(dim=-1, keepdim=True)
+    torch.testing.assert_close(out.cpu(), x.cpu().amin(dim=-1, keepdim=True), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Casting an on-device fp16 tensor to fp32 does not re-tile -- fp16 and "
+        "fp32 use different stick widths and spyre::ReStickifyOpHBM is unsupported "
+        "for IEEE_FP32 -- so a reduction over the fp32 result returns garbage. "
+        "SpyreGateLinear forces fp16 out_dtype and _spyre_compute_routing skips "
+        "the fp32 weight cast; drop both when this passes."
+    ),
+)
+def test_spyre_moe_fp16_to_fp32_restickify(spyre_device):
+    """fp16->fp32 cast followed by a reduction (the router's fp32 softmax path)."""
+    # x must come from an on-device op: a host-copied unaligned-width tensor is
+    # re-tiled and the comparison stops being meaningful (see scalar_pow_cube).
+    a = torch.randn(8, 256, dtype=torch.float16, device=spyre_device)
+    b = torch.randn(256, 128, dtype=torch.float16, device=spyre_device) / 16
+    logits = a @ b
+    probs = torch.softmax(logits.to(torch.float32), dim=-1)
+    expected = torch.softmax(a.cpu().float() @ b.cpu().float(), dim=-1)
+    torch.testing.assert_close(probs.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Rebuilding a dense [T, E] combine from a [T, K] top-k selection needs a "
+        "scatter (or one_hot) Spyre cannot lower. gemma4_routing_patch returns the "
+        "dense [T, E] combine and forward_oot evaluates all experts to avoid it; "
+        "when scatter works, routing can return the customary [T, K] and "
+        "forward_oot can gather only the active experts."
+    ),
+)
+def test_spyre_moe_scatter_dense_from_topk(spyre_device):
+    """Scatter a [T, K] selection back into a dense [T, E] row."""
+    num_tokens, topk, num_experts = 4, 8, 128
+    probs = torch.softmax(
+        torch.randn(num_tokens, num_experts, dtype=torch.float16, device=spyre_device), dim=-1
+    )
+    vals, ids = torch.topk(probs, k=topk, dim=-1)
+    dense = torch.zeros(num_tokens, num_experts, dtype=torch.float16, device=spyre_device)
+    with _no_cpu_fallback():
+        dense = dense.scatter(-1, ids, vals)
+    expected = torch.zeros(num_tokens, num_experts, dtype=torch.float16).scatter(
+        -1, ids.cpu(), vals.cpu()
+    )
+    torch.testing.assert_close(dense.cpu(), expected, atol=1e-2, rtol=1e-2)
+
+
+def test_spyre_moe_expanded_view_matmul(spyre_device):
+    """Batched matmul whose lhs is an expanded view (per-expert token broadcast).
+
+    This now lowers; SpyreUnquantizedFusedMoEMethod.forward_oot no longer
+    materializes the per-expert input with .contiguous() first."""
+    num_experts, num_tokens, hidden, inter = 8, 4, 64, 32
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+    w = torch.randn(num_experts, inter, hidden, dtype=torch.float16, device=spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(x, w):
+        xb = x.unsqueeze(0).expand(num_experts, num_tokens, hidden)  # view, no contiguous
+        return torch.matmul(xb, w.transpose(1, 2))
+
+    out = fn(x, w)
+    expected = torch.matmul(
+        x.cpu().unsqueeze(0).expand(num_experts, num_tokens, hidden), w.cpu().transpose(1, 2)
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "The upper half-slice of a stacked weight, w13[:, I:, :], is a "
+        "stick-unaligned partial-stick start that does not lower. "
+        "process_weights_after_loading splits w13 into contiguous w1/w3 halves on "
+        "CPU instead (the split also dodges the ~484 MiB per-core span of the full "
+        "transpose at E=128). Drop the split when the offset half-slice lowers."
+    ),
+)
+def test_spyre_moe_offset_half_slice_matmul(spyre_device):
+    """Offset half-slice of a stacked [E, 2I, H] weight used in a matmul.
+
+    Small E isolates the partial-stick alignment failure from the per-core span
+    limit that also motivates the split.
+    """
+    num_experts, inter, hidden, num_tokens = 8, 64, 64, 4
+    w13 = torch.randn(num_experts, 2 * inter, hidden, dtype=torch.float16, device=spyre_device)
+    x = torch.randn(num_experts, num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(w13, x):
+        up = w13[:, inter:, :]  # offset (partial-stick) slice, no contiguous
+        return torch.matmul(x, up.transpose(1, 2))
+
+    with _no_cpu_fallback():
+        out = fn(w13, x)
+    expected = torch.matmul(x.cpu(), w13.cpu()[:, inter:, :].transpose(1, 2))
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-1, rtol=5e-2)

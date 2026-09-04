@@ -72,6 +72,8 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
     max_tokens = ref["max_tokens"]
     revision = ref["revision"]
 
+    _assert_prompts_fit_prefill_bucket(model, revision, prompts)
+
     engine = LLM(
         model=model,
         revision=revision,
@@ -97,6 +99,27 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
     assert [output.prompt for output in outputs] == prompts, "Model output contained wrong prompt!"
     for hf_result, output in zip(ref["results"], outputs):
         _compare_against_hf(model, hf_result, output)
+
+
+def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
+    """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
+
+    Nothing else does: `next_bucket` stick-aligns past the end of the ladder
+    (spyre_shape_bucketer.py), so an over-long prompt is not an error but an uncompiled
+    shape -- it recompiles inside generate(), and the raised
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS lets that grind for hours instead of failing. Run
+    before the engine is built so an edited prompt costs seconds, not a warmup.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    for prompt in prompts:
+        num_tokens = len(tokenizer(prompt).input_ids)
+        assert num_tokens <= MAX_NUM_BATCHED_TOKENS, (
+            f"{model}: prompt is {num_tokens} tokens, past the largest compiled bucket "
+            f"({MAX_NUM_BATCHED_TOKENS}) -- it would recompile at generate() time. Shorten "
+            f"it, or raise MAX_NUM_BATCHED_TOKENS here and in the generator: {prompt!r}"
+        )
 
 
 def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOutput) -> None:

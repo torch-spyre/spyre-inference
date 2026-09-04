@@ -46,8 +46,8 @@ MODEL_REVISIONS = {
     "meta-llama/Llama-3.1-8B-Instruct": "0e9e39f249a16976918f6564b8830bc894c89659",
 }
 
-# Must stay under MAX_NUM_BATCHED_TOKENS (test_model_quality.py) so each prefill lands
-# in a single compiled bucket.
+# Must stay within MAX_NUM_BATCHED_TOKENS (test_model_quality.py) so each prefill lands
+# in a single compiled bucket; that test asserts it before building its engine.
 _TEMPLATE = (
     "Below is an instruction that describes a task. Write a response that "
     "appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"

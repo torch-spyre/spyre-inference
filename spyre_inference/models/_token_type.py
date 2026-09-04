@@ -15,7 +15,7 @@
 """Out-of-band ``token_type_ids`` transport for BERT-family encoders.
 
 Shared machinery rather than one architecture's adaptation, hence the private
-name: the modules beside it map one-to-one onto ``SPYRE_MODELS`` entries.
+name: the modules beside it mirror the vLLM modules whose architectures they adapt.
 
 vLLM packs segment ids into the high bits of ``input_ids`` (``TOKEN_TYPE_SHIFT``
 in ``vllm.model_executor.models.bert``) so torch.compile sees one persistent

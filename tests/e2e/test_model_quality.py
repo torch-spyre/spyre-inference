@@ -41,6 +41,12 @@ DECODER_MODELS = [
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are
 # compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
+# ABS_TOL alone is not a uniform bound: it holds p=0.999 to 8% but lets p=0.08 land
+# anywhere in [0, 0.16], a 2x relative error, so the gate is loosest exactly where the
+# reference is least certain. Below the ABS_TOL/REL_TOL crossover the bound goes
+# relative, holding a low-confidence token to the same *fraction* instead of the same
+# margin. At the defaults the crossover is p=0.16, so nothing above it changes.
+REL_TOL = float(os.environ.get("SPYRE_TEST_REL_TOL", "0.5"))
 
 # Enough of the distribution that HF's greedy token is present even when Spyre picks a
 # different one -- `_compare_against_hf` needs p(HF token) under *Spyre* to tell a
@@ -97,8 +103,20 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
     )
 
     assert [output.prompt for output in outputs] == prompts, "Model output contained wrong prompt!"
-    for hf_result, output in zip(ref["results"], outputs):
+    matched = [
         _compare_against_hf(model, hf_result, output)
+        for hf_result, output in zip(ref["results"], outputs)
+    ]
+    # A prompt that diverges early verifies only the steps before the split, so a green
+    # case is not automatically a well-covered one. Printed (PYTEST_ARGS carries -s) so
+    # the coverage a run actually achieved is visible without having to fail first.
+    per_prompt = ", ".join(f"{n}/{max_tokens}" for n in matched)
+    print(
+        f"\n{model}: matched {sum(matched)}/{len(prompts) * max_tokens} reference steps "
+        f"({per_prompt} per prompt). Prompts that stop after a step or two diverged on a "
+        f"near-tie and gate little -- see MODEL_PROMPTS in "
+        f"tests/data/generate_decoder_output_refs.py."
+    )
 
 
 def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
@@ -122,7 +140,16 @@ def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[
         )
 
 
-def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOutput) -> None:
+def _prob_tol(reference_prob: float) -> float:
+    """Tolerance for one probability comparison, tightening as the reference gets small.
+
+    ``min`` and not ``max``: this only ever tightens ABS_TOL, never loosens it, so the
+    bound is the stricter of "within ABS_TOL" and "within REL_TOL of the reference".
+    """
+    return min(ABS_TOL, REL_TOL * reference_prob)
+
+
+def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOutput) -> int:
     completion = output.outputs[0]
     token_ids = list(completion.token_ids)
     logprobs = [completion.logprobs[i][t].logprob for i, t in enumerate(token_ids)]
@@ -139,6 +166,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         zip(hf_result["token_ids"], hf_result["logprobs"], token_ids, logprobs)
     ):
         hf_prob, prob = math.exp(hf_logprob), math.exp(logprob)
+        tol = _prob_tol(hf_prob)
         detail = (
             f"step {step}: token {token_id} ({completion.logprobs[step][token_id].decoded_token!r},"
             f" p={prob:.4f}) vs HF {hf_id} ({hf_result['tokens'][step]!r}, p={hf_prob:.4f})"
@@ -157,28 +185,30 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"{NUM_LOGPROBS}, so the distributions disagree outright, {detail}"
             )
             spyre_hf_prob = math.exp(spyre_hf.logprob)
-            assert math.isclose(spyre_hf_prob, hf_prob, abs_tol=ABS_TOL), (
-                f"{model}: wrong token and p(HF token) differs by more than {ABS_TOL} "
+            assert abs(spyre_hf_prob - hf_prob) <= tol, (
+                f"{model}: wrong token and p(HF token) differs by more than {tol:.4f} "
                 f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
             )
             # A tie also means Spyre itself ranks the two level. Without this, a flat HF
             # distribution (its own argmax at p=0.1) would excuse Spyre being confidently
             # elsewhere at p=0.85, since p(HF token) still matches at 0.1 in both.
-            # Bound is 2*ABS_TOL, not ABS_TOL: HF picked its token, so it led there
-            # (p_hf(spyre token) <= hf_prob), and each of the two may drift by ABS_TOL in
+            # Bound is doubled: HF picked its token, so it led there
+            # (p_hf(spyre token) <= hf_prob), and each of the two may drift by `tol` in
             # the opposite direction, which is what flipped the argmax in the first place.
-            tie_tol = 2 * ABS_TOL
-            assert math.isclose(prob, spyre_hf_prob, abs_tol=tie_tol), (
+            tie_tol = 2 * tol
+            assert abs(prob - spyre_hf_prob) <= tie_tol, (
                 f"{model}: wrong token, and Spyre puts it {prob - spyre_hf_prob:.4f} > "
-                f"{tie_tol} above HF's token (p={spyre_hf_prob:.4f}), so this is not a "
-                f"near-tie, {detail}"
+                f"{tie_tol:.4f} above HF's token (p={spyre_hf_prob:.4f}), so this is not "
+                f"a near-tie, {detail}"
             )
             print(
                 f"    diverged on a near-tie at {detail}; p(HF token) on Spyre "
                 f"{spyre_hf_prob:.4f}; not comparing further"
             )
-            return
+            return step
 
-        assert math.isclose(hf_prob, prob, abs_tol=ABS_TOL), (
-            f"{model}: probability differs by more than {ABS_TOL}, {detail}"
+        assert abs(hf_prob - prob) <= tol, (
+            f"{model}: probability differs by more than {tol:.4f}, {detail}"
         )
+
+    return len(token_ids)

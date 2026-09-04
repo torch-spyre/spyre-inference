@@ -105,7 +105,15 @@ python tests/data/generate_encoder_embed_refs.py
 Regenerate only when the *expected* output changes (new model or prompt), never to make a
 failing test pass — that is the regression the gate exists to catch. Prompts are per
 model: `MODEL_PROMPTS` in the generator says which models are restricted and why.
-`SPYRE_TEST_ABS_TOL` (default `0.08`) sets the decoder probability tolerance.
+`SPYRE_TEST_ABS_TOL` (default `0.08`) and `SPYRE_TEST_REL_TOL` (default `0.5`) set the
+decoder probability tolerance: the stricter of the two applies, so a low-confidence
+reference token is held to a fraction rather than to the same absolute margin.
+
+A greedy path that diverges from HF on a near-tie cannot be compared past the split, so
+each decoder case prints how many reference steps it actually matched
+(`matched 32/48 reference steps (16/16, 0/16, 16/16 per prompt)`). Read that line rather
+than the pass/fail alone: a prompt that stops after a step or two gates very little, and
+the fix is a prompt whose greedy path is confident, not a looser tolerance.
 
 #### Upstream Test Integration
 

@@ -406,25 +406,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
-    @staticmethod
-    def _install_pooling_model_patches(model_config) -> None:
-        """Install model-specific pooling adapters (BERT/RoBERTa token_type, …)."""
-        if model_config.runner_type != "pooling":
-            return
-        from spyre_inference.models import install_pooling_model_patches
-
-        install_pooling_model_patches()
-
-    @staticmethod
-    def _install_decoder_model_patches() -> None:
-        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
-
-        A no-op unless the matching architecture is built (import-guarded + idempotent).
-        """
-        from spyre_inference.models import install_decoder_model_patches
-
-        install_decoder_model_patches()
-
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -433,9 +414,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
-
-        self._install_pooling_model_patches(self.model_config)
-        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
@@ -475,7 +453,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
+        # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
+        # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
@@ -892,12 +871,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        """Pool on the activation device; D2H only the pooled vectors.
+        """Pool on the activation device; copy only the pooled vectors back.
 
-        MEAN / FP32 heads keep the pooler on CPU — delegate to
-        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
-        hook: pooled D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU).
-        Drop this once that op is safe (fallback probes / #3507–#3508).
+        FP32 linear heads keep the pooler on CPU and use
+        ``GPUModelRunner._pool``. Do not crop here: Spyre dim-0 slices are
+        unsafe, and each method gathers itself (CLS/LAST rows, MEAN
+        per-request rows, token AllPool ranges).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
@@ -922,8 +901,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
         # would need index_select (Spyre dim-0 slice views are unsafe) and
         # would make its shape vary with real content on every request.
-        # Skip it: CLS/LAST read rows via cursor_row_indices_cpu, which never
-        # depends on hidden_states' own length.
+        # Skip it: each method gathers itself from host cursor counts.
         hidden_states = convert(hidden_states, self._spyre_device)
 
         # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for

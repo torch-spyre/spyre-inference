@@ -376,6 +376,7 @@ def _create_compilable_bucketed_decode_attn(
     num_queries_per_kv: int,
     block_size: int,
     head_size: int,
+    logits_soft_cap: float = 0.0,
     needs_gather: bool = True,
     store_out: bool = False,
 ):
@@ -384,6 +385,12 @@ def _create_compilable_bucketed_decode_attn(
     One gather per tensor, not one per block: two multi-element `index_select`s on
     the same tensor in one graph exhaust every candidate output layout in
     torch-spyre's `_multi_arg_pointwise_layouts` and fail to compile.
+
+    `logits_soft_cap` and `needs_gather` are closure constants resolved at trace
+    time, so each distinct value produces a different compiled graph.
+    `logits_soft_cap` is fixed per ``SpyreAttentionImpl`` instance and therefore
+    not part of ``_get_bucketed_decode_kernel``'s cache key; `needs_gather` varies
+    per step and is.
     """
 
     lead = num_seqs * num_kv_heads
@@ -423,6 +430,10 @@ def _create_compilable_bucketed_decode_attn(
             mask_tile = mask_by_block[i].unsqueeze(1)
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+            if logits_soft_cap > 0.0:
+                # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
+                # capping after it would un-mask the padded lanes.
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
             scores = scores + mask_tile
             scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
@@ -1206,8 +1217,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         needs_gather: bool,
         store_out: bool,
     ):
-        # block_size is fixed by the KV cache spec, so it is passed to the factory
-        # but not keyed on. needs_gather and store_out are closure constants, so they are.
+        # block_size and logits_soft_cap are fixed per instance (block_size by the
+        # KV cache spec, logits_soft_cap by __init__), so they are passed to the
+        # factory but not keyed on. needs_gather and store_out are closure
+        # constants, so they are.
         key = (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out)
         if key not in self._decode_fns:
             self._decode_fns[key] = _maybe_compile(
@@ -1218,6 +1231,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.num_queries_per_kv,
                     block_size,
                     self.head_size,
+                    logits_soft_cap=self.logits_soft_cap,
                     needs_gather=needs_gather,
                     store_out=store_out,
                 ),
@@ -1233,13 +1247,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if not envs.SPYRE_BUCKETED_DECODE:
             return False
         # Layer 0's builder gates on max_query_len, sliding_window, and the
-        # bucket lattice; we add ALiBi / soft-cap which the bucketed kernel
-        # doesn't implement.
+        # bucket lattice; we add ALiBi, which the bucketed kernel doesn't
+        # implement.
         if attn_metadata.bucket_num_seqs is None:
             return False
-        if self.alibi_slopes is not None:
-            return False
-        return self.logits_soft_cap == 0.0
+        return self.alibi_slopes is None
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates

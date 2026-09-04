@@ -30,6 +30,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
+    _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
 )
 
@@ -1679,6 +1680,103 @@ def test_spyre_attn_bucketed_decode_correctness(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
     )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384), (1, 256), (1, 512), (1, 128), (1, 384)],
+            id="bucket_exact(N=8)",
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
+            id="bucket_pad(N=5_bucket=8)",
+        ),
+        pytest.param(
+            [
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+                (1, 256),
+                (1, 384),
+                (1, 512),
+                (1, 128),
+            ],
+            id="bucket_pad(N=9_bucket=16)",
+        ),
+    ],
+)
+@pytest.mark.parametrize("soft_cap", [pytest.param(50.0, id="soft_cap(50)")])
+def test_spyre_attn_bucketed_decode_soft_cap(
+    default_vllm_config,
+    enable_bucketed_decode,
+    seq_lens: list[tuple[int, int]],
+    soft_cap: float,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Bucketed decode with logits soft-cap, vs the per-seq reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        soft_cap=soft_cap,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
+    """The capped kernel must actually clamp, not silently ignore the cap."""
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
+    lead = num_seqs * num_kv_heads
+
+    def build(cap: float):
+        return _create_compilable_bucketed_decode_attn(
+            num_seqs=num_seqs,
+            num_blocks=num_blocks,
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=qpk,
+            block_size=block_size,
+            head_size=head_size,
+            logits_soft_cap=cap,
+            needs_gather=False,
+        )
+
+    n_pages = num_blocks * num_seqs
+    # Scaled up so the logits exceed the cap and tanh actually clamps.
+    query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
+    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
+    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    block_ids = torch.arange(n_pages, dtype=torch.int64)
+    mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
+    query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
+    # Trailing None is the `out` buffer; unused because store_out defaults to False.
+    args = (query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, 1.0, None)
+
+    uncapped = build(0.0)(*args)
+    capped = build(5.0)(*args)
+
+    assert not torch.allclose(uncapped, capped), (
+        "soft-cap did not change the output; the capped kernel may be ignoring it"
+    )
+    assert torch.isfinite(capped).all()
 
 
 @pytest.mark.parametrize(

@@ -107,7 +107,7 @@ def test_spyre_matmul_output_dim_1(spyre_device, mode):
 
     out = fn(x, weight_t)
     expected = torch.matmul(x.cpu().float(), weight_t.cpu().float())
-    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------

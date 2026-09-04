@@ -1235,3 +1235,32 @@ def pytest_runtest_teardown(item, nextitem):
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Hard-exit a Spyre-host run before interpreter finalization.
+
+    senlib's global config singleton is destroyed from a libc exit handler
+    after pytest has already reported, and that destructor intermittently
+    aborts ("corrupted double-linked list"), failing an otherwise-green job.
+    os._exit skips it, but also skips Python atexit, so first save the coverage
+    instance COVERAGE_PROCESS_START starts (it otherwise saves via atexit). Same
+    class of teardown abort as the os._exit in profile_spyre_inference.py, now at
+    the session level since device tests run in the pytest process itself.
+    """
+    outcome = yield
+    if not spyre_hardware_present():
+        return
+    try:
+        from coverage import Coverage
+
+        cov = Coverage.current()
+        if cov is not None:
+            cov.save()
+    except Exception:
+        pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    result = outcome.get_result()
+    os._exit(int(result) if result is not None else 0)

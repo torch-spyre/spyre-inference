@@ -507,6 +507,7 @@ def _relayout_experts(experts: Any, moe: Any) -> None:
     w13: torch.Tensor = experts.w13_weight.data
     num_experts, twice_inter, hidden = w13.shape
     inter = twice_inter // 2
+    dtype = w13.dtype
     assert experts.w2_weight.shape == (num_experts, hidden, inter), (
         f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} "
         f"w2={tuple(experts.w2_weight.shape)}"
@@ -525,13 +526,15 @@ def _relayout_experts(experts: Any, moe: Any) -> None:
     moe.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
     del experts.w2_weight, w2
 
-    # Elements per Spyre stick at the platform's forced compute dtype. The top-k
-    # indices and the routing weights are both widened onto a full stick before
-    # the compiler will gather or restickify with them.
-    moe.spyre_stick = get_elem_in_stick(torch.float16)
+    # Elements per Spyre stick, which depends on the dtype: the top-k indices and the
+    # routing weights are both widened onto a full stick before the compiler will
+    # gather or restickify with them. Taken from the expert stacks rather than a
+    # literal fp16 so the width and the identity below cannot drift apart from the
+    # routing weights, whose dtype the same model dtype decides.
+    moe.spyre_stick = get_elem_in_stick(dtype)
     # Identity for the routing-weight restickify. It has to originate on the
     # host: Spyre has no on-device eye/diag kernel.
-    moe.spyre_route_identity = torch.eye(moe.spyre_stick, dtype=torch.float16).to("spyre")
+    moe.spyre_route_identity = torch.eye(moe.spyre_stick, dtype=dtype).to("spyre")
     logger.info_once(
         "Spyre: relaid out the Gemma-4 MoE expert stacks (%d experts, hidden=%d, "
         "intermediate=%d) for on-device gather and matmul.",

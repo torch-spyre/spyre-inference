@@ -173,6 +173,7 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     `down [E,M,H]` carrying `per_expert_scale`, and both sources are freed.
     """
     import torch.nn as nn
+    from torch_spyre._C import get_elem_in_stick
 
     from spyre_inference.models.gemma4_moe import _relayout_experts
 
@@ -204,6 +205,11 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     assert moe.spyre_up.shape == (EXPERTS, HIDDEN, INTER)
     assert moe.spyre_down.shape == (EXPERTS, INTER, HIDDEN)
     assert moe.spyre_route_identity.shape == (moe.spyre_stick, moe.spyre_stick)
+    # Stick width and identity both come from the stacks' dtype, not a literal: the
+    # identity multiplies the routing weights, which arrive in that same model dtype,
+    # and the number of elements on a stick changes with it.
+    assert moe.spyre_stick == get_elem_in_stick(w13.dtype)
+    assert moe.spyre_route_identity.dtype == w13.dtype
 
     # Not bit-exact: the device round-trip rounds ~0.1% of fp16 elements by one ulp
     # (~3e-5 at these magnitudes). The tolerance is still far tighter than the 0.5x-1.5x

@@ -35,6 +35,7 @@ DECODER_MODELS = [
     "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
+    "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are

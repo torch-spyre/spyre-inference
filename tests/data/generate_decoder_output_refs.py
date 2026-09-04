@@ -36,12 +36,14 @@ DECODER_MODELS = [
     "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
+    "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
 MODEL_REVISIONS = {
     "ibm-granite/granite-3.3-8b-instruct": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
     "ibm-granite/granite-4.1-8b": "1504002f650e656a0a3789d99574df12e3e94ed0",
     "google/gemma-4-31B": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",
+    "meta-llama/Llama-3.1-8B-Instruct": "0e9e39f249a16976918f6564b8830bc894c89659",
 }
 
 # Must stay under MAX_NUM_BATCHED_TOKENS (test_model_quality.py) so each prefill lands

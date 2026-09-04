@@ -2,7 +2,6 @@
   "google/gemma-4-31B": {
     "dtype": "float32",
     "max_tokens": 16,
-    "revision": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",
     "results": [
       {
         "logprobs": [
@@ -178,12 +177,12 @@
           "\n"
         ]
       }
-    ]
+    ],
+    "revision": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89"
   },
   "ibm-granite/granite-3.3-8b-instruct": {
     "dtype": "float32",
     "max_tokens": 16,
-    "revision": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
     "results": [
       {
         "logprobs": [
@@ -359,12 +358,12 @@
           ","
         ]
       }
-    ]
+    ],
+    "revision": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b"
   },
   "ibm-granite/granite-4.1-8b": {
     "dtype": "float32",
     "max_tokens": 16,
-    "revision": "1504002f650e656a0a3789d99574df12e3e94ed0",
     "results": [
       {
         "logprobs": [
@@ -540,6 +539,188 @@
           " `"
         ]
       }
-    ]
+    ],
+    "revision": "1504002f650e656a0a3789d99574df12e3e94ed0"
+  },
+  "meta-llama/Llama-3.1-8B-Instruct": {
+    "dtype": "float32",
+    "max_tokens": 16,
+    "results": [
+      {
+        "logprobs": [
+          -0.48447,
+          -0.932041,
+          -0.928222,
+          -0.034002,
+          -0.69502,
+          -0.002108,
+          -0.00067,
+          -0.004681,
+          -0.565966,
+          -0.349952,
+          -0.521094,
+          -0.55201,
+          -5.5e-05,
+          -0.076344,
+          -1.010146,
+          -0.003694
+        ],
+        "prompt": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nProvide a list of instructions for preparing chicken soup.\n\n### Response:",
+        "text": " \n\nHere's a step-by-step guide to preparing delicious chicken soup:\n\n1.",
+        "token_ids": [
+          4815,
+          8586,
+          596,
+          264,
+          3094,
+          14656,
+          30308,
+          8641,
+          311,
+          20646,
+          18406,
+          16553,
+          19724,
+          1473,
+          16,
+          13
+        ],
+        "tokens": [
+          " \n\n",
+          "Here",
+          "'s",
+          " a",
+          " step",
+          "-by",
+          "-step",
+          " guide",
+          " to",
+          " preparing",
+          " delicious",
+          " chicken",
+          " soup",
+          ":\n\n",
+          "1",
+          "."
+        ]
+      },
+      {
+        "logprobs": [
+          -0.489573,
+          -0.563746,
+          -1.127867,
+          -0.279811,
+          -0.700401,
+          -0.172913,
+          -0.405786,
+          -0.011894,
+          -0.274383,
+          -0.763821,
+          -1.057111,
+          -0.333751,
+          -1.217825,
+          -0.639492,
+          -0.759504,
+          -0.141694
+        ],
+        "prompt": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nWhat are the main businesses of IBM?\n\n### Response:",
+        "text": " \nIBM is a multinational technology and consulting company that operates in various sectors, including",
+        "token_ids": [
+          720,
+          68838,
+          374,
+          264,
+          69026,
+          5557,
+          323,
+          31831,
+          2883,
+          430,
+          27149,
+          304,
+          5370,
+          26593,
+          11,
+          2737
+        ],
+        "tokens": [
+          " \n",
+          "IBM",
+          " is",
+          " a",
+          " multinational",
+          " technology",
+          " and",
+          " consulting",
+          " company",
+          " that",
+          " operates",
+          " in",
+          " various",
+          " sectors",
+          ",",
+          " including"
+        ]
+      },
+      {
+        "logprobs": [
+          -0.337628,
+          -1.170689,
+          -0.002479,
+          -0.026265,
+          -0.631445,
+          -0.105513,
+          -0.064008,
+          -0.027309,
+          -0.001081,
+          -0.000404,
+          -0.003033,
+          -0.078346,
+          -0.043913,
+          -0.082205,
+          -0.045746,
+          -0.765835
+        ],
+        "prompt": "Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\nConvert char to string in Java.\n\n### Response:",
+        "text": " \n\nTo convert a char to a string in Java, you can use the `",
+        "token_ids": [
+          4815,
+          1271,
+          5625,
+          264,
+          1181,
+          311,
+          264,
+          925,
+          304,
+          8102,
+          11,
+          499,
+          649,
+          1005,
+          279,
+          1595
+        ],
+        "tokens": [
+          " \n\n",
+          "To",
+          " convert",
+          " a",
+          " char",
+          " to",
+          " a",
+          " string",
+          " in",
+          " Java",
+          ",",
+          " you",
+          " can",
+          " use",
+          " the",
+          " `"
+        ]
+      }
+    ],
+    "revision": "0e9e39f249a16976918f6564b8830bc894c89659"
   }
 }

@@ -112,12 +112,17 @@ def _run_gated(config, config_file):
         sys.exit(0)
     print(f"📋 Found {len(models)} model(s) to cache:", models)
     failed_models = []
-    for repo_id in models:
+    for entry in models:
+        if isinstance(entry, str):
+            repo_id, revision = entry, None
+        else:
+            repo_id, revision = entry["repo"], entry["revision"]
         print(f"\n🚀 Processing: {repo_id}...")
         try:
             # snapshot_download automatically reads and uses the HF_HOME env var
             snapshot_download(
                 repo_id=repo_id,
+                revision=revision,
                 token=token,
                 force_download=force,
                 ignore_patterns=["*.pt", "*.bin"],

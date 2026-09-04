@@ -7,10 +7,28 @@ Be sure to validate that all new behavior is covered by tests. Additionally, ens
 any added tests are actually run through CI. This includes making sure that tests are
 scheduled on jobs that have the correct number of spyre cards to execute them.
 
+Model cache misses are not PR bugs: This runs with HF_HUB_OFFLINE=1 and models should all be in the
+cache. You can flag when models are missing and validation cannot be done but these are temprary
+caching errors, not PR bugs.
+
 If this PR already has open comments, validate that the appropriate changes have been
 made to address them. Reply to these comments either asking for more changes or
 confirming that the comment can be resolved.
 
-Write all prose replies in ASD-STE100 Simplified Technical English: active voice,
-short sentences, one instruction per sentence, approved words only, no synonyms, no
-slang or idioms.
+When authoring all comments, don't write:
+
+- Metadiscourse. Perform the communication, don't narrate it. No speech-act prefaces ("I want to be straight about," "let me be clear," "I'll say the harder thing"), no speech-act `because` justifying why you're saying something, no defining a point by the lesser response it deserves ("more than a 'noted'"). Test: if deleting everything before the comma loses no information, delete it
+- Significance inflation — "serves as a testament to," "marks a pivotal moment," "reflects a broader," "evolving landscape"
+- Trailing -ing analysis — "…, highlighting the pattern across the week"
+- Promotional adjectives — vibrant, rich, breathtaking, renowned, seamless, powerful
+- Vague attribution — "experts believe," "research shows." Name the source or drop the claim
+- Negative parallelism — "not just X, it's Y"
+- Rule of three. Use two or four
+- Copula avoidance — "serves as" → "is"; "boasts" → "has"
+- Em dashes before a reveal, decorative bold, emoji, bolded-label bullet lists
+- Assistant residue and stacked hedges — "hope this helps," "great question," "could potentially arguably"
+- Generic upbeat closers. End on a fact or the next action
+
+Do: vary sentence length, replace vague claims with specifics, and state your actual read rather than surveying both sides. Trust me to get the point without the explanation after it.
+
+If a line sounds quotable, rewrite it.

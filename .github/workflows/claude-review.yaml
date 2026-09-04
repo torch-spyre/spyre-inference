@@ -74,7 +74,7 @@ jobs:
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -137,12 +137,14 @@ jobs:
           # text a maintainer types after /claude-review is ignored.
           prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/" .github/claude-review-prompt.txt)"
 
-          # No --strict-mcp-config: it would restrict MCP to only the config
-          # above and disable the CLI-provided github_inline_comment server that
-          # /code-review --comment uses to post inline comments.
+          # This CLI build does NOT provide a github_inline_comment MCP server
+          # /code-review --comment posts through the gh CLI fallback.
+          # --strict-mcp-config blocks any stray .mcp.json from loading in the untrusted-diff 
+          # context.
           claude -p "$prompt" \
             --model claude-opus-4-8 \
-            --max-turns 40 \
+            --max-turns 60 \
             --mcp-config "$mcp_config" \
-            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*),Bash(uv run:*),Bash(git diff:*),Bash(git log:*),mcp__spyre-knowledgebase,mcp__github_inline_comment__create_inline_comment" \
+            --strict-mcp-config \
+            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checkout:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*),Bash(uv run:*),Bash(git diff:*),Bash(git log:*),mcp__spyre-knowledgebase" \
             --output-format text

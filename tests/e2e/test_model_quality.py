@@ -42,6 +42,11 @@ DECODER_MODELS = [
 # compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
 
+# Enough of the distribution that HF's greedy token is present even when Spyre picks a
+# different one -- `_compare_against_hf` needs p(HF token) under *Spyre* to tell a
+# near-tie from two distributions that disagree. 20 is vLLM's default `max_logprobs`.
+NUM_LOGPROBS = 20
+
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
 # Caps the compiled buckets (platform.py) and so warmup; every prompt fits one bucket.
@@ -83,7 +88,7 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
-            logprobs=0,  # logprob of the sampled token only
+            logprobs=NUM_LOGPROBS,  # sampled token plus enough to locate HF's
             ignore_eos=True,  # the reference is a fixed-length run with EOS disabled
         ),
         use_tqdm=False,
@@ -111,17 +116,46 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         zip(hf_result["token_ids"], hf_result["logprobs"], token_ids, logprobs)
     ):
         hf_prob, prob = math.exp(hf_logprob), math.exp(logprob)
-        probs_close = math.isclose(hf_prob, prob, abs_tol=ABS_TOL)
         detail = (
             f"step {step}: token {token_id} ({completion.logprobs[step][token_id].decoded_token!r},"
             f" p={prob:.4f}) vs HF {hf_id} ({hf_result['tokens'][step]!r}, p={hf_prob:.4f})"
         )
 
         if hf_id != token_id:
-            # Greedy paths only diverge legitimately on a near-tie, and past that point
-            # the prefixes differ, so no later token is comparable.
-            assert probs_close, f"{model}: wrong token, {detail}"
-            print(f"    diverged on a near-tie at {detail}; not comparing further")
+            # Greedy paths only diverge legitimately on a near-tie. Judge that on the HF
+            # token in *both* distributions, never on the two sampled tokens' own
+            # probabilities: those agree whenever the models are equally confident, so
+            # HF at p=0.9 on one token and Spyre at p=0.9 on another -- a total
+            # disagreement -- would read as a tie. Past this step the prefixes differ,
+            # so no later token is comparable either way.
+            spyre_hf = completion.logprobs[step].get(hf_id)
+            assert spyre_hf is not None, (
+                f"{model}: wrong token and HF's token is outside Spyre's top "
+                f"{NUM_LOGPROBS}, so the distributions disagree outright, {detail}"
+            )
+            spyre_hf_prob = math.exp(spyre_hf.logprob)
+            assert math.isclose(spyre_hf_prob, hf_prob, abs_tol=ABS_TOL), (
+                f"{model}: wrong token and p(HF token) differs by more than {ABS_TOL} "
+                f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
+            )
+            # A tie also means Spyre itself ranks the two level. Without this, a flat HF
+            # distribution (its own argmax at p=0.1) would excuse Spyre being confidently
+            # elsewhere at p=0.85, since p(HF token) still matches at 0.1 in both.
+            # Bound is 2*ABS_TOL, not ABS_TOL: HF picked its token, so it led there
+            # (p_hf(spyre token) <= hf_prob), and each of the two may drift by ABS_TOL in
+            # the opposite direction, which is what flipped the argmax in the first place.
+            tie_tol = 2 * ABS_TOL
+            assert math.isclose(prob, spyre_hf_prob, abs_tol=tie_tol), (
+                f"{model}: wrong token, and Spyre puts it {prob - spyre_hf_prob:.4f} > "
+                f"{tie_tol} above HF's token (p={spyre_hf_prob:.4f}), so this is not a "
+                f"near-tie, {detail}"
+            )
+            print(
+                f"    diverged on a near-tie at {detail}; p(HF token) on Spyre "
+                f"{spyre_hf_prob:.4f}; not comparing further"
+            )
             return
 
-        assert probs_close, f"{model}: probability differs by more than {ABS_TOL}, {detail}"
+        assert math.isclose(hf_prob, prob, abs_tol=ABS_TOL), (
+            f"{model}: probability differs by more than {ABS_TOL}, {detail}"
+        )

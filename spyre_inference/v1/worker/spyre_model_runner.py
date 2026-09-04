@@ -959,11 +959,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
         advertises. The attention kernel selects a page by indexing with a
         one-element device tensor, so the page read is a real indirect access.
+
+        With SPYRE_LX_KV_LAYOUT the same bytes are folded to
+        [num_blocks * num_kv_heads, block_size, head_size] so a page's gather can stay
+        in LX. get_kv_cache_shape keeps advertising the logical frame.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
         from spyre_inference.v1.attention.backends.spyre_attn import (
             SpyrePagedKVCache,
+            head_major_kv_layout,
             slot_major_kv_layout,
         )
 
@@ -990,24 +995,29 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
             # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
+            if envs.SPYRE_LX_KV_LAYOUT:
+                # Materialised in the folded frame, not viewed out of the slot-major
+                # one: a view would leave the indexed axis off device position 0.
+                shape: tuple[int, ...] = (
+                    num_blocks * spec.num_kv_heads,
+                    spec.block_size,
+                    spec.head_size,
+                )
+                layout = head_major_kv_layout(
+                    shape[0], spec.block_size, spec.head_size, torch.float16
+                )
+            else:
+                shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+                layout = slot_major_kv_layout(
+                    num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+                )
 
-            k_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            k_pages = torch.zeros(shape, dtype=torch.float16).to(
+                self._spyre_device, device_layout=layout
+            )  # ty: ignore[no-matching-overload]
+            v_pages = torch.zeros(shape, dtype=torch.float16).to(
+                self._spyre_device, device_layout=layout
+            )  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

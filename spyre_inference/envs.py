@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_BUCKETED_DECODE: bool = False
+    SPYRE_LX_KV_LAYOUT: bool = False
+    SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -54,6 +56,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BUCKETED_DECODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_DECODE", "0"))),
+    # When "1", store the KV cache folded on (page, kv_head) so a gathered page stays
+    # in LX instead of round-tripping through HBM, and run attention with the query
+    # groups unrolled. Off by default; requires compiled attention.
+    "SPYRE_LX_KV_LAYOUT": lambda: bool(int(os.getenv("SPYRE_LX_KV_LAYOUT", "0"))),
+    # Core cap for the attention compile only, leaving the rest of the model on all
+    # 32. "0" (default) lets the LX layout pick its own cap and leaves the legacy
+    # layout uncapped.
+    "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

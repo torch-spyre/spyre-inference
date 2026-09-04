@@ -31,6 +31,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -47,6 +48,10 @@ class SlotMapping:
         self._layers = layers
         self._device: torch.device | None = None
         self.slots: torch.Tensor | None = None
+        self._published = False
+        # Keyed by (num_kv_heads, block_size): a hybrid model's layers need not share
+        # either.
+        self._folded: dict[tuple[int, int], list[torch.Tensor]] = {}
 
     def _resolve_device(self) -> torch.device | None:
         if self._device is None:
@@ -63,18 +68,46 @@ class SlotMapping:
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
-        device = self._resolve_device()
-        if device is None:
-            return
-        self.slots = convert(slot_mapping.clamp(min=_NULL_SLOT), device=device)
+        self._publish_host(slot_mapping.clamp(min=_NULL_SLOT))
 
     def publish_null(self, num_tokens: int) -> None:
+        self._publish_host(torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64))
+
+    def _publish_host(self, host: torch.Tensor) -> None:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = convert(
-            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device=device
-        )
+        self._published = True
+        self._folded.clear()
+        if not envs.SPYRE_LX_KV_LAYOUT:
+            self.slots = convert(host, device=device)
+            return
+        # Built here rather than on demand in `slots_for`, which runs inside the model's
+        # compiled graph: tensor arithmetic there gets traced into it.
+        for num_kv_heads, block_size in self._layer_shapes():
+            pages = torch.div(host, block_size, rounding_mode="floor")
+            offsets = host - pages * block_size
+            self._folded[(num_kv_heads, block_size)] = [
+                convert((pages * num_kv_heads + h) * block_size + offsets, device=device)
+                for h in range(num_kv_heads)
+            ]
+
+    def _layer_shapes(self) -> set[tuple[int, int]]:
+        # shape[1] is block_size in both the slot-major and the folded frame.
+        return {(layer.num_kv_heads, layer.kv_cache[0].shape[1]) for layer in self._layers}
+
+    def slots_for(
+        self, num_kv_heads: int, block_size: int
+    ) -> torch.Tensor | list[torch.Tensor] | None:
+        """This step's store index in whichever frame the KV cache is in.
+
+        Runs inside the compiled graph, so it must stay a lookup and touch no tensor.
+        """
+        if not self._published:
+            return None
+        if not envs.SPYRE_LX_KV_LAYOUT:
+            return self.slots
+        return self._folded.get((num_kv_heads, block_size))
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()
@@ -113,11 +146,17 @@ def _spyre_attention_forward(
         value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
     dep = None
-    slots = cast(SlotMapping, self.spyre_slots).slots
+    kv_cache = self.kv_cache
+    # shape[1] is block_size in both the slot-major and the folded frame.
+    slots = (
+        cast(SlotMapping, self.spyre_slots).slots_for(self.num_kv_heads, kv_cache[0].shape[1])
+        if len(kv_cache) > 0
+        else None
+    )
     if slots is not None and key is not None and value is not None:
         # `dep` makes "scatter before read" a real data dependency, which is otherwise
         # invisible because the op reaches its cache through the forward context.
-        dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
+        dep = self.impl.do_kv_cache_update(self, key, value, kv_cache, slots)
 
     torch.ops.vllm.unified_attention_with_output(
         query,  # ty: ignore[invalid-argument-type]

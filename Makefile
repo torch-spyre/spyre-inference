@@ -98,7 +98,7 @@ else ifeq ($(TEST_TYPE),integration)
 # Single-invocation integration = the union of the CI smoke + compile jobs, so
 # `make tests TEST_TYPE=integration` locally keeps the compile coverage that CI
 # splits into its own job. (compile is not attention-marked, so it stays in.)
-MARK_EXPR := -m "not (distributed or upstream or attention)"
+MARK_EXPR := -m "not (distributed or upstream or attention or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
 MARK_EXPR := -m "not upstream"
 else
@@ -113,7 +113,7 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-attention test-attention-shard test-distributed \
+        test-smoke test-compile test-model-quality test-attention test-attention-shard test-distributed \
         test-upstream test-upstream-distributed test-upstream-model \
         tests-single-card tests-multi-card
 
@@ -165,11 +165,14 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
 	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
-test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile)' JUNIT_XML=$(JUNIT_XML)
+test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile, non-model-quality).
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile or model_quality)' JUNIT_XML=$(JUNIT_XML)
 
 test-compile: ## Run the torch.compile marker combo (its own job; slow).
 	$(MAKE) run-one MARK_OVERRIDE='compile and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+test-model-quality: ## Run the product-model output-quality gates (its own job; loads 8B-31B models).
+	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
 test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split), one process.
 	$(MAKE) run-one MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
@@ -211,11 +214,12 @@ test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
 
 # Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the non-distributed marker combos (smoke/compile/attention/encoder-attention/upstream/upstream-model). Needs 1 card.
+tests-single-card: ## Run the non-distributed marker combos (smoke/compile/model-quality/attention/encoder-attention/upstream/upstream-model). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-smoke" && $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke/junit-test-smoke.xml" || rc=1; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-compile" && $(MAKE) test-compile JUNIT_XML="$(RESULTS_DIR)/junit-test-compile/junit-test-compile.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-model-quality" && $(MAKE) test-model-quality JUNIT_XML="$(RESULTS_DIR)/junit-test-model-quality/junit-test-model-quality.xml" || rc=1; \
 	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
 	done; \

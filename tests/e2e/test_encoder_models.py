@@ -107,6 +107,18 @@ def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
 def test_encoder_embed_models(model: str) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
+    _assert_embeddings_match_refs(model, enforce_eager=True)
+
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", EMBEDDING_MODELS)
+def test_encoder_embed_models_compiled(model: str) -> None:
+    """Same models and references, compiled rather than eager."""
+    _assert_embeddings_match_refs(model, enforce_eager=False)
+
+
+def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
     ref = _REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
@@ -117,7 +129,7 @@ def test_encoder_embed_models(model: str) -> None:
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
     )
     outputs = llm.embed(prompts)
     assert len(outputs) == len(prompts)

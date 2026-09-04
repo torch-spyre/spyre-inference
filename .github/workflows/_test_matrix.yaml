@@ -201,6 +201,16 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-compile
+          - cfg: Spyre model quality tests
+            # Each case loads and compiles an 8B-31B model, too slow for the
+            # `integration` tier the multi-repo hook runs.
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock

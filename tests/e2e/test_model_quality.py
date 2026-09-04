@@ -42,9 +42,10 @@ DECODER_MODELS = [
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
 
 MAX_MODEL_LEN = 256
-MAX_NUM_SEQS = 2
+MAX_NUM_SEQS = 3
 # Caps the compiled buckets (platform.py) and so warmup; every prompt fits one bucket.
 MAX_NUM_BATCHED_TOKENS = 64
+COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "decoder_output_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
@@ -73,6 +74,7 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        compilation_config={"compile_sizes": COMPILE_SIZES},
     )
 
     outputs = engine.generate(

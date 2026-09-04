@@ -56,6 +56,12 @@ def main():
         _run_gated(config, config_file)
 
 
+def _parse_entry(entry):
+    if isinstance(entry, str):
+        return entry, None
+    return entry["repo"], entry.get("revision")
+
+
 def _run_public(config, config_file):
     """Cache public_models entries."""
     models = config.get("public_models", [])
@@ -65,10 +71,7 @@ def _run_public(config, config_file):
     print(f"📋 Found {len(models)} public model(s) to cache:", models)
     failed_models = []
     for entry in models:
-        if isinstance(entry, str):
-            repo_id, revision = entry, None
-        else:
-            repo_id, revision = entry["repo"], entry["revision"]
+        repo_id, revision = _parse_entry(entry)
         print(f"\n🚀 Processing: {repo_id}...")
         try:
             snapshot_download(
@@ -113,10 +116,7 @@ def _run_gated(config, config_file):
     print(f"📋 Found {len(models)} model(s) to cache:", models)
     failed_models = []
     for entry in models:
-        if isinstance(entry, str):
-            repo_id, revision = entry, None
-        else:
-            repo_id, revision = entry["repo"], entry["revision"]
+        repo_id, revision = _parse_entry(entry)
         print(f"\n🚀 Processing: {repo_id}...")
         try:
             # snapshot_download automatically reads and uses the HF_HOME env var

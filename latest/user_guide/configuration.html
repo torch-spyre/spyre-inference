@@ -1941,7 +1941,7 @@ custom ops plus the Spyre Transformers backend (used for <code>model_impl="trans
   workaround until flash-style attention lands; the body is not rewritten to
   <code>T = B × L</code>.</li>
 </ul>
-<p><code>compile_sizes</code> for pooling is the body <code>T</code> ladder (<code>64, 128, …</code> up to the
+<p><code>compile_sizes</code> for pooling is the body <code>T</code> buckets (<code>64, 128, …</code> up to the
 token cap). Attention <code>L</code> comes from <code>--max-model-len</code> (<code>64, 128, …</code>).
 Attention <code>B</code> is powers of two up to <code>--max-num-seqs</code> (same as decoder).</p>
 <p>A 3-seq × 30-token request with <code>--max-num-seqs 4</code> pads the body to <code>T=128</code>

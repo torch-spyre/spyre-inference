@@ -309,14 +309,8 @@ class _SpyreModelWrapper:
                 return convert(t, dtype=torch.int64, device=self._spyre_device)
             return t
 
-        args_converted = []
-        for arg in args:
-            args_converted.append(_convert_int(arg))
-
-        kwargs_converted = {}
-        for key in kwargs:
-            val = kwargs.get(key)
-            kwargs_converted[key] = _convert_int(val)
+        args_converted = tree_map(_convert_int, args)
+        kwargs_converted = tree_map(_convert_int, kwargs)
 
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)

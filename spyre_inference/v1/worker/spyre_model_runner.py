@@ -249,6 +249,17 @@ def _block_sharing_defeated_by() -> str | None:
     return None
 
 
+def _is_attention_like(module: nn.Module) -> bool:
+    """Match vLLM's ``Attention`` or HF-style attention modules.
+
+    TransformersForCausalLM wraps HF models whose attention layers are named
+    ``GraniteAttention``, ``LlamaAttention``, etc. — not vLLM's ``Attention``.
+    Falling back to a class-name check lets per-block compilation work for
+    those models instead of compiling the whole model as one giant graph.
+    """
+    return isinstance(module, Attention) or "Attention" in type(module).__name__
+
+
 def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     block_lists = []
     for module in model.modules():
@@ -259,11 +270,11 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
-        if any(isinstance(b, Attention) for b in blocks):
+        if any(_is_attention_like(b) for b in blocks):
             continue
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
-        if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
+        if any(_is_attention_like(m) for b in blocks for m in b.modules()):
             block_lists.append(module)
     return block_lists
 

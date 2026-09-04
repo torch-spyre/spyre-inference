@@ -438,6 +438,22 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
     with open(hardcoded_cuda_test_path, "w") as f:
         f.write(content)
 
+    # @multi_gpu_test(num_gpus=2) calls current_platform.device_count() at
+    # module scope.  When test_models uses apply_model(), cloudpickle
+    # re-imports test_backend.py in the EngineCore subprocess where
+    # torch_spyre isn't loaded, crashing on `torch.spyre.device_count()`.
+    # Replace with a plain skip marker so the module imports cleanly.
+    transformers_backend_path = upstream_tests_dir / "models" / "transformers" / "test_backend.py"
+    if transformers_backend_path.exists():
+        with open(transformers_backend_path) as f:
+            content = f.read()
+        content = content.replace(
+            "@multi_gpu_test(num_gpus=2)",
+            '@pytest.mark.skip(reason="multi_gpu_test crashes in cloudpickle re-import")',
+        )
+        with open(transformers_backend_path, "w") as f:
+            f.write(content)
+
 
 # ---------------------------------------------------------------------------
 # Upstream Opt-In

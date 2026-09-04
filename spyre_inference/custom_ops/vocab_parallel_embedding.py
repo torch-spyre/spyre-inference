@@ -63,21 +63,21 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
             self._spyre_keep_table = None
 
     def _build_reindex_and_keep_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build the reindex and keep lookup tables in one pass."""
+        """Build the reindex and keep lookup tables (vectorized over the vocab)."""
         vocab_size = self.num_embeddings
+        indices = torch.arange(vocab_size, dtype=torch.int64)
+        masked_input, input_mask = get_masked_input_and_mask(
+            indices,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
         reindex_table = torch.zeros(vocab_size, 2, dtype=torch.int64)
+        reindex_table[:, 0] = masked_input
         keep_table = torch.zeros(vocab_size, 2, dtype=torch.float16)
-        for i in range(vocab_size):
-            masked_input, input_mask = get_masked_input_and_mask(
-                torch.tensor([i], dtype=torch.int64),
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-            )
-            reindex_table[i, 0] = masked_input.item()
-            keep_table[i, 0] = 0.0 if input_mask.item() else 1.0
+        keep_table[:, 0] = ~input_mask
         return reindex_table, keep_table
 
     def _apply(self, fn, recurse=True):

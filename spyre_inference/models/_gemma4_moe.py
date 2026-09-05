@@ -531,21 +531,23 @@ def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:
     """
     from torch_spyre._C import get_elem_in_stick
 
+    # ``get_parameter`` rather than attribute access: create_weights registers both
+    # stacks dynamically, so only the lookup is typed.
     experts = layer.spyre_experts()
-    w13: torch.Tensor = experts.w13_weight.data
+    w13 = experts.get_parameter("w13_weight").data
+    w2_shape = tuple(experts.get_parameter("w2_weight").shape)
     num_experts, twice_inter, hidden = w13.shape
     inter = twice_inter // 2
     dtype = w13.dtype
-    assert experts.w2_weight.shape == (num_experts, hidden, inter), (
-        f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} "
-        f"w2={tuple(experts.w2_weight.shape)}"
+    assert w2_shape == (num_experts, hidden, inter), (
+        f"unexpected Gemma-4 expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
     )
 
     layer.spyre_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2))
     layer.spyre_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2))
     del experts.w13_weight, w13
 
-    w2: torch.Tensor = experts.w2_weight.data
+    w2 = experts.get_parameter("w2_weight").data
     # Fold the per-expert output scale into ``down`` instead of gathering it
     # alongside the expert weights every step. It multiplies the already
     # renormalized routing weight, so pushing it onto that expert's rows is

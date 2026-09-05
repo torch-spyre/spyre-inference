@@ -1095,13 +1095,22 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
                 # Block-major so the kernel's in-graph gather is contiguous: only a
                 # dim-0 slice of a contiguous base gets a correct device layout.
-                # Flat, not 2D: an inner dim narrower than the stick width (32)
-                # emits a Mod(d0, ...) stick expression the inductor rejects.
-                block_ids_padded_cpu = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
-                for s, n in enumerate(real_num_blocks):
-                    n_use = min(n, b_blocks)
-                    for b in range(n_use):
-                        block_ids_padded_cpu[b * b_seqs + s] = block_table[s, b]
+                # Flattened before use: an inner dim narrower than the stick width (32)
+                # emits a Mod(d0, ...) stick expression the inductor rejects. Built 2-D
+                # and transposed so the fill is one gather rather than a scalar store per
+                # (seq, block).
+                n_use = torch.tensor([min(n, b_blocks) for n in real_num_blocks], dtype=torch.int64)
+                cols = torch.arange(b_blocks)
+                in_range = cols.unsqueeze(0) < n_use.unsqueeze(1)
+                gather_cols = cols.clamp(max=block_table.shape[1] - 1)
+                pages = torch.gather(
+                    block_table[:num_seqs].to(torch.int32),
+                    1,
+                    gather_cols.unsqueeze(0).expand(num_seqs, -1),
+                )
+                block_ids_padded_cpu = torch.zeros(b_blocks, b_seqs, dtype=torch.int32)
+                block_ids_padded_cpu[:, :num_seqs] = (pages * in_range).t()
+                block_ids_padded_cpu = block_ids_padded_cpu.reshape(-1)
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
@@ -1112,9 +1121,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     dtype=torch.float16,
                 )
                 for s in range(num_seqs):
-                    n_use = min(real_num_blocks[s], b_blocks)
-                    for b in range(n_use):
-                        mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
+                    used = int(n_use[s])
+                    if used:
+                        mask_bs_bb[s, :used] = torch.stack(
+                            [attention_mask_tiles[s][b][0] for b in range(used)]
+                        )
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.

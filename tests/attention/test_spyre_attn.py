@@ -1847,6 +1847,43 @@ def test_spyre_attn_bucketed_decode_fallback(
     )
 
 
+def test_bucketed_block_ids_match_scalar_fill() -> None:
+    """The vectorised block-id fill matches an explicit per-element fill.
+
+    Covers ragged num_active (mixed context lengths), truncation when a sequence has
+    more blocks than the bucket, and rows past the batch.
+    """
+    for num_seqs, b_seqs, b_blocks, num_active in (
+        (8, 8, 4, [4] * 8),
+        (8, 8, 6, [1, 2, 3, 4, 5, 6, 6, 6]),
+        (8, 8, 4, [8] * 8),
+        (5, 8, 4, [4] * 5),
+        (8, 8, 4, [0, 4, 4, 4, 4, 4, 4, 4]),
+    ):
+        block_table = torch.randint(0, 10_000, (num_seqs, max(num_active) + 1), dtype=torch.int32)
+
+        expected = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
+        for s, n in enumerate(num_active):
+            for b in range(min(n, b_blocks)):
+                expected[b * b_seqs + s] = block_table[s, b]
+
+        n_use = torch.tensor([min(n, b_blocks) for n in num_active], dtype=torch.int64)
+        cols = torch.arange(b_blocks)
+        in_range = cols.unsqueeze(0) < n_use.unsqueeze(1)
+        gather_cols = cols.clamp(max=block_table.shape[1] - 1)
+        pages = torch.gather(
+            block_table[:num_seqs].to(torch.int32),
+            1,
+            gather_cols.unsqueeze(0).expand(num_seqs, -1),
+        )
+        got = torch.zeros(b_blocks, b_seqs, dtype=torch.int32)
+        got[:, :num_seqs] = (pages * in_range).t()
+
+        assert torch.equal(got.reshape(-1), expected), (
+            f"num_active={num_active} b_blocks={b_blocks}"
+        )
+
+
 def _padded_mask_metadata(
     seq_lens: list[tuple[int, int]],
     block_size: int = 64,

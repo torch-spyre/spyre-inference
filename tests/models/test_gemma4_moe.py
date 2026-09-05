@@ -15,7 +15,7 @@
 """Both Gemma-4 MoE expert-dispatch forms, on Spyre, against a dense reference.
 
 The two forms compute the same function by different means (see
-``spyre_inference.models.gemma4_moe``), so one reference covers both. Shapes are
+``spyre_inference.models._gemma4_moe``), so one reference covers both. Shapes are
 scaled down but keep every dim stick-aligned, which is what the layout tricks in
 those regions depend on.
 """
@@ -58,7 +58,7 @@ def moe_weights():
         "down": torch.randn(EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
     # The per-expert output scale is folded into `down` at load time (see
-    # SpyreFusedMoEMethod), so the device stacks carry it and the reference
+    # relayout_moe_experts), so the device stacks carry it and the reference
     # applies it separately.
     host["scale"] = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
     scaled_down = host["down"] * host["scale"].view(EXPERTS, 1, 1)
@@ -83,7 +83,7 @@ def test_gathered_matches_dense_reference(moe_weights):
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
 
-    from spyre_inference.models.gemma4_moe import _moe_gathered
+    from spyre_inference.models._gemma4_moe import _moe_gathered
 
     host, device = moe_weights
     x, probs = _inputs(1)
@@ -120,7 +120,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     from torch_spyre._inductor import config as spyre_config
     from torch_spyre._inductor.wsr.propagate_named_dims import reset as reset_named_dims
 
-    from spyre_inference.models.gemma4_moe import (
+    from spyre_inference.models._gemma4_moe import (
         _moe_persistent,
         _moe_persistent_routing,
         _name_persistent_dims,
@@ -159,7 +159,7 @@ def test_token_cores_divides_the_token_axis(tokens, expected):
     """The token work-division split must divide the axis and not exceed the cores."""
     from torch_spyre._inductor import config as spyre_config
 
-    from spyre_inference.models.gemma4_moe import _token_cores
+    from spyre_inference.models._gemma4_moe import _token_cores
 
     if spyre_config.sencores != 32:
         pytest.skip(f"expectations assume SENCORES=32, got {spyre_config.sencores}")
@@ -167,7 +167,7 @@ def test_token_cores_divides_the_token_axis(tokens, expected):
 
 
 def test_relayout_splits_transposes_and_folds_the_scale():
-    """The load-time weight hook: what `SpyreFusedMoEMethod` leaves for the regions.
+    """The load-time weight hook: what `relayout_moe_experts` leaves for the regions.
 
     `w13 [E,2M,H]` splits into `gate`/`up` `[E,H,M]`, `w2 [E,H,M]` becomes
     `down [E,M,H]` carrying `per_expert_scale`, and both sources are freed.
@@ -175,9 +175,9 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
 
-    from spyre_inference.models.gemma4_moe import _relayout_experts
+    from spyre_inference.models._gemma4_moe import _relayout_experts
 
-    class _Experts(nn.Module):
+    class _RoutedExperts(nn.Module):
         """Stands in for vLLM's RoutedExperts — only the two stacks matter."""
 
         def __init__(self, w13, w2):
@@ -185,38 +185,45 @@ def test_relayout_splits_transposes_and_folds_the_scale():
             self.w13_weight = nn.Parameter(w13, requires_grad=False)
             self.w2_weight = nn.Parameter(w2, requires_grad=False)
 
-    class _Moe(nn.Module):
-        def __init__(self, scale):
+    class _Layer(nn.Module):
+        """Stands in for the decoder layer: the two things the relayout reads."""
+
+        def __init__(self, experts, scale):
             super().__init__()
-            self.per_expert_scale = nn.Parameter(scale, requires_grad=False)
+            self.routed_experts = experts
+            self.moe = nn.Module()
+            self.moe.per_expert_scale = nn.Parameter(scale, requires_grad=False)
+
+        def spyre_experts(self):
+            return self.routed_experts
 
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16) * 0.05
     w2 = torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05
     scale = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
-    experts = _Experts(w13.clone(), w2.clone())
-    moe = _Moe(scale.clone())
+    experts = _RoutedExperts(w13.clone(), w2.clone())
+    layer = _Layer(experts, scale.clone())
 
-    _relayout_experts(experts, moe)
+    _relayout_experts(layer)
 
     assert not hasattr(experts, "w13_weight"), "the fused stacks must be freed, not kept"
     assert not hasattr(experts, "w2_weight")
-    assert moe.spyre_gate.shape == (EXPERTS, HIDDEN, INTER)
-    assert moe.spyre_up.shape == (EXPERTS, HIDDEN, INTER)
-    assert moe.spyre_down.shape == (EXPERTS, INTER, HIDDEN)
-    assert moe.spyre_route_identity.shape == (moe.spyre_stick, moe.spyre_stick)
+    assert layer.spyre_gate.shape == (EXPERTS, HIDDEN, INTER)
+    assert layer.spyre_up.shape == (EXPERTS, HIDDEN, INTER)
+    assert layer.spyre_down.shape == (EXPERTS, INTER, HIDDEN)
+    assert layer.spyre_route_identity.shape == (layer.spyre_stick, layer.spyre_stick)
     # Stick width and identity both come from the stacks' dtype, not a literal: the
     # identity multiplies the routing weights, which arrive in that same model dtype,
     # and the number of elements on a stick changes with it.
-    assert moe.spyre_stick == get_elem_in_stick(w13.dtype)
-    assert moe.spyre_route_identity.dtype == w13.dtype
+    assert layer.spyre_stick == get_elem_in_stick(w13.dtype)
+    assert layer.spyre_route_identity.dtype == w13.dtype
 
     # Not bit-exact: the device round-trip rounds ~0.1% of fp16 elements by one ulp
     # (~3e-5 at these magnitudes). The tolerance is still far tighter than the 0.5x-1.5x
     # per-expert scale, so a dropped or misapplied fold would still fail here.
     close = {"atol": 1e-4, "rtol": 1e-2}
-    torch.testing.assert_close(moe.spyre_gate.cpu(), w13[:, :INTER, :].transpose(1, 2), **close)
-    torch.testing.assert_close(moe.spyre_up.cpu(), w13[:, INTER:, :].transpose(1, 2), **close)
+    torch.testing.assert_close(layer.spyre_gate.cpu(), w13[:, :INTER, :].transpose(1, 2), **close)
+    torch.testing.assert_close(layer.spyre_up.cpu(), w13[:, INTER:, :].transpose(1, 2), **close)
     torch.testing.assert_close(
-        moe.spyre_down.cpu(), (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), **close
+        layer.spyre_down.cpu(), (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), **close
     )

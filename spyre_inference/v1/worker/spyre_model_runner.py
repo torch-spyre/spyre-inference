@@ -579,8 +579,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
                     defeated_by,
                 )
-            num_blocks = self._compile_blocks(fullgraph=fullgraph)
-            if num_blocks:
+            num_blocks, num_self_compiled = self._compile_blocks(fullgraph=fullgraph)
+            if num_blocks or num_self_compiled:
                 logger.info(
                     "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
                     "(fullgraph=%s).",
@@ -588,6 +588,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     model_name,
                     fullgraph,
                 )
+                if num_self_compiled:
+                    logger.info(
+                        "%d block(s) compile their own regions and were left uncompiled here.",
+                        num_self_compiled,
+                    )
                 return
             logger.warning(
                 "Found no attention-bearing block ModuleList in %s; falling back to a "
@@ -604,18 +609,29 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
-    def _compile_blocks(self, fullgraph: bool = True) -> int:
+    def _compile_blocks(self, fullgraph: bool = True) -> tuple[int, int]:
+        """Wrap each transformer block in its own graph.
+
+        Returns ``(wrapped, self_compiled)``. A self-compiling block (Gemma-4 MoE,
+        whose expert tiling needs eager context set between compilations) is left
+        alone, but still counts as found so the caller does not fall back to a
+        whole-model graph.
+        """
         num_blocks = 0
+        num_self_compiled = 0
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
                 if isinstance(block, PPMissingLayer):
+                    continue
+                if getattr(block, "spyre_compiles_own_regions", False):
+                    num_self_compiled += 1
                     continue
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
                 block.compile(backend="inductor", fullgraph=fullgraph, dynamic=False)
                 num_blocks += 1
-        return num_blocks
+        return num_blocks, num_self_compiled
 
     def warming_up_model(self) -> None:
         """Warm kernels / compile.

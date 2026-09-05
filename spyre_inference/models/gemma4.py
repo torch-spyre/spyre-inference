@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
+from spyre_inference.models import _gemma4_moe
+
 if TYPE_CHECKING:
     from torch import nn
     from vllm.config import VllmConfig
@@ -117,7 +119,7 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
 
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 with the self-decoder's aliased scalars registered as buffers.
+    """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
 
     ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
     as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
@@ -126,8 +128,20 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     Re-registering the aliases restores the parent's stated intent (move with the
     model, interact with torch.compile) and needs no change to the embedding math:
     a device-side 0-d scalar lowers fine.
+
+    A checkpoint with ``enable_moe_block`` additionally needs its expert dispatch
+    replaced, since ``FusedMoE``'s kernels are CUDA-only; see ``models._gemma4_moe``.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         register_aliased_scalars(self.model.self_decoder)
+        _gemma4_moe.adapt_moe_layers(self.model.layers)
+
+    def process_weights_after_loading(self) -> None:
+        """vLLM's model-level post-load hook, called once the checkpoint is in.
+
+        The last point at which the expert stacks are loaded, on the host and
+        still whole — the model runner moves the model to the device next.
+        """
+        _gemma4_moe.relayout_moe_experts(self.model.layers)

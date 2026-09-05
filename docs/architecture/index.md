@@ -60,6 +60,7 @@ compiled graph (see below).
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
 
 ### Transposed linear weights
 
@@ -93,6 +94,36 @@ so that pass is gone. The remaining slicing constraint is narrower than it was a
 in the attention backend, where offset > 0 views still corrupt on transfer (see
 [Attention Backend](#attention-backend)).
 
+## Model adaptations
+
+Some models need more than a swapped-out layer: a different transport for an input, a
+buffer that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those live in
+`spyre_inference/models/`, one module per architecture, as **subclasses of the upstream
+vLLM class** rather than runtime monkey-patches. `models/__init__.py` holds the
+`SPYRE_MODELS` table (architecture string → Spyre class) and `register_models()`, which
+points vLLM's `ModelRegistry` at them; `_`-prefixed modules hold machinery those subclasses
+share or delegate to and register no architecture of their own. Registration is lazy —
+nothing is imported until vLLM resolves the architecture — and `register_models()` first
+checks every key against vLLM's own registry, so an upstream rename fails loudly instead of
+silently falling through to the unadapted class.
+
+Where upstream hardcodes a class and offers no hook (`Gemma4Model` names
+`Gemma4DecoderLayer` in its `make_layers` call; the BERT wrappers hardcode
+`embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
+`__init__`, same parameters, same module tree, only `forward` differs.
+
+Two adaptations worth knowing:
+
+- **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
+  owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
+  which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
+- **Gemma-4 MoE** (`models/_gemma4_moe.py`) replaces `FusedMoE`'s CUDA-only dispatch with
+  two Spyre forms — gathered for a single-token decode step, all-expert persistent for a
+  prefill chunk. `SpyreGemma4ForCausalLM.process_weights_after_loading`, vLLM's model-level
+  post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
+  `[E,H,M]` / `[E,M,H]` layout those forms contract on, folds `per_expert_scale` into
+  `down`, and frees each ~45 GB source stack as it goes.
+
 ## Compilation Granularity
 
 Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
@@ -125,6 +156,14 @@ which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bake
 own layer name and compiles separately, which is worse than the whole-model graph; the
 runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
 defeats sharing the same way, by folding each block's weights into its own graph.
+
+A block can opt out of this by setting `spyre_compiles_own_regions`, which makes
+`_compile_blocks` skip it (without falling back to a whole-model graph).
+`SpyreGemma4MoEDecoderLayer` does: its expert matmul is tiled by torch-spyre `spyre_hint`
+scopes that resolve against named dims the driver has to declare *eagerly*, between
+compilations, so that layer keeps an eager `forward` that drives several compiled regions
+of its own — one graph for a decode step, four for a prefill chunk. See
+`models/_gemma4_moe.py`.
 
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.

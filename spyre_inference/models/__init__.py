@@ -15,9 +15,9 @@
 """Model-specific Spyre adaptations, per architecture.
 
 Each entry in ``SPYRE_MODELS`` replaces a vLLM architecture with a subclass that
-lives in the matching module here; ``_``-prefixed modules hold machinery shared
-between them. Registration is lazy: nothing is imported until vLLM resolves the
-architecture.
+lives in the matching module here; ``_``-prefixed modules hold machinery those
+subclasses share or delegate to, and register no architecture of their own.
+Registration is lazy: nothing is imported until vLLM resolves the architecture.
 """
 
 from __future__ import annotations
@@ -45,9 +45,13 @@ SPYRE_MODELS: dict[str, str] = {
     "RobertaForTokenClassification": f"{_ROBERTA}:SpyreRobertaForTokenClassification",
     "XLMRobertaForTokenClassification": (f"{_ROBERTA}:SpyreRobertaForTokenClassification"),
     "BgeM3EmbeddingModel": f"{_ROBERTA}:SpyreBgeM3EmbeddingModel",
-    # Decoders. Gemma4ForConditionalGeneration needs no entry of its own: it
-    # builds its language model through the registry, so it picks this one up.
+    # Decoders. The Gemma-4 multimodal wrapper builds its language model through
+    # the registry, so it picks the causal-LM entry up on its own; it is listed
+    # only to forward vLLM's top-level-model-only post-load hook down to it.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration": (
+        "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"
+    ),
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"

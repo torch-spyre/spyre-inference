@@ -93,7 +93,7 @@
   <text class="t bdl" x="531" y="952" text-anchor="middle">eager today · spyre_pooler.py subclasses the upstream poolers; compiling it is its own work item, not a warmup</text>
 
   <rect x="46" y="968" width="970" height="30" rx="6" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
-  <text class="t note" x="531" y="988" text-anchor="middle">MEAN on device needs a compile-safe segment sum and torch-spyre#3507 (index_add). Until both land, MEAN pools on the host and the hidden state crosses each step.</text>
+  <text class="t note" x="531" y="988" text-anchor="middle">MEAN copies packed [T, H] as fp16 and reduces on the host. Destagger of a device fp32 sum is garbage (torch-spyre#2971). #3507 would keep the reduce on the card.</text>
 
   <path class="edge" d="M 531 998 V 1026" marker-end="url(#arrow)" />
 

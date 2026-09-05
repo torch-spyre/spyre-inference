@@ -119,14 +119,27 @@ def _spyre_attention_forward(
         # invisible because the op reaches its cache through the forward context.
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
 
+    # Staged here, not in the impl: the copies are then traced into the block
+    # graph, which warmup already compiles at every token bucket.
+    staging = getattr(self.impl, "staging_buffers", None)
+    buffers = staging(query.device) if staging is not None else None
+    rows = query.shape[0]
+    if buffers is None:
+        q_in, out_buf = query, output
+    else:
+        q_in, out_buf = buffers
+        q_in[:rows] = query
+
     torch.ops.vllm.unified_attention_with_output(
-        query,  # ty: ignore[invalid-argument-type]
+        q_in,  # ty: ignore[invalid-argument-type]
         key,  # ty: ignore[invalid-argument-type]
         value,  # ty: ignore[invalid-argument-type]
-        output,  # ty: ignore[invalid-argument-type]
+        out_buf,  # ty: ignore[invalid-argument-type]
         _encode_layer_name(self.layer_name),  # ty: ignore[invalid-argument-type]
         kv_cache_dummy_dep=dep,  # ty: ignore[invalid-argument-type]
     )
+    if buffers is not None:
+        output.copy_(out_buf[:rows])
     return output.view(-1, hidden_size)
 
 

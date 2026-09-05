@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import (
-    Gemma4DecoderLayer,
     Gemma4ForCausalLM,
     Gemma4Model,
     Gemma4SelfDecoderLayers,
@@ -146,30 +145,6 @@ def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[nn.Module]
     module.__class__ = spyre
 
 
-class SpyreGemma4DecoderLayer(Gemma4DecoderLayer):
-    """Decoder layer that slices its own PLE row in-graph.
-
-    ``SpyreGemma4Model.forward`` passes every layer's row packed into one tensor; slicing
-    here is safe because the block argument itself starts at offset 0 (torch-spyre#3770).
-    An argument already ``ple_dim`` wide was sliced by some other caller.
-    """
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        per_layer_input: torch.Tensor | None = None,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        ple_dim = self.hidden_size_per_layer_input
-        if per_layer_input is not None and per_layer_input.shape[-1] != ple_dim:
-            per_layer_input = per_layer_input.narrow(1, self.layer_idx * ple_dim, ple_dim)
-        return super().forward(
-            positions, hidden_states, residual, per_layer_input=per_layer_input, **kwargs
-        )
-
-
 class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
     """Self-decoder without upstream's no-op PLE vocab-range mask."""
 
@@ -193,7 +168,7 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
 
 
 class SpyreGemma4Model(Gemma4Model):
-    """Gemma-4 backbone handing each block the whole PLE tensor at offset 0."""
+    """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
     def forward(
         self,
@@ -206,10 +181,14 @@ class SpyreGemma4Model(Gemma4Model):
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         """``forward`` for the plain single-rank text path; anything else goes upstream.
 
-        Upstream slices ``per_layer_inputs[:, layer_idx, :]`` per layer; under per-block
-        compile that view becomes a block argument, and a compiled kernel reads its
-        arguments from offset 0, ignoring ``storage_offset`` (torch-spyre#3770). Each block
-        is handed the whole offset-0 tensor and slices in-graph instead.
+        Upstream slices ``per_layer_inputs[:, layer_idx, :]`` per layer and hands the block
+        that view. Two things stop it working here: a compiled kernel reads its arguments
+        from offset 0, ignoring ``storage_offset`` (torch-spyre#3770), and torch-spyre
+        cannot lay out the 3-D tensor at a graph boundary. Each row is cut from a 2-D view
+        and copied to offset 0 instead. Doing it here rather than inside the block is what
+        keeps warmup affordable: a ``layer_idx``-derived offset inside ``forward`` is a
+        graph constant, so every block guards differently and compiles its own artifact
+        (35 for E2B, 42 for E4B) instead of all of them sharing one.
 
         ``residual=None`` each iteration is exact: ``Gemma4DecoderLayer.forward`` overwrites
         ``residual`` on entry and always returns ``None`` for it.
@@ -236,12 +215,17 @@ class SpyreGemma4Model(Gemma4Model):
         hidden_states = self.embed_input_ids(input_ids)
         ple = self.project_per_layer_inputs(hidden_states, self.get_per_layer_inputs(input_ids))
         if ple is not None:
-            # Free (contiguous -> offset-0 view), and required: torch-spyre cannot build a
-            # SpyreTensorLayout for the 3-D shape at a graph boundary ("Incompatible
-            # host_size and dim_order").
             ple = ple.reshape(ple.shape[0], -1)
-        for layer in self.layers:
-            hidden_states, _ = layer(positions, hidden_states, None, per_layer_input=ple, **kwargs)
+        ple_dim = self.hidden_size_per_layer_input
+        for layer_idx, layer in enumerate(self.layers):
+            row = None
+            if ple is not None:
+                # ``clone``, not ``contiguous``: a one-row slice reports itself contiguous
+                # (a leading dim of 1 makes its stride irrelevant), so ``contiguous`` is a
+                # no-op there and leaves the offset in place -- correct at prefill, silently
+                # layer 0's row for every layer at decode.
+                row = ple.narrow(1, layer_idx * ple_dim, ple_dim).clone()
+            hidden_states, _ = layer(positions, hidden_states, None, per_layer_input=row, **kwargs)
         return self.norm(hidden_states)
 
 
@@ -257,16 +241,12 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
       live CPU graph input. Re-registering them restores the parent's stated intent (move
       with the model, interact with torch.compile) and needs no change to the embedding
       math: a device-side 0-d scalar lowers fine.
-    - The PLE path (E2B/E4B) drops a mask Spyre cannot lower and moves the per-layer slice
-      inside each compiled block; see the subclasses above.
+    - The PLE path (E2B/E4B) drops a mask Spyre cannot lower and hands each block its own
+      row as an offset-0 tensor; see the subclasses above.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         _retype(self.model, Gemma4Model, SpyreGemma4Model)
         _retype(self.model.self_decoder, Gemma4SelfDecoderLayers, SpyreGemma4SelfDecoderLayers)
-        # Also covers self_decoder.decoder_layers / cross_decoder.decoder_layers: both are
-        # slices of this ModuleList, holding the same layer objects.
-        for layer in self.model.layers:
-            _retype(layer, Gemma4DecoderLayer, SpyreGemma4DecoderLayer)
         register_aliased_scalars(self.model.self_decoder)

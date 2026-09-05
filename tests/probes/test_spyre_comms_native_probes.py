@@ -36,6 +36,10 @@ from __future__ import annotations
 import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
+# Also distributed + uses_subprocess per test below; `probe` routes the whole
+# file to the test-probes job (2-card runner) and out of test-distributed.
+pytestmark = pytest.mark.probe
+
 
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed

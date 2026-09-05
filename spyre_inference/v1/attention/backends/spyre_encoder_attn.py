@@ -664,7 +664,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             max_num_seqs=self._cached_max_num_seqs,
             max_model_len=self._cached_max_model_len,
             max_num_batched_tokens=self._cached_max_num_batched_tokens,
-            len_ladder=default_encoder_len_buckets(self._cached_max_model_len),
+            len_bucket=default_encoder_len_buckets(self._cached_max_model_len),
         )
 
     def forward(  # ty: ignore[invalid-method-override]

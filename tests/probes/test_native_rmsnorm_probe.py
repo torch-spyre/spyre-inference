@@ -25,9 +25,14 @@ Runs against the real Spyre device when available; otherwise skips silently.
 """
 
 import pytest
-from spyre_testing_plugin.pytest_plugin import spyre_available
+from spyre_testing_plugin.pytest_plugin import spyre_device_count
 
-pytestmark = pytest.mark.compile
+# Guard on spyre_device_count (reads AIU_WORLD_SIZE), never spyre_available: the latter
+# does torch.randn on the spyre device, which opens the card in the main pytest process
+# and then blocks this test's own EngineCore subprocess -- and every later subprocess
+# probe -- from opening it ("Device or resource busy"). uses_subprocess keeps this off
+# the shared card by running it before any in-process device test.
+pytestmark = [pytest.mark.probe, pytest.mark.uses_subprocess]
 
 
 @pytest.mark.xfail(
@@ -45,7 +50,7 @@ def test_native_rmsnorm_prefill_s64_lowers(monkeypatch: pytest.MonkeyPatch) -> N
     Whole-model (block-graph) phenomenon: a lone torch.compile of forward_native does
     not reproduce it, and S=1 decode does not either -- only the S=64 prefill compile.
     """
-    if not spyre_available():
+    if spyre_device_count() < 1:
         pytest.skip("Spyre device not available")
 
     from vllm import LLM, SamplingParams

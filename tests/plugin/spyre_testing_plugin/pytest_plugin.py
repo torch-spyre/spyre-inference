@@ -77,6 +77,7 @@ import yaml
 from _pytest.mark.expression import IDENT_PREFIX, Expression
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from spyre_testing_plugin import sharding
 from spyre_testing_plugin.models import (
     AllowEntry,
     BlockEntry,
@@ -510,19 +511,7 @@ def pytest_addoption(parser):
         help="Collect upstream vLLM tests even when the -m expression doesn't name the "
         "`upstream` marker (cloning vLLM if it isn't cached yet).",
     )
-    group = parser.getgroup("spyre-attention-shard")
-    group.addoption(
-        "--attn-shards",
-        type=int,
-        default=0,
-        help="Partition attention (non-encoder) tests into this many shards (0 = off).",
-    )
-    group.addoption(
-        "--attn-shard-id",
-        type=int,
-        default=0,
-        help="0-based index of the shard to run when --attn-shards is set.",
-    )
+    sharding.add_shard_options(parser)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -539,6 +528,11 @@ def pytest_configure(config):
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    # Register sharding for its own trylast pytest_collection_modifyitems, which must
+    # land after pytest's -m deselection. Registered here (not via the plugin's -p
+    # entry) and before the upstream return so it applies to `not upstream` shard jobs.
+    config.pluginmanager.register(sharding, "spyre-sharding")
 
     config._upstream_tests_base = None
     if not _upstream_requested(config):
@@ -699,60 +693,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
 
-    # Must run for local selections too: the shard jobs run `not upstream`, so gating
-    # this on upstream_tests_base makes the partition a silent no-op (every shard runs
-    # the whole suite).
     _reorder_tests_by_name(items)
-    _apply_attention_shard(config, items)
-
-
-def _apply_attention_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Keep only the attention items for this shard.
-
-    Every shard job computes the same partition and keeps its own slice, so no
-    cross-job coordination is needed.
-    """
-    num_shards = config.getoption("--attn-shards")
-    if not num_shards or num_shards <= 1:
-        return
-    shard_id = config.getoption("--attn-shard-id")
-    if not 0 <= shard_id < num_shards:
-        raise pytest.UsageError(f"--attn-shard-id must be in [0, {num_shards}); got {shard_id}")
-
-    attn_items = [
-        it
-        for it in items
-        if it.get_closest_marker("attention") and not it.get_closest_marker("encoder_attention")
-    ]
-    if not attn_items:
-        return
-
-    # Heavy = compiled kernel on device; those dominate wall time and HBM growth.
-    def _weight(item: pytest.Item) -> int:
-        nid = item.nodeid
-        return 8 if "device_spyre" in nid and "STOCK" in nid else 1
-
-    # Greedy longest-processing-time first over a stable order.
-    attn_items.sort(key=lambda it: it.nodeid)
-    attn_items.sort(key=_weight, reverse=True)
-    loads = [0] * num_shards
-    assigned: dict[str, int] = {}
-    for item in attn_items:
-        target = min(range(num_shards), key=lambda s: loads[s])
-        assigned[item.nodeid] = target
-        loads[target] += _weight(item)
-
-    attn_nodeids = {it.nodeid for it in attn_items}
-    kept, dropped = [], []
-    for item in items:
-        if item.nodeid in attn_nodeids and assigned[item.nodeid] != shard_id:
-            dropped.append(item)
-        else:
-            kept.append(item)
-
-    if dropped:
-        config.hook.pytest_deselected(items=dropped)
-        items[:] = kept
 
 
 def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
@@ -1204,19 +1145,33 @@ def pytest_fixture_setup(fixturedef, request):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Record whether a test failed/errored, so teardown only reaps after failures."""
+    """Flag subprocess tests whose teardown must reap the card, not just wait.
+
+    Only a `uses_subprocess` test can orphan a worker (EngineCore, TP rank) still
+    holding the VFIO fd, which a bare wait would never free. A strict-xfail probe
+    that fails in its subprocess reports as `xfailed` (wasxfail set), not `failed`,
+    so reap on either -- but gate on the marker: `wasxfail` alone also fires on the
+    upstream YAML's widespread `xfail(strict=False)`, where reaping would SIGKILL a
+    live card holder instead of waiting for a clean release. The reap excludes the
+    main pytest process (see teardown).
+    """
     outcome = yield
     report = outcome.get_result()
-    if report.failed:
-        item._spyre_test_failed = True
+    if not any(m.name == "uses_subprocess" for m in item.iter_markers()):
+        return
+    if report.failed or getattr(report, "wasxfail", None) is not None:
+        item._spyre_reap_card = True
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
     """Free the Spyre card at each test boundary on a Spyre host.
 
-    A failed test can orphan a holder outright, so after a failure we reap
-    (SIGKILL the holder, then wait for the card).
+    A failed or xfailed test can orphan a subprocess holder outright, so
+    afterwards we reap (SIGKILL the holder, then wait for the card). The reap
+    excludes the main pytest pid, so it cannot recover a card the main process
+    opened in-process -- uses_subprocess tests must keep off the card (guard on
+    spyre_device_count, never spyre_available) so no subprocess is blocked.
 
     A *passing* test can also leave the card transiently busy: an out-of-process
     vLLM engine is force-killed during shutdown and the kernel's VFIO release is
@@ -1230,8 +1185,16 @@ def pytest_runtest_teardown(item, nextitem):
     """
     if not spyre_hardware_present():
         return
-    if getattr(item, "_spyre_test_failed", False):
+    if getattr(item, "_spyre_reap_card", False):
         reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
+
+
+def pytest_runtest_logreport(report) -> None:
+    sharding.record_duration(report)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    sharding.write_durations(_log)

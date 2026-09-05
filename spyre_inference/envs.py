@@ -30,6 +30,9 @@ if TYPE_CHECKING:
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_ATTN_PROFILING: bool = False
+    SPYRE_ATTN_RECORD: bool = True
+    SPYRE_ATTN_KV_BUCKETS: str | None = None
+    SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_BUCKETED_DECODE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -50,6 +53,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
+    # When "1", pre-compile every attention variant the run can need during warmup,
+    # so no request pays an Inductor compile mid-serving. "0" (default) falls back to
+    # compiling each variant lazily on first use.
+    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "0"))),
+    # Comma-separated kv_len buckets to record, unset uses the default buckets of
+    # powers of two from block_size up to max_model_len.
+    "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
+    # Comma-separated query_len buckets to record, unset uses the default buckets
+    # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
+    "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # When "1", enables the bucketed multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.

@@ -195,7 +195,7 @@ class TestEncoderDispatch:
         assert desc.actual_num_seqs == 3
         assert desc.actual_max_len == 30
 
-    def test_pooling_2d_not_1d_token_ladder(self):
+    def test_pooling_2d_not_1d_token_buckets(self):
         """Body 1D pad and attention (B, L) are independent.
 
         3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
@@ -277,7 +277,7 @@ class TestEncoderBuckets:
     def test_next_bucket_overflow_stick_aligns(self):
         assert next_bucket(3000, [64, 128]) == 3008  # 3000 → 47*64 = 3008
 
-    def test_len_bucket_stick_aligns_when_ladder_unset(self):
+    def test_len_bucket_stick_aligns_when_override_unset(self):
         assert encoder_len_bucket(1) == 64
         assert encoder_len_bucket(32) == 64
         assert encoder_len_bucket(65) == 128
@@ -338,7 +338,7 @@ class TestEncoderBuckets:
             max_num_seqs=4,
             max_model_len=2048,
             max_num_batched_tokens=300,
-            len_ladder=[64, 256],
+            len_bucket=[64, 256],
         ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
 
     def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):

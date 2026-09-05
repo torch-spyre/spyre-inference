@@ -20,7 +20,7 @@ compile on ``[T, …]``.
 
 Attention (encoder only): warmed ``(B, L)`` cells for SDPA ``[B, H, L, D]``.
 The attention backend gathers rows into that grid; the body is not rewritten
-to ``T = B × L``. ``L`` is the ``max_model_len`` ladder, not ``compile_sizes``.
+to ``T = B × L``. ``L`` comes from ``max_model_len``, not ``compile_sizes``.
 ``B`` is powers of two up to ``--max-num-seqs``, same as decoder attention.
 """
 
@@ -45,7 +45,7 @@ def default_encoder_len_buckets(max_model_len: int) -> list[int]:
     """Stick-aligned prompt-length buckets from 64 up to ``max_model_len``.
 
     Powers of two through the last value that still fits, then ``max_model_len``
-    rounded down to a stick if that is not already on the ladder.
+    rounded down to a stick if that is not already a bucket.
     """
     cap = max(1, int(max_model_len))
     buckets: list[int] = []
@@ -64,7 +64,7 @@ def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
 
 
 def next_bucket(n: int, buckets: list[int]) -> int:
-    """Smallest bucket ``>= n``. If ``n`` exceeds the ladder, stick-align ``n``."""
+    """Smallest bucket ``>= n``. If ``n`` exceeds every bucket, stick-align ``n``."""
     if n < 1:
         n = 1
     ordered = sorted({b for b in buckets if b > 0})
@@ -78,7 +78,7 @@ def len_buckets(
     max_model_len: int,
     compile_sizes: Sequence[int] | None = None,
 ) -> list[int]:
-    """Attention ``L`` ladder from ``max_model_len``.
+    """Attention ``L`` buckets from ``max_model_len``.
 
     Optional ``compile_sizes`` overrides ``L`` in tests. Platform
     ``compile_sizes`` are body token counts and must not be passed here.
@@ -94,7 +94,7 @@ def len_buckets(
 def batch_buckets(max_num_seqs: int) -> list[int]:
     """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself.
 
-    Same ladder as decoder attention (``_powers_of_two_up_to``): clip with
+    Same buckets as decoder attention (``_powers_of_two_up_to``): clip with
     ``--max-num-seqs``, no extra env var.
     """
     cap = max(1, max_num_seqs)
@@ -152,12 +152,12 @@ def pooling_warmup_shapes(
     max_num_seqs: int,
     max_model_len: int,
     max_num_batched_tokens: int,
-    len_ladder: Sequence[int] | None = None,
+    len_bucket: Sequence[int] | None = None,
 ) -> list[tuple[int, int]]:
     """``(batch_size, prompt_len)`` pairs to dummy at serve start."""
     shapes: list[tuple[int, int]] = []
     for batch_size in batch_buckets(max_num_seqs):
-        for prompt_len in len_buckets(max_model_len, len_ladder):
+        for prompt_len in len_buckets(max_model_len, len_bucket):
             if prompt_len > max_model_len:
                 continue
             if batch_size * prompt_len > max_num_batched_tokens:
@@ -302,7 +302,7 @@ class SpyreShapeBucketer:
             max_num_seqs=scheduler.max_num_seqs,
             max_model_len=model_config.max_model_len,
             max_num_batched_tokens=scheduler.max_num_batched_tokens,
-            len_ladder=default_encoder_len_buckets(model_config.max_model_len),
+            len_bucket=default_encoder_len_buckets(model_config.max_model_len),
         )
         if not shapes and not compile_sizes:
             return None

@@ -38,7 +38,7 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
   workaround until flash-style attention lands; the body is not rewritten to
   `T = B × L`.
 
-`compile_sizes` for pooling is the body `T` ladder (`64, 128, …` up to the
+`compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
 token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
 Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
 

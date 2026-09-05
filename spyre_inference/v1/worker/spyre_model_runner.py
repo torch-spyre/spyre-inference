@@ -81,6 +81,11 @@ from spyre_inference.custom_ops.mlp_pad import (
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionImpl,
+    SpyrePagedKVCache,
+)
+from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -399,6 +404,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Shape bucketer for runtime dispatch (initialized after model load)
         self.spyre_shape_bucketer: SpyreShapeBucketer | None = None
 
+        # Per-layer paged KV caches, kept so warmup can record the attention
+        # kernels against real pages. Populated by initialize_kv_cache_tensors.
+        self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
@@ -670,6 +679,85 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
+        self._record_attention_graphs(bucket_sizes)
+
+    def _record_attention_graphs(self, token_counts: list[int]) -> None:
+        """Pre-compile the attention.
+
+        The model-level warmup above cannot cover these: ``_dummy_run`` delegates
+        upstream, which passes ``attn_metadata=None``, so ``forward`` returns
+        before touching a kernel. Left lazy, each new variant pays a full
+        Inductor compile mid-serving.
+        """
+        if not envs.SPYRE_ATTN_RECORD:
+            logger.info("Attention graph recording disabled (SPYRE_ATTN_RECORD=0)")
+            return
+        if self.compilation_config.mode is CompilationMode.NONE:
+            logger.info("Attention graph recording disabled (CompilationMode.NONE)")
+            return
+        assert self._spyre_kv_caches, (
+            "Attention graph recording needs the KV cache, but "
+            "_spyre_kv_caches is empty: initialize_kv_cache_tensors() must run first."
+        )
+
+        # Every layer keeps its own kernel cache, so each is recorded separately;
+        # layers sharing a head configuration trace to the same graph and only
+        # the first pays a full Inductor compile.
+        static_ctx = self.compilation_config.static_forward_context
+        t0 = time.time()
+        total = 0
+        # The metadata builders' own bucketer, not a second one built here, so
+        # every bucket recorded is one build() can actually produce.
+        bucketer = self._resolve_builder_attn_bucketer()
+        assert bucketer is not None, "No attention metadata builder exposes a bucketer"
+        with _set_spyre_compilation_settings(self.vllm_config):
+            for layer_name, kv_cache in self._spyre_kv_caches.items():
+                layer = static_ctx.get(layer_name)
+                impl = getattr(layer, "impl", None)
+                if not isinstance(impl, SpyreAttentionImpl):
+                    continue
+                logger.info("Recording attention graphs for layer %s...", layer_name)
+                total += impl.record_graphs(self._spyre_device, bucketer, kv_cache)
+        logger.info(
+            "Attention graph recording complete: %d graphs in %.3fs.",
+            total,
+            time.time() - t0,
+        )
+
+    def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
+        """The attention bucketer the metadata builders dispatch against.
+
+        Returned rather than constructed here, so the recorder compiles exactly
+        the buckets ``build()`` rounds onto -- a second, independently built
+        instance could drift and make every request pad to an unrecorded block
+        count. A model can have several attention groups and, under ubatching,
+        several builders per group; the assert below guards against a future
+        spec-dependent bucket, since today all builders derive buckets from
+        ``cache_config``/``model_config`` alone and so agree by construction.
+        Returns None when no builder exposes a bucketer.
+        """
+        first: SpyreAttnBucketer | None = None
+        for group in self._attn_group_iterator():
+            for builder in group.metadata_builders:
+                bucketer = getattr(builder, "_attn_bucketer", None)
+                if bucketer is None:
+                    continue
+                if first is None:
+                    first = bucketer
+                    continue
+                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
+                    first.block_size,
+                    first.num_blocks_buckets,
+                ), (
+                    "Attention bucketer buckets diverge between metadata builders: "
+                    f"{type(builder).__name__} has block_size={bucketer.block_size} "
+                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
+                    f"block_size={first.block_size} "
+                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
+                    "recorded, so a mismatch means some builder pads onto block "
+                    "counts no kernel was compiled for."
+                )
+        return first
 
     def _determine_batch_execution_and_padding(
         self,
@@ -965,10 +1053,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import (
-            SpyrePagedKVCache,
-            slot_major_kv_layout,
-        )
+        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
@@ -1024,6 +1109,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+        self._spyre_kv_caches = dict(kv_caches)
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---

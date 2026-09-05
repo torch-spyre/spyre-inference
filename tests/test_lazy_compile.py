@@ -197,7 +197,6 @@ def test_the_real_layers_opt_in() -> None:
         assert getattr(wrapped, "__wrapped__", None) is not None, f"{cls.__name__}.{method}"
 
 
-@pytest.mark.compile
 def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
     """A decorated layer inside a fullgraph block is traced into the block's graph."""
     mode(CompilationMode.STOCK_TORCH_COMPILE)
@@ -233,7 +232,6 @@ def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
     torch.testing.assert_close(out, expected)
 
 
-@pytest.mark.compile
 def test_a_real_compile_of_an_outermost_kernel_matches_eager(mode) -> None:
     """The head/tail path itself: torch.compile of a bound method, really traced."""
     mode(CompilationMode.STOCK_TORCH_COMPILE)

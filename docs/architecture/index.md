@@ -114,9 +114,9 @@ rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. T
 backend compile count is independent of depth, but it is not 1: layer 0 specializes
 separately because `residual is None` there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
-and full attention, giving four. A fresh `num_tokens` tier then costs one block recompile
+and full attention, giving four. A fresh `num_tokens` bucket then costs one block recompile
 rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
-dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers live inside
+dependence: kv-cache length and its block-count buckets live inside
 `unified_attention_with_output`, which is opaque to this graph and compiles its own
 kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
 
@@ -149,14 +149,16 @@ the write can scatter through a slot-major view of it:
 |---|---|---|
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
-| 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
+| 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to its bucket |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
 Key constraints:
 
-- **KV length alignment**: 256 tokens (avoids per-step recompilation on Spyre)
-- **Query chunk size**: 32 tokens (consistent tensor shapes for compilation)
+- **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
+  to `max_model_len` (avoids per-step recompilation on Spyre)
+- **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
+  (consistent tensor shapes for compilation)
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
 - **Block size**: Must be a multiple of 64; the platform rounds a user-supplied
   `block_size` up to the next multiple of 64 automatically
@@ -191,7 +193,7 @@ description of current behaviour.
 
 The shape of that target: the model body compiled once per token bucket, attention
 shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both shape ladders so nothing compiles on the first request.
+both sets of shape buckets so nothing compiles on the first request.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }

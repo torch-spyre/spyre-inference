@@ -29,6 +29,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_len_bucket,
     expand_packed_to_encoder_bucket,
     len_buckets,
+    logits_row_buckets,
     next_bucket,
     pooling_warmup_shapes,
 )
@@ -344,3 +345,15 @@ class TestEncoderBuckets:
     def test_encoder_bucket_valid_row_indices_skips_pads(self):
         indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
         assert indices == [0, 1, 2, 4, 5]
+
+
+class TestLogitsRowBuckets:
+    def test_clips_prefill_bucket_to_max_num_reqs(self):
+        # The 512-token prefill bucket samples at most max_num_seqs rows.
+        assert logits_row_buckets([1, 2, 4, 8, 512], max_num_reqs=8) == [1, 2, 4, 8]
+
+    def test_keeps_a_non_power_of_two_max(self):
+        assert logits_row_buckets([1, 2, 4, 6, 512], max_num_reqs=6) == [1, 2, 4, 6]
+
+    def test_ignores_non_positive_sizes(self):
+        assert logits_row_buckets([0, -1, 4], max_num_reqs=8) == [4]

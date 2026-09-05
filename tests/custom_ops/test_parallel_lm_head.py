@@ -508,6 +508,79 @@ def test_gather_only_tables_are_never_promoted(tp_group):
     assert not hasattr(per_layer, "padded_weight_t")
 
 
+@pytest.mark.parallel_lm_head
+def test_projection_compiles_itself_and_matches_eager(tp_group, monkeypatch, spyre_or_cpu_device):
+    """No graph encloses the lm_head, so it compiles its own and must not drift.
+
+    ``fullgraph=True`` also asserts no graph break: a break would silently fall back
+    to eager per step.
+    """
+    import types
+
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops import lazy_compile
+    from spyre_inference.custom_ops.linear import SpyreTransposedWeightMethod
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
+
+    torch.manual_seed(0)
+    vocab_size, embedding_dim, rows = 51200, 64, 8
+
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    layer.weight.data.copy_(torch.randn(layer.weight.shape, dtype=torch.float16))
+    layer.quant_method.process_weights_after_loading(layer)
+    layer = layer.to(spyre_or_cpu_device)
+    x = torch.randn(rows, embedding_dim, dtype=torch.float16).to(spyre_or_cpu_device)
+
+    eager = SpyreTransposedWeightMethod.apply(layer.quant_method, layer, x)
+
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    compiled_method = SpyreUnquantizedLMHeadMethod()
+    assert compiled_method.spyre_compiled_kernel is None
+
+    actual = compiled_method.apply(layer, x)
+
+    assert compiled_method.spyre_compiled_kernel is not None, "projection did not compile"
+    assert actual.shape == (rows, vocab_size)
+    torch.testing.assert_close(actual.cpu().float(), eager.cpu().float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parallel_lm_head
+def test_projection_stays_eager_inside_an_enclosing_graph(tp_group, monkeypatch):
+    """Blocks already compile their own linears; the wrapper must not nest a graph."""
+    import types
+
+    from vllm.config import CompilationMode
+
+    from spyre_inference.custom_ops import lazy_compile
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
+
+    monkeypatch.setattr(
+        lazy_compile,
+        "get_cached_compilation_config",
+        lambda: types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE),
+    )
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        torch, "compile", lambda *a, **k: pytest.fail("compiled inside an enclosing graph")
+    )
+
+    method = SpyreUnquantizedLMHeadMethod()
+    layer = torch.nn.Module()
+    layer.padded_weight_t = torch.randn(8, 16, dtype=torch.float16)
+    layer.spyre_row_padding = 0
+
+    out = method.apply(layer, torch.randn(3, 8, dtype=torch.float16))
+
+    assert out.shape == (3, 16)
+    assert method.spyre_compiled_kernel is None
+
+
 @pytest.fixture
 def spyre_or_cpu_device():
     """Use Spyre if available, otherwise CPU."""

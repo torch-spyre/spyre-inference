@@ -124,30 +124,32 @@ class SpyreAttnBucketer:
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
-        from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            _TOKEN_BUCKET_ANCHOR,
+            _token_buckets_up_to,
+        )
 
-        if block_size & (block_size - 1):
-            # Not fatal: _powers_of_two_up_to rounds the start up to a power of
-            # two, just coarser at the bottom. Reachable because the platform
-            # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
+        if block_size % _TOKEN_BUCKET_ANCHOR:
+            # Not fatal: token buckets are multiples of the 64-token anchor, so a
+            # block_size that is not a multiple of it makes the derived block counts
+            # coarser. Reachable because the platform only forces a multiple of 64
+            # (SpyrePlatform.check_and_update_config).
             logger.warning(
-                "block_size=%d is not a power of two; the smallest KV bucket is the next "
-                "power of two instead, making it larger than one block. Prefer a "
-                "power-of-two block_size.",
+                "block_size=%d is not a multiple of the %d-token bucket anchor, so the "
+                "derived block counts are coarser than the token buckets. Prefer a "
+                "block_size that is a multiple of %d.",
                 block_size,
+                _TOKEN_BUCKET_ANCHOR,
+                _TOKEN_BUCKET_ANCHOR,
             )
 
-        # Default: powers of two from block_size up to max_model_len. The
-        # recorded set is a product of both axes, so a bucket per KV token at a
-        # 32k context would be tens of thousands of variants; doubling keeps it
-        # affordable, with each bucket's extra padding absorbed by the mask.
-        # Starting at block_size rather than 1 skips buckets that would dedupe
-        # away anyway, since num_blocks = ceil(kv / block_size).
+        # Default: 4/3 steps over token counts. The recorded set is a product of both
+        # axes, so a fixed ratio keeps the variant count affordable.
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: list(_token_buckets_up_to(max_model_len)),
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by

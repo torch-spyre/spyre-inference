@@ -114,6 +114,37 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+# A padded block is a real KV read, so bucket round-up costs decode latency: 4/3 bounds
+# it at a quarter of the bucket where powers of two cost a half.
+_TOKEN_BUCKET_STEP_NUM, _TOKEN_BUCKET_STEP_DEN = 4, 3
+_TOKEN_BUCKET_ANCHOR = 64
+
+
+def _token_buckets_up_to(max_tokens: int, anchor: int = _TOKEN_BUCKET_ANCHOR) -> tuple[int, ...]:
+    """Multiplicative token buckets in [anchor, max_tokens], each a multiple of anchor."""
+    if max_tokens < 1:
+        return ()
+    steps: list[int] = []
+    t = anchor
+    while t < max_tokens:
+        steps.append(t)
+        # max() with t + anchor: at small t the ratio rounds back to t and would stall.
+        grown = -(-t * _TOKEN_BUCKET_STEP_NUM // _TOKEN_BUCKET_STEP_DEN)
+        t = -(-max(t + anchor, grown) // anchor) * anchor
+    steps.append(max_tokens)
+    return tuple(steps)
+
+
+def _block_buckets_up_to(max_tokens: int, block_size: int) -> tuple[int, ...]:
+    """Block-count buckets covering [1, ceil(max_tokens / block_size)]."""
+    max_blocks = (max_tokens + block_size - 1) // block_size
+    if max_blocks < 1:
+        return ()
+    return tuple(
+        sorted({min(-(-t // block_size), max_blocks) for t in _token_buckets_up_to(max_tokens)})
+    )
+
+
 def _find_bucket(n: int, buckets: tuple[int, ...]) -> int | None:
     """Smallest bucket >= n, or None when n exceeds the top bucket."""
     idx = bisect.bisect_left(buckets, n)
@@ -691,11 +722,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Buckets for the bucketed decode fast path. One compiled kernel
         # per bucket. TODO: expose as engine args if configurability is needed.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        max_num_blocks_per_seq = (
-            model_config.max_model_len + self.block_size - 1
-        ) // self.block_size
         self._num_seqs_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_seqs)
-        self._num_blocks_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_blocks_per_seq)
+        # Must equal self._attn_bucketer.num_blocks_buckets: warmup records from the
+        # bucketer while dispatch reads this, so divergence costs a serving-path compile.
+        self._num_blocks_buckets: tuple[int, ...] = _block_buckets_up_to(
+            model_config.max_model_len, self.block_size
+        )
 
         # Owned here, not by the recorder, so a bucket build() can emit is
         # always a bucket that was compiled: the warmup recorder reads this

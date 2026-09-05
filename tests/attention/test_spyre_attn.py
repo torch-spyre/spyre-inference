@@ -29,9 +29,12 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _block_buckets_up_to,
     _build_query_row_tables,
     _create_compilable_bucketed_decode_attn,
+    _find_bucket,
     _mirror_mask_tiles,
+    _token_buckets_up_to,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1847,6 +1850,53 @@ def test_spyre_attn_bucketed_decode_fallback(
     )
 
 
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("max_model_len", [64, 1024, 2048, 8192, 32768, 131072])
+def test_block_buckets_bound_round_up(max_model_len: int, block_size: int) -> None:
+    """Rounding up to a bucket costs at most a quarter of it, at every block count."""
+    buckets = _block_buckets_up_to(max_model_len, block_size)
+    max_blocks = (max_model_len + block_size - 1) // block_size
+    assert buckets == tuple(sorted(set(buckets)))
+    assert buckets[-1] == max_blocks
+    for n in range(1, max_blocks + 1):
+        picked = _find_bucket(n, buckets)
+        assert picked is not None and picked >= n
+        assert (picked - n) / picked <= 1 / 4
+
+
+def test_block_buckets_are_block_size_invariant() -> None:
+    """Buckets are chosen over token counts, so block_size only re-quantizes them."""
+    for max_model_len in (8192, 32768, 131072):
+        derived = tuple(b * 64 for b in _block_buckets_up_to(max_model_len, 64))
+        assert derived == _token_buckets_up_to(max_model_len)
+
+
+def test_builder_and_bucketer_block_buckets_agree(default_vllm_config) -> None:
+    """Warmup records from the bucketer while dispatch reads the builder's own buckets.
+
+    A divergence is silent: dispatch asks for a variant warmup never compiled, and the
+    serving path pays a lazy compile.
+    """
+    from vllm.config import get_current_vllm_config
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    vllm_config = get_current_vllm_config()
+    model_config = vllm_config.model_config
+    spec = FullAttentionSpec(
+        block_size=vllm_config.cache_config.block_size,
+        num_kv_heads=model_config.get_num_kv_heads(vllm_config.parallel_config),
+        head_size=model_config.get_head_size(),
+        dtype=torch.float16,
+    )
+    fake_layer = Mock()
+    fake_layer.kv_cache = None
+    vllm_config.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
+    builder = SpyreAttentionMetadataBuilder(
+        spec, ["layers.0.self_attn"], vllm_config, torch.device("cpu")
+    )
+    assert builder._num_blocks_buckets == tuple(builder._attn_bucketer.num_blocks_buckets)
+
+
 def _padded_mask_metadata(
     seq_lens: list[tuple[int, int]],
     block_size: int = 64,
@@ -2052,18 +2102,21 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    ("kv_len", "expected"),
+    "kv_len",
     [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
+        pytest.param(65, id="kv65"),
+        pytest.param(300, id="kv300"),
+        pytest.param(256, id="kv256_exact_noop"),
+        pytest.param(1025, id="kv1025"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len):
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
-    assert expected in buckets
+    # Derived, not hardcoded: the bucket set is a tunable default (SPYRE_ATTN_KV_BUCKETS).
+    real_blocks = (kv_len + 64 - 1) // 64
+    expected = _find_bucket(real_blocks, tuple(buckets))
+    assert expected is not None and expected >= real_blocks
 
     metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
 

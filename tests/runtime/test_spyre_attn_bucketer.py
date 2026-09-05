@@ -23,6 +23,7 @@ import pytest
 from spyre_inference import envs
 from spyre_inference.v1.attention.backends.spyre_attn import (
     _powers_of_two_up_to,
+    _token_buckets_up_to,
     resolve_needs_gather,
     resolve_store_mode,
 )
@@ -44,8 +45,13 @@ def make_config(max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK
 
 
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
-    """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
+    """[start, 2*start, ..., limit]."""
     return list(_powers_of_two_up_to(limit, start=start))
+
+
+def _list_default_kv(limit: int) -> list[int]:
+    """The buckets the kv axis defaults to."""
+    return list(_token_buckets_up_to(limit))
 
 
 @pytest.fixture()
@@ -62,9 +68,16 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+    def test_kv_buckets_bound_round_up_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == _list_default_kv(2048)
         assert bucketer.kv_buckets[-1] == 2048
+        # A padded block is a real KV read, so the step ratio caps what round-up costs.
+        # Asserted on block counts, which is what the kernel pads to; token steps are
+        # quantized to the 64-token anchor and so are coarser at the bottom.
+        blocks = bucketer.num_blocks_buckets
+        for prev, nxt in zip(blocks, blocks[1:]):
+            if prev >= 4:
+                assert (nxt - (prev + 1)) / nxt <= 1 / 4
 
     def test_kv_buckets_start_at_block_size(self, bucketer):
         """Buckets below block_size all collapse to num_blocks == 1, so the
@@ -72,16 +85,21 @@ class TestBuckets:
         assert bucketer.kv_buckets[0] == BLOCK_SIZE
 
     @pytest.mark.parametrize("block_size", [64, 128, 256])
-    def test_kv_buckets_start_tracks_block_size(self, block_size):
+    def test_kv_buckets_are_block_size_independent(self, block_size):
+        """Buckets are token counts, so block_size only re-quantizes the derived
+        block counts; it does not move where the token boundaries fall."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+        assert b.kv_buckets == _list_default_kv(4096)
 
-    def test_kv_buckets_round_non_power_of_two_block_size_up(self):
+    def test_kv_buckets_unaffected_by_non_power_of_two_block_size(self):
         """The platform only forces block_size to a multiple of 64, so a
-        non-power-of-two value is reachable; buckets stay a clean doubling
-        sequence by starting at the next power of two."""
+        non-power-of-two value is reachable. Token buckets do not depend on it;
+        only the derived block counts are coarser."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == _list_default_kv(4096)
+        assert b.num_blocks_buckets == sorted(
+            {min(-(-kv // 192), 4096 // 192 + 1) for kv in b.kv_buckets}
+        )
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -97,7 +115,8 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _list_default_kv(3000)
+        assert b.kv_buckets[-1] == 3000
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -119,7 +138,8 @@ class TestFindBucket:
         assert bucketer.find_query_bucket(512) == 512
 
     def test_rounds_up(self, bucketer):
-        assert bucketer.find_kv_bucket(257) == 512
+        # Derived: the kv bucket set is a tunable default (SPYRE_ATTN_KV_BUCKETS).
+        assert bucketer.find_kv_bucket(257) == next(b for b in bucketer.kv_buckets if b >= 257)
         assert bucketer.find_query_bucket(33) == 512
 
     def test_query_len_one_maps_to_decode_bucket(self, bucketer):

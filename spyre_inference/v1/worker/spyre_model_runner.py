@@ -607,10 +607,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
         num_blocks = 0
+        # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
+        # alias blocks across lists; recompiling one is harmless but would double the count.
+        seen: set[int] = set()
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
-                if isinstance(block, PPMissingLayer):
+                if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
+                seen.add(id(block))
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.

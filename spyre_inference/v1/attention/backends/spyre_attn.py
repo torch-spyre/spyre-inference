@@ -1021,14 +1021,31 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             )
             # Each tile is [aligned_max_query_len, block_size] -- _record_one
             # builds same-shaped zero tiles by hand; keep them in sync.
-            for s in range(num_seqs):
-                seq_tiles: list[torch.Tensor] = []
-                for b in range(padded_num_blocks[s]):
-                    col_start = b * block_size
-                    col_end = col_start + block_size
-                    tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
-                    seq_tiles.append(tile.contiguous())
-                attention_mask_tiles.append(seq_tiles)
+            if aligned_max_query_len == 1:
+                # Decode only: a one-row slice is already contiguous, so the
+                # loop below returns views too and unbind reproduces the storage
+                # offsets the tiles have today (torch-spyre#3770 reads a view
+                # from offset 0).
+                max_padded_blocks = max(padded_num_blocks)
+                tiles_by_block = (
+                    mask_cpu[:num_seqs, :1, : max_padded_blocks * block_size]
+                    .reshape(num_seqs, 1, max_padded_blocks, block_size)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                attention_mask_tiles = [
+                    list(seq_row.unbind(0))[: padded_num_blocks[s]]
+                    for s, seq_row in enumerate(tiles_by_block.unbind(0))
+                ]
+            else:
+                for s in range(num_seqs):
+                    seq_tiles: list[torch.Tensor] = []
+                    for b in range(padded_num_blocks[s]):
+                        col_start = b * block_size
+                        col_end = col_start + block_size
+                        tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
+                        seq_tiles.append(tile.contiguous())
+                    attention_mask_tiles.append(seq_tiles)
             # active_block_indices stays None, so forward iterates all blocks.
         else:
             # Sliding window: arithmetic block-skip. Blocks entirely outside

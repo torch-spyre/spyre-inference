@@ -16,13 +16,14 @@
 
 RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
 ``spyre_inference.models.bert``; the embedding differs only in RoBERTa's
-position offset.
+position offset, which runs on CPU (SDSC cannot schedule integer add).
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from vllm.model_executor.models.bert import BertModel
 from vllm.model_executor.models.roberta import (
     BgeM3EmbeddingModel,
@@ -32,15 +33,29 @@ from vllm.model_executor.models.roberta import (
     RobertaForTokenClassification,
 )
 
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
 )
 
 if TYPE_CHECKING:
-    import torch
     from vllm.config import VllmConfig
     from vllm.model_executor.models.bert_with_rope import BertWithRope
+
+
+def offset_roberta_position_ids(
+    position_ids: torch.Tensor, padding_idx: int, device: torch.device
+) -> torch.Tensor:
+    """``position_ids + padding_idx + 1`` on CPU, then H2D as int64.
+
+    Stock torch-spyre cannot schedule SDSC int32 add (warmup crash:
+    ``0_add``), and int64 add CPU-falls-back through ``to_dtype``. Keep the
+    offset off the device so position embedding is only a gather.
+    """
+    pos = convert(position_ids, device="cpu")
+    pos = pos + int(padding_idx) + 1
+    return convert(pos, device=device, dtype=torch.int64)
 
 
 class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
@@ -59,7 +74,11 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
         embeddings = (
             inputs_embeds
             + self.spyre_token_type_embeddings(input_ids)
-            + self.position_embeddings(position_ids + self.padding_idx + 1)
+            + self.position_embeddings(
+                offset_roberta_position_ids(
+                    position_ids, self.padding_idx, input_ids.device
+                )
+            )
         )
         return self.LayerNorm(embeddings)
 

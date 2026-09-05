@@ -158,6 +158,23 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
+def head_major_kv_layout(num_rows: int, block_size: int, head_size: int, dtype: torch.dtype):
+    """Rows-outermost layout for the (page, kv_head)-folded cache.
+
+    The indexed axis must sit at device position 0 or index_select costs the whole
+    tensor, so the fold is materialised with this layout, not viewed out of slot-major.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (head_size + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[num_rows, block_size, sticks, eps],
+        stride_map=[block_size * head_size, head_size, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
 def _maybe_compile(fn, compile_enabled: bool):
     """Compile `fn` when enabled. Attention compiles separately from the model's
     fullgraph capture, which can't hold its per-sequence Python loop.
@@ -433,12 +450,9 @@ def _create_compilable_bucketed_decode_attn(
     logits_soft_cap: float = 0.0,
     needs_gather: bool = True,
     store_out: bool = False,
+    folded_kv: bool = False,
 ):
     """Bucketed decode kernel factory; gathers K/V and the query in-graph.
-
-    One gather per tensor, not one per block: two multi-element `index_select`s on
-    the same tensor in one graph exhaust every candidate output layout in
-    torch-spyre's `_multi_arg_pointwise_layouts` and fail to compile.
 
     `logits_soft_cap` and `needs_gather` are closure constants resolved at trace
     time, so each distinct value produces a different compiled graph.
@@ -447,7 +461,6 @@ def _create_compilable_bucketed_decode_attn(
     per step and is.
     """
 
-    lead = num_seqs * num_kv_heads
     num_heads = num_kv_heads * num_queries_per_kv
 
     def specialized_bucketed_decode_kernel(
@@ -456,32 +469,41 @@ def _create_compilable_bucketed_decode_attn(
         # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
         # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
         q_rows = query.index_select(0, query_row_ids) if needs_gather else query[:num_seqs]
-        q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size).reshape(
-            lead, num_queries_per_kv, 1, head_size
-        )
+        # lower_bmm's 4-D form takes two batch axes, so num_seqs and KV stay separate.
+        q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size)
         # k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache)
-        # block_ids: [num_blocks * num_seqs] flat int32, block-major
+        # block_ids: [num_blocks, stick-padded num_seqs] int32, row i holding the
+        #   i-th block's page index per sequence
         # mask_by_block: [num_blocks, num_seqs * KV, 1, block_size], pre-broadcast
         #   across KV heads by the builder
-        # block_ids is block-major, so this is contiguous and the per-block dim-0
-        # slice below keeps a layout torch-spyre can derive.
-        k_gath = k_pages.index_select(0, block_ids).reshape(
-            num_blocks, num_seqs, block_size, num_kv_heads, head_size
-        )
-        v_gath = v_pages.index_select(0, block_ids).reshape(
-            num_blocks, num_seqs, block_size, num_kv_heads, head_size
-        )
 
         tile_max = None
         tile_sum = None
         tile_output = None
 
         for i in range(num_blocks):
-            # Token-major to head-major, folded to 4-D: lower_bmm rejects 5-D.
-            k_page = k_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
-            v_page = v_gath[i].permute(0, 2, 1, 3).reshape(lead, 1, block_size, head_size)
-            # Builder already broadcast across KV heads; add the QPK axis.
-            mask_tile = mask_by_block[i].unsqueeze(1)
+            # index_select, not `k_pages[page_idx]`: subscripting lowers to
+            # aten.index, which upcasts the int32 index to int64 and fails eager.
+            if folded_kv:
+                # Rows are `page * num_kv_heads + head`, so the gather lands
+                # head-major already and needs no permute. That is what lets the
+                # page stay in LX: the split falls on kv, a batch axis of both
+                # matmuls, so the consumer can mirror the gather's division.
+                rows = block_ids[i, 0 : num_seqs * num_kv_heads]
+                k_page = k_pages.index_select(0, rows).reshape(
+                    num_seqs, num_kv_heads, block_size, head_size
+                )
+                v_page = v_pages.index_select(0, rows).reshape(
+                    num_seqs, num_kv_heads, block_size, head_size
+                )
+            else:
+                page_idx = block_ids[i, 0:num_seqs]
+                # Token-major cache page to head-major; a view, so do not add
+                # .contiguous() -- merging these axes is what materializes the page.
+                k_page = k_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+                v_page = v_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+            # Builder already broadcast across KV heads; split them back out.
+            mask_tile = mask_by_block[i].reshape(num_seqs, num_kv_heads, 1, block_size)
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             if logits_soft_cap > 0.0:
@@ -510,11 +532,11 @@ def _create_compilable_bucketed_decode_attn(
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
-        attn = (tile_output / tile_sum).squeeze(2)
+        attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
         if store_out:
             # The destination prefix starts at offset 0, so torch-spyre#3770 does not
             # apply; rows past the batch are don't-care and kept finite by the builder.
-            out[:num_seqs].copy_(attn.reshape(num_seqs, num_heads, head_size))
+            out[:num_seqs].copy_(attn)
             return out
         return attn
 
@@ -613,15 +635,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Bucketed-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). query_row_ids is int64 because
-    # Spyre's index_copy_ requires int64. block_ids_padded is kept 1D so the
-    # Spyre inductor doesn't have to lower a 2D→1D reshape whose inner dim is
-    # narrower than the stick width. mask_by_block is pre-permuted for cheap
+    # Spyre's index_copy_ requires int64. mask_by_block is pre-permuted for cheap
     # axis-0 slicing in the dispatch.
     bucket_num_seqs: int | None = None
     bucket_num_blocks: int | None = None
     query_row_ids_cpu: torch.Tensor | None = None  # [B_seqs] int64
     query_row_ids_dev: torch.Tensor | None = None
-    block_ids_padded_cpu: torch.Tensor | None = None  # [B_seqs * B_blocks] int32
+    block_ids_padded_cpu: torch.Tensor | None = None  # [B_blocks, padded B_seqs] int32
     block_ids_padded_dev: torch.Tensor | None = None
     mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, block_size] fp16
     mask_by_block_dev: torch.Tensor | None = None
@@ -1093,15 +1113,30 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Guards the identity scatter used by _run_bucketed_decode_dispatch.
                 assert query_row_ids_cpu[:num_seqs].tolist() == list(range(num_seqs))
 
-                # Block-major so the kernel's in-graph gather is contiguous: only a
-                # dim-0 slice of a contiguous base gets a correct device layout.
-                # Flat, not 2D: an inner dim narrower than the stick width (32)
-                # emits a Mod(d0, ...) stick expression the inductor rejects.
-                block_ids_padded_cpu = torch.zeros(b_blocks * b_seqs, dtype=torch.int32)
+                # Rows padded to the stick width: a narrower inner dim emits a
+                # Mod(d0, ...) stick expression the inductor rejects. Folded, each
+                # sequence contributes one row per kv head, so the row is that much
+                # wider before padding.
+                kv = self.num_kv_heads if envs.SPYRE_LX_KV_LAYOUT else 1
+                row_width = b_seqs * kv
+                index_len = (
+                    (row_width + INT32_ELEMS_PER_STICK - 1)
+                    // INT32_ELEMS_PER_STICK
+                    * INT32_ELEMS_PER_STICK
+                )
+                block_ids_padded_cpu = torch.zeros(b_blocks, index_len, dtype=torch.int32)
                 for s, n in enumerate(real_num_blocks):
                     n_use = min(n, b_blocks)
                     for b in range(n_use):
-                        block_ids_padded_cpu[b * b_seqs + s] = block_table[s, b]
+                        page = int(block_table[s, b])
+                        if envs.SPYRE_LX_KV_LAYOUT:
+                            # s-major so the kernel's reshape to
+                            # (num_seqs, num_kv_heads, ...) sees sequences outermost.
+                            base = page * kv
+                            for h in range(kv):
+                                block_ids_padded_cpu[b, s * kv + h] = base + h
+                        else:
+                            block_ids_padded_cpu[b, s] = page
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
@@ -1358,6 +1393,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     needs_gather=needs_gather,
                     store_out=store_out,
+                    folded_kv=envs.SPYRE_LX_KV_LAYOUT,
                 ),
                 self._compile_attn,
             )
@@ -1667,9 +1703,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output: torch.Tensor,
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here:
-        # (1) block_ids_padded_cpu is flat, not reshaped 2D → 1D, so no
-        # Mod(d0, B_blocks) stick expression; (2) K/V/q fold (B_seqs, KV) into
-        # one leading axis so lower_bmm sees ≤ 4-D; (3) the kernel's per-block
+        # (1) block_ids_padded_cpu rows are stick-padded, so the kernel's row
+        # slice emits no Mod(d0, ...) stick expression; (2) K/V/q keep (B_seqs, KV)
+        # as the two batch axes lower_bmm allows; (3) the kernel's per-block
         # index stays at Dynamo-trace time (torch-spyre would emit
         # Mod(d0, num_blocks) for a runtime .select); (4) result scatter is a
         # single contiguous copy_ at offset 0, valid because Q=1 forces
@@ -1689,7 +1725,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # K/V are gathered in-graph by the kernel: an out-of-graph per-block slice
         # has storage_offset > 0, which a compiled kernel reads as 0
         # (torch-spyre#3770), so each block needed a .clone().
-        block_ids_flat = attn_metadata.block_ids_padded_dev
+        block_ids = attn_metadata.block_ids_padded_dev
 
         # Short of b_seqs rows only when the runner's compile bucket is tighter than
         # the power-of-two seq bucket; the kernel slices a prefix otherwise.
@@ -1707,12 +1743,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kernel = self._get_bucketed_decode_kernel(
             b_seqs, b_blocks, block_size, needs_gather, store_out
         )
+        if envs.SPYRE_LX_KV_LAYOUT:
+            # head_size is a multiple of the stick, so collapsing (page, kv_head) is a
+            # pure re-view of the folded allocation's bytes.
+            k_pages = k_pages.reshape(-1, block_size, head_size)
+            v_pages = v_pages.reshape(-1, block_size, head_size)
         result = kernel(
             query_dev,
             attn_metadata.query_row_ids_dev if needs_gather else None,
             k_pages,
             v_pages,
-            block_ids_flat,
+            block_ids,
             attn_metadata.mask_by_block_dev,
             self.scale,
             output if store_out else None,

@@ -26,6 +26,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    INT32_ELEMS_PER_STICK,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -1787,7 +1788,12 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    block_ids = torch.arange(n_pages, dtype=torch.int64)
+    # [num_blocks, stick-padded num_seqs]: the kernel slices a row per block.
+    index_len = (
+        (num_seqs + INT32_ELEMS_PER_STICK - 1) // INT32_ELEMS_PER_STICK * (INT32_ELEMS_PER_STICK)
+    )
+    block_ids = torch.zeros(num_blocks, index_len, dtype=torch.int32)
+    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int32).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
     query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
     # Trailing None is the `out` buffer; unused because store_out defaults to False.

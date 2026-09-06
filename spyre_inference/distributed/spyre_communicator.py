@@ -84,6 +84,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         orig_size = input_.shape[dim]
         pad = (-orig_size) % self._GATHER_ALIGN
         if not pad:
+            # spyreccl rejects a non-contiguous input; the logits reaching us are a
+            # sliced view from the head's unpad.
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
             output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
             dist.all_gather(  # ty: ignore[possibly-missing-attribute]
                 output_list, input_, group=self.device_group

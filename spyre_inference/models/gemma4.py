@@ -19,11 +19,23 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
 if TYPE_CHECKING:
+    from torch import nn
+    from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
+
+# Scalar buffers that ``Gemma4Model`` owns and ``Gemma4SelfDecoderLayers``
+# re-exposes as plain attributes.
+_ALIASED_SCALARS = (
+    "normalizer",
+    "embed_scale_per_layer",
+    "per_layer_input_scale",
+    "per_layer_projection_scale",
+)
 
 
 # Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
@@ -93,33 +105,29 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
-def install_spyre_patches() -> None:
-    """Register Gemma-4's aliased ``normalizer`` as a buffer so it follows the model.
+def register_aliased_scalars(decoder: nn.Module) -> None:
+    """Turn the self-decoder's aliased scalar attributes into buffers."""
+    buffers = dict(decoder.named_buffers(recurse=False))
+    for name in _ALIASED_SCALARS:
+        scalar = getattr(decoder, name, None)
+        if scalar is None or name in buffers:
+            continue
+        delattr(decoder, name)
+        decoder.register_buffer(name, scalar, persistent=False)
 
-    ``Gemma4SelfDecoderLayers`` stores ``normalizer`` as a plain tensor attribute
-    aliased from ``Gemma4Model``'s buffer. ``model.to("spyre")`` rebinds the parent's
-    buffer to a device tensor but leaves this alias on CPU, so the compiled
-    ``embed_input_ids`` feeds a 0-d CPU tensor into Inductor, which has no notion of a
-    live CPU graph input. Re-registering it as a buffer restores the parent's documented
-    intent (move with the model, interact with torch.compile) and needs no change to the
-    embedding math. A device-side 0-d scalar lowers fine.
+
+class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
+    """Gemma-4 with the self-decoder's aliased scalars registered as buffers.
+
+    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
+    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
+    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
+    CPU tensor into Inductor, which has no notion of a live CPU graph input.
+    Re-registering the aliases restores the parent's stated intent (move with the
+    model, interact with torch.compile) and needs no change to the embedding math:
+    a device-side 0-d scalar lowers fine.
     """
-    from vllm.model_executor.models.gemma4 import Gemma4SelfDecoderLayers
 
-    if getattr(Gemma4SelfDecoderLayers, "_spyre_patched", False):
-        return
-
-    orig_init = Gemma4SelfDecoderLayers.__init__
-
-    def __init__(self, *args, **kwargs) -> None:
-        orig_init(self, *args, **kwargs)
-        normalizer = self.normalizer
-        del self.normalizer
-        self.register_buffer("normalizer", normalizer, persistent=False)
-
-    Gemma4SelfDecoderLayers.__init__ = __init__  # ty: ignore[invalid-assignment]
-    Gemma4SelfDecoderLayers._spyre_patched = True
-    logger.info(
-        "Spyre: Gemma-4 normalizer registered as a buffer so it follows the model to "
-        "device (upstream aliases it as a plain CPU attribute)."
-    )
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        register_aliased_scalars(self.model.self_decoder)

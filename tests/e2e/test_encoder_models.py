@@ -36,6 +36,13 @@ EMBEDDING_MODELS = [
     "sentence-transformers/all-roberta-large-v1",
 ]
 
+# MEAN product models. The default embed e2e uses max_num_seqs=1; batched MEAN
+# is ``test_encoder_embed_mean_multi_seq``.
+MEAN_POOLING_MODELS = [
+    "intfloat/multilingual-e5-large",
+    "sentence-transformers/all-roberta-large-v1",
+]
+
 # None of the product encoder models above ship with LAST pooling (CLS or MEAN).
 # Force LAST on a small CLS model so SpyreLastPool is covered end-to-end.
 LAST_POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
@@ -124,6 +131,42 @@ def test_encoder_embed_models(model: str) -> None:
         sim = _cosine(emb, ref_emb)
         assert sim >= COSINE_MIN, (
             f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
+        )
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", MEAN_POOLING_MODELS)
+def test_encoder_embed_mean_multi_seq(model: str) -> None:
+    """MEAN with ``max_num_seqs=2`` so two requests share one packed ``[T, H]``.
+
+    The default embed e2e is ``max_num_seqs=1`` and never hits two sequences
+    in one packed ``[T, H]`` copy.
+    """
+    ref = _REFERENCES.get(model)
+    if ref is None:
+        pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
+
+    prompts = ref["prompts"]
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=2,
+        enforce_eager=True,
+    )
+    outputs = llm.embed(prompts)
+    assert len(outputs) == len(prompts)
+
+    for prompt, out, ref_emb in zip(prompts, outputs, ref["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb), (
+            f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
+        )
+        assert all(math.isfinite(x) for x in emb)
+        sim = _cosine(emb, ref_emb)
+        assert sim >= COSINE_MIN, (
+            f"{model} batched MEAN: cosine {sim:.4f} < {COSINE_MIN} "
+            f"vs cached HF reference for prompt {prompt!r}"
         )
 
 

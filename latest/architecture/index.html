@@ -2292,8 +2292,8 @@ the write can scatter through a slot-major view of it:</p>
 <li><strong>Query length bucketing</strong>: <code>[1] + multiples of min(512, max_num_batched_tokens)</code>
   (consistent tensor shapes for compilation)</li>
 <li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
-<li><strong>Block size</strong>: Must be a multiple of 64; the platform rounds a user-supplied
-  <code>block_size</code> up to the next multiple of 64 automatically</li>
+<li><strong>Block size</strong>: Must be a multiple of 64. The default is 128, and a user-supplied
+  <code>block_size</code> is rounded up to the next multiple of 64</li>
 <li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today</li>
 <li><strong>Supported</strong>: sliding-window masking and logits soft-capping are both handled;

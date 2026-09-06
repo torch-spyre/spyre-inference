@@ -213,8 +213,8 @@ def build_inputs_from_requests(
     num_seqs = len(query_lens)
     max_kv = max(seq_lens)
     blocks_per_seq = (max_kv + block_size - 1) // block_size
-    if num_blocks < blocks_per_seq:
-        return None  # cache too small for this shape
+    if num_blocks < num_seqs * blocks_per_seq:
+        return None  # cache too small to give every sequence its own pages
 
     scale = head_size**-0.5
     total_q = sum(query_lens)
@@ -225,7 +225,11 @@ def build_inputs_from_requests(
     k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
     v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
 
-    block_tables = torch.randint(0, num_blocks, (num_seqs, blocks_per_seq), dtype=torch.int32)
+    # Sample without replacement: an aliased page would let one sequence
+    # overwrite another's KV and shrink the set of pages actually gathered.
+    block_tables = torch.randperm(num_blocks, dtype=torch.int32)[: num_seqs * blocks_per_seq].view(
+        num_seqs, blocks_per_seq
+    )
 
     slot_mapping = []
     hist_k, hist_v, hist_slots = [], [], []
@@ -534,8 +538,9 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             kv_layout=cfg.get("kv_layout", "plain"),
         )
         if inputs is None:
-            row["error"] = "insufficient blocks"
-            print("    -> skipped (insufficient blocks)", flush=True)
+            needed = len(query_lens) * row["num_kv_blocks_iterated"]
+            row["error"] = f"insufficient blocks (need num_blocks >= {needed})"
+            print(f"    -> skipped ({row['error']})", flush=True)
             records.append(row)
             return
 

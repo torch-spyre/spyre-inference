@@ -94,6 +94,9 @@ returned between configs (`kineto_profiling.md` §4.3) despite the runner's `gc.
 so it accumulates across a sweep; affected rows get `error` set and empty `ms`.
 
 - Pin `num_blocks` constant across runs you intend to compare.
+- Block tables are sampled without replacement, so `num_blocks` has to cover the whole
+  batch: `num_reqs * ceil(max_seq_len / block_size)`. Shapes that do not fit are skipped
+  with the required value in the `error` column.
 - Order decode captures before prefill (or run them separately) to avoid the
   fragmentation cascade.
 - A failed allocation strands memory for the rest of the process and degrades later rows'

@@ -766,14 +766,13 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 10. FP32 reduce then D2H (MEAN destagger — both paths fail)
+# 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971). A raw convert
-# of the reduction is interleaved garbage. Downcast to fp16, convert, then
-# upcast is also garbage (e5/roberta cosine ~-0.02). MEAN therefore copies
-# packed fp16 and reduces on the host. When either XPASS-es, MEAN can
-# destagger a device fp32 sum and copy [B, H].
+# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
+# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
+# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
+# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -805,16 +804,8 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
     torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "to(fp16) then convert then upcast is also garbage (e5/roberta cosine "
-        "~-0.02). MEAN copies packed fp16 and reduces on the host. When this "
-        "XPASS-es, MEAN can destagger a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
-    """to(fp16) before convert does not un-stagger a device fp32 sum."""
+    """to(fp16) before convert un-staggers a device fp32 sum."""
     acc, ref = _fp32_mean_reduction(spyre_device)
     torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
 

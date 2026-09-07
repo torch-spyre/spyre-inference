@@ -274,6 +274,18 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     return block_lists
 
 
+def _self_compiling_block_names(model: nn.Module) -> list[str]:
+    """Names of submodules that drive compiled regions of their own
+    (``spyre_compiles_own_regions``). Only per-block granularity can honor them, by
+    leaving them uncompiled; a whole-model graph traces through their eager driver.
+    """
+    return [
+        name
+        for name, module in model.named_modules()
+        if getattr(module, "spyre_compiles_own_regions", False)
+    ]
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -608,6 +620,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "whole-model graph. Models whose attention is not a vLLM Attention "
                 "(MLA, encoder-only vision towers) take this path.",
                 model_name,
+            )
+
+        # Reached by granularity=model or by the fallback above; neither can honor a
+        # block that compiles its own regions.
+        self_compiling = _self_compiling_block_names(cast(nn.Module, self.model))
+        if self_compiling:
+            raise ValueError(
+                f"{model_name} cannot be wrapped in a whole-model graph "
+                f"(SPYRE_COMPILE_GRANULARITY={granularity}): "
+                f"{len(self_compiling)} layer(s) compile their own regions "
+                f"({', '.join(self_compiling[:3])}) and would be traced through here. "
+                f"Use SPYRE_COMPILE_GRANULARITY=block."
             )
 
         self.model = torch.compile(

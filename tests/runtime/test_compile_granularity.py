@@ -33,6 +33,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
     _repeated_block_lists,
+    _self_compiling_block_names,
 )
 
 
@@ -262,6 +263,44 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
 
     assert compiled == [model]
     assert all(block._compiled_call_impl is None for block in model.model.layers)
+
+
+def test_model_granularity_is_refused_when_a_block_compiles_its_own_regions(
+    monkeypatch,
+) -> None:
+    """A whole-model graph would trace through the block's own eager driver."""
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: pytest.fail("must not compile"))
+
+    model = _Model(num_layers=4)
+    model.model.layers[2].spyre_compiles_own_regions = True
+
+    with pytest.raises(ValueError, match=r"model\.layers\.2"):
+        _runner(model)._compile_for_spyre()
+
+
+def test_block_fallback_is_refused_when_a_block_compiles_its_own_regions(
+    monkeypatch,
+) -> None:
+    """The fallback whole-model graph is no safer than the explicit one."""
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: pytest.fail("must not compile"))
+
+    class NoBlocks(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(4, 4)
+            self.layer.spyre_compiles_own_regions = True
+
+    with pytest.raises(ValueError, match="compile their own regions"):
+        _runner(NoBlocks())._compile_for_spyre()
+
+
+def test_self_compiling_block_names_reports_every_opted_out_layer() -> None:
+    model = _Model(num_layers=4)
+    assert _self_compiling_block_names(model) == []
+    for i in (1, 3):
+        model.model.layers[i].spyre_compiles_own_regions = True
+    assert _self_compiling_block_names(model) == ["model.layers.1", "model.layers.3"]
 
 
 def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:

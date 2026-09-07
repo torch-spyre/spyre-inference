@@ -170,7 +170,9 @@ Embeddings and the final norm sit outside the block list and stay eager. `lm_hea
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count.
+grows with layer count. It is refused -- as is the no-blocks-found fallback -- when a
+block sets `spyre_compiles_own_regions`, naming the layer: a whole-model graph would
+trace through that block's eager driver instead of leaving it alone.
 
 ## Attention Backend
 

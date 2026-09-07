@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import torch
 from vllm.config import CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import (
@@ -32,11 +33,9 @@ from spyre_inference.models._retype import retype
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    import torch
     from torch import nn
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
-    from vllm.sequence import IntermediateTensors
 
 logger = init_logger(__name__)
 
@@ -149,6 +148,30 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
         )
 
 
+class _PerLayerRows(torch.Tensor):
+    """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
+
+    Upstream's backbone loop cuts each block's row with exactly that index, and the view
+    it gets is at a nonzero storage offset, which a compiled block reads from offset 0
+    (torch-spyre#3770). Carrying the rows lets that loop stand as written.
+    """
+
+    # No subclass propagation: only the instance the projection hands back carries rows.
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
 class SpyreGemma4Model(Gemma4Model):
     """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
@@ -170,49 +193,18 @@ class SpyreGemma4Model(Gemma4Model):
             for layer_idx in range(len(self.layers))
         )
 
-    def forward(
+    def project_per_layer_inputs(
         self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-        per_layer_inputs: torch.Tensor | None = None,
-        **kwargs,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        """``forward`` for the plain single-rank text path; anything else goes upstream."""
-        if (
-            self.fast_prefill_enabled
-            or input_ids is None
-            or inputs_embeds is not None
-            or intermediate_tensors is not None
-            or per_layer_inputs is not None
-            or self.aux_hidden_state_layers
-            or self.start_layer != 0
-            or self.end_layer != len(self.layers)
-        ):
-            return super().forward(
-                input_ids,
-                positions,
-                intermediate_tensors,
-                inputs_embeds,
-                per_layer_inputs,
-                **kwargs,
-            )
-
-        hidden_states = self.embed_input_ids(input_ids)
-        ple = self.project_per_layer_inputs(hidden_states, self.get_per_layer_inputs(input_ids))
-        rows = None
-        if ple is not None:
-            # Each block needs its row as a real offset-0 allocation: a compiled kernel
-            # ignores ``storage_offset`` (torch-spyre#3770), and an in-graph
-            # ``index_select`` off the packed tensor does not lower.
-            rows = self.split_per_layer_inputs(ple.reshape(ple.shape[0], -1))
-        # Rows are cut here, not inside the block: a ``layer_idx``-derived offset would be
-        # a graph constant, so every block would compile its own artifact.
-        for layer_idx, layer in enumerate(self.layers):
-            row = None if rows is None else rows[layer_idx]
-            hidden_states, _ = layer(positions, hidden_states, None, per_layer_input=row, **kwargs)
-        return self.norm(hidden_states)
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Upstream's projection, carrying the per-layer rows its loop will ask for."""
+        ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if ple is None:
+            return None
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple.reshape(ple.shape[0], -1))
+        return rows
 
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):

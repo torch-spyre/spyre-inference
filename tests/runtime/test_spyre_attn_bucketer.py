@@ -21,11 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.backends.spyre_attn import (
-    _powers_of_two_up_to,
-    resolve_needs_gather,
-    resolve_store_mode,
-)
+from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
@@ -151,54 +147,17 @@ class TestVariants:
         variants = bucketer.variants()
         assert variants[0].num_blocks == max(v.num_blocks for v in variants)
 
-    def test_prunes_unreachable_flag_combinations(self, bucketer):
-        keys = {(v.store_mode, v.needs_gather) for v in bucketer.variants()}
-        # "copy" is the one-row batch, whose lone sequence necessarily owns row 0.
-        assert ("copy", True) not in keys
-
     def test_descriptor_is_frozen(self, bucketer):
         with pytest.raises(FrozenInstanceError):
             bucketer.variants()[0].num_blocks = 10
 
-    def test_copy_only_at_the_decode_bucket(self, bucketer):
-        """A "copy" store needs output.shape[0] == 1, i.e. the whole batch is one
-        token, which forces max_query_len == 1 and so the unpadded decode bucket."""
-        for v in bucketer.variants():
-            if v.store_mode == "copy":
-                assert v.padded_query_len == 1
-
-    def test_index_without_gather_is_recorded_above_the_decode_bucket(self, bucketer):
-        """A single-sequence prefill filling the query buffer exactly needs no
-        gather, yet stores by index since the batch is wider than one row."""
+    def test_query_buckets_stay_narrower_than_the_query_buffer(self):
+        """``SpyreAttentionImpl`` gathers unconditionally, which faults if a
+        sequence is the whole buffer, so every bucket must fit with a row spare."""
+        max_batched = 512
+        bucketer = SpyreAttnBucketer(make_config(max_num_batched_tokens=max_batched))
         for bucket in bucketer.query_buckets:
-            if bucket == 1:
-                continue
-            keys = {
-                (v.store_mode, v.needs_gather)
-                for v in bucketer.variants()
-                if v.padded_query_len == bucket
-            }
-            assert ("index", False) in keys
-
-    @pytest.mark.parametrize("output_rows", [1, 2, 8, 512])
-    @pytest.mark.parametrize("fused_store_ok", [True, False])
-    def test_every_resolved_runtime_pair_was_recorded(self, bucketer, output_rows, fused_store_ok):
-        """The anti-drift guard: the flags come from the backend's own resolvers,
-        so this fails if either the resolvers or the enumeration changes alone."""
-        recorded = {(v.store_mode, v.needs_gather) for v in bucketer.variants()}
-        for query_len in (1, 2, 5, 200, 512):
-            padded = bucketer.find_query_bucket(query_len)
-            assert padded is not None
-            if output_rows == 1 and padded != 1:
-                continue  # a one-row batch cannot hold a longer query
-            for q_start in (0, 1):
-                if q_start >= output_rows:
-                    continue
-                pair = (
-                    resolve_store_mode(fused_store_ok, output_rows),
-                    resolve_needs_gather(q_start, padded, padded, output_rows),
-                )
-                assert pair in recorded, f"unrecorded runtime pair {pair}"
+            assert bucket < max_batched + 1
 
     def test_prunes_query_buckets_no_real_query_len_can_reach(self, bucketer):
         """Pruning bounds the *smallest real* query_len that reaches a bucket, not
@@ -298,10 +257,8 @@ class TestEnvOverride:
 
 class TestBucketKey:
     def test_key_matches_attn_fn_cache_tuple(self):
-        b = SpyreAttnBucket(
-            num_blocks=4, padded_query_len=32, store_mode="index", needs_gather=True
-        )
-        assert b.key == (4, 32, "index", True)
+        b = SpyreAttnBucket(num_blocks=4, padded_query_len=32)
+        assert b.key == (4, 32)
 
 
 class TestBuilderAttnBucketer:

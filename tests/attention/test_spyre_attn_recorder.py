@@ -66,22 +66,6 @@ def kv_cache():
     )
 
 
-def _runtime_flag_pairs(bucketer, padded_query_len: int):
-    """The (store_mode, needs_gather) pairs a batch at this query bucket can hit.
-
-    Read off the bucketer rather than hardcoded, since it derives them from the
-    backend's own resolvers. "copy" needs a one-row batch, so it only appears
-    at the decode bucket.
-    """
-    pairs = {
-        (v.store_mode, v.needs_gather)
-        for v in bucketer.variants()
-        if v.padded_query_len == padded_query_len
-    }
-    assert pairs, f"no recorded variant at query bucket {padded_query_len}"
-    return pairs
-
-
 def make_bucketer(max_model_len=256, max_num_batched_tokens=64):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
@@ -104,8 +88,8 @@ class TestRecordGraphs:
     def test_dispatch_after_recording_does_not_grow_the_cache(self, impl, kv_cache):
         """The acceptance criterion: no request compiles a new variant.
 
-        Rounds sizes and resolves flags the way production does, so a drift
-        between the two copies of the rules shows up here.
+        Rounds sizes the way production does, so a drift between the two copies
+        of the rules shows up here.
         """
         bucketer = make_bucketer()
         impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
@@ -122,13 +106,7 @@ class TestRecordGraphs:
                 assert padded_query_len is not None and num_blocks is not None
                 if num_blocks > NUM_PAGES:
                     continue
-                for store_mode, needs_gather in _runtime_flag_pairs(bucketer, padded_query_len):
-                    impl._get_attn_fn(
-                        num_blocks,
-                        padded_query_len,
-                        store_mode=store_mode,
-                        needs_gather=needs_gather,
-                    )
+                impl._get_attn_fn(num_blocks, padded_query_len)
 
         assert len(impl._attn_fns) == snapshot
 
@@ -182,15 +160,7 @@ class TestRecordGraphs:
             assert num_blocks in bucketer.num_blocks_buckets, (
                 f"kv_len={kv_len} produced an unrecorded block count {num_blocks}"
             )
-            for store_mode, needs_gather in _runtime_flag_pairs(
-                bucketer, metadata.aligned_max_query_len
-            ):
-                impl._get_attn_fn(
-                    num_blocks,
-                    metadata.aligned_max_query_len,
-                    store_mode=store_mode,
-                    needs_gather=needs_gather,
-                )
+            impl._get_attn_fn(num_blocks, metadata.aligned_max_query_len)
 
         assert len(impl._attn_fns) == snapshot
 

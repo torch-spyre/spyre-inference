@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import CompilationMode
 from vllm.logger import init_logger
@@ -27,6 +27,7 @@ from vllm.model_executor.models.gemma4 import (
 )
 
 from spyre_inference.custom_ops.lazy_compile import compile_when_outermost
+from spyre_inference.models._retype import retype
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,8 +37,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
     from vllm.sequence import IntermediateTensors
-
-_ModuleT = TypeVar("_ModuleT", bound="nn.Module")
 
 logger = init_logger(__name__)
 
@@ -127,21 +126,6 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
             continue
         delattr(decoder, name)
         decoder.register_buffer(name, scalar, persistent=False)
-
-
-def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[_ModuleT]) -> _ModuleT:
-    """Retype an already-built submodule to its Spyre subclass, and hand it back.
-
-    ``Gemma4ForCausalLM`` and ``Gemma4Model`` name the classes they build, so there is no
-    ``embedding_class``-style hook to pass a subclass through.
-    """
-    if type(module) is not upstream:
-        raise RuntimeError(
-            f"expected {upstream.__name__}, got {type(module).__name__}; the Spyre "
-            "gemma-4 adaptations need updating for this vLLM version."
-        )
-    module.__class__ = spyre
-    return cast("_ModuleT", module)
 
 
 class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
@@ -242,14 +226,17 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     a device-side 0-d scalar lowers fine.
     """
 
+
+    model: SpyreGemma4Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        backbone = _retype(self.model, Gemma4Model, SpyreGemma4Model)
-        _retype(self.model.self_decoder, Gemma4SelfDecoderLayers, SpyreGemma4SelfDecoderLayers)
+        retype(self.model, SpyreGemma4Model)
+        retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
         # What ``CompileOutermost.__init__`` would set. Inheriting it would not help: its
         # ``super().__init__()`` walks the instance's MRO, i.e. the upstream backbone's.
-        backbone.spyre_compile_enabled = (
+        self.model.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )
-        backbone.spyre_compiled_kernel = None
+        self.model.spyre_compiled_kernel = None
         register_aliased_scalars(self.model.self_decoder)

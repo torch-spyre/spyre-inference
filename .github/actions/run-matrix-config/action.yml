@@ -11,6 +11,13 @@ inputs:
   test_target:
     description: Makefile target to run (matrix.test_target)
     required: true
+  durations_run_id:
+    description: >-
+      Run id (resolved once by the resolve_durations job) whose test-durations
+      artifact this leg downloads to weight its shard partition by recorded
+      per-test runtime. Empty or missing artifact -> heuristic fallback.
+    required: false
+    default: ''
   runner_labels:
     description: JSON array string of the runs-on labels the caller resolved to, forwarded to gather-runner-info
     required: true
@@ -144,6 +151,46 @@ runs:
       shell: bash
       run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
 
+    # All shard jobs of a suite must weight the partition from the SAME durations
+    # file or they'd compute different partitions and drop/double-run tests, so
+    # the run id is pinned once (resolve_durations job) and every leg downloads
+    # that one run's artifact. Missing artifact / no pin -> plugin falls back to
+    # its static heuristic weights (continue-on-error keeps the leg running).
+    # gh is not installed on the self-hosted Spyre runners, so download the pinned
+    # durations with the artifacts action (cross-run) instead of `gh run download`.
+    # Not continue-on-error: a leg that silently fell back to heuristic weights would
+    # compute a different partition than its siblings and drop or double-run tests.
+    # A non-empty run id means resolve_durations already saw the artifact, so a
+    # failed download is a real error to surface (and retry), not a reason to fall
+    # back; the no-pin case is handled by the `if` above, not by swallowing errors.
+    - name: Download pinned test durations
+      if: ${{ inputs.durations_run_id != '' }}
+      uses: actions/download-artifact@v4
+      with:
+        name: test-durations
+        path: ${{ runner.temp }}/test-durations
+        run-id: ${{ inputs.durations_run_id }}
+        repository: ${{ github.repository }}
+        github-token: ${{ github.token }}
+
+    - name: Point the sharder at the pinned durations
+      if: ${{ inputs.durations_run_id != '' }}
+      shell: bash
+      run: |
+        f="${RUNNER_TEMP}/test-durations/test-durations.json"
+        if [ ! -f "$f" ]; then
+          echo "::error::pinned durations run ${{ inputs.durations_run_id }} was downloaded but $f is missing"
+          exit 1
+        fi
+        echo "SPYRE_TEST_DURATIONS=$f" >> "$GITHUB_ENV"
+        echo "Weighting shards by durations from run ${{ inputs.durations_run_id }}"
+
+    # This leg records its own slice's per-test runtimes here; the durations
+    # fan-in job merges every leg's file into the next run's pinned artifact.
+    - name: Record this leg's test durations
+      shell: bash
+      run: echo "SPYRE_TEST_DURATIONS_OUT=${RUNNER_TEMP}/durations-${{ inputs.job_slot }}.json" >> "$GITHUB_ENV"
+
     # Marker expression and coverage wiring both live in the Makefile test_target; COVERAGE=1 drops .coverage.* data files for the fan-in.
     # Bounded so a wedged card acquisition (a blocking open() on a contended /dev/vfio device) cannot hang the job silently -- failing here keeps the step's log and lets the post steps publish JUnit.
     # Composite action steps don't support the `timeout-minutes` step key, so the same bound is enforced with the shell `timeout` command instead.
@@ -163,6 +210,16 @@ runs:
         name: coverage-${{ inputs.job_slot }}
         path: .coverage.*
         include-hidden-files: true # .coverage.* are dotfiles
+        if-no-files-found: ignore
+        retention-days: 14
+
+    # This leg's {nodeid: seconds} slice, merged by the durations fan-in job into the next run's pinned partition weights. if-no-files-found=ignore: a leg that ran nothing (all skipped) writes no file.
+    - name: Upload test durations
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: durations-data-${{ inputs.job_slot }}
+        path: ${{ runner.temp }}/durations-${{ inputs.job_slot }}.json
         if-no-files-found: ignore
         retention-days: 14
 

@@ -34,6 +34,8 @@ import torch
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
+pytestmark = pytest.mark.probe
+
 
 @pytest.fixture()
 def spyre_device():
@@ -764,14 +766,13 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 10. FP32 reduce then D2H (MEAN destagger — both paths fail)
+# 10. FP32 reduce then D2H (MEAN destagger)
 # ---------------------------------------------------------------------------
 #
-# Device fp32 is staggered inside sticks (torch-spyre#2971). A raw convert
-# of the reduction is interleaved garbage. Downcast to fp16, convert, then
-# upcast is also garbage (e5/roberta cosine ~-0.02). MEAN therefore copies
-# packed fp16 and reduces on the host. When either XPASS-es, MEAN can
-# destagger a device fp32 sum and copy [B, H].
+# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
+# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
+# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
+# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
 
 
 def _fp32_mean_reduction(spyre_device):
@@ -803,16 +804,8 @@ def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
     torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "to(fp16) then convert then upcast is also garbage (e5/roberta cosine "
-        "~-0.02). MEAN copies packed fp16 and reduces on the host. When this "
-        "XPASS-es, MEAN can destagger a device fp32 sum."
-    ),
-)
 def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
-    """to(fp16) before convert does not un-stagger a device fp32 sum."""
+    """to(fp16) before convert un-staggers a device fp32 sum."""
     acc, ref = _fp32_mean_reduction(spyre_device)
     torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
 
@@ -891,3 +884,50 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
         if not re.search(rf"""register_buffer\(\s*["']{name}["']""", src)
     ]
     assert not plain, f"still plain attributes upstream: {plain}"
+
+
+# ---------------------------------------------------------------------------
+# 13. Short-row matmul scheduling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
+        "same weight sustains with a full 8-row block, so padding the activation out "
+        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
+        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "constants it reads. Tracked by torch-spyre#4032."
+    ),
+)
+def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
+    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    import time
+
+    from torch_spyre.streams import synchronize
+
+    # granite-3.3-8b's gate_up_proj weight_t -- the shape the workaround targets.
+    weight = torch.randn(4096, 25600, dtype=torch.float16, device=spyre_device)
+    activations = {
+        m: torch.randn(m, 4096, dtype=torch.float16, device=spyre_device) for m in (1, 8)
+    }
+
+    def best_of(rows, reps=8):
+        best = float("inf")
+        for _ in range(reps):
+            start = time.perf_counter()
+            torch.matmul(activations[rows], weight)
+            synchronize()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    for rows in (1, 8):  # compile and warm both kernels before timing either
+        best_of(rows, reps=3)
+    one_row, full_block = best_of(1), best_of(8)
+
+    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
+    assert one_row <= 1.10 * full_block, (
+        f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
+        f"({100 * (one_row / full_block - 1):.0f}% slower)"
+    )

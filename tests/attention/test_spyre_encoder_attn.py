@@ -99,6 +99,9 @@ def _build_metadata(
     vllm_config = get_current_vllm_config()
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
     vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    # The builder asserts these agree, and derives its padding buckets from the
+    # cache_config one, so a test block_size has to be set in both places.
+    vllm_config.cache_config.block_size = block_size
 
     kv_cache_spec = AttentionSpec(
         block_size=block_size,

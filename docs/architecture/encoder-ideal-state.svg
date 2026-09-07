@@ -136,7 +136,7 @@
 
   <!-- ================= RIGHT 3: warmup ================= -->
   <rect x="1056" y="604" width="618" height="236" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
-  <text class="t sect" x="1076" y="632">Startup: warmup walks both ladders</text>
+  <text class="t sect" x="1076" y="632">Startup: warmup walks both sets of buckets</text>
 
   <rect x="1076" y="648" width="578" height="52" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
   <text class="t bt" x="1365" y="672" text-anchor="middle">for T in token buckets: _dummy_run(T)</text>
@@ -177,7 +177,7 @@
   <text class="t id" x="66" y="1304">· build an additive mask [S, 1, L, L] marking padding and cross-request slots</text>
   <text class="t id" x="66" y="1324">· build three index lists, then gather Q / K / V into [S, H, L, D]</text>
   <text class="t id" x="66" y="1344">· one fused SDPA kernel per (S, L), then gather the results back out</text>
-  <text class="t id" x="66" y="1370" font-weight="700">Shape axes: T for the body, (S, L) for attention. Two ladders to warm.</text>
+  <text class="t id" x="66" y="1370" font-weight="700">Shape axes: T for the body, (S, L) for attention. Two sets of buckets to warm.</text>
   <text class="t id" x="66" y="1392">Costs: the mask grows with L² · index lists and a barrier per gather.</text>
   <text class="t id" x="66" y="1414">Works today. This is the current implementation.</text>
 

@@ -53,10 +53,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
-    # When "1", pre-compile every attention variant the run can need during warmup,
-    # so no request pays an Inductor compile mid-serving. "0" (default) falls back to
+    # When "1" (default), pre-compile every attention variant the run can need during
+    # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
     # compiling each variant lazily on first use.
-    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "0"))),
+    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),

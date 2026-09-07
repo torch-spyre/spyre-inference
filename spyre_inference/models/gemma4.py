@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre adaptations for vLLM's Gemma-4 model.
-
-Covers the dense 12B/31B variants and the E2B/E4B E-variants, whose per-layer embeddings
-(PLE) need two changes to lower on Spyre. Their other distinguishing feature, KV-sharing,
-needs nothing model-specific: the one vLLM KV-cache-group fix it wants is generic and
-lives in ``TorchSpyreModelRunner``.
-"""
+"""Spyre adaptations for vLLM's Gemma-4 model."""
 
 from __future__ import annotations
 
@@ -139,10 +133,7 @@ def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[_ModuleT])
     """Retype an already-built submodule to its Spyre subclass, and hand it back.
 
     ``Gemma4ForCausalLM`` and ``Gemma4Model`` name the classes they build, so there is no
-    ``embedding_class``-style hook to pass a subclass through. The built instance is
-    retyped instead: same ``__init__``, same parameters, same module tree — only the
-    overridden methods differ. Checked rather than assumed, so an upstream rename fails
-    loudly instead of silently running the unadapted forward.
+    ``embedding_class``-style hook to pass a subclass through.
     """
     if type(module) is not upstream:
         raise RuntimeError(
@@ -159,9 +150,8 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         """``get_per_layer_inputs`` without upstream's vocab-range mask.
 
-        The Spyre backend cannot lower a torch.bool result over an int32 operand, and the
-        mask is a no-op whenever ``vocab_size_per_layer_input >= vocab_size``. Smaller PLE
-        vocabs keep upstream's masked path.
+        Spyre cannot lower a torch.bool result over an int32 operand, and the mask is a
+        no-op whenever ``vocab_size_per_layer_input >= vocab_size``.
         """
         if self.embed_tokens_per_layer is None:
             return None
@@ -178,8 +168,7 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
 class SpyreGemma4Model(Gemma4Model):
     """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
-    # ``CompileOutermost``'s two fields, declared rather than set in an ``__init__`` that
-    # retyping never runs; ``SpyreGemma4ForCausalLM`` fills them in.
+    # ``CompileOutermost``'s two fields, set by ``SpyreGemma4ForCausalLM``.
     spyre_compile_enabled: bool
     spyre_compiled_kernel: Callable | None
 
@@ -187,11 +176,8 @@ class SpyreGemma4Model(Gemma4Model):
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Hand back every layer's PLE row, each in its own allocation.
 
-        One graph rather than one eager ``clone`` per layer. The copies themselves are
-        unavoidable — see ``forward`` — but eager ones cost a host launch each on a
-        forward pass that is already host-bound, and there are ``num_hidden_layers`` of
-        them per step. Compiled, they are one launch: measured ~2.4x cheaper than the
-        eager form across every warmup bucket.
+        One graph, so the unavoidable copies cost one host launch per step instead of
+        ``num_hidden_layers`` of them on an already host-bound forward.
         """
         ple_dim = self.hidden_size_per_layer_input
         return tuple(
@@ -208,25 +194,7 @@ class SpyreGemma4Model(Gemma4Model):
         per_layer_inputs: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        """``forward`` for the plain single-rank text path; anything else goes upstream.
-
-        Upstream slices ``per_layer_inputs[:, layer_idx, :]`` per layer and hands the block
-        that view. Two things stop it working here: a compiled kernel reads its arguments
-        from offset 0, ignoring ``storage_offset`` (torch-spyre#3770), and torch-spyre
-        cannot lay out the 3-D tensor at a graph boundary. So each row has to be a real
-        allocation, cut from a 2-D view -- a view of any width is read as layer 0's row,
-        and an in-graph ``index_select`` off the packed tensor does not lower at all
-        ("no mechanism to resolve stick incompatibility").
-
-        Cutting them here rather than inside the block is what keeps warmup affordable: a
-        ``layer_idx``-derived offset inside ``forward`` is a graph constant, so every block
-        would guard differently and compile its own artifact (35 for E2B, 42 for E4B)
-        instead of all of them sharing one. ``split_per_layer_inputs`` then keeps the
-        copies off the host critical path.
-
-        ``residual=None`` each iteration is exact: ``Gemma4DecoderLayer.forward`` overwrites
-        ``residual`` on entry and always returns ``None`` for it.
-        """
+        """``forward`` for the plain single-rank text path; anything else goes upstream."""
         if (
             self.fast_prefill_enabled
             or input_ids is None
@@ -250,7 +218,12 @@ class SpyreGemma4Model(Gemma4Model):
         ple = self.project_per_layer_inputs(hidden_states, self.get_per_layer_inputs(input_ids))
         rows = None
         if ple is not None:
+            # Each block needs its row as a real offset-0 allocation: a compiled kernel
+            # ignores ``storage_offset`` (torch-spyre#3770), and an in-graph
+            # ``index_select`` off the packed tensor does not lower.
             rows = self.split_per_layer_inputs(ple.reshape(ple.shape[0], -1))
+        # Rows are cut here, not inside the block: a ``layer_idx``-derived offset would be
+        # a graph constant, so every block would compile its own artifact.
         for layer_idx, layer in enumerate(self.layers):
             row = None if rows is None else rows[layer_idx]
             hidden_states, _ = layer(positions, hidden_states, None, per_layer_input=row, **kwargs)
@@ -260,26 +233,21 @@ class SpyreGemma4Model(Gemma4Model):
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 adapted for the Spyre compile path.
 
-    Two adaptations, both retyped onto the built module tree:
-
-    - The aliased scalars become buffers. ``Gemma4SelfDecoderLayers`` holds four scalar
-      buffers owned by ``Gemma4Model`` as plain tensor attributes, so ``model.to("spyre")``
-      rebinds the parent's buffers but leaves the aliases on CPU and the compiled
-      ``embed_input_ids`` feeds a 0-d CPU tensor into Inductor, which has no notion of a
-      live CPU graph input. Re-registering them restores the parent's stated intent (move
-      with the model, interact with torch.compile) and needs no change to the embedding
-      math: a device-side 0-d scalar lowers fine.
-    - The PLE path (E2B/E4B) drops a mask Spyre cannot lower and hands each block its own
-      row as an offset-0 tensor; see the subclasses above.
+    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
+    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
+    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
+    CPU tensor into Inductor, which has no notion of a live CPU graph input.
+    Re-registering the aliases restores the parent's stated intent (move with the
+    model, interact with torch.compile) and needs no change to the embedding math:
+    a device-side 0-d scalar lowers fine.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         backbone = _retype(self.model, Gemma4Model, SpyreGemma4Model)
         _retype(self.model.self_decoder, Gemma4SelfDecoderLayers, SpyreGemma4SelfDecoderLayers)
-        # What ``CompileOutermost.__init__`` would set. Retyping runs no ``__init__``, and
-        # inheriting it would not help: its ``super().__init__()`` walks the *instance's*
-        # MRO, which is the upstream backbone's.
+        # What ``CompileOutermost.__init__`` would set. Inheriting it would not help: its
+        # ``super().__init__()`` walks the instance's MRO, i.e. the upstream backbone's.
         backbone.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )

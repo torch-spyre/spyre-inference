@@ -58,7 +58,6 @@ _COSINE_MIN = 0.99
             "\n\nWhat is the IBM logo?\n\nWhat is the IBM slogan?\n\nWhat",
         ),
     ],
-    # Named so `-k <model>` selects one row; default tuple ids are positional.
     ids=["micro-g3.3-8b", "gemma-3-1b-it", "gemma-4-31B", "gemma-4-E2B", "gemma-4-E4B"],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:

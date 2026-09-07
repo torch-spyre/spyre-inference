@@ -17,10 +17,14 @@ public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
   - BAAI/bge-base-en-v1.5
   - sentence-transformers/all-MiniLM-L12-v2
-  - ibm-granite/granite-embedding-125m-english
-  - ibm-granite/granite-embedding-278m-multilingual
-  - intfloat/multilingual-e5-large
-  - sentence-transformers/all-roberta-large-v1
+  - repo: ibm-granite/granite-embedding-125m-english
+    revision: 4ab61ffd423be45cd932b21a7c696063d82bf45f
+  - repo: ibm-granite/granite-embedding-278m-multilingual
+    revision: a9cb5338491faf32b73dd17b714a31821c021bbf
+  - repo: intfloat/multilingual-e5-large
+    revision: 3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3
+  - repo: sentence-transformers/all-roberta-large-v1
+    revision: cf74d8acd4f198de950bf004b262e6accfed5d2c
   - repo: BAAI/bge-reranker-v2-m3
     revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
   - repo: BAAI/bge-reranker-large

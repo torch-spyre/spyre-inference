@@ -31,6 +31,19 @@ EMBEDDING_MODELS = [
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
 ]
+
+# Pinned so a reference keeps meaning one specific set of weights. Unpinned, an upstream
+# re-upload silently redefines what the cosine gate compares against, and the test cannot
+# tell that from a regression on the Spyre side. Written into the JSON per model and read
+# back by the test, so the gate loads the same revision this file measured -- do not pin
+# here without regenerating.
+MODEL_REVISIONS = {
+    "ibm-granite/granite-embedding-125m-english": "4ab61ffd423be45cd932b21a7c696063d82bf45f",
+    "ibm-granite/granite-embedding-278m-multilingual": "a9cb5338491faf32b73dd17b714a31821c021bbf",
+    "intfloat/multilingual-e5-large": "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3",
+    "sentence-transformers/all-roberta-large-v1": "cf74d8acd4f198de950bf004b262e6accfed5d2c",
+}
+
 EMBEDDING_PROMPTS = [
     "Hello world.",
     "The quick brown fox jumps over the lazy dog.",
@@ -44,10 +57,12 @@ def main() -> None:
     data: dict[str, dict] = {}
 
     for model in EMBEDDING_MODELS:
-        print(f"Encoding {model} ...")
-        st = SentenceTransformer(model, device="cpu")
+        revision = MODEL_REVISIONS[model]
+        print(f"Encoding {model} @ {revision} ...")
+        st = SentenceTransformer(model, revision=revision, device="cpu")
         embeddings = st.encode(prompts, normalize_embeddings=True)
         data[model] = {
+            "revision": revision,
             "prompts": prompts,
             "embeddings": [[round(float(x), _ROUND) for x in row] for row in embeddings],
         }

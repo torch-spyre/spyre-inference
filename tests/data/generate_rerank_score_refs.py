@@ -44,7 +44,13 @@ MODEL_REVISIONS = {
 # One query against documents a reranker should separate widely, listed most relevant
 # first. The spread is what lets the test gate the *ranking* and not only the individual
 # scores, so neighbouring documents have to stay far enough apart that fp16 drift cannot
-# swap them: every adjacent pair below differs by at least a factor of 8 in odds.
+# swap them. What has to clear that is the gap against the drift the two scores can absorb
+# between them -- min(7e-3, 13% * p) each, the worst measured in test_encoder_models.py --
+# and not a ratio of scores or of odds: odds explode near p=1, where drift is absolute, and
+# collapse onto the score ratio near p=0, where it is relative, so either ratio rates the
+# wrong pair as the risky one. The tightest pair below clears its combined drift by 2.8x
+# (the top two, 0.99997 vs 0.96147: a gap of 0.039 against 0.014 of drift); every other
+# pair clears it by 6x or more.
 QUERY = "What is the capital of France?"
 DOCUMENTS = [
     "The capital of France is Paris.",
@@ -57,8 +63,11 @@ DOCUMENTS = [
 
 # bge-reranker-large saturates: it scores every Paris-adjacent document above 0.9994, so on
 # the list above its top five land within 5e-4 of each other and their order is decided by
-# fp16 noise rather than by relevance. Give it documents spread across the range it
-# actually resolves. Drop this entry only for a model that separates the shared list.
+# fp16 noise rather than by relevance -- the same drift bound, failed. Give it documents
+# spread across the range it actually resolves; the list below clears that bound by 4.4x at
+# its tightest (0.00187 vs 0.00052, a gap of 1.4e-3 against 3.1e-4 of drift), so it is the
+# safer of the two despite sitting lower. Drop this entry only for a model that separates
+# the shared list.
 MODEL_DOCUMENTS = {
     "BAAI/bge-reranker-large": [
         "The capital of France is Paris.",

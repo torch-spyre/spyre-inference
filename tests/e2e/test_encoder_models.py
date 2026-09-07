@@ -100,12 +100,12 @@ def _cosine(a: list[float], b: list[float]) -> float:
     ).item()
 
 
-def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float]]:
+def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> list[list[float]]:
     """CPU HF last-nonpad-token + L2 (matches vLLM LastPool + normalize)."""
     from transformers import AutoModel, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
-    hf = AutoModel.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(model, revision=revision)
+    hf = AutoModel.from_pretrained(model, revision=revision)
     hf.eval()
     with torch.inference_mode():
         enc = tok(
@@ -145,6 +145,8 @@ def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
     prompts = ref["prompts"]
     llm = LLM(
         model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
@@ -180,6 +182,8 @@ def test_encoder_embed_mean_multi_seq(model: str) -> None:
     prompts = ref["prompts"]
     llm = LLM(
         model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
         runner="pooling",
         max_model_len=64,
         max_num_seqs=2,
@@ -209,11 +213,17 @@ def test_encoder_embed_last_pooling() -> None:
     override exercises the LAST gather + normalize path that
     ``configure_pooling_for_spyre`` patches to ``SpyreLastPool``.
     """
+    # Taken from the embed reference entry rather than hardcoded, so this case cannot drift
+    # onto a different revision than the embed gates measure. Both sides are computed in
+    # the same run here, so the pin buys reproducibility, not a valid comparison.
+    revision = _REFERENCES[LAST_POOLING_MODEL]["revision"]
     prompts = LAST_POOLING_PROMPTS
-    ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, prompts)
+    ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, revision, prompts)
 
     llm = LLM(
         model=LAST_POOLING_MODEL,
+        revision=revision,
+        tokenizer_revision=revision,
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
@@ -252,6 +262,16 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
+    """What runs on Spyre here is the encoder body, not the score itself.
+
+    A reranker's classifier head stays float32, and torch-spyre has no FP32 batchmatmul
+    (torch-spyre#1794), so ``configure_pooling_for_spyre`` sends the whole pooling tail
+    through ``run_pooling_tail_on_cpu`` -- logged as "FP32 classifier/head unsupported on
+    Spyre ... running pooler on CPU" at load, in the compiled case as much as the eager
+    one. So the bounds below gate the transformer blocks and the CLS gather, and a
+    regression confined to the head or the sigmoid would pass both. Extending the gate to
+    it needs the head on device, not another tolerance.
+    """
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")

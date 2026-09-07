@@ -108,6 +108,12 @@ Regenerate only when the *expected* output changes (new model or prompt), never 
 failing test pass — that is the regression the gate exists to catch. Prompts are per
 model: `MODEL_PROMPTS` (decoders) and `MODEL_DOCUMENTS` (rerankers) in the generators say
 which models get their own inputs and why.
+
+Every gated model is pinned to a revision, in the generator's `MODEL_REVISIONS` and again
+in `.github/cache_config/hf_models_and_datasets.yaml`. Each generator writes the revision
+it measured into its JSON, and the test loads that revision back — so a reference always
+names the weights it was taken from, and an upstream re-upload cannot silently redefine
+what the gate compares against. Bumping a pin means regenerating that model's reference.
 `SPYRE_TEST_ABS_TOL` (default `0.08`) and `SPYRE_TEST_REL_TOL` (default `0.5`) set the
 decoder probability tolerance: the stricter of the two applies, so a low-confidence
 reference token is held to a fraction rather than to the same absolute margin.

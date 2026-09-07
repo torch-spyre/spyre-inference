@@ -24,129 +24,38 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.compilation import CompilationConfig
 
 
-def _round_up_to_multiple_of_64(value: int) -> int:
-    """Helper: the exact rounding formula used in platform.py."""
-    return ((value + 63) // 64) * 64
-
-
-def test_block_size_override_formula():
-    """Test the round-up formula used for block_size override.
-
-    This isolates the core logic: ((value + 63) // 64) * 64
-    """
-    # Values that need rounding up
-    assert _round_up_to_multiple_of_64(1) == 64
-    assert _round_up_to_multiple_of_64(16) == 64
-    assert _round_up_to_multiple_of_64(32) == 64
-    assert _round_up_to_multiple_of_64(63) == 64
-    assert _round_up_to_multiple_of_64(65) == 128
-    assert _round_up_to_multiple_of_64(100) == 128
-    assert _round_up_to_multiple_of_64(127) == 128
-
-    # Values already aligned (should stay the same)
-    assert _round_up_to_multiple_of_64(64) == 64
-    assert _round_up_to_multiple_of_64(128) == 128
-    assert _round_up_to_multiple_of_64(256) == 256
-
-
-def test_block_size_override_default():
-    """Test that check_and_update_config overrides block_size when not user-specified.
-
-    The platform should round up non-64-aligned block sizes to the nearest
-    multiple of 64 when user_specified_block_size is False (default case).
-    """
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (None, 128),
+        (16, 64),
+        (100, 128),
+        (64, 64),
+        (128, 128),
+        (256, 256),
+    ],
+)
+def test_block_size(requested, expected):
+    """A user-supplied block size is rounded up to 64; otherwise the Spyre default wins."""
     from spyre_inference.platform import TorchSpyrePlatform
 
-    # Default block_size=16 (not user-specified)
-    cache_config = CacheConfig()
-    assert not cache_config.user_specified_block_size
-    assert cache_config.block_size == 16
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    compilation_config = CompilationConfig(custom_ops=["all"])
+    cache_config = CacheConfig(block_size=requested)
+    assert cache_config.user_specified_block_size == (requested is not None)
 
     vllm_config = VllmConfig(
-        model_config=model_config,
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
         cache_config=cache_config,
-        compilation_config=compilation_config,
+        compilation_config=CompilationConfig(custom_ops=["all"]),
     )
 
     TorchSpyrePlatform.check_and_update_config(vllm_config)
 
-    assert vllm_config.cache_config.block_size % 64 == 0
-
-
-def test_block_size_override_non_default_value():
-    """Test override with a non-standard block_size value.
-
-    This simulates a scenario where block_size=100 should round to 128.
-    """
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    # Create config with block_size=None, then set to 100
-    # This keeps user_specified_block_size=False
-    cache_config = CacheConfig(block_size=None)
-    assert not cache_config.user_specified_block_size
-
-    object.__setattr__(cache_config, "block_size", 100)
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert vllm_config.cache_config.block_size == 128
-
-
-def test_block_size_override_user_specified():
-    """Test that even user-specified block_size is overridden when invalid.
-
-    Spyre has a hard requirement for block_size to be a multiple of 64.
-    Even when the user (or test harness) explicitly passes an invalid value,
-    the platform must correct it to avoid a later ValueError.
-    """
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    cache_config = CacheConfig(block_size=16)
-    assert cache_config.user_specified_block_size, "Should be user-specified"
-    assert cache_config.block_size == 16
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert vllm_config.cache_config.block_size == 64, (
-        f"User-specified block_size=16 should be overridden to 64, "
-        f"got {vllm_config.cache_config.block_size}"
-    )
+    assert vllm_config.cache_config.block_size == expected
 
 
 def test_torch_accelerator_ops_are_noop():
@@ -179,31 +88,6 @@ def test_torch_accelerator_ops_are_noop():
         torch.accelerator.empty_cache = saved_empty_cache
         torch.accelerator.synchronize = saved_synchronize
         torch.accelerator.empty_host_cache = saved_empty_host_cache
-
-
-def test_block_size_valid_no_override():
-    """Test that valid block_size (multiple of 64) is not changed."""
-    from spyre_inference.platform import TorchSpyrePlatform
-
-    cache_config = CacheConfig(block_size=128)
-
-    model_config = ModelConfig(
-        model="Qwen/Qwen3-0.6B",
-        max_model_len=1,
-        dtype=torch.float16,
-        trust_remote_code=True,
-    )
-    compilation_config = CompilationConfig(custom_ops=["all"])
-
-    vllm_config = VllmConfig(
-        model_config=model_config,
-        cache_config=cache_config,
-        compilation_config=compilation_config,
-    )
-
-    TorchSpyrePlatform.check_and_update_config(vllm_config)
-
-    assert vllm_config.cache_config.block_size == 128
 
 
 def test_num_gpu_blocks_override_homogeneous():

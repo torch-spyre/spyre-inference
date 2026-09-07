@@ -32,6 +32,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
+    _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1176,6 +1177,11 @@ def test_kv_cache_shape_matches_runner_allocation():
     fake_layer.kv_cache = None
     runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
 
+    # spyre_available() allocates on the device, which creates the RuntimeContext that
+    # initialize_kv_cache_tensors' layout-carrying transfer needs but will not create.
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
     k_pages = caches["layers.0.self_attn"].k_pages
     v_pages = caches["layers.0.self_attn"].v_pages
@@ -1186,6 +1192,13 @@ def test_kv_cache_shape_matches_runner_allocation():
     # Sanity: the physical layout is token-major (block_size before num_kv_heads),
     # and each page is contiguous in the last two dims.
     assert k_pages.shape == (num_blocks, block_size, num_kv_heads, head_size)
+
+    # The paged scatter indexes dim 0, so the slot axis has to stay whole at device
+    # position 0: the default tiled layout splits it across two device dims and writes
+    # the wrong rows (torch-spyre#3705).
+    num_slots = num_blocks * block_size
+    for pages in (k_pages, v_pages):
+        assert pages.device_tensor_layout().device_size[0] == num_slots
 
 
 def test_sliding_window_none_equivalence(default_vllm_config):
@@ -1787,7 +1800,9 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    block_ids = torch.arange(n_pages, dtype=torch.int64)
+    # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
+    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
+    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
     query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
     # Trailing None is the `out` buffer; unused because store_out defaults to False.
@@ -1842,6 +1857,50 @@ def test_spyre_attn_bucketed_decode_fallback(
         seq_lens=seq_lens,
         block_size=128,
         sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("seq_lens", "sliding_window"),
+    [
+        # kv_lens are chosen so first_active > 0, i.e. the active blocks are a
+        # strict suffix; covers_all is the first_active == 0 control.
+        pytest.param([(1, 768)] * 8, 512, id="window512_multiblock(N=8)"),
+        pytest.param(
+            [(1, 768), (1, 896), (1, 1024), (1, 1152), (1, 1280), (1, 768)],
+            512,
+            id="window512_mixed_offsets(N=6)",
+        ),
+        pytest.param([(1, 512)] * 8, 128, id="window128_single_active(N=8)"),
+        pytest.param([(1, 768)] * 8, 500, id="window500_unaligned(N=8)"),
+        pytest.param([(1, 256)] * 8, 4096, id="window_covers_all(N=8)"),
+    ],
+)
+def test_spyre_attn_bucketed_decode_sliding_window(
+    default_vllm_config,
+    enable_bucketed_decode,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Bucketed decode with a sliding window: matches the per-seq reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
     )

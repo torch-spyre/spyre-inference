@@ -160,8 +160,8 @@ Key constraints:
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
-- **Block size**: Must be a multiple of 64; the platform rounds a user-supplied
-  `block_size` up to the next multiple of 64 automatically
+- **Block size**: Must be a multiple of 64. The default is 128, and a user-supplied
+  `block_size` is rounded up to the next multiple of 64
 - **GQA only**: MHA (`num_queries_per_kv = 1`) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today
 - **Supported**: sliding-window masking and logits soft-capping are both handled;

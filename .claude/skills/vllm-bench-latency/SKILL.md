@@ -61,7 +61,7 @@ CSIZES='[1,2,4,512]'   # at bs=4/512 this IS the default -- pins it, saves nothi
 
 Derive the list from the config, don't copy it. `bs=1`, `in64/out64/max128`: decode schedules 1 token, the prompt prefills in one chunk, so `[1,64]` is the complete cover — and a max of 64 is safe here precisely because 64 already holds the whole prompt. `bs=4` with a 3200-token prompt: decode schedules 1–4, prefill chunks fill the budget, so `[1,2,4,512]` (`find_bucket` pads 3 up to 4).
 
-**KV block count** — the per-block mask tile list grows by one entry every time `kv_len` crosses a `block_size` boundary (128 on this platform; `CpuPlatform` overrides the platform's 64), and `compile_sizes` does *not* bucket that. Each crossing is a fresh runtime re-record — the expensive kind. Choose params so the block count is **constant across the timed window**:
+**KV block count** — the per-block mask tile list grows by one entry every time `kv_len` crosses a `block_size` boundary (128, the platform default), and `compile_sizes` does *not* bucket that. Each crossing is a fresh runtime re-record — the expensive kind. Choose params so the block count is **constant across the timed window**:
 
 - make `--input-len` a multiple of 128, and
 - keep `--input-len + --output-len` inside the *same* block, i.e. `output-len ≤ 128`.

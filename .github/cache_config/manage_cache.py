@@ -64,16 +64,30 @@ def _run_public(config, config_file):
         return
     print(f"📋 Found {len(models)} public model(s) to cache:", models)
     failed_models = []
-    for repo_id in models:
+    for entry in models:
+        if isinstance(entry, str):
+            repo_id, revision = entry, None
+        else:
+            repo_id, revision = entry["repo"], entry["revision"]
         print(f"\n🚀 Processing: {repo_id}...")
         try:
-            snapshot_download(repo_id, local_files_only=True, ignore_patterns=["*.pt", "*.bin"])
+            snapshot_download(
+                repo_id,
+                revision=revision,
+                local_files_only=True,
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
+            )
             print(f"✅ {repo_id}: already cached")
             continue
         except LocalEntryNotFoundError:
             pass
         try:
-            snapshot_download(repo_id, local_files_only=False, ignore_patterns=["*.pt", "*.bin"])
+            snapshot_download(
+                repo_id,
+                revision=revision,
+                local_files_only=False,
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
+            )
             print(f"✅ {repo_id}: downloaded and cached")
         except Exception as e:
             print(f"⚠️ Warning: failed to cache {repo_id}: {e}")
@@ -98,15 +112,20 @@ def _run_gated(config, config_file):
         sys.exit(0)
     print(f"📋 Found {len(models)} model(s) to cache:", models)
     failed_models = []
-    for repo_id in models:
+    for entry in models:
+        if isinstance(entry, str):
+            repo_id, revision = entry, None
+        else:
+            repo_id, revision = entry["repo"], entry["revision"]
         print(f"\n🚀 Processing: {repo_id}...")
         try:
             # snapshot_download automatically reads and uses the HF_HOME env var
             snapshot_download(
                 repo_id=repo_id,
+                revision=revision,
                 token=token,
                 force_download=force,
-                ignore_patterns=["*.pt", "*.bin"],
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
             )
             print(f"✅ Success: {repo_id} cache verified!")
         except Exception as e:

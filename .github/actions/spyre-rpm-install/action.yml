@@ -11,13 +11,13 @@ runs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: /tmp/spyre-rpms
-        key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+        key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}
 
     - name: Fail on RPM cache miss
       if: steps.rpm-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
-        echo "::error::RPM cache miss for spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}. Trigger the populate-rpm-cache workflow to populate it."
+        echo "::error::RPM cache miss for spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}. Trigger the populate-rpm-cache workflow to populate it."
         exit 1
 
     - name: Extract RPMs
@@ -25,17 +25,25 @@ runs:
       run: |
         set -euo pipefail
         SPYRE_LIBS="${RUNNER_TEMP}/spyre-libs"
-        ARCH="$(arch)"
+        ARCH="x86_64"
         mkdir -p "$SPYRE_LIBS"
+        # The lock pins commits, not filenames, so glob the cached RPM for each
+        # expected package. `-[0-9]` anchors on the version so e.g. ibm-deeptools
+        # does not also match ibm-deeptools-devel.
         while IFS= read -r name; do
-          rpm="/tmp/spyre-rpms/${name}.${ARCH}.rpm"
-          if [[ ! -f "$rpm" ]]; then
-            echo "::error::Expected RPM not found: $rpm"
+          [[ -z "$name" ]] && continue
+          shopt -s nullglob
+          matches=( /tmp/spyre-rpms/"${name}"-[0-9]*."${ARCH}".rpm )
+          shopt -u nullglob
+          if [[ ${#matches[@]} -eq 0 ]]; then
+            echo "::error::No cached RPM for package '${name}' (arch ${ARCH})."
             exit 1
           fi
-          echo "Extracting $(basename "$rpm")..."
-          rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
-        done < <(grep -v '^[[:space:]]*#' spyre-rpms.lock | grep -v '^[[:space:]]*$')
+          for rpm in "${matches[@]}"; do
+            echo "Extracting $(basename "$rpm")..."
+            rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
+          done
+        done < <(python3 .github/scripts/resolve_rpms.py names)
         NEW_PATHS=$(find "$SPYRE_LIBS/opt/ibm/spyre" -maxdepth 2 -type d -name "lib" | sort | tr '\n' ':' | sed 's/:$//')
         echo "LD_LIBRARY_PATH=${NEW_PATHS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" >> "$GITHUB_ENV"
         # Point SENTIENT_BASE_INSTALL_DIR at our extracted RPMs and clear the

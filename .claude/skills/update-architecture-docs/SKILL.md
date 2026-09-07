@@ -233,8 +233,8 @@ Compare the current code against the diagrams and docs:
 5. **Architecture changes** — new processes, new inheritance relationships, new composition.
    E.g., if a new scheduler override is added, it should appear in the system overview.
 
-6. **Key constraints** — check alignment constants (KV_LEN_ALIGNMENT, QUERY_CHUNK_SIZE,
-   head size requirements) and update the docs if they changed.
+6. **Key constraints** — check the bucketing (`SpyreAttnBucketer`'s kv/query
+   buckets, head size requirements) and update the docs if they changed.
 
 ## index.md Image Styling
 

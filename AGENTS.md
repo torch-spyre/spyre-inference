@@ -16,7 +16,7 @@
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — PyTorch-native paged-KV attention
 - `spyre_inference/custom_ops/` — device-specific layer implementations (linear, rms_norm, rotary_embedding, silu_and_mul, embeddings, lm_head)
 
-**Attention notes:** transposed matmul kernel (`_attn_transposed`), KV cache aligned to 256 tokens (avoids per-step recompile), query chunked at 32 tokens, block-diagonal masking for GQA.
+**Attention notes:** transposed matmul kernel (`_attn_transposed`), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, block-diagonal masking for GQA.
 
 ## Development Commands
 
@@ -44,7 +44,7 @@ Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`), which is
 - **Head size** must be a multiple of 64 (128-byte stick / 2 bytes for fp16).
 - **dtype**: float16 only (enforced in `platform.py`).
 - **Tensor parallelism**: TP≥1 supported; `all_reduce` is provided natively by `libspyre_comms` (no longer overridden in `SpyreCommunicator`). **DP>1 is rejected** in `TorchSpyrePlatform.check_and_update_config` — the spyre-comms global rank space isn't validated for DP×TP.
-- **Compilation**: default is compiled (`STOCK_TORCH_COMPILE`), not eager. Attention compiles in its own domain: `SpyreAttentionImpl` reads `get_current_vllm_config().compilation_config.mode` at construction, so building it outside a `set_current_vllm_config` context raises. Tests force `enforce_eager=True` where they want eager — don't assume "eager in tests." `STOCK_TORCH_COMPILE` compiles one transformer block at a time; `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model graph.
+- **Compilation**: default is compiled (`STOCK_TORCH_COMPILE`), not eager. Attention compiles in its own domain: `SpyreAttentionImpl` reads `get_current_vllm_config().compilation_config.mode` at construction, so building it outside a `set_current_vllm_config` context raises. Tests force `enforce_eager=True` where they want eager — don't assume "eager in tests." `STOCK_TORCH_COMPILE` compiles one transformer block at a time; `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model graph. Attention kernels are recorded during warmup rather than compiled lazily in the serving path: warmup walks `SpyreAttnBucketer.variants()` and traces each one. `SPYRE_ATTN_RECORD=0` restores the lazy behaviour, and `SPYRE_ATTN_KV_BUCKETS` / `SPYRE_ATTN_QUERY_BUCKETS` override the default buckets (an override whose top entry falls below `max_model_len` / `max_num_batched_tokens` gets that limit appended, so every schedulable length always has a bucket) — the KV buckets are geometric (powers of two from `block_size`) because the recorded set is a product of both axes, so dense buckets make warmup unaffordable at a long context; the query buckets are coarse, evenly-spaced ones for the same reason.
 - **Single accelerator**: the device is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/xdist, no parallel `uv run pytest`, no backgrounding one Spyre test while starting another. Parallel runs hang, corrupt device state, or corrupt the compile cache.
 
 ## Iterating on a Local `torch-spyre` Checkout

@@ -39,4 +39,3 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     utils.register()
-    vocab_parallel_embedding.register()

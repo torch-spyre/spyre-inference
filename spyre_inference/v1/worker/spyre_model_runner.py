@@ -81,8 +81,12 @@ from spyre_inference.custom_ops.mlp_pad import (
 )
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionImpl,
+    SpyrePagedKVCache,
+)
+from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
-    TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
@@ -397,6 +401,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Shape bucketer for runtime dispatch (initialized after model load)
         self.spyre_shape_bucketer: SpyreShapeBucketer | None = None
 
+        # Per-layer paged KV caches, kept so warmup can record the attention
+        # kernels against real pages. Populated by initialize_kv_cache_tensors.
+        self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
@@ -407,25 +415,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _FuncWrapper; the type mismatch is the point of the patch.
         block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
-    @staticmethod
-    def _install_pooling_model_patches(model_config) -> None:
-        """Install model-specific pooling adapters (BERT/RoBERTa token_type, …)."""
-        if model_config.runner_type != "pooling":
-            return
-        from spyre_inference.models import install_pooling_model_patches
-
-        install_pooling_model_patches()
-
-    @staticmethod
-    def _install_decoder_model_patches() -> None:
-        """Install model-specific decoder adapters (Gemma-4 embed scale, …).
-
-        A no-op unless the matching architecture is built (import-guarded + idempotent).
-        """
-        from spyre_inference.models import install_decoder_model_patches
-
-        install_decoder_model_patches()
-
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
         logger.info("Loading model %s...", self.model_config.model)
@@ -434,9 +423,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
-
-        self._install_pooling_model_patches(self.model_config)
-        self._install_decoder_model_patches()
 
         # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
@@ -476,7 +462,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
-        # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
+        # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
+        # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
@@ -689,6 +676,85 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
+        self._record_attention_graphs(bucket_sizes)
+
+    def _record_attention_graphs(self, token_counts: list[int]) -> None:
+        """Pre-compile the attention.
+
+        The model-level warmup above cannot cover these: ``_dummy_run`` delegates
+        upstream, which passes ``attn_metadata=None``, so ``forward`` returns
+        before touching a kernel. Left lazy, each new variant pays a full
+        Inductor compile mid-serving.
+        """
+        if not envs.SPYRE_ATTN_RECORD:
+            logger.info("Attention graph recording disabled (SPYRE_ATTN_RECORD=0)")
+            return
+        if self.compilation_config.mode is CompilationMode.NONE:
+            logger.info("Attention graph recording disabled (CompilationMode.NONE)")
+            return
+        assert self._spyre_kv_caches, (
+            "Attention graph recording needs the KV cache, but "
+            "_spyre_kv_caches is empty: initialize_kv_cache_tensors() must run first."
+        )
+
+        # Every layer keeps its own kernel cache, so each is recorded separately;
+        # layers sharing a head configuration trace to the same graph and only
+        # the first pays a full Inductor compile.
+        static_ctx = self.compilation_config.static_forward_context
+        t0 = time.time()
+        total = 0
+        # The metadata builders' own bucketer, not a second one built here, so
+        # every bucket recorded is one build() can actually produce.
+        bucketer = self._resolve_builder_attn_bucketer()
+        assert bucketer is not None, "No attention metadata builder exposes a bucketer"
+        with _set_spyre_compilation_settings(self.vllm_config):
+            for layer_name, kv_cache in self._spyre_kv_caches.items():
+                layer = static_ctx.get(layer_name)
+                impl = getattr(layer, "impl", None)
+                if not isinstance(impl, SpyreAttentionImpl):
+                    continue
+                logger.info("Recording attention graphs for layer %s...", layer_name)
+                total += impl.record_graphs(self._spyre_device, bucketer, kv_cache)
+        logger.info(
+            "Attention graph recording complete: %d graphs in %.3fs.",
+            total,
+            time.time() - t0,
+        )
+
+    def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
+        """The attention bucketer the metadata builders dispatch against.
+
+        Returned rather than constructed here, so the recorder compiles exactly
+        the buckets ``build()`` rounds onto -- a second, independently built
+        instance could drift and make every request pad to an unrecorded block
+        count. A model can have several attention groups and, under ubatching,
+        several builders per group; the assert below guards against a future
+        spec-dependent bucket, since today all builders derive buckets from
+        ``cache_config``/``model_config`` alone and so agree by construction.
+        Returns None when no builder exposes a bucketer.
+        """
+        first: SpyreAttnBucketer | None = None
+        for group in self._attn_group_iterator():
+            for builder in group.metadata_builders:
+                bucketer = getattr(builder, "_attn_bucketer", None)
+                if bucketer is None:
+                    continue
+                if first is None:
+                    first = bucketer
+                    continue
+                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
+                    first.block_size,
+                    first.num_blocks_buckets,
+                ), (
+                    "Attention bucketer buckets diverge between metadata builders: "
+                    f"{type(builder).__name__} has block_size={bucketer.block_size} "
+                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
+                    f"block_size={first.block_size} "
+                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
+                    "recorded, so a mismatch means some builder pads onto block "
+                    "counts no kernel was compiled for."
+                )
+        return first
 
     def _determine_batch_execution_and_padding(
         self,
@@ -886,20 +952,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         return model.pooler(hidden_states=hidden_states, pooling_metadata=dummy_metadata)
 
-    def get_supported_pooling_tasks(self) -> list[PoolingTask]:
-        """Drop token-level tasks on Spyre pooler (slice views are unsafe)."""
-        tasks = super().get_supported_pooling_tasks()
-        if not self._pooling_on_spyre:
-            return tasks
-
-        supported = [t for t in tasks if t not in TOKEN_POOLING_TASKS]
-        if tasks and not supported:
-            raise RuntimeError(
-                f"Model {self.model_config.model} supports only token-level "
-                "pooling, which is unsupported while the pooler runs on Spyre."
-            )
-        return supported
-
     def _pool(
         self,
         hidden_states: torch.Tensor,
@@ -907,12 +959,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_scheduled_tokens_np: np.ndarray,
         kv_connector_output: KVConnectorOutput | None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        """Pool on the activation device; D2H only the pooled vectors.
+        """Pool on the activation device; copy only the pooled vectors back.
 
-        MEAN / FP32 heads keep the pooler on CPU — delegate to
-        ``GPUModelRunner._pool``. On-Spyre CLS/LAST still overrides the private
-        hook: pooled D2H must use ``convert`` (not CUDA ``.to`` / AsyncGPU).
-        Drop this once that op is safe (fallback probes / #3507–#3508).
+        FP32 linear heads keep the pooler on CPU and use
+        ``GPUModelRunner._pool``. Do not crop here: Spyre dim-0 slices are
+        unsafe, and each method gathers itself (CLS/LAST rows, MEAN
+        per-request rows, token AllPool ranges).
         """
         assert not self.use_async_scheduling, (
             "async scheduling is unsupported while pooling on Spyre"
@@ -934,19 +986,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Either all or none of the requests in a batch must be pooling request"
         )
 
-        for params in self.input_batch.pooling_params.values():
-            if params.task in TOKEN_POOLING_TASKS:
-                raise NotImplementedError(
-                    f"Pooling task {params.task!r} returns per-sequence views "
-                    "of hidden_states, which is unsupported while the pooler "
-                    "runs on Spyre."
-                )
-
         # Unlike upstream's cheap [:num_scheduled_tokens] slice, cropping here
         # would need index_select (Spyre dim-0 slice views are unsafe) and
         # would make its shape vary with real content on every request.
-        # Skip it: CLS/LAST read rows via cursor_row_indices_cpu, which never
-        # depends on hidden_states' own length.
+        # Skip it: each method gathers itself from host cursor counts.
         hidden_states = convert(hidden_states, self._spyre_device)
 
         # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for
@@ -1007,10 +1050,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import (
-            SpyrePagedKVCache,
-            slot_major_kv_layout,
-        )
+        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
@@ -1066,6 +1106,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+        self._spyre_kv_caches = dict(kv_caches)
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---

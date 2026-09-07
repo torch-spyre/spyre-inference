@@ -139,7 +139,6 @@ def _can_split(layer: Attention) -> bool:
         and hasattr(layer.impl, "do_kv_cache_update")
         and layer.kv_sharing_target_layer_name is None
         and layer.query_quant is None
-        and not layer.calculate_kv_scales
     )
 
 

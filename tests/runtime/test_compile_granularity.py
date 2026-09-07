@@ -273,7 +273,6 @@ def test_eager_compiles_nothing(monkeypatch) -> None:
     assert all(block._compiled_call_impl is None for block in model.model.layers)
 
 
-@pytest.mark.compile
 def test_identical_blocks_share_compiled_artifacts_regardless_of_depth(
     isolated_dynamo_state,
 ) -> None:

@@ -361,6 +361,153 @@ def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
     torch.testing.assert_close(logits_out.cpu().float(), logits_ref.float(), atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize("vocab_size", [128, 49216])
+def test_tied_head_promoted_on_first_logits_call(tp_group, vocab_size):
+    """An embedding used as the head gains a padded `Wᵀ`, leaving `weight` untouched."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
+    from spyre_inference.custom_ops.vocab_parallel_embedding import promote_tied_lm_head
+
+    embedding_dim = 64
+    torch.manual_seed(42)
+
+    embed = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    assert not isinstance(embed.quant_method, SpyreUnquantizedLMHeadMethod)
+
+    loaded = torch.randn(embed.weight.shape, dtype=torch.float16)
+    embed.weight.data.copy_(loaded)
+    embed.quant_method.process_weights_after_loading(embed)
+    assert not hasattr(embed, "padded_weight_t")
+
+    weight_before = embed.weight
+    promote_tied_lm_head(embed)
+
+    assert isinstance(embed.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert embed.weight is weight_before
+    torch.testing.assert_close(embed.weight.data, loaded, atol=0.0, rtol=0.0)
+
+    padded_vocab = vocab_size + embed.spyre_row_padding
+    assert padded_vocab % (64 * 32) == 0
+    assert embed.padded_weight_t.shape == (embedding_dim, padded_vocab)
+    torch.testing.assert_close(
+        embed.padded_weight_t[:, :vocab_size], loaded.t(), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.parallel_lm_head
+def test_promotion_is_idempotent(tp_group):
+    """`_apply_head` runs every decode step, so a second promotion must be a no-op."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.vocab_parallel_embedding import promote_tied_lm_head
+
+    embed = VocabParallelEmbedding(49216, 64, params_dtype=torch.float16)
+    embed.quant_method.process_weights_after_loading(embed)
+
+    promote_tied_lm_head(embed)
+    method, weight_t = embed.quant_method, embed.padded_weight_t
+    promote_tied_lm_head(embed)
+
+    assert embed.quant_method is method
+    assert embed.padded_weight_t is weight_t
+
+
+@pytest.mark.parallel_lm_head
+def test_tied_head_projection_matches_reference(tp_group):
+    """The promoted head's logits match F.linear, and its gather still works."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.vocab_parallel_embedding import promote_tied_lm_head
+
+    vocab_size, embedding_dim, num_tokens = 49216, 64, 7
+    torch.manual_seed(42)
+
+    embed = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    embed.weight.data.normal_(std=0.02)
+    embed.quant_method.process_weights_after_loading(embed)
+
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
+    input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
+    logits_ref = reference_lm_head(x, embed.weight.data)
+    gather_ref = F.embedding(input_ids, embed.weight)
+
+    # Promote after the device move, as the first logits call does.
+    embed = embed.to("spyre")
+    promote_tied_lm_head(embed)
+    assert embed.padded_weight_t.device.type == "spyre"
+
+    logits = embed.quant_method.apply(embed, x.to("spyre"))
+    gather = embed(input_ids.to("spyre"))
+
+    assert logits.shape == (num_tokens, vocab_size)
+    # Spyre matmul accumulation order diverges from the CPU reference in fp16.
+    torch.testing.assert_close(logits.cpu().float(), logits_ref.float(), atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(gather.cpu().float(), gather_ref.float(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parallel_lm_head
+def test_real_head_is_left_alone(tp_group):
+    """A real ParallelLMHead already owns the projection; promotion must not touch it."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.vocab_parallel_embedding import promote_tied_lm_head
+
+    embed = VocabParallelEmbedding(49216, 64, params_dtype=torch.float16)
+    head = ParallelLMHead(49216, 64, params_dtype=torch.float16).tie_weights(embed)
+    assert head.weight is embed.weight
+
+    embed.weight.data.normal_(std=0.02)
+    head.quant_method.process_weights_after_loading(head)
+    method, weight_t = head.quant_method, head.padded_weight_t
+
+    promote_tied_lm_head(head)
+
+    assert head.quant_method is method
+    assert head.padded_weight_t is weight_t
+    # The tied table is only ever gathered from, so it never grows a projection.
+    assert not hasattr(embed, "padded_weight_t")
+
+
+@pytest.mark.parallel_lm_head
+def test_gather_only_tables_are_never_promoted(tp_group):
+    """Only the table handed to the logits processor is promoted.
+
+    Gemma 3n builds a second, gather-only `embed_tokens_per_layer` under the same
+    tied config; duplicating that table transposed would be pure waste.
+    """
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
+
+    torch.manual_seed(42)
+    embed_tokens = VocabParallelEmbedding(49216, 64, params_dtype=torch.float16)
+    per_layer = VocabParallelEmbedding(2048, 64, params_dtype=torch.float16)
+    for table in (embed_tokens, per_layer):
+        table.weight.data.normal_(std=0.02)
+        table.quant_method.process_weights_after_loading(table)
+
+    processor = LogitsProcessor(vocab_size=49216, org_vocab_size=49216)
+    processor(embed_tokens, torch.randn(4, 64, dtype=torch.float16), embedding_bias=None)
+
+    assert isinstance(embed_tokens.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert not isinstance(per_layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert not hasattr(per_layer, "padded_weight_t")
+
+
 @pytest.fixture
 def spyre_or_cpu_device():
     """Use Spyre if available, otherwise CPU."""

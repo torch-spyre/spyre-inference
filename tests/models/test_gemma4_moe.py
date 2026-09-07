@@ -207,9 +207,9 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     assert layer.spyre_up.shape == (EXPERTS, HIDDEN, INTER)
     assert layer.spyre_down.shape == (EXPERTS, INTER, HIDDEN)
     assert layer.spyre_route_identity.shape == (layer.spyre_stick, layer.spyre_stick)
-    # Stick width and identity both come from the stacks' dtype, not a literal: the
-    # identity multiplies the routing weights, which arrive in that same model dtype,
-    # and the number of elements on a stick changes with it.
+    # Both come from the stacks' dtype, not a literal: the identity multiplies the
+    # routing weights, which arrive in that same dtype, and a stick's element count
+    # changes with it.
     assert layer.spyre_stick == get_elem_in_stick(w13.dtype)
     assert layer.spyre_route_identity.dtype == w13.dtype
 

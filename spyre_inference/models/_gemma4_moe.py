@@ -16,9 +16,8 @@
 
 vLLM dispatches Gemma-4's expert block through ``FusedMoE``, whose kernels are
 CUDA / Triton only. This module supplies a Spyre dispatch instead, ported from the
-``hf_adapters`` ``hf_gemma4_moe`` adapter — the reference for what the torch-spyre
-compiler accepts here. Two forms, both reading the expert stacks
-:func:`relayout_moe_experts` lays out:
+``hf_adapters`` ``hf_gemma4_moe`` adapter. Two forms, both reading the expert
+stacks :func:`relayout_moe_experts` lays out:
 
 *Gathered*, for a single-token decode step: gather only the selected experts'
 weights, one row per top-k slot, and contract with per-row BMMs. One graph for the
@@ -101,9 +100,6 @@ def _moe_gathered(
 
     ``x`` is ``[T,H]``; ``gate``/``up`` are ``[E,H,M]`` and ``down`` is
     ``[E,M,H]``. Returns ``[T,H]``.
-
-    Unlike the reference adapter this needs no ``spyre_hint`` row tiling: the region
-    lowers without the scope at all.
     """
     tokens, hidden = x.shape
     weights, indices = _topk(probs, top_k)
@@ -152,8 +148,8 @@ def _token_cores(tokens: int) -> int:
     """How many ways to spread the token axis over cores.
 
     ``work_div`` splits a dim across that many cores, so it has to divide it
-    exactly. vLLM's compile buckets (16, 24, 40, 56, …) are not all multiples of the
-    core count the reference adapter hardcodes, so take the largest legal divisor.
+    exactly, and vLLM's compile buckets (16, 24, 40, 56, …) are not all multiples of
+    the core count — hence the largest legal divisor rather than the count itself.
     """
     from torch_spyre._inductor import config as spyre_config
 
@@ -317,9 +313,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
     (``models._token_type`` retypes the BERT embedding the same way).
     """
 
-    # The model runner must not wrap this layer in one whole-block graph: the
-    # persistent path needs named-dims context set eagerly between two of its
-    # compilations. See ``forward``.
+    # The model runner must not wrap this layer in one whole-block graph; see ``forward``.
     spyre_compiles_own_regions = True
 
     # Upstream types these as ``| None`` because a dense layer leaves them unset;
@@ -346,17 +340,22 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
             "Spyre Gemma-4 MoE does not support per-layer embeddings (PLE); "
             f"hidden_size_per_layer_input={self.hidden_size_per_layer_input}."
         )
+        experts = self.spyre_experts()
+        moe_config = experts.moe_config
+        if moe_config.tp_size > 1 or moe_config.ep_size > 1:
+            raise NotImplementedError(
+                "Spyre Gemma-4 MoE does not support tensor or expert parallelism "
+                f"(tp_size={moe_config.tp_size}, ep_size={moe_config.ep_size}). "
+                "Run with --tensor-parallel-size 1."
+            )
         if get_current_vllm_config().compilation_config.mode is CompilationMode.NONE:
-            # Fail here rather than with an AttributeError 30 layers deep: the
-            # persistent path's `torch.ops.spyre.keep_by_index` exists only as an
-            # Inductor lowering and returns None when called eagerly.
             raise NotImplementedError(
                 "Spyre Gemma-4 MoE requires torch.compile — torch.ops.spyre.keep_by_index, "
                 "which builds the prefill routing weights, has no eager implementation. "
                 "Run without --enforce-eager."
             )
         self._spyre_regions: dict[str, Any] = {}
-        self.spyre_top_k = int(self.spyre_experts().top_k)
+        self.spyre_top_k = int(experts.top_k)
 
     def spyre_experts(self) -> RoutedExperts:
         return self.moe.experts.routed_experts
@@ -392,10 +391,8 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
                     self, positions, hidden_states, **kwargs
                 )
             else:
-                # Persistent form, four graphs: the expert matmul needs a named-dims
-                # context declared eagerly (so it cannot share a graph with what runs
-                # before it), and the routing must sit between the two — out of that
-                # context, and downstream of the softmax's own graph.
+                # Four graphs: the expert matmul's named-dims context has to be
+                # declared eagerly, and the routing must sit outside it.
                 residual, probs, expert_input = self._spyre_region(
                     "prologue", _persistent_prologue
                 )(self, positions, hidden_states, **kwargs)
@@ -486,18 +483,16 @@ def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:
     del experts.w13_weight, w13
 
     w2 = experts.get_parameter("w2_weight").data
-    # Fold the per-expert output scale into ``down`` instead of gathering it
-    # alongside the expert weights every step. It multiplies the already
-    # renormalized routing weight, so pushing it onto that expert's rows is
-    # exact; the checkpoint's values sit within 2% of 1.0, well inside fp16.
+    # Fold the per-expert output scale into ``down`` instead of gathering it every
+    # step. It multiplies the already renormalized routing weight, so the fold is
+    # exact, and the checkpoint's values sit within 2% of 1.0, well inside fp16.
     w2.mul_(layer.moe.per_expert_scale.data.detach().to(w2.dtype).view(num_experts, 1, 1))
     layer.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
     del experts.w2_weight, w2
 
-    # Elements per stick, which depends on the dtype: the top-k indices and the
+    # Elements per stick, from the stacks' own dtype: the top-k indices and the
     # routing weights are both widened onto a full stick before the compiler will
-    # gather or restickify with them. Taken from the stacks, not a literal fp16, so it
-    # cannot drift from the routing weights the same model dtype decides.
+    # gather or restickify with them.
     layer.spyre_stick = get_elem_in_stick(dtype)
     # Identity for the routing-weight restickify. It has to originate on the
     # host: Spyre has no on-device eye/diag kernel.

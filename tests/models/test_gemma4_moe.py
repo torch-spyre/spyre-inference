@@ -58,7 +58,7 @@ def moe_weights():
         "down": torch.randn(EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
     # The per-expert output scale is folded into `down` at load time (see
-    # relayout_moe_experts), so the device stacks carry it and the reference
+    # spyre_relayout_weights), so the device stacks carry it and the reference
     # applies it separately.
     host["scale"] = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
     scaled_down = host["down"] * host["scale"].view(EXPERTS, 1, 1)
@@ -166,7 +166,7 @@ def test_token_cores_divides_the_token_axis(tokens, expected):
 
 
 def test_relayout_splits_transposes_and_folds_the_scale():
-    """The load-time weight hook: what `relayout_moe_experts` leaves for the regions.
+    """The load-time weight hook: what `spyre_relayout_weights` leaves for the regions.
 
     `w13 [E,2M,H]` splits into `gate`/`up` `[E,H,M]`, `w2 [E,H,M]` becomes
     `down [E,M,H]` carrying `per_expert_scale`, and both sources are freed.
@@ -174,7 +174,7 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
 
-    from spyre_inference.models._gemma4_moe import _relayout_experts
+    from spyre_inference.models._gemma4_moe import SpyreGemma4MoEDecoderLayer
 
     class _RoutedExperts(nn.Module):
         def __init__(self, w13, w2):
@@ -192,6 +192,9 @@ def test_relayout_splits_transposes_and_folds_the_scale():
         def spyre_experts(self):
             return self.routed_experts
 
+        # The real hook, under the name the model runner's post-load walk looks for.
+        spyre_relayout_weights = SpyreGemma4MoEDecoderLayer.spyre_relayout_weights
+
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16) * 0.05
     w2 = torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05
@@ -199,7 +202,7 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     experts = _RoutedExperts(w13.clone(), w2.clone())
     layer = _Layer(experts, scale.clone())
 
-    _relayout_experts(layer)
+    layer.spyre_relayout_weights()
 
     assert not hasattr(experts, "w13_weight"), "the fused stacks must be freed, not kept"
     assert not hasattr(experts, "w2_weight")

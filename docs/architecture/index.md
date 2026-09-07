@@ -119,10 +119,10 @@ Two adaptations worth knowing:
   which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
 - **Gemma-4 MoE** (`models/_gemma4_moe.py`) replaces `FusedMoE`'s CUDA-only dispatch with
   two Spyre forms — gathered for a single-token decode step, all-expert persistent for a
-  prefill chunk. `SpyreGemma4ForCausalLM.process_weights_after_loading`, vLLM's model-level
-  post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
-  `[E,H,M]` / `[E,M,H]` layout those forms contract on, folds `per_expert_scale` into
-  `down`, and frees each source stack as it goes, since the device cannot hold both
+  prefill chunk. Each layer's `spyre_relayout_weights`, which the model runner calls before
+  moving the model to the device, rebuilds that layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks
+  into the `[E,H,M]` / `[E,M,H]` layout those forms contract on, folds `per_expert_scale`
+  into `down`, and frees each source stack as it goes, since the device cannot hold both
   layouts at once.
 
 ## Compilation Granularity

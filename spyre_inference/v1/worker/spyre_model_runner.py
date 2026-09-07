@@ -460,6 +460,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Layers owning a device-specific weight layout rebuild it here, weights still
+        # whole on the host. A walk, not vLLM's model-level post-load hook, which fires
+        # on the top-level model only and so misses a nested backbone.
+        for module in cast(nn.Module, self.model).modules():
+            relayout = getattr(module, "spyre_relayout_weights", None)
+            if relayout is not None:
+                relayout()
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 

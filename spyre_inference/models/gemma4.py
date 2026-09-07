@@ -137,9 +137,3 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         register_aliased_scalars(self.model.self_decoder)
         _gemma4_moe.adapt_moe_layers(self.model.layers)
-
-    def process_weights_after_loading(self) -> None:
-        """The last point at which the expert stacks are loaded, on the host and
-        still whole — the model runner moves the model to the device next.
-        """
-        _gemma4_moe.relayout_moe_experts(self.model.layers)

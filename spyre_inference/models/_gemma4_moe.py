@@ -17,7 +17,7 @@
 vLLM dispatches Gemma-4's expert block through ``FusedMoE``, whose kernels are
 CUDA / Triton only. This module supplies a Spyre dispatch instead, ported from the
 ``hf_adapters`` ``hf_gemma4_moe`` adapter. Two forms, both reading the expert
-stacks :func:`relayout_moe_experts` lays out:
+stacks :meth:`SpyreGemma4MoEDecoderLayer.spyre_relayout_weights` lays out:
 
 *Gathered*, for a single-token decode step: gather only the selected experts'
 weights, one row per top-k slot, and contract with per-row BMMs. One graph for the
@@ -119,7 +119,7 @@ def _moe_gathered(
 
     # The routing weight is folded into the H-carrying tensor: a bare [T,K] product
     # has no legal layout. The per-expert output scale is already in ``down`` (see
-    # relayout_moe_experts), so nothing else joins it here.
+    # spyre_relayout_weights), so nothing else joins it here.
     return (expert_out * weights[..., None]).sum(dim=1)
 
 
@@ -324,7 +324,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
     post_feedforward_layernorm_1: RMSNorm
     post_feedforward_layernorm_2: RMSNorm
 
-    # Set by spyre_init / relayout_moe_experts.
+    # Set by spyre_init / spyre_relayout_weights.
     spyre_top_k: int
     spyre_stick: int
     spyre_gate: torch.Tensor
@@ -359,6 +359,10 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
 
     def spyre_experts(self) -> RoutedExperts:
         return self.moe.experts.routed_experts
+
+    def spyre_relayout_weights(self) -> None:
+        """Post-load hook the model runner walks for, while the stacks are still whole."""
+        _relayout_experts(self)
 
     def _spyre_region(self, name: str, fn: Any) -> Any:
         """``dynamic=False`` is mandatory: the Spyre backend rejects SymInt shapes.
@@ -415,8 +419,8 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
 def adapt_moe_layers(layers: Iterable[nn.Module]) -> None:
     """Retype Gemma-4's MoE decoder layers onto the Spyre expert dispatch.
 
-    Runs before the checkpoint is loaded; :func:`relayout_moe_experts` finishes the
-    job once the expert weights are in.
+    Runs before the checkpoint is loaded; each layer's ``spyre_relayout_weights``
+    finishes the job once the expert weights are in.
     """
     adapted = 0
     for layer in layers:
@@ -443,13 +447,6 @@ def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
 
     moved = dma_moe_expert_weight_to_spyre(weight)
     return moved if moved is not None else weight.contiguous().to("spyre")
-
-
-def relayout_moe_experts(layers: Iterable[nn.Module]) -> None:
-    """Move every adapted layer's expert stacks into the layout its regions read."""
-    for layer in layers:
-        if isinstance(layer, SpyreGemma4MoEDecoderLayer):
-            _relayout_experts(layer)
 
 
 def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:

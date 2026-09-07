@@ -282,10 +282,8 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
-          # Product-model output-quality gate. Carved out of the smoke shards
-          # above and deliberately NOT in `integration`: every case loads and
-          # compiles a product model, from the 125M encoders up to the 31B
-          # decoders, too slow for the tier the multi-repo integration hook runs.
+          # Product-model output-quality gate: its own job and not in
+          # `integration`, since every case compiles a product model.
           - cfg: Spyre model quality tests
             test_types: regression trunk
             runs_on:

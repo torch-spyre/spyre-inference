@@ -58,11 +58,8 @@ PROMPTS = [
     _TEMPLATE.format("Convert char to string in Java."),
 ]
 
-# gemma-4 drifts from HF as the prompt grows, because torch-spyre runs RMSNorm in fp16:
-# on the prompts above its first-token probability is 0.65 against HF's 0.84 and the
-# continuation diverges, while short prompts match token for token. Neither the reference
-# dtype (fp16 CPU HF agrees with fp32 to <0.002) nor torch.compile (eager deviates just
-# as far) is involved, so drop this entry once torch-spyre normalises in fp32.
+# gemma-4 diverges from HF on the prompts above because torch-spyre runs RMSNorm in fp16;
+# short prompts match token for token. Drop this entry once it normalises in fp32.
 MODEL_PROMPTS = {
     "google/gemma-4-31B": [
         "What are IBMs main businesses?",
@@ -133,7 +130,7 @@ def main() -> None:
         data[model_id] = generate_reference(
             model_id, MODEL_REVISIONS[model_id], getattr(torch, args.dtype)
         )
-        # Written per model: each one takes minutes and is easy to interrupt.
+        # Written per model so an interrupted run keeps what it already generated.
         args.out.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
         print(f"Wrote {args.out}", flush=True)
 

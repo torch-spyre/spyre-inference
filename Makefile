@@ -96,19 +96,15 @@ else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
 # Single-invocation integration = the CI smoke suite, which now also carries the
-# compiled (enforce_eager=False) tests/e2e/test_compile.py cases. Probes and the
-# model-quality gate are excluded here just as the sharded smoke jobs exclude
-# them, each running in its own CI job: probes must not gate integration on
-# strict-xfail flips, and the model-quality gate compiles a product model per case
-# -- encoders from 125M up to the 31B decoders -- far too slow for the integration
-# tier.
+# compiled (enforce_eager=False) tests/e2e/test_compile.py cases. Probes are
+# excluded here just as the sharded smoke jobs exclude them (they run in their
+# own test-probes job and must not gate integration on strict-xfail flips), and
+# the model-quality gate likewise has its own job: every case compiles a product
+# model, up to the 31B decoders.
 MARK_EXPR := -m "not (distributed or upstream or attention or probe or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
-# Mirrors the CI jobs the `unit` tier schedules (_test_matrix.yaml test_types):
-# the smoke shards (which now carry the compiled e2e cases), the attention shards,
-# encoder-attention, the distributed shards and the probe shards -- so probes stay
-# in here, unlike the integration tier above. model_quality is regression/trunk
-# only there, so it stays out here too.
+# model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
+# out of the unit tier as well.
 MARK_EXPR := -m "not (upstream or model_quality)"
 else
 # The validation above already rejected any type outside VALID_TEST_TYPES, so
@@ -196,10 +192,8 @@ test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
 test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
-# Carved out of smoke (and so out of integration): every case loads and compiles a
-# product model -- a 125M-580M encoder or an 8B-31B decoder -- and the decoders alone
-# are more than the smoke shards' runtime budget can absorb.
-test-model-quality: ## Run the product-model output-quality gates (its own job; compiles 125M encoders up to 31B decoders).
+# Carved out of smoke: every case compiles a product model, up to the 31B decoders.
+test-model-quality: ## Run the product-model output-quality gates against the cached HF references.
 	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
 test-probes: ## Run the torch-spyre backend probes (excluded from integration), unsharded (local full run).

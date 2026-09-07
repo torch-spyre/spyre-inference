@@ -54,8 +54,7 @@ LAST_POOLING_PROMPTS = [
 ]
 
 # Cross-encoder rerankers (classify / score path). The two BGE variants share
-# XLMRobertaForSequenceClassification but not their weights or position table (514 vs
-# 8194 slots), so each is gated on its own cached scores.
+# XLMRobertaForSequenceClassification but not their weights or position table.
 RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
     "BAAI/bge-reranker-large",
@@ -73,13 +72,8 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-# Reranker references are sigmoid probabilities, and a bare absolute bound is a poor gate
-# for one: most of them sit just above zero, where 0.03 permits an arbitrary relative
-# error -- 400x on the smallest. Paired with a relative bound (stricter of the two wins,
-# as in test_model_quality.py) a near-zero reference is held to a fraction instead, while
-# the near-one end stays on the absolute bound, which is already tight relatively there.
-# Worst measured drift on the reference documents is 7e-3 absolute and 13% relative, both
-# on bge-reranker-large, so each bound keeps ~4x margin.
+# Reranker references are sigmoid probabilities and most sit just above zero, where an
+# absolute bound permits an arbitrary relative error, so the stricter of the two applies.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
 
@@ -213,9 +207,8 @@ def test_encoder_embed_last_pooling() -> None:
     override exercises the LAST gather + normalize path that
     ``configure_pooling_for_spyre`` patches to ``SpyreLastPool``.
     """
-    # Taken from the embed reference entry rather than hardcoded, so this case cannot drift
-    # onto a different revision than the embed gates measure. Both sides are computed in
-    # the same run here, so the pin buys reproducibility, not a valid comparison.
+    # Both sides are computed in this run, so the pin buys reproducibility rather than a
+    # valid comparison; read from the embed refs so it cannot drift off the gated weights.
     revision = _REFERENCES[LAST_POOLING_MODEL]["revision"]
     prompts = LAST_POOLING_PROMPTS
     ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, revision, prompts)
@@ -264,13 +257,9 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     """What runs on Spyre here is the encoder body, not the score itself.
 
-    A reranker's classifier head stays float32, and torch-spyre has no FP32 batchmatmul
-    (torch-spyre#1794), so ``configure_pooling_for_spyre`` sends the whole pooling tail
-    through ``run_pooling_tail_on_cpu`` -- logged as "FP32 classifier/head unsupported on
-    Spyre ... running pooler on CPU" at load, in the compiled case as much as the eager
-    one. So the bounds below gate the transformer blocks and the CLS gather, and a
-    regression confined to the head or the sigmoid would pass both. Extending the gate to
-    it needs the head on device, not another tolerance.
+    The classifier head stays float32 and torch-spyre has no FP32 batchmatmul
+    (torch-spyre#1794), so ``configure_pooling_for_spyre`` runs the pooling tail on CPU,
+    compiled case included.
     """
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
@@ -293,9 +282,8 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     scores = [out.outputs.score for out in outputs]
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
-    # A reranker is used for its ordering, and every score can drift the same direction
-    # without disturbing that -- so the ranking is checked apart from the per-score bound,
-    # which conversely passes on a pair that has swapped inside the tolerance.
+    # Ranking is checked apart from the per-score bound: all scores can drift the same
+    # direction without reordering, and a pair can swap while both stay inside tolerance.
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
     ref_order = sorted(range(len(ref_scores)), key=lambda i: ref_scores[i], reverse=True)
     assert order == ref_order, (

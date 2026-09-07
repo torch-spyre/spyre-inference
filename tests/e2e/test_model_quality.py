@@ -38,10 +38,8 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
-# Weight-only FP8 (compressed-tensors) checkpoints, each mapped to the unquantized sibling
-# whose reference entry it borrows prompts from -- the smoke test below compares no
-# output, it only needs prompts that fit a compiled prefill bucket. Both run end to end on
-# Spyre today, so the sibling entries are what gate the numerics.
+# Each FP8 checkpoint borrows prompts from its unquantized sibling; the smoke test below
+# compares no output, it only needs prompts that fit a compiled prefill bucket.
 FP8_DECODER_MODELS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b-fp8": "ibm-granite/granite-4.1-8b",
@@ -50,29 +48,24 @@ FP8_REVISIONS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "4b5990b8d402a75febe0086abbf1e490af494e3d",
     "ibm-granite/granite-4.1-8b-fp8": "070021b3608433b6107a00733d561c9779b9937e",
 }
-# Short: nothing is compared, so the run only has to prove decode advances at all.
+# Nothing is compared, so the run only has to prove decode advances.
 FP8_MAX_TOKENS = 8
 
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are
 # compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
-# ABS_TOL alone is not a uniform bound: it holds p=0.999 to 8% but lets p=0.08 land
-# anywhere in [0, 0.16], a 2x relative error, so the gate is loosest exactly where the
-# reference is least certain. Below the ABS_TOL/REL_TOL crossover the bound goes
-# relative, holding a low-confidence token to the same *fraction* instead of the same
-# margin. At the defaults the crossover is p=0.16, so nothing above it changes.
+# Below the crossover with ABS_TOL (p=0.16 at the defaults) `_prob_tol` bounds relatively:
+# a flat 0.08 on a reference of 0.08 would permit a 2x error.
 REL_TOL = float(os.environ.get("SPYRE_TEST_REL_TOL", "0.5"))
 
-# Enough of the distribution that HF's greedy token is present even when Spyre picks a
-# different one -- `_compare_against_hf` needs p(HF token) under *Spyre* to tell a
-# near-tie from two distributions that disagree. 20 is vLLM's default `max_logprobs`.
+# `_compare_against_hf` needs p(HF token) under Spyre, so HF's greedy token has to be in
+# the returned distribution even when Spyre picks another. 20 is vLLM's `max_logprobs`.
 NUM_LOGPROBS = 20
 
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
-# Top of COMPILE_SIZES below, which is what caps warmup: passing compile_sizes
-# explicitly skips the default buckets platform.py would derive, and platform.py then
-# clamps max_num_batched_tokens down to the largest bucket. Every prompt fits this one.
+# Passing compile_sizes skips the buckets platform.py would derive, and platform.py clamps
+# max_num_batched_tokens down to the largest one, so this is the top of COMPILE_SIZES.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
 
@@ -113,7 +106,7 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         SamplingParams(
             temperature=0.0,
             max_tokens=max_tokens,
-            logprobs=NUM_LOGPROBS,  # sampled token plus enough to locate HF's
+            logprobs=NUM_LOGPROBS,
             ignore_eos=True,  # the reference is a fixed-length run with EOS disabled
         ),
         use_tqdm=False,
@@ -125,8 +118,7 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         for hf_result, output in zip(ref["results"], outputs)
     ]
     # A prompt that diverges early verifies only the steps before the split, so a green
-    # case is not automatically a well-covered one. Printed (PYTEST_ARGS carries -s) so
-    # the coverage a run actually achieved is visible without having to fail first.
+    # case is not automatically a well-covered one.
     per_prompt = ", ".join(f"{n}/{max_tokens}" for n in matched)
     print(
         f"\n{model}: matched {sum(matched)}/{len(prompts) * max_tokens} reference steps "
@@ -140,11 +132,8 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
 def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """A compiled FP8 checkpoint loads and decodes.
 
-    Load-and-decode only, with no reference comparison: a reference for a
-    compressed-tensors checkpoint means dequantizing it on CPU first, which the generator
-    does not do. So this holds the FP8 weight load and the ``aten._scaled_mm`` kernel
-    (``custom_ops/fp8_linear_kernel.py``) to running at all rather than to a numerical
-    bound -- `test_decoder_model_output` gates the unquantized siblings' output.
+    No reference comparison: writing one means dequantizing a compressed-tensors
+    checkpoint on CPU, which the generator does not do.
     """
     base = FP8_DECODER_MODELS[model]
     base_ref = _REFERENCES.get(base)
@@ -190,12 +179,9 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
 def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
     """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
 
-    Nothing else does: past the largest bucket `SpyreShapeBucketer.find_bucket` returns
-    None (spyre_shape_bucketer.py) and execute_model runs the shape unpadded, so an
-    over-long prompt is not an error but a Dynamo recompile inside generate() -- and the
-    raised VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS lets that grind for hours instead of
-    failing. Run before the engine is built so an edited prompt costs seconds, not a
-    warmup.
+    Past the largest bucket `SpyreShapeBucketer.find_bucket` returns None and the shape
+    runs unpadded, so an over-long prompt is a silent Dynamo recompile inside generate()
+    rather than an error.
     """
     from transformers import AutoTokenizer
 
@@ -210,11 +196,6 @@ def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[
 
 
 def _prob_tol(reference_prob: float) -> float:
-    """Tolerance for one probability comparison, tightening as the reference gets small.
-
-    ``min`` and not ``max``: this only ever tightens ABS_TOL, never loosens it, so the
-    bound is the stricter of "within ABS_TOL" and "within REL_TOL of the reference".
-    """
     return min(ABS_TOL, REL_TOL * reference_prob)
 
 
@@ -242,12 +223,8 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         )
 
         if hf_id != token_id:
-            # Greedy paths only diverge legitimately on a near-tie. Judge that on the HF
-            # token in *both* distributions, never on the two sampled tokens' own
-            # probabilities: those agree whenever the models are equally confident, so
-            # HF at p=0.9 on one token and Spyre at p=0.9 on another -- a total
-            # disagreement -- would read as a tie. Past this step the prefixes differ,
-            # so no later token is comparable either way.
+            # The sampled tokens' own probabilities agree whenever the models are equally
+            # confident, however far apart they picked, so judge the tie on HF's token.
             spyre_hf = completion.logprobs[step].get(hf_id)
             assert spyre_hf is not None, (
                 f"{model}: wrong token and HF's token is outside Spyre's top "
@@ -258,12 +235,8 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"{model}: wrong token and p(HF token) differs by more than {tol:.4f} "
                 f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
             )
-            # A tie also means Spyre itself ranks the two level. Without this, a flat HF
-            # distribution (its own argmax at p=0.1) would excuse Spyre being confidently
-            # elsewhere at p=0.85, since p(HF token) still matches at 0.1 in both.
-            # Bound is doubled: HF picked its token, so it led there
-            # (p_hf(spyre token) <= hf_prob), and each of the two may drift by `tol` in
-            # the opposite direction, which is what flipped the argmax in the first place.
+            # A tie also means Spyre ranks the two level: a flat HF distribution must not
+            # excuse Spyre being confident elsewhere. Doubled: both may drift by `tol`.
             tie_tol = 2 * tol
             assert abs(prob - spyre_hf_prob) <= tie_tol, (
                 f"{model}: wrong token, and Spyre puts it {prob - spyre_hf_prob:.4f} > "

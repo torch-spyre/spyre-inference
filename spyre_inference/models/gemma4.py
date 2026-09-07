@@ -22,8 +22,9 @@ lives in ``TorchSpyreModelRunner``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
+from vllm.config import CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import (
     Gemma4ForCausalLM,
@@ -31,12 +32,18 @@ from vllm.model_executor.models.gemma4 import (
     Gemma4SelfDecoderLayers,
 )
 
+from spyre_inference.custom_ops.lazy_compile import compile_when_outermost
+
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import torch
     from torch import nn
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
     from vllm.sequence import IntermediateTensors
+
+_ModuleT = TypeVar("_ModuleT", bound="nn.Module")
 
 logger = init_logger(__name__)
 
@@ -128,8 +135,8 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
-def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[nn.Module]) -> None:
-    """Retype an already-built submodule to its Spyre subclass.
+def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[_ModuleT]) -> _ModuleT:
+    """Retype an already-built submodule to its Spyre subclass, and hand it back.
 
     ``Gemma4ForCausalLM`` and ``Gemma4Model`` name the classes they build, so there is no
     ``embedding_class``-style hook to pass a subclass through. The built instance is
@@ -143,6 +150,7 @@ def _retype(module: nn.Module, upstream: type[nn.Module], spyre: type[nn.Module]
             "gemma-4 adaptations need updating for this vLLM version."
         )
     module.__class__ = spyre
+    return cast("_ModuleT", module)
 
 
 class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
@@ -170,6 +178,27 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
 class SpyreGemma4Model(Gemma4Model):
     """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
+    # ``CompileOutermost``'s two fields, declared rather than set in an ``__init__`` that
+    # retyping never runs; ``SpyreGemma4ForCausalLM`` fills them in.
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
+
+    @compile_when_outermost
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Hand back every layer's PLE row, each in its own allocation.
+
+        One graph rather than one eager ``clone`` per layer. The copies themselves are
+        unavoidable — see ``forward`` — but eager ones cost a host launch each on a
+        forward pass that is already host-bound, and there are ``num_hidden_layers`` of
+        them per step. Compiled, they are one launch: measured ~2.4x cheaper than the
+        eager form across every warmup bucket.
+        """
+        ple_dim = self.hidden_size_per_layer_input
+        return tuple(
+            ple.narrow(1, layer_idx * ple_dim, ple_dim).clone()
+            for layer_idx in range(len(self.layers))
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -184,11 +213,16 @@ class SpyreGemma4Model(Gemma4Model):
         Upstream slices ``per_layer_inputs[:, layer_idx, :]`` per layer and hands the block
         that view. Two things stop it working here: a compiled kernel reads its arguments
         from offset 0, ignoring ``storage_offset`` (torch-spyre#3770), and torch-spyre
-        cannot lay out the 3-D tensor at a graph boundary. Each row is cut from a 2-D view
-        and copied to offset 0 instead. Doing it here rather than inside the block is what
-        keeps warmup affordable: a ``layer_idx``-derived offset inside ``forward`` is a
-        graph constant, so every block guards differently and compiles its own artifact
-        (35 for E2B, 42 for E4B) instead of all of them sharing one.
+        cannot lay out the 3-D tensor at a graph boundary. So each row has to be a real
+        allocation, cut from a 2-D view -- a view of any width is read as layer 0's row,
+        and an in-graph ``index_select`` off the packed tensor does not lower at all
+        ("no mechanism to resolve stick incompatibility").
+
+        Cutting them here rather than inside the block is what keeps warmup affordable: a
+        ``layer_idx``-derived offset inside ``forward`` is a graph constant, so every block
+        would guard differently and compile its own artifact (35 for E2B, 42 for E4B)
+        instead of all of them sharing one. ``split_per_layer_inputs`` then keeps the
+        copies off the host critical path.
 
         ``residual=None`` each iteration is exact: ``Gemma4DecoderLayer.forward`` overwrites
         ``residual`` on entry and always returns ``None`` for it.
@@ -214,17 +248,11 @@ class SpyreGemma4Model(Gemma4Model):
 
         hidden_states = self.embed_input_ids(input_ids)
         ple = self.project_per_layer_inputs(hidden_states, self.get_per_layer_inputs(input_ids))
+        rows = None
         if ple is not None:
-            ple = ple.reshape(ple.shape[0], -1)
-        ple_dim = self.hidden_size_per_layer_input
+            rows = self.split_per_layer_inputs(ple.reshape(ple.shape[0], -1))
         for layer_idx, layer in enumerate(self.layers):
-            row = None
-            if ple is not None:
-                # ``clone``, not ``contiguous``: a one-row slice reports itself contiguous
-                # (a leading dim of 1 makes its stride irrelevant), so ``contiguous`` is a
-                # no-op there and leaves the offset in place -- correct at prefill, silently
-                # layer 0's row for every layer at decode.
-                row = ple.narrow(1, layer_idx * ple_dim, ple_dim).clone()
+            row = None if rows is None else rows[layer_idx]
             hidden_states, _ = layer(positions, hidden_states, None, per_layer_input=row, **kwargs)
         return self.norm(hidden_states)
 
@@ -247,6 +275,13 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        _retype(self.model, Gemma4Model, SpyreGemma4Model)
+        backbone = _retype(self.model, Gemma4Model, SpyreGemma4Model)
         _retype(self.model.self_decoder, Gemma4SelfDecoderLayers, SpyreGemma4SelfDecoderLayers)
+        # What ``CompileOutermost.__init__`` would set. Retyping runs no ``__init__``, and
+        # inheriting it would not help: its ``super().__init__()`` walks the *instance's*
+        # MRO, which is the upstream backbone's.
+        backbone.spyre_compile_enabled = (
+            vllm_config.compilation_config.mode is not CompilationMode.NONE
+        )
+        backbone.spyre_compiled_kernel = None
         register_aliased_scalars(self.model.self_decoder)

@@ -45,9 +45,8 @@ SPYRE_MODELS: dict[str, str] = {
     "RobertaForTokenClassification": f"{_ROBERTA}:SpyreRobertaForTokenClassification",
     "XLMRobertaForTokenClassification": (f"{_ROBERTA}:SpyreRobertaForTokenClassification"),
     "BgeM3EmbeddingModel": f"{_ROBERTA}:SpyreBgeM3EmbeddingModel",
-    # Decoders. The Gemma-4 multimodal wrapper builds its language model through
-    # the registry, so it picks the causal-LM entry up on its own; it is listed
-    # only to forward vLLM's top-level-model-only post-load hook down to it.
+    # Decoders. The Gemma-4 multimodal wrapper picks the causal-LM entry up through
+    # the registry; it is listed only to forward the top-level post-load hook down.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Gemma4ForConditionalGeneration": (
         "spyre_inference.models.gemma4_mm:SpyreGemma4ForConditionalGeneration"

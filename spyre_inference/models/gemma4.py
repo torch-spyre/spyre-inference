@@ -139,9 +139,7 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         _gemma4_moe.adapt_moe_layers(self.model.layers)
 
     def process_weights_after_loading(self) -> None:
-        """vLLM's model-level post-load hook, called once the checkpoint is in.
-
-        The last point at which the expert stacks are loaded, on the host and
+        """The last point at which the expert stacks are loaded, on the host and
         still whole — the model runner moves the model to the device next.
         """
         _gemma4_moe.relayout_moe_experts(self.model.layers)

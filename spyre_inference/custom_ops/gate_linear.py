@@ -29,6 +29,5 @@ class SpyreGateLinear(GateLinear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Cleared after ``super().__init__`` rather than through the argument, so
-        # it also covers callers that pass ``out_dtype`` positionally. The kernel
-        # eligibility flags it feeds are all CUDA-gated, so they do not matter here.
+        # it also covers callers that pass ``out_dtype`` positionally.
         self.out_dtype = None

@@ -122,7 +122,8 @@ Two adaptations worth knowing:
   prefill chunk. `SpyreGemma4ForCausalLM.process_weights_after_loading`, vLLM's model-level
   post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
   `[E,H,M]` / `[E,M,H]` layout those forms contract on, folds `per_expert_scale` into
-  `down`, and frees each ~45 GB source stack as it goes.
+  `down`, and frees each source stack as it goes, since the device cannot hold both
+  layouts at once.
 
 ## Compilation Granularity
 

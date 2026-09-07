@@ -77,8 +77,7 @@ def _inputs(num_tokens):
 def test_gathered_matches_dense_reference(moe_weights):
     """The decode form: gather the selected experts' weights, BMM, combine over K.
 
-    Single token only — that is the shape the form exists for, and the only one
-    whose combine step has a legal device layout.
+    Single token only — the only shape whose combine step has a legal device layout.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -111,10 +110,10 @@ def test_gathered_matches_dense_reference(moe_weights):
 def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     """The prefill form: dense routing weights times every expert's output.
 
-    Mirrors the region sequence in ``_spyre_moe_layer_forward``: the routing runs
-    in a graph of its own, then the expert matmul runs under an eagerly declared
-    named-dims context. 24 tokens is there because it does not divide the core
-    count, which the expert matmul's work-division hint has to cope with.
+    Mirrors the region sequence in ``SpyreGemma4MoEDecoderLayer.forward``: the
+    routing runs in a graph of its own, then the expert matmul under an eagerly
+    declared named-dims context. 24 tokens does not divide the core count, which the
+    work-division hint has to cope with.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -178,16 +177,12 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     from spyre_inference.models._gemma4_moe import _relayout_experts
 
     class _RoutedExperts(nn.Module):
-        """Stands in for vLLM's RoutedExperts — only the two stacks matter."""
-
         def __init__(self, w13, w2):
             super().__init__()
             self.w13_weight = nn.Parameter(w13, requires_grad=False)
             self.w2_weight = nn.Parameter(w2, requires_grad=False)
 
     class _Layer(nn.Module):
-        """Stands in for the decoder layer: the two things the relayout reads."""
-
         def __init__(self, experts, scale):
             super().__init__()
             self.routed_experts = experts
@@ -218,9 +213,9 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     assert layer.spyre_stick == get_elem_in_stick(w13.dtype)
     assert layer.spyre_route_identity.dtype == w13.dtype
 
-    # Not bit-exact: the device round-trip rounds ~0.1% of fp16 elements by one ulp
-    # (~3e-5 at these magnitudes). The tolerance is still far tighter than the 0.5x-1.5x
-    # per-expert scale, so a dropped or misapplied fold would still fail here.
+    # Not bit-exact: the device round-trip rounds a few fp16 elements by one ulp. The
+    # tolerance is still far tighter than the 0.5x-1.5x per-expert scale, so a dropped
+    # or misapplied fold would still fail here.
     close = {"atol": 1e-4, "rtol": 1e-2}
     torch.testing.assert_close(layer.spyre_gate.cpu(), w13[:, :INTER, :].transpose(1, 2), **close)
     torch.testing.assert_close(layer.spyre_up.cpu(), w13[:, INTER:, :].transpose(1, 2), **close)

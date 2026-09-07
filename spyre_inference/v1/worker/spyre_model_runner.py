@@ -612,10 +612,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _compile_blocks(self, fullgraph: bool = True) -> tuple[int, int]:
         """Wrap each transformer block in its own graph.
 
-        Returns ``(wrapped, self_compiled)``. A self-compiling block (Gemma-4 MoE,
-        whose expert tiling needs eager context set between compilations) is left
-        alone, but still counts as found so the caller does not fall back to a
-        whole-model graph.
+        Returns ``(wrapped, self_compiled)``. A self-compiling block is left alone but
+        still counts as found, so the caller does not fall back to a whole-model graph.
         """
         num_blocks = 0
         num_self_compiled = 0

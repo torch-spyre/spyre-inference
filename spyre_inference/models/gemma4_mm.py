@@ -32,11 +32,10 @@ if TYPE_CHECKING:
 class SpyreGemma4ForConditionalGeneration(Gemma4ForConditionalGeneration):
     """Forward vLLM's post-load hook down to the text backbone.
 
-    vLLM calls ``process_weights_after_loading`` on the top-level model only. The
-    wrapper builds its language model through the registry, so that model is already
-    ``SpyreGemma4ForCausalLM`` — but its hook, which lays out the Gemma-4 MoE expert
-    stacks, would never fire. Reachable only when the user sets ``hf_overrides`` and
-    so opts out of ``gemma4.force_text_backbone``.
+    vLLM calls ``process_weights_after_loading`` on the top-level model only, so the
+    language model's own hook — which lays out the MoE expert stacks — would never
+    fire. Reachable only when the user sets ``hf_overrides`` and so opts out of
+    ``gemma4.force_text_backbone``.
     """
 
     def process_weights_after_loading(self) -> None:

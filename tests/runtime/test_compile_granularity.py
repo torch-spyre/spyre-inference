@@ -222,8 +222,8 @@ def test_pp_missing_layers_are_not_compiled() -> None:
 def test_self_compiling_blocks_are_left_alone_but_still_count() -> None:
     """Gemma-4 MoE compiles its own regions; wrapping it would nest the graphs.
 
-    Such a block must still count as found, or the caller falls back to a
-    whole-model graph and undoes the block's own compilation.
+    It must still count as found, or the caller falls back to a whole-model graph and
+    undoes the block's own compilation.
     """
     model = _Model(num_layers=4)
     for block in list(model.model.layers)[2:]:

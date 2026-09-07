@@ -30,7 +30,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _create_compilable_bucketed_decode_attn,
+    _create_compilable_batched_decode_attn,
     _mirror_mask_tiles,
     _stick_aligned_len,
 )
@@ -40,16 +40,16 @@ pytestmark = pytest.mark.attention
 
 
 @pytest.fixture()
-def enable_bucketed_decode(monkeypatch):
-    """Enable the bucketed decode kernel for tests that exercise it.
+def enable_batched_decode(monkeypatch):
+    """Enable the batched decode kernel for tests that exercise it.
 
-    The path ships gated off (``SPYRE_BUCKETED_DECODE``, default "0") pending
+    The path ships gated off (``SPYRE_BATCHED_DECODE``, default "0") pending
     performance characterisation at the smallest bucket. Without this fixture the
-    bucketed tests would silently fall back to the per-seq loop and pass while
+    batched tests would silently fall back to the per-seq loop and pass while
     testing nothing. The autouse cache-clearing fixture in ``tests/conftest.py``
     makes the monkeypatched value visible to ``envs``.
     """
-    monkeypatch.setenv("SPYRE_BUCKETED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
 
 @pytest.fixture()
@@ -1715,14 +1715,14 @@ def test_install_patches_layers_not_the_attention_class():
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_correctness(
+def test_spyre_attn_batched_decode_correctness(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode fast path: bit-exact vs the per-seq reference."""
+    """Batched decode fast path: bit-exact vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1770,15 +1770,15 @@ def test_spyre_attn_bucketed_decode_correctness(
     ],
 )
 @pytest.mark.parametrize("soft_cap", [pytest.param(50.0, id="soft_cap(50)")])
-def test_spyre_attn_bucketed_decode_soft_cap(
+def test_spyre_attn_batched_decode_soft_cap(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     soft_cap: float,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode with logits soft-cap, vs the per-seq reference."""
+    """Batched decode with logits soft-cap, vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1789,7 +1789,7 @@ def test_spyre_attn_bucketed_decode_soft_cap(
     )
 
 
-def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
+def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     """The capped kernel must actually clamp, not silently ignore the cap."""
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -1798,7 +1798,7 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
     lead = num_seqs * num_kv_heads
 
     def build(cap: float):
-        return _create_compilable_bucketed_decode_attn(
+        return _create_compilable_batched_decode_attn(
             num_seqs=num_seqs,
             num_blocks=num_blocks,
             num_kv_heads=num_kv_heads,
@@ -1859,9 +1859,9 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_fallback(
+def test_spyre_attn_batched_decode_fallback(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
@@ -1902,15 +1902,15 @@ def test_spyre_attn_bucketed_decode_fallback(
         pytest.param([(1, 256)] * 8, 4096, id="window_covers_all(N=8)"),
     ],
 )
-def test_spyre_attn_bucketed_decode_sliding_window(
+def test_spyre_attn_batched_decode_sliding_window(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     sliding_window: int,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode with a sliding window: matches the per-seq reference."""
+    """Batched decode with a sliding window: matches the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,

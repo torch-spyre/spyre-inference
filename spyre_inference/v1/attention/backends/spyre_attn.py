@@ -48,7 +48,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
 
 logger = init_logger(__name__)
 
-# When set, wraps forward(), _online_softmax_attention() and the bucketed
+# When set, wraps forward(), _online_softmax_attention() and the batched
 # decode K/V/mask gather blocks in torch.profiler.record_function spans for
 # kineto trace capture. Off by default: the spans are not free, so a profiled
 # run is not wall-clock comparable to a default one.
@@ -90,9 +90,9 @@ def _record_block(name: str):
 INT32_ELEMS_PER_STICK = 32
 
 
-# Batches below this fall back to the per-seq loop: the bucketed matmul's
+# Batches below this fall back to the per-seq loop: the batched matmul's
 # padded-row overhead exceeds the per-seq cost at small N.
-_MIN_SEQS_BUCKET = 4
+_MIN_BATCHED_SEQS = 4
 
 
 def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
@@ -366,7 +366,7 @@ def _create_compilable_page_attn(
     return specialized_paged_attn_kernel
 
 
-def _create_compilable_bucketed_decode_attn(
+def _create_compilable_batched_decode_attn(
     num_seqs: int,
     num_blocks: int,
     num_kv_heads: int,
@@ -377,7 +377,7 @@ def _create_compilable_bucketed_decode_attn(
     needs_gather: bool = True,
     store_out: bool = False,
 ):
-    """Bucketed decode kernel factory; gathers K/V and the query in-graph.
+    """Batched decode kernel factory; gathers K/V and the query in-graph.
 
     Gathers one block at a time; block_ids rows must stay stick-aligned, since a
     flat per-block slice does not compile.
@@ -385,13 +385,13 @@ def _create_compilable_bucketed_decode_attn(
     `logits_soft_cap` and `needs_gather` are closure constants resolved at trace
     time, so each distinct value produces a different compiled graph.
     `logits_soft_cap` is fixed per ``SpyreAttentionImpl`` instance and therefore
-    not part of ``_get_bucketed_decode_kernel``'s cache key; `needs_gather` varies
+    not part of ``_get_batched_decode_kernel``'s cache key; `needs_gather` varies
     per step and is.
     """
 
     num_heads = num_kv_heads * num_queries_per_kv
 
-    def specialized_bucketed_decode_kernel(
+    def specialized_batched_decode_kernel(
         query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, scale, out
     ):
         # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
@@ -455,7 +455,7 @@ def _create_compilable_bucketed_decode_attn(
             return out
         return attn
 
-    return specialized_bucketed_decode_kernel
+    return specialized_batched_decode_kernel
 
 
 @dataclass
@@ -548,12 +548,12 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
-    # Bucketed-decode precomputes. None-valued when the batch is ineligible
+    # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). query_row_ids is int64 because
     # Spyre's index_copy_ requires int64. mask_by_block is pre-permuted for cheap
     # axis-0 slicing in the dispatch.
-    bucket_num_seqs: int | None = None
-    bucket_num_blocks: int | None = None
+    padded_num_seqs: int | None = None
+    padded_batch_blocks: int | None = None
     query_row_ids_cpu: torch.Tensor | None = None  # [B_seqs] int64
     query_row_ids_dev: torch.Tensor | None = None
     block_ids_padded_cpu: torch.Tensor | None = None  # [B_blocks, padded B_seqs] int32
@@ -623,7 +623,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
-        # Buckets for the bucketed decode fast path. One compiled kernel
+        # Buckets for the batched decode fast path. One compiled kernel
         # per bucket. TODO: expose as engine args if configurability is needed.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_num_blocks_per_seq = (
@@ -1009,16 +1009,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # False, so the traced write keeps one shape per bucket, not one per token count.
         self._slot_mapping.publish(slot_mapping)
 
-        # Bucketed-decode precomputes: only when Q=1 and num_seqs is within the
+        # Batched-decode precomputes: only when Q=1 and num_seqs is within the
         # buckets. None-valued fields signal fallback. Sliding-window batches are
         # eligible: the kernel reads a precomputed mask, so a window only shrinks
         # the active block set.
-        bucket_num_seqs = None
-        bucket_num_blocks = None
+        padded_num_seqs = None
+        padded_batch_blocks = None
         query_row_ids_cpu = None
         block_ids_padded_cpu = None
         mask_by_block_cpu = None
-        if max_query_len == 1 and num_seqs >= _MIN_SEQS_BUCKET:
+        if max_query_len == 1 and num_seqs >= _MIN_BATCHED_SEQS:
             # Real counts, not padded: this path has its own buckets, so an
             # inflated count would only push it onto a larger bucket for no
             # reason. Safe because padding only appends blocks. Under a window
@@ -1028,13 +1028,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             b_seqs = _find_bucket(num_seqs, self._num_seqs_buckets)
             b_blocks = _find_bucket(max(blocks_per_seq), self._num_blocks_buckets)
             if b_seqs is not None and b_blocks is not None:
-                bucket_num_seqs = b_seqs
-                bucket_num_blocks = b_blocks
+                padded_num_seqs = b_seqs
+                padded_batch_blocks = b_blocks
 
                 # int64 (not int32): Spyre's index_copy_ requires int64 indices.
                 query_row_ids_cpu = torch.zeros(b_seqs, dtype=torch.int64)
                 query_row_ids_cpu[:num_seqs] = query_start_loc[:num_seqs].to(torch.int64)
-                # Guards the identity scatter used by _run_bucketed_decode_dispatch.
+                # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_row_ids_cpu[:num_seqs].tolist() == list(range(num_seqs))
 
                 # Rows padded to the stick width: a narrower inner dim emits a
@@ -1098,8 +1098,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             page_index_tables_cpu=page_index_tables_cpu,
             aligned_max_query_len=aligned_max_query_len,
             padded_num_blocks=padded_num_blocks,
-            bucket_num_seqs=bucket_num_seqs,
-            bucket_num_blocks=bucket_num_blocks,
+            padded_num_seqs=padded_num_seqs,
+            padded_batch_blocks=padded_batch_blocks,
             query_row_ids_cpu=query_row_ids_cpu,
             block_ids_padded_cpu=block_ids_padded_cpu,
             mask_by_block_cpu=mask_by_block_cpu,
@@ -1241,7 +1241,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         self._kv_slots: SpyrePagedKVCache | None = None
 
-        # Keyed by (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out).
+        # Keyed by (padded_num_seqs, padded_batch_blocks, needs_gather, store_out).
         self._decode_fns: dict[tuple[int, int, bool, bool], object] = {}
 
         # Constant for the run, so the kernel's arguments never carry the model
@@ -1307,10 +1307,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._attn_fns[key]
 
-    def _get_bucketed_decode_kernel(
+    def _get_batched_decode_kernel(
         self,
-        bucket_num_seqs: int,
-        bucket_num_blocks: int,
+        padded_num_seqs: int,
+        padded_batch_blocks: int,
         block_size: int,
         needs_gather: bool,
         store_out: bool,
@@ -1319,12 +1319,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # KV cache spec, logits_soft_cap by __init__), so they are passed to the
         # factory but not keyed on. needs_gather and store_out are closure
         # constants, so they are.
-        key = (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out)
+        key = (padded_num_seqs, padded_batch_blocks, needs_gather, store_out)
         if key not in self._decode_fns:
             self._decode_fns[key] = _maybe_compile(
-                _create_compilable_bucketed_decode_attn(
-                    bucket_num_seqs,
-                    bucket_num_blocks,
+                _create_compilable_batched_decode_attn(
+                    padded_num_seqs,
+                    padded_batch_blocks,
                     self.num_kv_heads,
                     self.num_queries_per_kv,
                     block_size,
@@ -1337,16 +1337,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._decode_fns[key]
 
-    def _bucketed_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
-        # Off by default: the bucketed matmul pads every sequence row up to the
+    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+        # Off by default: the batched matmul pads every sequence row up to the
         # bucket width, and that overhead is uncharacterised at the smallest
-        # bucket (num_seqs == _MIN_SEQS_BUCKET), where there is no headroom.
-        # Set SPYRE_BUCKETED_DECODE=1 to restore the path.
-        if not envs.SPYRE_BUCKETED_DECODE:
+        # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
+        # Set SPYRE_BATCHED_DECODE=1 to restore the path.
+        if not envs.SPYRE_BATCHED_DECODE:
             return False
         # Layer 0's builder gates on max_query_len and the bucket lattice;
-        # we add ALiBi, which the bucketed kernel doesn't implement.
-        if attn_metadata.bucket_num_seqs is None:
+        # we add ALiBi, which the batched kernel doesn't implement.
+        if attn_metadata.padded_num_seqs is None:
             return False
         return self.alibi_slopes is None
 
@@ -1394,11 +1394,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
 
-        # Mirror bucketed-decode precomputes to device once per step, only for
-        # layers whose impl can actually use the bucketed kernel (skips ALiBi
+        # Mirror batched-decode precomputes to device once per step, only for
+        # layers whose impl can actually use the batched kernel (skips ALiBi
         # and soft-cap layers).
         if (
-            self._bucketed_decode_preconditions_met(attn_metadata)
+            self._batched_decode_preconditions_met(attn_metadata)
             and attn_metadata.query_row_ids_dev is None
         ):
             assert attn_metadata.query_row_ids_cpu is not None
@@ -1606,7 +1606,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # kernel, so ordering the read after it covers the V write too.
         return k_slots
 
-    def _run_bucketed_decode_dispatch(
+    def _run_batched_decode_dispatch(
         self,
         query_dev: torch.Tensor,
         k_pages: torch.Tensor,
@@ -1622,8 +1622,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Mod(d0, num_blocks) for a runtime .select); (4) result scatter is a
         # single contiguous copy_ at offset 0, valid because Q=1 forces
         # query_row_ids_cpu[:num_seqs] == range(num_seqs) (asserted in builder).
-        b_seqs = attn_metadata.bucket_num_seqs
-        b_blocks = attn_metadata.bucket_num_blocks
+        b_seqs = attn_metadata.padded_num_seqs
+        b_blocks = attn_metadata.padded_batch_blocks
         num_seqs = attn_metadata.num_seqs
         num_heads = self.num_heads
         head_size = self.head_size
@@ -1652,7 +1652,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             and output.storage_offset() == 0
             and output.is_contiguous()
         )
-        kernel = self._get_bucketed_decode_kernel(
+        kernel = self._get_batched_decode_kernel(
             b_seqs, b_blocks, block_size, needs_gather, store_out
         )
         result = kernel(
@@ -1719,8 +1719,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
-        if self._bucketed_decode_preconditions_met(attn_metadata):
-            self._run_bucketed_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
+        if self._batched_decode_preconditions_met(attn_metadata):
+            self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
             return output
 
         # Mirrors the batch layout row for row, so the absolute query_start_loc

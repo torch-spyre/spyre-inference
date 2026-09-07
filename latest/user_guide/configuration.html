@@ -1018,6 +1018,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#decoder-compile-buckets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decoder compile buckets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#encoder-pooling-compile-buckets" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1593,6 +1604,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#decoder-compile-buckets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decoder compile buckets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#encoder-pooling-compile-buckets" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1833,6 +1855,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#decoder-compile-buckets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decoder compile buckets
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#encoder-pooling-compile-buckets" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1931,6 +1964,13 @@ custom ops plus the Spyre Transformers backend (used for <code>model_impl="trans
 </span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="p">)</span>
 </span></code></pre></div>
 <p>See the <a href="../examples/offline_inference/torch_spyre_inference.html">Examples</a> page for more usage patterns.</p>
+<h2 id="decoder-compile-buckets">Decoder compile buckets<a class="headerlink" href="#decoder-compile-buckets" title="Permanent link">&para;</a></h2>
+<p>The body pads the packed token count to the next <code>compile_sizes</code> bucket, and warmup
+dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
+it needs the same treatment: it projects one row per <em>sampled</em> request, a width that
+would otherwise take every value in <code>1..--max-num-seqs</code> as requests finish. Those rows
+pad onto the same buckets clipped to <code>--max-num-seqs</code>, and warmup projects each width, so
+no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.</p>
 <h2 id="encoder-pooling-compile-buckets">Encoder / pooling compile buckets<a class="headerlink" href="#encoder-pooling-compile-buckets" title="Permanent link">&para;</a></h2>
 <p>Spyre compile is on by default (<code>STOCK_TORCH_COMPILE</code>, <code>dynamic=False</code>). Pass
 <code>--enforce-eager</code> to disable it. Body and attention are bucketed independently:</p>

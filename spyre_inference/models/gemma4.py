@@ -131,10 +131,8 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
     """Self-decoder without upstream's no-op PLE vocab-range mask."""
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        """``get_per_layer_inputs`` without upstream's vocab-range mask.
-
-        Spyre cannot lower a torch.bool result over an int32 operand, and the mask is a
-        no-op whenever ``vocab_size_per_layer_input >= vocab_size``.
+        """Upstream's, minus a mask Spyre cannot lower: a torch.bool result over an
+        int32 operand. It is a no-op whenever ``vocab_size_per_layer_input >= vocab_size``.
         """
         if self.embed_tokens_per_layer is None:
             return None
@@ -151,13 +149,12 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
 class _PerLayerRows(torch.Tensor):
     """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
 
-    Upstream's backbone loop cuts each block's row with exactly that index, and the view
-    it gets is at a nonzero storage offset, which a compiled block reads from offset 0
-    (torch-spyre#3770). Carrying the rows lets that loop stand as written.
+    Upstream's backbone loop cuts each block's row with exactly that index, and a
+    compiled block reads that nonzero-offset view from offset 0 (torch-spyre#3770).
     """
 
     # No subclass propagation: only the instance the projection hands back carries rows.
-    __torch_function__ = torch._C._disabled_torch_function_impl
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
 
     spyre_rows: tuple[torch.Tensor, ...]
 
@@ -175,17 +172,15 @@ class _PerLayerRows(torch.Tensor):
 class SpyreGemma4Model(Gemma4Model):
     """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
-    # ``compile_when_outermost`` reads these two. No ``__init__`` runs on a retyped
-    # instance, so ``SpyreGemma4ForCausalLM`` assigns them.
+    # ``compile_when_outermost`` reads these; ``retype`` runs no ``__init__``, so
+    # ``SpyreGemma4ForCausalLM`` assigns them instead of ``CompileOutermost``.
     spyre_compile_enabled: bool
     spyre_compiled_kernel: Callable | None
 
     @compile_when_outermost
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Hand back every layer's PLE row, each in its own allocation.
-
-        One graph, so the unavoidable copies cost one host launch per step instead of
-        ``num_hidden_layers`` of them on an already host-bound forward.
+        """Every layer's PLE row in its own allocation, in one graph: the copies cost one
+        host launch per step instead of one per layer.
         """
         ple_dim = self.hidden_size_per_layer_input
         return tuple(
@@ -216,7 +211,6 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         retype(self.model, SpyreGemma4Model)
         retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
-        # ``retype`` runs no ``__init__``, so set what ``compile_when_outermost`` reads.
         self.model.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )

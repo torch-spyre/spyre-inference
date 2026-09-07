@@ -19,11 +19,7 @@ Shared machinery rather than one architecture's adaptation, hence the private na
 A vLLM model that hardcodes the class of a submodule it builds offers no
 ``embedding_class``-style hook to pass a subclass through, so the Spyre adaptation
 lets ``super().__init__()`` build the tree and then swaps the class of the one
-submodule it needs to change. The alternatives are worse: rebuilding the submodule
-allocates its weights a second time and re-registers its attention layers, and
-skipping ``super().__init__()`` to inline upstream's body duplicates whatever churns
-there. The subclass adds no ``__init__``, no parameters and no children, so the
-built tree is already exactly what it would have constructed.
+submodule it needs to change.
 """
 
 from __future__ import annotations
@@ -39,20 +35,9 @@ _ModuleT = TypeVar("_ModuleT", bound="nn.Module")
 def retype(module: object, spyre: type[_ModuleT]) -> _ModuleT:
     """Retype ``module`` to the Spyre subclass ``spyre``, and hand it back.
 
-    ``module`` is annotated ``object`` because the static type of a built submodule
-    differs by call site — a plain mixin where one is in play — and it is ``spyre``
-    that has to be an ``nn.Module`` subclass. The check below is the real constraint.
-
-    The class ``module`` is expected to be is ``spyre``'s last base, so a Spyre
-    subclass must name its mixins first (``class SpyreX(SomeMixin, UpstreamX)``);
-    written the other way round the check below rejects every module.
-
-    Returns:
-        ``module``, typed as ``spyre`` so callers can reach what the subclass adds.
-
-    Raises:
-        RuntimeError: if ``module`` is not exactly an instance of that base. A
-            subclass is refused too: retyping one would drop whatever it overrides.
+    ``spyre`` must name its mixins before the upstream class it adapts
+    (``class SpyreX(SomeMixin, UpstreamX)``): its last base is the class ``module``
+    is required to be an exact instance of.
     """
     upstream = spyre.__bases__[-1]
     if type(module) is not upstream:

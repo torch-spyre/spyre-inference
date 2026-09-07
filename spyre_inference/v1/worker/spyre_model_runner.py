@@ -1046,9 +1046,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
         """Also mirror each KV-sharing layer's spec into its group's per-layer specs.
 
-        Upstream appends the layer to the group's ``layer_names`` only, so
-        ``initialize_attn_backend`` KeyErrors on it once ``disable_hybrid_kv_cache_manager``
-        has collapsed a hybrid model into one group indexed per layer.
+        Upstream appends the layer to ``layer_names`` only, so ``initialize_attn_backend``
+        KeyErrors once ``disable_hybrid_kv_cache_manager`` collapses a hybrid model into
+        one group indexed per layer.
         """
         super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
 

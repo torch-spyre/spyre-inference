@@ -19,6 +19,7 @@ from __future__ import annotations
 import types
 
 import torch
+from vllm.config import CompilationMode
 
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -37,10 +38,13 @@ class _Bucketer:
 
 
 def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
+    # NONE keeps warmup off the attention recorder, which this file does not
+    # exercise and which needs a real KV cache.
     compilation_config = types.SimpleNamespace(
         compile_sizes=list(bucket_sizes),
         inductor_compile_config={},
         static_forward_context={},
+        mode=CompilationMode.NONE,
     )
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner.model_config = types.SimpleNamespace(runner_type="generate")

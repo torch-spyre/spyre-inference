@@ -202,6 +202,30 @@ def test_compile_blocks_wraps_every_block_in_place() -> None:
         assert original._compiled_call_impl is not None
 
 
+def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
+    """Gemma-4 slices ``layers`` into a self- and a cross-decoder, aliasing every block."""
+    model = _Model(num_layers=4)
+    model.model.self_decoder = nn.Module()
+    model.model.self_decoder.decoder_layers = model.model.layers[:2]
+    model.model.cross_decoder = nn.Module()
+    model.model.cross_decoder.decoder_layers = model.model.layers[2:]
+    assert len(_repeated_block_lists(model)) == 3
+
+    assert _runner(model)._compile_blocks() == (4, 0)
+    assert all(block._compiled_call_impl is not None for block in model.model.layers)
+
+
+def test_compile_blocks_counts_a_shared_self_compiling_block_once() -> None:
+    """The alias must not be counted twice, nor compiled on its second visit."""
+    model = _Model(num_layers=4)
+    model.model.self_decoder = nn.Module()
+    model.model.self_decoder.decoder_layers = model.model.layers[:2]
+    for block in list(model.model.layers)[:2]:
+        block.spyre_compiles_own_regions = True
+
+    assert _runner(model)._compile_blocks() == (2, 2)
+
+
 def test_compile_blocks_preserves_parameter_names() -> None:
     """An ``_orig_mod.`` segment in a parameter path breaks weight save/reload."""
     model = _Model(num_layers=4)

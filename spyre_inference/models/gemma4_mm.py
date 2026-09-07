@@ -14,9 +14,9 @@
 
 """Spyre adaptation for vLLM's multimodal Gemma-4 wrapper.
 
-Its own module, not part of ``models.gemma4``: ``apply_prelaunch_overrides``
-imports that one for every launch, and pulling the vision / audio towers in with
-it would cost every other model. Registration here stays lazy.
+Its own module, not part of ``models.gemma4``: ``apply_prelaunch_overrides`` imports
+that one for every launch, which would pull the vision / audio towers in for every
+model. Registration here stays lazy.
 """
 
 from __future__ import annotations

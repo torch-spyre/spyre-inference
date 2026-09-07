@@ -103,7 +103,7 @@ def _moe_gathered(
     ``[E,M,H]``. Returns ``[T,H]``.
 
     Unlike the reference adapter this needs no ``spyre_hint`` row tiling: the region
-    lowers without the scope, and no tile width measured faster.
+    lowers without the scope at all.
     """
     tokens, hidden = x.shape
     weights, indices = _topk(probs, top_k)
@@ -460,10 +460,9 @@ def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:
 
     ``FusedMoE`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows) and
     ``w2`` as ``[E, H, M]``. The Spyre regions contract on the *second* axis, so
-    gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``. Gate and up stay
-    two stacks: fusing them into ``[E, H, 2M]`` is marginally better for the gathered
-    form and several times worse for the persistent one, and there is only room for
-    one layout.
+    gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``. Gate and up stay two
+    stacks rather than one fused ``[E, H, 2M]``: the gathered and persistent forms
+    favour opposite layouts here, and only one of them can be stored.
 
     The device cannot hold the stacks and their relaid-out copies at once, so each is
     converted and freed before the next one starts.

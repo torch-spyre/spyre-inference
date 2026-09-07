@@ -96,16 +96,16 @@ in the attention backend, where offset > 0 views still corrupt on transfer (see
 
 ## Model adaptations
 
-Some models need more than a swapped-out layer: a different transport for an input, a
-buffer that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those live in
-`spyre_inference/models/`, one module per architecture, as **subclasses of the upstream
-vLLM class** rather than runtime monkey-patches. `models/__init__.py` holds the
-`SPYRE_MODELS` table (architecture string → Spyre class) and `register_models()`, which
-points vLLM's `ModelRegistry` at them; `_`-prefixed modules hold machinery those subclasses
-share or delegate to and register no architecture of their own. Registration is lazy —
-nothing is imported until vLLM resolves the architecture — and `register_models()` first
-checks every key against vLLM's own registry, so an upstream rename fails loudly instead of
-silently falling through to the unadapted class.
+Some models need more than a swapped-out layer: a different transport for an input, a buffer
+that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those live in
+`spyre_inference/models/`, one module per architecture, as **subclasses of the upstream vLLM
+class** rather than runtime monkey-patches. `models/__init__.py` holds `spyre_models()`
+(architecture string → Spyre class, built from the `_ADAPTED_MODULES` and `_ADAPTED_ARCHS`
+tables) and `register_models()`, which points vLLM's `ModelRegistry` at them; `_`-prefixed
+modules hold machinery those subclasses share or delegate to and register no architecture of
+their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
+and `register_models()` first checks every key against vLLM's own registry, so an upstream
+rename fails loudly instead of silently falling through to the unadapted class.
 
 Where upstream hardcodes a class and offers no hook (`Gemma4Model` names
 `Gemma4DecoderLayer` in its `make_layers` call; the BERT wrappers hardcode

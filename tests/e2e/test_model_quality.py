@@ -70,7 +70,9 @@ NUM_LOGPROBS = 20
 
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
-# Caps the compiled buckets (platform.py) and so warmup; every prompt fits one bucket.
+# Top of COMPILE_SIZES below, which is what caps warmup: passing compile_sizes
+# explicitly skips the default buckets platform.py would derive, and platform.py then
+# clamps max_num_batched_tokens down to the largest bucket. Every prompt fits this one.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
 
@@ -188,11 +190,12 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
 def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
     """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
 
-    Nothing else does: `next_bucket` stick-aligns past the end of the ladder
-    (spyre_shape_bucketer.py), so an over-long prompt is not an error but an uncompiled
-    shape -- it recompiles inside generate(), and the raised
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS lets that grind for hours instead of failing. Run
-    before the engine is built so an edited prompt costs seconds, not a warmup.
+    Nothing else does: past the largest bucket `SpyreShapeBucketer.find_bucket` returns
+    None (spyre_shape_bucketer.py) and execute_model runs the shape unpadded, so an
+    over-long prompt is not an error but a Dynamo recompile inside generate() -- and the
+    raised VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS lets that grind for hours instead of
+    failing. Run before the engine is built so an edited prompt costs seconds, not a
+    warmup.
     """
     from transformers import AutoTokenizer
 

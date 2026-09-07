@@ -74,11 +74,12 @@ TOKEN_CLASSIFY_PROMPTS = [
 COSINE_MIN = 0.99
 
 # Reranker references are sigmoid probabilities, and a bare absolute bound is a poor gate
-# for one: the scores sit near the rails, where it permits an arbitrary relative error.
-# Paired with a relative bound (stricter of the two wins, as in test_model_quality.py) a
-# saturated reference is held to a fraction instead. Worst measured drift on the reference
-# documents is 7e-3 absolute and 13% relative, both on bge-reranker-large, so each bound
-# keeps ~4x margin.
+# for one: most of them sit just above zero, where 0.03 permits an arbitrary relative
+# error -- 400x on the smallest. Paired with a relative bound (stricter of the two wins,
+# as in test_model_quality.py) a near-zero reference is held to a fraction instead, while
+# the near-one end stays on the absolute bound, which is already tight relatively there.
+# Worst measured drift on the reference documents is 7e-3 absolute and 13% relative, both
+# on bge-reranker-large, so each bound keeps ~4x margin.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
 

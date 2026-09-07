@@ -602,17 +602,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
             num_blocks, num_self_compiled = self._compile_blocks(fullgraph=fullgraph)
             if num_blocks or num_self_compiled:
-                logger.info(
-                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
-                    "(fullgraph=%s).",
-                    num_blocks,
-                    model_name,
-                    fullgraph,
-                )
+                # Either count can be zero: a model whose every block drives its own
+                # regions leaves nothing to wrap here.
+                if num_blocks:
+                    logger.info(
+                        "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
+                        "(fullgraph=%s).",
+                        num_blocks,
+                        model_name,
+                        fullgraph,
+                    )
                 if num_self_compiled:
                     logger.info(
-                        "%d block(s) compile their own regions and were left uncompiled here.",
+                        "%d block(s) of %s compile their own regions and were left "
+                        "uncompiled here.",
                         num_self_compiled,
+                        model_name,
                     )
                 return
             logger.warning(

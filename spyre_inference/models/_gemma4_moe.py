@@ -336,10 +336,11 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
         """Per-instance setup, in place of the ``__init__`` a retype skips."""
         from vllm.config import CompilationMode, get_current_vllm_config
 
-        assert not self.hidden_size_per_layer_input, (
-            "Spyre Gemma-4 MoE does not support per-layer embeddings (PLE); "
-            f"hidden_size_per_layer_input={self.hidden_size_per_layer_input}."
-        )
+        if self.hidden_size_per_layer_input:
+            raise NotImplementedError(
+                "Spyre Gemma-4 MoE does not support per-layer embeddings (PLE); "
+                f"hidden_size_per_layer_input={self.hidden_size_per_layer_input}."
+            )
         experts = self.spyre_experts()
         moe_config = experts.moe_config
         if moe_config.tp_size > 1 or moe_config.ep_size > 1:
@@ -356,6 +357,12 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
             )
         self._spyre_regions: dict[str, Any] = {}
         self.spyre_top_k = int(experts.top_k)
+        # Built once: ``patch`` defines a fresh class per call, and ``forward`` enters
+        # these once per layer per step. Reusable as long as they are not nested.
+        from torch_spyre._inductor import config as spyre_config
+
+        self._spyre_moe_config = spyre_config.patch(_MOE_COMPILER_CONFIG)
+        self._spyre_persistent_config = spyre_config.patch(_PERSISTENT_COMPILER_CONFIG)
 
     def spyre_experts(self) -> RoutedExperts:
         return self.moe.experts.routed_experts
@@ -387,9 +394,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
         **kwargs,
     ) -> tuple[torch.Tensor, None]:
         """Gathered experts for a single-token decode step, persistent otherwise."""
-        from torch_spyre._inductor import config as spyre_config
-
-        with spyre_config.patch(_MOE_COMPILER_CONFIG):
+        with self._spyre_moe_config:
             if hidden_states.shape[0] == 1:
                 out = self._spyre_region("gathered_layer", _gathered_layer)(
                     self, positions, hidden_states, **kwargs
@@ -403,7 +408,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
                 route = self._spyre_region("route", _persistent_route)(self, probs)
                 _name_persistent_dims(expert_input, self.spyre_gate, self.spyre_up, self.spyre_down)
                 try:
-                    with spyre_config.patch(_PERSISTENT_COMPILER_CONFIG):
+                    with self._spyre_persistent_config:
                         moe_out = self._spyre_region("experts", _persistent_experts)(
                             self, expert_input, route
                         )

@@ -152,7 +152,8 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
 class SpyreGemma4Model(Gemma4Model):
     """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
 
-    # ``CompileOutermost``'s two fields, set by ``SpyreGemma4ForCausalLM``.
+    # ``compile_when_outermost`` reads these two. No ``__init__`` runs on a retyped
+    # instance, so ``SpyreGemma4ForCausalLM`` assigns them.
     spyre_compile_enabled: bool
     spyre_compiled_kernel: Callable | None
 
@@ -215,17 +216,7 @@ class SpyreGemma4Model(Gemma4Model):
 
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 adapted for the Spyre compile path.
-
-    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
-    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
-    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
-    CPU tensor into Inductor, which has no notion of a live CPU graph input.
-    Re-registering the aliases restores the parent's stated intent (move with the
-    model, interact with torch.compile) and needs no change to the embedding math:
-    a device-side 0-d scalar lowers fine.
-    """
-
+    """Gemma-4 adapted for the Spyre compile path."""
 
     model: SpyreGemma4Model
 
@@ -233,8 +224,7 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         retype(self.model, SpyreGemma4Model)
         retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
-        # What ``CompileOutermost.__init__`` would set. Inheriting it would not help: its
-        # ``super().__init__()`` walks the instance's MRO, i.e. the upstream backbone's.
+        # ``retype`` runs no ``__init__``, so set what ``compile_when_outermost`` reads.
         self.model.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )

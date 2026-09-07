@@ -275,9 +275,10 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
 
 
 def _self_compiling_block_names(model: nn.Module) -> list[str]:
-    """Names of submodules that drive compiled regions of their own
-    (``spyre_compiles_own_regions``). Only per-block granularity can honor them, by
-    leaving them uncompiled; a whole-model graph traces through their eager driver.
+    """Submodules that drive compiled regions of their own.
+
+    Only per-block granularity can honor them, by leaving them uncompiled; a
+    whole-model graph traces through their eager driver.
     """
     return [
         name
@@ -473,8 +474,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
         # Layers owning a device-specific weight layout rebuild it here, weights still
-        # whole on the host. A walk, not vLLM's model-level post-load hook, which fires
-        # on the top-level model only and so misses a nested backbone.
+        # whole on the host. A walk, because vLLM's post-load hook fires on the
+        # top-level model only and so misses a nested backbone.
         for module in cast(nn.Module, self.model).modules():
             relayout = getattr(module, "spyre_relayout_weights", None)
             if relayout is not None:
@@ -602,8 +603,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
             num_blocks, num_self_compiled = self._compile_blocks(fullgraph=fullgraph)
             if num_blocks or num_self_compiled:
-                # Either count can be zero: a model whose every block drives its own
-                # regions leaves nothing to wrap here.
                 if num_blocks:
                     logger.info(
                         "Wrapped %d transformer blocks of %s for per-block compile on Spyre "
@@ -627,8 +626,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 model_name,
             )
 
-        # Reached by granularity=model or by the fallback above; neither can honor a
-        # block that compiles its own regions.
         self_compiling = _self_compiling_block_names(cast(nn.Module, self.model))
         if self_compiling:
             raise ValueError(
@@ -648,10 +645,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
 
     def _compile_blocks(self, fullgraph: bool = True) -> tuple[int, int]:
-        """Wrap each transformer block in its own graph.
+        """Wrap each transformer block in its own graph, returning ``(wrapped, skipped)``.
 
-        Returns ``(wrapped, self_compiled)``. A self-compiling block is left alone but
-        still counts as found, so the caller does not fall back to a whole-model graph.
+        A self-compiling block is skipped but still counts as found, so the caller does
+        not fall back to a whole-model graph.
         """
         num_blocks = 0
         num_self_compiled = 0

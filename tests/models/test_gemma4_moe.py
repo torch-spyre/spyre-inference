@@ -14,14 +14,12 @@
 
 """The Spyre Gemma-4 MoE layer: its expert dispatch, and its decoder-layer plumbing.
 
-Both dispatch forms compute the same function by different means (see
-``spyre_inference.models._gemma4_moe``), so one dense reference covers both. Those
-tests need the card; shapes are scaled down but keep every dim stick-aligned, which
-is what the layout tricks in those regions depend on.
+Both dispatch forms compute the same function by different means, so one dense
+reference covers both. They need the card; shapes are scaled down but keep every dim
+stick-aligned, which is what the layout tricks in those regions depend on.
 
-The decoder-layer tests at the bottom are the other half: the Spyre path re-splits
-upstream's ``Gemma4DecoderLayer.forward`` around its expert dispatch, and they hold
-that copy to the original. They are plain host torch and need no device.
+The decoder-layer tests hold the Spyre re-split of upstream's
+``Gemma4DecoderLayer.forward`` to the original. They are host torch, no device.
 """
 
 import pytest
@@ -79,10 +77,7 @@ def _inputs(num_tokens):
 
 
 def test_gathered_matches_dense_reference(moe_weights):
-    """The decode form: gather the selected experts' weights, BMM, combine over K.
-
-    Single token only — the only shape whose combine step has a legal device layout.
-    """
+    """The decode form, at the single token whose combine has a legal device layout."""
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
 
@@ -112,12 +107,10 @@ def test_gathered_matches_dense_reference(moe_weights):
 
 @pytest.mark.parametrize("num_tokens", [24, 32])
 def test_persistent_matches_dense_reference(moe_weights, num_tokens):
-    """The prefill form: dense routing weights times every expert's output.
+    """The prefill form, in the region sequence ``SpyreGemma4MoEDecoderLayer`` uses.
 
-    Mirrors the region sequence in ``SpyreGemma4MoEDecoderLayer.forward``: the
-    routing runs in a graph of its own, then the expert matmul under an eagerly
-    declared named-dims context. 24 tokens does not divide the core count, which the
-    work-division hint has to cope with.
+    24 tokens does not divide the core count, which the work-division hint has to cope
+    with.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -170,11 +163,7 @@ def test_token_cores_divides_the_token_axis(tokens, expected):
 
 
 def test_relayout_splits_transposes_and_folds_the_scale():
-    """The load-time weight hook: what `spyre_relayout_weights` leaves for the regions.
-
-    `w13 [E,2M,H]` splits into `gate`/`up` `[E,H,M]`, `w2 [E,H,M]` becomes
-    `down [E,M,H]` carrying `per_expert_scale`, and both sources are freed.
-    """
+    """`w13 [E,2M,H]` -> `gate`/`up` `[E,H,M]`, `w2` -> scaled `down [E,M,H]`, both freed."""
     import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
 
@@ -220,9 +209,8 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     assert layer.spyre_stick == get_elem_in_stick(w13.dtype)
     assert layer.spyre_route_identity.dtype == w13.dtype
 
-    # Not bit-exact: the device round-trip rounds a few fp16 elements by one ulp. The
-    # tolerance is still far tighter than the 0.5x-1.5x per-expert scale, so a dropped
-    # or misapplied fold would still fail here.
+    # Not bit-exact: the device round-trip rounds a few fp16 elements by one ulp. Still
+    # far tighter than the 0.5x-1.5x scale, so a dropped fold would fail here.
     close = {"atol": 1e-4, "rtol": 1e-2}
     torch.testing.assert_close(layer.spyre_gate.cpu(), w13[:, :INTER, :].transpose(1, 2), **close)
     torch.testing.assert_close(layer.spyre_up.cpu(), w13[:, INTER:, :].transpose(1, 2), **close)
@@ -231,15 +219,11 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     )
 
 
-# ---------------------------------------------------------------------------
-# Decoder-layer plumbing
-#
-# The Spyre path does not call upstream's ``Gemma4DecoderLayer.forward``: it
-# splits the same body into ``_attn_block`` / ``_persistent_prologue`` /
-# ``_combine_block`` so the expert dispatch can sit between two compiled
-# regions. That split is a hand copy of upstream's residual-and-sandwich-norm
-# ordering, and nothing but these tests keeps the copy honest.
-# ---------------------------------------------------------------------------
+# The Spyre path splits upstream's ``Gemma4DecoderLayer.forward`` body into
+# ``_attn_block`` / ``_persistent_prologue`` / ``_combine_block`` so the expert
+# dispatch can sit between two compiled regions. That split is a hand copy of
+# upstream's residual-and-sandwich-norm ordering, and nothing but the tests below
+# keeps it honest.
 
 DTYPE = torch.float16
 
@@ -247,8 +231,8 @@ DTYPE = torch.float16
 class _StubAttention(torch.nn.Module):
     """Stands in for ``Gemma4Attention``, which needs a KV cache and a backend.
 
-    ``positions`` and the forwarded ``**kwargs`` both enter the result, and the
-    probe is a required argument, so a path that drops either fails.
+    ``positions`` and the forwarded ``**kwargs`` both enter the result, so a path that
+    drops either fails.
     """
 
     def __init__(self, *, hidden_size: int, **kwargs) -> None:
@@ -260,11 +244,7 @@ class _StubAttention(torch.nn.Module):
 
 
 class _StubMoE(torch.nn.Module):
-    """Stands in for ``Gemma4MoE``, whose ``FusedMoE`` kernels are CUDA-only.
-
-    Keeps the real module's own ``per_expert_scale``; the fixture then replaces
-    ``forward`` with the one expert dispatch both paths call.
-    """
+    """Stands in for ``Gemma4MoE``, whose ``FusedMoE`` kernels are CUDA-only."""
 
     def __init__(self, config, **kwargs) -> None:
         super().__init__()
@@ -319,11 +299,8 @@ def _spyre_moe(layer, expert_input, probs):
 def build_moe_layer(tp_group):
     """Builds a real ``Gemma4DecoderLayer`` with an MoE block, eager and on the host.
 
-    Upstream's own: the five RMSNorms, the dense MLP, the router, ``layer_scalar``
-    and — the point of the exercise — ``Gemma4DecoderLayer.forward``. Only the two
-    submodules that cannot run here are replaced, and both paths call the identical
-    stand-in, so any difference between them is plumbing and nothing else.
-
+    Only the two submodules that cannot run here are replaced, and both paths call the
+    identical stand-in, so any difference between them is plumbing and nothing else.
     ``CompilationMode.NONE`` is what keeps this off the card: the OOT layers'
     ``compile_when_outermost`` kernels would otherwise compile for the device.
     """
@@ -357,8 +334,8 @@ def build_moe_layer(tp_group):
             )
 
         # vLLM's linear layers come out of torch.empty, so every weight has to be
-        # written. Norm weights multiply an already normalized tensor: centred on
-        # 1.0, or five norms in sequence would shrink the activations to fp16 zero.
+        # written. Norm weights are centred on 1.0, or five norms in sequence would
+        # shrink the activations to fp16 zero.
         for module in layer.modules():
             weight = getattr(module, "weight", None)
             if isinstance(weight, torch.Tensor):
@@ -367,16 +344,14 @@ def build_moe_layer(tp_group):
         # Not 1.0: the combine step's final multiply has to be observable.
         layer.layer_scalar.fill_(0.75)
 
-        # The load-time pass the loader runs over every linear layer; the Spyre
-        # linear method stores its transposed weight there and reads it in apply.
+        # The Spyre linear method stores its transposed weight here and reads it in apply.
         for module in layer.modules():
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 quant_method.process_weights_after_loading(module)
 
-        # The expert stacks in the layout spyre_relayout_weights leaves behind
-        # (per-expert scale already folded into ``down``); its own test covers
-        # the load-time hook that builds them on the device.
+        # The layout spyre_relayout_weights leaves behind, per-expert scale already
+        # folded into ``down``.
         torch.manual_seed(1)
         layer.spyre_gate = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE) * 0.05
         layer.spyre_up = torch.randn(EXPERTS, HIDDEN, INTER, dtype=DTYPE) * 0.05
@@ -384,9 +359,8 @@ def build_moe_layer(tp_group):
         layer.spyre_top_k = TOP_K
         layer.spyre_stick = get_elem_in_stick(DTYPE)
 
-        # Upstream's MoE takes router logits, the Spyre regions take probabilities:
-        # the softmax lands on the same side of the boundary either way, so both
-        # paths reach _moe_gathered with bit-identical inputs.
+        # Upstream's MoE takes router logits, the Spyre regions take probabilities; the
+        # softmax lands on the same side either way, so both reach _moe_gathered equal.
         def _moe_forward(expert_input, router_logits):
             return _spyre_moe(layer, expert_input, torch.softmax(router_logits, dim=-1))
 
@@ -417,11 +391,10 @@ def _upstream_layer_output(layer, num_tokens):
     expected, residual = layer(
         positions=positions, hidden_states=hidden_states, residual=None, **kwargs
     )
-    # Upstream carries no fused residual here, which is why the Spyre forward can
-    # return None as its second element.
+    # Upstream carries no fused residual, which is why the Spyre forward returns None.
     assert residual is None
-    # Guards against a vacuous comparison: fp16 underflow to zero on both sides
-    # would otherwise pass whatever the plumbing did.
+    # Guards against a vacuous comparison: fp16 underflow to zero on both sides would
+    # otherwise pass whatever the plumbing did.
     assert torch.isfinite(expected).all()
     assert expected.abs().max() > 1e-3
     return expected, positions, hidden_states, kwargs
@@ -432,11 +405,8 @@ def _upstream_layer_output(layer, num_tokens):
 def test_persistent_plumbing_matches_upstream_forward(build_moe_layer, num_tokens, config):
     """``_persistent_prologue`` + experts + ``_combine_block`` == upstream's forward.
 
-    The prefill form's regions, minus the expert math itself: the sandwich norms,
-    the second residual capture, what the router and the expert block are each fed,
-    the dense/MoE combine and the layer scalar. Exact equality — both sides run the
-    same ops on the same tensors in the same order, so anything but a bit-for-bit
-    match is a real reordering.
+    Exact equality: both sides run the same ops on the same tensors in the same order,
+    so anything but a bit-for-bit match is a real reordering.
     """
     from spyre_inference.models._gemma4_moe import _combine_block, _persistent_prologue
 
@@ -456,8 +426,7 @@ def test_persistent_plumbing_matches_upstream_forward(build_moe_layer, num_token
 def test_gathered_layer_matches_upstream_forward(build_moe_layer, config):
     """``_gathered_layer`` == upstream's forward, at the one token it is used for.
 
-    The decode form is a single region, so this runs its whole body — including the
-    real ``_moe_gathered``, which is plain torch and needs no device.
+    A single region, so this runs its whole body including the real ``_moe_gathered``.
     """
     from spyre_inference.models._gemma4_moe import _gathered_layer
 

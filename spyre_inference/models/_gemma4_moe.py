@@ -12,27 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre sparse-MoE path for Gemma-4 26B-A4B (``enable_moe_block``).
+"""Spyre sparse-MoE dispatch for Gemma-4 26B-A4B (``enable_moe_block``).
 
-vLLM dispatches Gemma-4's expert block through ``FusedMoE``, whose kernels are
-CUDA / Triton only. This module supplies a Spyre dispatch instead, ported from the
-``hf_adapters`` ``hf_gemma4_moe`` adapter. Two forms, both reading the expert
+vLLM routes Gemma-4's expert block through ``FusedMoE``, whose kernels are CUDA /
+Triton only. This module supplies two Spyre forms instead, both reading the expert
 stacks :meth:`SpyreGemma4MoEDecoderLayer.spyre_relayout_weights` lays out:
 
-*Gathered*, for a single-token decode step: gather only the selected experts'
-weights, one row per top-k slot, and contract with per-row BMMs. One graph for the
-whole layer. Its per-row combine has no legal device layout above one token.
+*Gathered*, for a single-token decode step: gather only the selected experts' weights
+and contract with per-row BMMs, in one graph. Its combine step has no legal device
+layout above one token.
 
-*Persistent*, for everything else: evaluate every expert over every token as one
-batched ``[E,T,H] x [E,H,M]`` matmul, with dense routing weights zeroing the
-unselected pairs. Reads each expert weight once regardless of token count. Needs
-four graphs: its expert matmul is tiled by ``spyre_hint`` scopes resolving against
-named dims the driver declares *eagerly*, between compilations, and the routing
-weights must sit in a graph of their own between the softmax and that context — so
-the layer opts out of the model runner's whole-block compile.
+*Persistent*, for everything else: every expert over every token as one batched
+``[E,T,H] x [E,H,M]`` matmul, with dense routing weights zeroing the unselected
+pairs. It needs four graphs, because its ``spyre_hint`` tiling resolves against named
+dims the driver has to declare *eagerly*, between compilations — so the layer opts
+out of the model runner's whole-block compile.
 
-Both forms require ``torch.compile``; see
-:meth:`SpyreGemma4MoEDecoderLayer.spyre_init`.
+Both forms require ``torch.compile``.
 """
 
 from __future__ import annotations
@@ -64,8 +60,7 @@ _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 def _topk(probs: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Top-k over the expert axis, padded to two rows at T=1.
 
-    A length-1 reduction aborts the Spyre compiler ("stick expression 1"), so a
-    single-token batch duplicates its row and slices the result back.
+    A length-1 reduction aborts the Spyre compiler ("stick expression 1").
     """
     tokens = probs.shape[0]
     padded = probs.expand(2, -1).contiguous() if tokens == 1 else probs
@@ -77,9 +72,8 @@ def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tens
     """Turn topk's fp16 expert ids into device int32 gather indices.
 
     The ids have to travel through a full stick before the int32 cast, and the
-    ``.contiguous()`` is what restickifies them. Materializing the widening with a
-    pointwise op instead (``relu``, as the routing path does) yields an index layout
-    the backend's gather-index conversion rejects (``fmod(dsDim, size) == 0``).
+    ``.contiguous()`` is what restickifies them; widening with a pointwise op instead
+    yields a layout the backend's gather-index conversion rejects.
     """
     tokens = indices.shape[0]
     widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
@@ -98,8 +92,7 @@ def _moe_gathered(
 ) -> torch.Tensor:
     """Expert FFN over the selected experts only: gather weights, BMM, combine.
 
-    ``x`` is ``[T,H]``; ``gate``/``up`` are ``[E,H,M]`` and ``down`` is
-    ``[E,M,H]``. Returns ``[T,H]``.
+    ``x`` ``[T,H]``, ``gate``/``up`` ``[E,H,M]``, ``down`` ``[E,M,H]``, out ``[T,H]``.
     """
     tokens, hidden = x.shape
     weights, indices = _topk(probs, top_k)
@@ -118,8 +111,7 @@ def _moe_gathered(
     expert_out = expert_out.reshape(tokens, top_k, hidden)
 
     # The routing weight is folded into the H-carrying tensor: a bare [T,K] product
-    # has no legal layout. The per-expert output scale is already in ``down`` (see
-    # spyre_relayout_weights), so nothing else joins it here.
+    # has no legal layout. The per-expert output scale is already in ``down``.
     return (expert_out * weights[..., None]).sum(dim=1)
 
 
@@ -147,9 +139,8 @@ def _moe_persistent_routing(
 def _token_cores(tokens: int) -> int:
     """How many ways to spread the token axis over cores.
 
-    ``work_div`` splits a dim across that many cores, so it has to divide it
-    exactly, and vLLM's compile buckets (16, 24, 40, 56, …) are not all multiples of
-    the core count — hence the largest legal divisor rather than the count itself.
+    ``work_div`` has to divide the dim exactly, and vLLM's compile buckets (16, 24,
+    40, …) are not all multiples of the core count — hence the largest legal divisor.
     """
     from torch_spyre._inductor import config as spyre_config
 
@@ -171,10 +162,9 @@ def _moe_persistent(
     up: torch.Tensor,
     down: torch.Tensor,
 ) -> torch.Tensor:
-    """Expert FFN over every expert, summed against ``route``.
+    """Expert FFN over every expert, summed against ``route`` ``[T,E,1]``.
 
-    ``x`` is ``[T,H]``, ``route`` is ``[T,E,1]``, weights as in
-    ``_moe_gathered``. Returns ``[T,H]``.
+    ``x`` ``[T,H]``, weights as in ``_moe_gathered``, out ``[T,H]``.
     """
     from torch_spyre._inductor.propagate_hints import spyre_hint
 
@@ -195,9 +185,8 @@ def _name_persistent_dims(
 ) -> None:
     """Declare the named dims the persistent form's tiling hints resolve against.
 
-    The propagation pass reads these names off the *real* input tensors during
-    lowering, so this must run eagerly, before the region is traced — which is why
-    the FFN gets a graph of its own.
+    The propagation pass reads these names off the *real* input tensors, so this has
+    to run eagerly — which is why the FFN gets a graph of its own.
     """
     from torch_spyre._inductor.wsr.propagate_named_dims import (
         declare_tensor_dim,
@@ -225,10 +214,10 @@ def _attn_block(
     hidden_states: torch.Tensor,
     **kwargs,
 ):
-    """``input_layernorm`` -> attention -> ``post_attention_layernorm`` -> residual add.
+    """Attention under Gemma-4's sandwich norm.
 
-    Gemma-4 norms the attention *output* before adding the residual (a "sandwich"
-    norm), so the add cannot be fused into the next norm.
+    The attention *output* is normed before the residual add, so that add cannot be
+    fused into the next norm.
     """
     residual = hidden_states
     normed = layer.input_layernorm(hidden_states)
@@ -255,8 +244,7 @@ def _persistent_prologue(
     """Attention, the router probabilities, and the expert block's normed input.
 
     Softmax puts its stick on the token axis and ``keep_by_index`` needs it on the
-    expert axis, so the probabilities have to cross a graph boundary — which restores
-    the default layout — before the routing weights are built.
+    expert axis, so the probabilities have to cross a graph boundary in between.
     """
     residual = _attn_block(layer, positions, hidden_states, **kwargs)
     probs = torch.softmax(layer.router(residual), dim=-1)
@@ -264,12 +252,11 @@ def _persistent_prologue(
 
 
 def _persistent_route(layer: SpyreGemma4MoEDecoderLayer, probs: torch.Tensor) -> torch.Tensor:
-    """Dense routing weights.
+    """Dense routing weights, in a graph of their own.
 
-    Its own graph for two independent reasons: it cannot share one with the softmax
-    (layout, see ``_persistent_prologue``) nor with ``_moe_persistent``, because
-    ``keep_by_index`` reduces over the top-k axis, which the named-dims propagation
-    pass cannot map onto its probability input.
+    They can share one with neither the softmax (layout, see ``_persistent_prologue``)
+    nor ``_moe_persistent``: ``keep_by_index`` reduces over the top-k axis, which the
+    named-dims propagation cannot map onto its probability input.
     """
     return _moe_persistent_routing(
         probs, layer.spyre_route_identity, layer.spyre_top_k, layer.spyre_stick
@@ -309,15 +296,13 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
 
     Instances are retyped into this class by :func:`adapt_moe_layers` rather than
     constructed: ``Gemma4Model`` names ``Gemma4DecoderLayer`` directly in its
-    ``make_layers`` call, so there is no class hook to inject through
-    (``models._token_type`` retypes the BERT embedding the same way).
+    ``make_layers`` call, so there is no class hook to inject through.
     """
 
     # The model runner must not wrap this layer in one whole-block graph; see ``forward``.
     spyre_compiles_own_regions = True
 
-    # Upstream types these as ``| None`` because a dense layer leaves them unset;
-    # this class only ever wraps a layer that has them.
+    # Upstream types these ``| None`` for dense layers; this class only wraps MoE ones.
     router: Gemma4Router
     moe: Gemma4MoE
     pre_feedforward_layernorm_2: RMSNorm
@@ -357,8 +342,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
             )
         self._spyre_regions: dict[str, Any] = {}
         self.spyre_top_k = int(experts.top_k)
-        # Built once: ``patch`` defines a fresh class per call, and ``forward`` enters
-        # these once per layer per step. Reusable as long as they are not nested.
+        # Built once: ``patch`` defines a fresh class per call. Reusable while unnested.
         from torch_spyre._inductor import config as spyre_config
 
         self._spyre_moe_config = spyre_config.patch(_MOE_COMPILER_CONFIG)
@@ -372,11 +356,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
         _relayout_experts(self)
 
     def _spyre_region(self, name: str, fn: Any) -> Any:
-        """``dynamic=False`` is mandatory: the Spyre backend rejects SymInt shapes.
-
-        All layers share each region's code object, so layers 2..N hit the Inductor
-        cache.
-        """
+        """Memoized ``torch.compile``; ``dynamic=False`` because Spyre rejects SymInts."""
         region = self._spyre_regions.get(name)
         if region is None:
             region = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
@@ -400,8 +380,6 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
                     self, positions, hidden_states, **kwargs
                 )
             else:
-                # Four graphs: the expert matmul's named-dims context has to be
-                # declared eagerly, and the routing must sit outside it.
                 residual, probs, expert_input = self._spyre_region(
                     "prologue", _persistent_prologue
                 )(self, positions, hidden_states, **kwargs)
@@ -413,9 +391,8 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
                             self, expert_input, route
                         )
                 finally:
-                    # Unconditional: a stale _enabled flag would leak the persistent form's
-                    # named dims into the next region's compilation whenever this one is an
-                    # Inductor cache hit and never reaches the propagation pass.
+                    # Unconditional: on an Inductor cache hit the propagation pass never
+                    # runs, and the stale names would leak into the next compilation.
                     _reset_named_dims()
                 out = self._spyre_region("combine", _combine_block)(self, residual, moe_out)
         return out, None
@@ -424,8 +401,7 @@ class SpyreGemma4MoEDecoderLayer(Gemma4DecoderLayer):
 def adapt_moe_layers(layers: Iterable[nn.Module]) -> None:
     """Retype Gemma-4's MoE decoder layers onto the Spyre expert dispatch.
 
-    Runs before the checkpoint is loaded; each layer's ``spyre_relayout_weights``
-    finishes the job once the expert weights are in.
+    Runs before the checkpoint is loaded; ``spyre_relayout_weights`` finishes the job.
     """
     adapted = 0
     for layer in layers:
@@ -457,19 +433,18 @@ def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
 def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:
     """Split, transpose and move one layer's expert stacks, freeing the originals.
 
-    ``FusedMoE`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows) and
-    ``w2`` as ``[E, H, M]``. The Spyre regions contract on the *second* axis, so
-    gate/up become ``[E, H, M]`` and down becomes ``[E, M, H]``. Gate and up stay two
-    stacks rather than one fused ``[E, H, 2M]``: the gathered and persistent forms
-    favour opposite layouts here, and only one of them can be stored.
+    ``FusedMoE`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows) and ``w2``
+    as ``[E, H, M]``; the Spyre regions contract on the *second* axis, so gate/up
+    become ``[E, H, M]`` and down ``[E, M, H]``. Gate and up stay separate stacks
+    because the two forms favour opposite layouts for a fused one.
 
-    The device cannot hold the stacks and their relaid-out copies at once, so each is
-    converted and freed before the next one starts.
+    The device cannot hold both layouts at once, so each stack is converted and freed
+    before the next one starts.
     """
     from torch_spyre._C import get_elem_in_stick
 
-    # ``get_parameter`` rather than attribute access: create_weights registers both
-    # stacks dynamically, so only the lookup is typed.
+    # ``get_parameter``, not attribute access: create_weights registers both stacks
+    # dynamically, so only the lookup is typed.
     experts = layer.spyre_experts()
     w13 = experts.get_parameter("w13_weight").data
     w2_shape = tuple(experts.get_parameter("w2_weight").shape)
@@ -486,18 +461,15 @@ def _relayout_experts(layer: SpyreGemma4MoEDecoderLayer) -> None:
 
     w2 = experts.get_parameter("w2_weight").data
     # Fold the per-expert output scale into ``down`` instead of gathering it every
-    # step. It multiplies the already renormalized routing weight, so the fold is
-    # exact, and the checkpoint's values sit within 2% of 1.0, well inside fp16.
+    # step: it multiplies the already renormalized routing weight, so this is exact.
     w2.mul_(layer.moe.per_expert_scale.data.detach().to(w2.dtype).view(num_experts, 1, 1))
     layer.spyre_down = _to_spyre_expert_weight(w2.transpose(1, 2))
     del experts.w2_weight, w2
 
-    # Elements per stick, from the stacks' own dtype: the top-k indices and the
-    # routing weights are both widened onto a full stick before the compiler will
-    # gather or restickify with them.
+    # Elements per stick: both the top-k indices and the routing weights are widened
+    # onto a full stick before the compiler will gather or restickify with them.
     layer.spyre_stick = get_elem_in_stick(dtype)
-    # Identity for the routing-weight restickify. It has to originate on the
-    # host: Spyre has no on-device eye/diag kernel.
+    # Identity for the routing-weight restickify; host-built, as Spyre has no eye kernel.
     layer.spyre_route_identity = torch.eye(layer.spyre_stick, dtype=dtype).to("spyre")
     logger.info_once(
         "Spyre: relaid out the Gemma-4 MoE expert stacks (%d experts, hidden=%d, "

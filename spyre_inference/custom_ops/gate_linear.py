@@ -14,11 +14,8 @@
 
 """Spyre OOT ``GateLinear``: MoE router logits stay in the weight dtype.
 
-Models ask this layer for fp32 logits because CUDA's top-k kernels are more
-stable that way. Spyre cannot restickify fp32 (``spyre::ReStickifyOpHBM`` is
-unsupported for IEEE_FP32), so the routing softmax's reduction over fp32 logits
-fails to lower. Clearing ``out_dtype`` drops both of upstream's casts and leaves
-the logits in the weight dtype, which the platform already forces to float16.
+Spyre cannot restickify fp32 (``spyre::ReStickifyOpHBM`` is unsupported for
+IEEE_FP32), so the routing softmax over upstream's fp32 logits fails to lower.
 """
 
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -28,6 +25,5 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 class SpyreGateLinear(GateLinear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Cleared after ``super().__init__`` rather than through the argument, so
-        # it also covers callers that pass ``out_dtype`` positionally.
+        # Cleared here rather than through the argument, to also catch positional callers.
         self.out_dtype = None

@@ -113,10 +113,10 @@ def test_tp2_llm_generate_matches_tp1() -> None:
 def test_tp2_compiled_llm_generate_matches_tp1() -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.
 
-    compile_sizes capped at 5 buckets; full 35-bucket warmup exceeds the
-    pytest-timeout (1800 s) on cold-cache CI.
+    compile_sizes is pinned to the reachable token counts: 1 (one sequence
+    decoding alone), 2 (both decoding), and 16 as the prefill/scheduler cap.
     """
-    _cc = {"compile_sizes": [1, 2, 4, 8, 16]}
+    _cc = {"compile_sizes": [1, 2, 16]}
     _assert_matches_tp1(
         _generate(tp=1, enforce_eager=False, compilation_config=_cc),
         _generate(tp=2, enforce_eager=False, compilation_config=_cc),

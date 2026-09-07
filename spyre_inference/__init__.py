@@ -34,18 +34,12 @@ def register():
 
 
 def register_ops():
-    """Register the Spyre OOT custom ops and Transformers backend."""
-    from vllm.model_executor.models import ModelRegistry
-
+    """Register the Spyre OOT custom ops and model adaptations."""
     from spyre_inference.custom_ops import register_all
+    from spyre_inference.models import register_models
 
     register_all()
-
-    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
-    ModelRegistry.register_model(
-        "TransformersForCausalLM",
-        "spyre_inference.transformers_backend:SpyreTransformersForCausalLM",
-    )
+    register_models()
 
 
 def _init_logging():

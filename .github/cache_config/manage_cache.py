@@ -75,7 +75,7 @@ def _run_public(config, config_file):
                 repo_id,
                 revision=revision,
                 local_files_only=True,
-                ignore_patterns=["*.pt", "*.bin"],
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
             )
             print(f"✅ {repo_id}: already cached")
             continue
@@ -86,7 +86,7 @@ def _run_public(config, config_file):
                 repo_id,
                 revision=revision,
                 local_files_only=False,
-                ignore_patterns=["*.pt", "*.bin"],
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
             )
             print(f"✅ {repo_id}: downloaded and cached")
         except Exception as e:
@@ -125,7 +125,7 @@ def _run_gated(config, config_file):
                 revision=revision,
                 token=token,
                 force_download=force,
-                ignore_patterns=["*.pt", "*.bin"],
+                ignore_patterns=["*.pt", "*.pth", "*.bin"],
             )
             print(f"✅ Success: {repo_id} cache verified!")
         except Exception as e:

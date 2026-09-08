@@ -12,33 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre routed-expert dispatch, plugged into vLLM's own ``FusedMoE`` seams.
+"""Spyre routed-expert dispatch, on vLLM's ``FusedMoE`` quant-method seam.
 
-vLLM's unquantized MoE oracle has a kernel for CUDA, ROCm, XPU and CPU, and for an
-out-of-tree platform it selects ``UnquantizedMoeBackend.OOT`` — no kernel, and
-``process_weights_after_loading`` returns early, "OOT handles internally". This
-module is that OOT handling: a ``CustomOp.register_oot`` replacement for
-``UnquantizedFusedMoEMethod`` that lays the expert stacks out for Spyre at load
-time and computes the experts on device.
+vLLM's unquantized MoE oracle selects ``UnquantizedMoeBackend.OOT`` for an out-of-tree
+platform: no kernel, and ``process_weights_after_loading`` returns early. This module is
+both, as a ``CustomOp.register_oot`` replacement for ``UnquantizedFusedMoEMethod``. vLLM
+reaches the experts through ``torch.ops.vllm.moe_forward``, an opaque custom op, so the
+dispatch runs eagerly inside the block's compiled graph and can drive compiled regions of
+its own; ``Gemma4DecoderLayer.forward`` and ``MoERunner`` run unmodified.
 
-Everything above the expert compute stays upstream's. ``Gemma4DecoderLayer.forward``
-runs unmodified, so the model runner compiles the block as usual, and ``MoERunner``
-still drives the padding, the routed-input transform and the layer plumbing. vLLM
-reaches the experts through ``torch.ops.vllm.moe_forward``, an opaque custom op, so
-this code runs *eagerly inside* the block's compiled graph — the same seam the
-attention backend uses — which is what lets it drive compiled regions of its own
-without the runner having to leave the layer uncompiled.
-
-Two forms, both reading the stacks :func:`_relayout_experts` builds:
-
-*Gathered*, for a single-token decode step: gather only the selected experts'
-weights and contract with per-row BMMs, in one graph. Its combine step has no legal
-device layout above one token.
-
-*Persistent*, for everything else: every expert over every token as one batched
-``[E,T,H] x [E,H,M]`` matmul, with dense routing weights zeroing the unselected
-pairs. It needs three graphs, because its ``spyre_hint`` tiling resolves against
-named dims the driver has to declare *eagerly*, between compilations.
+Two forms over the stacks :func:`_relayout_experts` builds. *Gathered* contracts only the
+selected experts' weights, with per-row BMMs in one graph; its combine step has no legal
+device layout above one token. *Persistent* runs every expert over every token as one
+batched ``[E,T,H] x [E,H,M]`` matmul with dense routing weights, and needs three graphs
+because its ``spyre_hint`` tiling resolves against named dims the driver declares
+eagerly, between compilations.
 """
 
 from __future__ import annotations
@@ -65,11 +53,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.models.gemma4 import Gemma4MoE
 
     class RoutedExperts(_RoutedExperts):
-        """Type-only view of the Spyre attributes hung on vLLM's ``RoutedExperts``.
-
-        ``nn.Module.__getattr__`` types every dynamically added attribute as
-        ``Tensor | Module``, so without this the regions cannot read them.
-        """
+        """Types the Spyre attributes; ``__getattr__`` alone gives ``Tensor | Module``."""
 
         spyre_moe_owner: weakref.ref[Gemma4MoE]
         spyre_regions: dict[str, Any]
@@ -93,8 +77,8 @@ _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 def _compiler_scopes() -> tuple[Any, Any]:
     """The two torch-spyre config scopes the forms compile under.
 
-    Built once and reused: ``patch`` defines a fresh class per call, and the objects
-    it returns are reusable as long as neither is entered inside itself.
+    Cached because ``patch`` defines a fresh class per call; reuse is safe as long as
+    neither scope is entered inside itself.
     """
     from torch_spyre._inductor import config as spyre_config
 
@@ -118,9 +102,9 @@ def _topk(probs: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
 def _gather_indices(indices: torch.Tensor, top_k: int, stick: int) -> torch.Tensor:
     """Turn topk's fp16 expert ids into device int32 gather indices.
 
-    The ids have to travel through a full stick before the int32 cast, and the
-    ``.contiguous()`` is what restickifies them; widening with a pointwise op instead
-    yields a layout the backend's gather-index conversion rejects.
+    The ids must travel through a full stick, restickified by the ``.contiguous()``,
+    before the int32 cast; a pointwise widening instead yields a layout the backend's
+    gather-index conversion rejects.
     """
     tokens = indices.shape[0]
     widened = indices[..., None].expand(tokens, top_k, stick).contiguous()
@@ -196,7 +180,6 @@ def _token_cores(tokens: int) -> int:
 
 
 def _reset_named_dims() -> None:
-    """Drop the driver-declared named dims so they cannot leak into the next graph."""
     from torch_spyre._inductor.wsr.propagate_named_dims import reset
 
     reset()
@@ -279,9 +262,9 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:
     """Dense routing weights, in a graph of their own.
 
-    They can share one with neither the softmax (layout, see ``_probs``) nor
-    ``_moe_persistent``: ``keep_by_index`` reduces over the top-k axis, which the
-    named-dims propagation cannot map onto its probability input.
+    Shareable with neither the softmax (layout, see ``_probs``) nor ``_moe_persistent``:
+    named-dims propagation cannot map ``keep_by_index``'s reduction over the top-k axis
+    onto its probability input.
     """
     return _moe_persistent_routing(
         probs, layer.spyre_route_identity, layer.top_k, layer.spyre_stick
@@ -310,10 +293,8 @@ def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """Unquantized routed experts on Spyre, in place of the backend the oracle lacks.
 
-    Inert for any MoE model that has not opted in: only a layer carrying the
-    ``spyre_moe_owner`` backref :func:`adapt_moe_layers` sets is taken over, and any
-    other layer falls through to upstream, which fails the same way it does without
-    this class.
+    Only a layer carrying the ``spyre_moe_owner`` backref :func:`adapt_moe_layers` sets
+    is taken over; any other MoE model falls through to upstream unchanged.
     """
 
     @property
@@ -364,12 +345,8 @@ def adapt_moe_layers(layers: Iterable[nn.Module]) -> None:
     """Opt each Gemma-4 MoE layer's ``RoutedExperts`` into the Spyre dispatch.
 
     vLLM's post-load hook is handed the ``RoutedExperts``, which does not know the
-    ``Gemma4MoE`` holding ``per_expert_scale``; the backref supplies it. A weakref,
-    so it is not a submodule cycle (a plain child->parent attribute makes module
-    walks recurse forever).
-
-    Raises:
-        NotImplementedError: under ``--enforce-eager``, or for a PLE checkpoint.
+    ``Gemma4MoE`` holding ``per_expert_scale``; the backref supplies it. Weak, because a
+    plain child->parent attribute is a submodule cycle: module walks recurse forever.
     """
     from vllm.config import CompilationMode, get_current_vllm_config
 
@@ -396,8 +373,7 @@ def adapt_moe_layers(layers: Iterable[nn.Module]) -> None:
     if adapted:
         logger.info(
             "Spyre: %d Gemma-4 MoE layers dispatch their experts through the Spyre "
-            "gathered / persistent forms; vLLM's unquantized MoE oracle has no "
-            "out-of-tree backend.",
+            "gathered / persistent forms.",
             adapted,
         )
 
@@ -413,12 +389,10 @@ def _relayout_experts(layer: RoutedExperts) -> None:
     """Split, transpose and move one layer's expert stacks, freeing the originals.
 
     ``create_weights`` stores ``w13`` as ``[E, 2M, H]`` (gate rows then up rows) and
-    ``w2`` as ``[E, H, M]``; the Spyre regions contract on the *second* axis, so
-    gate/up become ``[E, H, M]`` and down ``[E, M, H]``. Gate and up stay separate
-    stacks because the two forms favour opposite layouts for a fused one.
-
-    The device cannot hold both layouts at once, so each stack is converted and freed
-    before the next one starts.
+    ``w2`` as ``[E, H, M]``; the Spyre regions contract on the *second* axis, so gate/up
+    become ``[E, H, M]`` and down ``[E, M, H]``. Gate and up stay separate stacks because
+    the two forms favour opposite layouts for a fused one. Each stack is freed before the
+    next is converted — the device cannot hold both layouts at once.
     """
     from torch_spyre._C import get_elem_in_stick
 
@@ -461,8 +435,7 @@ def _relayout_experts(layer: RoutedExperts) -> None:
     layer.spyre_route_identity = torch.eye(layer.spyre_stick, dtype=dtype).to("spyre")
 
     logger.info_once(
-        "Spyre: relaid out the Gemma-4 MoE expert stacks (%d experts, hidden=%d, "
-        "intermediate=%d) for on-device gather and matmul.",
+        "Spyre: relaid out the Gemma-4 MoE expert stacks (%d experts, hidden=%d, intermediate=%d).",
         num_experts,
         hidden,
         inter,

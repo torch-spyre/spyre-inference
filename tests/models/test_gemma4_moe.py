@@ -14,13 +14,9 @@
 
 """The Spyre Gemma-4 MoE expert dispatch: its two forms and its weight relayout.
 
-Both dispatch forms compute the same function by different means, so one dense
-reference covers both. They need the card; shapes are scaled down but keep every dim
-stick-aligned, which is what the layout tricks in those regions depend on.
-
-There is nothing to test around them: the dispatch hangs off vLLM's own
-``UnquantizedFusedMoEMethod`` seam, so ``Gemma4DecoderLayer.forward`` runs upstream's
-body unmodified.
+Both forms compute the same function by different means, so one dense reference covers
+both. They need the card; shapes are scaled down but every dim stays stick-aligned,
+which is what the layout tricks in those regions depend on.
 """
 
 import pytest
@@ -60,9 +56,8 @@ def moe_weights():
         "up": torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
         "down": torch.randn(EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
     }
-    # The per-expert output scale is folded into `down` at load time (see
-    # _relayout_experts), so the device stacks carry it and the reference
-    # applies it separately.
+    # `_relayout_experts` folds the per-expert output scale into `down` at load time, so
+    # the device stacks carry it and the reference applies it separately.
     host["scale"] = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
     scaled_down = host["down"] * host["scale"].view(EXPERTS, 1, 1)
     stacks = {"gate": host["gate"], "up": host["up"], "down": scaled_down}
@@ -202,9 +197,8 @@ def test_relayout_splits_transposes_and_folds_the_scale():
     assert layer.spyre_up.shape == (EXPERTS, HIDDEN, INTER)
     assert layer.spyre_down.shape == (EXPERTS, INTER, HIDDEN)
     assert layer.spyre_route_identity.shape == (layer.spyre_stick, layer.spyre_stick)
-    # Both come from the stacks' dtype, not a literal: the identity multiplies the
-    # routing weights, which arrive in that same dtype, and a stick's element count
-    # changes with it.
+    # Both follow the stacks' dtype, not a literal: a stick's element count changes with
+    # it, and the identity multiplies routing weights that arrive in that same dtype.
     assert layer.spyre_stick == get_elem_in_stick(w13.dtype)
     assert layer.spyre_route_identity.dtype == w13.dtype
 

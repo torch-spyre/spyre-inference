@@ -126,14 +126,11 @@ Two adaptations worth knowing:
   computes the experts in two Spyre forms — gathered for a single-token decode step,
   all-expert persistent for a prefill chunk — and, in the post-load hook, rebuilds each
   layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the `[E,H,M]` / `[E,M,H]` layout those
-  forms contract on, folds `per_expert_scale` into `down`, and frees each source stack as
-  it goes, since the device cannot hold both layouts at once. `Gemma4DecoderLayer.forward`
-  and `MoERunner` are untouched: vLLM reaches the experts through
-  `torch.ops.vllm.moe_forward`, an opaque custom op, so the dispatch runs eagerly *inside*
-  the block's compiled graph — the same seam the attention backend uses — and can drive
-  compiled regions of its own. `SpyreGemma4ForCausalLM` only marks each MoE layer's
-  `RoutedExperts` with a weakref to the `Gemma4MoE` that owns `per_expert_scale`, which
-  the post-load hook is not otherwise handed.
+  forms contract on, folding `per_expert_scale` into `down` and freeing each source stack
+  as it goes, since the device cannot hold both layouts at once. `Gemma4DecoderLayer.forward`
+  and `MoERunner` are untouched: vLLM reaches the experts through `torch.ops.vllm.moe_forward`,
+  an opaque custom op, so the dispatch runs eagerly *inside* the block's compiled graph —
+  the same seam the attention backend uses — and can drive compiled regions of its own.
 
 ## Compilation Granularity
 

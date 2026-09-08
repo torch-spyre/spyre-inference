@@ -205,7 +205,12 @@ def _moe_persistent_routing(
     stick: int,
 ) -> torch.Tensor:
     _, selected = _topk(values, top_k)
-    weights = torch.ops.spyre.keep_by_index(values, selected, -1, 0.0)
+    weights = torch.ops.spyre.keep_by_index(
+        values,  # ty: ignore[invalid-argument-type]
+        selected,  # ty: ignore[invalid-argument-type]
+        -1,  # ty: ignore[invalid-argument-type]
+        0.0,  # ty: ignore[invalid-argument-type]
+    )
     weights = weights / weights.sum(-1, keepdim=True)
     packed = torch.relu(weights.unsqueeze(-1).expand(-1, -1, stick))
     return (packed @ route_identity)[..., :1]

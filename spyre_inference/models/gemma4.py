@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
-from spyre_inference.models import _gemma4_moe
+from spyre_inference.models import gemma4_moe
 
 if TYPE_CHECKING:
     from torch import nn
@@ -129,11 +129,12 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     model, interact with torch.compile) and needs no change to the embedding math:
     a device-side 0-d scalar lowers fine.
 
-    A checkpoint with ``enable_moe_block`` additionally needs a routed-expert kernel,
-    which vLLM's MoE oracle has for no out-of-tree platform; see ``models._gemma4_moe``.
+    A checkpoint with ``enable_moe_block`` additionally supplies its routing recipe to
+    Spyre's generic unquantized MoE backend; see ``models.gemma4_moe``. That backend
+    compiles its own fixed-shape regions, independently of outer-model compilation.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         register_aliased_scalars(self.model.self_decoder)
-        _gemma4_moe.adapt_moe_layers(self.model.layers)
+        gemma4_moe.configure_gemma4_moe_layers(self.model.layers)

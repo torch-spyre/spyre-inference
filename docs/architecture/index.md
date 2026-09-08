@@ -119,15 +119,16 @@ Two adaptations worth knowing:
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
   which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
-- **Gemma-4 MoE** (`models/_gemma4_moe.py`) supplies the routed-expert kernel vLLM's
+- **MoE** (`moe.py`) supplies the routed-expert backend vLLM's
   unquantized MoE oracle lacks for an out-of-tree platform (it selects
   `UnquantizedMoeBackend.OOT` — no kernel — and leaves `process_weights_after_loading` to
   the plugin). A `CustomOp.register_oot` replacement for `UnquantizedFusedMoEMethod`
   computes the experts in two Spyre forms — gathered for a single-token decode step,
   all-expert persistent for a prefill chunk — and, in the post-load hook, rebuilds each
-  layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the `[E,H,M]` / `[E,M,H]` layout those
-  forms contract on, folding `per_expert_scale` into `down` and freeing each source stack
-  as it goes, since the device cannot hold both layouts at once. `Gemma4DecoderLayer.forward`
+   layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the `[E,H,M]` / `[E,M,H]` layout those
+   forms contract on and frees each source stack as it goes, since the device cannot hold both
+   layouts at once. Model recipes, such as `models/gemma4_moe.py`, define any model-owned scaling.
+   `Gemma4DecoderLayer.forward`
   and `MoERunner` are untouched: vLLM reaches the experts through `torch.ops.vllm.moe_forward`,
   an opaque custom op, so the dispatch runs eagerly *inside* the block's compiled graph —
   the same seam the attention backend uses — and can drive compiled regions of its own.

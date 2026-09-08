@@ -47,7 +47,6 @@ if TYPE_CHECKING:
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
         spyre_moe_route_identity: torch.Tensor
-        spyre_moe_expert_scale: torch.Tensor | None
 
 
 logger = init_logger(__name__)
@@ -336,10 +335,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     w2 = layer.get_parameter("w2_weight").data
     recipe = layer.spyre_moe_recipe
     if recipe.expert_scale is not None:
-        if not recipe.fold_expert_scale_into_down:
-            raise NotImplementedError(
-                "Spyre MoE only supports per-expert output scales folded into down weights."
-            )
+        # configure_spyre_moe_layer has already rejected an unfolded scale.
         w2.mul_(recipe.expert_scale.detach().to(w2.dtype).view(experts, 1, 1))
     layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2))
     del layer.w2_weight, w2
@@ -347,7 +343,6 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     dtype = layer.spyre_moe_gate.dtype
     layer.spyre_moe_stick = get_elem_in_stick(dtype)
     layer.spyre_moe_route_identity = torch.eye(layer.spyre_moe_stick, dtype=dtype).to("spyre")
-    layer.spyre_moe_expert_scale = None
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d).",
         experts, hidden, inter,
@@ -357,8 +352,6 @@ def _prepare_layer(layer: RoutedExperts) -> None:
 @CustomOp.register_oot(name="UnquantizedFusedMoEMethod")
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
-
-    supports_pre_processed_weights = False
 
     @property
     def is_monolithic(self) -> bool:

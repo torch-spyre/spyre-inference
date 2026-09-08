@@ -84,6 +84,25 @@ def test_standard_recipe_matches_upstream_topk_softmax():
     torch.testing.assert_close(actual, torch.softmax(selected, dim=-1))
 
 
+def test_standard_recipe_prefill_routing_matches_decode():
+    """The prefill dense form and the decode gathered form must agree on the weights.
+
+    ``_topk_probs`` is the multi-token half of the standard recipe, so nothing else in
+    the suite reaches it; Gemma-4 only ever takes the ``full_softmax`` branch.
+    """
+    from spyre_inference.moe import _routing_weights, _topk_probs
+
+    logits = torch.tensor([[0.5, -1.0, 2.0, 1.5], [-0.25, 3.0, 0.75, -2.0]], dtype=torch.float32)
+    dense = _topk_probs(logits, 2)
+    weights, indices = _routing_weights(logits, 2, "topk_softmax")
+    expected = torch.zeros_like(logits).scatter(-1, indices, weights)
+    torch.testing.assert_close(dense, expected)
+    # Exactly top_k live slots per token, already normalized, so the re-normalize inside
+    # _moe_persistent_routing is the divide-by-one it is meant to be.
+    assert (dense != 0).sum(-1).tolist() == [2, 2]
+    torch.testing.assert_close(dense.sum(-1), torch.ones(logits.shape[0]))
+
+
 def test_gemma_recipe_uses_full_softmax_before_topk():
     """Gemma's recipe stays model-specific rather than becoming a backend default."""
     from spyre_inference.moe import _routing_weights

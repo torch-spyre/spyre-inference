@@ -276,7 +276,7 @@ def _probs(router_logits: torch.Tensor) -> torch.Tensor:
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
     """Materialize standard vLLM top-k-softmax routing as dense weights."""
     selected_logits, indices = _topk(router_logits, top_k)
-    selected_weights = _probs(selected_logits, dim=-1)
+    selected_weights = _probs(selected_logits)
     return torch.zeros_like(router_logits).scatter(-1, indices, selected_weights)
 
 

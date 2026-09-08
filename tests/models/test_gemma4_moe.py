@@ -76,27 +76,28 @@ def _inputs(num_tokens):
     return x, logits
 
 
-def test_routing_recipes_are_not_interchangeable():
-    """``topk_softmax`` is upstream's default; ``full_softmax`` is Gemma's own.
+def test_routing_recipes_agree_under_renormalization():
+    """Each recipe is pinned to its own formula, and to agreeing with the other.
 
-    The two differ only in whether the softmax runs before or after the top-k, which makes
-    them easy to invert, so each is pinned to its own formula and to being distinct.
+    The backend only claims ``renormalize=True`` layers, and there both spellings are
+    ``exp(logit)`` over the sum across the selected set. They differ only in the graph.
     """
     from spyre_inference.moe import _routing_weights
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5]], dtype=torch.float32)
 
-    standard, indices = _routing_weights(logits, 2, "topk_softmax")
+    standard, standard_indices = _routing_weights(logits, 2, "topk_softmax")
     selected, expected_indices = torch.topk(logits, 2, dim=-1)
-    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(standard_indices, expected_indices)
     torch.testing.assert_close(standard, torch.softmax(selected, dim=-1))
 
-    gemma, indices = _routing_weights(logits, 2, "full_softmax")
+    gemma, gemma_indices = _routing_weights(logits, 2, "full_softmax")
     top_probs, expected_indices = torch.topk(torch.softmax(logits, dim=-1), 2, dim=-1)
-    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(gemma_indices, expected_indices)
     torch.testing.assert_close(gemma, top_probs / top_probs.sum(-1, keepdim=True))
 
-    assert not torch.allclose(standard, gemma), "the two recipes must not collapse into one"
+    torch.testing.assert_close(standard_indices, gemma_indices)
+    torch.testing.assert_close(standard, gemma)
 
 
 def test_prefill_routing_matches_the_decode_form():

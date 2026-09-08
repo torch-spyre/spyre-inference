@@ -221,7 +221,7 @@ def _build_query_row_tables(
     rows[:, :aligned] = (
         starts.unsqueeze(1) + torch.minimum(q_pos.unsqueeze(0), (lens - 1).unsqueeze(1))
     ).to(torch.int32)
-    rows_dev = convert(rows.contiguous(), device=device)
+    rows_dev = convert(rows, device=device)
     # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770).
     return rows_dev, [rows_dev[s].clone() for s in range(num_seqs)]
 

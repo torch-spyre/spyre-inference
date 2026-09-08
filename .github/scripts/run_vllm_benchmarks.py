@@ -33,6 +33,8 @@ from pathlib import Path
 
 import yaml
 
+from resource_sampler import ContainerSampler, write_resource_metrics
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
@@ -162,11 +164,17 @@ def run_benchmark(
 
     log_file = results_dir / f"{test_name}.log"
     with open(log_file, "w") as lf:
-        result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        log.error("Test %s failed with exit code %d", test_name, result.returncode)
-        if result.stderr:
-            stderr_lines = result.stderr.strip().splitlines()[-50:]
+        proc = subprocess.Popen(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
+    sampler = ContainerSampler()
+    sampler.start()
+    _, stderr_output = proc.communicate()
+    sampler.stop()
+    write_resource_metrics(test_name, results_dir, sampler.summary())
+
+    if proc.returncode != 0:
+        log.error("Test %s failed with exit code %d", test_name, proc.returncode)
+        if stderr_output:
+            stderr_lines = stderr_output.strip().splitlines()[-50:]
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
     log.info("Test %s passed", test_name)
@@ -267,12 +275,22 @@ def run_serve_benchmark(
             start_new_session=True,
         )
 
+        # Sample the container during model load and compilation (compile phase).
+        # The compile window covers everything from server start until /health
+        # returns 200, which includes compile_or_warm_up_model() entirely.
+        compile_sampler = ContainerSampler()
+        compile_sampler.start()
+
         # Wait for server health
         health_url = f"http://{host}:{port}/health"
         server_ready = False
         for i in range(1, health_timeout + 1):
             if server_proc.poll() is not None:
                 log.error("Server process died with exit code %d", server_proc.returncode)
+                compile_sampler.stop()
+                write_resource_metrics(
+                    test_name, results_dir, compile_sampler.summary(phase="compile")
+                )
                 if server_log.exists():
                     log.error("Server log:\n%s", server_log.read_text())
                 return False
@@ -284,11 +302,14 @@ def run_serve_benchmark(
             except Exception:
                 time.sleep(1)
 
+        compile_sampler.stop()
+
         if not server_ready:
             log.error("Server did not become healthy within %ds", health_timeout)
             if server_log.exists():
                 log.error("Server log:\n%s", server_log.read_text())
             _kill_server(server_proc)
+            write_resource_metrics(test_name, results_dir, compile_sampler.summary(phase="compile"))
             return False
 
         # Run bench serve
@@ -307,18 +328,30 @@ def run_serve_benchmark(
         log.info("=== Running serve benchmark: %s ===", test_name)
         log.info("Bench command: %s", " ".join(bench_cmd))
 
+        # Sample the container during steady-state inference (bench phase).
         bench_log = results_dir / f"{test_name}_bench.log"
         with open(bench_log, "w") as blf:
-            result = subprocess.run(
+            bench_proc = subprocess.Popen(
                 bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
             )
+        bench_sampler = ContainerSampler()
+        bench_sampler.start()
+        _, bench_stderr = bench_proc.communicate()
+        bench_sampler.stop()
+
+        # Merge both phases into a single host_resources file.
+        combined = {
+            **compile_sampler.summary(phase="compile"),
+            **bench_sampler.summary(),
+        }
+        write_resource_metrics(test_name, results_dir, combined)
 
         _kill_server(server_proc)
 
-    if result.returncode != 0:
-        log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
-        if result.stderr:
-            stderr_lines = result.stderr.strip().splitlines()[-50:]
+    if bench_proc.returncode != 0:
+        log.error("Serve test %s failed with exit code %d", test_name, bench_proc.returncode)
+        if bench_stderr:
+            stderr_lines = bench_stderr.strip().splitlines()[-50:]
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
     log.info("Serve test %s passed", test_name)

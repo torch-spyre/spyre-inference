@@ -87,6 +87,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    mark_warmup_complete,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
@@ -310,7 +311,10 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
 
     def __call__(self, *args, **kwargs):
-        # Convert integer tensor inputs to Spyre int64
+        # Convert integer tensor inputs to Spyre int64. Do not use int32:
+        # stock torch-spyre SDSC cannot schedule integer add (warmup crash
+        # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
+        # in models/roberta.py.
         def _convert_int(t):
             if (
                 t is not None
@@ -766,6 +770,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             total,
             time.time() - t0,
         )
+        # Past the early returns: with recording off, first-use compiles are intended.
+        mark_warmup_complete()
 
     def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
         """The attention bucketer the metadata builders dispatch against.

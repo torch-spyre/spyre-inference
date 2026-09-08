@@ -359,6 +359,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 
     def process_weights_after_loading(self, layer: _RoutedExperts) -> None:
         if getattr(layer, "spyre_moe_recipe", None) is None:
+            logger.warning_once(
+                "Spyre MoE: claiming routed experts with no model adapter. The generic "
+                "recipe is untested on this model — verify the outputs."
+            )
             configure_spyre_moe_layer(layer, _default_recipe(layer))
         _prepare_layer(cast("RoutedExperts", layer))
 

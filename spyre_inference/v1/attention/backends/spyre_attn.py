@@ -464,7 +464,7 @@ def _call_kernel(label: str, fn, *args):
         logger.warning_once(
             "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
             "Re-run with TORCH_LOGS=recompiles to see which guard failed, or enable "
-            "SPYRE_KERNEL_CACHE=1 to reuse compiled kernels across runs.",
+            "SPYRE_KERNEL_CACHE=1 to reuse compiled kernels across future runs.",
             label,
         )
     return result

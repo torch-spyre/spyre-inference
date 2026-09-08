@@ -23,7 +23,6 @@ from vllm.config import CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import (
     Gemma4ForCausalLM,
-    Gemma4Model,
     Gemma4SelfDecoderLayers,
 )
 
@@ -128,7 +127,17 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
 
 
 class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
-    """Self-decoder without upstream's no-op PLE vocab-range mask."""
+    """Self-decoder adapting the two PLE operations Spyre cannot lower."""
+
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
+
+    @compile_when_outermost
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Materialize every PLE row at offset zero in one compiled operation."""
+        return tuple(
+            ple[:, layer_idx, :].clone() for layer_idx in range(self.config.num_hidden_layers)
+        )
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
         """Upstream's, minus a mask Spyre cannot lower: a torch.bool result over an
@@ -144,6 +153,19 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
             self.config.num_hidden_layers,
             self.hidden_size_per_layer_input,
         )
+
+    def project_per_layer_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Use upstream's projection and materialize the rows its model loop slices."""
+        ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if ple is None:
+            return None
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple)
+        return rows
 
 
 class _PerLayerRows(torch.Tensor):
@@ -169,50 +191,14 @@ class _PerLayerRows(torch.Tensor):
         return torch.Tensor.__getitem__(self, index)
 
 
-class SpyreGemma4Model(Gemma4Model):
-    """Gemma-4 backbone cutting each block's PLE row outside the compiled block."""
-
-    # ``compile_when_outermost`` reads these; ``retype`` runs no ``__init__``, so
-    # ``SpyreGemma4ForCausalLM`` assigns them instead of ``CompileOutermost``.
-    spyre_compile_enabled: bool
-    spyre_compiled_kernel: Callable | None
-
-    @compile_when_outermost
-    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Every layer's PLE row in its own allocation, in one graph: the copies cost one
-        host launch per step instead of one per layer.
-        """
-        ple_dim = self.hidden_size_per_layer_input
-        return tuple(
-            ple.narrow(1, layer_idx * ple_dim, ple_dim).clone()
-            for layer_idx in range(len(self.layers))
-        )
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        """Upstream's projection, carrying the per-layer rows its loop will ask for."""
-        ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
-        if ple is None:
-            return None
-        rows = ple.as_subclass(_PerLayerRows)
-        rows.spyre_rows = self.split_per_layer_inputs(ple.reshape(ple.shape[0], -1))
-        return rows
-
-
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 adapted for the Spyre compile path."""
 
-    model: SpyreGemma4Model
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        retype(self.model, SpyreGemma4Model)
-        retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
-        self.model.spyre_compile_enabled = (
+        decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
+        decoder.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )
-        self.model.spyre_compiled_kernel = None
+        decoder.spyre_compiled_kernel = None
         register_aliased_scalars(self.model.self_decoder)

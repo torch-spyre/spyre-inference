@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
-from spyre_inference.models import gemma4_moe
+from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from torch import nn
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
@@ -118,6 +120,32 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
+def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe.
+
+    Per-expert output scaling is explicitly requested by this recipe, not the
+    generic backend. The generic backend compiles only its MoE regions, so this
+    works with both compiled and eager outer model execution.
+    """
+    configured = 0
+    for decoder in layers:
+        moe = getattr(decoder, "moe", None)
+        if moe is None:
+            continue
+        configure_spyre_moe_layer(
+            moe.experts.routed_experts,
+            SpyreMoERecipe(
+                activation="gelu_tanh",
+                routing="full_softmax",
+                expert_scale=moe.per_expert_scale,
+                fold_expert_scale_into_down=True,
+            ),
+        )
+        configured += 1
+    if configured:
+        logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
 
@@ -129,12 +157,13 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     model, interact with torch.compile) and needs no change to the embedding math:
     a device-side 0-d scalar lowers fine.
 
-    A checkpoint with ``enable_moe_block`` additionally supplies its routing recipe to
-    Spyre's generic unquantized MoE backend; see ``models.gemma4_moe``. That backend
-    compiles its own fixed-shape regions, independently of outer-model compilation.
+    A checkpoint with ``enable_moe_block`` additionally supplies its routing recipe
+    to Spyre's generic unquantized MoE backend; see ``configure_gemma4_moe_layers``.
+    That backend compiles its own fixed-shape regions, independently of outer-model
+    compilation.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         register_aliased_scalars(self.model.self_decoder)
-        gemma4_moe.configure_gemma4_moe_layers(self.model.layers)
+        configure_gemma4_moe_layers(self.model.layers)

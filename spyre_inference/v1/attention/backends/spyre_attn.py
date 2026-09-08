@@ -935,18 +935,42 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             )
             # Each tile is [aligned_max_query_len, block_size] -- _record_one
             # builds same-shaped zero tiles by hand; keep them in sync.
-            for s in range(num_seqs):
-                seq_tiles: list[torch.Tensor] = []
-                for b in range(padded_num_blocks[s]):
-                    col_start = b * block_size
-                    col_end = col_start + block_size
-                    tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
-                    # `.contiguous()` is a no-op on a [1, N] slice, leaving
-                    # stride(0) == mask_kv_width and a nonzero storage offset
-                    # reaching a compiled kernel (torch-spyre#3770).
-                    tile = tile.clone(memory_format=torch.contiguous_format)
-                    seq_tiles.append(tile)
-                attention_mask_tiles.append(seq_tiles)
+            if aligned_max_query_len == 1:
+                # Decode: build every tile from one contiguous buffer. A tile sliced
+                # straight out of mask_cpu is strided (stride(0) == mask_kv_width), and
+                # copying from a strided source costs ~1.8x copying from a contiguous
+                # one, so the reshape/permute pays for itself many times over at the
+                # tile counts a full batch reaches.
+                max_padded_blocks = max(padded_num_blocks)
+                tiles_by_block = (
+                    mask_cpu[:num_seqs, :1, : max_padded_blocks * block_size]
+                    .reshape(num_seqs, 1, max_padded_blocks, block_size)
+                    .permute(0, 2, 1, 3)
+                    .contiguous()
+                )
+                # unbind yields views into tiles_by_block at increasing offsets, so each
+                # tile is still cloned: a compiled kernel reads its arguments from
+                # storage offset 0 (torch-spyre#3770).
+                attention_mask_tiles = [
+                    [
+                        tile.clone(memory_format=torch.contiguous_format)
+                        for tile in list(seq_row.unbind(0))[: padded_num_blocks[s]]
+                    ]
+                    for s, seq_row in enumerate(tiles_by_block.unbind(0))
+                ]
+            else:
+                for s in range(num_seqs):
+                    seq_tiles: list[torch.Tensor] = []
+                    for b in range(padded_num_blocks[s]):
+                        col_start = b * block_size
+                        col_end = col_start + block_size
+                        tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
+                        # `.contiguous()` is a no-op on a [1, N] slice, leaving
+                        # stride(0) == mask_kv_width and a nonzero storage offset
+                        # reaching a compiled kernel (torch-spyre#3770).
+                        tile = tile.clone(memory_format=torch.contiguous_format)
+                        seq_tiles.append(tile)
+                    attention_mask_tiles.append(seq_tiles)
             # active_block_indices stays None, so forward iterates all blocks.
         else:
             # Sliding window: arithmetic block-skip. Blocks entirely outside

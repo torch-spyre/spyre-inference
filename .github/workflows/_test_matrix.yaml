@@ -172,35 +172,116 @@ jobs:
           RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
           echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
 
+  # Pin the test-durations artifact this run's shard jobs weight their partition
+  # by: one run id resolved once, so every shard of a suite reads identical
+  # durations (a divergent partition would drop or double-run tests). Prefers a
+  # passing run on this PR's head branch (so a PR with heavy test changes
+  # self-balances), else the base branch. Empty output / no artifact -> the
+  # plugin falls back to its static heuristic weights. Informational: never
+  # fails the workflow.
+  resolve_durations:
+    name: Resolve test durations pin
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      durations_run_id: ${{ steps.resolve.outputs.durations_run_id }}
+    steps:
+      - name: Checkout scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Resolve durations run id
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ inputs.repository || github.repository }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+        run: python3 .github/scripts/resolve_durations_run.py
+
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
+    needs: resolve_durations
     strategy:
       fail-fast: false
       matrix:
         include:
-          - cfg: Non-distributed spyre tests
-            # Fast per-op unit tests: the smoke set (compile split out below).
+          # Smoke set, sharded across parallel jobs. This carries the compiled
+          # (enforce_eager=False) tests/e2e/test_compile.py cases -- once a
+          # separate "Spyre compile tests" job -- which the plugin's weighted
+          # partition (e2e paths weighted heavy) spreads across the shards so no
+          # single shard eats the ~20 min the compile job used to.
+          # MUST keep `integration` in this set: the multi-repo integration hook
+          # runs only the integration-tagged configs, so dropping it would
+          # silently lose the smoke + torch.compile end-to-end coverage.
+          # Adding/removing a shard = add/remove an entry here and bump
+          # SMOKE_SHARDS (Makefile default). Marker expression owned by the
+          # Makefile (test-<name> target); see that target's comment.
+          - cfg: Non-distributed spyre tests (shard 1/8)
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            # Marker expression owned by the Makefile (test-<name> target); see that target's comment.
-            test_target: test-smoke
-          - cfg: Spyre compile tests
-            # Split out of smoke (it was ~20 min of a ~28 min job). MUST keep
-            # `integration` in this set: the multi-repo integration hook runs
-            # only the integration-tagged configs, so dropping it here would
-            # silently lose the torch.compile end-to-end check that guards
-            # against upstream-runtime regressions.
+            test_target: test-smoke-shard-0
+          - cfg: Non-distributed spyre tests (shard 2/8)
             test_types: unit integration regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-compile
+            test_target: test-smoke-shard-1
+          - cfg: Non-distributed spyre tests (shard 3/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-2
+          - cfg: Non-distributed spyre tests (shard 4/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-3
+          - cfg: Non-distributed spyre tests (shard 5/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-4
+          - cfg: Non-distributed spyre tests (shard 6/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-5
+          - cfg: Non-distributed spyre tests (shard 7/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-6
+          - cfg: Non-distributed spyre tests (shard 8/8)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-smoke-shard-7
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock
@@ -209,7 +290,7 @@ jobs:
           # the weighted partition; ATTN_SHARDS (Makefile default) is the count.
           # Adding/removing a shard = add/remove an entry here and bump that
           # default. The encoder split runs below.
-          - cfg: Spyre attention tests (shard 1/7)
+          - cfg: Spyre attention tests (shard 1/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -217,7 +298,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-0
-          - cfg: Spyre attention tests (shard 2/7)
+          - cfg: Spyre attention tests (shard 2/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -225,7 +306,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-1
-          - cfg: Spyre attention tests (shard 3/7)
+          - cfg: Spyre attention tests (shard 3/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -233,7 +314,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-2
-          - cfg: Spyre attention tests (shard 4/7)
+          - cfg: Spyre attention tests (shard 4/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -241,7 +322,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-3
-          - cfg: Spyre attention tests (shard 5/7)
+          - cfg: Spyre attention tests (shard 5/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -249,7 +330,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-4
-          - cfg: Spyre attention tests (shard 6/7)
+          - cfg: Spyre attention tests (shard 6/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -257,7 +338,7 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-5
-          - cfg: Spyre attention tests (shard 7/7)
+          - cfg: Spyre attention tests (shard 7/10)
             test_types: unit regression trunk
             runs_on:
               - x86_64
@@ -265,6 +346,30 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-6
+          - cfg: Spyre attention tests (shard 8/10)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-7
+          - cfg: Spyre attention tests (shard 9/10)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-8
+          - cfg: Spyre attention tests (shard 10/10)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-attention-shard-9
           - cfg: Encoder attention tests
             test_types: unit regression trunk
             runs_on:
@@ -273,23 +378,120 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-encoder-attention
-          - cfg: Distributed spyre tests
+          # Distributed (TP=2) suite, sharded across parallel 2-card jobs. Each
+          # case spawns a TP=2 subprocess pair, so the model-run cases dominate;
+          # the plugin's weighted partition balances by recorded runtime.
+          # `integration` added so the multi-repo integration hook exercises the
+          # TP=2 path. Probes are excluded (dedicated probe job below). Adding/
+          # removing a shard = add/remove an entry here and bump DIST_SHARDS.
+          - cfg: Distributed spyre tests (shard 1/3)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x2
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-distributed-shard-0
+          - cfg: Distributed spyre tests (shard 2/3)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x2
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-distributed-shard-1
+          - cfg: Distributed spyre tests (shard 3/3)
+            test_types: unit integration regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x2
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-distributed-shard-2
+          # torch-spyre backend probes (strict-xfail signals for backend readiness),
+          # sharded across parallel 2-card jobs. Deliberately NOT in `integration`: a
+          # strict-xfail flipping to xpass means the backend team shipped support and must
+          # not block integration runs. Shares the 2-card runner (some probes are TP=2
+          # native-collective probes). Adding/removing a shard = add/remove an entry here
+          # and bump PROBE_SHARDS (Makefile default).
+          - cfg: Spyre probe tests (shard 1/2)
             test_types: unit regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x2
               - linux
             image_label: image_torch_spyre
-            test_target: test-distributed
-          - cfg: Upstream vLLM tests
-            # Upstream-vLLM suites are excluded from integration/unit (heavy).
+            test_target: test-probes-shard-0
+          - cfg: Spyre probe tests (shard 2/2)
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x2
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-probes-shard-1
+          # Non-distributed upstream-vLLM suites, sharded across parallel jobs.
+          # The heavy model tests (under a models/ path) were once a separate
+          # "Upstream model vLLM tests" job; the plugin's weighted partition
+          # (models/ paths weighted heavy) now balances them across the shards.
+          # Excluded from integration/unit (heavy). Adding/removing a shard =
+          # add/remove an entry here and bump UPSTREAM_SHARDS (Makefile default).
+          - cfg: Upstream vLLM tests (shard 1/7)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-upstream
+            test_target: test-upstream-shard-0
+          - cfg: Upstream vLLM tests (shard 2/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-1
+          - cfg: Upstream vLLM tests (shard 3/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-2
+          - cfg: Upstream vLLM tests (shard 4/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-3
+          - cfg: Upstream vLLM tests (shard 5/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-4
+          - cfg: Upstream vLLM tests (shard 6/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-5
+          - cfg: Upstream vLLM tests (shard 7/7)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-upstream-shard-6
           - cfg: Upstream distributed vLLM tests
             test_types: regression trunk
             runs_on:
@@ -298,14 +500,6 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-distributed
-          - cfg: Upstream model vLLM tests
-            test_types: regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-upstream-model
     # Compose runner labels from matrix.runs_on and the image label.
     # When inputs.runner_label is set (per-PR dispatch flow), it replaces
     # the standing image label with the per-PR image label.
@@ -403,6 +597,7 @@ jobs:
         with:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
+          durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           # Echo the exact runner-label selectors this job's runs-on used (matrix.runs_on plus the per-PR runner_label override, or the standing matrix.image_label).
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
@@ -460,7 +655,7 @@ jobs:
   # Pod-level retry: re-runs, on a brand-new runner pod, exactly the configs collect_failed_suites found failed (no changed-files gate, since these are already known to need running); a config that fails again here is a genuine failure.
   test_retry:
     name: 'build and run tests (${{ matrix.cfg }}) (pod-level retry)'
-    needs: collect_failed_suites
+    needs: [collect_failed_suites, resolve_durations]
     if: ${{ !cancelled() && needs.collect_failed_suites.outputs.has_failed == 'true' }}
     strategy:
       fail-fast: false
@@ -485,6 +680,7 @@ jobs:
         with:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
+          durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
@@ -587,6 +783,59 @@ jobs:
             coverage.xml
             htmlcov/
           retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Durations fan-in: merge every leg's {nodeid: seconds} slice (each leg wrote
+  # its own via the plugin's SPYRE_TEST_DURATIONS_OUT) into the single
+  # `test-durations` artifact a LATER run pins and weights its shard partition by
+  # (resolve_durations -> run-matrix-config download). Merge, not replace: each
+  # leg records only its own shard and no test runs twice in a run, so the union
+  # across legs is the whole suite. always() so a run with some failed legs still
+  # refreshes the durations of the legs that passed. Informational: never fails
+  # the workflow.
+  # ---------------------------------------------------------------------------
+  durations:
+    name: Aggregate test durations
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download durations data
+        uses: actions/download-artifact@v4
+        with:
+          pattern: durations-data-*
+          path: durations
+          merge-multiple: true
+
+      - name: Merge durations
+        run: |
+          shopt -s nullglob
+          files=(durations/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No durations data to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/merge_test_durations.py durations/*.json \
+            --out test-durations.json
+
+      - name: Upload test durations
+        if: ${{ hashFiles('test-durations.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-durations
+          path: test-durations.json
+          retention-days: 30
 
   # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the

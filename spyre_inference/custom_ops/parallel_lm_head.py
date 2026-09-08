@@ -21,22 +21,41 @@ Spyre Device Constraints:
       Other quantization methods raise NotImplementedError.
 """
 
+import torch
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
 )
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
 from .linear import SpyreTransposedWeightMethod
 
 logger = init_logger(__name__)
 
 
-class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbeddingMethod):
-    """LM-head projection via the shared transposed-weight fast path."""
+class SpyreUnquantizedLMHeadMethod(
+    CompileOutermost, SpyreTransposedWeightMethod, UnquantizedEmbeddingMethod
+):
+    """LM-head projection via the shared transposed-weight fast path.
+
+    No graph encloses it: per-block wraps only the block ModuleList, and a whole-model
+    compile intercepts ``__call__``, not ``compute_logits``. Compiled ``dynamic=False``,
+    so rows must arrive padded onto one of the ``logits_row_buckets``.
+    """
 
     WEIGHT_T_ATTR = "padded_weight_t"
     ROW_ALIGN = 64 * 32
+
+    @compile_when_outermost
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return SpyreTransposedWeightMethod.apply(self, layer, x, bias)
 
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
@@ -61,6 +80,9 @@ class SpyreParallelLMHead(ParallelLMHead):
                 self._parameters["weight"] = weight
 
     def __init__(self, *args, **kwargs):
+        # Pad the vocab so every TP shard is a whole number of 64-element sticks, which
+        # lets the logits gather stay on device (see SpyreCommunicator.all_gather).
+        kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
 
         # Only UnquantizedEmbeddingMethod supported. Fp8Config resolves to it;

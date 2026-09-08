@@ -115,6 +115,11 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
+    # 2 bytes for fp16).
+    _BLOCK_SIZE_MULTIPLE = 64
+    _DEFAULT_BLOCK_SIZE = 128
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -439,6 +444,31 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _align_block_size(cls, vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+
+        if not cache_config.user_specified_block_size:
+            if cache_config.block_size != cls._DEFAULT_BLOCK_SIZE:
+                logger.info(
+                    "Setting kv cache block size to %d for the Spyre paged attention backend.",
+                    cls._DEFAULT_BLOCK_SIZE,
+                )
+                cache_config.block_size = cls._DEFAULT_BLOCK_SIZE
+            return
+
+        multiple = cls._BLOCK_SIZE_MULTIPLE
+        aligned = ((cache_config.block_size + multiple - 1) // multiple) * multiple
+        if aligned != cache_config.block_size:
+            logger.warning(
+                "Block size must be a multiple of %d for the Spyre paged attention "
+                "backend. Overriding block_size from %d to %d.",
+                multiple,
+                cache_config.block_size,
+                aligned,
+            )
+            cache_config.block_size = aligned
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
@@ -458,21 +488,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
         cls._maybe_pad_intermediate_size(vllm_config)
-
-        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The Spyre paged attention backend requires 64-element stick alignment for
-        # torch.compile.
-        cache_config = vllm_config.cache_config
-        original_block_size = cache_config.block_size
-        if original_block_size % 64 != 0:
-            new_block_size = ((original_block_size + 63) // 64) * 64
-            logger.warning(
-                "Block size must be a multiple of 64 for the Spyre paged attention "
-                "backend. Overriding block_size from %d to %d.",
-                original_block_size,
-                new_block_size,
-            )
-            cache_config.block_size = new_block_size
 
         parallel_config = vllm_config.parallel_config
 
@@ -534,23 +549,20 @@ class TorchSpyrePlatform(CpuPlatform):
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
 
+        # Must run after super(), which sets a block_size default of its own, and before
+        # the num_gpu_blocks_override math below, which reads block_size.
+        cls._align_block_size(vllm_config)
+
         # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
-        # single-group formula only holds for homogeneous decoder models.
+        # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
+        # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
+        # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
-        # Hybrid models build several KV cache groups whose block count depends
-        # on vLLM's internal layer-grouping (not knowable here), so we skip the
-        # cap and let vLLM size the cache from the profiled memory budget.
         cache_config = vllm_config.cache_config
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(
                     "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
-                )
-            elif cls._is_hybrid_attention(vllm_config):
-                logger.info(
-                    "Hybrid attention model detected; leaving num_gpu_blocks "
-                    "to vLLM (skipping the single-group block-count override)."
                 )
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -570,15 +582,3 @@ class TorchSpyrePlatform(CpuPlatform):
         """Encoder / embedding / scoring models (no paged KV cache)."""
         model_config = vllm_config.model_config
         return getattr(model_config, "runner_type", None) == "pooling"
-
-    @staticmethod
-    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
-        """Whether the model interleaves multiple attention types.
-
-        More than one distinct HF `layer_types` value means vLLM builds
-        multiple KV cache groups (a hybrid model).
-        """
-        model_config = vllm_config.model_config
-        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-        layer_types = getattr(hf_config, "layer_types", None)
-        return bool(layer_types) and len(set(layer_types)) > 1

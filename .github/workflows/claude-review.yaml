@@ -171,14 +171,25 @@ jobs:
           # text a maintainer types after /claude-review is ignored.
           prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/" .github/claude-review-prompt.txt)"
 
-          # This CLI build does NOT provide a github_inline_comment MCP server
-          # /code-review --comment posts through the gh CLI fallback.
-          # --strict-mcp-config blocks any stray .mcp.json from loading in the untrusted-diff 
-          # context.
+          # This CLI build does NOT provide a github_inline_comment MCP server,
+          # so /code-review --comment posts through the gh CLI fallback.
+          # --strict-mcp-config blocks any stray .mcp.json from loading.
+          #
+          # Bash is allowed broadly (not a per-subcommand allowlist) on purpose.
+          # In headless -p mode --allowedTools does not prompt: a non-matching
+          # command is auto-DENIED, and the model reports that as "requires
+          # approval". The /code-review gh fallback builds its inline-comment
+          # `gh api` call differently run to run -- when it pipes the JSON body
+          # (cat/echo | gh api ...) the leading token is not `gh`, so a
+          # Bash(gh api:*) rule misses and posting silently fails. A narrow list
+          # also buys no real containment here: on-hardware verification needs
+          # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
+          # execution. The trust boundary is the maintainer write-access gate +
+          # internal-IP firewall (see PR #785), not the tool list.
           claude -p "$prompt" \
             --model claude-opus-4-8 \
             --max-turns 60 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \
-            --allowedTools "Read,Grep,Glob,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr checkout:*),Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh api:*),Bash(uv run:*),Bash(git diff:*),Bash(git log:*),mcp__spyre-knowledgebase" \
+            --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
             --output-format text

@@ -140,6 +140,221 @@ def test_recipe_rejects_unfolded_expert_scale():
         )
 
 
+def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
+    """An upstream ``RoutedExperts`` the backend would claim, with no model adapter."""
+    from types import SimpleNamespace
+
+    moe = {
+        "num_logical_experts": EXPERTS,
+        "num_experts": EXPERTS,
+        "tp_size": 1,
+        "ep_size": 1,
+        "dp_size": 1,
+        "pcp_size": 1,
+        "sp_size": 1,
+    } | (moe_config or {})
+    fields = {
+        "custom_routing_function": None,
+        "activation": SimpleNamespace(value="silu"),
+        "global_num_experts": EXPERTS,
+        "local_num_experts": EXPERTS,
+        "renormalize": True,
+        "apply_router_weight_on_input": False,
+    } | overrides
+    return SimpleNamespace(
+        moe_config=SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=enable_eplb), **moe
+        ),
+        **fields,
+    )
+
+
+def test_generic_moe_layer_is_claimed_by_the_standard_recipe():
+    """A Mixtral-shaped layer with no adapter yields the standard recipe, not an error."""
+    from spyre_inference.moe import _default_recipe, configure_spyre_moe_layer
+
+    layer = _generic_layer()
+    recipe = _default_recipe(layer)
+    assert (recipe.routing, recipe.activation) == ("topk_softmax", "silu")
+    assert recipe.expert_scale is None
+
+    configure_spyre_moe_layer(layer, recipe)
+    assert layer.spyre_moe_recipe is recipe
+    assert layer.spyre_moe_regions == {}
+
+
+def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
+    """The post-load hook takes over layers no adapter opted in, and says so.
+
+    This is the opt-out reach of ``register_oot``: reinstating any gate here (a
+    ``super()`` fallthrough, an adapter-only check) has to break this test. Upstream
+    cannot serve as that fallback — its OOT path returns before building a kernel.
+    """
+    from spyre_inference import moe as moe_module
+
+    prepared, warned = [], []
+    monkeypatch.setattr(moe_module, "_prepare_layer", prepared.append)
+    monkeypatch.setattr(moe_module.logger, "warning_once", lambda msg, *a: warned.append(msg))
+    method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
+
+    layer = _generic_layer()
+    method.process_weights_after_loading(layer)
+    assert layer.spyre_moe_recipe.routing == "topk_softmax"
+    assert prepared == [layer], "an unconfigured layer must still be relaid out"
+    assert warned, "claiming a layer with no model adapter must warn"
+
+    # A layer an adapter already configured keeps its recipe and stays quiet.
+    warned.clear()
+    adapted = _generic_layer()
+    recipe = moe_module.SpyreMoERecipe("silu", "topk_softmax")
+    adapted.spyre_moe_recipe = recipe
+    method.process_weights_after_loading(adapted)
+    assert adapted.spyre_moe_recipe is recipe
+    assert not warned
+
+
+def test_default_recipe_rejects_custom_routing():
+    """A DeepSeek-shaped layer needs an adapter rather than the generic recipe."""
+    from spyre_inference.moe import _default_recipe
+
+    with pytest.raises(NotImplementedError, match="model adapter"):
+        _default_recipe(_generic_layer(custom_routing_function=object()))
+
+
+def test_default_recipe_rejects_unsupported_activation():
+    """Only the two activations the expert regions implement may be claimed."""
+    from types import SimpleNamespace
+
+    from spyre_inference.moe import _default_recipe
+
+    with pytest.raises(NotImplementedError, match="activation="):
+        _default_recipe(_generic_layer(activation=SimpleNamespace(value="swigluoai")))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"tp_size": 2}, {"ep_size": 2}, {"dp_size": 2}, {"pcp_size": 2}, {"sp_size": 2}],
+)
+def test_configure_rejects_expert_parallelism(override):
+    """Every parallel axis must be local: the regions hold whole expert stacks."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(moe_config=override)
+    with pytest.raises(NotImplementedError, match="local experts"):
+        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
+
+
+def test_configure_rejects_eplb():
+    """Expert-parallel load balancing replicates experts the relayout would mis-stack."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(enable_eplb=True)
+    with pytest.raises(NotImplementedError, match="enable_eplb=True"):
+        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        ({"local_num_experts": EXPERTS // 2}, "remapped experts"),
+        ({"renormalize": False}, "normalized top-k"),
+        ({"apply_router_weight_on_input": True}, "input-weighted"),
+    ],
+)
+def test_configure_rejects_incompatible_routing(override, match):
+    """The remaining upstream knobs the two Spyre forms cannot express."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(**override)
+    with pytest.raises(NotImplementedError, match=match):
+        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
+
+
+def test_configure_rejects_recipe_activation_mismatch():
+    """The recipe's activation must be the one the layer actually asks for."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    with pytest.raises(NotImplementedError, match="requires activation="):
+        configure_spyre_moe_layer(_generic_layer(), SpyreMoERecipe("gelu_tanh", "topk_softmax"))
+
+
+def _dispatch_recorder(monkeypatch, fail_on=None):
+    """Swap the compiled regions for recorders: dispatch order, without the device."""
+    from contextlib import nullcontext
+
+    from spyre_inference import moe as moe_module
+
+    calls, resets = [], []
+
+    def fake_region(layer, name, fn):
+        def run(*args):
+            calls.append((name, fn.__name__))
+            if name == fail_on:
+                raise RuntimeError("region blew up")
+            return torch.zeros(1)
+
+        return run
+
+    monkeypatch.setattr(moe_module, "_region", fake_region)
+    monkeypatch.setattr(moe_module, "_compiler_scopes", lambda: (nullcontext(), nullcontext()))
+    monkeypatch.setattr(moe_module, "_name_persistent_dims", lambda *args: None)
+    monkeypatch.setattr(moe_module, "_reset_named_dims", lambda: resets.append(1))
+    return calls, resets
+
+
+def _dispatch_layer(routing):
+    from types import SimpleNamespace
+
+    from spyre_inference.moe import SpyreMoERecipe
+
+    activation = "gelu_tanh" if routing == "full_softmax" else "silu"
+    return SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe(activation, routing),
+        spyre_moe_gate=None,
+        spyre_moe_up=None,
+        spyre_moe_down=None,
+        top_k=TOP_K,
+    )
+
+
+def _apply(layer, tokens):
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    method = object.__new__(SpyreUnquantizedFusedMoEMethod)
+    return method.apply_monolithic(layer, torch.zeros(tokens, HIDDEN), torch.zeros(tokens, EXPERTS))
+
+
+def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
+    """One token takes the gathered region, whose combine is the only legal layout there."""
+    calls, resets = _dispatch_recorder(monkeypatch)
+    _apply(_dispatch_layer("full_softmax"), tokens=1)
+    assert calls == [("gathered", "_gathered")]
+    assert resets == [], "the gathered form declares no persistent dims to reset"
+
+
+@pytest.mark.parametrize(
+    ("routing", "probs_fn"), [("full_softmax", "_probs"), ("topk_softmax", "_topk_probs")]
+)
+def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, probs_fn):
+    """The persistent form runs probs -> route -> experts, routing chosen by the recipe.
+
+    The probs function is the recipe's, not a backend default: a Gemma-4 layer must not
+    silently take the standard top-k-softmax route, or vice versa.
+    """
+    calls, resets = _dispatch_recorder(monkeypatch)
+    _apply(_dispatch_layer(routing), tokens=8)
+    assert calls == [("probs", probs_fn), ("route", "_route"), ("experts", "_experts")]
+    assert resets == [1]
+
+
+def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
+    """Unconditional reset: on an Inductor cache hit stale names leak into the next graph."""
+    calls, resets = _dispatch_recorder(monkeypatch, fail_on="experts")
+    with pytest.raises(RuntimeError, match="region blew up"):
+        _apply(_dispatch_layer("topk_softmax"), tokens=8)
+    assert resets == [1], "the reset must survive a failing region"
+
+
 def test_gathered_matches_dense_reference(moe_weights):
     """The decode form, at the single token whose combine has a legal device layout."""
     from torch_spyre._C import get_elem_in_stick
@@ -252,21 +467,17 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks():
 
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
-    class _MoEConfig:
-        tp_size = 1
-        ep_size = 1
-        dp_size = 1
-        pcp_size = 1
-        sp_size = 1
-
     class _RoutedExperts(nn.Module):
-        """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
+        """Stands in for vLLM's, which needs a whole FusedMoEConfig to build.
+
+        No ``moe_config``: the parallel checks live in ``configure_spyre_moe_layer`` now,
+        and carrying a stub here would imply this test covers them.
+        """
 
         def __init__(self, w13, w2):
             super().__init__()
             self.w13_weight = nn.Parameter(w13, requires_grad=False)
             self.w2_weight = nn.Parameter(w2, requires_grad=False)
-            self.moe_config = _MoEConfig()
 
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * INTER, HIDDEN, dtype=torch.float16) * 0.05

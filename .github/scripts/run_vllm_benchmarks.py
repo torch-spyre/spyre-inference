@@ -37,6 +37,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 import yaml
+from resource_sampler import ContainerSampler, write_resource_metrics
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -328,6 +329,27 @@ def record_command(cmd: list[str], env_vars: dict[str, str], cmd_file: Path) -> 
 VLLM_CLI = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
+class _Noop:
+    """No-op stand-in for ContainerSampler when cgroup metrics are unavailable."""
+
+    def stop(self) -> None:
+        pass
+
+    def summary(self, phase: str = "") -> dict:
+        return {}
+
+
+def _make_sampler() -> ContainerSampler:
+    """Construct and start a ContainerSampler, degrading to a no-op on any error."""
+    try:
+        s = ContainerSampler()
+        s.start()
+        return s
+    except Exception:
+        log.warning("cgroup metrics unavailable; host resource sampling disabled")
+        return _Noop()  # type: ignore[return-value]
+
+
 def run_benchmark(
     bench_type: str,
     test_name: str,
@@ -356,10 +378,18 @@ def run_benchmark(
     log.info("Command: %s", cmd_line)
 
     log_file = results_dir / f"{test_name}.log"
+    sampler = _make_sampler()
     with open(log_file, "w") as lf:
         lf.write(f"# {cmd_line}\n")
         lf.flush()
         result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
+    sampler.stop()
+    # "total": covers compile + inference in one window, unlike the serve path
+    # which splits compile_host_* from the bare bench-phase host_* metrics.
+    write_resource_metrics(
+        test_name, results_dir, sampler.summary(phase="total"), model=parameters.get("model", "")
+    )
+
     if result.returncode != 0:
         log.error("Test %s failed with exit code %d", test_name, result.returncode)
         if result.stderr:
@@ -460,6 +490,7 @@ def run_serve_benchmark(
             proc.wait()
 
     server_log = results_dir / f"{test_name}_server.log"
+    bench_result = None
     with open(server_log, "w") as server_lf:
         server_lf.write(f"# {server_cmd_line}\n")
         server_lf.flush()
@@ -471,7 +502,9 @@ def run_serve_benchmark(
             stderr=server_lf,
             start_new_session=True,
         )
+
         try:
+            compile_sampler = _make_sampler()
             # Timed from before the spawn: for large models this is mostly the
             # one-time warmup compile, which is worth comparing run to run.
             health_url = f"http://{host}:{port}/health"
@@ -480,6 +513,13 @@ def run_serve_benchmark(
             while time.monotonic() < deadline:
                 if server_proc.poll() is not None:
                     log.error("Server process died with exit code %d", server_proc.returncode)
+                    compile_sampler.stop()
+                    write_resource_metrics(
+                        test_name,
+                        results_dir,
+                        compile_sampler.summary(phase="compile"),
+                        model=model,
+                    )
                     if server_log.exists():
                         log.error("Server log:\n%s", server_log.read_text())
                     return False
@@ -491,10 +531,15 @@ def run_serve_benchmark(
                 except Exception:
                     time.sleep(1)
 
+            compile_sampler.stop()
+
             if server_startup_sec is None:
                 log.error("Server did not become healthy within %ds", health_timeout)
                 if server_log.exists():
                     log.error("Server log:\n%s", server_log.read_text())
+                write_resource_metrics(
+                    test_name, results_dir, compile_sampler.summary(phase="compile"), model=model
+                )
                 return False
 
             # Run bench serve
@@ -522,19 +567,30 @@ def run_serve_benchmark(
             log.info("Bench command: %s", bench_cmd_line)
 
             bench_log = results_dir / f"{test_name}_bench.log"
-            with open(bench_log, "w") as blf:
-                blf.write(f"# {bench_cmd_line}\n")
-                blf.flush()
-                result = subprocess.run(
-                    bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
-                )
+            bench_sampler = _make_sampler()
+            try:
+                with open(bench_log, "w") as blf:
+                    blf.write(f"# {bench_cmd_line}\n")
+                    blf.flush()
+                    bench_result = subprocess.run(
+                        bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
+                    )
+            finally:
+                bench_sampler.stop()
+
+            combined = {
+                **compile_sampler.summary(phase="compile"),
+                **bench_sampler.summary(),
+            }
+            write_resource_metrics(test_name, results_dir, combined, model=model)
+
         finally:
             _kill_server(server_proc)
 
-    if result.returncode != 0:
-        log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
-        if result.stderr:
-            stderr_lines = result.stderr.strip().splitlines()[-50:]
+    if bench_result.returncode != 0:
+        log.error("Serve test %s failed with exit code %d", test_name, bench_result.returncode)
+        if bench_result.stderr:
+            stderr_lines = bench_result.stderr.strip().splitlines()[-50:]
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
 

@@ -26,6 +26,7 @@ breaks these invariants fails here.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,8 @@ import yaml
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / ".github" / "scripts" / "run_vllm_benchmarks.py"
+# The runner imports its sibling resource_sampler, which loading by path does not resolve.
+sys.path.insert(0, str(_SCRIPT.parent))
 _spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _SCRIPT)
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)

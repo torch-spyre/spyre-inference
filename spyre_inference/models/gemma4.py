@@ -121,12 +121,7 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
 
 
 def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
-    """Register Gemma-4's full-softmax, scaled GELU expert recipe.
-
-    Per-expert output scaling is explicitly requested by this recipe, not the
-    generic backend. The generic backend compiles only its MoE regions, so this
-    works with both compiled and eager outer model execution.
-    """
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe."""
     configured = 0
     for decoder in layers:
         moe = getattr(decoder, "moe", None)
@@ -156,11 +151,6 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     Re-registering the aliases restores the parent's stated intent (move with the
     model, interact with torch.compile) and needs no change to the embedding math:
     a device-side 0-d scalar lowers fine.
-
-    A checkpoint with ``enable_moe_block`` additionally supplies its routing recipe
-    to Spyre's generic unquantized MoE backend; see ``configure_gemma4_moe_layers``.
-    That backend compiles its own fixed-shape regions, independently of outer-model
-    compilation.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

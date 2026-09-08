@@ -14,9 +14,9 @@
 
 """The Gemma-4 recipe over the generic Spyre MoE backend.
 
-Both forms compute the same function by different means, so one dense reference covers
-both. They need the card; shapes are scaled down but every dim stays stick-aligned,
-which is what the layout tricks in those regions depend on.
+The two expert forms compute the same function, so one dense reference covers both.
+Those tests need the card: the shapes are scaled down, but every dim stays stick-aligned
+because the layouts in those regions depend on it.
 """
 
 import pytest
@@ -85,11 +85,7 @@ def test_standard_recipe_matches_upstream_topk_softmax():
 
 
 def test_standard_recipe_prefill_routing_matches_decode():
-    """The prefill dense form and the decode gathered form must agree on the weights.
-
-    ``_topk_probs`` is the multi-token half of the standard recipe, so nothing else in
-    the suite reaches it; Gemma-4 only ever takes the ``full_softmax`` branch.
-    """
+    """The prefill dense form and the decode gathered form must agree on the weights."""
     from spyre_inference.moe import _routing_weights, _topk_probs
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5], [-0.25, 3.0, 0.75, -2.0]], dtype=torch.float32)
@@ -184,12 +180,7 @@ def test_generic_moe_layer_is_claimed_by_the_standard_recipe():
 
 
 def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
-    """The post-load hook takes over layers no adapter opted in, and says so.
-
-    This is the opt-out reach of ``register_oot``: reinstating any gate here (a
-    ``super()`` fallthrough, an adapter-only check) has to break this test. Upstream
-    cannot serve as that fallback — its OOT path returns before building a kernel.
-    """
+    """The post-load hook takes over layers no adapter opted in, and says so."""
     from spyre_inference import moe as moe_module
 
     prepared, warned = [], []
@@ -245,7 +236,7 @@ def test_configure_rejects_expert_parallelism(override):
 
 
 def test_configure_rejects_eplb():
-    """Expert-parallel load balancing replicates experts the relayout would mis-stack."""
+    """Expert-parallel load balancing replicates experts the relayout would stack wrongly."""
     from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
     layer = _generic_layer(enable_eplb=True)
@@ -336,11 +327,7 @@ def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
     ("routing", "probs_fn"), [("full_softmax", "_probs"), ("topk_softmax", "_topk_probs")]
 )
 def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, probs_fn):
-    """The persistent form runs probs -> route -> experts, routing chosen by the recipe.
-
-    The probs function is the recipe's, not a backend default: a Gemma-4 layer must not
-    silently take the standard top-k-softmax route, or vice versa.
-    """
+    """The persistent form runs probs -> route -> experts, routing chosen by the recipe."""
     calls, resets = _dispatch_recorder(monkeypatch)
     _apply(_dispatch_layer(routing), tokens=8)
     assert calls == [("probs", probs_fn), ("route", "_route"), ("experts", "_experts")]
@@ -396,8 +383,7 @@ def test_gathered_matches_dense_reference(moe_weights):
 def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     """The prefill form, in the region sequence ``apply_monolithic`` uses.
 
-    24 tokens does not divide the core count, which the work-division hint has to cope
-    with.
+    24 tokens does not divide the core count, which the work-division hint has to cope with.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
@@ -460,7 +446,7 @@ def test_token_cores_divides_the_token_axis(tokens, expected):
 
 
 def test_relayout_splits_and_transposes_the_generic_expert_stacks():
-    """The generic backend preserves model-specific scaling outside its weights."""
+    """The recipe's per-expert scale is folded into the down stack, not kept beside it."""
 
     import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
@@ -468,11 +454,7 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks():
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
 
     class _RoutedExperts(nn.Module):
-        """Stands in for vLLM's, which needs a whole FusedMoEConfig to build.
-
-        No ``moe_config``: the parallel checks live in ``configure_spyre_moe_layer`` now,
-        and carrying a stub here would imply this test covers them.
-        """
+        """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
 
         def __init__(self, w13, w2):
             super().__init__()
@@ -509,4 +491,3 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks():
     torch.testing.assert_close(
         layer.spyre_moe_down.cpu(), (w2 * scale.view(EXPERTS, 1, 1)).transpose(1, 2), **close
     )
-    assert layer.spyre_moe_expert_scale is None

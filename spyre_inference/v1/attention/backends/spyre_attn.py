@@ -463,7 +463,8 @@ def _call_kernel(label: str, fn, *args):
     if counters["stats"]["unique_graphs"] != before:
         logger.warning_once(
             "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
-            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
+            "Re-run with TORCH_LOGS=recompiles to see which guard failed, or enable "
+            "SPYRE_KERNEL_CACHE=1 to reuse compiled kernels across runs.",
             label,
         )
     return result

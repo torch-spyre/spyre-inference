@@ -129,8 +129,8 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     model, interact with torch.compile) and needs no change to the embedding math:
     a device-side 0-d scalar lowers fine.
 
-    A checkpoint with ``enable_moe_block`` additionally needs its expert dispatch
-    replaced, since ``FusedMoE``'s kernels are CUDA-only; see ``models._gemma4_moe``.
+    A checkpoint with ``enable_moe_block`` additionally needs a routed-expert kernel,
+    which vLLM's MoE oracle has for no out-of-tree platform; see ``models._gemma4_moe``.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

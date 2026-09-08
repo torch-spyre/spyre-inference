@@ -33,7 +33,6 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
     _repeated_block_lists,
-    _self_compiling_block_names,
 )
 
 
@@ -194,7 +193,7 @@ def test_compile_blocks_wraps_every_block_in_place() -> None:
     model = _Model(num_layers=4)
     originals = list(model.model.layers)
 
-    assert _runner(model)._compile_blocks() == (4, 0)
+    assert _runner(model)._compile_blocks() == 4
 
     for i, original in enumerate(originals):
         assert model.model.layers[i] is original
@@ -211,19 +210,8 @@ def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
     model.model.cross_decoder.decoder_layers = model.model.layers[2:]
     assert len(_repeated_block_lists(model)) == 3
 
-    assert _runner(model)._compile_blocks() == (4, 0)
+    assert _runner(model)._compile_blocks() == 4
     assert all(block._compiled_call_impl is not None for block in model.model.layers)
-
-
-def test_compile_blocks_counts_a_shared_self_compiling_block_once() -> None:
-    """The alias must not be counted twice, nor compiled on its second visit."""
-    model = _Model(num_layers=4)
-    model.model.self_decoder = nn.Module()
-    model.model.self_decoder.decoder_layers = model.model.layers[:2]
-    for block in list(model.model.layers)[:2]:
-        block.spyre_compiles_own_regions = True
-
-    assert _runner(model)._compile_blocks() == (2, 2)
 
 
 def test_compile_blocks_preserves_parameter_names() -> None:
@@ -240,21 +228,8 @@ def test_compile_blocks_preserves_parameter_names() -> None:
 
 def test_pp_missing_layers_are_not_compiled() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _runner(model)._compile_blocks() == (2, 0)
+    assert _runner(model)._compile_blocks() == 2
     assert all(isinstance(layer, PPMissingLayer) for layer in model.model.layers[2:])
-
-
-def test_self_compiling_blocks_are_left_alone_but_still_count() -> None:
-    """It must still count as found, or the caller falls back to a whole-model graph."""
-    model = _Model(num_layers=4)
-    for block in list(model.model.layers)[2:]:
-        block.spyre_compiles_own_regions = True
-
-    assert _runner(model)._compile_blocks() == (2, 2)
-
-    wrapped, self_compiled = list(model.model.layers)[:2], list(model.model.layers)[2:]
-    assert all(block._compiled_call_impl is not None for block in wrapped)
-    assert all(block._compiled_call_impl is None for block in self_compiled)
 
 
 def test_rejects_an_unknown_granularity_even_when_eager(monkeypatch) -> None:
@@ -283,44 +258,6 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
 
     assert compiled == [model]
     assert all(block._compiled_call_impl is None for block in model.model.layers)
-
-
-def test_model_granularity_is_refused_when_a_block_compiles_its_own_regions(
-    monkeypatch,
-) -> None:
-    """A whole-model graph would trace through the block's own eager driver."""
-    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
-    monkeypatch.setattr(torch, "compile", lambda m, **kw: pytest.fail("must not compile"))
-
-    model = _Model(num_layers=4)
-    model.model.layers[2].spyre_compiles_own_regions = True
-
-    with pytest.raises(ValueError, match=r"model\.layers\.2"):
-        _runner(model)._compile_for_spyre()
-
-
-def test_block_fallback_is_refused_when_a_block_compiles_its_own_regions(
-    monkeypatch,
-) -> None:
-    """The fallback whole-model graph is no safer than the explicit one."""
-    monkeypatch.setattr(torch, "compile", lambda m, **kw: pytest.fail("must not compile"))
-
-    class NoBlocks(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer = nn.Linear(4, 4)
-            self.layer.spyre_compiles_own_regions = True
-
-    with pytest.raises(ValueError, match="compile their own regions"):
-        _runner(NoBlocks())._compile_for_spyre()
-
-
-def test_self_compiling_block_names_reports_every_opted_out_layer() -> None:
-    model = _Model(num_layers=4)
-    assert _self_compiling_block_names(model) == []
-    for i in (1, 3):
-        model.model.layers[i].spyre_compiles_own_regions = True
-    assert _self_compiling_block_names(model) == ["model.layers.1", "model.layers.3"]
 
 
 def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:

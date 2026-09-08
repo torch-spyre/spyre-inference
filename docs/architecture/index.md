@@ -107,23 +107,33 @@ their own. Registration is lazy — nothing is imported until vLLM resolves the 
 and `register_models()` first checks every key against vLLM's own registry, so an upstream
 rename fails loudly instead of silently falling through to the unadapted class.
 
-Where upstream hardcodes a class and offers no hook (`Gemma4Model` names
-`Gemma4DecoderLayer` in its `make_layers` call; the BERT wrappers hardcode
+Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
 `embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
-`__init__`, same parameters, same module tree, only `forward` differs.
+`__init__`, same parameters, same module tree, only `forward` differs. Prefer a documented
+upstream extension point where one exists: `CustomOp.register_oot` /
+`PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
+unquantized oracle leaves open for an out-of-tree platform.
 
 Two adaptations worth knowing:
 
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
   which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
-- **Gemma-4 MoE** (`models/_gemma4_moe.py`) replaces `FusedMoE`'s CUDA-only dispatch with
-  two Spyre forms — gathered for a single-token decode step, all-expert persistent for a
-  prefill chunk. Each layer's `spyre_relayout_weights`, which the model runner calls before
-  moving the model to the device, rebuilds that layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks
-  into the `[E,H,M]` / `[E,M,H]` layout those forms contract on, folds `per_expert_scale`
-  into `down`, and frees each source stack as it goes, since the device cannot hold both
-  layouts at once.
+- **Gemma-4 MoE** (`models/_gemma4_moe.py`) supplies the routed-expert kernel vLLM's
+  unquantized MoE oracle lacks for an out-of-tree platform (it selects
+  `UnquantizedMoeBackend.OOT` — no kernel — and leaves `process_weights_after_loading` to
+  the plugin). A `CustomOp.register_oot` replacement for `UnquantizedFusedMoEMethod`
+  computes the experts in two Spyre forms — gathered for a single-token decode step,
+  all-expert persistent for a prefill chunk — and, in the post-load hook, rebuilds each
+  layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the `[E,H,M]` / `[E,M,H]` layout those
+  forms contract on, folds `per_expert_scale` into `down`, and frees each source stack as
+  it goes, since the device cannot hold both layouts at once. `Gemma4DecoderLayer.forward`
+  and `MoERunner` are untouched: vLLM reaches the experts through
+  `torch.ops.vllm.moe_forward`, an opaque custom op, so the dispatch runs eagerly *inside*
+  the block's compiled graph — the same seam the attention backend uses — and can drive
+  compiled regions of its own. `SpyreGemma4ForCausalLM` only marks each MoE layer's
+  `RoutedExperts` with a weakref to the `Gemma4MoE` that owns `per_expert_scale`, which
+  the post-load hook is not otherwise handed.
 
 ## Compilation Granularity
 
@@ -158,21 +168,11 @@ own layer name and compiles separately, which is worse than the whole-model grap
 runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
 defeats sharing the same way, by folding each block's weights into its own graph.
 
-A block can opt out of this by setting `spyre_compiles_own_regions`, which makes
-`_compile_blocks` skip it (without falling back to a whole-model graph).
-`SpyreGemma4MoEDecoderLayer` does: its expert matmul is tiled by torch-spyre `spyre_hint`
-scopes that resolve against named dims the driver has to declare *eagerly*, between
-compilations, so that layer keeps an eager `forward` that drives several compiled regions
-of its own — one graph for a decode step, four for a prefill chunk. See
-`models/_gemma4_moe.py`.
-
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count. It is refused — as is the no-blocks-found fallback — when a
-block sets `spyre_compiles_own_regions`, naming the layer: a whole-model graph would
-trace through that block's eager driver instead of leaving it alone.
+grows with layer count.
 
 ## Attention Backend
 

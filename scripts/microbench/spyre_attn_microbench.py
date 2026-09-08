@@ -78,7 +78,7 @@ register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EA
 
 
 @contextlib.contextmanager
-def spyre_vllm_config(compiled: bool):
+def spyre_vllm_config(compiled: bool, max_model_len=None):
     """Establish a Spyre vLLM config context for standalone (non-pytest) use."""
     from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig, CompilationMode
@@ -90,10 +90,12 @@ def spyre_vllm_config(compiled: bool):
     current_platform._enum = PlatformEnum.OOT
     register_all()
     mode = CompilationMode.STOCK_TORCH_COMPILE if compiled else CompilationMode.NONE
+    # max_model_len sizes the bucketer's num_blocks buckets, which cap the kv
+    # extent a shape can dispatch to; the stub model's default is 2048.
     config = VllmConfig(
         device_config=DeviceConfig(device="cpu"),
         compilation_config=CompilationConfig(custom_ops=["all"], mode=mode),
-        model_config=ModelConfig(dtype=DTYPE),
+        model_config=ModelConfig(dtype=DTYPE, max_model_len=max_model_len),
     )
     with set_current_vllm_config(config), set_forward_context(None, config):
         yield
@@ -171,6 +173,47 @@ def build_metadata(
     return builder.build(common_prefix_len=0, common_attn_metadata=common)
 
 
+def _folded_slot_mapping(slots, num_kv_heads, block_size, device):
+    """Per-kv-head store index in the folded frame, as attn_layer.SlotMapping builds it."""
+    from spyre_inference.custom_ops.utils import convert
+
+    pages = torch.div(slots, block_size, rounding_mode="floor")
+    offsets = slots - pages * block_size
+    return [
+        convert((pages * num_kv_heads + h) * block_size + offsets, device=device)
+        for h in range(num_kv_heads)
+    ]
+
+
+def _fill_folded_cache(impl, inputs, kv_cache):
+    """Write history and this step's KV through the production scatter.
+
+    The folded cache is allocated zeroed on device (as the runner does) and never
+    host-populated: the fold is a device-layout property, so a host tensor's
+    transfer does not reproduce it.
+    """
+    from spyre_inference.custom_ops.utils import convert
+
+    device = inputs["cache_device"]
+    for k_src, v_src, slots in inputs["kv_writes"]:
+        impl.do_kv_cache_update(
+            None,
+            convert(k_src, device=device),
+            convert(v_src, device=device),
+            kv_cache,
+            _folded_slot_mapping(slots, inputs["num_kv_heads"], inputs["block_size"], device),
+        )
+
+
+def read_kv_pages(inputs):
+    """KV pages back on the host in the plain [num_blocks, block_size, H, D] frame."""
+    k, v = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
+    if not inputs["folded"]:
+        return k, v
+    shape = (-1, inputs["num_kv_heads"], inputs["block_size"], inputs["head_size"])
+    return tuple(t.reshape(shape).permute(0, 2, 1, 3) for t in (k, v))
+
+
 def _fused_qkv_kv_views(query, key, value, device):
     """K/V as the backend receives them: strided views of a fused QKV on device."""
     from spyre_inference.custom_ops.utils import convert
@@ -183,6 +226,18 @@ def _fused_qkv_kv_views(query, key, value, device):
         k_view.view(num_tokens, key.shape[1], key.shape[2]),
         v_view.view(num_tokens, value.shape[1], value.shape[2]),
     )
+
+
+def _padded_block_width(num_blocks: int) -> int:
+    """Block-table width build() can slice: the count rounded onto its buckets.
+
+    Mirrors SpyreAttentionMetadataBuilder._pad_num_blocks. Kept as a local power-of-two
+    round rather than reaching for the bucketer, which needs a full vllm_config.
+    """
+    width = 1
+    while width < num_blocks:
+        width *= 2
+    return width
 
 
 def build_inputs_from_requests(
@@ -201,7 +256,10 @@ def build_inputs_from_requests(
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        head_major_kv_layout,
+        slot_major_kv_layout,
+    )
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):
@@ -213,7 +271,13 @@ def build_inputs_from_requests(
     num_seqs = len(query_lens)
     max_kv = max(seq_lens)
     blocks_per_seq = (max_kv + block_size - 1) // block_size
-    if num_blocks < num_seqs * blocks_per_seq:
+    # build() pads each sequence's block count onto the bucket lattice and then
+    # slices block_table[s, :padded], so the table must be at least that wide --
+    # production allocates it at ceil(max_model_len / block_size) for the engine's
+    # lifetime, for exactly this reason. A table sized to the real count raises
+    # "expanded size of the tensor" for any off-bucket kv length.
+    table_width = _padded_block_width(blocks_per_seq)
+    if num_blocks < num_seqs * table_width:
         return None  # cache too small to give every sequence its own pages
 
     scale = head_size**-0.5
@@ -227,8 +291,10 @@ def build_inputs_from_requests(
 
     # Sample without replacement: an aliased page would let one sequence
     # overwrite another's KV and shrink the set of pages actually gathered.
-    block_tables = torch.randperm(num_blocks, dtype=torch.int32)[: num_seqs * blocks_per_seq].view(
-        num_seqs, blocks_per_seq
+    # Padded columns get real, distinct pages too: build() puts them in the gather,
+    # and their tiles are fully masked, so their contents never reach the output.
+    block_tables = torch.randperm(num_blocks, dtype=torch.int32)[: num_seqs * table_width].view(
+        num_seqs, table_width
     )
 
     slot_mapping = []
@@ -268,6 +334,7 @@ def build_inputs_from_requests(
     )
 
     cache_device = torch.device(device)
+    folded = kv_layout == "lx" and cache_device.type == "spyre"
 
     def to_device(cache):
         # plain: host-populated cache, plain transfer. Matches
@@ -276,9 +343,17 @@ def build_inputs_from_requests(
         # reproduce the finding (see README). _reshape_and_cache views pages as
         # [-1, H, D] and relies on the slot-outermost device layout, which
         # convert() does not reproduce for a host tensor.
+        # lx: the folded frame, allocated zeroed exactly as
+        # TorchSpyreModelRunner.initialize_kv_cache_tensors does and filled on
+        # device afterwards; the fold is a device-layout property a host
+        # tensor's transfer cannot reproduce.
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
+        if folded:
+            return torch.zeros(nb * h, bsz, d, dtype=cache.dtype).to(
+                cache_device, device_layout=head_major_kv_layout(nb * h, bsz, d, cache.dtype)
+            )
         layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
         if kv_layout == "slot_major":
             return cache.to(cache_device, device_layout=layout)
@@ -296,6 +371,19 @@ def build_inputs_from_requests(
         v_pages.view(view).index_copy_(0, slots_dev, hv_dev)
     key_dev, value_dev = _fused_qkv_kv_views(query, key, value, cache_device)
 
+    # Replayed on device by _fill_folded_cache. The step's KV goes in as the
+    # strided fused-QKV views the backend receives, not the host copies.
+    kv_writes = [(key_dev, value_dev, slot_mapping)]
+    if hist_slots:
+        kv_writes.insert(
+            0,
+            (
+                torch.cat(hist_k),
+                torch.cat(hist_v),
+                torch.tensor(hist_slots, dtype=torch.int64),
+            ),
+        )
+
     return {
         "query_dev": convert(query, cache_device),
         "key_dev": key_dev,
@@ -312,6 +400,11 @@ def build_inputs_from_requests(
         "query_lens": list(query_lens),
         "seq_lens": list(seq_lens),
         "total_query_tokens": total_q,
+        "num_kv_heads": num_kv_heads,
+        "head_size": head_size,
+        "block_size": block_size,
+        "folded": folded,
+        "kv_writes": kv_writes,
     }
 
 
@@ -435,6 +528,8 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
     # not match, and the readback is then garbage.
     output = torch.empty_like(inputs["query_cpu"]).to(inputs["cache_device"])
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+    if inputs["folded"]:
+        _fill_folded_cache(impl, inputs, kv_cache)
 
     @torch.inference_mode()
     def run():
@@ -538,7 +633,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             kv_layout=cfg.get("kv_layout", "plain"),
         )
         if inputs is None:
-            needed = len(query_lens) * row["num_kv_blocks_iterated"]
+            needed = len(query_lens) * _padded_block_width(row["num_kv_blocks_iterated"])
             row["error"] = f"insufficient blocks (need num_blocks >= {needed})"
             print(f"    -> skipped ({row['error']})", flush=True)
             records.append(row)
@@ -558,10 +653,11 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
+        k_ref, v_ref = read_kv_pages(inputs)
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            k_ref,
+            v_ref,
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -693,14 +789,23 @@ def main():
     ap.add_argument("--warmup", type=int, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="Context the bucketer sizes its num_blocks buckets from. Raise it above "
+        "the stub model's 2048 to reach longer kv extents.",
+    )
+    ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill"],
+        choices=["plain", "slot_major", "slot_major_devfill", "lx"],
         default=None,
         help="KV page device layout. 'plain' (default) is correct for a "
         "host-populated cache. 'slot_major_devfill' matches the "
         "worker: zeroed slot-major alloc, history written on device. "
         "'slot_major' pins the worker layout on a host-populated "
-        "cache and is numerically wrong; kept to reproduce that.",
+        "cache and is numerically wrong; kept to reproduce that. "
+        "'lx' benchmarks the LX-resident kernel: sets SPYRE_LX_KV_LAYOUT=1 and "
+        "allocates the (page, kv_head)-folded cache as the worker does.",
     )
     ap.add_argument(
         "--span",
@@ -721,6 +826,7 @@ def main():
         ("device", args.device),
         ("span", args.span),
         ("kv_layout", args.kv_layout),
+        ("max_model_len", args.max_model_len),
     ):
         if val is not None:
             cfg[key] = val
@@ -728,6 +834,14 @@ def main():
         cfg["variants"] = args.variants
     cfg["stop_on_failure"] = args.stop_on_failure
     cfg.setdefault("device", "spyre")
+
+    if cfg.get("kv_layout") == "lx":
+        # Read in SpyreAttentionImpl.__init__ and _attn_max_cores, and cached on
+        # first access, so set it before either runs.
+        os.environ["SPYRE_LX_KV_LAYOUT"] = "1"
+        from spyre_inference import envs
+
+        envs.clear_env_cache()
 
     variants = [v for v in cfg["variants"] if VARIANT_REGISTRY[v]["available"]()]
     if not variants:
@@ -739,6 +853,11 @@ def main():
         raise SystemExit(
             "compiled and eager variants need separate runs (the compilation mode "
             "is fixed for the process). Re-run with --variants one at a time."
+        )
+    if cfg.get("kv_layout") == "lx" and not next(iter(compiled_modes)):
+        raise SystemExit(
+            "--kv-layout lx needs a compiled variant: the folded cache is gathered "
+            "with a 2-D index, which eager cannot lower."
         )
 
     entries = entries_from_config(cfg)
@@ -756,13 +875,16 @@ def main():
         f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
     )
     print(f"  span       : {SPANS[cfg.get('span', 'online_softmax')]}")
+    print(f"  kv_layout  : {cfg.get('kv_layout', 'plain')}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
     print(f"  iterations : {cfg.get('iterations', 10)} (warmup {cfg.get('warmup', 2)})")
     print(f"  output     : {out_dir if not args.no_output else 'none'}\n", flush=True)
 
     records = []
-    with spyre_vllm_config(compiled=next(iter(compiled_modes))):
+    with spyre_vllm_config(
+        compiled=next(iter(compiled_modes)), max_model_len=cfg.get("max_model_len")
+    ):
         import torch._dynamo
 
         # The kernel specializes per (num_blocks, aligned_max_query_len), so a
@@ -786,6 +908,8 @@ def main():
             cfg["block_size"],
             cfg["num_blocks"],
             cfg["device"],
+            seed=cfg.get("seed", 0),
+            kv_layout=cfg.get("kv_layout", "plain"),
         )
         probe_run, _ = make_forward(
             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]

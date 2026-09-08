@@ -14,10 +14,13 @@
 
 """The Gemma-4 recipe over the generic Spyre MoE backend.
 
-The two expert forms compute the same function, so one dense reference covers both.
-Those tests need the card: the shapes are scaled down, but every dim stays stick-aligned
-because the layouts in those regions depend on it.
+The two expert forms compute the same function, so one dense reference covers both. The
+tests that run them, and the relayout test, need the card: the shapes are scaled down, but
+every dim stays stick-aligned because the layouts in those regions depend on it. Routing,
+configuration and dispatch are host-side and need nothing.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -73,18 +76,30 @@ def _inputs(num_tokens):
     return x, logits
 
 
-def test_standard_recipe_matches_upstream_topk_softmax():
-    """The generic recipe retains vLLM's standard top-k-softmax semantics."""
+def test_routing_recipes_are_not_interchangeable():
+    """``topk_softmax`` is upstream's default; ``full_softmax`` is Gemma's own.
+
+    The two differ only in whether the softmax runs before or after the top-k, which makes
+    them easy to invert, so each is pinned to its own formula and to being distinct.
+    """
     from spyre_inference.moe import _routing_weights
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5]], dtype=torch.float32)
-    actual, indices = _routing_weights(logits, 2, "topk_softmax")
+
+    standard, indices = _routing_weights(logits, 2, "topk_softmax")
     selected, expected_indices = torch.topk(logits, 2, dim=-1)
     torch.testing.assert_close(indices, expected_indices)
-    torch.testing.assert_close(actual, torch.softmax(selected, dim=-1))
+    torch.testing.assert_close(standard, torch.softmax(selected, dim=-1))
+
+    gemma, indices = _routing_weights(logits, 2, "full_softmax")
+    top_probs, expected_indices = torch.topk(torch.softmax(logits, dim=-1), 2, dim=-1)
+    torch.testing.assert_close(indices, expected_indices)
+    torch.testing.assert_close(gemma, top_probs / top_probs.sum(-1, keepdim=True))
+
+    assert not torch.allclose(standard, gemma), "the two recipes must not collapse into one"
 
 
-def test_standard_recipe_prefill_routing_matches_decode():
+def test_prefill_routing_matches_the_decode_form():
     """The prefill dense form and the decode gathered form must agree on the weights."""
     from spyre_inference.moe import _routing_weights, _topk_probs
 
@@ -99,47 +114,8 @@ def test_standard_recipe_prefill_routing_matches_decode():
     torch.testing.assert_close(dense.sum(-1), torch.ones(logits.shape[0]))
 
 
-def test_gemma_recipe_uses_full_softmax_before_topk():
-    """Gemma's recipe stays model-specific rather than becoming a backend default."""
-    from spyre_inference.moe import _routing_weights
-
-    logits = torch.tensor([[0.5, -1.0, 2.0, 1.5]], dtype=torch.float32)
-    actual, indices = _routing_weights(logits, 2, "full_softmax")
-    probs = torch.softmax(logits, dim=-1)
-    expected, expected_indices = torch.topk(probs, 2, dim=-1)
-    torch.testing.assert_close(indices, expected_indices)
-    torch.testing.assert_close(actual, expected / expected.sum(-1, keepdim=True))
-
-
-def test_recipe_rejects_unbound_full_softmax_routing():
-    """Only model adapters may request a non-standard upstream routing recipe."""
-    from types import SimpleNamespace
-
-    from spyre_inference.moe import SpyreMoERecipe, _validate_recipe
-
-    layer = SimpleNamespace(custom_routing_function=None)
-    with pytest.raises(NotImplementedError, match="model-specific"):
-        _validate_recipe(layer, SpyreMoERecipe("gelu_tanh", "full_softmax"))
-
-
-def test_recipe_rejects_unfolded_expert_scale():
-    """The current persistent kernel cannot carry per-expert scale tensors."""
-    from types import SimpleNamespace
-
-    from spyre_inference.moe import SpyreMoERecipe, _validate_recipe
-
-    layer = SimpleNamespace(custom_routing_function=object())
-    with pytest.raises(NotImplementedError, match="fold"):
-        _validate_recipe(
-            layer,
-            SpyreMoERecipe("gelu_tanh", "full_softmax", torch.ones(EXPERTS)),
-        )
-
-
 def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
     """An upstream ``RoutedExperts`` the backend would claim, with no model adapter."""
-    from types import SimpleNamespace
-
     moe = {
         "num_logical_experts": EXPERTS,
         "num_experts": EXPERTS,
@@ -165,22 +141,11 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
     )
 
 
-def test_generic_moe_layer_is_claimed_by_the_standard_recipe():
-    """A Mixtral-shaped layer with no adapter yields the standard recipe, not an error."""
-    from spyre_inference.moe import _default_recipe, configure_spyre_moe_layer
-
-    layer = _generic_layer()
-    recipe = _default_recipe(layer)
-    assert (recipe.routing, recipe.activation) == ("topk_softmax", "silu")
-    assert recipe.expert_scale is None
-
-    configure_spyre_moe_layer(layer, recipe)
-    assert layer.spyre_moe_recipe is recipe
-    assert layer.spyre_moe_regions == {}
-
-
 def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
-    """The post-load hook takes over layers no adapter opted in, and says so."""
+    """A Mixtral-shaped layer no adapter opted in is claimed by the standard recipe.
+
+    The hook has to take it over and say so, rather than either erroring or going quiet.
+    """
     from spyre_inference import moe as moe_module
 
     prepared, warned = [], []
@@ -190,7 +155,10 @@ def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
 
     layer = _generic_layer()
     method.process_weights_after_loading(layer)
-    assert layer.spyre_moe_recipe.routing == "topk_softmax"
+    recipe = layer.spyre_moe_recipe
+    assert (recipe.routing, recipe.activation) == ("topk_softmax", "silu")
+    assert recipe.expert_scale is None
+    assert layer.spyre_moe_regions == {}
     assert prepared == [layer], "an unconfigured layer must still be relaid out"
     assert warned, "claiming a layer with no model adapter must warn"
 
@@ -204,69 +172,55 @@ def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
     assert not warned
 
 
-def test_default_recipe_rejects_custom_routing():
-    """A DeepSeek-shaped layer needs an adapter rather than the generic recipe."""
-    from spyre_inference.moe import _default_recipe
-
-    with pytest.raises(NotImplementedError, match="model adapter"):
-        _default_recipe(_generic_layer(custom_routing_function=object()))
-
-
-def test_default_recipe_rejects_unsupported_activation():
-    """Only the two activations the expert regions implement may be claimed."""
-    from types import SimpleNamespace
-
-    from spyre_inference.moe import _default_recipe
-
-    with pytest.raises(NotImplementedError, match="activation="):
-        _default_recipe(_generic_layer(activation=SimpleNamespace(value="swigluoai")))
-
-
 @pytest.mark.parametrize(
-    "override",
-    [{"tp_size": 2}, {"ep_size": 2}, {"dp_size": 2}, {"pcp_size": 2}, {"sp_size": 2}],
-)
-def test_configure_rejects_expert_parallelism(override):
-    """Every parallel axis must be local: the regions hold whole expert stacks."""
-    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
-
-    layer = _generic_layer(moe_config=override)
-    with pytest.raises(NotImplementedError, match="local experts"):
-        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
-
-
-def test_configure_rejects_eplb():
-    """Expert-parallel load balancing replicates experts the relayout would stack wrongly."""
-    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
-
-    layer = _generic_layer(enable_eplb=True)
-    with pytest.raises(NotImplementedError, match="enable_eplb=True"):
-        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
-
-
-@pytest.mark.parametrize(
-    ("override", "match"),
+    ("overrides", "match"),
     [
-        ({"local_num_experts": EXPERTS // 2}, "remapped experts"),
-        ({"renormalize": False}, "normalized top-k"),
-        ({"apply_router_weight_on_input": True}, "input-weighted"),
+        # A DeepSeek-shaped layer needs an adapter rather than the generic recipe.
+        ({"custom_routing_function": object()}, "model adapter"),
+        # Only the two activations the expert regions implement may be claimed.
+        ({"activation": SimpleNamespace(value="swigluoai")}, "activation="),
     ],
 )
-def test_configure_rejects_incompatible_routing(override, match):
-    """The remaining upstream knobs the two Spyre forms cannot express."""
-    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+def test_default_recipe_rejects_layers_that_need_an_adapter(overrides, match):
+    from spyre_inference.moe import _default_recipe
 
-    layer = _generic_layer(**override)
     with pytest.raises(NotImplementedError, match=match):
-        configure_spyre_moe_layer(layer, SpyreMoERecipe("silu", "topk_softmax"))
+        _default_recipe(_generic_layer(**overrides))
 
 
-def test_configure_rejects_recipe_activation_mismatch():
-    """The recipe's activation must be the one the layer actually asks for."""
+_STANDARD = ("silu", "topk_softmax")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "recipe_args", "match"),
+    [
+        # Every parallel axis must be local: the regions hold whole expert stacks.
+        ({"moe_config": {"tp_size": 2}}, _STANDARD, "local experts"),
+        ({"moe_config": {"ep_size": 2}}, _STANDARD, "local experts"),
+        ({"moe_config": {"dp_size": 2}}, _STANDARD, "local experts"),
+        ({"moe_config": {"pcp_size": 2}}, _STANDARD, "local experts"),
+        ({"moe_config": {"sp_size": 2}}, _STANDARD, "local experts"),
+        # Load balancing replicates experts the relayout would stack wrongly.
+        ({"enable_eplb": True}, _STANDARD, "enable_eplb=True"),
+        # The remaining upstream knobs the two Spyre forms cannot express.
+        ({"local_num_experts": EXPERTS // 2}, _STANDARD, "remapped experts"),
+        ({"renormalize": False}, _STANDARD, "normalized top-k"),
+        ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
+        # The recipe's activation must be the one the layer actually asks for.
+        ({}, ("gelu_tanh", "topk_softmax"), "requires activation="),
+        # Only model adapters may request a non-standard upstream routing recipe.
+        ({}, ("silu", "full_softmax"), "model-specific"),
+        # The persistent kernel cannot carry a per-expert scale tensor beside the weights.
+        ({}, ("silu", "topk_softmax", torch.ones(EXPERTS)), "fold"),
+    ],
+)
+def test_configure_rejects_what_the_spyre_forms_cannot_express(overrides, recipe_args, match):
+    """Everything unsupported has to be refused here, before the post-load hook frees w13/w2."""
     from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
-    with pytest.raises(NotImplementedError, match="requires activation="):
-        configure_spyre_moe_layer(_generic_layer(), SpyreMoERecipe("gelu_tanh", "topk_softmax"))
+    layer = _generic_layer(**overrides)
+    with pytest.raises(NotImplementedError, match=match):
+        configure_spyre_moe_layer(layer, SpyreMoERecipe(*recipe_args))
 
 
 def _dispatch_recorder(monkeypatch, fail_on=None):
@@ -294,8 +248,6 @@ def _dispatch_recorder(monkeypatch, fail_on=None):
 
 
 def _dispatch_layer(routing):
-    from types import SimpleNamespace
-
     from spyre_inference.moe import SpyreMoERecipe
 
     activation = "gelu_tanh" if routing == "full_softmax" else "silu"
@@ -431,18 +383,20 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize(
-    ("tokens", "expected"), [(1, 1), (16, 16), (24, 24), (32, 32), (40, 20), (64, 32)]
-)
-def test_token_cores_divides_the_token_axis(tokens, expected):
+# One core; a split that is the whole axis; a divisor below the core count; and a
+# core-count split at a longer axis.
+@pytest.mark.parametrize("tokens", [1, 24, 40, 64])
+def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
     """The token work-division split must divide the axis and not exceed the cores."""
     from torch_spyre._inductor import config as spyre_config
 
     from spyre_inference.moe import _token_cores
 
-    if spyre_config.sencores != 32:
-        pytest.skip(f"expectations assume SENCORES=32, got {spyre_config.sencores}")
-    assert _token_cores(tokens) == expected
+    limit = min(tokens, spyre_config.sencores)
+    cores = _token_cores(tokens)
+    assert tokens % cores == 0, f"{cores} does not divide {tokens}"
+    assert 1 <= cores <= limit
+    assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
 
 
 def test_relayout_splits_and_transposes_the_generic_expert_stacks():

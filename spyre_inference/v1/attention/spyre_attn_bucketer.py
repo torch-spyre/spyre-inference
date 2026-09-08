@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bucketer for the attention kernel's compile cache.
+"""Bucketer for the attention kernel's compiled variants.
 
-``SpyreAttentionImpl`` compiles one kernel per
-``(num_blocks, padded_query_len)`` key, lazily on first use, which puts a full
-Inductor compile in the serving path. This module enumerates the keys a run can
-reach so warmup can record them all up front.
+Dynamo specializes the attention kernel on ``(num_blocks, padded_query_len)``,
+compiling on first use, which would put a full Inductor compile in the serving
+path. This module enumerates the pairs a run can reach so warmup can record them
+all up front.
 
 Separate from ``SpyreShapeBucketer``, which dispatches a single ``num_tokens``
 int for the model graph; an attention variant is 2-D (kv_len and query_len
@@ -51,16 +51,12 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 class SpyreAttnBucket:
     """One recordable attention kernel variant.
 
-    Fields mirror ``SpyreAttentionImpl._get_attn_fn``'s cache key exactly, so a
-    recorded bucket and a runtime dispatch are the same tuple.
+    Fields are the values the kernel specializes on, so a recorded bucket and a
+    runtime dispatch reach the same Dynamo entry.
     """
 
     num_blocks: int
     padded_query_len: int
-
-    @property
-    def key(self) -> tuple[int, int]:
-        return (self.num_blocks, self.padded_query_len)
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -206,6 +202,8 @@ class SpyreAttnBucketer:
         The two size axes aren't independent: ``kv_len >= query_len`` always, so
         a query bucket only pairs with block counts that can hold it -- the full
         cross product would record many unreachable variants at a long context.
+        Requires the backend to round each sequence's own query_len, so the bound
+        holds per sequence and not against a batch max.
         The bound is on the *smallest real* query_len that reaches a bucket, not
         the bucket itself, since a 2-token query on a 1-block sequence still
         dispatches to a large padded bucket; bounding by the bucket would prune

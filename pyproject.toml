@@ -266,6 +266,7 @@ markers = [
     "compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job",
     "rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)",
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
+    "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
 ]
 # --8<-- [end:test-markers-definition]
 

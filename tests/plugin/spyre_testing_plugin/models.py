@@ -99,15 +99,21 @@ class FileConfig:
     """Filter configuration for a single upstream test file.
 
     Attributes:
-        rel_path:   Path relative to upstream repo root
-                    (e.g. "tests/kernels/core/test_layernorm.py").
-        allow_list: Tests allowed to run from this file.
-        block_list: Tests blocked from running (takes precedence over allow_list).
+        rel_path:    Path relative to upstream repo root
+                     (e.g. "tests/kernels/core/test_layernorm.py").
+        allow_list:  Tests allowed to run from this file.
+        block_list:  Tests blocked from running (takes precedence over allow_list).
+        config_list: Optional path (relative to this plugin package) to a config-list
+                     file for tests parametrized by an upstream `config_filename`
+                     fixture (e.g. tests/evals/gsm8k). When set, it overrides the
+                     upstream conftest's `--config-list-file` so its own
+                     `pytest_generate_tests` parametrizes from Spyre-owned configs.
     """
 
     rel_path: str
     allow_list: tuple[AllowEntry, ...] = ()
     block_list: tuple[BlockEntry, ...] = ()
+    config_list: str | None = None
 
 
 @dataclass(frozen=True)

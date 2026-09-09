@@ -98,9 +98,8 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
     moe = layer.moe_config
     _validate_recipe(layer, recipe)
     parallel = moe.moe_parallel_config
-    # TP is supported: upstream shards each expert's intermediate dim, so the regions
-    # see a narrower ``M`` and MoERunner all-reduces the partial sums. The other axes
-    # would split the expert stacks themselves, which the regions cannot express.
+    # TP only narrows each expert's ``M``, and MoERunner all-reduces the partial sums.
+    # The other axes would split the expert stacks the regions hold whole.
     unsupported = {
         "ep_size": moe.ep_size,
         "dp_size": moe.dp_size,
@@ -330,8 +329,7 @@ def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch
     """Move one expert stack to the device in the gather-friendly MoE layout.
 
     ``dma_moe_expert_weight_to_spyre`` only takes an ``[E, C, F]`` stack whose free dim
-    spans whole sticks, so a stack narrower than that has to be widened first — hence
-    ``pad``, an ``F.pad`` spec for the dim the intermediate size lands on.
+    spans whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
     """
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
@@ -359,9 +357,8 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
 
-    # ``inter`` need not span whole sticks — TP divides it by the rank count — so the
-    # stacks are widened. That is inert: the gate lanes the padding adds activate to
-    # zero, and the matching zero rows of ``down`` contribute nothing from them.
+    # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
+    # is inert: the added lanes activate to zero, against zero rows of ``down``.
     stick = get_elem_in_stick(w13.dtype)
     pad = -inter % stick
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))

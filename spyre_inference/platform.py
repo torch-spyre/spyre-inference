@@ -120,9 +120,8 @@ class TorchSpyrePlatform(CpuPlatform):
     _BLOCK_SIZE_MULTIPLE = 64
     _DEFAULT_BLOCK_SIZE = 128
 
-    # Gated MLP activations whose padded lanes are provably inert: the added gate
-    # lanes are multiplied by an equally zero up lane, so `act(0) * 0 == 0` whatever
-    # `act` does at zero.
+    # Gated activations whose padded lanes are provably inert: `act(0)` meets an equally
+    # zero up lane, so the lane is zero whatever `act` does.
     _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
@@ -418,11 +417,10 @@ class TorchSpyrePlatform(CpuPlatform):
         read ``config.intermediate_size`` directly, so overriding the config value
         before the model is built widens the modules with no per-class shim.
 
-        Dense MLPs only. A MoE's routed experts are padded where their stacks are
-        relaid out (``spyre_inference.moe``), and a MoE that sizes its experts from
-        ``intermediate_size`` itself is skipped: the loader cannot reach the stacked
-        expert tensors in the checkpoint, so widening the layer would load them
-        truncated. Zero-padding is inert for a gated MLP (see ``custom_ops.mlp_pad``).
+        Dense MLPs only: routed experts are widened in ``spyre_inference.moe`` instead,
+        and a MoE that sizes its experts from ``intermediate_size`` is skipped, since the
+        loader cannot reach the stacked expert tensors to pad them. Zero-padding is inert
+        for a gated MLP (see ``custom_ops.mlp_pad``).
         """
         from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
 

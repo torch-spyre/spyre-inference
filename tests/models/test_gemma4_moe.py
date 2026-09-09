@@ -439,7 +439,6 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     _prepare_layer(layer)
 
     stick = get_elem_in_stick(w13.dtype)
-    # The stacks are widened to whole sticks, which is what the device MoE layout takes.
     width = inter + -inter % stick
     assert not hasattr(layer, "w13_weight"), "the fused stacks must be freed, not kept"
     assert not hasattr(layer, "w2_weight")

@@ -120,6 +120,11 @@ class TorchSpyrePlatform(CpuPlatform):
     _BLOCK_SIZE_MULTIPLE = 64
     _DEFAULT_BLOCK_SIZE = 128
 
+    # Gated MLP activations whose padded lanes are provably inert: the added gate
+    # lanes are multiplied by an equally zero up lane, so `act(0) * 0 == 0` whatever
+    # `act` does at zero.
+    _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -404,38 +409,45 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _maybe_pad_intermediate_size(cls, vllm_config: VllmConfig) -> None:
-        """Round hf_config.intermediate_size up to a 64-multiple when it is not
-        stick-aligned, stashing the original as ``_spyre_orig_intermediate_size``.
+        """Round intermediate_size up so each TP rank's shard is a 64-multiple,
+        stashing the original as ``_spyre_orig_intermediate_size``.
 
-        A SwiGLU MLP whose ``intermediate_size`` is not a multiple of the fp16
-        stick fuses gate+up and slices the up half at an unaligned offset, which
-        Spyre inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3`` read
-        ``config.intermediate_size`` directly, so overriding the config value
+        A gated MLP whose per-rank ``intermediate_size`` is not a multiple of the fp16
+        stick fuses gate+up and slices the up half at an unaligned offset, which Spyre
+        inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3``/``Gemma4MLP``
+        read ``config.intermediate_size`` directly, so overriding the config value
         before the model is built widens the modules with no per-class shim.
 
-        Dense SwiGLU only (SiLU/swish is unique to it); MoE and other MLPs are
-        left unpadded, as the loader can't reach their projections. Zero-padding
-        is inert for SwiGLU (see ``custom_ops.mlp_pad``).
+        Dense MLPs only. A MoE's routed experts are padded where their stacks are
+        relaid out (``spyre_inference.moe``), and a MoE that sizes its experts from
+        ``intermediate_size`` itself is skipped: the loader cannot reach the stacked
+        expert tensors in the checkpoint, so widening the layer would load them
+        truncated. Zero-padding is inert for a gated MLP (see ``custom_ops.mlp_pad``).
         """
         from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
 
-        model_config = vllm_config.model_config
-        hf_config = model_config.hf_config
-        orig = getattr(hf_config, "intermediate_size", None)
-        if not orig or orig % BLOCK_SIZE == 0:
+        # The text config is where a multimodal checkpoint keeps the decoder's MLP width.
+        text_config = vllm_config.model_config.hf_text_config
+        orig = getattr(text_config, "intermediate_size", None)
+        # TP shards the intermediate dim, so it is the per-rank shard that has to land
+        # on a stick boundary.
+        align = BLOCK_SIZE * vllm_config.parallel_config.tensor_parallel_size
+        if not orig or orig % align == 0:
             return
         moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
-        is_moe = any(getattr(hf_config, a, None) for a in moe_attrs)
-        act = getattr(hf_config, "hidden_act", None) or getattr(
-            hf_config, "hidden_activation", None
+        is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
+        expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
+            text_config, "expert_intermediate_size", None
         )
-        if is_moe or act not in ("silu", "swish"):
+        act = getattr(text_config, "hidden_act", None) or getattr(
+            text_config, "hidden_activation", None
+        )
+        if (is_moe and expert_size in (None, orig)) or act not in cls._GATED_ACTS:
             return
 
-        padded = ((orig + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
-        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
-            cfg._spyre_orig_intermediate_size = orig
-            cfg.intermediate_size = padded
+        padded = ((orig + align - 1) // align) * align
+        text_config._spyre_orig_intermediate_size = orig
+        text_config.intermediate_size = padded
         logger.info(
             "Padding MLP intermediate_size %d -> %d for Spyre stick alignment "
             "(original preserved as _spyre_orig_intermediate_size).",

@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from spyre_inference.custom_ops.mlp_pad import (
     _pad_weight,
+    original_intermediate_size,
     verify_padded_intermediate_size,
 )
 
@@ -151,3 +152,48 @@ def test_verify_noop_without_padding():
     verify_padded_intermediate_size(
         _model_with_down_proj(_ORIG), SimpleNamespace(intermediate_size=_ORIG)
     )
+
+
+def _config_stub(*, tp=1, **fields):
+    """Just what ``_maybe_pad_intermediate_size`` reads off a VllmConfig."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(**fields)),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+    )
+
+
+@pytest.mark.parametrize(
+    ("tp", "fields", "expected"),
+    [
+        # Aligned at TP=1, but a TP=2 shard of 2112 lands mid-stick, so 2176 it is.
+        (1, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, None),
+        (2, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, 2176),
+        (1, {"intermediate_size": 160, "hidden_act": "silu"}, 192),
+        (2, {"intermediate_size": 160, "hidden_act": "silu"}, 256),
+        # A MoE with its own expert width: only the dense MLP is widened here.
+        (
+            2,
+            {
+                "intermediate_size": 2112,
+                "moe_intermediate_size": 704,
+                "num_experts": 128,
+                "hidden_activation": "gelu_pytorch_tanh",
+            },
+            2176,
+        ),
+        # A MoE that sizes its experts from intermediate_size would load them truncated.
+        (2, {"intermediate_size": 2112, "num_experts": 8, "hidden_act": "silu"}, None),
+        # Padding is only provably inert for a gated MLP.
+        (2, {"intermediate_size": 2112, "hidden_act": "relu"}, None),
+    ],
+)
+def test_platform_aligns_intermediate_size_to_the_per_rank_shard(tp, fields, expected):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    config = _config_stub(tp=tp, **fields)
+    text_config = config.model_config.hf_text_config
+    TorchSpyrePlatform._maybe_pad_intermediate_size(config)
+
+    assert text_config.intermediate_size == (expected or fields["intermediate_size"])
+    original = fields["intermediate_size"] if expected else None
+    assert original_intermediate_size(text_config) == original

@@ -40,7 +40,9 @@ from __future__ import annotations
 
 import bisect
 import time
+from copy import copy
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import cast
 
 import numpy as np
@@ -1100,25 +1102,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
-    def maybe_add_kv_sharing_layers_to_kv_cache_groups(self, kv_cache_config) -> None:
-        """Also mirror each KV-sharing layer's spec into its group's per-layer specs.
-
-        Upstream appends the layer to ``layer_names`` only, so ``initialize_attn_backend``
-        KeyErrors once ``disable_hybrid_kv_cache_manager`` collapses a hybrid model into
-        one group indexed per layer.
-        """
-        super().maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
-
+    def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        """Resolve KV-sharing specs without changing physical cache metadata."""
         from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
+        attn_config = copy(kv_cache_config)
+        attn_config.kv_cache_groups = []
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
-            if not isinstance(spec, UniformTypeKVCacheSpecs):
-                continue
-            for layer_name in group.layer_names:
-                if layer_name not in spec.kv_cache_specs:
-                    target = self.shared_kv_cache_layers[layer_name]
-                    spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[target]
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                per_layer = dict(spec.kv_cache_specs)
+                for layer_name in group.layer_names:
+                    if layer_name not in per_layer:
+                        target = self.shared_kv_cache_layers[layer_name]
+                        per_layer[layer_name] = per_layer[target]
+                spec = replace(spec, kv_cache_specs=per_layer)
+            attn_config.kv_cache_groups.append(replace(group, kv_cache_spec=spec))
+
+        super().initialize_attn_backend(attn_config, is_profiling=is_profiling)
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.

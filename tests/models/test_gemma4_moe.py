@@ -88,8 +88,9 @@ def moe_weights(request):
 
 
 def _inputs(num_tokens):
-    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16) * 0.5
-    logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float16)
+    gen = torch.Generator().manual_seed(num_tokens)
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(num_tokens, EXPERTS, dtype=torch.float16, generator=gen)
     return x, logits
 
 

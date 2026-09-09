@@ -40,8 +40,8 @@ from __future__ import annotations
 
 import bisect
 import time
-from copy import copy
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import replace
 from typing import cast
 

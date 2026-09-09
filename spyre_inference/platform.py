@@ -486,7 +486,7 @@ class TorchSpyrePlatform(CpuPlatform):
             text_config = vllm_config.model_config.hf_text_config
             if (
                 vllm_config.cache_config.kv_sharing_fast_prefill
-                and getattr(text_config, "hidden_size_per_layer_input", 0) > 0
+                and (getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
             ):
                 raise NotImplementedError(
                     "Spyre does not support kv_sharing_fast_prefill for models with "

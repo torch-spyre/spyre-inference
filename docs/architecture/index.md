@@ -145,7 +145,10 @@ Three adaptations worth knowing:
   ([torch-spyre#3770](https://github.com/torch-spyre/torch-spyre/issues/3770)). Lastly,
   `force_text_backbone` points a gemma-4 config at its text-only backbone through
   `hf_overrides`, rebuilding the `global_*` head / kv-head attributes vLLM's builder reads and
-  transformers >=5.16 consumes into `per_layer_config`.
+  transformers >=5.16 consumes into `per_layer_config`. A PLE checkpoint consequently rejects
+  three configurations up front: `SPYRE_COMPILE_GRANULARITY=model`, `kv_sharing_fast_prefill`,
+  and a narrower `vocab_size_per_layer_input` than `vocab_size` — that last one is the dropped
+  mask's own precondition, and torch-spyre lowers the mask in neither compile nor eager mode.
 
 ## Compilation Granularity
 
@@ -184,7 +187,8 @@ Embeddings and the final norm sit outside the block list and stay eager. `lm_hea
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count.
+grows with layer count. A model with per-layer embeddings rejects it: its PLE row cut has to
+stay outside the graph.
 
 ## Attention Backend
 

@@ -128,6 +128,24 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
+def reject_masked_per_layer_vocab(decoder: nn.Module) -> None:
+    """Reject a PLE checkpoint whose per-layer vocab is narrower than the full one.
+
+    Upstream then masks ``input_ids`` down to the per-layer vocab, and that mask is a
+    ``torch.bool`` result over an int operand, which torch-spyre lowers in neither mode:
+    its eager dispatch goes through the same Inductor backend, so there is no eager path
+    to fall back to. Raised at construction, before weights load, not mid-forward.
+    """
+    if decoder.embed_tokens_per_layer is None:
+        return
+    per_layer, full = decoder.vocab_size_per_layer_input, decoder.config.vocab_size
+    if per_layer < full:
+        raise NotImplementedError(
+            f"Gemma-4 per-layer embeddings on Spyre require vocab_size_per_layer_input "
+            f">= vocab_size (got {per_layer} < {full})."
+        )
+
+
 def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Fold Gemma's output scale into the source down-projection stack."""
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
@@ -168,18 +186,12 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
         )
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        """Upstream's, minus a mask Spyre cannot lower: a torch.bool result over an
-        int32 operand. It is a no-op whenever ``vocab_size_per_layer_input >= vocab_size``.
+        """Upstream's, minus the mask ``reject_masked_per_layer_vocab`` makes a no-op.
+
+        That mask is a torch.bool result over an int operand, which Spyre cannot lower.
         """
         if self.embed_tokens_per_layer is None:
             return None
-        if self.vocab_size_per_layer_input < self.config.vocab_size:
-            if self.spyre_compile_enabled:
-                raise NotImplementedError(
-                    "Compiled Gemma-4 per-layer embeddings require "
-                    "vocab_size_per_layer_input >= vocab_size."
-                )
-            return super().get_per_layer_inputs(input_ids)
         per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
         return per_layer_embeds.reshape(
             *input_ids.shape,
@@ -230,6 +242,7 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
+        reject_masked_per_layer_vocab(decoder)
         decoder.spyre_compile_enabled = (
             vllm_config.compilation_config.mode is not CompilationMode.NONE
         )

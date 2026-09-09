@@ -12,19 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Gemma-4's per-layer-embedding (PLE) adaptations.
+
+Both are host-side and need no card: the row cut upstream's backbone loop takes out of the
+projected PLE tensor, and the per-layer vocab width the Spyre path requires.
+"""
+
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
-from vllm.model_executor.models.gemma4 import (
-    Gemma4SelfDecoderLayers,
-    _run_decoder_layers,
-)
+from vllm.model_executor.models.gemma4 import _run_decoder_layers
 
 from spyre_inference.models.gemma4 import (
     SpyreGemma4SelfDecoderLayers,
     _PerLayerRows,
+    reject_masked_per_layer_vocab,
 )
 
 
@@ -50,30 +54,31 @@ def test_upstream_decoder_uses_precomputed_per_layer_rows():
     )
 
 
-def _decoder_with_masked_ple(*, compile_enabled: bool) -> SpyreGemma4SelfDecoderLayers:
+def _decoder_with_masked_ple() -> SpyreGemma4SelfDecoderLayers:
     decoder = SpyreGemma4SelfDecoderLayers.__new__(SpyreGemma4SelfDecoderLayers)
     nn.Module.__init__(decoder)
     decoder.embed_tokens_per_layer = nn.Identity()
     decoder.vocab_size_per_layer_input = 8
     decoder.config = SimpleNamespace(vocab_size=16)
-    decoder.spyre_compile_enabled = compile_enabled
     return decoder
 
 
-def test_compiled_masked_ple_is_rejected():
-    decoder = _decoder_with_masked_ple(compile_enabled=True)
-
+def test_masked_per_layer_vocab_is_rejected():
+    """Unconditional: torch-spyre's eager dispatch lowers through Inductor too, so
+    enforce_eager is not a way around the mask."""
     with pytest.raises(NotImplementedError, match="vocab_size_per_layer_input"):
-        decoder.get_per_layer_inputs(torch.tensor([1]))
+        reject_masked_per_layer_vocab(_decoder_with_masked_ple())
 
 
-def test_eager_masked_ple_delegates_upstream(monkeypatch):
-    sentinel = torch.tensor([42])
-    monkeypatch.setattr(
-        Gemma4SelfDecoderLayers,
-        "get_per_layer_inputs",
-        lambda self, input_ids: sentinel,
-    )
-    decoder = _decoder_with_masked_ple(compile_enabled=False)
+def test_full_width_per_layer_vocab_is_accepted():
+    decoder = _decoder_with_masked_ple()
+    decoder.vocab_size_per_layer_input = decoder.config.vocab_size
 
-    assert decoder.get_per_layer_inputs(torch.tensor([1])) is sentinel
+    reject_masked_per_layer_vocab(decoder)
+
+
+def test_checkpoint_without_per_layer_embeddings_is_accepted():
+    decoder = _decoder_with_masked_ple()
+    decoder.embed_tokens_per_layer = None
+
+    reject_masked_per_layer_vocab(decoder)

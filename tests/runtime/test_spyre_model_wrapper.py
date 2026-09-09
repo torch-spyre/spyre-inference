@@ -90,9 +90,7 @@ def test_kv_sharing_attention_lookup_preserves_physical_specs(monkeypatch):
     group = KVCacheGroupSpec(layer_names=[owner, sharing], kv_cache_spec=uniform_spec)
     config = KVCacheConfig(
         num_blocks=2,
-        kv_cache_tensors=[
-            KVCacheTensor(size=2 * layer_spec.page_size_bytes, shared_by=[owner])
-        ],
+        kv_cache_tensors=[KVCacheTensor(size=2 * layer_spec.page_size_bytes, shared_by=[owner])],
         kv_cache_groups=[group],
     )
     runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)

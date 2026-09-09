@@ -307,3 +307,23 @@ class TestBuilderAttnBucketer:
         bucketer = SpyreAttnBucketer(make_config())
         runner = self._runner([None, bucketer])
         assert runner._resolve_builder_attn_bucketer() is bucketer
+
+
+class TestVariantCountIndependentOfKVLayout:
+    """`folded_kv` is a specialisation key, so both values in one process would double
+    the recorded variant set and the warmup that records it."""
+
+    @pytest.mark.parametrize("layout", ["0", "1"])
+    def test_variant_count_matches_across_kv_layouts(self, monkeypatch, layout):
+        monkeypatch.setenv("SPYRE_LX_KV_LAYOUT", layout)
+        envs.clear_env_cache()
+        variants = SpyreAttnBucketer(make_config()).variants()
+        monkeypatch.setenv("SPYRE_LX_KV_LAYOUT", "0" if layout == "1" else "1")
+        envs.clear_env_cache()
+        other = SpyreAttnBucketer(make_config()).variants()
+        assert variants == other
+
+    def test_variants_carry_no_kv_layout_axis(self, bucketer):
+        """The variant key is the shape lattice alone, so residency cannot widen it."""
+        fields = set(vars(bucketer.variants()[0]))
+        assert fields == {"num_blocks", "padded_query_len"}

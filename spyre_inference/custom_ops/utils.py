@@ -71,18 +71,21 @@ def _convert_op_fake(
     return torch.empty(tensor.shape, dtype=target_dtype, device=target_device)
 
 
-def convert(tensor, device=None, dtype=None):
+def convert(tensor, device=None, dtype=None, device_layout=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 
-    Routes through the opaque custom op `torch.ops.vllm.spyre_convert` so the
-    transfer is invisible to torch.compile / Dynamo. None tensors are
-    short-circuited at the Python boundary because `infer_schema` does not
-    accept Optional[Tensor] returns.
+    Normal transfers route through the opaque custom op
+    `torch.ops.vllm.spyre_convert` so the transfer is invisible to torch.compile
+    / Dynamo. A device layout requires a direct device transfer because
+    ``SpyreTensorLayout`` is not representable in the custom-op schema. None
+    tensors are short-circuited at the Python boundary because `infer_schema`
+    does not accept Optional[Tensor] returns.
 
     Args:
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
+        device_layout: Optional physical Spyre tensor layout for a device transfer.
 
     Returns:
         Converted tensor, or None if input is None.
@@ -91,6 +94,14 @@ def convert(tensor, device=None, dtype=None):
         return None
     if isinstance(device, str):
         device = torch.device(device)
+    if device_layout is not None:
+        if device is None or tensor.device == device:
+            raise RuntimeError("A layout-aware conversion requires a device transfer.")
+        if dtype is not None and tensor.dtype != dtype:
+            tensor = convert(tensor, dtype=dtype)
+        return tensor.to(  # ty: ignore[no-matching-overload]
+            device=device, device_layout=device_layout
+        )
     # Short-circuit a true no-op at the call site so Inductor never emits a
     # same-device/dtype spyre_convert FallbackKernel into the graph.
     target_device = device if device is not None else tensor.device
@@ -141,8 +152,9 @@ def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
         )
         return fn(src)
 
-    return src.to(  # ty: ignore[no-matching-overload]
-        probe.device,
+    return convert(
+        src,
+        device=probe.device,
         dtype=probe.dtype,
         device_layout=SpyreTensorLayout(
             device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],

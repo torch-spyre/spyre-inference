@@ -70,6 +70,7 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
+from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -314,28 +315,33 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
 
+    def _convert_tensors(
+        self,
+        value,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        predicate=None,
+    ):
+        """Convert matching tensors throughout an argument tree at a model boundary."""
+
+        def _convert(t):
+            if isinstance(t, torch.Tensor) and (predicate is None or predicate(t)):
+                return convert(
+                    t, dtype=dtype, device=self._spyre_device if device is None else device
+                )
+            return t
+
+        return tree_map(_convert, value)
+
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
         # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
         # in models/roberta.py.
-        def _convert_int(t):
-            if (
-                t is not None
-                and isinstance(t, torch.Tensor)
-                and t.dtype in (torch.int32, torch.int64)
-            ):
-                return convert(t, dtype=torch.int64, device=self._spyre_device)
-            return t
-
-        args_converted = []
-        for arg in args:
-            args_converted.append(_convert_int(arg))
-
-        kwargs_converted = {}
-        for key in kwargs:
-            val = kwargs.get(key)
-            kwargs_converted[key] = _convert_int(val)
+        is_integer = lambda t: t.dtype in (torch.int32, torch.int64)
+        args_converted = self._convert_tensors(args, dtype=torch.int64, predicate=is_integer)
+        kwargs_converted = self._convert_tensors(kwargs, dtype=torch.int64, predicate=is_integer)
 
         # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
         reset_llama4_scale_cache()
@@ -345,11 +351,7 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-
-            def _to_cpu(x):
-                return convert(x, device="cpu")
-
-            result = tree_map(_to_cpu, result)
+            result = self._convert_tensors(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -365,12 +367,9 @@ class _SpyreModelWrapper:
         vision weights are on Spyre.
         """
 
-        def _to_spyre_float(t):
-            if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
-            return t
-
-        kwargs = tree_map(_to_spyre_float, kwargs)
+        kwargs = self._convert_tensors(
+            kwargs, dtype=torch.float16, predicate=torch.Tensor.is_floating_point
+        )
         out = self._model.embed_multimodal(**kwargs)
         return out
 
@@ -414,7 +413,7 @@ class _SpyreModelWrapper:
         else:
             padded_tokens = None
 
-        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        input_ids = self._convert_tensors(input_ids, dtype=torch.int64)
         inputs_embeds = self._model.embed_input_ids(input_ids)
         if padded_tokens is not None:
             inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
@@ -424,17 +423,14 @@ class _SpyreModelWrapper:
 
         from vllm.model_executor.models.utils import _merge_multimodal_embeddings
 
-        inputs_embeds = convert(inputs_embeds, device="cpu")
-        mm_embeds_cpu = tree_map(
-            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
-            multimodal_embeddings,
-        )
+        inputs_embeds = self._convert_tensors(inputs_embeds, device="cpu")
+        mm_embeds_cpu = self._convert_tensors(multimodal_embeddings, device="cpu")
         merged = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=mm_embeds_cpu,
-            is_multimodal=is_multimodal.to("cpu"),
+            is_multimodal=self._convert_tensors(is_multimodal, device="cpu"),
         )
-        return convert(merged, device=self._spyre_device)
+        return self._convert_tensors(merged)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -458,7 +454,7 @@ class _SpyreModelWrapper:
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
-        hidden_states = convert(hidden_states, device=self._spyre_device)
+        hidden_states = self._convert_tensors(hidden_states)
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -572,6 +568,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+        for module in self.model.modules():
+            if isinstance(module, SpyreConv2d):
+                module.process_weights_after_loading()
 
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.
@@ -1217,7 +1216,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Host-allocated then transferred: only .to() takes a device_layout.
+            # Host-allocated then transferred with the required slot-major layout.
             layout = slot_major_kv_layout(
                 num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
             )
@@ -1228,14 +1227,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 spec.num_kv_heads,
                 spec.head_size,
                 dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            )
+            k_pages = convert(k_pages, device=self._spyre_device, device_layout=layout)
             v_pages = torch.zeros(
                 num_blocks,
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
                 dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            )
+            v_pages = convert(v_pages, device=self._spyre_device, device_layout=layout)
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

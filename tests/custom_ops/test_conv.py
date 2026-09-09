@@ -188,6 +188,7 @@ def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
     )
 
     layer = layer.to("spyre")
+    layer.process_weights_after_loading()
     actual = layer.forward_oot(x.to("spyre"))
 
     assert actual.shape == expected.shape

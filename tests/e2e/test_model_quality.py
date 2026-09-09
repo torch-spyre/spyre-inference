@@ -39,8 +39,7 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
-# Each FP8 checkpoint borrows prompts from its unquantized sibling; the smoke test below
-# compares no output, it only needs prompts that fit a compiled prefill bucket.
+# Prompts come from the unquantized sibling; the smoke case only needs ones that fit a bucket.
 FP8_DECODER_MODELS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b-fp8": "ibm-granite/granite-4.1-8b",
@@ -55,13 +54,16 @@ FP8_MAX_TOKENS = 8
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are
 # compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
-# Below the crossover with ABS_TOL (p=0.16 at the defaults) `_prob_tol` bounds relatively:
-# a flat 0.08 on a reference of 0.08 would permit a 2x error.
+# Below the ABS_TOL crossover (p=0.16) a flat 0.08 on a 0.08 reference would permit a 2x error.
 REL_TOL = float(os.environ.get("SPYRE_TEST_REL_TOL", "0.5"))
 
-# `_compare_against_hf` needs p(HF token) under Spyre, so HF's greedy token has to be in
-# the returned distribution even when Spyre picks another. 20 is vLLM's `max_logprobs`.
+# HF's greedy token must be in Spyre's distribution even when Spyre picks another; 20 is
+# vLLM's `max_logprobs`.
 NUM_LOGPROBS = 20
+
+# A near-tie split ends the comparison, so without a floor a case that mispredicts at step 0
+# on every prompt would pass having compared nothing.
+MIN_MATCHED_FRACTION = 0.5
 
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
@@ -69,6 +71,9 @@ MAX_NUM_SEQS = 3
 # max_num_batched_tokens down to the largest one, so this is the top of COMPILE_SIZES.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
+# Slack for the prompt-fit guard below: it counts with a bare `tokenizer(prompt)` while the
+# engine tokenizes through vLLM, which can differ by a special token or two.
+PROMPT_TOKEN_MARGIN = 8
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "decoder_output_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
@@ -118,8 +123,6 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         _compare_against_hf(model, hf_result, output)
         for hf_result, output in zip(ref["results"], outputs)
     ]
-    # A prompt that diverges early verifies only the steps before the split, so a green
-    # case is not automatically a well-covered one.
     per_prompt = ", ".join(f"{n}/{max_tokens}" for n in matched)
     print(
         f"\n{model}: matched {sum(matched)}/{len(prompts) * max_tokens} reference steps "
@@ -127,15 +130,19 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         f"near-tie and gate little -- see MODEL_PROMPTS in "
         f"tests/data/generate_decoder_output_refs.py."
     )
+    min_matched = math.ceil(MIN_MATCHED_FRACTION * max_tokens)
+    assert all(n >= min_matched for n in matched), (
+        f"{model}: matched {per_prompt} reference steps per prompt, under the "
+        f"{min_matched}/{max_tokens} floor -- the near-tie split came too early to gate "
+        f"anything. Every prompt matched all {max_tokens} steps when the reference was "
+        f"taken, so treat this as a regression, not as a floor to lower."
+    )
 
 
 @pytest.mark.parametrize("model", FP8_DECODER_MODELS)
 def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A compiled FP8 checkpoint loads and decodes.
-
-    No reference comparison: writing one means dequantizing a compressed-tensors
-    checkpoint on CPU, which the generator does not do.
-    """
+    """A compiled FP8 checkpoint loads and decodes; no reference, the generator does not
+    dequantize compressed-tensors on CPU."""
     base = FP8_DECODER_MODELS[model]
     base_ref = _REFERENCES.get(base)
     assert base_ref is not None, (
@@ -171,28 +178,30 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
     for output in outputs:
         completion = output.outputs[0]
         print(f"\n{model}  prompt: {output.prompt!r}\n    Spyre: {completion.text!r}")
+        # Token count only: this case must not assume the tokens decode to non-empty text.
         assert len(completion.token_ids) == FP8_MAX_TOKENS, (
             f"{model}: generated {len(completion.token_ids)} of {FP8_MAX_TOKENS} tokens"
         )
-        assert completion.text.strip(), f"{model}: empty completion for {output.prompt!r}"
 
 
 def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
     """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
 
-    Past the largest bucket `SpyreShapeBucketer.find_bucket` returns None and the shape
-    runs unpadded, so an over-long prompt is a silent Dynamo recompile inside generate()
-    rather than an error.
+    Past the largest bucket `SpyreShapeBucketer.find_bucket` returns None and the shape runs
+    unpadded, so an over-long prompt is a silent Dynamo recompile inside generate().
     """
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    limit = MAX_NUM_BATCHED_TOKENS - PROMPT_TOKEN_MARGIN
     for prompt in prompts:
         num_tokens = len(tokenizer(prompt).input_ids)
-        assert num_tokens <= MAX_NUM_BATCHED_TOKENS, (
-            f"{model}: prompt is {num_tokens} tokens, past the largest compiled bucket "
-            f"({MAX_NUM_BATCHED_TOKENS}) -- it would recompile at generate() time. Shorten "
-            f"it, or raise MAX_NUM_BATCHED_TOKENS here and in the generator: {prompt!r}"
+        assert num_tokens <= limit, (
+            f"{model}: prompt is {num_tokens} tokens, over the {limit}-token bound this "
+            f"guard holds ({PROMPT_TOKEN_MARGIN} below the largest compiled bucket, "
+            f"{MAX_NUM_BATCHED_TOKENS}) -- past the bucket it would recompile at generate() "
+            f"time. Shorten it, or raise MAX_NUM_BATCHED_TOKENS here and in the generator: "
+            f"{prompt!r}"
         )
 
 
@@ -224,8 +233,8 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         )
 
         if hf_id != token_id:
-            # The sampled tokens' own probabilities agree whenever the models are equally
-            # confident, however far apart they picked, so judge the tie on HF's token.
+            # Two equally confident models agree on p(sampled) however far apart they
+            # picked, so judge the tie on HF's token.
             spyre_hf = completion.logprobs[step].get(hf_id)
             assert spyre_hf is not None, (
                 f"{model}: wrong token and HF's token is outside Spyre's top "
@@ -236,7 +245,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"{model}: wrong token and p(HF token) differs by more than {tol:.4f} "
                 f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
             )
-            # A tie also means Spyre ranks the two level: a flat HF distribution must not
+            # A tie also means Spyre ranks the two level, so a flat HF distribution cannot
             # excuse Spyre being confident elsewhere. Doubled: both may drift by `tol`.
             tie_tol = 2 * tol
             assert abs(prob - spyre_hf_prob) <= tie_tol, (

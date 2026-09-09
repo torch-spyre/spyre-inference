@@ -118,7 +118,8 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-smoke-shard test-model-quality test-probes test-probes-shard \
+        test-smoke test-smoke-shard test-model-quality test-model-quality-shard \
+        test-probes test-probes-shard \
         test-attention test-attention-shard \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
         test-upstream-distributed tests-single-card tests-multi-card
@@ -193,8 +194,24 @@ test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # Carved out of smoke: every case compiles a product model, up to the 31B decoders.
-test-model-quality: ## Run the product-model output-quality gates against the cached HF references.
+test-model-quality: ## Run the product-model output-quality gates against the cached HF references. Unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# CI fans the gate out across parallel shard jobs like smoke/attention; the plugin's
+# weighted partition (--quality-shards) balances by recorded runtime when a durations file
+# is present, else by decoder-vs-encoder path weight. No partition beats the slowest single
+# case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
+QUALITY_SHARDS ?= 6
+QUALITY_SHARD_ID ?= 0
+test-model-quality-shard: ## Run one model-quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --quality-shards=$(QUALITY_SHARDS) --quality-shard-id=$(QUALITY_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-model-quality-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to QUALITY_SHARD_ID.
+test-model-quality-shard-%:
+	$(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 test-probes: ## Run the torch-spyre backend probes (excluded from integration), unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' JUNIT_XML=$(JUNIT_XML)
@@ -285,13 +302,15 @@ test-upstream-distributed: ## Run the upstream+distributed marker combo.
 
 # Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the 1-card marker combos (smoke shards / model-quality / attention shards / encoder-attention / upstream shards). Needs 1 card.
+tests-single-card: ## Run the 1-card marker combos (smoke shards / model-quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-smoke-shard-$$i" && $(MAKE) test-smoke-shard SMOKE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-shard-$$i/junit-test-smoke-shard-$$i.xml" || rc=1; \
 	done; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-model-quality" && $(MAKE) test-model-quality JUNIT_XML="$(RESULTS_DIR)/junit-test-model-quality/junit-test-model-quality.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(QUALITY_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-model-quality-shard-$$i" && $(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-model-quality-shard-$$i/junit-test-model-quality-shard-$$i.xml" || rc=1; \
+	done; \
 	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
 	done; \

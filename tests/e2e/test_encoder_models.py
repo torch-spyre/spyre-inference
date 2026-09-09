@@ -255,12 +255,9 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """What runs on Spyre here is the encoder body, not the score itself.
-
-    The classifier head stays float32 and torch-spyre has no FP32 batchmatmul
-    (torch-spyre#1794), so ``configure_pooling_for_spyre`` runs the pooling tail on CPU,
-    compiled case included.
-    """
+    """What runs on Spyre is the encoder body, not the score: the classifier head stays
+    float32 and torch-spyre has no FP32 batchmatmul (torch-spyre#1794), so the pooling tail
+    runs on CPU even in the compiled case."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")

@@ -14,7 +14,7 @@
 
 """Duration-weighted test sharding for CI fan-out.
 
-Each suite (attn/smoke/upstream/dist/probe) is split across N parallel jobs; a job
+Each suite (attn/smoke/upstream/dist/probe/quality) is split across N parallel jobs; a job
 keeps only its shard's slice. Every shard job computes the same weighted greedy
 longest-processing-time partition, so no cross-job coordination is needed and
 the union of all shards is the full selection exactly once (guarded by
@@ -60,7 +60,7 @@ def _will_skip(item: pytest.Item) -> bool:
 def add_shard_options(parser) -> None:
     """Register one --<suite>-shards / --<suite>-shard-id pair per CI suite."""
     group = parser.getgroup("spyre-test-sharding")
-    for suite in ("attn", "smoke", "upstream", "dist", "probe"):
+    for suite in ("attn", "smoke", "upstream", "dist", "probe", "quality"):
         group.addoption(
             f"--{suite}-shards",
             type=int,
@@ -93,6 +93,7 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
+    _apply_model_quality_shard(config, items)
 
 
 def _load_durations(config: pytest.Config) -> dict[str, float]:
@@ -348,6 +349,34 @@ def _apply_probe_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
         select=select,
         weight=lambda item: 1,
         label="probe",
+        durations=_load_durations(config),
+    )
+
+
+def _apply_model_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """The product-model output-quality gate, split across parallel 1-card jobs.
+
+    Every case compiles a product model, so the spread that matters is decoders (load,
+    compile, then 16 greedy steps) against the much smaller encoder cases.
+    """
+
+    def select(item: pytest.Item) -> bool:
+        return bool(item.get_closest_marker("model_quality")) and not item.get_closest_marker(
+            "upstream"
+        )
+
+    # Heavy = a decoder case; the encoder gates share a much smaller compile.
+    def weight(item: pytest.Item) -> int:
+        return 8 if "test_model_quality" in item.nodeid else 1
+
+    _apply_shard(
+        config,
+        items,
+        num_shards=config.getoption("--quality-shards"),
+        shard_id=config.getoption("--quality-shard-id"),
+        select=select,
+        weight=weight,
+        label="quality",
         durations=_load_durations(config),
     )
 

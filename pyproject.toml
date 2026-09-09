@@ -27,6 +27,10 @@ dependencies = [
     # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
     # satisfy the transformers import. VLM is x86_64-only for now.
     "torchvision; platform_machine not in 's390x, ppc64le'",
+
+    # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
+    # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
+    "transformers<5.17",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]

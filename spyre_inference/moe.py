@@ -21,6 +21,7 @@ adapters opt a layer in with a ``SpyreMoERecipe``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -58,21 +59,17 @@ _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 class SpyreMoERecipe:
     """The upstream MoE semantics implemented by Spyre's current kernels.
 
-    ``full_softmax`` normalizes over all experts before choosing top-k;
-    ``topk_softmax`` is upstream's default, softmax over the top-k logits only.
+    The routing function follows vLLM's canonical ``(topk_weights, topk_ids)``
+    contract. The persistent form expands that result to Spyre's dense route
+    layout without selecting top-k a second time.
     """
 
     activation: Literal["gelu_tanh", "silu"]
     routing: Literal["full_softmax", "topk_softmax"]
-    expert_scale: torch.Tensor | None = None
-    fold_expert_scale_into_down: bool = False
+    prepare_down_weight: Callable[[torch.Tensor], torch.Tensor] | None = None
 
 
 def _validate_recipe(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
-    if recipe.expert_scale is not None and not recipe.fold_expert_scale_into_down:
-        raise NotImplementedError(
-            "Spyre MoE recipes with per-expert scales must fold them into down weights."
-        )
     if recipe.routing == "full_softmax" and layer.custom_routing_function is None:
         raise NotImplementedError(
             "Full-softmax routing requires a model-specific Spyre MoE recipe."
@@ -92,11 +89,18 @@ def _compiler_scopes() -> tuple[Any, Any]:
 def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> None:
     """Opt one upstream ``RoutedExperts`` layer into Spyre, before weight loading.
 
-    The post-load hook frees vLLM's source weight layout, so anything unsupported has
-    to be rejected here.
+    The post-load hook replaces vLLM's source layout with a second, transposed
+    device layout. It frees source parameters because holding both layouts would
+    double MoE weight memory, so unsupported configurations must be rejected here.
     """
     moe = layer.moe_config
     _validate_recipe(layer, recipe)
+    if not isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
+        raise NotImplementedError("Spyre MoE backend does not support quantized experts.")
+    if moe.is_lora_enabled:
+        raise NotImplementedError("Spyre MoE backend does not support LoRA experts.")
+    if moe.has_bias:
+        raise NotImplementedError("Spyre MoE backend does not support expert biases.")
     parallel = moe.moe_parallel_config
     # TP only narrows each expert's ``M``, and MoERunner all-reduces the partial sums.
     # The other axes would split the expert stacks the regions hold whole.
@@ -129,15 +133,6 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
     layer = cast("RoutedExperts", layer)
     layer.spyre_moe_recipe = recipe
     layer.spyre_moe_regions = {}
-
-
-def _default_recipe(layer: _RoutedExperts) -> SpyreMoERecipe:
-    if layer.custom_routing_function is not None:
-        raise NotImplementedError("Spyre MoE backend requires a model adapter for custom routing.")
-    activation = layer.activation.value
-    if activation not in ("gelu_tanh", "silu"):
-        raise NotImplementedError(f"Spyre MoE backend does not support activation={activation!r}.")
-    return SpyreMoERecipe(activation=activation, routing="topk_softmax")
 
 
 def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,6 +212,14 @@ def _moe_persistent_routing(
     return (packed @ route_identity)[..., :1]
 
 
+def _moe_persistent_selected_routing(
+    dense_topk_probs: torch.Tensor, route_identity: torch.Tensor, stick: int
+) -> torch.Tensor:
+    """Convert dense weights already selected by vLLM-style top-k routing."""
+    packed = torch.relu(dense_topk_probs.unsqueeze(-1).expand(-1, -1, stick))
+    return (packed @ route_identity)[..., :1]
+
+
 def _token_cores(tokens: int) -> int:
     from torch_spyre._inductor import config as spyre_config
 
@@ -286,9 +289,9 @@ def _probs(router_logits: torch.Tensor) -> torch.Tensor:
 
 
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
-    selected_logits, indices = _topk(router_logits, top_k)
-    selected_weights = _probs(selected_logits)
-    return torch.zeros_like(router_logits).scatter(-1, indices, selected_weights)
+    """Materialize canonical vLLM top-k weights in dense expert order."""
+    topk_weights, topk_ids = _routing_weights(router_logits, top_k, "topk_softmax")
+    return torch.zeros_like(router_logits).scatter(-1, topk_ids, topk_weights)
 
 
 def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:
@@ -297,6 +300,12 @@ def _route(layer: RoutedExperts, probs: torch.Tensor) -> torch.Tensor:
         layer.spyre_moe_route_identity,
         layer.top_k,
         layer.spyre_moe_stick,
+    )
+
+
+def _route_selected(layer: RoutedExperts, topk_probs: torch.Tensor) -> torch.Tensor:
+    return _moe_persistent_selected_routing(
+        topk_probs, layer.spyre_moe_route_identity, layer.spyre_moe_stick
     )
 
 
@@ -365,10 +374,9 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
-    recipe = layer.spyre_moe_recipe
-    if recipe.expert_scale is not None:
-        # configure_spyre_moe_layer has already rejected an unfolded scale.
-        w2.mul_(recipe.expert_scale.detach().to(w2.dtype).view(experts, 1, 1))
+    transform_down = layer.spyre_moe_recipe.prepare_down_weight
+    if transform_down is not None:
+        w2 = transform_down(w2)
     layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
     del layer.w2_weight, w2
 
@@ -388,17 +396,19 @@ def _prepare_layer(layer: RoutedExperts) -> None:
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
 
+    # The source expert parameters are replaced with device-specific stacks.
+    supports_pre_processed_weights = False
+
     @property
     def is_monolithic(self) -> bool:
         return True
 
     def process_weights_after_loading(self, layer: _RoutedExperts) -> None:
         if getattr(layer, "spyre_moe_recipe", None) is None:
-            logger.warning_once(
-                "Spyre MoE: claiming routed experts with no model adapter. The generic "
-                "recipe is untested on this model — verify the outputs."
+            raise NotImplementedError(
+                "Spyre MoE backend requires an explicit model-specific recipe; "
+                "this architecture has not opted in."
             )
-            configure_spyre_moe_layer(layer, _default_recipe(layer))
         _prepare_layer(cast("RoutedExperts", layer))
 
     def apply_monolithic(
@@ -416,9 +426,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits)
+                route = _region(layer, "route", _route)(layer, probs)
             else:
-                probs = _region(layer, "probs", _topk_probs)(router_logits, layer.top_k)
-            route = _region(layer, "route", _route)(layer, probs)
+                topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)
+                route = _region(layer, "route_selected", _route_selected)(layer, topk_probs)
             _name_persistent_dims(x, layer.spyre_moe_gate, layer.spyre_moe_up, layer.spyre_moe_down)
             try:
                 with persistent_scope:

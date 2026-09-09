@@ -100,19 +100,56 @@ def test_routing_recipes_agree_under_renormalization():
     torch.testing.assert_close(standard, gemma)
 
 
-def test_prefill_routing_matches_the_decode_form():
-    """The prefill dense form and the decode gathered form must agree on the weights."""
-    from spyre_inference.moe import _routing_weights, _topk_probs
+def test_dense_topk_weights_are_softmax_over_the_selected_logits():
+    """The dense prefill weights, against the formula rather than against the decode form.
+
+    Both forms now share ``_routing_weights``, so they agree by construction; what still
+    needs pinning is the formula that shared helper implements.
+    """
+    from spyre_inference.moe import _topk_probs
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5], [-0.25, 3.0, 0.75, -2.0]], dtype=torch.float32)
     dense = _topk_probs(logits, 2)
-    weights, indices = _routing_weights(logits, 2, "topk_softmax")
-    expected = torch.zeros_like(logits).scatter(-1, indices, weights)
+    expected_weights, indices = torch.topk(logits, 2, dim=-1)
+    expected = torch.zeros_like(logits).scatter(
+        -1, indices, torch.softmax(expected_weights, dim=-1)
+    )
     torch.testing.assert_close(dense, expected)
-    # Exactly top_k live slots per token, already normalized, so the re-normalize inside
-    # _moe_persistent_routing is the divide-by-one it is meant to be.
-    assert (dense != 0).sum(-1).tolist() == [2, 2]
-    torch.testing.assert_close(dense.sum(-1), torch.ones(logits.shape[0]))
+
+
+def test_selected_routing_matches_the_general_routing_form():
+    """The topk path skips the re-normalize the full-softmax path needs.
+
+    That is only legal because these weights already have exactly ``top_k`` live slots
+    summing to one, so the two forms must come out identical.
+    """
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import (
+        _moe_persistent_routing,
+        _moe_persistent_selected_routing,
+        _topk_probs,
+    )
+
+    torch.manual_seed(0)
+    logits = torch.randn(8, EXPERTS, dtype=torch.float16)
+    dense = _topk_probs(logits, TOP_K)
+    assert (dense != 0).sum(-1).tolist() == [TOP_K] * logits.shape[0]
+    torch.testing.assert_close(dense.sum(-1), torch.ones(logits.shape[0], dtype=torch.float16))
+
+    stick = get_elem_in_stick(torch.float16)
+    identity = torch.eye(stick, dtype=torch.float16)
+    torch.testing.assert_close(
+        _moe_persistent_selected_routing(dense, identity, stick),
+        _moe_persistent_routing(dense, identity, TOP_K, stick),
+    )
+
+
+def _unquantized_method():
+    """What vLLM installs for an unquantized layer — the Spyre OOT subclass, here."""
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    return object.__new__(SpyreUnquantizedFusedMoEMethod)
 
 
 def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
@@ -125,6 +162,8 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
         "dp_size": 1,
         "pcp_size": 1,
         "sp_size": 1,
+        "is_lora_enabled": False,
+        "has_bias": False,
     } | (moe_config or {})
     fields = {
         "custom_routing_function": None,
@@ -133,6 +172,8 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
         "local_num_experts": EXPERTS,
         "renormalize": True,
         "apply_router_weight_on_input": False,
+        "quant_config": None,
+        "quant_method": _unquantized_method(),
     } | overrides
     return SimpleNamespace(
         moe_config=SimpleNamespace(
@@ -142,51 +183,24 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
     )
 
 
-def test_post_load_claims_an_unconfigured_layer_and_warns(monkeypatch):
-    """A Mixtral-shaped layer no adapter opted in is claimed by the standard recipe.
-
-    The hook has to take it over and say so, rather than either erroring or going quiet.
-    """
+def test_post_load_rejects_an_unconfigured_layer(monkeypatch):
+    """An architecture must opt in before the backend destroys source weights."""
     from spyre_inference import moe as moe_module
 
-    prepared, warned = [], []
+    prepared = []
     monkeypatch.setattr(moe_module, "_prepare_layer", prepared.append)
-    monkeypatch.setattr(moe_module.logger, "warning_once", lambda msg, *a: warned.append(msg))
     method = object.__new__(moe_module.SpyreUnquantizedFusedMoEMethod)
 
-    layer = _generic_layer()
-    method.process_weights_after_loading(layer)
-    recipe = layer.spyre_moe_recipe
-    assert (recipe.routing, recipe.activation) == ("topk_softmax", "silu")
-    assert recipe.expert_scale is None
-    assert layer.spyre_moe_regions == {}
-    assert prepared == [layer], "an unconfigured layer must still be relaid out"
-    assert warned, "claiming a layer with no model adapter must warn"
-
-    # A layer an adapter already configured keeps its recipe and stays quiet.
-    warned.clear()
-    adapted = _generic_layer()
-    recipe = moe_module.SpyreMoERecipe("silu", "topk_softmax")
-    adapted.spyre_moe_recipe = recipe
-    method.process_weights_after_loading(adapted)
-    assert adapted.spyre_moe_recipe is recipe
-    assert not warned
+    with pytest.raises(NotImplementedError, match="explicit model-specific recipe"):
+        method.process_weights_after_loading(_generic_layer())
+    assert prepared == []
 
 
-@pytest.mark.parametrize(
-    ("overrides", "match"),
-    [
-        # A DeepSeek-shaped layer needs an adapter rather than the generic recipe.
-        ({"custom_routing_function": object()}, "model adapter"),
-        # Only the two activations the expert regions implement may be claimed.
-        ({"activation": SimpleNamespace(value="swigluoai")}, "activation="),
-    ],
-)
-def test_default_recipe_rejects_layers_that_need_an_adapter(overrides, match):
-    from spyre_inference.moe import _default_recipe
+def test_post_load_advertises_no_preprocessed_weight_support():
+    """The destructive relayout cannot consume a vLLM preprocessed weight cache."""
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
 
-    with pytest.raises(NotImplementedError, match=match):
-        _default_recipe(_generic_layer(**overrides))
+    assert not SpyreUnquantizedFusedMoEMethod.supports_pre_processed_weights
 
 
 _STANDARD = ("silu", "topk_softmax")
@@ -206,12 +220,13 @@ _STANDARD = ("silu", "topk_softmax")
         ({"local_num_experts": EXPERTS // 2}, _STANDARD, "remapped experts"),
         ({"renormalize": False}, _STANDARD, "normalized top-k"),
         ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
+        ({"quant_method": object()}, _STANDARD, "quantized experts"),
+        ({"moe_config": {"is_lora_enabled": True}}, _STANDARD, "LoRA experts"),
+        ({"moe_config": {"has_bias": True}}, _STANDARD, "expert biases"),
         # The recipe's activation must be the one the layer actually asks for.
         ({}, ("gelu_tanh", "topk_softmax"), "requires activation="),
         # Only model adapters may request a non-standard upstream routing recipe.
         ({}, ("silu", "full_softmax"), "model-specific"),
-        # The persistent kernel cannot carry a per-expert scale tensor beside the weights.
-        ({}, ("silu", "topk_softmax", torch.ones(EXPERTS)), "fold"),
     ],
 )
 def test_configure_rejects_what_the_spyre_forms_cannot_express(overrides, recipe_args, match):
@@ -230,6 +245,15 @@ def test_configure_accepts_tensor_parallel_experts():
     layer = _generic_layer(moe_config={"tp_size": 2})
     configure_spyre_moe_layer(layer, SpyreMoERecipe(*_STANDARD))
     assert layer.spyre_moe_regions == {}
+
+
+def test_configure_claims_an_unquantized_layer_of_a_quantized_model():
+    """A quantized checkpoint hands its ignored MoE layers back unquantized; claim those."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(quant_config=object())
+    configure_spyre_moe_layer(layer, SpyreMoERecipe(*_STANDARD))
+    assert layer.spyre_moe_recipe.routing == "topk_softmax"
 
 
 def _dispatch_recorder(monkeypatch, fail_on=None):
@@ -285,13 +309,18 @@ def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("routing", "probs_fn"), [("full_softmax", "_probs"), ("topk_softmax", "_topk_probs")]
+    ("routing", "routing_fn", "route_fn"),
+    [("full_softmax", "_probs", "_route"), ("topk_softmax", "_topk_probs", "_route_selected")],
 )
-def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, probs_fn):
-    """The persistent form runs probs -> route -> experts, routing chosen by the recipe."""
+def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, routing_fn, route_fn):
+    """The persistent form runs routing -> route -> experts for the selected recipe."""
     calls, resets = _dispatch_recorder(monkeypatch)
     _apply(_dispatch_layer(routing), tokens=8)
-    assert calls == [("probs", probs_fn), ("route", "_route"), ("experts", "_experts")]
+    assert calls == [
+        ("probs" if routing == "full_softmax" else "topk_probs", routing_fn),
+        ("route" if routing == "full_softmax" else "route_selected", route_fn),
+        ("experts", "_experts"),
+    ]
     assert resets == [1]
 
 
@@ -412,7 +441,7 @@ def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
 # gemma-4-26B-A4B, scaled down here).
 @pytest.mark.parametrize("inter", [INTER, INTER - 32])
 def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
-    """The recipe's per-expert scale is folded into the down stack, not kept beside it."""
+    """A model recipe may prepare down weights before generic relayout."""
 
     import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
@@ -433,7 +462,9 @@ def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     scale = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
     layer = _RoutedExperts(w13.clone(), w2.clone())
     layer.spyre_moe_recipe = SpyreMoERecipe(
-        "gelu_tanh", "full_softmax", scale, fold_expert_scale_into_down=True
+        "gelu_tanh",
+        "full_softmax",
+        prepare_down_weight=lambda weight: weight * scale.view(EXPERTS, 1, 1),
     )
 
     _prepare_layer(layer)

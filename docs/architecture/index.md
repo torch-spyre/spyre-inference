@@ -60,6 +60,7 @@ compiled graph (see below).
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
 
 ### Transposed linear weights
 
@@ -92,6 +93,45 @@ pass — so that no fused output ever had to be sliced; one fused GEMM is faster
 so that pass is gone. The remaining slicing constraint is narrower than it was and lives
 in the attention backend, where offset > 0 views still corrupt on transfer (see
 [Attention Backend](#attention-backend)).
+
+## Model adaptations
+
+Some models need more than a swapped-out layer: a different transport for an input, a buffer
+that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those live in
+`spyre_inference/models/`, one module per architecture, as **subclasses of the upstream vLLM
+class** rather than runtime monkey-patches. `models/__init__.py` holds `spyre_models()`
+(architecture string → Spyre class, built from the `_ADAPTED_MODULES` and `_ADAPTED_ARCHS`
+tables) and `register_models()`, which points vLLM's `ModelRegistry` at them; `_`-prefixed
+modules hold machinery those subclasses share or delegate to and register no architecture of
+their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
+and `register_models()` first checks every key against vLLM's own registry, so an upstream
+rename fails loudly instead of silently falling through to the unadapted class.
+
+Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
+`embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
+`__init__`, same parameters, same module tree, only `forward` differs. Prefer a documented
+upstream extension point where one exists: `CustomOp.register_oot` /
+`PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
+unquantized oracle leaves open for an out-of-tree platform.
+
+Two adaptations worth knowing:
+
+- **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
+  owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
+  which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
+- **MoE** (`moe.py`) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
+  for an out-of-tree platform (it selects `UnquantizedMoeBackend.OOT` — no kernel — and
+  leaves `process_weights_after_loading` to the plugin). A `CustomOp.register_oot`
+  replacement for `UnquantizedFusedMoEMethod` computes the experts in two Spyre forms —
+  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
+  in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
+  `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
+  since the device cannot hold both layouts at once. Each model's own adaptation module
+  supplies its recipe and any model-owned scaling (`configure_gemma4_moe_layers` in
+  `models/gemma4.py`). `Gemma4DecoderLayer.forward` and `MoERunner` are untouched: vLLM
+  reaches the experts through `torch.ops.vllm.moe_forward`, an opaque custom op, so the
+  dispatch runs eagerly *inside* the block's compiled graph — the same seam the attention
+  backend uses — and can drive compiled regions of its own.
 
 ## Compilation Granularity
 

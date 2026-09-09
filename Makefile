@@ -42,6 +42,11 @@ endif
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
 PYTEST_ARGS ?= -s -vvv
 
+# Set before the interpreter, not in configure_threading: torch sizes its OpenMP pool
+# at import, and vLLM's per-test fork then segfaults in gomp_team_start.
+OMP_THREADS ?=
+OMP_ENV := $(if $(OMP_THREADS),OMP_NUM_THREADS=$(OMP_THREADS))
+
 # When set, write JUnit XML here (CI callers set this to collect results
 # for artifact upload / result ingestion). Unset = no JUnit file.
 JUNIT_XML ?=
@@ -164,7 +169,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
+	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe). Carries the compiled e2e cases.
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe)' JUNIT_XML=$(JUNIT_XML)
@@ -271,8 +276,9 @@ test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=
 test-upstream-shard-%:
 	$(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
+# The only combo that forks per test (fork_new_process_for_each_test).
 test-upstream-distributed: ## Run the upstream+distributed marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' JUNIT_XML=$(JUNIT_XML)
+	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' OMP_THREADS=1 JUNIT_XML=$(JUNIT_XML)
 
 # Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.

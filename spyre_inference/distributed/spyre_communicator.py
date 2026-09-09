@@ -50,6 +50,14 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu" or self._group_name is None:
             return super().all_reduce(input_)
 
+        # Workaround: deeptools' L3 scheduler asserts "Expect valid lower and upper
+        # bound parameters" chunking the sum kernel for some rank-3 shapes
+        # ([1, 528, 1024] dies, [1, 3120, 1024] builds); a flat view has one dim to chunk.
+        orig_shape = input_.shape
+        flattened = input_.dim() > 2
+        if flattened:
+            input_ = input_.reshape(-1)
+
         # Out-of-place, unlike the base class's in-place `dist.all_reduce`: vLLM's
         # `torch.ops.vllm.all_reduce` wrapper declares no mutation, so under
         # torch.compile functionalization misses the overwrite and the graph
@@ -59,7 +67,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             "sum",  # ty: ignore[invalid-argument-type]
             self._group_name,  # ty: ignore[invalid-argument-type]
         )
-        return torch.ops._c10d_functional.wait_tensor(out)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        if flattened:
+            out = out.reshape(orig_shape)
+        return out
 
     # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
     # along the gathered dim, so a shard whose size along `dim` is not a multiple
@@ -84,6 +95,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         orig_size = input_.shape[dim]
         pad = (-orig_size) % self._GATHER_ALIGN
         if not pad:
+            # spyreccl rejects a non-contiguous input; the logits reaching us are a
+            # sliced view from the head's unpad.
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
             output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
             dist.all_gather(  # ty: ignore[possibly-missing-attribute]
                 output_list, input_, group=self.device_group

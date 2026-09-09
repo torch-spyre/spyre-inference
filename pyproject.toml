@@ -17,6 +17,16 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
+
+    # Required at runtime by vLLM's image processors (the Pixtral/Ministral vision
+    # path). Declared directly rather than relying on a transitive pull: the entry
+    # in `override-dependencies` only constrains the version if something else
+    # requests torchvision, it does not install it.
+    # Version left out: resolved against the pinned torch from the pytorch-cpu index.
+    # Excluded on Power/Z: the index has no modern wheel there, and unmarked this
+    # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
+    # satisfy the transformers import. VLM is x86_64-only for now.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -62,9 +72,12 @@ override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
 
-    # Skipping torch-vision temporarily
-    # TODO: This will be required in the future for VLM support via vllm
-    "torchvision; sys_platform == 'never'",
+    # Declared in [project.dependencies] too; this entry exists to neutralise any
+    # version constraint a transitive dep (e.g. transformers) puts on torchvision,
+    # so it resolves against the pinned torch from the pytorch-cpu index. Same
+    # arch marker as the direct dep, so a transitive requester cannot pull the
+    # stale 0.2.0 wheel back in on Power/Z.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
@@ -111,7 +124,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "e02b78ba35f9a1a69a458c3149e9c01d9f4fa6a8" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "76978116cb44020b50c8df1a1822d5178629922a" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -263,10 +276,14 @@ markers = [
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
-    "compile: torch.compile end-to-end tests (tests/e2e/test_compile.py); slow, runs in its own CI job",
-    "rotary: Spyre RoPE custom-op tests (tests/custom_ops/test_rotary_embedding.py)",
+    "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
+    "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
+    "rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)",
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
+    "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
+    "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
+    "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
 ]
 # --8<-- [end:test-markers-definition]
 

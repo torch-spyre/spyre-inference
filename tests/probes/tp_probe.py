@@ -226,7 +226,134 @@ def probe_compiled_all_gather_lastdim_unaligned(device, device_group, world_size
         )
 
 
+def _vision_pattern(patches, rank, device):
+    """Position-dependent values, so a layout scramble cannot pass as correct. ``idx %
+    97`` stays under 2048, where fp16 is exact, so the reduction is bit-exact."""
+    idx = torch.arange(patches * 1024, dtype=torch.int32)
+    values = (idx % 97).to(torch.float16) * float(rank + 1)
+    return values.reshape(1, patches, 1024).to(device)
+
+
+def probe_all_reduce_vision_flattened(device, device_group, world_size, rank):
+    """The vision o_proj reduction as a flat view. 528 is the patch count whose rank-3
+    collective made deeptools' L3 scheduler assert; 3120 is the count that built."""
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    for patches in (528, 3120):
+        t = _vision_pattern(patches, rank, device)
+        out = torch.ops._c10d_functional.all_reduce(t.reshape(-1), "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out).reshape(t.shape)
+
+        expected = _vision_pattern(patches, 0, "cpu") * scale
+        actual = out.cpu()
+        if not torch.equal(actual, expected):
+            bad = (actual != expected).nonzero()
+            raise AssertionError(
+                f"patches={patches}: {bad.shape[0]} of {expected.numel()} elements wrong; "
+                f"first bad index {bad[0].tolist()} "
+                f"got {actual[tuple(bad[0])]} want {expected[tuple(bad[0])]}"
+            )
+        print(f"[rank {rank}] patches={patches} flattened all_reduce exact")
+
+
+def probe_all_reduce_vision_rank3(device, device_group, world_size, rank):
+    """The same reduction without flattening. 528 is expected to fail the build."""
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    for patches in (528, 3120):
+        t = _vision_pattern(patches, rank, device)
+        out = torch.ops._c10d_functional.all_reduce(t, "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        expected = _vision_pattern(patches, 0, "cpu") * scale
+        torch.testing.assert_close(out.cpu(), expected, atol=0.0, rtol=0.0)
+        print(f"[rank {rank}] patches={patches} rank-3 all_reduce exact")
+
+
+def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
+    """Ministral's 1-token TP row-parallel decode. Expected to fail.
+
+    Eager, spyre-comms cannot build a work schedule for this shape and
+    `dxp_standalone` exits 1; compiled, the same shape lowers to
+    `spyre::all_reduce_async` and works. The mechanism is not stick alignment --
+    [1, 5120] is 80 sticks (80 % 32 == 16) and compiles, while 322560 elements
+    (5040 sticks, also % 32 == 16) does not. Which sizes build is still unexplained.
+    """
+    gn = _group_name(device_group)
+    t = torch.full((1, 5120), float(rank + 1), dtype=torch.float16, device=device)
+    out = torch.ops._c10d_functional.all_reduce(t, "sum", gn)
+    out = torch.ops._c10d_functional.wait_tensor(out)
+    expected = float(sum(range(1, world_size + 1)))
+    torch.testing.assert_close(out.cpu(), torch.full((1, 5120), expected, dtype=torch.float16))
+
+
+def probe_compiled_all_reduce_padded(device, device_group, world_size, rank):
+    """The padded decode reduction as the compiled decoder runs it: eager passes, but
+    compiled the pad/all_reduce/unpad go through Inductor's reinplacing and layout
+    passes. The unpadded controls isolate the padding from the collective."""
+    from spyre_inference.v1.pool import select_rows
+
+    gn = _group_name(device_group)
+    scale = float(sum(range(1, world_size + 1)))
+    base = (torch.arange(5120, dtype=torch.int32) % 97).to(torch.float16)
+
+    def padded_block(x):
+        padded = torch.nn.functional.pad(x, (0, 0, 0, 1))
+        out = torch.ops._c10d_functional.all_reduce(padded, "sum", gn)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        return select_rows(out, torch.arange(1, dtype=torch.int32))
+
+    def plain_block(x):
+        out = torch.ops._c10d_functional.all_reduce(x, "sum", gn)
+        return torch.ops._c10d_functional.wait_tensor(out)
+
+    # Every config runs even after one fails: an unpadded collective that is also
+    # corrupt would mean padding is a symptom, not the cause.
+    configs = (
+        ("plain[2,5120]", plain_block, 2),
+        ("padded[1,5120]", padded_block, 1),
+        ("plain[1,5120]", plain_block, 1),
+    )
+    failures = []
+    for name, body, rows in configs:
+        fns = [torch.compile(body, dynamic=False) for _ in range(32)]
+        kept = []
+        try:
+            for i, fn in enumerate(fns):
+                t = ((base + float(i)) * float(rank + 1)).reshape(1, 5120)
+                t = t.expand(rows, 5120).contiguous().to(device)
+                kept.append(fn(t))
+        except Exception as exc:  # noqa: BLE001 -- an unbuildable config is a result
+            print(f"[rank {rank}] {name} compiled: RAISED {type(exc).__name__}: {exc}")
+            failures.append(name)
+            continue
+
+        bad = []
+        for i, got in enumerate(kept):
+            want = ((base + float(i)) * scale).reshape(1, 5120).expand(rows, 5120).contiguous()
+            if not torch.equal(got.cpu(), want):
+                bad.append(i)
+        if bad:
+            got = kept[bad[0]].cpu()
+            want = ((base + float(bad[0])) * scale).reshape(1, 5120).expand(rows, 5120).contiguous()
+            idx = (got != want).nonzero()[0]
+            print(
+                f"[rank {rank}] {name} compiled: {len(bad)}/32 blocks corrupted "
+                f"(first={bad[0]}), element {idx.tolist()} got {got[tuple(idx)]} "
+                f"want {want[tuple(idx)]}"
+            )
+            failures.append(name)
+        else:
+            print(f"[rank {rank}] {name} compiled: 32 blocks exact")
+
+    if failures:
+        raise AssertionError(f"corrupted under compile: {failures}")
+
+
 PROBES = {
+    "compiled_all_reduce_padded": probe_compiled_all_reduce_padded,
+    "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
+    "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
+    "all_reduce_hidden5120_decode": probe_all_reduce_hidden5120_decode,
     "native_all_reduce": probe_native_all_reduce,
     "native_all_gather_into_tensor": probe_native_all_gather_into_tensor,
     "native_all_gather_list": probe_native_all_gather_list,

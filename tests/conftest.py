@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pytest
+from spyre_testing_plugin.tags import result_tags
 
 from spyre_inference import envs
 
@@ -24,3 +25,13 @@ def _clear_env_cache():
     envs.clear_env_cache()
     yield
     envs.clear_env_cache()
+
+
+@pytest.fixture(autouse=True)
+def _emit_result_tags(request, record_property):
+    """Autouse: stamp each local test's `model__`/`testtype__` JUnit tags (see
+    spyre_testing_plugin.tags). Upstream tests are tagged in the plugin's
+    collection hook instead."""
+    params = getattr(getattr(request.node, "callspec", None), "params", {})
+    for name, value in result_tags(params):
+        record_property(name, value)

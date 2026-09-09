@@ -60,6 +60,7 @@ compiled graph (see below).
 | `SiluAndMul` | `SpyreSiluAndMul` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` directly on the fused `[..., 2*d]` tensor; the gate/up slice stays on Spyre (indirect access, no CPU detour) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | — | Makes logits contiguous — the downstream in-place `logits *= scale` otherwise trips a torch-spyre compile issue |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
 
 ### Transposed linear weights
 
@@ -93,6 +94,45 @@ so that pass is gone. The remaining slicing constraint is narrower than it was a
 in the attention backend, where offset > 0 views still corrupt on transfer (see
 [Attention Backend](#attention-backend)).
 
+## Model adaptations
+
+Some models need more than a swapped-out layer: a different transport for an input, a buffer
+that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those live in
+`spyre_inference/models/`, one module per architecture, as **subclasses of the upstream vLLM
+class** rather than runtime monkey-patches. `models/__init__.py` holds `spyre_models()`
+(architecture string → Spyre class, built from the `_ADAPTED_MODULES` and `_ADAPTED_ARCHS`
+tables) and `register_models()`, which points vLLM's `ModelRegistry` at them; `_`-prefixed
+modules hold machinery those subclasses share or delegate to and register no architecture of
+their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
+and `register_models()` first checks every key against vLLM's own registry, so an upstream
+rename fails loudly instead of silently falling through to the unadapted class.
+
+Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
+`embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
+`__init__`, same parameters, same module tree, only `forward` differs. Prefer a documented
+upstream extension point where one exists: `CustomOp.register_oot` /
+`PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
+unquantized oracle leaves open for an out-of-tree platform.
+
+Two adaptations worth knowing:
+
+- **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
+  owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
+  which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
+- **MoE** (`moe.py`) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
+  for an out-of-tree platform (it selects `UnquantizedMoeBackend.OOT` — no kernel — and
+  leaves `process_weights_after_loading` to the plugin). A `CustomOp.register_oot`
+  replacement for `UnquantizedFusedMoEMethod` computes the experts in two Spyre forms —
+  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
+  in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
+  `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
+  since the device cannot hold both layouts at once. Each model's own adaptation module
+  supplies its recipe and any model-owned scaling (`configure_gemma4_moe_layers` in
+  `models/gemma4.py`). `Gemma4DecoderLayer.forward` and `MoERunner` are untouched: vLLM
+  reaches the experts through `torch.ops.vllm.moe_forward`, an opaque custom op, so the
+  dispatch runs eagerly *inside* the block's compiled graph — the same seam the attention
+  backend uses — and can drive compiled regions of its own.
+
 ## Compilation Granularity
 
 Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
@@ -114,9 +154,9 @@ rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. T
 backend compile count is independent of depth, but it is not 1: layer 0 specializes
 separately because `residual is None` there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
-and full attention, giving four. A fresh `num_tokens` tier then costs one block recompile
+and full attention, giving four. A fresh `num_tokens` bucket then costs one block recompile
 rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
-dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers live inside
+dependence: kv-cache length and its block-count buckets live inside
 `unified_attention_with_output`, which is opaque to this graph and compiles its own
 kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
 
@@ -149,17 +189,19 @@ the write can scatter through a slot-major view of it:
 |---|---|---|
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
-| 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
+| 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to its bucket |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
 Key constraints:
 
-- **KV length alignment**: 256 tokens (avoids per-step recompilation on Spyre)
-- **Query chunk size**: 32 tokens (consistent tensor shapes for compilation)
+- **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
+  to `max_model_len` (avoids per-step recompilation on Spyre)
+- **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
+  (consistent tensor shapes for compilation)
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
-- **Block size**: Must be a multiple of 64; the platform rounds a user-supplied
-  `block_size` up to the next multiple of 64 automatically
+- **Block size**: Must be a multiple of 64. The default is 128, and a user-supplied
+  `block_size` is rounded up to the next multiple of 64
 - **GQA only**: MHA (`num_queries_per_kv = 1`) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today
 - **Supported**: sliding-window masking and logits soft-capping are both handled;
@@ -191,7 +233,7 @@ description of current behaviour.
 
 The shape of that target: the model body compiled once per token bucket, attention
 shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both shape ladders so nothing compiles on the first request.
+both sets of shape buckets so nothing compiles on the first request.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }

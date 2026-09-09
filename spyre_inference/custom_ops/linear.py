@@ -38,14 +38,27 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
+# torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
+# full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
+_PAD_ROWS = 8
+_MAX_PAD_WEIGHT = 200_000_000
+
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
+
+    A 3-D input is folded to 2-D first: torch-spyre computes 3-D @ 2-D wrongly under
+    torch.compile — right shape, uncorrelated values, no warning (torch-spyre#4155).
+    The decoder only passes 2-D, so this surfaces only in the Pixtral vision tower.
     """
-    out = torch.matmul(x, weight_t)
+    if x.dim() == 3:
+        out = torch.matmul(x.reshape(-1, x.shape[-1]), weight_t)
+        out = out.reshape(x.shape[0], x.shape[1], weight_t.shape[-1])
+    else:
+        out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     return out
@@ -104,8 +117,10 @@ class SpyreTransposedWeightMethod:
         padding = cast(int, layer.spyre_row_padding)
         if padding:
             # Drop the trailing pad columns; the slice lowers on-device eagerly
-            # (torch-spyre #3578 honors the storage offset).
-            out = out[:, :-padding]
+            # (torch-spyre #3578 honors the storage offset). Index from the end
+            # so a batched `[..., T, out]` input slices output features rather
+            # than the sequence dim.
+            out = out[..., :-padding]
         return out
 
 
@@ -117,8 +132,36 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
     """
 
 
+class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
+    """Pads a partial row block to `_PAD_ROWS`; set on every merged-column layer."""
+
+    def _pads(self, layer: torch.nn.Module) -> bool:
+        return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if self._pads(layer):
+            logger.warning_once(
+                "%s: short row blocks padded to %d rows (torch-spyre#4032) "
+                "expect numerical differences to upstream vLLM.",
+                layer.__class__.__name__,
+                _PAD_ROWS,
+            )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        m = x.shape[0] if x.dim() == 2 else 0
+        if 0 < m < _PAD_ROWS and self._pads(layer):
+            return super().apply(layer, F.pad(x, (0, 0, 0, _PAD_ROWS - m)), bias)[:m]
+        return super().apply(layer, x, bias)
+
+
 class _SpyreTransposedLinearMixin:
-    """Swaps in `SpyreUnquantizedLinearMethod` for unquantized linear layers.
+    """Swaps in `LINEAR_METHOD` for unquantized linear layers.
 
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the
     layer normally; we then replace the unquantized method with the transposed
@@ -127,10 +170,12 @@ class _SpyreTransposedLinearMixin:
     applies to unquantized weights.
     """
 
+    LINEAR_METHOD: type[SpyreUnquantizedLinearMethod] = SpyreUnquantizedLinearMethod
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if isinstance(self.quant_method, UnquantizedLinearMethod):
-            self.quant_method = SpyreUnquantizedLinearMethod()
+            self.quant_method = self.LINEAR_METHOD()
 
 
 @ColumnParallelLinear.register_oot(name="ColumnParallelLinear")
@@ -141,6 +186,8 @@ class SpyreColumnParallelLinear(_SpyreTransposedLinearMixin, ColumnParallelLinea
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
 class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnParallelLinear):
     """OOT MergedColumnParallelLinear (e.g. gate_up_proj) storing `Wᵀ`."""
+
+    LINEAR_METHOD = SpyrePaddedRowsLinearMethod
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")

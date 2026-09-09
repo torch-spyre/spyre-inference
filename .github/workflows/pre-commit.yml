@@ -26,6 +26,10 @@ jobs:
       with:
         python-version: "3.12"
         enable-cache: true
+        # merge_group runs save to an ephemeral gh-readonly-queue ref nothing
+        # can restore later, orphaning a ~700MB cache per cycle; restore only
+        # there (mirrors run-matrix-config's save-cache guard).
+        save-cache: ${{ github.event_name != 'merge_group' }}
         # Key only on uv.lock; setup-uv's default glob also hashes
         # pyproject.toml, so config-only edits would needlessly bust the cache.
         cache-dependency-glob: uv.lock

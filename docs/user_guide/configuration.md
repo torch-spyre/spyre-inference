@@ -27,6 +27,15 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Decoder compile buckets
+
+The body pads the packed token count to the next `compile_sizes` bucket, and warmup
+dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
+it needs the same treatment: it projects one row per *sampled* request, a width that
+would otherwise take every value in `1..--max-num-seqs` as requests finish. Those rows
+pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
+no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
+
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
@@ -38,7 +47,7 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
   workaround until flash-style attention lands; the body is not rewritten to
   `T = B × L`.
 
-`compile_sizes` for pooling is the body `T` ladder (`64, 128, …` up to the
+`compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
 token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
 Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
 

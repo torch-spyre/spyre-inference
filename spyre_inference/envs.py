@@ -30,7 +30,11 @@ if TYPE_CHECKING:
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_ATTN_PROFILING: bool = False
-    SPYRE_BUCKETED_DECODE: bool = False
+    SPYRE_ATTN_RECORD: bool = True
+    SPYRE_ATTN_KV_BUCKETS: str | None = None
+    SPYRE_ATTN_QUERY_BUCKETS: str | None = None
+    SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -50,10 +54,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
     "SPYRE_ATTN_PROFILING": lambda: bool(int(os.getenv("SPYRE_ATTN_PROFILING", "0"))),
-    # When "1", enables the bucketed multi-sequence decode kernel. Off by default
+    # When "1" (default), pre-compile every attention variant the run can need during
+    # warmup, so no request pays an Inductor compile mid-serving. "0" falls back to
+    # compiling each variant lazily on first use.
+    "SPYRE_ATTN_RECORD": lambda: bool(int(os.getenv("SPYRE_ATTN_RECORD", "1"))),
+    # Comma-separated kv_len buckets to record, unset uses the default buckets of
+    # powers of two from block_size up to max_model_len.
+    "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
+    # Comma-separated query_len buckets to record, unset uses the default buckets
+    # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
+    "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
+    # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
-    "SPYRE_BUCKETED_DECODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_DECODE", "0"))),
+    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1", reuse compiled Spyre kernels across processes by caching them on
+    # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
+    # even when this flag is enabled.
+    "SPYRE_KERNEL_CACHE": lambda: os.getenv("SPYRE_KERNEL_CACHE", "0") == "1",
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

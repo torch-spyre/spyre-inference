@@ -29,6 +29,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_len_bucket,
     expand_packed_to_encoder_bucket,
     len_buckets,
+    logits_row_buckets,
     next_bucket,
     pooling_warmup_shapes,
 )
@@ -195,7 +196,7 @@ class TestEncoderDispatch:
         assert desc.actual_num_seqs == 3
         assert desc.actual_max_len == 30
 
-    def test_pooling_2d_not_1d_token_ladder(self):
+    def test_pooling_2d_not_1d_token_buckets(self):
         """Body 1D pad and attention (B, L) are independent.
 
         3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
@@ -277,7 +278,7 @@ class TestEncoderBuckets:
     def test_next_bucket_overflow_stick_aligns(self):
         assert next_bucket(3000, [64, 128]) == 3008  # 3000 → 47*64 = 3008
 
-    def test_len_bucket_stick_aligns_when_ladder_unset(self):
+    def test_len_bucket_stick_aligns_when_override_unset(self):
         assert encoder_len_bucket(1) == 64
         assert encoder_len_bucket(32) == 64
         assert encoder_len_bucket(65) == 128
@@ -319,13 +320,26 @@ class TestEncoderBuckets:
             (4, 128),
         ]
 
+    def test_warmup_shapes_fair_ab_max_model_len_64(self):
+        """``--max-num-seqs 1 --max-model-len 64`` warms only ``(1, 64)``.
+
+        Same 64-token prompts on ``--max-model-len 128`` still pick ``(1, 64)``
+        at runtime when that cell exists. Capping ``L`` isolates pad-up from
+        the sendnn stack gap.
+        """
+        assert pooling_warmup_shapes(
+            max_num_seqs=1,
+            max_model_len=64,
+            max_num_batched_tokens=512,
+        ) == [(1, 64)]
+
     def test_warmup_shapes_skip_over_token_budget(self):
         # 4*256 = 1024 and 2*256 = 512 both exceed 300; 4*64 = 256 still fits.
         assert pooling_warmup_shapes(
             max_num_seqs=4,
             max_model_len=2048,
             max_num_batched_tokens=300,
-            len_ladder=[64, 256],
+            len_bucket=[64, 256],
         ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
 
     def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
@@ -344,3 +358,15 @@ class TestEncoderBuckets:
     def test_encoder_bucket_valid_row_indices_skips_pads(self):
         indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
         assert indices == [0, 1, 2, 4, 5]
+
+
+class TestLogitsRowBuckets:
+    def test_clips_prefill_bucket_to_max_num_reqs(self):
+        # The 512-token prefill bucket samples at most max_num_seqs rows.
+        assert logits_row_buckets([1, 2, 4, 8, 512], max_num_reqs=8) == [1, 2, 4, 8]
+
+    def test_keeps_a_non_power_of_two_max(self):
+        assert logits_row_buckets([1, 2, 4, 6, 512], max_num_reqs=6) == [1, 2, 4, 6]
+
+    def test_ignores_non_positive_sizes(self):
+        assert logits_row_buckets([0, -1, 4], max_num_reqs=8) == [4]

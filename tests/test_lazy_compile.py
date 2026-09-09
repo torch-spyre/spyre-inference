@@ -181,6 +181,7 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm, SpyreTPAwareRMSNorm
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
@@ -191,13 +192,13 @@ def test_the_real_layers_opt_in() -> None:
         (SpyreGemmaRMSNorm, "forward_oot"),
         (SpyreTPAwareRMSNorm, "forward_oot"),
         (SpyreVocabParallelEmbedding, "forward"),
+        (SpyreUnquantizedLMHeadMethod, "apply"),
     ):
         assert issubclass(cls, CompileOutermost), cls.__name__
         wrapped = getattr(cls, method)
         assert getattr(wrapped, "__wrapped__", None) is not None, f"{cls.__name__}.{method}"
 
 
-@pytest.mark.compile
 def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
     """A decorated layer inside a fullgraph block is traced into the block's graph."""
     mode(CompilationMode.STOCK_TORCH_COMPILE)
@@ -233,7 +234,6 @@ def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
     torch.testing.assert_close(out, expected)
 
 
-@pytest.mark.compile
 def test_a_real_compile_of_an_outermost_kernel_matches_eager(mode) -> None:
     """The head/tail path itself: torch.compile of a bound method, really traced."""
     mode(CompilationMode.STOCK_TORCH_COMPILE)

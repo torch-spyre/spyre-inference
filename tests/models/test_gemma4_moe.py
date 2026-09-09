@@ -16,8 +16,10 @@
 
 The two expert forms compute the same function, so one dense reference covers both. The
 tests that run them, and the relayout test, need the card: the shapes are scaled down, but
-every dim stays stick-aligned because the layouts in those regions depend on it. Routing,
-configuration and dispatch are host-side and need nothing.
+every dim the device sees stays stick-aligned, because the layouts in those regions depend
+on it. The intermediate dim reaches that alignment the way a TP shard does — zero-widened
+when it lands mid-stick — so the forms are exercised at both a native and a widened width.
+Routing, configuration and dispatch are host-side and need nothing.
 """
 
 from types import SimpleNamespace
@@ -48,16 +50,26 @@ def _dense_reference(x, probs, gate, up, down, scale, top_k):
     return out
 
 
-@pytest.fixture(scope="module")
-def moe_weights():
-    """Random expert stacks in the device layout, plus their host copies."""
+# A whole number of sticks, and a TP shard that lands mid-stick with the same remainder
+# gemma-4-26B-A4B leaves at TP=2 (704 // 2 = 352).
+@pytest.fixture(scope="module", params=[INTER, INTER - 32], ids=["native", "widened"])
+def moe_weights(request):
+    """Random expert stacks in the device layout, plus their host copies.
+
+    ``_prepare_layer`` zero-widens an intermediate dim that does not span whole sticks, so
+    the device stacks can be wider than the host copies the reference is computed from. The
+    added lanes must not reach the result: that inertness is what lets TP narrow ``M``.
+    """
+    from torch_spyre._C import get_elem_in_stick
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
+    inter = request.param
+    pad = -inter % get_elem_in_stick(torch.float16)
     torch.manual_seed(0)
     host = {
-        "gate": torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
-        "up": torch.randn(EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
-        "down": torch.randn(EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
+        "gate": torch.randn(EXPERTS, HIDDEN, inter, dtype=torch.float16) * 0.05,
+        "up": torch.randn(EXPERTS, HIDDEN, inter, dtype=torch.float16) * 0.05,
+        "down": torch.randn(EXPERTS, inter, HIDDEN, dtype=torch.float16) * 0.05,
     }
     host["scale"] = torch.rand(EXPERTS, dtype=torch.float16) + 0.5
     stacks = {
@@ -65,6 +77,11 @@ def moe_weights():
         "up": host["up"],
         "down": host["down"] * host["scale"].view(EXPERTS, 1, 1),
     }
+    if pad:
+        # The same widening, on the same axes, that ``_prepare_layer`` applies.
+        stacks["gate"] = F.pad(stacks["gate"], (0, pad))
+        stacks["up"] = F.pad(stacks["up"], (0, pad))
+        stacks["down"] = F.pad(stacks["down"], (0, 0, 0, pad))
     device = {k: dma_moe_expert_weight_to_spyre(v) for k, v in stacks.items()}
     assert all(v is not None for v in device.values()), "expert stacks must take the MoE layout"
     return host, device

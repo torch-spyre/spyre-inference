@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config import CompilationMode
@@ -138,7 +138,8 @@ def reject_masked_per_layer_vocab(decoder: nn.Module) -> None:
     """
     if decoder.embed_tokens_per_layer is None:
         return
-    per_layer, full = decoder.vocab_size_per_layer_input, decoder.config.vocab_size
+    self_decoder = cast("Any", decoder)
+    per_layer, full = self_decoder.vocab_size_per_layer_input, self_decoder.config.vocab_size
     if per_layer < full:
         raise NotImplementedError(
             f"Gemma-4 per-layer embeddings on Spyre require vocab_size_per_layer_input "

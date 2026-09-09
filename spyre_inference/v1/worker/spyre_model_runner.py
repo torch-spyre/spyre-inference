@@ -38,6 +38,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
+import bisect
 import time
 from contextlib import contextmanager
 from typing import cast
@@ -45,6 +46,7 @@ from typing import cast
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
@@ -85,6 +87,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    mark_warmup_complete,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
@@ -94,6 +97,7 @@ from spyre_inference.v1.pool import (
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    logits_row_buckets,
     pooling_warmup_shapes,
 )
 
@@ -298,14 +302,19 @@ class _SpyreModelWrapper:
         model: nn.Module,
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
+        logits_row_buckets: list[int] | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
 
     def __call__(self, *args, **kwargs):
-        # Convert integer tensor inputs to Spyre int64
+        # Convert integer tensor inputs to Spyre int64. Do not use int32:
+        # stock torch-spyre SDSC cannot schedule integer add (warmup crash
+        # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
+        # in models/roberta.py.
         def _convert_int(t):
             if (
                 t is not None
@@ -345,15 +354,30 @@ class _SpyreModelWrapper:
         """Move hidden_states onto Spyre for the lm_head custom op.
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
+        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
+        `select_rows`), so the tensor handed to compute_logits is on CPU;
+        move it onto Spyre for the lm_head matmul. The logits are
         returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
         for the TP all_gather, and SpyreLogitsProcessor._gather_logits
         converts back to CPU right after the gather (before the vocab slice
         and scale), so downstream sampling gets CPU logits.
+
+        The sampled-row count is not body-bucket padded, so padding it onto the warmed
+        row buckets keeps the projection on shapes warmup compiled.
         """
+        num_rows = hidden_states.shape[0]
+        buckets = self._logits_row_buckets
+        idx = bisect.bisect_left(buckets, num_rows)
+        padded_rows = buckets[idx] if idx < len(buckets) else num_rows
+        if padded_rows != num_rows:
+            hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
+
         hidden_states = convert(hidden_states, device=self._spyre_device)
-        return self._model.compute_logits(hidden_states, *args, **kwargs)
+        logits = self._model.compute_logits(hidden_states, *args, **kwargs)
+
+        if padded_rows != num_rows and logits is not None:
+            logits = logits[:num_rows]
+        return logits
 
     def __getattr__(self, name):
         return getattr(self._model, name)
@@ -475,15 +499,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
 
+        # Initialize bucket dispatcher for shape bucketing at runtime.
+        self.spyre_shape_bucketer = self._create_shape_bucketer()
+
         # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
+        bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
             self._spyre_device,
             keep_outputs_on_device=self._pooling_on_spyre,
+            logits_row_buckets=(
+                []
+                if bucketer is None
+                else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
+            ),
         )
-
-        # Initialize bucket dispatcher for shape bucketing at runtime.
-        self.spyre_shape_bucketer = self._create_shape_bucketer()
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
@@ -607,10 +637,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     def _compile_blocks(self, fullgraph: bool = True) -> int:
         num_blocks = 0
+        # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
+        # alias blocks across lists; recompiling one is harmless but would double the count.
+        seen: set[int] = set()
         for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
             for block in blocks:
-                if isinstance(block, PPMissingLayer):
+                if isinstance(block, PPMissingLayer) or id(block) in seen:
                     continue
+                seen.add(id(block))
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
@@ -621,7 +655,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
 
-        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first).
+        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then a dummy
+        logits/sampler run at each *sampled-row* width so the lm_head compiles here
+        rather than mid-request. The two bucket sets differ: body buckets are packed
+        token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
         attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
@@ -666,13 +703,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             bucket_sizes[0] if bucket_sizes else 0,
             bucket_sizes[-1] if bucket_sizes else 0,
         )
+        row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs)
         t0 = time.time()
         with _set_spyre_compilation_settings(self.vllm_config):
             # Compile largest bucket first: Inductor's internal caches benefit
             # from seeing the most complex shape first, so subsequent smaller
             # shapes compile faster via partial cache hits.
+            widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
-                self._dummy_run(size)
+                _, last_hidden_states = self._dummy_run(size)
+                if widest_hidden_states is None:
+                    widest_hidden_states = last_hidden_states
+            # Row buckets, not one run per body bucket: the prefill bucket's token count
+            # exceeds any reachable row count, so it would compile an unreachable width.
+            if widest_hidden_states is not None:
+                for rows in sorted(row_widths, reverse=True):
+                    self._dummy_sampler_run(widest_hidden_states[:rows])
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -724,6 +770,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             total,
             time.time() - t0,
         )
+        # Past the early returns: with recording off, first-use compiles are intended.
+        mark_warmup_complete()
 
     def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
         """The attention bucketer the metadata builders dispatch against.

@@ -16,12 +16,18 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
+import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
+from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from torch import nn
     from vllm.config import VllmConfig
     from vllm.engine.arg_utils import EngineArgs
@@ -116,8 +122,34 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
+def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Fold Gemma's output scale into the source down-projection stack."""
+    return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
+
+
+def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe."""
+
+    configured = 0
+    for decoder in layers:
+        moe = getattr(decoder, "moe", None)
+        if moe is None:
+            continue
+        configure_spyre_moe_layer(
+            moe.experts.routed_experts,
+            SpyreMoERecipe(
+                activation="gelu_tanh",
+                routing="full_softmax",
+                prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
+            ),
+        )
+        configured += 1
+    if configured:
+        logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 with the self-decoder's aliased scalars registered as buffers.
+    """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
 
     ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
     as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
@@ -131,3 +163,4 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         register_aliased_scalars(self.model.self_decoder)
+        configure_gemma4_moe_layers(self.model.layers)

@@ -23,7 +23,6 @@ import pytest
 from spyre_inference import envs
 from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
-    SpyreAttnBucket,
     SpyreAttnBucketer,
     _parse_buckets,
 )
@@ -138,10 +137,10 @@ class TestFindBucket:
 class TestVariants:
     def test_no_duplicates(self, bucketer):
         variants = bucketer.variants()
-        assert len(variants) == len({v.key for v in variants})
+        assert len(variants) == len(set(variants))
 
     def test_stable_across_calls(self, bucketer):
-        assert [v.key for v in bucketer.variants()] == [v.key for v in bucketer.variants()]
+        assert bucketer.variants() == bucketer.variants()
 
     def test_largest_first(self, bucketer):
         variants = bucketer.variants()
@@ -253,12 +252,6 @@ class TestEnvOverride:
     def test_parse_buckets_empty_is_none(self):
         assert _parse_buckets("") is None
         assert _parse_buckets(None) is None
-
-
-class TestBucketKey:
-    def test_key_matches_attn_fn_cache_tuple(self):
-        b = SpyreAttnBucket(num_blocks=4, padded_query_len=32)
-        assert b.key == (4, 32)
 
 
 class TestBuilderAttnBucketer:

@@ -101,21 +101,24 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     return ends - 1 if last else ends - counts
 
 
-def select_rows(hidden_states: torch.Tensor, row_indices_cpu: torch.Tensor) -> torch.Tensor:
+def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
     """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
-    ``row_indices_cpu`` may be 1-D (CLS/LAST, unpack) or ``[B, L]`` (pack).
+    ``row_indices`` may be 1-D (CLS/LAST, unpack) or ``[B, L]`` (pack), on CPU
+    or already on ``hidden_states.device``. Spyre has no int64 index kernel.
     """
-    flat_idx = row_indices_cpu.reshape(-1)
-    if hidden_states.device.type != "spyre":
-        return torch.index_select(
-            hidden_states, 0, flat_idx.to(device=hidden_states.device, dtype=torch.long)
-        )
+    flat_idx = row_indices.reshape(-1)
+    device = hidden_states.device
+    if device.type != "spyre":
+        return torch.index_select(hidden_states, 0, flat_idx.to(device=device, dtype=torch.long))
 
-    # Spyre has no int64 index kernel. convert() H2D is blocking
-    # (copy_tensor non_blocking=False); no extra synchronize.
-    indices = convert(flat_idx.to(torch.int32), hidden_states.device)
-    return torch.index_select(hidden_states, 0, indices)
+    if flat_idx.device.type == "spyre":
+        if flat_idx.dtype != torch.int32:
+            flat_idx = convert(flat_idx, dtype=torch.int32)
+        return torch.index_select(hidden_states, 0, flat_idx)
+
+    # convert() H2D is blocking (copy_tensor non_blocking=False).
+    return torch.index_select(hidden_states, 0, convert(flat_idx.to(torch.int32), device))
 
 
 class SpyreCLSPool(CLSPool):

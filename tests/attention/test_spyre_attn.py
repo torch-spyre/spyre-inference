@@ -29,8 +29,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _batched_decode_kernel,
     _build_query_row_tables,
-    _create_compilable_bucketed_decode_attn,
     _mirror_mask_tiles,
     _stick_aligned_len,
 )
@@ -40,16 +40,16 @@ pytestmark = pytest.mark.attention
 
 
 @pytest.fixture()
-def enable_bucketed_decode(monkeypatch):
-    """Enable the bucketed decode kernel for tests that exercise it.
+def enable_batched_decode(monkeypatch):
+    """Enable the batched decode kernel for tests that exercise it.
 
-    The path ships gated off (``SPYRE_BUCKETED_DECODE``, default "0") pending
+    The path ships gated off (``SPYRE_BATCHED_DECODE``, default "0") pending
     performance characterisation at the smallest bucket. Without this fixture the
-    bucketed tests would silently fall back to the per-seq loop and pass while
+    batched tests would silently fall back to the per-seq loop and pass while
     testing nothing. The autouse cache-clearing fixture in ``tests/conftest.py``
     makes the monkeypatched value visible to ``envs``.
     """
-    monkeypatch.setenv("SPYRE_BUCKETED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
 
 @pytest.fixture()
@@ -361,6 +361,7 @@ def _run_spyre_attn_test(
     num_kv_heads: int = 8,
     head_size: int = 128,
     expect_fused_store: bool | None = None,
+    expect_query_widths: set[int] | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -463,22 +464,18 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
-    # store_out is not a cache key, so observe it where it happens: whether the
-    # kernel was handed an `out` buffer to write into.
+    # The fused store is just whether the kernel was handed an `out` buffer.
     fused_calls: list[bool] = []
-    if expect_fused_store is not None:
-        _real_get_attn_fn = attn_impl._get_attn_fn
+    dispatched_widths: set[int] = set()
+    if expect_fused_store is not None or expect_query_widths is not None:
+        _real_attn_fn = attn_impl._attn_fn
 
-        def _spy_get_attn_fn(*args, **kwargs):
-            fn = _real_get_attn_fn(*args, **kwargs)
+        def _spy_attn_fn(*a, **kw):
+            fused_calls.append(a[-1] is not None)
+            dispatched_widths.add(a[8])  # padded_query_len
+            return _real_attn_fn(*a, **kw)
 
-            def wrapped(*a, out=None, **kw):
-                fused_calls.append(out is not None)
-                return fn(*a, out=out, **kw)
-
-            return wrapped
-
-        attn_impl._get_attn_fn = _spy_get_attn_fn  # type: ignore[method-assign]
+        attn_impl._attn_fn = _spy_attn_fn
 
     # NaN, not empty_like: every row is expected to be written, so a store that
     # lands nowhere fails below instead of passing on whatever the allocator gave.
@@ -509,6 +506,12 @@ def _run_spyre_attn_test(
         assert fused_calls, "no attention kernel ran"
         assert set(fused_calls) == {expect_fused_store}, (
             f"fused output store: expected {expect_fused_store}, got {set(fused_calls)}"
+        )
+
+    if expect_query_widths is not None:
+        assert dispatched_widths == expect_query_widths, (
+            f"query widths dispatched: expected {expect_query_widths}, "
+            f"got {sorted(dispatched_widths)}"
         )
 
     ref_output = ref_attn(
@@ -946,6 +949,44 @@ def test_spyre_attn_chunked_prefill(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+def test_mixed_batch_dispatches_decode_at_query_width_one(
+    default_vllm_config,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """A decoding sequence in a mixed batch keeps the query_len=1 kernel."""
+    from vllm.config import get_current_vllm_config
+
+    chunk_len = 64
+    chunk_bucket = SpyreAttnBucketer(get_current_vllm_config()).find_query_bucket(chunk_len)
+    assert chunk_bucket is not None and chunk_bucket > 1
+
+    _run_spyre_attn_test(
+        seq_lens=[(chunk_len, 256), (1, 256), (1, 512)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_query_widths={1, chunk_bucket},
     )
 
 
@@ -1715,14 +1756,14 @@ def test_install_patches_layers_not_the_attention_class():
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_correctness(
+def test_spyre_attn_batched_decode_correctness(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode fast path: bit-exact vs the per-seq reference."""
+    """Batched decode fast path: bit-exact vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1770,15 +1811,15 @@ def test_spyre_attn_bucketed_decode_correctness(
     ],
 )
 @pytest.mark.parametrize("soft_cap", [pytest.param(50.0, id="soft_cap(50)")])
-def test_spyre_attn_bucketed_decode_soft_cap(
+def test_spyre_attn_batched_decode_soft_cap(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     soft_cap: float,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode with logits soft-cap, vs the per-seq reference."""
+    """Batched decode with logits soft-cap, vs the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1789,25 +1830,13 @@ def test_spyre_attn_bucketed_decode_soft_cap(
     )
 
 
-def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
+def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     """The capped kernel must actually clamp, not silently ignore the cap."""
     torch.set_default_device("cpu")
     set_random_seed(0)
 
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
     lead = num_seqs * num_kv_heads
-
-    def build(cap: float):
-        return _create_compilable_bucketed_decode_attn(
-            num_seqs=num_seqs,
-            num_blocks=num_blocks,
-            num_kv_heads=num_kv_heads,
-            num_queries_per_kv=qpk,
-            block_size=block_size,
-            head_size=head_size,
-            logits_soft_cap=cap,
-            needs_gather=False,
-        )
 
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
@@ -1818,12 +1847,27 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
     block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
     block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
-    query_row_ids = torch.arange(num_seqs, dtype=torch.int64)
-    # Trailing None is the `out` buffer; unused because store_out defaults to False.
-    args = (query, query_row_ids, k_pages, v_pages, block_ids, mask_by_block, 1.0, None)
 
-    uncapped = build(0.0)(*args)
-    capped = build(5.0)(*args)
+    def run(cap: float):
+        return _batched_decode_kernel(
+            query,
+            None,
+            k_pages,
+            v_pages,
+            block_ids,
+            mask_by_block,
+            1.0,
+            num_seqs,
+            num_blocks,
+            num_kv_heads,
+            qpk,
+            block_size,
+            head_size,
+            logits_soft_cap=cap,
+        )
+
+    uncapped = run(0.0)
+    capped = run(5.0)
 
     assert not torch.allclose(uncapped, capped), (
         "soft-cap did not change the output; the capped kernel may be ignoring it"
@@ -1859,9 +1903,9 @@ def test_bucketed_decode_soft_cap_changes_the_kernel() -> None:
         ),
     ],
 )
-def test_spyre_attn_bucketed_decode_fallback(
+def test_spyre_attn_batched_decode_fallback(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
     configure_device: str,
@@ -1902,15 +1946,15 @@ def test_spyre_attn_bucketed_decode_fallback(
         pytest.param([(1, 256)] * 8, 4096, id="window_covers_all(N=8)"),
     ],
 )
-def test_spyre_attn_bucketed_decode_sliding_window(
+def test_spyre_attn_batched_decode_sliding_window(
     default_vllm_config,
-    enable_bucketed_decode,
+    enable_batched_decode,
     seq_lens: list[tuple[int, int]],
     sliding_window: int,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Bucketed decode with a sliding window: matches the per-seq reference."""
+    """Batched decode with a sliding window: matches the per-seq reference."""
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1983,9 +2027,8 @@ def test_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     if query_len == 1:
-        # A decode-only batch skips query padding entirely.
         assert aligned == 1
         return
     assert aligned >= query_len
@@ -2029,15 +2072,43 @@ def test_padded_mask_rows_isolated_across_sequences(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512), (1, 128)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens
+    assert aligned[2] == 1
+    assert aligned[0] > 1 and aligned[1] > 1
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
         mask = _seq_mask(metadata, seq_idx)
+        assert mask.shape[0] == aligned[seq_idx]
         last_real = mask[query_len - 1]
-        for row in range(query_len, aligned):
+        for row in range(query_len, aligned[seq_idx]):
             assert torch.equal(mask[row], last_real), (
                 f"seq {seq_idx} padded row {row} does not match its own row {query_len - 1}"
             )
+
+
+@pytest.mark.parametrize(
+    "sliding_window",
+    [pytest.param(None, id="full_attention"), pytest.param(128, id="sliding_window128")],
+)
+def test_per_sequence_masks_match_a_solo_build(default_vllm_config, monkeypatch, sliding_window):
+    """Each sequence's mask must not depend on who else is in its batch."""
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,8,64,512")
+    torch.set_default_device("cpu")
+    seq_lens = [(7, 256), (33, 512), (1, 128), (40, 300)]
+    # Headroom for the padded block counts, as a real engine's table has.
+    table_width = _num_blocks_buckets()[-1]
+
+    batched = _padded_mask_metadata(
+        seq_lens, sliding_window=sliding_window, max_num_blocks=table_width
+    )
+    assert sorted(set(batched.aligned_query_lens)) == [1, 8, 64]
+
+    for seq_idx, one in enumerate(seq_lens):
+        solo = _padded_mask_metadata(
+            [one], sliding_window=sliding_window, max_num_blocks=table_width
+        )
+        assert batched.aligned_query_lens[seq_idx] == solo.aligned_query_lens[0]
+        assert torch.equal(_seq_mask(batched, seq_idx), _seq_mask(solo, 0))
 
 
 def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
@@ -2045,15 +2116,16 @@ def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
 
     row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
     starts = metadata.query_start_loc[:-1].tolist()
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
+        aligned = metadata.aligned_query_lens[seq_idx]
         rows = row_tables[seq_idx][:aligned].tolist()
         expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
         assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
+        assert row_tables[seq_idx].storage_offset() == 0
 
 
 @pytest.mark.parametrize(
@@ -2069,7 +2141,7 @@ def test_sliding_window_padded_mask_rows_equal_last_real_row(default_vllm_config
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens, sliding_window=128)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     mask = _seq_mask(metadata, 0)
     last_real = mask[query_len - 1]
     for row in range(query_len, aligned):
@@ -2092,27 +2164,6 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     num_blocks = (kv_len + block_size - 1) // block_size
     assert metadata.active_block_indices is not None
     assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
-
-
-def test_attn_fn_cache_key_is_shape_only(default_vllm_config):
-    """Query lengths in the same bucket must share one compiled kernel."""
-    torch.set_default_device("cpu")
-    impl = SpyreAttentionImpl(
-        num_heads=32,
-        head_size=128,
-        scale=128**-0.5,
-        num_kv_heads=8,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-    )
-
-    impl._get_attn_fn(4, 32)
-    impl._get_attn_fn(4, 32)
-    assert list(impl._attn_fns) == [(4, 32)]
-
-    impl._get_attn_fn(4, 64)
-    assert len(impl._attn_fns) == 2
 
 
 def _num_blocks_buckets(block_size: int = 64) -> list[int]:

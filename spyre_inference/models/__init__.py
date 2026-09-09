@@ -37,8 +37,8 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
-    # Gemma4ForConditionalGeneration needs no entry of its own: it builds its
-    # language model through the registry, so it picks this one up.
+    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
+    # apply_prelaunch_overrides rewrites it to this text-only backbone first.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (

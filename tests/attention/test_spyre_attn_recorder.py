@@ -21,6 +21,7 @@ decides whether a dispatch reuses a graph. The kernels run on CPU here (no
 Spyre), which is enough to exercise dummy-arg construction and the guards.
 """
 
+import inspect
 import logging
 from unittest.mock import MagicMock
 
@@ -30,6 +31,7 @@ from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import _print_warning_once
 
+from spyre_inference import envs
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -282,6 +284,116 @@ class TestRecordGraphs:
         recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
         assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
+
+
+_LX_ARGS = list(inspect.signature(spyre_attn._lx_page_attn_kernel).parameters)
+
+
+def _store_pairings(impl, run) -> set[tuple[int, bool]]:
+    """The (padded_query_len, fused store) pairs the folded kernel is called on.
+
+    Spied rather than run: the real folded kernel needs a Spyre device layout, while
+    what matters here is only which pairing the caller asks for. Checked outside the
+    spy, since record_graphs swallows a variant's exceptions.
+    """
+    seen: set[tuple[int, bool]] = set()
+    wrong_base: list[int] = []
+
+    def spy(*args):
+        out = args[_LX_ARGS.index("out")]
+        width = args[_LX_ARGS.index("padded_query_len")]
+        fused = args[_LX_ARGS.index("out_row_tables")] is not None
+        if fused and out is not impl._lx_out_flat:
+            wrong_base.append(width)
+        seen.add((width, fused))
+        return out
+
+    impl._lx_attn_fn = spy
+    run()
+    assert not wrong_base, f"a fused store was not handed the flat base, at widths {wrong_base}"
+    return seen
+
+
+def _forward(impl, kv_cache, metadata) -> None:
+    num_tokens = int(metadata.query_start_loc[metadata.num_seqs].item())
+    query = torch.zeros(num_tokens, NUM_HEADS, HEAD_SIZE, dtype=impl.model_dtype)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=torch.zeros(num_tokens, NUM_KV_HEADS, HEAD_SIZE, dtype=impl.model_dtype),
+        value=torch.zeros(num_tokens, NUM_KV_HEADS, HEAD_SIZE, dtype=impl.model_dtype),
+        kv_cache=kv_cache,
+        attn_metadata=metadata,
+        output=torch.zeros_like(query),
+    )
+
+
+class TestLxStoreChoice:
+    """The folded kernel's store choice must be made per sequence.
+
+    Batch-wide it was false for any batch holding a prefill, so a decode beside one
+    dispatched query length 1 with the non-fused store. The recorder pairs length 1
+    with the fused store, so nothing had traced that, and it compiled mid-request.
+    """
+
+    @pytest.fixture()
+    def lx_impl(self, default_vllm_config, monkeypatch):
+        monkeypatch.setenv("SPYRE_LX_KV_LAYOUT", "1")
+        envs.clear_env_cache()
+        get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        impl = SpyreAttentionImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=1.0 / (HEAD_SIZE**0.5),
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=None,
+            sliding_window=None,
+        )
+        # Standing in for _staging_buffers, whose allocation needs a Spyre device
+        # layout. The store choice turns on the flat base and the 3-D view aliasing
+        # it, so both are built here the same way.
+        shape = (impl.staging_rows, NUM_HEADS, HEAD_SIZE)
+        impl._lx_out_flat = torch.zeros(
+            impl.staging_rows * NUM_HEADS, HEAD_SIZE, dtype=impl.model_dtype
+        )
+        impl._staging = (
+            torch.zeros(shape, dtype=impl.model_dtype),
+            impl._lx_out_flat.view(shape),
+        )
+        return impl
+
+    def test_a_decode_beside_a_prefill_dispatches_a_recorded_pairing(self, lx_impl, kv_cache):
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
+        recorded = _store_pairings(
+            lx_impl, lambda: lx_impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+        )
+        # The rule dispatch has to mirror. Asserted rather than assumed, so a recorder
+        # that stops pairing length 1 with the fused store fails here instead of
+        # leaving the check below vacuous.
+        assert {fused for width, fused in recorded if width == 1} == {True}
+        assert not any(fused for width, fused in recorded if width != 1)
+
+        metadata = _padded_mask_metadata(
+            [(32, 300), (1, 200), (1, 65)],
+            block_size=BLOCK_SIZE,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=NUM_PAGES,
+        )
+        assert metadata.aligned_query_lens[0] > 1
+        assert metadata.aligned_query_lens[1:] == [1, 1]
+
+        dispatched = _store_pairings(lx_impl, lambda: _forward(lx_impl, kv_cache, metadata))
+
+        assert dispatched == {(width, width == 1) for width, _ in dispatched}, (
+            f"a sequence dispatched a store the recorder never traces: {sorted(dispatched)}"
+        )
+        assert {fused for _, fused in dispatched} == {False, True}, (
+            "the batch dispatched only one kind of store, so it proves nothing"
+        )
 
 
 class TestRecompileLimit:

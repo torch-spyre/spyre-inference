@@ -174,6 +174,11 @@ class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
         if self.embed_tokens_per_layer is None:
             return None
         if self.vocab_size_per_layer_input < self.config.vocab_size:
+            if self.spyre_compile_enabled:
+                raise NotImplementedError(
+                    "Compiled Gemma-4 per-layer embeddings require "
+                    "vocab_size_per_layer_input >= vocab_size."
+                )
             return super().get_per_layer_inputs(input_ids)
         per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
         return per_layer_embeds.reshape(

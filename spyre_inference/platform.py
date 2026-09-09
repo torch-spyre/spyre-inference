@@ -427,6 +427,11 @@ class TorchSpyrePlatform(CpuPlatform):
         # The text config is where a multimodal checkpoint keeps the decoder's MLP width.
         text_config = vllm_config.model_config.hf_text_config
         orig = getattr(text_config, "intermediate_size", None)
+        if orig is not None and not isinstance(orig, int):
+            raise NotImplementedError(
+                "Spyre MLP intermediate-size padding does not support per-layer "
+                f"intermediate_size values (got {type(orig).__name__})."
+            )
         # TP shards the intermediate dim, so it is the per-rank shard that has to land
         # on a stick boundary.
         align = BLOCK_SIZE * vllm_config.parallel_config.tensor_parallel_size

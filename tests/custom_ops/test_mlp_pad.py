@@ -28,6 +28,7 @@ import torch.nn.functional as F
 
 from spyre_inference.custom_ops.mlp_pad import (
     _pad_weight,
+    install_mlp_pad_weight_loader,
     original_intermediate_size,
     verify_padded_intermediate_size,
 )
@@ -82,6 +83,47 @@ def test_pad_weight_splits_and_pads_a_fused_gate_up_bias():
     assert torch.equal(up[:_ORIG], b[_ORIG:])
     assert not gate[_ORIG:].any()
     assert not up[_ORIG:].any()
+
+
+@pytest.mark.parametrize("proj", ["gate_proj", "up_proj"])
+def test_pad_weight_end_pads_double_wide_rows_with_zeros(proj):
+    width = 2 * _ORIG
+    padded_width = 2 * _PADDED
+    w = torch.arange(1.0, width * _HIDDEN + 1).reshape(width, _HIDDEN)
+
+    out = _pad_weight(f"layers.0.mlp.{proj}.weight", w, _ORIG, _PADDED)
+
+    assert out.shape == (padded_width, _HIDDEN)
+    assert torch.equal(out[:width], w)
+    assert not out[width:].any()
+
+
+def test_pad_weight_splits_and_pads_a_double_wide_fused_projection():
+    width = 2 * _ORIG
+    padded_width = 2 * _PADDED
+    w = torch.arange(1.0, 2 * width * _HIDDEN + 1).reshape(2 * width, _HIDDEN)
+
+    out = _pad_weight("layers.0.mlp.gate_up_proj.weight", w, _ORIG, _PADDED)
+
+    assert out.shape == (2 * padded_width, _HIDDEN)
+    gate, up = out.split([padded_width, padded_width])
+    gate_src, up_src = w.split([width, width])
+    assert torch.equal(gate[:width], gate_src)
+    assert torch.equal(up[:width], up_src)
+    assert not gate[width:].any()
+    assert not up[width:].any()
+
+
+def test_pad_weight_end_pads_double_wide_down_cols_with_zeros():
+    width = 2 * _ORIG
+    padded_width = 2 * _PADDED
+    w = torch.arange(1.0, _HIDDEN * width + 1).reshape(_HIDDEN, width)
+
+    out = _pad_weight("layers.0.mlp.down_proj.weight", w, _ORIG, _PADDED)
+
+    assert out.shape == (_HIDDEN, padded_width)
+    assert torch.equal(out[:, :width], w)
+    assert not out[:, width:].any()
 
 
 def test_pad_weight_leaves_an_already_aligned_width_untouched():
@@ -148,10 +190,36 @@ def test_verify_accepts_a_padded_down_proj():
     verify_padded_intermediate_size(_model_with_down_proj(_PADDED), hf_config)
 
 
+def test_verify_accepts_a_double_wide_padded_down_proj():
+    hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
+
+    verify_padded_intermediate_size(_model_with_down_proj(2 * _PADDED), hf_config)
+
+
 def test_verify_noop_without_padding():
     verify_padded_intermediate_size(
         _model_with_down_proj(_ORIG), SimpleNamespace(intermediate_size=_ORIG)
     )
+
+
+def test_install_rejects_a_loader_that_cannot_pad_weights():
+    hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
+
+    with pytest.raises(NotImplementedError, match="get_all_weights.*object is unsupported"):
+        install_mlp_pad_weight_loader(object(), hf_config)
+
+
+def test_install_allows_an_unpadded_config_with_any_loader():
+    install_mlp_pad_weight_loader(object(), SimpleNamespace(intermediate_size=_ORIG))
+
+
+def test_install_allows_dummy_weights_with_padding():
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+    hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
+
+    install_mlp_pad_weight_loader(DummyModelLoader(LoadConfig(load_format="dummy")), hf_config)
 
 
 def _config_stub(*, tp=1, **fields):
@@ -197,3 +265,16 @@ def test_platform_aligns_intermediate_size_to_the_per_rank_shard(tp, fields, exp
     assert text_config.intermediate_size == (expected or fields["intermediate_size"])
     original = fields["intermediate_size"] if expected else None
     assert original_intermediate_size(text_config) == original
+
+
+def test_platform_rejects_per_layer_intermediate_sizes():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    config = _config_stub(
+        tp=2,
+        intermediate_size=[160, 192],
+        hidden_activation="gelu_pytorch_tanh",
+    )
+
+    with pytest.raises(NotImplementedError, match="per-layer intermediate_size values"):
+        TorchSpyrePlatform._maybe_pad_intermediate_size(config)

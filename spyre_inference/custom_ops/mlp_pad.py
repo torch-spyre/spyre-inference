@@ -65,14 +65,29 @@ def _pad_cols_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
 def _pad_weight(name: str, w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right end-padding by its name."""
     # Must precede the up_proj test: "gate_up_proj.*" also ends with "up_proj.*".
-    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")) and w.shape[0] == 2 * orig:
-        gate, up = w.chunk(2, dim=0)
-        return torch.cat([_pad_rows_end(gate, orig, padded), _pad_rows_end(up, orig, padded)])
+    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")):
+        for multiplier in (1, 2):
+            width = multiplier * orig
+            if w.shape[0] == 2 * width:
+                gate, up = w.chunk(2, dim=0)
+                padded_width = multiplier * padded
+                return torch.cat(
+                    [
+                        _pad_rows_end(gate, width, padded_width),
+                        _pad_rows_end(up, width, padded_width),
+                    ]
+                )
     if name.endswith(("gate_proj.weight", "gate_proj.bias", "up_proj.weight", "up_proj.bias")):
-        return _pad_rows_end(w, orig, padded) if w.shape[0] == orig else w
+        for multiplier in (1, 2):
+            width = multiplier * orig
+            if w.shape[0] == width:
+                return _pad_rows_end(w, width, multiplier * padded)
     # down_proj input columns line up with the padded activation lanes.
-    if name.endswith("down_proj.weight") and w.ndim == 2 and w.shape[1] == orig:
-        return _pad_cols_end(w, orig, padded)
+    if name.endswith("down_proj.weight") and w.ndim == 2:
+        for multiplier in (1, 2):
+            width = multiplier * orig
+            if w.shape[1] == width:
+                return _pad_cols_end(w, width, multiplier * padded)
     return w
 
 
@@ -88,11 +103,14 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     if not hasattr(model_loader, "get_all_weights"):
-        logger.warning(
-            "MLP padding active but %s has no get_all_weights; weights not padded.",
-            type(model_loader).__name__,
+        from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+        if isinstance(model_loader, DummyModelLoader):
+            return
+        raise NotImplementedError(
+            "Spyre MLP intermediate-size padding requires a model loader that "
+            f"exposes get_all_weights; {type(model_loader).__name__} is unsupported."
         )
-        return
 
     orig = getattr(hf_config, _ORIG_ATTR)
     padded = hf_config.intermediate_size
@@ -121,7 +139,8 @@ def verify_padded_intermediate_size(model, hf_config) -> None:
         {
             f"{name}(input_size={module.input_size})"
             for name, module in model.named_modules()
-            if name.endswith("down_proj") and getattr(module, "input_size", padded) != padded
+            if name.endswith("down_proj")
+            and getattr(module, "input_size", padded) not in (padded, 2 * padded)
         }
     )
     if bad:

@@ -754,6 +754,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#compilation-granularity" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1557,6 +1568,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#compilation-granularity" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1961,6 +1983,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#model-adaptations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model adaptations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#compilation-granularity" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2175,6 +2208,12 @@ compiled graph (see below).</p>
 <td>—</td>
 <td>Makes logits contiguous — the downstream in-place <code>logits *= scale</code> otherwise trips a torch-spyre compile issue</td>
 </tr>
+<tr>
+<td><code>GateLinear</code></td>
+<td><code>SpyreGateLinear</code></td>
+<td>Spyre</td>
+<td>Clears <code>out_dtype</code> so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (<code>spyre::ReStickifyOpHBM</code> is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower</td>
+</tr>
 </tbody>
 </table>
 <h3 id="transposed-linear-weights">Transposed linear weights<a class="headerlink" href="#transposed-linear-weights" title="Permanent link">&para;</a></h3>
@@ -2206,6 +2245,42 @@ pass — so that no fused output ever had to be sliced; one fused GEMM is faster
 so that pass is gone. The remaining slicing constraint is narrower than it was and lives
 in the attention backend, where offset &gt; 0 views still corrupt on transfer (see
 <a href="#attention-backend">Attention Backend</a>).</p>
+<h2 id="model-adaptations">Model adaptations<a class="headerlink" href="#model-adaptations" title="Permanent link">&para;</a></h2>
+<p>Some models need more than a swapped-out layer: a different transport for an input, a buffer
+that has to follow <code>.to("spyre")</code>, an expert dispatch Spyre can lower. Those live in
+<code>spyre_inference/models/</code>, one module per architecture, as <strong>subclasses of the upstream vLLM
+class</strong> rather than runtime monkey-patches. <code>models/__init__.py</code> holds <code>spyre_models()</code>
+(architecture string → Spyre class, built from the <code>_ADAPTED_MODULES</code> and <code>_ADAPTED_ARCHS</code>
+tables) and <code>register_models()</code>, which points vLLM's <code>ModelRegistry</code> at them; <code>_</code>-prefixed
+modules hold machinery those subclasses share or delegate to and register no architecture of
+their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
+and <code>register_models()</code> first checks every key against vLLM's own registry, so an upstream
+rename fails loudly instead of silently falling through to the unadapted class.</p>
+<p>Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
+<code>embedding_class</code>), the already-built instance is <strong>retyped</strong> to its Spyre subclass — same
+<code>__init__</code>, same parameters, same module tree, only <code>forward</code> differs. Prefer a documented
+upstream extension point where one exists: <code>CustomOp.register_oot</code> /
+<code>PluggableLayer.register_oot</code> for a layer, and — for a MoE — the quant-method seam the
+unquantized oracle leaves open for an out-of-tree platform.</p>
+<p>Two adaptations worth knowing:</p>
+<ul>
+<li><strong>BERT / RoBERTa</strong> (<code>models/_token_type.py</code>) carry <code>token_type_ids</code> in a side buffer
+  owned by the embedding instead of vLLM's bit-pack into the high bits of <code>input_ids</code>,
+  which Spyre cannot unpack (<a href="https://github.com/torch-spyre/torch-spyre/issues/3509">torch-spyre#3509</a>).</li>
+<li><strong>MoE</strong> (<code>moe.py</code>) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
+  for an out-of-tree platform (it selects <code>UnquantizedMoeBackend.OOT</code> — no kernel — and
+  leaves <code>process_weights_after_loading</code> to the plugin). A <code>CustomOp.register_oot</code>
+  replacement for <code>UnquantizedFusedMoEMethod</code> computes the experts in two Spyre forms —
+  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
+  in the post-load hook, rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into the
+  <code>[E,H,M]</code> / <code>[E,M,H]</code> layout those forms contract on, freeing each source stack as it goes,
+  since the device cannot hold both layouts at once. Each model's own adaptation module
+  supplies its recipe and any model-owned scaling (<code>configure_gemma4_moe_layers</code> in
+  <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> and <code>MoERunner</code> are untouched: vLLM
+  reaches the experts through <code>torch.ops.vllm.moe_forward</code>, an opaque custom op, so the
+  dispatch runs eagerly <em>inside</em> the block's compiled graph — the same seam the attention
+  backend uses — and can drive compiled regions of its own.</li>
+</ul>
 <h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
 <p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of
 the model's block <code>ModuleList</code> in place via <code>block.compile(backend="inductor",

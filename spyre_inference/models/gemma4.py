@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
+import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
@@ -120,8 +122,14 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
+def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Fold Gemma's output scale into the source down-projection stack."""
+    return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
+
+
 def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
     """Register Gemma-4's full-softmax, scaled GELU expert recipe."""
+
     configured = 0
     for decoder in layers:
         moe = getattr(decoder, "moe", None)
@@ -132,8 +140,7 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
             SpyreMoERecipe(
                 activation="gelu_tanh",
                 routing="full_softmax",
-                expert_scale=moe.per_expert_scale,
-                fold_expert_scale_into_down=True,
+                prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
             ),
         )
         configured += 1

@@ -78,7 +78,7 @@ register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EA
 
 
 @contextlib.contextmanager
-def spyre_vllm_config(compiled: bool, max_model_len=None):
+def spyre_vllm_config(compiled: bool, max_model_len=None, staging_rows=None):
     """Establish a Spyre vLLM config context for standalone (non-pytest) use."""
     from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig, CompilationMode
@@ -97,6 +97,11 @@ def spyre_vllm_config(compiled: bool, max_model_len=None):
         compilation_config=CompilationConfig(custom_ops=["all"], mode=mode),
         model_config=ModelConfig(dtype=DTYPE, max_model_len=max_model_len),
     )
+    # Diagnostic only: SpyreAttentionImpl sizes its staging buffers as
+    # max_num_batched_tokens + 1, so this shrinks them without touching the measured
+    # product. Separates the kernel's own cost from the staging gather/store cost.
+    if staging_rows:
+        config.scheduler_config.max_num_batched_tokens = staging_rows - 1
     with set_current_vllm_config(config), set_forward_context(None, config):
         yield
 
@@ -232,7 +237,9 @@ def _padded_block_width(num_blocks: int) -> int:
     """Block-table width build() can slice: the count rounded onto its buckets.
 
     Mirrors SpyreAttentionMetadataBuilder._pad_num_blocks. Kept as a local power-of-two
-    round rather than reaching for the bucketer, which needs a full vllm_config.
+    round rather than reaching for the bucketer, which needs a full vllm_config. The
+    real buckets derive from SPYRE_ATTN_KV_BUCKETS, so a sparse override can round to a
+    wider table than this predicts; the default buckets are powers of two.
     """
     width = 1
     while width < num_blocks:
@@ -256,10 +263,7 @@ def build_inputs_from_requests(
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.backends.spyre_attn import (
-        head_major_kv_layout,
-        slot_major_kv_layout,
-    )
+    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):
@@ -351,6 +355,10 @@ def build_inputs_from_requests(
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
         if folded:
+            # Imported here, not at the top: a baseline checkout predating the folded
+            # frame has no head_major_kv_layout, and only ever asks for a plain cache.
+            from spyre_inference.v1.attention.backends.spyre_attn import head_major_kv_layout
+
             return torch.zeros(nb * h, bsz, d, dtype=cache.dtype).to(
                 cache_device, device_layout=head_major_kv_layout(nb * h, bsz, d, cache.dtype)
             )
@@ -796,6 +804,13 @@ def main():
         "the stub model's 2048 to reach longer kv extents.",
     )
     ap.add_argument(
+        "--staging-rows",
+        type=int,
+        default=None,
+        help="Diagnostic: shrink the impl's staging buffers to this many rows without "
+        "changing the measured shape, to separate kernel cost from staging cost.",
+    )
+    ap.add_argument(
         "--kv-layout",
         choices=["plain", "slot_major", "slot_major_devfill", "lx"],
         default=None,
@@ -827,6 +842,7 @@ def main():
         ("span", args.span),
         ("kv_layout", args.kv_layout),
         ("max_model_len", args.max_model_len),
+        ("staging_rows", args.staging_rows),
     ):
         if val is not None:
             cfg[key] = val
@@ -883,7 +899,9 @@ def main():
 
     records = []
     with spyre_vllm_config(
-        compiled=next(iter(compiled_modes)), max_model_len=cfg.get("max_model_len")
+        compiled=next(iter(compiled_modes)),
+        max_model_len=cfg.get("max_model_len"),
+        staging_rows=cfg.get("staging_rows"),
     ):
         import torch._dynamo
 

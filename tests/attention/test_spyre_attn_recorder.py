@@ -107,6 +107,23 @@ def _dispatch(impl, kv_cache, num_blocks, padded_query_len):
 
 
 class TestRecordGraphs:
+    def test_recorder_uses_single_page_decode_and_grouped_prefill(
+        self, impl, kv_cache, monkeypatch
+    ):
+        monkeypatch.setattr(impl, "_page_group", 8)
+        groups = []
+        real = impl._attn_fn
+
+        def capture(*args):
+            groups.append((args[8], args[13]))
+            return real(*args)
+
+        monkeypatch.setattr(impl, "_attn_fn", capture)
+        impl.record_graphs(torch.device("cpu"), make_bucketer(), kv_cache)
+
+        assert groups
+        assert all(group == (1 if query_len == 1 else 8) for query_len, group in groups)
+
     def test_records_every_enumerated_variant(self, impl, kv_cache):
         bucketer = make_bucketer()
 
@@ -329,6 +346,7 @@ class TestRecordGraphs:
                 NUM_KV_HEADS,
                 HEAD_SIZE,
                 impl.logits_soft_cap,
+                impl._page_group,
                 None,
                 out_staging,
             )
@@ -357,6 +375,22 @@ class TestRecordGraphs:
         recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
 
         assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
+
+    def test_a_failing_variant_aborts_strict_recording(self, impl, kv_cache, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_FAIL_ON_RECOMPILE", "1")
+        from spyre_inference import envs
+
+        envs.clear_env_cache()
+        monkeypatch.setattr(
+            impl,
+            "_record_one",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("synthetic lowering failure")
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="synthetic lowering failure"):
+            impl.record_graphs(torch.device("cpu"), make_bucketer(), kv_cache)
 
 
 class TestRecompileLimit:
@@ -436,6 +470,18 @@ class TestLateCompileWarning:
             spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
 
         assert "outside warmup" not in caplog.text
+
+    def test_strict_gate_raises_when_an_unrecorded_variant_compiles(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_FAIL_ON_RECOMPILE", "1")
+        from spyre_inference import envs
+
+        envs.clear_env_cache()
+        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
+        spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
+        spyre_attn.mark_warmup_complete()
+
+        with pytest.raises(RuntimeError, match="compiled outside warmup"):
+            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 2)
 
     def test_mark_warmup_complete_arms_the_check(self):
         assert spyre_attn._warmup_complete is False

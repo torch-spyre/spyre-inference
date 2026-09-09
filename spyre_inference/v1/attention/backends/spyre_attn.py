@@ -247,6 +247,7 @@ def _page_attn_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
+    page_group=1,
     alibi_bias_tiles=None,
     out=None,
 ):
@@ -288,17 +289,27 @@ def _page_attn_kernel(
     tile_sum = None
     tile_output = None
 
-    for i in range(num_blocks):
+    for group_start in range(0, num_blocks, page_group):
+        group_end = min(group_start + page_group, num_blocks)
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:1]
+        page_idx = page_index_table[group_start:group_end, 0]
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
         # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+        tile_tokens = (group_end - group_start) * k_page.shape[1]
+        k_page_4d = (
+            k_page.permute(2, 0, 1, 3)
+            .reshape(num_kv_heads, tile_tokens, head_size)
+            .unsqueeze(1)
+        )
+        v_page_4d = (
+            v_page.permute(2, 0, 1, 3)
+            .reshape(num_kv_heads, tile_tokens, head_size)
+            .unsqueeze(1)
+        )
 
-        mask_tile = mask_tiles[i]
+        mask_tile = torch.cat(mask_tiles[group_start:group_end], dim=-1)
 
         scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
@@ -310,11 +321,11 @@ def _page_attn_kernel(
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + alibi_bias_tiles[i]
+            scores = scores + torch.cat(alibi_bias_tiles[group_start:group_end], dim=-1)
         scores = scores + mask_tile
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
+        if group_start == 0:
             tile_max = scores_max
             tile_probs = torch.exp(scores - tile_max)
             tile_output = torch.matmul(tile_probs, v_page_4d)
@@ -464,11 +475,13 @@ def _call_kernel(label: str, fn, *args):
     before = counters["stats"]["unique_graphs"]
     result = fn(*args)
     if counters["stats"]["unique_graphs"] != before:
-        logger.warning_once(
-            "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
-            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
-            label,
+        message = (
+            f"{label} compiled outside warmup, which costs a full Inductor compile "
+            "mid-request. Re-run with TORCH_LOGS=recompiles to see which guard failed."
         )
+        if envs.SPYRE_ATTN_FAIL_ON_RECOMPILE:
+            raise RuntimeError(message)
+        logger.warning_once(message)
     return result
 
 
@@ -1241,6 +1254,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # treat as compiled. The platform resolves compiled runs to STOCK.
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+        self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
+        if self._page_group < 1:
+            raise ValueError(
+                f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}"
+            )
+        if sliding_window is not None and self._page_group != 1:
+            raise ValueError(
+                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with sliding-window "
+                "attention; use SPYRE_ATTN_PAGE_GROUP=1"
+            )
+        if envs.SPYRE_BATCHED_DECODE and self._page_group != 1:
+            raise ValueError(
+                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with "
+                "SPYRE_BATCHED_DECODE=1"
+            )
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1316,6 +1344,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"padded_query_len={padded_query_len} needs a query buffer wider than "
             "itself; a gather selecting its whole source faults the device"
         )
+
+    def _page_group_for_query(self, query_len: int) -> int:
+        """Group pages only for multi-token prefill/chunked-prefill sequences."""
+        return self._page_group if query_len > 1 else 1
 
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
         # Off by default: the batched matmul pads every sequence row up to the
@@ -1417,9 +1449,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         ``index_select``s real pages. Dynamo traces on the first *call*, so each
         variant is invoked once here.
 
-        Returns the number of variants invoked. A failing variant is logged and
-        skipped, not raised, so it can't take down engine startup; dispatch
-        falls back to compiling it on first use.
+        Returns the number of variants invoked. By default a failing variant is
+        logged and skipped. SPYRE_ATTN_FAIL_ON_RECOMPILE=1 makes it fatal so a
+        latency benchmark cannot start with incomplete graph coverage.
         """
         if not self._compile_attn:
             return 0
@@ -1469,6 +1501,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             try:
                 self._record_one(bucket, k_pages, v_pages, block_size, device)
             except Exception:
+                if envs.SPYRE_ATTN_FAIL_ON_RECOMPILE:
+                    raise
                 logger.warning(
                     "Attention variant %s failed to record; it will compile on first use instead.",
                     bucket,
@@ -1546,6 +1580,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
+            self._page_group_for_query(q_len),
             alibi_bias_tiles,
             out_staging,
         )
@@ -1821,6 +1856,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.num_kv_heads,
                 self.head_size,
                 self.logits_soft_cap,
+                self._page_group_for_query(query_len),
                 alibi_bias_tiles,
                 out_staging if store_out else None,
             )

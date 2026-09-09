@@ -32,11 +32,115 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _batched_decode_kernel,
     _build_query_row_tables,
     _mirror_mask_tiles,
+    _page_attn_kernel,
     _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
+
+
+@pytest.mark.parametrize("query_len", [1, 7])
+@pytest.mark.parametrize("page_group", [2, 3, 4, 8])
+@pytest.mark.parametrize("with_alibi", [False, True])
+def test_page_group_tail_matches_single_page_attention(query_len, page_group, with_alibi):
+    """Odd block counts and groups wider than the context preserve attention."""
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    num_blocks, num_pages = 5, 8
+    num_heads, num_kv_heads = 4, 2
+    head_size, block_size = 16, 8
+    qpk = num_heads // num_kv_heads
+
+    query = torch.randn(query_len + 1, num_heads, head_size, generator=generator)
+    query_rows = torch.arange(query_len, dtype=torch.int32)
+    k_pages = torch.randn(
+        num_pages, block_size, num_kv_heads, head_size, generator=generator
+    )
+    v_pages = torch.randn(
+        num_pages, block_size, num_kv_heads, head_size, generator=generator
+    )
+    page_table = torch.zeros(num_blocks, 32, dtype=torch.int32)
+    page_table[:, 0] = torch.tensor([6, 1, 7, 3, 2], dtype=torch.int32)
+    masks = [torch.zeros(query_len, block_size) for _ in range(num_blocks)]
+    masks[-1][:, block_size // 2 :] = torch.finfo(torch.float32).min
+    alibi = None
+    if with_alibi:
+        alibi = [
+            torch.randn(num_kv_heads, qpk, 1, block_size, generator=generator) * 0.01
+            for _ in range(num_blocks)
+        ]
+
+    args = (
+        query,
+        query_rows,
+        k_pages,
+        v_pages,
+        page_table,
+        masks,
+        head_size**-0.5,
+        num_blocks,
+        query_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        2.0,
+        alibi,
+        None,
+    )
+    expected = _page_attn_kernel(*args[:13], 1, *args[13:])
+    actual = _page_attn_kernel(*args[:13], page_group, *args[13:])
+
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("page_group", [0, -1])
+def test_invalid_page_group_is_rejected(default_vllm_config, monkeypatch, page_group):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", str(page_group))
+    with pytest.raises(ValueError, match="SPYRE_ATTN_PAGE_GROUP must be >= 1"):
+        SpyreAttentionImpl(
+            num_heads=4,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=2,
+        )
+
+
+def test_page_group_rejects_sliding_window(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "2")
+    with pytest.raises(ValueError, match="sliding-window"):
+        SpyreAttentionImpl(
+            num_heads=4,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=2,
+            sliding_window=128,
+        )
+
+
+def test_page_group_rejects_batched_decode(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "2")
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    with pytest.raises(ValueError, match="SPYRE_BATCHED_DECODE"):
+        SpyreAttentionImpl(
+            num_heads=4,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=2,
+        )
+
+
+def test_page_group_is_used_only_for_multi_token_queries(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "8")
+    impl = SpyreAttentionImpl(
+        num_heads=4,
+        head_size=64,
+        scale=0.125,
+        num_kv_heads=2,
+    )
+
+    assert impl._page_group_for_query(1) == 1
+    assert impl._page_group_for_query(2) == 8
+    assert impl._page_group_for_query(512) == 8
 
 
 @pytest.fixture()

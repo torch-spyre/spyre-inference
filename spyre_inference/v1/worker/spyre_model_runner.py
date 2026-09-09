@@ -595,6 +595,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
+        if granularity == "model" and any(
+            getattr(module, "embed_tokens_per_layer", None) is not None
+            for module in self.model.modules()
+        ):
+            raise NotImplementedError(
+                "SPYRE_COMPILE_GRANULARITY=model is not supported for models with "
+                "per-layer embeddings; use SPYRE_COMPILE_GRANULARITY=block."
+            )
+
         # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
         # stays isolated. fullgraph=True cannot graph-break.
         uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))

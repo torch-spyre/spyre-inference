@@ -95,7 +95,7 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
     """
     moe = layer.moe_config
     _validate_recipe(layer, recipe)
-    if layer.quant_config is not None:
+    if not isinstance(layer.quant_method, UnquantizedFusedMoEMethod):
         raise NotImplementedError("Spyre MoE backend does not support quantized experts.")
     if moe.is_lora_enabled:
         raise NotImplementedError("Spyre MoE backend does not support LoRA experts.")

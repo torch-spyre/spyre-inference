@@ -26,5 +26,4 @@ class SpyreGateLinear(GateLinear):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # Cleared here rather than through the argument, to also catch positional callers.
-        # Causes the MoE linear gate to be performed in BF16
         self.out_dtype = None

@@ -100,8 +100,12 @@ def test_routing_recipes_agree_under_renormalization():
     torch.testing.assert_close(standard, gemma)
 
 
-def test_prefill_routing_matches_the_decode_form():
-    """The prefill dense form and the decode gathered form must agree on the weights."""
+def test_dense_topk_weights_are_softmax_over_the_selected_logits():
+    """The dense prefill weights, against the formula rather than against the decode form.
+
+    Both forms now share ``_routing_weights``, so they agree by construction; what still
+    needs pinning is the formula that shared helper implements.
+    """
     from spyre_inference.moe import _topk_probs
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5], [-0.25, 3.0, 0.75, -2.0]], dtype=torch.float32)
@@ -111,6 +115,41 @@ def test_prefill_routing_matches_the_decode_form():
         -1, indices, torch.softmax(expected_weights, dim=-1)
     )
     torch.testing.assert_close(dense, expected)
+
+
+def test_selected_routing_matches_the_general_routing_form():
+    """The topk path skips the re-normalize the full-softmax path needs.
+
+    That is only legal because these weights already have exactly ``top_k`` live slots
+    summing to one, so the two forms must come out identical.
+    """
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import (
+        _moe_persistent_routing,
+        _moe_persistent_selected_routing,
+        _topk_probs,
+    )
+
+    torch.manual_seed(0)
+    logits = torch.randn(8, EXPERTS, dtype=torch.float16)
+    dense = _topk_probs(logits, TOP_K)
+    assert (dense != 0).sum(-1).tolist() == [TOP_K] * logits.shape[0]
+    torch.testing.assert_close(dense.sum(-1), torch.ones(logits.shape[0], dtype=torch.float16))
+
+    stick = get_elem_in_stick(torch.float16)
+    identity = torch.eye(stick, dtype=torch.float16)
+    torch.testing.assert_close(
+        _moe_persistent_selected_routing(dense, identity, stick),
+        _moe_persistent_routing(dense, identity, TOP_K, stick),
+    )
+
+
+def _unquantized_method():
+    """What vLLM installs for an unquantized layer — the Spyre OOT subclass, here."""
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    return object.__new__(SpyreUnquantizedFusedMoEMethod)
 
 
 def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
@@ -134,6 +173,7 @@ def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
         "renormalize": True,
         "apply_router_weight_on_input": False,
         "quant_config": None,
+        "quant_method": _unquantized_method(),
     } | overrides
     return SimpleNamespace(
         moe_config=SimpleNamespace(
@@ -181,7 +221,7 @@ _STANDARD = ("silu", "topk_softmax")
         ({"local_num_experts": EXPERTS // 2}, _STANDARD, "remapped experts"),
         ({"renormalize": False}, _STANDARD, "normalized top-k"),
         ({"apply_router_weight_on_input": True}, _STANDARD, "input-weighted"),
-        ({"quant_config": object()}, _STANDARD, "quantized experts"),
+        ({"quant_method": object()}, _STANDARD, "quantized experts"),
         ({"moe_config": {"is_lora_enabled": True}}, _STANDARD, "LoRA experts"),
         ({"moe_config": {"has_bias": True}}, _STANDARD, "expert biases"),
         # The recipe's activation must be the one the layer actually asks for.
@@ -197,6 +237,15 @@ def test_configure_rejects_what_the_spyre_forms_cannot_express(overrides, recipe
     layer = _generic_layer(**overrides)
     with pytest.raises(NotImplementedError, match=match):
         configure_spyre_moe_layer(layer, SpyreMoERecipe(*recipe_args))
+
+
+def test_configure_claims_an_unquantized_layer_of_a_quantized_model():
+    """A quantized checkpoint hands its ignored MoE layers back unquantized; claim those."""
+    from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+    layer = _generic_layer(quant_config=object())
+    configure_spyre_moe_layer(layer, SpyreMoERecipe(*_STANDARD))
+    assert layer.spyre_moe_recipe.routing == "topk_softmax"
 
 
 def _dispatch_recorder(monkeypatch, fail_on=None):

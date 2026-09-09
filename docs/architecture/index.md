@@ -114,7 +114,7 @@ upstream extension point where one exists: `CustomOp.register_oot` /
 `PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.
 
-Two adaptations worth knowing:
+Three adaptations worth knowing:
 
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
@@ -132,6 +132,20 @@ Two adaptations worth knowing:
   reaches the experts through `torch.ops.vllm.moe_forward`, an opaque custom op, so the
   dispatch runs eagerly *inside* the block's compiled graph — the same seam the attention
   backend uses — and can drive compiled regions of its own.
+- **Gemma-4** (`models/gemma4.py`) carries three repairs. The self-decoder's four scalars
+  (`normalizer` and the PLE scales) are plain attributes aliasing buffers `Gemma4Model` owns,
+  which `model.to("spyre")` leaves on CPU — a live 0-d CPU input to a compiled
+  `embed_input_ids`; re-registering them as buffers of the self-decoder is enough, since a
+  device-side 0-d scalar lowers fine. It is also retyped for two per-layer-embedding (PLE)
+  operations, both no-ops on a checkpoint without PLE: a mask upstream builds as a
+  `torch.bool` result over an int32 operand is dropped, and `project_per_layer_inputs` returns
+  a tensor subclass whose `[:, layer_idx, :]` — the backbone loop's per-block cut — hands back
+  a row pre-materialized at offset zero by one compiled graph, since a compiled block reads a
+  nonzero-offset view from offset 0
+  ([torch-spyre#3770](https://github.com/torch-spyre/torch-spyre/issues/3770)). Lastly,
+  `force_text_backbone` points a gemma-4 config at its text-only backbone through
+  `hf_overrides`, rebuilding the `global_*` head / kv-head attributes vLLM's builder reads and
+  transformers >=5.16 consumes into `per_layer_config`.
 
 ## Compilation Granularity
 

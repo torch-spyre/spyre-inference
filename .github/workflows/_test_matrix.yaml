@@ -492,6 +492,35 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-upstream-shard-6
+          # GSM8K accuracy gate, one server-based eval per config sharded across
+          # parallel 1-card jobs (one config per shard). Heavy (full vLLM server +
+          # batched eval per config), so regression/trunk only -- excluded from
+          # integration/unit like the upstream suites. Adding/removing a shard =
+          # add/remove an entry here and bump QUALITY_SHARDS (Makefile default).
+          - cfg: Quality accuracy gate (shard 1/3)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-0
+          - cfg: Quality accuracy gate (shard 2/3)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-1
+          - cfg: Quality accuracy gate (shard 3/3)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-2
           - cfg: Upstream distributed vLLM tests
             test_types: regression trunk
             runs_on:

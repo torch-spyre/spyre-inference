@@ -209,7 +209,13 @@ def test_encoder_embed_last_pooling() -> None:
     """
     # Both sides are computed in this run, so the pin buys reproducibility rather than a
     # valid comparison; read from the embed refs so it cannot drift off the gated weights.
-    revision = _REFERENCES[LAST_POOLING_MODEL]["revision"]
+    ref = _REFERENCES.get(LAST_POOLING_MODEL)
+    if ref is None:
+        pytest.skip(
+            f"No HF ref for {LAST_POOLING_MODEL}; run tests/data/generate_encoder_embed_refs.py"
+        )
+
+    revision = ref["revision"]
     prompts = LAST_POOLING_PROMPTS
     ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, revision, prompts)
 

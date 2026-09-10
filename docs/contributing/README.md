@@ -117,12 +117,22 @@ Every gated model is pinned to a revision, in the generator's `MODEL_REVISIONS` 
 measured in its JSON and the test loads that one back, so bumping a pin means regenerating
 that model's reference.
 
-`SPYRE_TEST_ABS_TOL` / `SPYRE_TEST_REL_TOL` (decoder probabilities) and
-`SPYRE_TEST_SCORE_ABS_TOL` / `SPYRE_TEST_SCORE_REL_TOL` (reranker scores) set the
-tolerances; the stricter of each pair applies, so a low-confidence reference is held to a
-fraction rather than to the same absolute margin. Reranker ranking is checked separately
-from the per-score bound. The FP8 decoder checkpoints are load-and-decode cases with no
-reference of their own — their unquantized siblings gate the numerics.
+`SPYRE_TEST_MEAN_ABS_TOL` / `SPYRE_TEST_ABS_TOL` / `SPYRE_TEST_REL_TOL` (decoder
+probabilities) and `SPYRE_TEST_SCORE_ABS_TOL` / `SPYRE_TEST_SCORE_REL_TOL` (reranker scores)
+set the tolerances. For a low-confidence reference the stricter of the absolute and relative
+bound applies, so it is held to a fraction rather than to the same absolute margin. Reranker
+ranking is checked separately from the per-score bound.
+
+The decoder gate is aggregate-first: `SPYRE_TEST_MEAN_ABS_TOL` bounds each prompt's *mean*
+error and is what holds quality, while `SPYRE_TEST_ABS_TOL` only caps a single step against
+gross breakage. A reference near p=0.5 is maximally ill-conditioned (`dp/dlogit` peaks at
+`p(1-p)`), and one compiled graph has measured 0.115 apart on such a step between two CI pods
+with every token still exact — a tight per-step bound buys flakiness, not coverage. Each case
+prints `mean=`/`max=` per prompt, so a failure is readable without a rerun.
+`SPYRE_TEST_TIE_ABS_TOL` holds token disagreements to a tighter bound, since picking a
+different token is a stronger signal than drift. The FP8 decoder checkpoints are
+load-and-decode cases with no reference of their own — their unquantized siblings gate the
+numerics.
 
 A greedy path that diverges from HF on a near-tie cannot be compared past the split, so
 each decoder case prints how many reference steps it matched and fails below

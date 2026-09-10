@@ -52,10 +52,21 @@ FP8_REVISIONS = {
 FP8_MAX_TOKENS = 8
 
 # fp16 on device reorders accumulation against the fp32 reference, so probabilities are
-# compared with a tolerance. Same default as sendnn-inference's TEST_ABS_TOL.
-ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.08"))
-# Below the ABS_TOL crossover (p=0.16) a flat 0.08 on a 0.08 reference would permit a 2x error.
+# compared with a tolerance. Two bounds, because the failure modes are opposites.
+#
+# The mean is the sensitive bound: drift spread over a prompt shows up here while no single
+# step looks unusual. Worst measured over the five gated decoders is 0.006 (granite-3.3).
+MEAN_ABS_TOL = float(os.environ.get("SPYRE_TEST_MEAN_ABS_TOL", "0.03"))
+# The per-step cap only has to catch gross breakage, so it is deliberately loose: a reference
+# near p=0.5 is maximally ill-conditioned (dp/dlogit peaks at p(1-p)), and one graph measured
+# 0.115 apart there across two CI pods with every token still exact (PR #723). Worst measured
+# step is 0.027 -- 3x under the 0.08 this replaces, so that bound was thin for every model.
+ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.20"))
+# Low-probability steps keep a relative bound; a flat one would permit an arbitrary ratio.
 REL_TOL = float(os.environ.get("SPYRE_TEST_REL_TOL", "0.5"))
+# A token disagreement is a stronger signal than drift, so judging one as a near-tie keeps the
+# original tight bound rather than inheriting ABS_TOL.
+TIE_ABS_TOL = float(os.environ.get("SPYRE_TEST_TIE_ABS_TOL", "0.08"))
 
 # HF's greedy token must be in Spyre's distribution even when Spyre picks another; 20 is
 # vLLM's `max_logprobs`.
@@ -206,7 +217,27 @@ def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[
 
 
 def _prob_tol(reference_prob: float) -> float:
+    """Per-step cap when Spyre and HF picked the same token."""
     return min(ABS_TOL, REL_TOL * reference_prob)
+
+
+def _tie_tol(reference_prob: float) -> float:
+    """Bound for accepting a token disagreement as a near-tie rather than a regression."""
+    return min(TIE_ABS_TOL, REL_TOL * reference_prob)
+
+
+def _assert_mean_prob_error(model: str, prompt: str, diffs: list[float]) -> None:
+    """The bound that holds quality: drift spread over a prompt fails here well before any
+    single step reaches ``ABS_TOL``."""
+    if not diffs:
+        return
+    mean = sum(diffs) / len(diffs)
+    print(f"    prob error over {len(diffs)} compared steps: mean={mean:.4f} max={max(diffs):.4f}")
+    assert mean <= MEAN_ABS_TOL, (
+        f"{model}: mean probability error {mean:.4f} over {len(diffs)} steps exceeds "
+        f"{MEAN_ABS_TOL:.4f} for prompt {prompt!r} -- the distribution drifted as a whole, "
+        f"which no single-step bound catches. A regression, not a tolerance to raise."
+    )
 
 
 def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOutput) -> int:
@@ -222,6 +253,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         f"{model}: generated {len(token_ids)} tokens, reference has {len(hf_result['token_ids'])}"
     )
 
+    diffs: list[float] = []
     for step, (hf_id, hf_logprob, token_id, logprob) in enumerate(
         zip(hf_result["token_ids"], hf_result["logprobs"], token_ids, logprobs, strict=True)
     ):
@@ -241,13 +273,14 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"{NUM_LOGPROBS}, so the distributions disagree outright, {detail}"
             )
             spyre_hf_prob = math.exp(spyre_hf.logprob)
-            assert abs(spyre_hf_prob - hf_prob) <= tol, (
-                f"{model}: wrong token and p(HF token) differs by more than {tol:.4f} "
+            ref_tol = _tie_tol(hf_prob)
+            assert abs(spyre_hf_prob - hf_prob) <= ref_tol, (
+                f"{model}: wrong token and p(HF token) differs by more than {ref_tol:.4f} "
                 f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
             )
             # A tie also means Spyre ranks the two level, so a flat HF distribution cannot
-            # excuse Spyre being confident elsewhere. Doubled: both may drift by `tol`.
-            tie_tol = 2 * tol
+            # excuse Spyre being confident elsewhere. Doubled: both may drift by `ref_tol`.
+            tie_tol = 2 * ref_tol
             assert abs(prob - spyre_hf_prob) <= tie_tol, (
                 f"{model}: wrong token, and Spyre puts it {prob - spyre_hf_prob:.4f} > "
                 f"{tie_tol:.4f} above HF's token (p={spyre_hf_prob:.4f}), so this is not "
@@ -257,10 +290,13 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"    diverged on a near-tie at {detail}; p(HF token) on Spyre "
                 f"{spyre_hf_prob:.4f}; not comparing further"
             )
+            _assert_mean_prob_error(model, hf_result["prompt"], diffs)
             return step
 
         assert abs(hf_prob - prob) <= tol, (
             f"{model}: probability differs by more than {tol:.4f}, {detail}"
         )
+        diffs.append(abs(hf_prob - prob))
 
+    _assert_mean_prob_error(model, hf_result["prompt"], diffs)
     return len(token_ids)

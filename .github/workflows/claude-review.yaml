@@ -119,6 +119,14 @@ jobs:
         env:
           DISABLE_AUTOUPDATER: '1'
         run: |
+          # The image's ~/.local is not writable by this arbitrary CI uid, and
+          # the native installer hardcodes $HOME/.local/{bin,share,state} (it
+          # does not honour XDG). Point HOME at a job-writable dir so both the
+          # install and the runtime state the binary writes land there. The
+          # launcher path is exported to PATH for the review step, which sets
+          # the same HOME. RUNNER_TEMP persists for the whole job.
+          export HOME="${RUNNER_TEMP}/claude-home"
+          mkdir -p "$HOME"
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -155,8 +163,15 @@ jobs:
         run: |
           # Device env, so the agent's own Bash can reach the accelerator for
           # on-hardware verification (this shell does not inherit it otherwise).
+          # Source it from the real home before switching HOME below.
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+
+          # claude was installed under this HOME (the image's ~/.local is
+          # read-only for this uid); set it so the CLI is found and can write
+          # its runtime state. uv/gh keep working: uv uses the workspace .venv
+          # and gh authenticates via GH_TOKEN.
+          export HOME="${RUNNER_TEMP}/claude-home"
 
           # Build the MCP config from the secret URL in-shell so the URL stays
           # masked (never interpolated into the rendered workflow).
@@ -181,48 +196,33 @@ jobs:
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
           # internal-IP firewall (see PR #785), not the tool list.
-          # tee the closing summary for the next step to post. Default Actions
-          # shell has -o pipefail, so a non-zero claude exit still fails here.
+          #
+          # The agent posts its own PR-level summary comment (see the prompt);
+          # the completion signal is the outcome reaction in the next step.
           claude -p "$prompt" \
             --model claude-opus-4-8 \
             --max-turns 60 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \
             --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
-            --output-format text \
-            | tee "${RUNNER_TEMP}/claude-summary.txt"
+            --output-format text
 
-      # Deterministic "review finished" signal, separate from the inline
-      # comments: always posts, carrying the closing summary or a failure notice.
-      - name: Post review summary
+      # React on the trigger comment with the outcome: :+1: on success, :-1:
+      # otherwise. GitHub has no check/X reaction, so this is the closest
+      # pass/fail pair. always() so a timeout or error still signals -- this is
+      # the only completion signal when the agent dies before posting a summary.
+      - name: React with review outcome
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
           REVIEW_OUTCOME: ${{ steps.claude.outcome }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          summary_file="${RUNNER_TEMP}/claude-summary.txt"
-          body_file="${RUNNER_TEMP}/claude-comment.md"
-          if [ "$REVIEW_OUTCOME" = "success" ]; then
-            {
-              echo "## ✅ Claude review complete"
-              echo
-              echo "Any inline comments have been posted to the changed lines above."
-              echo
-              if [ -s "$summary_file" ]; then
-                cat "$summary_file"
-              else
-                echo "_The review produced no closing summary._"
-              fi
-            } > "$body_file"
-          else
-            {
-              echo "## ⚠️ Claude review did not finish"
-              echo
-              echo "The review ended with status \`${REVIEW_OUTCOME}\` (e.g. timeout or error) before it could complete."
-              echo "See the [workflow run](${RUN_URL}) for details."
-            } > "$body_file"
-          fi
-          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body_file"
+          if [ "$REVIEW_OUTCOME" = "success" ]; then reaction="+1"; else reaction="-1"; fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d "{\"content\":\"${reaction}\"}" \
+            || echo "::warning::Could not add the outcome reaction to the trigger comment"

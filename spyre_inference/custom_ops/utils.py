@@ -76,16 +76,16 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
 
     Normal transfers route through the opaque custom op
     `torch.ops.vllm.spyre_convert` so the transfer is invisible to torch.compile
-    / Dynamo. A device layout requires a direct device transfer because
-    ``SpyreTensorLayout`` is not representable in the custom-op schema. None
-    tensors are short-circuited at the Python boundary because `infer_schema`
-    does not accept Optional[Tensor] returns.
+    / Dynamo. A device layout bypasses that op because ``SpyreTensorLayout`` is
+    not representable in the custom-op schema. None tensors are short-circuited
+    at the Python boundary because `infer_schema` does not accept
+    Optional[Tensor] returns.
 
     Args:
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
-        device_layout: Optional physical Spyre tensor layout for a device transfer.
+        device_layout: Optional physical Spyre tensor layout to place the result in.
 
     Returns:
         Converted tensor, or None if input is None.
@@ -95,12 +95,14 @@ def convert(tensor, device=None, dtype=None, device_layout=None):
     if isinstance(device, str):
         device = torch.device(device)
     if device_layout is not None:
-        if device is None or tensor.device == device:
-            raise RuntimeError("A layout-aware conversion requires a device transfer.")
-        if dtype is not None and tensor.dtype != dtype:
-            tensor = convert(tensor, dtype=dtype)
+        # `Tensor.to` is the only entry point that takes a layout, and it covers
+        # both a host->device placement and a same-device relayout (copy_from_d2d),
+        # so a layout-aware conversion must not insist on a device transfer: a
+        # cache already moved to Spyre still needs its rows placed outermost.
         return tensor.to(  # ty: ignore[no-matching-overload]
-            device=device, device_layout=device_layout
+            tensor.device if device is None else device,
+            dtype=tensor.dtype if dtype is None else dtype,
+            device_layout=device_layout,
         )
     # Short-circuit a true no-op at the call site so Inductor never emits a
     # same-device/dtype spyre_convert FallbackKernel into the graph.

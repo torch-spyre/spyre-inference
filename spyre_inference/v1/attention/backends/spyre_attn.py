@@ -93,6 +93,10 @@ INT32_ELEMS_PER_STICK = 32
 
 _SPYRE_CORE_COUNT = 32
 
+# mean/max decode block count: low means the batch pads short sequences up to a
+# much longer one. Calibrated from the crossover sweep; 0.0 disables.
+_BATCHED_DECODE_MIN_UNIFORMITY: float = 0.0
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -557,6 +561,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
     num_decode_seqs: int = 0  # leading decode-only seqs; == num_seqs for pure-decode batches
     num_decode_tokens: int = 0  # == num_decode_seqs since each decode contributes one token
+    decode_uniformity: float = 0.0  # mean/max decode block count; 0.0 when batched path ineligible
     padded_num_seqs: int | None = None
     padded_batch_blocks: int | None = None
     blocks_per_chunk: int | None = None
@@ -1045,6 +1050,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         rep_row_ids_cpu = None
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
+        decode_uniformity = 0.0
         if num_decode_seqs >= _MIN_BATCHED_SEQS:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
@@ -1054,6 +1060,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
 
             if b_seqs is not None and b_blocks is not None:
+                # Mean/max block count: how uniform the contexts are, independent of
+                # bucket round-up (which padding the denser ladder addresses instead).
+                decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
                 # Entries target the cores: fewer under-fills them, more than one
                 # stick's worth hits a backend axis-merge limit.
@@ -1155,6 +1164,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             padded_num_blocks=padded_num_blocks,
             num_decode_seqs=num_decode_seqs,
             num_decode_tokens=num_decode_tokens,
+            decode_uniformity=decode_uniformity,
             padded_num_seqs=padded_num_seqs,
             padded_batch_blocks=padded_batch_blocks,
             blocks_per_chunk=blocks_per_chunk,
@@ -1355,6 +1365,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Layer 0's builder gates on the decode count and the bucket lattice;
         # we add ALiBi, which the batched kernel doesn't implement.
         if attn_metadata.padded_num_seqs is None:
+            return False
+        if attn_metadata.decode_uniformity < _BATCHED_DECODE_MIN_UNIFORMITY:
             return False
         return self.alibi_slopes is None
 

@@ -299,14 +299,10 @@ def _page_attn_kernel(
         # Token-major page to head-major for the matmuls; permutes on device.
         tile_tokens = (group_end - group_start) * k_page.shape[1]
         k_page_4d = (
-            k_page.permute(2, 0, 1, 3)
-            .reshape(num_kv_heads, tile_tokens, head_size)
-            .unsqueeze(1)
+            k_page.permute(2, 0, 1, 3).reshape(num_kv_heads, tile_tokens, head_size).unsqueeze(1)
         )
         v_page_4d = (
-            v_page.permute(2, 0, 1, 3)
-            .reshape(num_kv_heads, tile_tokens, head_size)
-            .unsqueeze(1)
+            v_page.permute(2, 0, 1, 3).reshape(num_kv_heads, tile_tokens, head_size).unsqueeze(1)
         )
 
         mask_tile = torch.cat(mask_tiles[group_start:group_end], dim=-1)
@@ -1256,9 +1252,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
         self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
         if self._page_group < 1:
-            raise ValueError(
-                f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}"
-            )
+            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}")
         if sliding_window is not None and self._page_group != 1:
             raise ValueError(
                 "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with sliding-window "
@@ -1266,8 +1260,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         if envs.SPYRE_BATCHED_DECODE and self._page_group != 1:
             raise ValueError(
-                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with "
-                "SPYRE_BATCHED_DECODE=1"
+                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with SPYRE_BATCHED_DECODE=1"
             )
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).

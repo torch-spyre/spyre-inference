@@ -53,12 +53,8 @@ def test_page_group_tail_matches_single_page_attention(query_len, page_group, wi
 
     query = torch.randn(query_len + 1, num_heads, head_size, generator=generator)
     query_rows = torch.arange(query_len, dtype=torch.int32)
-    k_pages = torch.randn(
-        num_pages, block_size, num_kv_heads, head_size, generator=generator
-    )
-    v_pages = torch.randn(
-        num_pages, block_size, num_kv_heads, head_size, generator=generator
-    )
+    k_pages = torch.randn(num_pages, block_size, num_kv_heads, head_size, generator=generator)
+    v_pages = torch.randn(num_pages, block_size, num_kv_heads, head_size, generator=generator)
     page_table = torch.zeros(num_blocks, 32, dtype=torch.int32)
     page_table[:, 0] = torch.tensor([6, 1, 7, 3, 2], dtype=torch.int32)
     masks = [torch.zeros(query_len, block_size) for _ in range(num_blocks)]

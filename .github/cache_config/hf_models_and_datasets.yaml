@@ -15,6 +15,7 @@ gated_models:
 
 public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
+  - mistralai/Ministral-3-14B-Instruct-2512-BF16
   - BAAI/bge-base-en-v1.5
   - sentence-transformers/all-MiniLM-L12-v2
   - ibm-granite/granite-embedding-125m-english
@@ -30,6 +31,8 @@ public_models:
     revision: 1504002f650e656a0a3789d99574df12e3e94ed0
   - repo: google/gemma-4-31B
     revision: 5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89
+  - repo: google/gemma-4-26B-A4B
+    revision: 24548b62aa021d562695c04aaf7758a1ea47990b
   - repo: google/gemma-4-E2B
     revision: d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f
   - repo: google/gemma-4-E4B

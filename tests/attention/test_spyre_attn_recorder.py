@@ -32,8 +32,11 @@ from vllm.logger import _print_warning_once
 
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    INT32_ELEMS_PER_STICK,
     SpyreAttentionImpl,
     SpyrePagedKVCache,
+    _build_query_row_tables,
+    _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
@@ -259,6 +262,78 @@ class TestRecordGraphs:
         for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
             variant = SpyreAttnBucket(metadata.padded_num_blocks[seq_idx], aligned)
             assert variant in recorded, f"sequence {seq_idx} dispatches unrecorded {variant}"
+
+    def test_mixed_batch_row_tables_keep_their_own_width(self, impl, kv_cache):
+        """The recorded key is not enough: the row table's width is a guard too."""
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        metadata = _padded_mask_metadata(
+            [(32, 300), (1, 200), (1, 65)],
+            block_size=BLOCK_SIZE,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=NUM_PAGES,
+        )
+        aligned = metadata.aligned_query_lens
+        assert aligned[0] > 1 and aligned[1:] == [1, 1], "not a mixed batch"
+
+        row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
+
+        widths = [(t.shape[-1], _stick_aligned_len(al)) for t, al in zip(row_tables, aligned)]
+        assert all(got == want for got, want in widths), (
+            f"row-table widths {widths} (got, want) differ from the recorder's, so these "
+            "sequences dispatch to an unrecorded graph"
+        )
+
+    def test_mixed_batch_real_row_tables_compile_nothing(self, impl, kv_cache):
+        """The acceptance criterion, dispatched on the row tables the builder makes.
+
+        The other mixed-batch tests reach the kernel through ``_record_one``, which
+        rebuilds the row table itself and so cannot see a dispatcher/recorder drift.
+        """
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
+        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        metadata = _padded_mask_metadata(
+            [(32, 300), (1, 200), (1, 65)],
+            block_size=BLOCK_SIZE,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=NUM_PAGES,
+        )
+        assert metadata.padded_num_blocks is not None
+        row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
+        q_staging, out_staging = impl._staging_buffers(torch.device("cpu"))
+
+        snapshot = compiles()
+        for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
+            num_blocks = metadata.padded_num_blocks[seq_idx]
+            assert num_blocks <= NUM_PAGES, "variant would have been skipped when recording"
+            impl._attn_fn(
+                q_staging,
+                row_tables[seq_idx],
+                *kv_cache,
+                torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
+                [
+                    torch.zeros(aligned, BLOCK_SIZE, dtype=impl.model_dtype)
+                    for _ in range(num_blocks)
+                ],
+                impl.scale,
+                num_blocks,
+                aligned,
+                NUM_HEADS,
+                NUM_KV_HEADS,
+                HEAD_SIZE,
+                impl.logits_soft_cap,
+                None,
+                out_staging,
+            )
+
+        assert compiles() == snapshot
 
     def test_eager_records_nothing(self, impl, kv_cache):
         impl._compile_attn = False

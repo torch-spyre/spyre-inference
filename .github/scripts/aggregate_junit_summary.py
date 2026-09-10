@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Aggregate the sharded legs' JUnit XML into one $GITHUB_STEP_SUMMARY report.
+"""Aggregate the sharded legs' JUnit XML into one $GITHUB_STEP_SUMMARY report:
+a per-shard summary plus a searchable row for every test case.
 
 Each shard is labelled by its junit-<target>.xml file name.
 """
@@ -21,47 +22,39 @@ import argparse
 import os
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
+# emoji, word (word is plain text so a browser ctrl+f for "xpass" hits the row).
+STATUS_META = {
+    "error": ("🔥", "error"),
+    "fail": ("❌", "fail"),
+    "xpass": ("⚠️", "xpass"),
+    "xfail": ("🟡", "xfail"),
+    "skip": ("⏭️", "skip"),
+    "pass": ("✅", "pass"),
+}
+# Worst first, so a truncated table keeps the rows that matter.
+SEVERITY = {s: i for i, s in enumerate(STATUS_META)}
+
+# GitHub drops a step summary over 1 MiB; stay under with headroom.
+SUMMARY_BUDGET = 900_000
+
 
 @dataclass
-class Suite:
-    label: str
-    tests: int = 0
-    failures: int = 0
-    errors: int = 0
-    skipped: int = 0
-    time: float = 0.0
-
-    @property
-    def passed(self) -> int:
-        return self.tests - self.failures - self.errors - self.skipped
-
-
-@dataclass
-class Failure:
-    suite: str
+class Case:
+    shard: str
     test: str
-    kind: str
-    message: str
+    status: str
+    time: float
+    detail: str
 
 
 @dataclass
 class Report:
-    suites: list[Suite] = field(default_factory=list)
-    failures: list[Failure] = field(default_factory=list)
-
-    @property
-    def totals(self) -> Suite:
-        agg = Suite(label="TOTAL")
-        for s in self.suites:
-            agg.tests += s.tests
-            agg.failures += s.failures
-            agg.errors += s.errors
-            agg.skipped += s.skipped
-            agg.time += s.time
-        return agg
+    cases: list[Case]
+    shard_time: dict[str, float]
 
 
 def _suite_label(path: str) -> str:
@@ -70,9 +63,33 @@ def _suite_label(path: str) -> str:
 
 
 def _clean(text: str, limit: int = 240) -> str:
-    one_line = " ".join(text.split())
-    one_line = one_line.replace("|", "\\|")
+    one_line = " ".join(text.split()).replace("|", "\\|")
     return one_line[: limit - 1] + "…" if len(one_line) > limit else one_line
+
+
+def _classify(case: ET.Element) -> tuple[str, str]:
+    """(status, detail) for one <testcase>, mirroring pytest 9's JUnit shapes:
+    xfail -> <skipped type=pytest.xfail>; strict xpass -> <failure> whose message
+    is "[XPASS(strict)]…" (no type). Non-strict xpass is a bare <testcase>,
+    indistinguishable from a pass, so it can only ever read as "pass"."""
+    err = case.find("error")
+    if err is not None:
+        return "error", _detail(err)
+    fail = case.find("failure")
+    if fail is not None:
+        ftype = (fail.get("type") or "").lower()
+        if "xfail" in ftype or (fail.get("message") or "").startswith("[XPASS"):
+            return "xpass", _detail(fail)
+        return "fail", _detail(fail)
+    skipped = case.find("skipped")
+    if skipped is not None:
+        kind = "xfail" if "xfail" in (skipped.get("type") or "").lower() else "skip"
+        return kind, _detail(skipped)
+    return "pass", ""
+
+
+def _detail(child: ET.Element) -> str:
+    return _clean(child.get("message") or (child.text or "").strip() or "(no message)")
 
 
 def _case_id(case: ET.Element) -> str:
@@ -81,11 +98,7 @@ def _case_id(case: ET.Element) -> str:
     return f"{classname}::{name}" if classname else name
 
 
-def _failure_message(child: ET.Element) -> str:
-    return _clean(child.get("message") or (child.text or "").strip() or "(no message)")
-
-
-def parse_file(path: str) -> tuple[Suite, list[Failure]] | None:
+def parse_file(path: str) -> tuple[str, float, list[Case]] | None:
     try:
         root = ET.parse(path).getroot()
     except (OSError, ET.ParseError) as e:
@@ -93,75 +106,112 @@ def parse_file(path: str) -> tuple[Suite, list[Failure]] | None:
         return None
 
     label = _suite_label(path)
-    suite = Suite(label=label)
-    failures: list[Failure] = []
-    # Root is either <testsuites><testsuite>…</testsuites> or a bare <testsuite>.
+    # Root is either <testsuites><testsuite>… or a bare <testsuite>.
     testsuites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    total_time = 0.0
+    cases: list[Case] = []
     for ts in testsuites:
-        suite.time += float(ts.get("time") or 0.0)
+        total_time += float(ts.get("time") or 0.0)
         for case in ts.findall("testcase"):
-            suite.tests += 1
-            fail = case.find("failure")
-            err = case.find("error")
-            if case.find("skipped") is not None:
-                suite.skipped += 1
-            elif fail is not None:
-                suite.failures += 1
-                failures.append(Failure(label, _case_id(case), "fail", _failure_message(fail)))
-            elif err is not None:
-                suite.errors += 1
-                failures.append(Failure(label, _case_id(case), "error", _failure_message(err)))
-
-    return suite, failures
+            status, detail = _classify(case)
+            cases.append(
+                Case(label, _case_id(case), status, float(case.get("time") or 0.0), detail)
+            )
+    return label, total_time, cases
 
 
 def build_report(paths: list[str]) -> Report:
-    report = Report()
+    cases: list[Case] = []
+    shard_time: dict[str, float] = {}
     for path in sorted(paths):
         parsed = parse_file(path)
         if parsed is None:
             continue
-        suite, failures = parsed
-        report.suites.append(suite)
-        report.failures.extend(failures)
-    return report
+        label, total_time, shard_cases = parsed
+        shard_time[label] = total_time
+        cases.extend(shard_cases)
+    return Report(cases, shard_time)
+
+
+def _shard_table(report: Report) -> list[str]:
+    lines = ["| Shard | Tests | ✅ | ❌ | 🔥 | ⚠️ | 🟡 | ⏭️ | ⏱️ |"]
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|")
+    by_shard: dict[str, list[Case]] = {}
+    for c in report.cases:
+        by_shard.setdefault(c.shard, []).append(c)
+    for shard in sorted(by_shard, key=lambda s: (-_broken(by_shard[s]), s)):
+        n = Counter(c.status for c in by_shard[shard])
+        lines.append(
+            f"| {shard} | {len(by_shard[shard])} | {n['pass']} | {n['fail']} | "
+            f"{n['error']} | {n['xpass']} | {n['xfail']} | {n['skip']} | "
+            f"{report.shard_time.get(shard, 0.0):.0f}s |"
+        )
+    return lines
+
+
+def _broken(cases: list[Case]) -> int:
+    return sum(c.status in ("fail", "error", "xpass") for c in cases)
+
+
+def _case_table(report: Report) -> list[str]:
+    def row(c: Case) -> str:
+        emoji, word = STATUS_META[c.status]
+        return f"| {c.shard} | `{c.test}` | {emoji} {word} | {c.time:.1f}s | {c.detail} |"
+
+    ordered = sorted(report.cases, key=lambda c: (SEVERITY[c.status], c.shard, c.test))
+    header = ["| Shard | Test | Status | Time | Details |", "|---|---|---|--:|---|"]
+    # Non-passing rows always survive; passes fill whatever budget is left.
+    lines = header + [row(c) for c in ordered if c.status != "pass"]
+    used = len("\n".join(lines).encode())
+    omitted = 0
+    for c in (c for c in ordered if c.status == "pass"):
+        r = row(c)
+        if used + len(r.encode()) + 1 > SUMMARY_BUDGET:
+            omitted += 1
+            continue
+        lines.append(r)
+        used += len(r.encode()) + 1
+    if omitted:
+        lines.append("")
+        lines.append(f"> {omitted} passing cases omitted to fit the summary size limit.")
+    return lines
 
 
 def render(report: Report) -> str:
-    t = report.totals
-    broken = t.failures + t.errors
-    status = "❌" if broken else ("⚠️" if t.tests == 0 else "✅")
-    lines: list[str] = []
-    lines.append("## Aggregate test report")
-    lines.append("")
-    lines.append(
-        f"{status} **{t.passed}/{t.tests} passed** across {len(report.suites)} "
-        f"shards — {t.failures} failed, {t.errors} errored, {t.skipped} skipped "
-        f"({t.time:.0f}s)."
-    )
-    lines.append("")
+    n = Counter(c.status for c in report.cases)
+    total = len(report.cases)
+    status = "❌" if _broken(report.cases) else ("⚠️" if total == 0 else "✅")
+    time = sum(report.shard_time.values())
 
-    lines.append("| Shard | Tests | ✅ | ❌ | 🔥 | ⏭️ | ⏱️ |")
-    lines.append("|---|--:|--:|--:|--:|--:|--:|")
-    for s in sorted(report.suites, key=lambda s: (-(s.failures + s.errors), s.label)):
-        lines.append(
-            f"| {s.label} | {s.tests} | {s.passed} | {s.failures} | "
-            f"{s.errors} | {s.skipped} | {s.time:.0f}s |"
-        )
-    lines.append("")
+    lines = [
+        "## Aggregate test report",
+        "",
+        f"{status} **{n['pass']}/{total} passed** across {len(report.shard_time)} "
+        f"shards — {n['fail']} failed, {n['error']} errored, {n['xpass']} xpassed, "
+        f"{n['xfail']} xfailed, {n['skip']} skipped ({time:.0f}s).",
+        "",
+        *_shard_table(report),
+        "",
+        "### All test cases",
+        "",
+        *_case_table(report),
+    ]
+    if n["xfail"] or n["xpass"]:
+        lines += [
+            "",
+            "> A non-strict `xfail` that passes reads as a plain pass in JUnit XML "
+            "and is counted as passed; only strict xpass shows as `xpass`.",
+        ]
+    return "\n".join(lines) + "\n"
 
-    if report.failures:
-        lines.append(f"### Failures ({len(report.failures)})")
-        lines.append("")
-        lines.append("| Shard | Test | Message |")
-        lines.append("|---|---|---|")
-        for f in report.failures:
-            mark = "🔥" if f.kind == "error" else "❌"
-            lines.append(f"| {f.suite} | {mark} `{f.test}` | {f.message} |")
+
+def _emit(markdown: str) -> None:
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(markdown)
     else:
-        lines.append("All tests passed 🎉")
-    lines.append("")
-    return "\n".join(lines)
+        print(markdown)
 
 
 def main() -> None:
@@ -175,17 +225,7 @@ def main() -> None:
         _emit(msg + "\n")
         return
 
-    report = build_report(args.inputs)
-    _emit(render(report))
-
-
-def _emit(markdown: str) -> None:
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    if summary:
-        with open(summary, "a") as f:
-            f.write(markdown)
-    else:
-        print(markdown)
+    _emit(render(build_report(args.inputs)))
 
 
 if __name__ == "__main__":

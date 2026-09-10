@@ -644,7 +644,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
-        # `torch.float16` upstream so it's always a real torch.dtype here.
+        # `torch.float16`/`torch.bfloat16` upstream, so it's always a real
+        # torch.dtype here.
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
@@ -1096,7 +1097,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 mask_bs_bb = torch.full(
                     (b_seqs, b_blocks, block_size),
                     float("-inf"),
-                    dtype=torch.float16,
+                    dtype=self.model_dtype,
                 )
                 for s in range(num_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
@@ -1106,7 +1107,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.
                 # Holds under a window too: first_active <= num_blocks - 1.
-                mask_bs_bb[num_seqs:, 0] = torch.finfo(torch.float16).min
+                mask_bs_bb[num_seqs:, 0] = torch.finfo(self.model_dtype).min
                 # 4-D, not 5-D: the kernel slices dim 0 per block, and a dim-0 slice
                 # of a 5-D base fails torch-spyre layout propagation.
                 mask_by_block_cpu = (
@@ -1152,6 +1153,8 @@ class SpyreAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
+        # For checkpoints that overflow fp16 (see TorchSpyrePlatform._default_dtype).
+        torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -1242,12 +1245,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        # Resolved before the ALiBi slopes below, which are built at this dtype.
+        # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
+        _dtype = get_current_vllm_config().model_config.dtype
+        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
         # cleanly against the score-tile shape.
         if alibi_slopes is not None:
-            slopes_t = torch.tensor(alibi_slopes, dtype=torch.float16)
+            slopes_t = torch.tensor(alibi_slopes, dtype=self.model_dtype)
             if slopes_t.numel() != num_heads:
                 raise ValueError(
                     f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
@@ -1262,11 +1270,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # can bake it as a closure constant. logits_soft_cap == 0.0 disables
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
-
-        # The recorder needs the model's dtype to fabricate dummy args.
-        # TorchSpyrePlatform.check_and_update_config enforces float16 upstream.
-        _dtype = get_current_vllm_config().model_config.dtype
-        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
@@ -1792,7 +1795,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     kv_pos = torch.arange(
                         b * block_size,
                         (b + 1) * block_size,
-                        dtype=torch.float16,
+                        dtype=self.model_dtype,
                     )
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
                     bias = self.alibi_slopes * rel

@@ -14,7 +14,8 @@
 
 """
 Offline inference on Spyre through the vision path: image+text (ChartQA) prompts
-against a Pixtral vision tower with a Mistral/Ministral decoder.
+against a vision tower + text decoder. Supports Pixtral/Ministral (Mistral-format
+config) and Gemma 4 (HF-format config, e.g. google/gemma-4-26B-A4B).
 
 See torch_spyre_inference.py for the text-only equivalent.
 
@@ -66,7 +67,31 @@ def parse_args():
         dest="enforce_eager",
         help="Skip torch.compile (whole model and attention kernel), run in eager mode",
     )
+    parser.add_argument(
+        "--config-format",
+        type=str,
+        default=None,
+        dest="config_format",
+        help=(
+            "vLLM config_format for --model. Defaults to 'mistral' for a "
+            "mistral/ministral/pixtral model name, 'hf' otherwise (explicit, not "
+            "'auto': 'auto's mistral probe is a live Hub call)."
+        ),
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        help=(
+            "Leave as auto: the platform picks float16, or bfloat16 for checkpoints "
+            "that overflow it"
+        ),
+    )
     return parser.parse_args()
+
+
+def _default_config_format(model: str) -> str:
+    return "mistral" if any(name in model.lower() for name in ("mistral", "pixtral")) else "hf"
 
 
 _CHARTQA = "https://raw.githubusercontent.com/vis-nlp/ChartQA/main/ChartQA%20Dataset/test/png/"
@@ -142,17 +167,16 @@ def run_multimodal(args):
             print(f"WARNING: {url} failed ({exc}); reusing the first image.")
             prepared.append((prepared[0][0], question, expected))
 
+    config_format = args.config_format or _default_config_format(args.model)
     llm = LLM(
         model=args.model,
         tokenizer=args.model,
-        # Explicit, not `auto`: auto's mistral probe is a live Hub call, so passing a
-        # repo id on an offline host loads the unpatched HF tower instead.
-        config_format="mistral",
+        config_format=config_format,
         max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         tensor_parallel_size=args.tp,
         max_num_batched_tokens=args.max_num_batched_tokens,
-        dtype="float16",
+        dtype=args.dtype,
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
         limit_mm_per_prompt={"image": 1},

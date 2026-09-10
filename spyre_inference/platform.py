@@ -47,6 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
+# Dtypes torch-spyre can run. Both are 2 bytes wide, so the 64-element stick
+# alignment every constant in this plugin is derived from holds for either.
+_SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
+
 
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
@@ -297,10 +301,39 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_capture_size,
             )
 
-        # In check_and_update_config we assert this must be float16 for spyre.
+        # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
-        vllm_config.model_config.dtype = torch.float16
+        vllm_config.model_config.dtype = cls._default_dtype(vllm_config)
+
+    @classmethod
+    def _default_dtype(cls, vllm_config: VllmConfig) -> torch.dtype:
+        """float16, except multimodal gemma-4, which overflows it to NaN logits.
+
+        Scoped to the vision checkpoints on purpose: text-only gemma-4 is validated in
+        fp16 here, and widening this would change the dtype of existing deployments.
+
+        Runs after vLLM resolved ``model_config.dtype``, so an explicit ``--dtype`` is
+        indistinguishable from ``auto``; the decision comes from the config instead.
+
+        The choice is recorded on the ``ModelConfig`` because this hook runs again for
+        the nested text config a multimodal model builds its decoder from
+        (``VllmConfig.with_hf_config``). That nested config has no ``vision_config``, so
+        re-deciding would downgrade the decoder to fp16 while its weights stayed bf16 --
+        which disagrees with ``head_dtype`` and silently diverts the lm-head onto a
+        fallback path. ``with_hf_config`` deep-copies the config, so the marker rides along.
+        """
+        from spyre_inference.models.gemma4 import is_multimodal_gemma4
+
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_config", None)
+        already_chosen = getattr(model_config, "_spyre_requires_bfloat16", False)
+        if already_chosen or (hf_config is not None and is_multimodal_gemma4(hf_config)):
+            if not already_chosen:
+                logger.info("Selecting torch.bfloat16: this checkpoint overflows float16.")
+            model_config._spyre_requires_bfloat16 = True
+            return torch.bfloat16
+        return torch.float16
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
@@ -493,12 +526,14 @@ class TorchSpyrePlatform(CpuPlatform):
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
-            # Check if the model dtype is different from float16,
-            # which is only currently supported in torch-spyre
-            if vllm_config.model_config.dtype != torch.float16:
+            # float16 is the Spyre default; bfloat16 is accepted for checkpoints that
+            # overflow it (see _default_dtype). Both are 2 bytes, so every stick
+            # alignment constant in this plugin is unaffected by the choice.
+            if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
+                supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
-                    f"The model dtype needs to be torch.float16 for spyre, "
-                    f"but was specified to be {vllm_config.model_config.dtype}"
+                    f"The model dtype needs to be one of {supported} for spyre, but "
+                    f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.

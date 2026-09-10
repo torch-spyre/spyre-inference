@@ -52,12 +52,18 @@ _GEMMA4_FULL_ATTENTION_ATTRS = {
 }
 
 
-def _gemma4_text_backbone_override(config: Any) -> Any:
-    # Module-level (not a closure) so it survives the pickle to EngineCore.
-    config.architectures = ["Gemma4ForCausalLM"]
+def _gemma4_repair_head_dim_access(config: Any) -> None:
+    """Let bare reads (config.head_dim, config.num_key_value_heads) return the
+    sliding/global scalar, matching vLLM's sliding-layer path.
+
+    This is the transformers>=5.16 heterogeneous-config repair
+    (``force_text_backbone``'s docstring) applied in place. It's needed whether or
+    not the checkpoint is multimodal: the ambiguous per-layer read lives in
+    ``Gemma4TextConfig`` regardless of whether a sibling ``vision_config``/
+    ``audio_config`` is also present, so a VLM checkpoint's nested ``text_config``
+    needs the exact same fix as a plain text checkpoint's top-level config.
+    """
     text_config = getattr(config, "text_config", config)
-    # Let bare reads (config.head_dim, config.num_key_value_heads) return the
-    # sliding/global scalar, matching vLLM's sliding-layer path.
     for cfg in {id(config): config, id(text_config): text_config}.values():
         cfg.allow_global_per_layer_attribute_access = True
     per_layer = getattr(text_config, "per_layer_config", None)
@@ -70,6 +76,23 @@ def _gemma4_text_backbone_override(config: Any) -> Any:
             values = {getattr(per_layer[i], src_attr) for i in full_idx}
             if len(values) == 1:
                 setattr(text_config, global_attr, values.pop())
+
+
+def _gemma4_text_backbone_override(config: Any) -> Any:
+    # Module-level (not a closure) so it survives the pickle to EngineCore.
+    config.architectures = ["Gemma4ForCausalLM"]
+    _gemma4_repair_head_dim_access(config)
+    return config
+
+
+def _gemma4_multimodal_head_dim_override(config: Any) -> Any:
+    """Repair the same heterogeneous-config head-dim access on a real multimodal
+    Gemma4Config, without touching ``architectures`` -- vision/audio stay intact so
+    vLLM resolves ``Gemma4ForConditionalGeneration`` normally. Needed because that
+    class builds its nested text decoder via ``init_vllm_registered_model(hf_config=
+    config.text_config, ...)``, which re-triggers the same bare ``head_dim`` read.
+    """
+    _gemma4_repair_head_dim_access(config)
     return config
 
 
@@ -79,13 +102,25 @@ def _gemma4_text_backbone_override(config: Any) -> Any:
 _GEMMA4_TEXT_MODEL_TYPES = {"gemma4", "gemma4_text"}
 
 
+def is_multimodal_gemma4(hf_config: Any) -> bool:
+    """True for a gemma-4 config carrying a vision tower. Audio is out of scope."""
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return False
+    return getattr(hf_config, "vision_config", None) is not None
+
+
 def force_text_backbone(engine_args: EngineArgs) -> None:
-    """Default gemma-4 to its text-only backbone and repair its head-dim config.
+    """Repair gemma-4's head-dim config; default a plain text checkpoint to its
+    text-only backbone.
 
     transformers >=5.16 reclassifies gemma-4 as heterogeneous: a bare ``config.head_dim``
     read then raises (crashing vLLM's ``get_head_size``) and the ``global_*`` head/kv-head
     attributes vLLM needs are consumed into ``per_layer_config``. The override restores the
     <=5.14 view before ``ModelConfig`` is built; skipped when the user set ``hf_overrides``.
+
+    A vision checkpoint gets the same head-dim repair but keeps its real
+    ``architectures``; forcing ``Gemma4ForCausalLM`` there would strip the tower. An
+    audio-only checkpoint is rejected rather than silently reduced to text.
     """
     if engine_args.hf_overrides:
         return
@@ -107,6 +142,26 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
         return
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
         return
+    has_audio = getattr(hf_config, "audio_config", None) is not None
+    # A multimodal Gemma4Config reports the same model_type as a text checkpoint, and
+    # the head-dim repair below is unrelated to multimodality -- so repair it but keep
+    # the real architectures, or the vision tower is stripped off.
+    if is_multimodal_gemma4(hf_config):
+        if has_audio:
+            logger.warning(
+                "gemma-4: this checkpoint has an audio tower, which is not supported on "
+                "Spyre; image and text inputs work, audio input will fail."
+            )
+        engine_args.hf_overrides = _gemma4_multimodal_head_dim_override
+        logger.info("gemma-4: repairing head-dim config access for a multimodal checkpoint.")
+        return
+    if has_audio:
+        # Falling through would force the text-only backbone and silently drop the
+        # tower, leaving a model that looks fine but ignores its audio inputs.
+        raise NotImplementedError(
+            "gemma-4 audio is not supported on Spyre, and this checkpoint has an audio "
+            "tower but no vision tower. Use a text-only or vision checkpoint."
+        )
     engine_args.hf_overrides = _gemma4_text_backbone_override
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 

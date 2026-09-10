@@ -306,6 +306,7 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        model_dtype: torch.dtype = torch.float16,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -313,6 +314,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_model_dtype", model_dtype)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -367,7 +369,7 @@ class _SpyreModelWrapper:
 
         def _to_spyre_float(t):
             if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
+                return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
@@ -604,6 +606,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     @staticmethod
@@ -1182,6 +1185,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def _model_dtype(self) -> torch.dtype:
+        """The activation dtype the platform settled on (float16, or bfloat16 for
+        checkpoints that overflow it). Resolved to a real ``torch.dtype`` by
+        ``TorchSpyrePlatform.check_and_update_config``."""
+        dtype = self.model_config.dtype
+        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
@@ -1218,8 +1228,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
             # Host-allocated then transferred: only .to() takes a device_layout.
+            # The KV cache carries activations, so it follows the model dtype
+            # (float16, or bfloat16 for checkpoints that overflow it).
+            kv_dtype = self._model_dtype()
             layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, kv_dtype
             )
 
             k_pages = torch.zeros(
@@ -1227,14 +1240,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
-                dtype=torch.float16,
+                dtype=kv_dtype,
             ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
             v_pages = torch.zeros(
                 num_blocks,
                 spec.block_size,
                 spec.num_kv_heads,
                 spec.head_size,
-                dtype=torch.float16,
+                dtype=kv_dtype,
             ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
@@ -1287,14 +1300,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> SpyreCpuGpuBuffer:
         """Create a SpyreCpuGpuBuffer with float tensors on Spyre.
 
-        - Float dtypes: .cpu on CPU, .gpu on Spyre as float16
+        - Float dtypes: .cpu on CPU, .gpu on Spyre at the model dtype
         - Int/bool dtypes: .gpu aliased to .cpu (stays on CPU)
         """
         if dtype.is_floating_point:
             return SpyreCpuGpuBuffer(
                 *size,
                 cpu_dtype=dtype,
-                gpu_dtype=torch.float16,
+                gpu_dtype=self._model_dtype(),
                 device=self._spyre_device,
                 pin_memory=False,
                 with_numpy=numpy,

@@ -577,3 +577,47 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
         configure_threading(worker_count=1)
+
+
+def test_default_dtype_selects_bfloat16_for_a_multimodal_gemma4_config():
+    """The hook runs after vLLM resolved ``model_config.dtype``, so it decides from the
+    model config rather than the user's flag."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
+    text_cfg = SimpleNamespace(model_type="gemma4", vision_config=None, audio_config=None)
+
+    def _config(hf_config):
+        return SimpleNamespace(model_config=SimpleNamespace(hf_config=hf_config))
+
+    assert TorchSpyrePlatform._default_dtype(_config(vision_cfg)) is torch.bfloat16
+    assert TorchSpyrePlatform._default_dtype(_config(text_cfg)) is torch.float16
+    # No hf_config at all (bare VllmConfig) must not crash.
+    assert TorchSpyrePlatform._default_dtype(_config(None)) is torch.float16
+
+
+def test_default_dtype_keeps_bfloat16_for_the_nested_text_config():
+    """``with_hf_config`` re-runs this hook with the bare text half, which has no
+    ``vision_config``. Deciding afresh there would downgrade the decoder to fp16 while
+    its weights stay bf16 -- a mismatch that silently diverts the lm-head.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vision_cfg = SimpleNamespace(model_type="gemma4", vision_config=object(), audio_config=None)
+    model_config = SimpleNamespace(hf_config=vision_cfg)
+    outer = SimpleNamespace(model_config=model_config)
+
+    assert TorchSpyrePlatform._default_dtype(outer) is torch.bfloat16
+
+    # with_hf_config deep-copies the ModelConfig and swaps in the text half.
+    import copy
+
+    nested_model_config = copy.deepcopy(model_config)
+    nested_model_config.hf_config = SimpleNamespace(
+        model_type="gemma4_text", vision_config=None, audio_config=None
+    )
+    nested = SimpleNamespace(model_config=nested_model_config)
+
+    assert TorchSpyrePlatform._default_dtype(nested) is torch.bfloat16, (
+        "the nested text config must inherit bf16, not fall back to fp16"
+    )

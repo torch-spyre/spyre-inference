@@ -286,6 +286,7 @@ markers = [
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
+    "gemma4_vision: Gemma-4 vision-tower patch tests (tests/multimodal/test_gemma4_vision.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
 ]
 # --8<-- [end:test-markers-definition]

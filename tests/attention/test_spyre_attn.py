@@ -1256,6 +1256,15 @@ def test_kv_cache_shape_matches_runner_allocation():
         assert pages.device_tensor_layout().device_size[0] == num_slots
 
 
+def test_supported_dtypes_includes_bfloat16():
+    """bf16 has to be declared here too, or backend selection rejects a checkpoint
+    TorchSpyrePlatform picked bf16 for (Gemma-4 vision, which overflows fp16)."""
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    assert torch.float16 in SpyreAttentionBackend.supported_dtypes
+    assert torch.bfloat16 in SpyreAttentionBackend.supported_dtypes
+
+
 def test_sliding_window_none_equivalence(default_vllm_config):
     """Verify sliding_window=None produces identical results to full attention.
 

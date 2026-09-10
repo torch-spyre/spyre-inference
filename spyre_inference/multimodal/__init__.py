@@ -21,7 +21,7 @@ implementations by layer class.
 
 import torch
 
-from . import pixtral
+from . import gemma4_vision, pixtral
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -31,8 +31,19 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
     # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
-    # Mistral3 `vision_tower`. Ungated, the patches rewrite vLLM's shared module.
-    if not any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
+    # Mistral3 and Gemma 4 `vision_tower`. Ungated, the patches rewrite vLLM's shared
+    # module. Explicit `is not None` rather than `or`: a tower is an nn.Module, and
+    # container modules are falsy when empty.
+    vision_tower = getattr(model, "vision_tower", None)
+    if vision_tower is None:
+        vision_tower = getattr(model, "vision_encoder", None)
+    if vision_tower is None:
+        return
+
+    # Gemma4VisionModel is a stock transformers class, not vLLM's Pixtral -- dispatch
+    # by class name rather than the shared `vision_tower` attribute name.
+    if type(vision_tower).__name__ == "Gemma4VisionModel":
+        gemma4_vision.apply(model, device)
         return
 
     pixtral.apply(model, device)

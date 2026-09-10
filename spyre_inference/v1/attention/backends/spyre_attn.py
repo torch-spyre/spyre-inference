@@ -226,8 +226,11 @@ def _build_query_row_tables(
         last_real = max(int(lens[s]) - 1, 0)
         rows[s, :aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
     rows_dev = convert(rows, device=device)
-    # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770).
-    return [rows_dev[s].clone() for s in range(num_seqs)]
+    # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770), each
+    # narrowed to the width the recorder traced for that query length, not the batch max.
+    return [
+        rows_dev[s, : _stick_aligned_len(aligned_query_lens[s])].clone() for s in range(num_seqs)
+    ]
 
 
 def _page_attn_kernel(

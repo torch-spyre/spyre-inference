@@ -931,6 +931,8 @@ jobs:
           # true -> "1" (bypass uv, use the baked venv's python3 directly),
           # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
+          # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
+          SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
         run: |
           echo "Running vLLM benchmark suite (TEST_TYPE=perf)..."
           make tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}" \

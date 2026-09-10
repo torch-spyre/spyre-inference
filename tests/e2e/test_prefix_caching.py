@@ -15,7 +15,6 @@
 """Prefix-caching (APC) end-to-end tests for the Spyre backend."""
 
 import pytest
-
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.config import AttentionConfig

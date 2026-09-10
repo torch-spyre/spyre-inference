@@ -164,7 +164,7 @@ class TestRecordGraphs:
         metadata for unbucketed kv_lens through ``SpyreAttentionMetadataBuilder``
         and dispatches on the block counts ``build()`` actually produced.
         """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         # Built from the live config, not make_bucketer's narrower stand-in, so
         # this bucketer and the builder's derive from the same config.
@@ -192,7 +192,7 @@ class TestRecordGraphs:
 
     def test_mixed_batch_dispatch_compiles_nothing(self, impl, kv_cache):
         """A mixed batch dispatches two query widths; both must be recorded."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         bucketer = SpyreAttnBucketer(get_current_vllm_config())
         impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
@@ -227,7 +227,7 @@ class TestRecordGraphs:
         three query buckets, and only bites when a chunk is wider than another
         sequence's padded KV, so the other recorder tests never reach it.
         """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         cfg = get_current_vllm_config()
         monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
@@ -265,7 +265,7 @@ class TestRecordGraphs:
 
     def test_mixed_batch_row_tables_keep_their_own_width(self, impl, kv_cache):
         """The recorded key is not enough: the row table's width is a guard too."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         metadata = _padded_mask_metadata(
             [(32, 300), (1, 200), (1, 65)],
@@ -292,7 +292,7 @@ class TestRecordGraphs:
         The other mixed-batch tests reach the kernel through ``_record_one``, which
         rebuilds the row table itself and so cannot see a dispatcher/recorder drift.
         """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         bucketer = SpyreAttnBucketer(get_current_vllm_config())
         impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)

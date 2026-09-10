@@ -94,6 +94,12 @@ class _Tail(CompileOutermost, nn.Module):
         return x * torch.rsqrt(variance + 1e-6) * self.weight, x
 
 
+class _ForcedNorm(CompileOutermost, nn.Module):
+    @compile_when_outermost(force_compile=True)
+    def kernel(self, x: torch.Tensor) -> torch.Tensor:
+        return x * 2
+
+
 def test_compiles_itself_on_the_first_outermost_call(compile_calls, mode) -> None:
     mode(CompilationMode.STOCK_TORCH_COMPILE)
     norm = _Norm()
@@ -133,6 +139,24 @@ def test_eager_mode_compiles_nothing(compile_calls, mode) -> None:
 
     norm.kernel(torch.ones(2))
 
+    assert compile_calls == []
+
+
+def test_forced_kernel_compiles_in_eager_mode(compile_calls, mode) -> None:
+    """A numerical-correctness kernel may opt out of enforce_eager."""
+    mode(CompilationMode.NONE)
+
+    assert torch.equal(_ForcedNorm().kernel(torch.ones(2)), torch.full((2,), 2.0))
+    assert len(compile_calls) == 1
+
+
+def test_forced_kernel_is_absorbed_by_an_enclosing_graph(compile_calls, mode, monkeypatch) -> None:
+    """Forced eager-mode compilation never nests inside Dynamo tracing."""
+    mode(CompilationMode.NONE)
+    norm = _ForcedNorm()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+
+    assert torch.equal(norm.kernel(torch.ones(2)), torch.full((2,), 2.0))
     assert compile_calls == []
 
 

@@ -28,7 +28,7 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-    @compile_when_outermost
+    @compile_when_outermost(force_compile=True)
     def forward_oot(
         self,
         x: torch.Tensor,

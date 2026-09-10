@@ -2302,7 +2302,10 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
   in the post-load hook, rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into the
   <code>[E,H,M]</code> / <code>[E,M,H]</code> layout those forms contract on, freeing each source stack as it goes,
-  since the device cannot hold both layouts at once. Each model's own adaptation module
+  since the device cannot hold both layouts at once. Tensor parallelism needs nothing
+  further: upstream shards each expert's intermediate dim, so the forms just see a
+  narrower <code>M</code> — zero-widened to whole sticks where a shard lands mid-stick — and
+  <code>MoERunner</code> all-reduces the per-rank partial sums. Each model's own adaptation module
   supplies its recipe and any model-owned scaling (<code>configure_gemma4_moe_layers</code> in
   <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> and <code>MoERunner</code> are untouched: vLLM
   reaches the experts through <code>torch.ops.vllm.moe_forward</code>, an opaque custom op, so the

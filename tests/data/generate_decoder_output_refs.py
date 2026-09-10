@@ -14,10 +14,9 @@
 
 """Write CPU HF greedy references for tests/e2e/test_model_quality.py.
 
-The models are too large to run through transformers in CI, so the references are
-generated here and checked in. Each run merges into the existing file.
+The models are too large to run through transformers in CI, so references are checked in.
+Each run merges into the existing file.
 
-    python tests/data/generate_decoder_output_refs.py
     python tests/data/generate_decoder_output_refs.py --models ibm-granite/granite-4.1-8b
 """
 
@@ -48,8 +47,7 @@ MODEL_REVISIONS = {
     "meta-llama/Llama-3.1-8B-Instruct": "0e9e39f249a16976918f6564b8830bc894c89659",
 }
 
-# Must stay within MAX_NUM_BATCHED_TOKENS (test_model_quality.py) so each prefill lands
-# in a single compiled bucket; that test asserts it before building its engine.
+# Must fit MAX_NUM_BATCHED_TOKENS (test_model_quality.py asserts this before it builds).
 _TEMPLATE = (
     "Below is an instruction that describes a task. Write a response that "
     "appropriately completes the request.\n\n### Instruction:\n{}\n\n### Response:"
@@ -60,8 +58,8 @@ PROMPTS = [
     _TEMPLATE.format("Convert char to string in Java."),
 ]
 
-# gemma-4 diverges from HF on the prompts above because torch-spyre runs RMSNorm in fp16;
-# short prompts match token for token. Drop these entries once it normalises in fp32.
+# torch-spyre runs RMSNorm in fp16, which diverges on the prompts above; short ones match
+# token for token. Drop once it normalises in fp32.
 _GEMMA4_PROMPTS = [
     "What are IBMs main businesses?",
     "The capital of France is",
@@ -82,8 +80,7 @@ def generate_reference(model_id: str, revision: str, dtype: torch.dtype) -> dict
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     model = AutoModelForCausalLM.from_pretrained(model_id, revision=revision, dtype=dtype)
     model.eval()
-    # The test runs with ignore_eos=True, so the reference needs all MAX_TOKENS steps.
-    model.generation_config.eos_token_id = None
+    model.generation_config.eos_token_id = None  # the test runs with ignore_eos=True
 
     results = []
     for prompt in MODEL_PROMPTS.get(model_id, PROMPTS):
@@ -96,7 +93,7 @@ def generate_reference(model_id: str, revision: str, dtype: torch.dtype) -> dict
                 return_dict_in_generate=True,
                 output_scores=True,
             )
-        # normalize_logits gives logprobs over the vocabulary, matching what vLLM reports.
+        # normalize_logits makes these vocabulary logprobs, matching what vLLM reports.
         logprobs = model.compute_transition_scores(
             output.sequences, output.scores, normalize_logits=True
         )[0]
@@ -134,7 +131,7 @@ def main() -> None:
         data[model_id] = generate_reference(
             model_id, MODEL_REVISIONS[model_id], getattr(torch, args.dtype)
         )
-        # Written per model so an interrupted run keeps what it already generated.
+        # Per model, so an interrupted run keeps what it generated.
         args.out.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
         print(f"Wrote {args.out}", flush=True)
 

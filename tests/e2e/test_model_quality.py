@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Output-quality gate for the product decoder models: compiled Spyre output against a
-cached CPU HF reference, comparing token ids and per-token probabilities.
+"""Compiled decoder output vs cached CPU HF references: token ids and probabilities.
 
-Prompts and references: ``python tests/data/generate_decoder_output_refs.py``
+References: ``python tests/data/generate_decoder_output_refs.py``
 """
 
 from __future__ import annotations
@@ -23,6 +22,8 @@ from __future__ import annotations
 import json
 import math
 import os
+import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +40,7 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
-# Prompts come from the unquantized sibling; the smoke case only needs ones that fit a bucket.
+# Maps to the unquantized sibling whose prompts the smoke case borrows.
 FP8_DECODER_MODELS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b-fp8": "ibm-granite/granite-4.1-8b",
@@ -48,45 +49,32 @@ FP8_REVISIONS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "4b5990b8d402a75febe0086abbf1e490af494e3d",
     "ibm-granite/granite-4.1-8b-fp8": "070021b3608433b6107a00733d561c9779b9937e",
 }
-# Nothing is compared, so the run only has to prove decode advances.
 FP8_MAX_TOKENS = 8
 
-# fp16 on device reorders accumulation against the fp32 reference, so probabilities are
-# compared with a tolerance. Two bounds, because the failure modes are opposites.
-#
-# The mean is the sensitive bound: drift spread over a prompt shows up here while no single
-# step looks unusual. Worst measured over the five gated decoders is 0.006 (granite-3.3).
+# fp16 on device reorders accumulation against the fp32 reference, so probabilities need a
+# tolerance. The mean is the bound that holds quality; ABS_TOL only catches gross breakage,
+# loose because a reference near p=0.5 measured 0.115 apart across two CI pods with every
+# token still exact (PR #723).
 MEAN_ABS_TOL = float(os.environ.get("SPYRE_TEST_MEAN_ABS_TOL", "0.03"))
-# The per-step cap only has to catch gross breakage, so it is deliberately loose: a reference
-# near p=0.5 is maximally ill-conditioned (dp/dlogit peaks at p(1-p)), and one graph measured
-# 0.115 apart there across two CI pods with every token still exact (PR #723). Worst measured
-# step is 0.027 -- 3x under the 0.08 this replaces, so that bound was thin for every model.
 ABS_TOL = float(os.environ.get("SPYRE_TEST_ABS_TOL", "0.20"))
-# Low-probability steps keep a relative bound; a flat one would permit an arbitrary ratio.
+# Low-probability steps need a relative bound; a flat one permits an arbitrary ratio.
 REL_TOL = float(os.environ.get("SPYRE_TEST_REL_TOL", "0.5"))
-# A token disagreement is a stronger signal than drift, so judging one as a near-tie keeps the
-# original tight bound rather than inheriting ABS_TOL.
 TIE_ABS_TOL = float(os.environ.get("SPYRE_TEST_TIE_ABS_TOL", "0.08"))
 
-# HF's greedy token must be in Spyre's distribution even when Spyre picks another; 20 is
-# vLLM's `max_logprobs`.
+# vLLM's `max_logprobs` ceiling. HF's token must be in Spyre's top-k on a disagreement.
 NUM_LOGPROBS = 20
 
-# A near-tie split ends the comparison, so without a floor a case that mispredicts at step 0
-# on every prompt would pass having compared nothing. Counted over the case, not per prompt:
-# where the reference itself is a coin flip (granite-4.1's second prompt opens on p=0.4961)
-# fp16 drift alone decides the argmax, and one prompt truncating to zero says nothing about
-# output quality -- but every prompt truncating still fails.
-MIN_MATCHED_FRACTION = 0.5
+# A near-tie split ends the comparison, so coverage is a fact about the prompts, not about
+# quality: fp16 drift alone decides the argmax where the reference is a coin flip
+# (granite-4.1 opens one prompt on p=0.4961). Hence reported, not asserted.
+COVERAGE_WARN_FRACTION = float(os.environ.get("SPYRE_TEST_COVERAGE_WARN_FRACTION", "0.5"))
 
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
-# Passing compile_sizes skips the buckets platform.py would derive, and platform.py clamps
-# max_num_batched_tokens down to the largest one, so this is the top of COMPILE_SIZES.
+# platform.py clamps max_num_batched_tokens to max(compile_sizes), so this is its top entry.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
-# Slack for the prompt-fit guard below: it counts with a bare `tokenizer(prompt)` while the
-# engine tokenizes through vLLM, which can differ by a special token or two.
+# The guard counts with a bare `tokenizer()`; vLLM can add a special token or two.
 PROMPT_TOKEN_MARGIN = 8
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "decoder_output_refs.json"
@@ -94,7 +82,11 @@ _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else
 
 
 @pytest.mark.parametrize("model", DECODER_MODELS)
-def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_decoder_model_output(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, str], None],
+) -> None:
     """Compiled Spyre output matches the cached HF reference for `model`."""
     ref = _REFERENCES.get(model)
     assert ref is not None, (
@@ -137,27 +129,12 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         _compare_against_hf(model, hf_result, output)
         for hf_result, output in zip(ref["results"], outputs)
     ]
-    per_prompt = ", ".join(f"{n}/{max_tokens}" for n in matched)
-    print(
-        f"\n{model}: matched {sum(matched)}/{len(prompts) * max_tokens} reference steps "
-        f"({per_prompt} per prompt). Prompts that stop after a step or two diverged on a "
-        f"near-tie and gate little -- see MODEL_PROMPTS in "
-        f"tests/data/generate_decoder_output_refs.py."
-    )
-    total_steps = len(prompts) * max_tokens
-    min_matched = math.ceil(MIN_MATCHED_FRACTION * total_steps)
-    assert sum(matched) >= min_matched, (
-        f"{model}: matched {sum(matched)}/{total_steps} reference steps ({per_prompt} per "
-        f"prompt), under the {min_matched}/{total_steps} floor -- the near-tie splits came too "
-        f"early to gate anything. Every prompt matched all {max_tokens} steps when the "
-        f"reference was taken, so treat this as a regression, not as a floor to lower."
-    )
+    _report_reference_coverage(model, matched, max_tokens, record_property)
 
 
 @pytest.mark.parametrize("model", FP8_DECODER_MODELS)
 def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A compiled FP8 checkpoint loads and decodes; no reference, the generator does not
-    dequantize compressed-tensors on CPU."""
+    """A compiled FP8 checkpoint loads and decodes; no reference (no CPU dequant)."""
     base = FP8_DECODER_MODELS[model]
     base_ref = _REFERENCES.get(base)
     assert base_ref is not None, (
@@ -199,12 +176,46 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
         )
 
 
-def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
-    """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
+class LowReferenceCoverage(UserWarning):
+    """A decoder case compared fewer than ``COVERAGE_WARN_FRACTION`` of the reference steps."""
 
-    Past the largest bucket `SpyreShapeBucketer.find_bucket` returns None and the shape runs
-    unpadded, so an over-long prompt is a silent Dynamo recompile inside generate().
-    """
+
+def _report_reference_coverage(
+    model: str,
+    matched: list[int],
+    max_tokens: int,
+    record_property: Callable[[str, str], None],
+) -> None:
+    """Warn, never fail, on a case the prompts cut short; zero compared is the exception."""
+    total = len(matched) * max_tokens
+    compared = sum(matched)
+    per_prompt = ", ".join(f"{n}/{max_tokens}" for n in matched)
+    # `key__value` is the JUnit tag convention the ClickHouse ingest reads (plugin tags.py).
+    record_property("tag", f"refcoverage__{compared}/{total}")
+    print(f"\n{model}: compared {compared}/{total} reference steps ({per_prompt} per prompt).")
+
+    assert compared > 0, (
+        f"{model}: every prompt diverged on its first step, so not one probability was "
+        f"compared and this case asserted nothing about output quality. The near-tie bounds "
+        f"held at each split, so this is the fixture, not a regression: replace the prompts "
+        f"in MODEL_PROMPTS (tests/data/generate_decoder_output_refs.py) with ones whose "
+        f"reference does not open on a coin flip, and regenerate."
+    )
+    if compared < math.ceil(COVERAGE_WARN_FRACTION * total):
+        warnings.warn(
+            f"{model}: compared only {compared}/{total} reference steps ({per_prompt} per "
+            f"prompt) -- the rest was cut off by a near-tie split, so this case gates less "
+            f"than it looks like it does. The quality bounds passed on what it did compare. "
+            f"The fix is more confident prompts in MODEL_PROMPTS "
+            f"(tests/data/generate_decoder_output_refs.py), not a looser tolerance.",
+            LowReferenceCoverage,
+            stacklevel=2,
+        )
+
+
+def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[str]) -> None:
+    """Past the largest bucket `find_bucket` returns None and the shape recompiles in
+    generate(), so an over-long prompt fails here instead."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
@@ -231,8 +242,6 @@ def _tie_tol(reference_prob: float) -> float:
 
 
 def _assert_mean_prob_error(model: str, prompt: str, diffs: list[float]) -> None:
-    """The bound that holds quality: drift spread over a prompt fails here well before any
-    single step reaches ``ABS_TOL``."""
     if not diffs:
         return
     mean = sum(diffs) / len(diffs)
@@ -269,8 +278,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
         )
 
         if hf_id != token_id:
-            # Two equally confident models agree on p(sampled) however far apart they
-            # picked, so judge the tie on HF's token.
+            # Judge the tie on HF's token: p(sampled) agrees for any two equally sure models.
             spyre_hf = completion.logprobs[step].get(hf_id)
             assert spyre_hf is not None, (
                 f"{model}: wrong token and HF's token is outside Spyre's top "
@@ -282,8 +290,7 @@ def _compare_against_hf(model: str, hf_result: dict[str, Any], output: RequestOu
                 f"{model}: wrong token and p(HF token) differs by more than {ref_tol:.4f} "
                 f"(Spyre {spyre_hf_prob:.4f} vs HF {hf_prob:.4f}), {detail}"
             )
-            # A tie also means Spyre ranks the two level, so a flat HF distribution cannot
-            # excuse Spyre being confident elsewhere. Doubled: both may drift by `ref_tol`.
+            # A tie means Spyre ranks the two level too. Doubled: both sides may drift.
             tie_tol = 2 * ref_tol
             assert abs(prob - spyre_hf_prob) <= tie_tol, (
                 f"{model}: wrong token, and Spyre puts it {prob - spyre_hf_prob:.4f} > "

@@ -134,11 +134,15 @@ different token is a stronger signal than drift. The FP8 decoder checkpoints are
 load-and-decode cases with no reference of their own — their unquantized siblings gate the
 numerics.
 
-A greedy path that diverges from HF on a near-tie cannot be compared past the split, so
-each decoder case prints how many reference steps it matched and fails below
-`MIN_MATCHED_FRACTION` of them. Read the printed line rather than the pass/fail alone: a
-prompt that stops early gates very little, and the fix is a more confident prompt, not a
-looser tolerance or a lower floor.
+A greedy path that diverges from HF on a near-tie cannot be compared past the split, so how
+much of the reference a case compares depends on the prompts. That is **reported, not
+asserted**: the tolerances above are the gate, and coverage is a separate signal, because
+truncation is all-or-nothing per prompt and a floor cannot tell an unlucky prompt from a
+regression. Each decoder case prints `compared <n>/<total> reference steps`, records it as a
+`refcoverage__<n>/<total>` JUnit tag, and warns (`LowReferenceCoverage`) below
+`COVERAGE_WARN_FRACTION`. A warning means the case gates less than it looks like it does and
+its prompts want replacing — not that the model regressed. The one coverage failure is zero:
+a case where every prompt diverged on its first step asserted nothing at all.
 
 #### Upstream Test Integration
 

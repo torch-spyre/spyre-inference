@@ -32,8 +32,8 @@ EMBEDDING_MODELS = [
     "sentence-transformers/all-roberta-large-v1",
 ]
 
-# Written into the JSON per model and read back by the test, so the gate loads the same
-# weights measured here and an upstream re-upload cannot redefine what it compares against.
+# Written into the JSON and read back by the test, so an upstream re-upload cannot redefine
+# what the gate compares against.
 MODEL_REVISIONS = {
     "ibm-granite/granite-embedding-125m-english": "4ab61ffd423be45cd932b21a7c696063d82bf45f",
     "ibm-granite/granite-embedding-278m-multilingual": "a9cb5338491faf32b73dd17b714a31821c021bbf",

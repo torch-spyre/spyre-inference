@@ -16,7 +16,6 @@
 
 Each run merges into the existing file.
 
-    python tests/data/generate_rerank_score_refs.py
     python tests/data/generate_rerank_score_refs.py --models BAAI/bge-reranker-large
 """
 
@@ -41,8 +40,8 @@ MODEL_REVISIONS = {
     "BAAI/bge-reranker-large": "55611d7bca2a7133960a6d3b71e083071bbfc312",
 }
 
-# One query against documents a reranker should separate widely, most relevant first: the
-# ranking gate needs neighbouring scores farther apart than the tolerance each can drift.
+# Most relevant first. The ranking gate needs neighbours farther apart than the tolerance
+# each score may drift, so the documents have to separate widely.
 QUERY = "What is the capital of France?"
 DOCUMENTS = [
     "The capital of France is Paris.",
@@ -54,7 +53,7 @@ DOCUMENTS = [
 ]
 
 # bge-reranker-large scores every Paris-adjacent document above 0.9994, so on the shared
-# list its top five land within fp16 noise of each other and their order is arbitrary.
+# list its top five sit inside fp16 noise and their order is arbitrary.
 MODEL_DOCUMENTS = {
     "BAAI/bge-reranker-large": [
         "The capital of France is Paris.",
@@ -65,8 +64,7 @@ MODEL_DOCUMENTS = {
     ],
 }
 
-# Scores span ~1e-5 to ~1 and the test bounds small ones *relatively*, so a fixed number
-# of decimals has to keep several significant digits at the bottom of that range.
+# The test bounds small scores relatively, and they reach ~1e-5.
 _ROUND = 8
 
 OUT_PATH = Path(__file__).parent / "rerank_score_refs.json"
@@ -82,14 +80,12 @@ def generate_reference(model_id: str, revision: str) -> dict[str, Any]:
     documents = MODEL_DOCUMENTS.get(model_id, DOCUMENTS)
     scores = []
     for document in documents:
-        # The same tokenizer call vLLM's cross-encoder io_processor makes, one pair at a
-        # time so no padding reaches the reference.
+        # vLLM's cross-encoder io_processor call, one pair at a time so nothing is padded.
         inputs = tokenizer(text=QUERY, text_pair=document, return_tensors="pt")
         with torch.inference_mode():
             logit = model(**inputs).logits.reshape(-1)
         assert logit.numel() == 1, f"{model_id}: expected num_labels=1, got {logit.numel()}"
-        # vLLM's PoolerClassify sigmoids a single-label head, so the reference is a
-        # probability on [0, 1].
+        # vLLM's PoolerClassify sigmoids a single-label head, so this is a probability.
         scores.append(round(float(torch.sigmoid(logit)[0]), _ROUND))
         print(f"  {document!r}\n    -> {scores[-1]:.6f}", flush=True)
 

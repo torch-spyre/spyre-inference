@@ -14,8 +14,7 @@
 
 """Spyre product encoder tests vs cached HF refs: embeddings, reranker scores, labels.
 
-Regenerate refs: ``python tests/data/generate_encoder_embed_refs.py`` and
-``python tests/data/generate_rerank_score_refs.py``
+Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py``
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
-# Cross-encoder rerankers (classify / score path). The two BGE variants share
+# Cross-encoder rerankers (classify / score path). The BGE variants share
 # XLMRobertaForSequenceClassification but not their weights or position table.
 RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
@@ -72,8 +71,8 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-# Reranker references are sigmoid probabilities and most sit just above zero, where an
-# absolute bound permits an arbitrary relative error, so the stricter of the two applies.
+# Sigmoid probabilities, most just above zero where an absolute bound permits an arbitrary
+# relative error, so the stricter of the two applies.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
 
@@ -207,8 +206,7 @@ def test_encoder_embed_last_pooling() -> None:
     override exercises the LAST gather + normalize path that
     ``configure_pooling_for_spyre`` patches to ``SpyreLastPool``.
     """
-    # Both sides are computed in this run, so the pin buys reproducibility rather than a
-    # valid comparison; read from the embed refs so it cannot drift off the gated weights.
+    # Both sides are computed here, so the pin buys reproducibility, not a valid comparison.
     ref = _REFERENCES.get(LAST_POOLING_MODEL)
     if ref is None:
         pytest.skip(
@@ -261,9 +259,8 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """What runs on Spyre is the encoder body, not the score: the classifier head stays
-    float32 and torch-spyre has no FP32 batchmatmul (torch-spyre#1794), so the pooling tail
-    runs on CPU even in the compiled case."""
+    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
+    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
@@ -285,8 +282,8 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     scores = [out.outputs.score for out in outputs]
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
-    # Ranking is checked apart from the per-score bound: all scores can drift the same
-    # direction without reordering, and a pair can swap while both stay inside tolerance.
+    # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
+    # and all scores can drift one direction without reordering.
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
     ref_order = sorted(range(len(ref_scores)), key=lambda i: ref_scores[i], reverse=True)
     assert order == ref_order, (

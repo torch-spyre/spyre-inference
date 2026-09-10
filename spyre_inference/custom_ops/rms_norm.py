@@ -12,23 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for RMSNorm.
-
-Spyre constraints:
-    - No dtype promotion to float32 (not yet supported in torch-spyre)
-
-References:
-    - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
-"""
+"""Compile upstream FP32 RMSNorm when it is outside a block graph."""
 
 import torch
-from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
-
-logger = init_logger(__name__)
 
 
 @RMSNorm.register_oot(name="RMSNorm")
@@ -38,36 +28,14 @@ class SpyreRMSNorm(CompileOutermost, RMSNorm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        logger.warning_once(
-            "SpyreRMSNorm: no dtype promotion is performed, "
-            "expect numerical differences to upstream vLLM."
-        )
-
     @compile_when_outermost
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """RMSNorm kernel for Spyre."""
-
-        if self.variance_size_override is not None:
-            raise NotImplementedError("TODO: variance_size_override not yet implemented")
-
-        if residual is not None:
-            x = x + residual
-            residual = x
-
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.has_weight:
-            x = x * self.weight
-        if residual is None:
-            return x
-        else:
-            return x, residual
+        """Run the unchanged vLLM native implementation."""
+        return super().forward_native(x, residual)
 
 
 # The norm fuser instantiates TPAwareRMSNorm and OOT dispatch keys on the concrete class

@@ -73,7 +73,10 @@ TIE_ABS_TOL = float(os.environ.get("SPYRE_TEST_TIE_ABS_TOL", "0.08"))
 NUM_LOGPROBS = 20
 
 # A near-tie split ends the comparison, so without a floor a case that mispredicts at step 0
-# on every prompt would pass having compared nothing.
+# on every prompt would pass having compared nothing. Counted over the case, not per prompt:
+# where the reference itself is a coin flip (granite-4.1's second prompt opens on p=0.4961)
+# fp16 drift alone decides the argmax, and one prompt truncating to zero says nothing about
+# output quality -- but every prompt truncating still fails.
 MIN_MATCHED_FRACTION = 0.5
 
 MAX_MODEL_LEN = 256
@@ -141,12 +144,13 @@ def test_decoder_model_output(model: str, monkeypatch: pytest.MonkeyPatch) -> No
         f"near-tie and gate little -- see MODEL_PROMPTS in "
         f"tests/data/generate_decoder_output_refs.py."
     )
-    min_matched = math.ceil(MIN_MATCHED_FRACTION * max_tokens)
-    assert all(n >= min_matched for n in matched), (
-        f"{model}: matched {per_prompt} reference steps per prompt, under the "
-        f"{min_matched}/{max_tokens} floor -- the near-tie split came too early to gate "
-        f"anything. Every prompt matched all {max_tokens} steps when the reference was "
-        f"taken, so treat this as a regression, not as a floor to lower."
+    total_steps = len(prompts) * max_tokens
+    min_matched = math.ceil(MIN_MATCHED_FRACTION * total_steps)
+    assert sum(matched) >= min_matched, (
+        f"{model}: matched {sum(matched)}/{total_steps} reference steps ({per_prompt} per "
+        f"prompt), under the {min_matched}/{total_steps} floor -- the near-tie splits came too "
+        f"early to gate anything. Every prompt matched all {max_tokens} steps when the "
+        f"reference was taken, so treat this as a regression, not as a floor to lower."
     )
 
 

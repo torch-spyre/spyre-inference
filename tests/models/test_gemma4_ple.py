@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from vllm.model_executor.models.gemma4 import _run_decoder_layers
+from vllm.model_executor.models import gemma4 as upstream
 
 from spyre_inference.models.gemma4 import (
     SpyreGemma4SelfDecoderLayers,
@@ -32,22 +32,51 @@ from spyre_inference.models.gemma4 import (
 )
 
 
-def test_upstream_decoder_uses_precomputed_per_layer_rows():
-    class CaptureLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.per_layer_input = None
+class _CaptureLayer(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.per_layer_input: torch.Tensor | None = None
 
-        def forward(self, positions, hidden_states, residual, *, per_layer_input, **kwargs):
-            self.per_layer_input = per_layer_input
-            return hidden_states, None
+    def forward(self, positions, hidden_states, residual, *, per_layer_input, **kwargs):
+        self.per_layer_input = per_layer_input
+        return hidden_states, None
 
-    layers = [CaptureLayer(), CaptureLayer()]
-    ple = torch.zeros(3, 2, 4)
-    rows = ple.as_subclass(_PerLayerRows)
-    rows.spyre_rows = tuple(torch.full((3, 4), i + 1.0) for i in range(2))
 
-    _run_decoder_layers(layers, 0, torch.arange(3), torch.zeros(3, 4), rows)
+def _backbone(layers: list[nn.Module], rows: _PerLayerRows) -> upstream.Gemma4Model:
+    model = upstream.Gemma4Model.__new__(upstream.Gemma4Model)
+    nn.Module.__init__(model)
+    model.layers = nn.ModuleList(layers)
+    model.start_layer = 0
+    model.end_layer = len(layers)
+    model.norm = nn.Identity()
+    model.fast_prefill_enabled = False
+    model.project_per_layer_inputs = lambda inputs_embeds, per_layer_inputs: rows
+    return model
+
+
+def test_upstream_backbone_loop_uses_precomputed_per_layer_rows(monkeypatch):
+    """The only PLE cut Spyre reaches is ``Gemma4Model.forward``'s inline
+    ``per_layer_inputs[:, layer_idx, :]``: upstream's other one, in ``_run_decoder_layers``,
+    is reachable only through ``fast_prefill_forward``, which the platform rejects for
+    per-layer-embedding models.
+    """
+    monkeypatch.setattr(
+        upstream,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    layers = [_CaptureLayer(), _CaptureLayer()]
+    rows = torch.zeros(3, len(layers), 4).as_subclass(_PerLayerRows)
+    rows.spyre_rows = tuple(torch.full((3, 4), i + 1.0) for i in range(len(layers)))
+
+    # Unbound: support_torch_compile's __call__ reads do_not_compile, which only __init__ sets.
+    upstream.Gemma4Model.forward(
+        _backbone(layers, rows),
+        None,
+        torch.arange(3),
+        None,
+        inputs_embeds=torch.zeros(3, 4),
+    )
 
     assert all(layer.per_layer_input is row for layer, row in zip(layers, rows.spyre_rows)), (
         "vLLM changed its PLE row access; update _PerLayerRows before upgrading"

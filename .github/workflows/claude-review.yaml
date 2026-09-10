@@ -76,6 +76,21 @@ jobs:
             *) echo "::error::${ACTOR} lacks write access (${perm:-none}); refusing review." ; exit 1 ;;
           esac
 
+      # Ack that the run was picked up. curl, not gh (not installed yet);
+      # best-effort so a failed reaction never blocks the review.
+      - name: Acknowledge trigger comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d '{"content":"eyes"}' \
+            || echo "::warning::Could not add :eyes: reaction to the trigger comment"
+
       # Checkout with no ref = the trusted default branch. The agent pulls the
       # PR itself (gh pr checkout) when it must run the changed code on hardware.
       - name: Checkout
@@ -122,6 +137,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Claude review
+        id: claude
         env:
           # ALL model traffic goes to the enterprise LiteLLM proxy -- never
           # api.anthropic.com. AUTH_TOKEN is sent as `Authorization: Bearer`.
@@ -165,10 +181,48 @@ jobs:
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
           # internal-IP firewall (see PR #785), not the tool list.
+          # tee the closing summary for the next step to post. Default Actions
+          # shell has -o pipefail, so a non-zero claude exit still fails here.
           claude -p "$prompt" \
             --model claude-opus-4-8 \
             --max-turns 60 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \
             --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
-            --output-format text
+            --output-format text \
+            | tee "${RUNNER_TEMP}/claude-summary.txt"
+
+      # Deterministic "review finished" signal, separate from the inline
+      # comments: always posts, carrying the closing summary or a failure notice.
+      - name: Post review summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          REVIEW_OUTCOME: ${{ steps.claude.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          summary_file="${RUNNER_TEMP}/claude-summary.txt"
+          body_file="${RUNNER_TEMP}/claude-comment.md"
+          if [ "$REVIEW_OUTCOME" = "success" ]; then
+            {
+              echo "## ✅ Claude review complete"
+              echo
+              echo "Any inline comments have been posted to the changed lines above."
+              echo
+              if [ -s "$summary_file" ]; then
+                cat "$summary_file"
+              else
+                echo "_The review produced no closing summary._"
+              fi
+            } > "$body_file"
+          else
+            {
+              echo "## ⚠️ Claude review did not finish"
+              echo
+              echo "The review ended with status \`${REVIEW_OUTCOME}\` (e.g. timeout or error) before it could complete."
+              echo "See the [workflow run](${RUN_URL}) for details."
+            } > "$body_file"
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file "$body_file"

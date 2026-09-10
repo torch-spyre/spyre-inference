@@ -15,6 +15,11 @@ If this PR already has open comments, validate that the appropriate changes have
 made to address them. Reply to these comments either asking for more changes or
 confirming that the comment can be resolved.
 
+End your response with a short summary of the review: what you checked, whether you
+verified behavior on the Spyre hardware, and the count and severity of any issues you
+raised (or that the PR looks good). This closing summary is posted back to the PR as the
+signal that the review has finished, so keep it to a few sentences and self-contained.
+
 When authoring all comments, don't write:
 
 - Metadiscourse. Perform the communication, don't narrate it. No speech-act prefaces ("I want to be straight about," "let me be clear," "I'll say the harder thing"), no speech-act `because` justifying why you're saying something, no defining a point by the lesser response it deserves ("more than a 'noted'"). Test: if deleting everything before the comma loses no information, delete it

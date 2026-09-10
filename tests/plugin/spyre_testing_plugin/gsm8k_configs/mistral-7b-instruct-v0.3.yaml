@@ -1,12 +1,6 @@
-# GSM8K correctness gate for Mistral-7B-Instruct-v0.3 on Spyre.
-# fp16-only device, so no quantized variant. accuracy_threshold is the measured
-# on-device baseline (compiled, batched); see PR. num_questions is kept small to
-# gate cheaply, not a full 1319-question eval.
-#
-# Compiled (no --enforce-eager) and batched (max_concurrency matches the server's
-# 4-sequence batch area) to reflect real-world serving. request_timeout_seconds is
-# a *total* per-request budget that includes connection-pool queue-wait, so it must
-# exceed the whole batched run's wall-clock, not just per-request compute.
+# GSM8K accuracy gate for Mistral-7B-Instruct-v0.3 on Spyre (fp16, no quantized variant).
+# accuracy_threshold is the measured on-device baseline; num_questions is small to gate cheaply.
+# request_timeout_seconds is a *total* per-request budget (incl. queue-wait), so it must exceed the whole batched run's wall-clock.
 model_name: "mistralai/Mistral-7B-Instruct-v0.3"
 accuracy_threshold: 0.375
 num_questions: 64

@@ -345,7 +345,12 @@ def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch
     if any(pad):
         weight = F.pad(weight, pad)
     moved = dma_moe_expert_weight_to_spyre(weight)
-    return moved if moved is not None else weight.contiguous().to("spyre")
+    if moved is None:
+        raise RuntimeError(
+            "Spyre MoE expert weight free dimension must span complete sticks after "
+            f"padding, got shape {tuple(weight.shape)}."
+        )
+    return moved
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:

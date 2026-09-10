@@ -120,10 +120,6 @@ class TorchSpyrePlatform(CpuPlatform):
     _BLOCK_SIZE_MULTIPLE = 64
     _DEFAULT_BLOCK_SIZE = 128
 
-    # Gated activations whose padded lanes are provably inert: `act(0)` meets an equally
-    # zero up lane, so the lane is zero whatever `act` does.
-    _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
-
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -417,12 +413,12 @@ class TorchSpyrePlatform(CpuPlatform):
         read ``config.intermediate_size`` directly, so overriding the config value
         before the model is built widens the modules with no per-class shim.
 
-        Dense MLPs only: routed experts are widened in ``spyre_inference.moe`` instead,
-        and a MoE that sizes its experts from ``intermediate_size`` is skipped, since the
-        loader cannot reach the stacked expert tensors to pad them. Zero-padding is inert
-        for a gated MLP (see ``custom_ops.mlp_pad``).
+        Supported dense gated MLPs only: routed experts are widened in
+        ``spyre_inference.moe`` instead, and a MoE that sizes its experts from
+        ``intermediate_size`` is skipped, since the loader cannot reach the stacked tensors
+        to pad them. Zero-padding is inert for a gated MLP (see ``custom_ops.mlp_pad``).
         """
-        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
+        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE, supports_intermediate_padding
 
         # The text config is where a multimodal checkpoint keeps the decoder's MLP width.
         text_config = vllm_config.model_config.hf_text_config
@@ -442,13 +438,12 @@ class TorchSpyrePlatform(CpuPlatform):
         expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
             text_config, "expert_intermediate_size", None
         )
-        act = getattr(text_config, "hidden_act", None) or getattr(
-            text_config, "hidden_activation", None
-        )
+        if not supports_intermediate_padding(text_config):
+            return
         # Experts sized from ``intermediate_size``, or from its double-wide ``2x``
         # form (e.g. gemma4), would load truncated: the loader cannot reach the
         # stacked tensors to widen them.
-        if (is_moe and expert_size in (None, orig, 2 * orig)) or act not in cls._GATED_ACTS:
+        if is_moe and expert_size in (None, orig, 2 * orig):
             return
 
         padded = ((orig + align - 1) // align) * align

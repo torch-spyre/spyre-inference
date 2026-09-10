@@ -1,7 +1,7 @@
 name: Run matrix test config
 description: >-
   Builds spyre-inference and runs one _test_matrix.yaml matrix leg (RPM
-  install through JUnit publish). Shared by the `test` and `test_retry`
+  install through JUnit upload). Shared by the `test` and `test_retry`
   jobs so the pod-level retry doesn't need its own copy of every step.
 
 inputs:
@@ -240,13 +240,10 @@ runs:
         if-no-files-found: ignore
         retention-days: 14
 
-    # overwrite: on a pod-level retry, replaces the failed first attempt's report
-    # (same name) so downstream consumers see only the corrected result. The
-    # `test-report` fan-in job in _test_matrix.yaml collects every leg's artifact
-    # into one aggregate check + step-summary table; the ClickHouse ingest
-    # (push-to-clickhouse.yaml) also consumes these. There is deliberately no
-    # per-leg dorny/test-reporter publish here -- 35 shards produced 35 checks
-    # ("the sea of test reports"); the single aggregate replaces them.
+    # Consumed by the test-report fan-in (_test_matrix.yaml) and the ClickHouse
+    # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
+    # the one aggregate report. overwrite: a pod-level retry replaces its failed
+    # first attempt's file.
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v4

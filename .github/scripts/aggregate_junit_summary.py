@@ -12,17 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Fan-in of every sharded leg's JUnit XML into one aggregate report.
+"""Aggregate the sharded legs' JUnit XML into one $GITHUB_STEP_SUMMARY report.
 
-Walks the junit-<target>.xml files the test matrix's legs produce and writes a
-single summary to $GITHUB_STEP_SUMMARY (stdout when unset): overall totals, a
-per-shard table, and the full list of failing/erroring cases, each labelled by
-the shard it ran in. The shard label comes from the file name, matching
-_test_matrix.yaml's artifact naming and the Makefile test targets.
-
-Usage:
-    python3 aggregate_junit_summary.py junit/*.xml
+Each shard is labelled by its junit-<target>.xml file name.
 """
 
 import argparse
@@ -51,7 +43,7 @@ class Suite:
 class Failure:
     suite: str
     test: str
-    kind: str  # "fail" or "error"
+    kind: str
     message: str
 
 
@@ -149,7 +141,6 @@ def render(report: Report) -> str:
     )
     lines.append("")
 
-    # Worst (most broken) shard first.
     lines.append("| Shard | Tests | ✅ | ❌ | 🔥 | ⏭️ | ⏱️ |")
     lines.append("|---|--:|--:|--:|--:|--:|--:|")
     for s in sorted(report.suites, key=lambda s: (-(s.failures + s.errors), s.label)):

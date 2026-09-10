@@ -43,6 +43,7 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreLastPool,
     SpyreMeanPool,
     SpyreNormalize,
+    SpyreTokenPooler,
     configure_pooling_for_spyre,
     patch_pooler_for_spyre,
     run_pooling_tail_on_cpu,
@@ -165,6 +166,48 @@ def test_token_pooler_all_pool_is_patched():
     assert isinstance(pooler.pooling, SpyreAllPool)
 
 
+def test_token_pooler_promoted_so_bucketed_rows_are_always_trimmed():
+    """``defer_trim`` may only be set together with the pooler that trims.
+
+    A bucketed gather without a trim would ship padded rows to the client, so the
+    two are switched on as a pair and never independently.
+    """
+    pooler = _token_pooler(AllPool)
+    patch_pooler_for_spyre(pooler)
+    assert isinstance(pooler, SpyreTokenPooler)
+    assert pooler.pooling.defer_trim is True
+
+
+def test_spyre_all_pool_defers_trim_only_when_asked():
+    """Standalone use keeps AllPool's real-length contract; deferring buckets."""
+    counts = [3, 1, 4]
+    hidden_states = torch.arange(sum(counts) * 9, dtype=torch.float16).reshape(-1, 9)
+    meta = _counts_metadata(counts)
+
+    plain = SpyreAllPool(enable_chunked_prefill=False)(hidden_states, meta)
+    assert [c.shape[0] for c in plain] == counts
+
+    deferred = SpyreAllPool(enable_chunked_prefill=False, defer_trim=True)(hidden_states, meta)
+    # Every chunk is padded up to the same bucket, so the gather's shape no longer
+    # tracks the request's token count.
+    assert {c.shape[0] for c in deferred} == {64}
+    for chunk, n, expected in zip(deferred, counts, torch.split(hidden_states, counts)):
+        assert torch.equal(chunk[:n], expected)
+        # Padded rows duplicate the last real row, so a trim is all that is needed.
+        assert torch.equal(chunk[n:], expected[-1].expand(chunk.shape[0] - n, -1))
+
+
+def test_spyre_token_pooler_trims_bucketed_rows_to_real_lengths():
+    counts = [3, 1, 4]
+    hidden_states = torch.arange(sum(counts) * 9, dtype=torch.float16).reshape(-1, 9)
+    pooler = _token_pooler(AllPool)
+    patch_pooler_for_spyre(pooler)
+
+    got = pooler(hidden_states, _counts_metadata(counts))
+    for chunk, expected in zip(got, torch.split(hidden_states, counts)):
+        assert torch.equal(chunk, expected)
+
+
 def test_token_pooler_step_pool_is_unsupported():
     """StepPool subclasses AllPool but indexes by step tag; keep it on CPU."""
     pooler = _token_pooler(StepPool)
@@ -172,14 +215,18 @@ def test_token_pooler_step_pool_is_unsupported():
     assert (num_patched, unsupported) == (0, ["StepPool"])
 
 
-def test_spyre_all_pool_matches_torch_split():
-    counts = [3, 1, 4]
-    hidden_states = torch.arange(sum(counts) * 9, dtype=torch.float16).reshape(-1, 9)
-
+def _counts_metadata(counts: list[int]):
     class _Meta:
         def get_pooling_cursor(self):
             return type("C", (), {"num_scheduled_tokens_cpu": torch.tensor(counts)})()
 
-    got = SpyreAllPool(enable_chunked_prefill=False)(hidden_states, _Meta())
+    return _Meta()
+
+
+def test_spyre_all_pool_matches_torch_split():
+    counts = [3, 1, 4]
+    hidden_states = torch.arange(sum(counts) * 9, dtype=torch.float16).reshape(-1, 9)
+
+    got = SpyreAllPool(enable_chunked_prefill=False)(hidden_states, _counts_metadata(counts))
     for chunk, expected in zip(got, torch.split(hidden_states, counts)):
         assert torch.equal(chunk, expected)

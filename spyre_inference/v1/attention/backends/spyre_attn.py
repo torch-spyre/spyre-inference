@@ -37,7 +37,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
@@ -450,6 +450,11 @@ def mark_warmup_complete() -> None:
     _warmup_complete = True
 
 
+def is_warmup_complete() -> bool:
+    """Whether ``mark_warmup_complete`` has run. For diagnostics, not control flow."""
+    return _warmup_complete
+
+
 def _call_kernel(label: str, fn, *args):
     """Dispatch a kernel, warning if it compiles once warmup has claimed coverage.
 
@@ -585,9 +590,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_pack_batch: int | None = None
     encoder_pack_len: int | None = None
     encoder_fused_sdpa: bool = False
-    # Host-built dense key-pad ``[B * KV, 1, L, L]`` on the target device.
-    # ``None`` on the fused path. ``[BH, 1, 1, L]`` does not broadcast onto
-    # encoder scores ``[BH, G, L, L]`` (eager add; query axis ``1 → L``).
+    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
+    # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
+    # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only
+    # while that add was eager.
     encoder_key_pad_mask: torch.Tensor | None = None
     # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
     # before each pack so pad slots stay empty. K and V must not share a buffer:
@@ -626,6 +632,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         )
         self.block_size = kv_cache_spec.block_size
         self.head_size = kv_cache_spec.head_size
+        # No KV cache, so build() skips every block-, page- and tile-shaped field.
+        self._encoder_only = isinstance(kv_cache_spec, EncoderOnlyAttentionSpec)
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
@@ -698,8 +706,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # denominator, so zero real blocks must stay zero.
             return 0
         padded = SpyreAttnBucketer._round_up(num_blocks, self._attn_bucketer.num_blocks_buckets)
-        # Unreachable: the top bucket covers ceil(max_model_len / block_size),
-        # and num_blocks here is bounded by the same max_model_len.
+        # The buckets cover ceil(max_model_len / block_size), and the scheduler
+        # bounds seq_lens by max_model_len. Encoder-only builds, whose profiling
+        # seq_lens come from the token budget instead, never reach here.
         assert padded is not None, (
             f"num_blocks={num_blocks} exceeds the largest recorded bucket "
             f"{self._attn_bucketer.num_blocks_buckets[-1]}, which should cover "
@@ -928,6 +937,29 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         max_query_len = common_attn_metadata.max_query_len
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+
+        if self._encoder_only:
+            # Everything below is KV-cache state -- block counts, per-block mask
+            # tiles, page-index tables, batched-decode precomputes -- and
+            # SpyreEncoderAttentionImpl reads none of it, deriving its own packed
+            # grid from seq_lens and query_start_loc. Besides the per-step waste,
+            # _pad_num_blocks would reject the batch: its ladder comes from
+            # max_model_len while a pooling model's body buckets come from
+            # max_num_batched_tokens, and warmup profiles every sequence at the full
+            # body size (a 256-token sentence-transformer asks for 512).
+            return SpyreAttentionMetadata(
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                num_seqs=common_attn_metadata.num_reqs,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                block_table=block_table,
+                block_size=self.block_size,
+                slot_mapping=slot_mapping,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+            )
 
         causal = common_attn_metadata.causal
         if isinstance(causal, torch.Tensor):

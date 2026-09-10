@@ -342,6 +342,42 @@ class TestEncoderBuckets:
             len_bucket=[64, 256],
         ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
 
+    def test_warmup_shapes_batch_bucket_can_lose_every_cell(self):
+        """A batch bucket whose minimum row already exceeds the token budget
+        is dropped entirely, not just narrowed (spyre-inference#775).
+
+        16 * 64 = 1024 > 512, and 64 is the smallest possible row, so batch
+        bucket 16 has no surviving cell at any prompt length — unlike bucket 8
+        (8*64=512, exactly at budget), which keeps one. A batch this large
+        still falls back to an unwarmed exact-num_seqs shape at request time
+        (spyre_encoder_attn.py's pick_encoder_attention_shape fallback), which
+        the compiled+cached pack/SDPA kernel now absorbs as a bounded,
+        one-time compile per distinct shape rather than a per-request cost.
+        """
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=16,
+            max_model_len=512,
+            max_num_batched_tokens=512,
+        )
+        covered_batches = {batch for batch, _length in shapes}
+        assert covered_batches == {1, 2, 4, 8}
+        assert 16 not in covered_batches
+
+    def test_warmup_shapes_cover_every_batch_bucket_within_budget(self):
+        """Once max_num_seqs * ENCODER_SEQ_ALIGNMENT <= max_num_batched_tokens,
+        every batch bucket keeps at least one warmed cell.
+        """
+        max_num_batched_tokens = 512
+        max_num_seqs = max_num_batched_tokens // 64  # == 8
+
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=max_num_seqs,
+            max_model_len=512,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        covered_batches = {batch for batch, _length in shapes}
+        assert covered_batches == set(batch_buckets(max_num_seqs))
+
     def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
         padded_ids, padded_pos = expand_packed_to_encoder_bucket(
             input_ids=[1, 2, 3, 4, 5],

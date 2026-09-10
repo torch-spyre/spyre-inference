@@ -770,6 +770,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 self._warmup_pooling_bucket_shapes()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
+            # Pooling never reaches _record_attention_graphs (encoder layers have
+            # no KV cache to record against), so claim coverage here instead --
+            # otherwise _call_kernel stays silent for the encoder kernels.
+            mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -1000,6 +1004,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
                 hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
                 self._dummy_pooler_run(hidden_states)
+                if batch_size == 1:
+                    # An exact fill satisfies _is_b1_fused_sdpa, so the run above
+                    # traces only the fused kernel. One token short takes the
+                    # packed QK/P.V kernels instead, which is what serving hits
+                    # for every prompt whose length is not already a bucket.
+                    logger.info(
+                        "Pooling attention warmup: partial bucket "
+                        "batch_size=1 prompt_len=%d (bucket %d)",
+                        prompt_len - 1,
+                        prompt_len,
+                    )
+                    hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
+                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
 

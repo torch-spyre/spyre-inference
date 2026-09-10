@@ -19,7 +19,7 @@ import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 from spyre_inference.v1.attention.backends import spyre_encoder_attn as encoder_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -98,6 +98,7 @@ def _build_metadata(
     query_start_loc: torch.Tensor,
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
+    spec_cls: type[AttentionSpec] = EncoderOnlyAttentionSpec,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
     from vllm.config import get_current_vllm_config
@@ -111,7 +112,10 @@ def _build_metadata(
     # cache_config one, so a test block_size has to be set in both places.
     vllm_config.cache_config.block_size = block_size
 
-    kv_cache_spec = AttentionSpec(
+    # Defaults to the spec upstream hands an ENCODER_ONLY group, not a plain
+    # AttentionSpec: build() branches on it to skip the KV-cache fields, so a plain
+    # one would exercise a path production never takes.
+    kv_cache_spec = spec_cls(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -737,7 +741,11 @@ def _assert_pad_mask(meta, real_len: int) -> None:
     key_pad = meta.encoder_key_pad_mask
     assert key_pad is not None
     key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
-    assert key_cpu.shape[-2] == key_cpu.shape[-1]
+    # Query axis stays 1: the same key-pad row applies to every query row and the
+    # compiled add in _packed_pv broadcasts it. A dense [.., L, L] here would be
+    # 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
+    assert key_cpu.shape[-2] == 1
+    assert key_cpu.shape[-1] == meta.encoder_pack_len
     assert key_cpu[0, 0, 0, 0].item() == 0.0
     assert key_cpu[0, 0, 0, real_len].item() < -1.0e3
 
@@ -1076,3 +1084,59 @@ def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
     assert calls["n"] == 0
     expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
     assert torch.equal(out, expected)
+
+
+def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs: int):
+    """Metadata for warmup's profiling batch: every sequence at the full body size.
+
+    Upstream ``_dummy_run`` sets ``seq_lens = num_tokens`` for every request
+    regardless of how it split the token budget, so this is what the builder sees
+    when the pooling warmup loop runs its largest body bucket.
+    """
+    from vllm.config import get_current_vllm_config
+
+    get_current_vllm_config().model_config.max_model_len = max_model_len
+    return _build_metadata(
+        num_query_heads=4,
+        num_kv_heads=4,
+        head_size=64,
+        block_size=128,
+        seq_lens=torch.full((num_seqs,), prompt_len, dtype=torch.int32),
+        query_start_loc=torch.arange(0, (num_seqs + 1) * prompt_len, prompt_len).to(torch.int32),
+        block_table=torch.zeros((num_seqs, 8), dtype=torch.int32),
+        slot_mapping=torch.zeros(num_seqs * prompt_len, dtype=torch.int64),
+        spec_cls=spec_cls,
+    )
+
+
+def test_encoder_build_skips_kv_cache_fields(default_vllm_config) -> None:
+    meta = _profile_metadata(EncoderOnlyAttentionSpec, max_model_len=512, prompt_len=64, num_seqs=2)
+    assert meta.padded_num_blocks is None
+    assert not meta.attention_mask_tiles
+    assert meta.page_index_tables_cpu is None
+    assert meta.active_block_indices is None
+    # Everything SpyreEncoderAttentionImpl.forward actually reads.
+    assert meta.num_seqs == 2
+    assert meta.num_actual_tokens == 128
+    assert meta.seq_lens.tolist() == [64, 64]
+    assert meta.query_start_loc.tolist() == [0, 64, 128]
+
+
+def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_config) -> None:
+    """A pooling model whose max_model_len is under the top body bucket still builds.
+
+    The two ladders are keyed on different quantities: the num_blocks buckets come
+    from max_model_len, while the body buckets a pooling model warms come from
+    max_num_batched_tokens. all-MiniLM-L6-v2 and all-roberta-large-v1 derive
+    max_model_len=256 and get a 512-token top body bucket, so warmup profiled 4
+    blocks against a 2-block ladder and the engine died at init.
+    """
+    meta = _profile_metadata(
+        EncoderOnlyAttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1
+    )
+    assert meta.padded_num_blocks is None
+
+    # Same input on the paged builder still raises: the guard is what makes the
+    # encoder case work, not a widened ladder.
+    with pytest.raises(AssertionError, match="exceeds the largest recorded bucket"):
+        _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)

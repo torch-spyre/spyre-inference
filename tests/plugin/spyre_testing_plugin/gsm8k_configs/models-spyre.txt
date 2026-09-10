@@ -1,8 +1,9 @@
 # GSM8K eval configs runnable on Spyre (fp16, no quantization).
 # Consumed by upstream tests/evals/gsm8k/test_gsm8k_correctness.py; selected via
 # the `config_list` field on that file's entry in upstream_tests.yaml.
-# All configs run compiled + batched (max_concurrency=4); thresholds are measured
-# on-device baselines at num_questions=16. See PR for the baseline methodology.
+# All configs run compiled + batched (max_concurrency=4) at num_questions=64;
+# thresholds are on-device baselines (re-validate on any num_questions change).
+# See PR for the baseline methodology.
 qwen2.5-0.5b-instruct.yaml
 granite-4.1-3b.yaml
 mistral-7b-instruct-v0.3.yaml

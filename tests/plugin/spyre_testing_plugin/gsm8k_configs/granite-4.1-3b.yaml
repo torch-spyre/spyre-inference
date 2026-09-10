@@ -9,10 +9,8 @@
 # exceed the whole batched run's wall-clock, not just per-request compute.
 model_name: "ibm-granite/granite-4.1-3b"
 accuracy_threshold: 0.625
-tolerance: 0.08
-num_questions: 16
+num_questions: 64
 num_fewshot: 5
-max_tokens: 256
 max_concurrency: 4
 server_args: "--max-model-len 4096"
 request_timeout_seconds: 2400

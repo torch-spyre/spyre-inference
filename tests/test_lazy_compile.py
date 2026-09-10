@@ -199,6 +199,19 @@ def test_the_real_layers_opt_in() -> None:
         assert getattr(wrapped, "__wrapped__", None) is not None, f"{cls.__name__}.{method}"
 
 
+def test_spyre_rmsnorm_delegates_to_vllm_native_fp32_path(monkeypatch) -> None:
+    """Guard the FP32 upcast rather than the former FP16 Spyre reimplementation."""
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
+
+    expected = torch.empty(0)
+    monkeypatch.setattr(RMSNorm, "forward_native", lambda self, x, residual: expected)
+    norm = object.__new__(SpyreRMSNorm)
+
+    assert SpyreRMSNorm.forward_oot.__wrapped__(norm, torch.empty(0)) is expected
+
+
 def test_an_enclosing_graph_absorbs_the_layer_without_breaking(mode) -> None:
     """A decorated layer inside a fullgraph block is traced into the block's graph."""
     mode(CompilationMode.STOCK_TORCH_COMPILE)

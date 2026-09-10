@@ -88,6 +88,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.tags import result_tags
 from spyre_testing_plugin.vfio_reaper import (
     reap_vfio_holders,
     spyre_hardware_present,
@@ -658,6 +659,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
             item.add_marker(upstream_marker)
 
+            # Tag upstream items here (the conftest fixture binds only under
+            # tests/). Before the skip/xfail branches so a tag lands regardless
+            # of the item's eventual disposition.
+            params = getattr(getattr(item, "callspec", None), "params", {})
+            for name, value in result_tags(params):
+                item.user_properties.append((name, value))
+
             fc = _find_file_config(test_path, file_configs)
             if fc is None:
                 item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
@@ -1035,6 +1043,23 @@ def inference_mode():
     """Run every test under torch.inference_mode()."""
     with torch.inference_mode():
         yield
+
+
+@pytest.fixture()
+def register_ministral_14b(request, monkeypatch):
+    """Make `mistralai/Ministral-3-14B-Instruct-2512-BF16` resolvable upstream.
+
+    Upstream's registry only knows the 3B, and `find_hf_info` raises for unknown ids,
+    so register the 14B as another extra on the same architecture entry. `setitem`
+    because `_HfExamplesInfo` is frozen — the `extras` dict is not.
+    """
+    hf_models = request.node.module.HF_EXAMPLE_MODELS.hf_models
+    info = hf_models["PixtralForConditionalGeneration"]
+    monkeypatch.setitem(
+        info.extras,
+        "ministral-3-14b",
+        "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    )
 
 
 @pytest.fixture()

@@ -40,6 +40,8 @@ _ADAPTED_ARCHS: dict[str, str] = {
     # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
     # apply_prelaunch_overrides rewrites it to this text-only backbone first.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
+    "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"

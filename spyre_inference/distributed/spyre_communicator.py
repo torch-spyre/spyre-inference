@@ -50,6 +50,14 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu" or self._group_name is None:
             return super().all_reduce(input_)
 
+        # Workaround: deeptools' L3 scheduler asserts "Expect valid lower and upper
+        # bound parameters" chunking the sum kernel for some rank-3 shapes
+        # ([1, 528, 1024] dies, [1, 3120, 1024] builds); a flat view has one dim to chunk.
+        orig_shape = input_.shape
+        flattened = input_.dim() > 2
+        if flattened:
+            input_ = input_.reshape(-1)
+
         # Out-of-place, unlike the base class's in-place `dist.all_reduce`: vLLM's
         # `torch.ops.vllm.all_reduce` wrapper declares no mutation, so under
         # torch.compile functionalization misses the overwrite and the graph
@@ -59,7 +67,10 @@ class SpyreCommunicator(DeviceCommunicatorBase):
             "sum",  # ty: ignore[invalid-argument-type]
             self._group_name,  # ty: ignore[invalid-argument-type]
         )
-        return torch.ops._c10d_functional.wait_tensor(out)
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        if flattened:
+            out = out.reshape(orig_shape)
+        return out
 
     # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
     # along the gathered dim, so a shard whose size along `dim` is not a multiple

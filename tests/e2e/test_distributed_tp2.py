@@ -70,14 +70,15 @@ def _generate(
             ["Hello, world!", "The capital of France is"],
             SamplingParams(max_tokens=8, temperature=0.0),
         )
-        return [list(o.outputs[0].token_ids) for o in outs]
+        result = [list(o.outputs[0].token_ids) for o in outs]
     finally:
         llm.llm_engine.engine_core.shutdown(timeout=60)
         del llm
         gc.collect()
-        assert wait_until_card_free(exclude_pids={os.getpid()}, timeout=60), (
-            "Spyre devices were not released after LLM shutdown"
-        )
+        freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
+    # Outside the finally, where a generate failure would mask this check's own.
+    assert freed, "Spyre devices were not released after LLM shutdown"
+    return result
 
 
 def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:

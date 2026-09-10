@@ -445,7 +445,9 @@ class TorchSpyrePlatform(CpuPlatform):
         act = getattr(text_config, "hidden_act", None) or getattr(
             text_config, "hidden_activation", None
         )
-        if (is_moe and expert_size in (None, orig)) or act not in cls._GATED_ACTS:
+        # Experts sized from ``intermediate_size``, or from its double-wide ``2x`` form (e.g. gemma4),
+        # would load truncated: the loader cannot reach the stacked tensors to widen them.
+        if (is_moe and expert_size in (None, orig, 2 * orig)) or act not in cls._GATED_ACTS:
             return
 
         padded = ((orig + align - 1) // align) * align

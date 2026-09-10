@@ -240,7 +240,13 @@ runs:
         if-no-files-found: ignore
         retention-days: 14
 
-    # overwrite: on a pod-level retry, replaces the failed first attempt's report (same name) so downstream consumers see only the corrected result.
+    # overwrite: on a pod-level retry, replaces the failed first attempt's report
+    # (same name) so downstream consumers see only the corrected result. The
+    # `test-report` fan-in job in _test_matrix.yaml collects every leg's artifact
+    # into one aggregate check + step-summary table; the ClickHouse ingest
+    # (push-to-clickhouse.yaml) also consumes these. There is deliberately no
+    # per-leg dorny/test-reporter publish here -- 35 shards produced 35 checks
+    # ("the sea of test reports"); the single aggregate replaces them.
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v4
@@ -249,13 +255,3 @@ runs:
         path: junit-${{ inputs.test_target }}.xml
         retention-days: 14
         overwrite: ${{ inputs.retry }}
-
-    - name: Publish JUnit test report
-      if: always()
-      uses: dorny/test-reporter@v1
-      with:
-        name: "Test report (${{ inputs.cfg }})${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}"
-        path: junit-${{ inputs.test_target }}.xml
-        # dorny/test-reporter@v1 has no python-specific reporter; java-junit parses the generic JUnit-XML schema pytest's --junit-xml emits.
-        reporter: java-junit
-        fail-on-error: false

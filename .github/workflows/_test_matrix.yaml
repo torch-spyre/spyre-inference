@@ -840,6 +840,79 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # Test-report fan-in: combine every leg's JUnit XML into ONE aggregate view so
+  # an individual case is findable without opening the ~35 per-shard reports the
+  # matrix used to publish (the run-matrix-config action no longer publishes a
+  # per-leg dorny check -- that "sea of reports" is what this replaces). Two
+  # surfaces, from the same downloaded artifacts:
+  #   - a single browsable dorny check-run in the Checks tab, failures expanded;
+  #   - a totals + per-shard + complete-failures table on the run Summary page
+  #     ($GITHUB_STEP_SUMMARY), matching the coverage/durations fan-ins.
+  # always() so a run with failed legs still reports; continue-on-error so this
+  # informational job never fails the callers' required-check gate; no-op when no
+  # leg produced a JUnit file (all configs skipped or failed early).
+  # ---------------------------------------------------------------------------
+  test-report:
+    name: Aggregate test report
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout script
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      # Every leg's junit-<target> artifact, merged flat into one dir. Names are
+      # unique per target (retries overwrite in place), so no file collides.
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Check for JUnit files
+        id: junit
+        run: |
+          shopt -s nullglob
+          files=(junit/*.xml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No JUnit XML to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Single aggregate check-run (Checks tab). One glob -> one merged report;
+      # java-junit parses the generic JUnit-XML schema pytest emits (v1 has no
+      # python-specific reporter). list-tests: failed keeps the check focused on
+      # what broke rather than listing thousands of passing cases.
+      - name: Publish aggregate test report
+        if: ${{ steps.junit.outputs.found == 'true' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Aggregate test report
+          path: junit/*.xml
+          reporter: java-junit
+          list-suites: all
+          list-tests: failed
+          fail-on-error: false
+
+      # Complete totals + per-shard + every-failure table on the run Summary
+      # page. Skipped when no files matched (the step above already wrote the
+      # empty-case note) -- bash leaves an unmatched glob literal, which the
+      # script would otherwise treat as a missing file.
+      - name: Write aggregate summary
+        if: ${{ steps.junit.outputs.found == 'true' }}
+        run: python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
+
+  # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
   # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
   # one of the matrix configs above: perf runs benchmarks, not pytest markers,

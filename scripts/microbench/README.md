@@ -67,6 +67,13 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 
 `block_sizes: [64, 128]` sweeps block size as an extra axis.
 
+## KV layout probes
+
+`page_major` is the default `--kv-layout`: it places the page axis outermost
+in device layout for `index_select` experiments. The startup probe uses the same
+selection, so it cannot seed the compilation cache with the plain layout. This
+is a layout/SDSC probe, not a correctness mode.
+
 ## Output
 
 Tab-separated, written after every measurement (a crash keeps what completed) plus a

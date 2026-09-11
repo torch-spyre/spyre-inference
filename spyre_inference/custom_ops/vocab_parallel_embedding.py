@@ -102,7 +102,7 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
             reindex_table = self._spyre_reindex_table
             keep_table = self._spyre_keep_table
             assert reindex_table is not None and keep_table is not None
-            keep = F.embedding(input_, keep_table)[:, 0]
+            keep = F.embedding(input_, keep_table)[..., 0]
             masked_input = torch.index_select(reindex_table, 0, input_.flatten())[:, 0]
             masked_input = masked_input.view(input_.shape)
         else:

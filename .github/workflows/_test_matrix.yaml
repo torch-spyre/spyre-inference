@@ -840,9 +840,9 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # Test-report fan-in: every leg's JUnit XML into one aggregate check-run plus a
-  # step-summary table, replacing the per-shard dorny checks the matrix used to
-  # publish. always()/continue-on-error like the other fan-ins; no-op when no leg
+  # Test-report fan-in: every leg's JUnit XML into one aggregate dorny report,
+  # replacing the per-shard dorny checks the matrix used to publish.
+  # always()/continue-on-error like the other fan-ins; no-op when no leg
   # produced a JUnit file.
   # ---------------------------------------------------------------------------
   test-report:
@@ -852,14 +852,6 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout script
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
-          sparse-checkout: .github/scripts
-          sparse-checkout-cone-mode: false
-
       - name: Download JUnit results
         uses: actions/download-artifact@v4
         with:
@@ -880,8 +872,10 @@ jobs:
             echo "found=true" >> "$GITHUB_OUTPUT"
           fi
 
-      # java-junit: dorny v1 has no python reporter, but it parses the generic
-      # JUnit-XML schema pytest emits.
+      # One aggregate report: the per-shard summary table (one row per leg's
+      # JUnit file), expanding only failed suites/tests -- passing shards are not
+      # re-listed under the table. java-junit: dorny v1 has no python reporter but
+      # parses the generic JUnit-XML schema pytest emits.
       - name: Publish aggregate test report
         if: ${{ steps.junit.outputs.found == 'true' }}
         uses: dorny/test-reporter@v1
@@ -889,15 +883,9 @@ jobs:
           name: Aggregate test report
           path: junit/*.xml
           reporter: java-junit
-          list-suites: all
+          list-suites: failed
           list-tests: failed
           fail-on-error: false
-
-      # Guarded on found: an unmatched junit/*.xml would reach the script as a
-      # literal path.
-      - name: Write aggregate summary
-        if: ${{ steps.junit.outputs.found == 'true' }}
-        run: python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
 
   # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the

@@ -599,6 +599,10 @@ jobs:
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           test_type: ${{ inputs.test_type }}
+          # The matrix entry's own declared membership set, not the invoked tier: one
+          # testtype__ tag per member, which is what lets a later run of another tier
+          # reuse this leg's coverage instead of re-running it.
+          test_types: ${{ matrix.test_types }}
           # Echo the exact runner-label selectors this job's runs-on used (matrix.runs_on plus the per-PR runner_label override, or the standing matrix.image_label).
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
@@ -683,6 +687,9 @@ jobs:
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           test_type: ${{ inputs.test_type }}
+          # Survives the retry hop: the failed-suite descriptor is toJSON(matrix), so
+          # the whole entry -- test_types included -- is rebuilt by collect_failed_suites.
+          test_types: ${{ matrix.test_types }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || matrix.image_label) }}
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'

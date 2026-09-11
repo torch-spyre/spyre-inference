@@ -30,6 +30,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     _pad_weight,
     install_mlp_pad_weight_loader,
     original_intermediate_size,
+    supports_intermediate_padding,
     verify_padded_intermediate_size,
     width_multipliers,
 )
@@ -240,7 +241,7 @@ def test_verify_noop_without_padding():
 def test_install_rejects_a_loader_that_cannot_pad_weights():
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 
-    with pytest.raises(NotImplementedError, match="get_all_weights.*object is unsupported"):
+    with pytest.raises(NotImplementedError, match="get_all_weights.*object .*unsupported"):
         install_mlp_pad_weight_loader(object(), hf_config)
 
 
@@ -248,13 +249,20 @@ def test_install_allows_an_unpadded_config_with_any_loader():
     install_mlp_pad_weight_loader(object(), SimpleNamespace(intermediate_size=_ORIG))
 
 
-def test_install_allows_dummy_weights_with_padding():
-    from vllm.config import LoadConfig
-    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-
+def test_install_allows_dummy_load_format_with_padding():
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 
-    install_mlp_pad_weight_loader(DummyModelLoader(LoadConfig(load_format="dummy")), hf_config)
+    loader = SimpleNamespace(load_config=SimpleNamespace(load_format="dummy"))
+    install_mlp_pad_weight_loader(loader, hf_config)
+
+
+def test_supported_intermediate_padding_models_have_gated_mlp_layouts():
+    assert supports_intermediate_padding(SimpleNamespace(model_type="gemma4"))
+    assert supports_intermediate_padding(SimpleNamespace(model_type="gemma4_text"))
+    assert supports_intermediate_padding(SimpleNamespace(model_type="qwen2"))
+    assert supports_intermediate_padding(SimpleNamespace(model_type="qwen3"))
+    assert not supports_intermediate_padding(SimpleNamespace(model_type="llama"))
+    assert not supports_intermediate_padding(SimpleNamespace())
 
 
 def _config_stub(*, tp=1, **fields):
@@ -269,10 +277,10 @@ def _config_stub(*, tp=1, **fields):
     ("tp", "fields", "expected"),
     [
         # Aligned at TP=1, but a TP=2 shard of 2112 lands mid-stick, so 2176 it is.
-        (1, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, None),
-        (2, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, 2176),
-        (1, {"intermediate_size": 160, "hidden_act": "silu"}, 192),
-        (2, {"intermediate_size": 160, "hidden_act": "silu"}, 256),
+        (1, {"model_type": "gemma4", "intermediate_size": 2112}, None),
+        (2, {"model_type": "gemma4", "intermediate_size": 2112}, 2176),
+        (1, {"model_type": "qwen2", "intermediate_size": 160}, 192),
+        (2, {"model_type": "qwen3", "intermediate_size": 160}, 256),
         # A MoE with its own expert width: only the dense MLP is widened here.
         (
             2,
@@ -280,14 +288,14 @@ def _config_stub(*, tp=1, **fields):
                 "intermediate_size": 2112,
                 "moe_intermediate_size": 704,
                 "num_experts": 128,
-                "hidden_activation": "gelu_pytorch_tanh",
+                "model_type": "gemma4",
             },
             2176,
         ),
         # A MoE that sizes its experts from intermediate_size would load them truncated.
-        (2, {"intermediate_size": 2112, "num_experts": 8, "hidden_act": "silu"}, None),
-        # Padding is only provably inert for a gated MLP.
-        (2, {"intermediate_size": 2112, "hidden_act": "relu"}, None),
+        (2, {"model_type": "qwen2", "intermediate_size": 2112, "num_experts": 8}, None),
+        # An unsupported architecture must not mutate its config based on activation alone.
+        (2, {"model_type": "bert", "intermediate_size": 2112}, None),
     ],
 )
 def test_platform_aligns_intermediate_size_to_the_per_rank_shard(tp, fields, expected):
@@ -307,8 +315,8 @@ def test_platform_rejects_per_layer_intermediate_sizes():
 
     config = _config_stub(
         tp=2,
+        model_type="gemma4",
         intermediate_size=[160, 192],
-        hidden_activation="gelu_pytorch_tanh",
     )
 
     with pytest.raises(NotImplementedError, match="per-layer intermediate_size values"):

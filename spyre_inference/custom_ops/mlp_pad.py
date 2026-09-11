@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Native-path SwiGLU MLP ``intermediate_size`` padding to a stick-aligned width.
+"""Native-path gated MLP ``intermediate_size`` padding to a stick-aligned width.
 
 An ``intermediate_size`` that is not a multiple of the 64-element fp16 stick makes
 ``SiluAndMul`` slice the fused gate+up tensor's second half at an unaligned offset,
@@ -20,9 +20,10 @@ which Spyre inductor cannot lower. ``TorchSpyrePlatform._maybe_pad_intermediate_
 rounds it up to a 64-multiple before the model is built; the pass here zero-fills the
 added gate/up output rows and down_proj input columns as the checkpoint streams in.
 
-Zero-padding is arithmetically inert for SwiGLU (``silu(0) = 0``): unlike QK-norm
-padding, nothing normalizes over ``intermediate_size`` so no rescale is needed, and
-there is no RoPE half-split so plain end-padding (not interleaving) suffices.
+Zero-padding is arithmetically inert for a supported gated MLP: each added lane has a
+zero up-projection value, so ``activation(0) * 0`` is zero. Unlike QK-norm, nothing
+normalizes over ``intermediate_size`` so no rescale is needed, and there is no RoPE
+half-split so plain end-padding (not interleaving) suffices.
 
 Scope: dense SwiGLU (``gate_proj``/``up_proj``/``down_proj``, fused or separate); MoE
 experts (``moe_intermediate_size``) are out of scope — a fused expert tensor differs.
@@ -50,6 +51,16 @@ def original_intermediate_size(hf_config) -> int | None:
 def intermediate_padding_active(hf_config) -> bool:
     """True when the platform padded this model's intermediate_size for alignment."""
     return original_intermediate_size(hf_config) is not None
+
+
+def supports_intermediate_padding(hf_config) -> bool:
+    """Whether the config uses the gated MLP layout handled by this module."""
+    return getattr(hf_config, "model_type", None) in {
+        "gemma4",
+        "gemma4_text",
+        "qwen2",
+        "qwen3",
+    }
 
 
 def _pad_rows_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
@@ -116,13 +127,13 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     if not hasattr(model_loader, "get_all_weights"):
-        from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
-
-        if isinstance(model_loader, DummyModelLoader):
+        load_format = getattr(getattr(model_loader, "load_config", None), "load_format", None)
+        if load_format == "dummy":
             return
         raise NotImplementedError(
             "Spyre MLP intermediate-size padding requires a model loader that "
-            f"exposes get_all_weights; {type(model_loader).__name__} is unsupported."
+            "exposes get_all_weights; "
+            f"{type(model_loader).__name__} (load_format={load_format!r}) is unsupported."
         )
 
     orig = getattr(hf_config, _ORIG_ATTR)

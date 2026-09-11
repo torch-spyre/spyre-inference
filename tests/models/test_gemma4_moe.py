@@ -170,6 +170,13 @@ def _unquantized_method():
     return object.__new__(SpyreUnquantizedFusedMoEMethod)
 
 
+def test_expert_weight_layout_rejects_an_unaligned_free_dimension():
+    from spyre_inference.moe import _to_spyre_expert_weight
+
+    with pytest.raises(RuntimeError, match="must span complete sticks"):
+        _to_spyre_expert_weight(torch.empty(EXPERTS, HIDDEN, INTER - 1), ())
+
+
 def _generic_layer(*, moe_config=None, enable_eplb=False, **overrides):
     """An upstream ``RoutedExperts`` the backend would claim, with no model adapter."""
     moe = {

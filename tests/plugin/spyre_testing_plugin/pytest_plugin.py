@@ -58,6 +58,7 @@ XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import os
 import re
@@ -67,6 +68,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 import pytest
@@ -1228,26 +1230,27 @@ def pytest_sessionfinish(session, exitstatus) -> None:
 def pytest_cmdline_main(config):
     """Hard-exit a Spyre-host run before interpreter finalization.
 
-    senlib's global config singleton is destroyed from a libc exit handler
-    after pytest has already reported, and that destructor intermittently
-    aborts ("corrupted double-linked list"), failing an otherwise-green job.
-    os._exit skips it, but also skips Python atexit, so first save the coverage
-    instance COVERAGE_PROCESS_START starts (it otherwise saves via atexit). Same
-    class of teardown abort as the os._exit in profile_spyre_inference.py, now at
-    the session level since device tests run in the pytest process itself.
+    senlib's config singleton is torn down from a libc exit handler after
+    pytest has already reported, and that destructor intermittently aborts
+    ("corrupted double-linked list"), failing an otherwise-green job. os._exit
+    skips it. Remove once senlib no longer aborts at process exit.
     """
     outcome = yield
     if not spyre_hardware_present():
         return
+    result = outcome.get_result()
+    code = int(result) if result is not None else 0
+    _log(
+        f"Spyre host: hard-exiting (code {code}) past finalization "
+        "to skip the senlib teardown abort"
+    )
     try:
-        from coverage import Coverage
-
-        cov = Coverage.current()
-        if cov is not None:
-            cov.save()
+        # os._exit skips every atexit handler; run them now so coverage saves,
+        # logging flushes and multiprocessing reaps children. Only the libc
+        # handler where the abort lives is left to be skipped.
+        atexit._run_exitfuncs()
     except Exception:
-        pass
+        _log(f"atexit handlers failed before hard-exit:\n{traceback.format_exc()}")
     sys.stdout.flush()
     sys.stderr.flush()
-    result = outcome.get_result()
-    os._exit(int(result) if result is not None else 0)
+    os._exit(code)

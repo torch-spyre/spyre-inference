@@ -128,7 +128,11 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "447d19e18738e2acbd7dc8172768e9623bf32206" }
+# TEMPORARY: pinned to the head of torch-spyre PR #4475 (sliced staggered dtype
+# conversion; unblocks Gemma q_norm/k_norm under native FP32 RMSNorm). The commit
+# lives on a fork branch but is fetchable from this URL via refs/pull/4475/head.
+# Bump to a merged main rev once #4475 lands.
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "fe345c52613595c612f3778712bdac0df231328a" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

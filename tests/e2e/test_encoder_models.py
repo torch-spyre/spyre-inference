@@ -51,6 +51,21 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
+# Sequence classifiers via model_impl='transformers' (TransformersForSequenceClassification).
+# id2label for distilbert-base-uncased-finetuned-sst-2-english: {0: NEGATIVE, 1: POSITIVE}
+CLASSIFY_MODELS = [
+    "distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+]
+
+CLASSIFY_PROMPTS = [
+    "This movie is great!",
+    "This movie is terrible!",
+]
+
+# HF fp32 reference (cpu): great→POSITIVE≈0.9999, terrible→NEGATIVE≈0.9997.
+# Minimum probability for the correct class to catch near-uniform wrong results.
+CLASSIFY_MIN_CORRECT_PROB = 0.9
+
 # Cross-encoder reranker smoke (classify / score path). One model is enough —
 # both BGE variants share XLMRobertaForSequenceClassification.
 RERANKER_MODELS = [
@@ -219,6 +234,67 @@ def test_encoder_rerank_models(model: str) -> None:
     scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
     assert len(scores) == 1
     assert math.isfinite(scores[0].outputs.score)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", CLASSIFY_MODELS)
+def test_encoder_classify_models(model: str) -> None:
+    """TransformersForSequenceClassification: probs match HF fp32 reference logits.
+
+    Runs an inline HF CPU reference to obtain fp32 logits for both prompts,
+    then compares Spyre softmax probabilities against reference probabilities
+    within a loose tolerance (fp16 encoder + fp32 head on CPU).
+
+    Also asserts correct sentiment direction for both prompts so that a broken
+    head (e.g. missing pre_classifier → near-uniform [0.51, 0.49]) fails even
+    if probabilities are finite and sum to 1.
+    """
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    # HF fp32 CPU reference.
+    tok = AutoTokenizer.from_pretrained(model)
+    hf = AutoModelForSequenceClassification.from_pretrained(model, dtype=torch.float32)
+    hf.eval()
+    with torch.inference_mode():
+        enc = tok(
+            CLASSIFY_PROMPTS,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=64,
+        )
+        ref_probs = F.softmax(hf(**enc).logits.float(), dim=-1)  # [N, num_labels]
+
+    llm = LLM(
+        model=model,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=len(CLASSIFY_PROMPTS),
+        model_impl="transformers",
+    )
+    outputs = llm.classify(CLASSIFY_PROMPTS)
+    assert len(outputs) == len(CLASSIFY_PROMPTS)
+
+    for i, (out, ref) in enumerate(zip(outputs, ref_probs)):
+        probs = torch.tensor(out.outputs.probs, dtype=torch.float32)
+        assert probs.shape == ref.shape
+        assert all(math.isfinite(p) for p in probs.tolist())
+        assert abs(probs.sum().item() - 1.0) < 1e-3
+        # fp16 encoder + fp32 head: allow atol=0.01 (1 percentage point).
+        assert torch.allclose(probs, ref, atol=1e-2), (
+            f"prompt {i}: Spyre probs {probs.tolist()} vs HF {ref.tolist()}"
+        )
+
+    # Explicit sentiment-direction check: catches near-uniform false passes
+    # even within tolerance. distilbert-sst2: {0: NEGATIVE, 1: POSITIVE}.
+    great_probs = outputs[0].outputs.probs
+    terrible_probs = outputs[1].outputs.probs
+    assert great_probs[1] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'great' POSITIVE={great_probs[1]:.4f} < {CLASSIFY_MIN_CORRECT_PROB}"
+    )
+    assert terrible_probs[0] >= CLASSIFY_MIN_CORRECT_PROB, (
+        f"'terrible' NEGATIVE={terrible_probs[0]:.4f} < {CLASSIFY_MIN_CORRECT_PROB}"
+    )
 
 
 @pytest.mark.uses_subprocess

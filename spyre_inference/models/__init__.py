@@ -42,9 +42,16 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
-    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
+    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation,
+    # gather-free embeddings, pre_classifier inference path, etc.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
+    ),
+    "TransformersEmbeddingModel": (
+        "spyre_inference.transformers_backend:SpyreTransformersEmbeddingModel"
+    ),
+    "TransformersForSequenceClassification": (
+        "spyre_inference.transformers_backend:SpyreTransformersForSequenceClassification"
     ),
 }
 

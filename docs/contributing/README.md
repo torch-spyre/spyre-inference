@@ -84,15 +84,22 @@ pytest --upstream -m "attention"
 
 #### Model Output Quality Gate
 
-The `model_quality` marker gates the product models on their output: each is loaded
-**compiled** (the platform default) and compared against a CPU HF reference — greedy token
-ids and per-token probabilities for the decoders (`tests/e2e/test_model_quality.py`),
-cosine similarity for the embedding models and sigmoid scores plus document ranking for
-the cross-encoder rerankers (`tests/e2e/test_encoder_models.py`).
+The quality gate holds the product models to their output, and runs as one suite of two
+kinds of case:
+
+- **`model_quality`** — each product model is loaded **compiled** (the platform default) and
+  compared against a CPU HF reference: greedy token ids and per-token probabilities for the
+  decoders (`tests/e2e/test_model_quality.py`), cosine similarity for the embedding models
+  and sigmoid scores plus document ranking for the cross-encoder rerankers
+  (`tests/e2e/test_encoder_models.py`).
+- **`gsm8k`** — server-based GSM8K accuracy evals (one per config in
+  `tests/plugin/spyre_testing_plugin/gsm8k_configs/models-spyre.txt`), each starting a vLLM
+  server and running a batched eval. These live in the upstream vLLM tree, so the gate's
+  marker expression pulls the cached checkout in automatically (no `--upstream` flag).
 
 ```bash
-make test-model-quality              # the whole gate, one card
-make test-model-quality-shard-0      # one CI shard (QUALITY_SHARDS=6)
+make test-quality              # the whole gate, one card
+make test-quality-shard-0      # one CI shard (QUALITY_SHARDS=8)
 ```
 
 CI runs the gate as `QUALITY_SHARDS` parallel 1-card jobs, weighted by recorded runtime like

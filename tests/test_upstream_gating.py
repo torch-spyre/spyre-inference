@@ -54,22 +54,23 @@ def test_markexpr_does_not_request_upstream(markexpr):
 
 
 # Target families whose suites live in the upstream vLLM tree and so must trigger a clone.
-# The gsm8k accuracy gate (test-gsm8k*) is an upstream suite too, despite its name.
-UPSTREAM_TARGET_PREFIXES = ("test-upstream", "test-gsm8k")
+# The quality gate (test-quality*) folds in the GSM8K accuracy evals, which carry the
+# `upstream` marker, so it is an upstream-requiring suite too despite its name.
+UPSTREAM_TARGET_PREFIXES = ("test-upstream", "test-quality")
 
 
 def test_makefile_upstream_targets_are_classified_correctly(pytestconfig):
     """The Makefile's combos all mention `upstream`, most negatively; only the
-    test-upstream* and test-gsm8k* targets should trigger a clone.
+    test-upstream* and test-quality* targets should trigger a clone.
     """
     makefile = (Path(pytestconfig.rootpath) / "Makefile").read_text()
     overrides = dict(re.findall(r"^(test-[\w-]+):.*\n\t.*MARK_OVERRIDE='([^']*)'", makefile, re.M))
     assert len(overrides) >= 8, f"failed to parse MARK_OVERRIDEs out of the Makefile: {overrides}"
 
     for target, markexpr in overrides.items():
-        assert _markexpr_selects_upstream(markexpr) == target.startswith(UPSTREAM_TARGET_PREFIXES), (
-            f"{target} ({markexpr!r}) is on the wrong side of the upstream gate"
-        )
+        assert _markexpr_selects_upstream(markexpr) == target.startswith(
+            UPSTREAM_TARGET_PREFIXES
+        ), f"{target} ({markexpr!r}) is on the wrong side of the upstream gate"
 
 
 def test_plugin_is_loaded_via_addopts(pytestconfig):

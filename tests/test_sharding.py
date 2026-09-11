@@ -461,8 +461,7 @@ def _makefile_shard_counts() -> dict[str, int]:
         ("upstream", "UPSTREAM_SHARDS"),
         ("distributed", "DIST_SHARDS"),
         ("probes", "PROBE_SHARDS"),
-        ("model-quality", "QUALITY_SHARDS"),
-        ("gsm8k", "GSM8K_SHARDS"),
+        ("quality", "QUALITY_SHARDS"),
     ):
         m = re.search(rf"^{var}\s*\?=\s*(\d+)", text, re.MULTILINE)
         assert m, f"{var} not found in Makefile"
@@ -480,8 +479,7 @@ def _matrix_shard_ids() -> dict[str, list[int]]:
             "upstream",
             "distributed",
             "probes",
-            "model-quality",
-            "gsm8k",
+            "quality",
         )
     }
 

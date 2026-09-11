@@ -123,11 +123,11 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-smoke-shard test-model-quality test-model-quality-shard \
+        test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
         test-attention test-attention-shard \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
-        test-upstream-distributed test-gsm8k test-gsm8k-shard \
+        test-upstream-distributed \
         tests-single-card tests-multi-card
 
 help: ## Show this help message
@@ -199,25 +199,31 @@ test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
 test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
-# Carved out of smoke: every case compiles a product model, up to the 31B decoders.
-test-model-quality: ## Run the product-model output-quality gates against the cached HF references. Unsharded (local full run).
-	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+# The model-output quality gate. Two kinds of heavy case share it: the product-model output
+# checks (`model_quality`; local, every case compiles a product model, up to the 31B decoders)
+# and the GSM8K accuracy evals (`gsm8k`; each starts a vLLM server and runs a batched eval).
+# The gsm8k evals live in the upstream vLLM tree and carry the `upstream` marker, so the combo
+# names `upstream` on that branch: the gate detects it and clones the cached vLLM checkout (as
+# test-upstream does), no --upstream flag needed. `not (distributed or upstream)` on the
+# model_quality branch keeps those local and on one card.
+test-quality: ## Run the model-output quality gate (product-model output checks + GSM8K accuracy evals). Unsharded (local full run). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' JUNIT_XML=$(JUNIT_XML)
 
-# CI fans the gate out across parallel shard jobs like smoke/attention; the plugin's
+# CI fans the gate out across parallel 1-card shard jobs like smoke/attention; the plugin's
 # weighted partition (--quality-shards) balances by recorded runtime when a durations file
-# is present, else by decoder-vs-encoder path weight. No partition beats the slowest single
-# case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
-QUALITY_SHARDS ?= 6
+# is present, else by the decoder/eval-vs-encoder path weight. No partition beats the slowest
+# single case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
+QUALITY_SHARDS ?= 8
 QUALITY_SHARD_ID ?= 0
-test-model-quality-shard: ## Run one model-quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i).
-	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' \
+test-quality-shard: ## Run one quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' \
 	  PYTEST_ARGS='$(PYTEST_ARGS) --quality-shards=$(QUALITY_SHARDS) --quality-shard-id=$(QUALITY_SHARD_ID)' \
 	  JUNIT_XML=$(JUNIT_XML)
 
-# CI runs one matrix job per shard as `test-model-quality-shard-<i>` so each JUnit
+# CI runs one matrix job per shard as `test-quality-shard-<i>` so each JUnit
 # artifact name is unique; the pattern maps <i> to QUALITY_SHARD_ID.
-test-model-quality-shard-%:
-	$(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+test-quality-shard-%:
+	$(MAKE) test-quality-shard QUALITY_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 test-probes: ## Run the torch-spyre backend probes (excluded from integration), unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' JUNIT_XML=$(JUNIT_XML)
@@ -284,7 +290,7 @@ test-distributed-shard-%:
 	$(MAKE) test-distributed-shard DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # `not gsm8k` carves the GSM8K accuracy gate out of the upstream suite: it also
-# carries the `upstream` marker but is its own sharded suite (test-gsm8k below).
+# carries the `upstream` marker but is part of the quality suite (test-quality above).
 test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' JUNIT_XML=$(JUNIT_XML)
 
@@ -309,40 +315,16 @@ test-upstream-shard-%:
 test-upstream-distributed: ## Run the upstream+distributed marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' OMP_THREADS=1 JUNIT_XML=$(JUNIT_XML)
 
-# The GSM8K accuracy gate: server-based correctness evals kept in their own suite
-# (not the upstream per-op suite) because each one starts a vLLM server and runs a
-# batched eval -- minutes per config, single card. `gsm8k and upstream` names the
-# `upstream` marker so the eval file is collected from the cached vLLM checkout
-# (as test-upstream does); no --upstream flag needed.
-test-gsm8k: ## Run the GSM8K accuracy gate (server-based evals), unsharded (local full run). Needs 1 card.
-	$(MAKE) run-one MARK_OVERRIDE='gsm8k and upstream' JUNIT_XML=$(JUNIT_XML)
-
-# One eval per config (gsm8k_configs/models-spyre.txt) sharded across parallel
-# 1-card CI jobs, one config per shard. The plugin owns the partition
-# (--gsm8k-shards), balancing by recorded runtime when a durations file is
-# present, else evenly. GSM8K_SHARDS is the single source of the count.
-GSM8K_SHARDS ?= 3
-GSM8K_SHARD_ID ?= 0
-test-gsm8k-shard: ## Run one GSM8K accuracy shard (GSM8K_SHARDS=N GSM8K_SHARD_ID=i). Needs 1 card.
-	$(MAKE) run-one MARK_OVERRIDE='gsm8k and upstream' \
-	  PYTEST_ARGS='$(PYTEST_ARGS) --gsm8k-shards=$(GSM8K_SHARDS) --gsm8k-shard-id=$(GSM8K_SHARD_ID)' \
-	  JUNIT_XML=$(JUNIT_XML)
-
-# CI runs one matrix job per shard as `test-gsm8k-shard-<i>` so each JUnit
-# artifact name is unique; the pattern maps <i> to GSM8K_SHARD_ID.
-test-gsm8k-shard-%:
-	$(MAKE) test-gsm8k-shard GSM8K_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
-
-# Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
+# Single-card / multi-card split, grouping the marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the 1-card marker combos (smoke shards / model-quality shards / attention shards / encoder-attention / upstream shards / gsm8k shards). Needs 1 card.
+tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-smoke-shard-$$i" && $(MAKE) test-smoke-shard SMOKE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-shard-$$i/junit-test-smoke-shard-$$i.xml" || rc=1; \
 	done; \
 	for i in $$(seq 0 $$(( $(QUALITY_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-model-quality-shard-$$i" && $(MAKE) test-model-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-model-quality-shard-$$i/junit-test-model-quality-shard-$$i.xml" || rc=1; \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-quality-shard-$$i" && $(MAKE) test-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-quality-shard-$$i/junit-test-quality-shard-$$i.xml" || rc=1; \
 	done; \
 	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
@@ -350,9 +332,6 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / model-quality
 	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
 	for i in $$(seq 0 $$(( $(UPSTREAM_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-upstream-shard-$$i" && $(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-shard-$$i/junit-test-upstream-shard-$$i.xml" || rc=1; \
-	done; \
-	for i in $$(seq 0 $$(( $(GSM8K_SHARDS) - 1 ))); do \
-	  mkdir -p "$(RESULTS_DIR)/junit-test-gsm8k-shard-$$i" && $(MAKE) test-gsm8k-shard GSM8K_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-gsm8k-shard-$$i/junit-test-gsm8k-shard-$$i.xml" || rc=1; \
 	done; \
 	exit $$rc
 

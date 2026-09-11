@@ -1964,6 +1964,40 @@ def test_spyre_attn_batched_decode_sliding_window(
     )
 
 
+@pytest.mark.parametrize(
+    ("kv_lens", "sliding_window"),
+    [
+        pytest.param([256, 512, 128, 384, 256, 512, 128, 384], None, id="no_window_ragged"),
+        pytest.param([64, 512, 512, 512], None, id="no_window_short_first"),
+        pytest.param([1, 128, 128, 128], None, id="no_window_zero_full_blocks"),
+        pytest.param([512, 512, 512, 512], 256, id="window_uniform"),
+    ],
+)
+def test_bucketed_block_ids_match_scalar_fill(
+    default_vllm_config, kv_lens: list[int], sliding_window: int | None
+) -> None:
+    block_size = 64
+    seq_lens = [(1, kv) for kv in kv_lens]
+    metadata = _padded_mask_metadata(seq_lens, block_size=block_size, sliding_window=sliding_window)
+    assert metadata.block_ids_padded_cpu is not None
+
+    got = metadata.block_ids_padded_cpu
+    bt = metadata.block_table
+    active = metadata.active_block_indices
+    b_blocks = got.shape[0]
+    for s, kv in enumerate(kv_lens):
+        abs_blocks = (
+            active[s] if active is not None else list(range((kv + block_size - 1) // block_size))
+        )
+        n_use = min(len(abs_blocks), b_blocks)
+        for b in range(n_use):
+            assert got[b, s].item() == bt[s, abs_blocks[b]].item(), (
+                f"seq={s} block={b}: got {got[b, s].item()}, expected {bt[s, abs_blocks[b]].item()}"
+            )
+        for b in range(n_use, b_blocks):
+            assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
+
+
 def _padded_mask_metadata(
     seq_lens: list[tuple[int, int]],
     block_size: int = 64,

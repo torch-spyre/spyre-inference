@@ -76,6 +76,21 @@ jobs:
             *) echo "::error::${ACTOR} lacks write access (${perm:-none}); refusing review." ; exit 1 ;;
           esac
 
+      # Ack that the run was picked up. curl, not gh (not installed yet);
+      # best-effort so a failed reaction never blocks the review.
+      - name: Acknowledge trigger comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d '{"content":"eyes"}' \
+            || echo "::warning::Could not add :eyes: reaction to the trigger comment"
+
       # Checkout with no ref = the trusted default branch. The agent pulls the
       # PR itself (gh pr checkout) when it must run the changed code on hardware.
       - name: Checkout
@@ -104,6 +119,14 @@ jobs:
         env:
           DISABLE_AUTOUPDATER: '1'
         run: |
+          # The image's ~/.local is not writable by this arbitrary CI uid, and
+          # the native installer hardcodes $HOME/.local/{bin,share,state} (it
+          # does not honour XDG). Point HOME at a job-writable dir so both the
+          # install and the runtime state the binary writes land there. The
+          # launcher path is exported to PATH for the review step, which sets
+          # the same HOME. RUNNER_TEMP persists for the whole job.
+          export HOME="${RUNNER_TEMP}/claude-home"
+          mkdir -p "$HOME"
           curl -fsSL https://claude.ai/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -122,6 +145,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Claude review
+        id: claude
         env:
           # ALL model traffic goes to the enterprise LiteLLM proxy -- never
           # api.anthropic.com. AUTH_TOKEN is sent as `Authorization: Bearer`.
@@ -139,8 +163,15 @@ jobs:
         run: |
           # Device env, so the agent's own Bash can reach the accelerator for
           # on-hardware verification (this shell does not inherit it otherwise).
+          # Source it from the real home before switching HOME below.
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
+
+          # claude was installed under this HOME (the image's ~/.local is
+          # read-only for this uid); set it so the CLI is found and can write
+          # its runtime state. uv/gh keep working: uv uses the workspace .venv
+          # and gh authenticates via GH_TOKEN.
+          export HOME="${RUNNER_TEMP}/claude-home"
 
           # Build the MCP config from the secret URL in-shell so the URL stays
           # masked (never interpolated into the rendered workflow).
@@ -165,6 +196,9 @@ jobs:
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
           # internal-IP firewall (see PR #785), not the tool list.
+          #
+          # The agent posts its own PR-level summary comment (see the prompt);
+          # the completion signal is the outcome reaction in the next step.
           claude -p "$prompt" \
             --model claude-opus-4-8 \
             --max-turns 60 \
@@ -172,3 +206,23 @@ jobs:
             --strict-mcp-config \
             --allowedTools "Read,Grep,Glob,Bash,mcp__spyre-knowledgebase" \
             --output-format text
+
+      # React on the trigger comment with the outcome: :+1: on success, :-1:
+      # otherwise. GitHub has no check/X reaction, so this is the closest
+      # pass/fail pair. always() so a timeout or error still signals -- this is
+      # the only completion signal when the agent dies before posting a summary.
+      - name: React with review outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REVIEW_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          if [ "$REVIEW_OUTCOME" = "success" ]; then reaction="+1"; else reaction="-1"; fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -d "{\"content\":\"${reaction}\"}" \
+            || echo "::warning::Could not add the outcome reaction to the trigger comment"

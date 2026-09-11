@@ -1079,16 +1079,20 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 block_ids_padded_cpu = torch.zeros(
                     b_blocks, _stick_aligned_len(b_seqs), dtype=torch.int32
                 )
-                for s, n in enumerate(blocks_per_seq):
-                    n_use = min(n, b_blocks)
-                    # Position i is the i-th ACTIVE block, matching the mask tiles.
-                    blocks_s = (
-                        range(n_use)
-                        if active_block_indices is None
-                        else active_block_indices[s][:n_use]
-                    )
-                    for b, abs_b in enumerate(blocks_s):
-                        block_ids_padded_cpu[b, s] = block_table[s, abs_b]
+                bt = block_table[:num_seqs].to(torch.int32)
+                if active_block_indices is None:
+                    n_use_list = [min(n, b_blocks) for n in blocks_per_seq]
+                    w = min(b_blocks, bt.shape[1])
+                    cols = torch.arange(w)
+                    in_range = cols.unsqueeze(0) < torch.tensor(
+                        n_use_list, dtype=torch.int64
+                    ).unsqueeze(1)
+                    block_ids_padded_cpu[:w, :num_seqs] = (bt[:, :w] * in_range).t()
+                else:
+                    for s, abs_blocks in enumerate(active_block_indices):
+                        n_use = min(len(abs_blocks), b_blocks)
+                        for b, abs_b in enumerate(abs_blocks[:n_use]):
+                            block_ids_padded_cpu[b, s] = bt[s, abs_b]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
@@ -1100,8 +1104,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 )
                 for s in range(num_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
-                    for b in range(n_use):
-                        mask_bs_bb[s, b] = attention_mask_tiles[s][b][0]
+                    if n_use:
+                        mask_bs_bb[s, :n_use] = torch.stack(
+                            [attention_mask_tiles[s][b][0] for b in range(n_use)]
+                        )
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.

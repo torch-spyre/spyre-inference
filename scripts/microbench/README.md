@@ -67,6 +67,16 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 
 `block_sizes: [64, 128]` sweeps block size as an extra axis.
 
+## KV layout probes
+
+`slot_major_devfill` is the default `--kv-layout`: it matches the worker's
+slot-major allocation and device-side KV history write. The startup probe uses
+the selected layout and block count, so it cannot seed the compilation cache
+with a different specialization.
+
+`page_major` is an opt-in `index_select` layout/SDSC probe. Its device axes are
+`[page, kv_head, D-stick, token, D-element]`.
+
 ## Output
 
 Tab-separated, written after every measurement (a crash keeps what completed) plus a

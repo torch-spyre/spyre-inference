@@ -195,7 +195,7 @@ def build_inputs_from_requests(
     num_blocks,
     device,
     seed=0,
-    kv_layout="plain",
+    kv_layout="slot_major_devfill",
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
@@ -272,13 +272,26 @@ def build_inputs_from_requests(
     def to_device(cache):
         # plain: host-populated cache, plain transfer. Matches
         # tests/attention/test_spyre_attn.py, correct at these shapes.
-        # slot_major / slot_major_devfill: numerically WRONG, kept only to
-        # reproduce the finding (see README). _reshape_and_cache views pages as
-        # [-1, H, D] and relies on the slot-outermost device layout, which
-        # convert() does not reproduce for a host tensor.
+        # _reshape_and_cache views pages as [-1, H, D] and requires the
+        # slot-outermost device layout, which host conversion cannot reproduce.
+        # slot_major is therefore wrong; slot_major_devfill uses production's
+        # device-side history write.
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
+        if kv_layout == "page_major":
+            from torch_spyre._C import SpyreTensorLayout
+
+            # device axes: [page, kv_head, D-stick, token, D-element]
+            return cache.to(
+                cache_device,
+                device_layout=SpyreTensorLayout(
+                    [nb, bsz, h, d],
+                    [bsz * h * d, h * d, d, 1],
+                    cache.dtype,
+                    [1, 0, 2, 3],
+                ),
+            )
         layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
         if kv_layout == "slot_major":
             return cache.to(cache_device, device_layout=layout)
@@ -501,7 +514,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "head_size": head_size,
         "block_size": block_size,
         "num_blocks": num_blocks,
-        "kv_layout": cfg.get("kv_layout", "plain"),
+        "kv_layout": cfg.get("kv_layout", "slot_major_devfill"),
         "num_kv_blocks_iterated": (max_kv + block_size - 1) // block_size,
         "dtype": str(DTYPE),
         "implementation": meta["impl_label"],
@@ -535,7 +548,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             num_blocks,
             cfg.get("device", "spyre"),
             seed=cfg.get("seed", 0),
-            kv_layout=cfg.get("kv_layout", "plain"),
+            kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
         )
         if inputs is None:
             needed = len(query_lens) * row["num_kv_blocks_iterated"]
@@ -694,13 +707,13 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill"],
+        choices=["plain", "slot_major", "slot_major_devfill", "page_major"],
         default=None,
-        help="KV page device layout. 'plain' (default) is correct for a "
-        "host-populated cache. 'slot_major_devfill' matches the "
-        "worker: zeroed slot-major alloc, history written on device. "
-        "'slot_major' pins the worker layout on a host-populated "
-        "cache and is numerically wrong; kept to reproduce that.",
+        help="KV page device layout. 'slot_major_devfill' (default) matches the "
+        "worker: zeroed slot-major alloc, history written on device. 'plain' is "
+        "correct for a host-populated cache. 'slot_major' pins the worker layout "
+        "on a host-populated cache and is numerically wrong. 'page_major' is an "
+        "index_select layout/SDSC probe.",
     )
     ap.add_argument(
         "--span",
@@ -784,8 +797,12 @@ def main():
             cfg["num_kv_heads"],
             cfg["head_size"],
             cfg["block_size"],
-            cfg["num_blocks"],
+            max(
+                cfg["num_blocks"],
+                (max(probe["seq_lens"]) + cfg["block_size"] - 1) // cfg["block_size"],
+            ),
             cfg["device"],
+            kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
         )
         probe_run, _ = make_forward(
             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]

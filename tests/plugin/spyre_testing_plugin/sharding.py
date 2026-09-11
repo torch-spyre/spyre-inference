@@ -14,7 +14,7 @@
 
 """Duration-weighted test sharding for CI fan-out.
 
-Each suite (attn/smoke/upstream/dist/probe/quality) is split across N parallel jobs; a job
+Each suite (attn/smoke/upstream/dist/probe/quality/gsm8k) is split across N parallel jobs; a job
 keeps only its shard's slice. Every shard job computes the same weighted greedy
 longest-processing-time partition, so no cross-job coordination is needed and
 the union of all shards is the full selection exactly once (guarded by
@@ -60,7 +60,7 @@ def _will_skip(item: pytest.Item) -> bool:
 def add_shard_options(parser) -> None:
     """Register one --<suite>-shards / --<suite>-shard-id pair per CI suite."""
     group = parser.getgroup("spyre-test-sharding")
-    for suite in ("attn", "smoke", "upstream", "dist", "probe", "quality"):
+    for suite in ("attn", "smoke", "upstream", "dist", "probe", "quality", "gsm8k"):
         group.addoption(
             f"--{suite}-shards",
             type=int,
@@ -93,7 +93,8 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
-    _apply_quality_shard(config, items)
+    _apply_gsm8k_shard(config, items)
+    _apply_model_quality_shard(config, items)
 
 
 def _load_durations(config: pytest.Config) -> dict[str, float]:
@@ -299,7 +300,7 @@ def _apply_upstream_shard(config: pytest.Config, items: list[pytest.Item]) -> No
         return 8 if "models/" in item.nodeid else 1
 
     # The GSM8K gate also carries the `upstream` marker but is its own sharded suite
-    # (_apply_quality_shard); excluded here so its server-based evals stay out of this partition.
+    # (_apply_gsm8k_shard); excluded here so its server-based evals stay out of this partition.
     _apply_shard(
         config,
         items,
@@ -355,18 +356,42 @@ def _apply_probe_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
     )
 
 
-def _apply_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
-    # The GSM8K accuracy gate (Makefile test-quality: `gsm8k and upstream`), one
+def _apply_gsm8k_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # The GSM8K accuracy gate (Makefile test-gsm8k: `gsm8k and upstream`), one
     # server-based eval per config in gsm8k_configs/models-spyre.txt. Each starts a
     # vLLM server and runs a batched eval -- heavy and roughly per-config uniform, so
     # a shard per config; durations refine that. Single card each (one server at a time).
     _apply_shard(
         config,
         items,
-        num_shards=config.getoption("--quality-shards"),
-        shard_id=config.getoption("--quality-shard-id"),
+        num_shards=config.getoption("--gsm8k-shards"),
+        shard_id=config.getoption("--gsm8k-shard-id"),
         select=lambda item: bool(item.get_closest_marker("gsm8k")),
         weight=lambda item: 1,
+        label="gsm8k",
+        durations=_load_durations(config),
+    )
+
+
+def _apply_model_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # The product-model output-quality gate (Makefile test-model-quality), split across
+    # parallel 1-card jobs. Every case compiles a product model, so the spread that matters
+    # is the decoders against the much smaller encoder cases.
+    def select(item: pytest.Item) -> bool:
+        return bool(item.get_closest_marker("model_quality")) and not item.get_closest_marker(
+            "upstream"
+        )
+
+    def weight(item: pytest.Item) -> int:
+        return 8 if "test_model_quality" in item.nodeid else 1
+
+    _apply_shard(
+        config,
+        items,
+        num_shards=config.getoption("--quality-shards"),
+        shard_id=config.getoption("--quality-shard-id"),
+        select=select,
+        weight=weight,
         label="quality",
         durations=_load_durations(config),
     )

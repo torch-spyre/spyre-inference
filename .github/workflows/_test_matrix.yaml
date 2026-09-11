@@ -282,6 +282,60 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
+          # Product-model output-quality gate: its own jobs and not in
+          # `integration`, since every case compiles a product model. Sharded
+          # across parallel 1-card jobs like smoke/attention, bounded by the
+          # slowest single case. The plugin owns the weighted partition;
+          # QUALITY_SHARDS (Makefile default) is the count. Adding/removing a
+          # shard = add/remove an entry here and bump that default.
+          - cfg: Spyre model quality tests (shard 1/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-0
+          - cfg: Spyre model quality tests (shard 2/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-1
+          - cfg: Spyre model quality tests (shard 3/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-2
+          - cfg: Spyre model quality tests (shard 4/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-3
+          - cfg: Spyre model quality tests (shard 5/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-4
+          - cfg: Spyre model quality tests (shard 6/6)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-quality-shard-5
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock
@@ -496,31 +550,31 @@ jobs:
           # parallel 1-card jobs (one config per shard). Heavy (full vLLM server +
           # batched eval per config), so regression/trunk only -- excluded from
           # integration/unit like the upstream suites. Adding/removing a shard =
-          # add/remove an entry here and bump QUALITY_SHARDS (Makefile default).
-          - cfg: Quality accuracy gate (shard 1/3)
+          # add/remove an entry here and bump GSM8K_SHARDS (Makefile default).
+          - cfg: GSM8K accuracy gate (shard 1/3)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-quality-shard-0
-          - cfg: Quality accuracy gate (shard 2/3)
+            test_target: test-gsm8k-shard-0
+          - cfg: GSM8K accuracy gate (shard 2/3)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-quality-shard-1
-          - cfg: Quality accuracy gate (shard 3/3)
+            test_target: test-gsm8k-shard-1
+          - cfg: GSM8K accuracy gate (shard 3/3)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-quality-shard-2
+            test_target: test-gsm8k-shard-2
           - cfg: Upstream distributed vLLM tests
             test_types: regression trunk
             runs_on:
@@ -571,6 +625,7 @@ jobs:
             spyre-rpms.lock
             tests/**/*.py
             tests/**/*.yaml
+            tests/data/**
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 
@@ -941,7 +996,13 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            uv add --frozen \
+            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
+            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
+            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
+            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
+            # --frozen"). Shadow it to a false value for this one call so the add
+            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
+            UV_NO_SYNC=0 uv add --frozen \
               "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
             uv sync --verbose --group dev
           else

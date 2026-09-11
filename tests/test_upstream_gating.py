@@ -54,13 +54,13 @@ def test_markexpr_does_not_request_upstream(markexpr):
 
 
 # Target families whose suites live in the upstream vLLM tree and so must trigger a clone.
-# The gsm8k accuracy gate (test-quality*) is an upstream suite too, despite its name.
-UPSTREAM_TARGET_PREFIXES = ("test-upstream", "test-quality")
+# The gsm8k accuracy gate (test-gsm8k*) is an upstream suite too, despite its name.
+UPSTREAM_TARGET_PREFIXES = ("test-upstream", "test-gsm8k")
 
 
 def test_makefile_upstream_targets_are_classified_correctly(pytestconfig):
     """The Makefile's combos all mention `upstream`, most negatively; only the
-    test-upstream* and test-quality* targets should trigger a clone.
+    test-upstream* and test-gsm8k* targets should trigger a clone.
     """
     makefile = (Path(pytestconfig.rootpath) / "Makefile").read_text()
     overrides = dict(re.findall(r"^(test-[\w-]+):.*\n\t.*MARK_OVERRIDE='([^']*)'", makefile, re.M))

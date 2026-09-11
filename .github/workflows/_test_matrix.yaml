@@ -895,6 +895,61 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # Test-report fan-in: every leg's JUnit XML into one aggregate dorny report,
+  # replacing the per-shard dorny checks the matrix used to publish.
+  # always()/continue-on-error like the other fan-ins; no-op when no leg
+  # produced a JUnit file.
+  # ---------------------------------------------------------------------------
+  test-report:
+    name: Aggregate test report
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      # dorny/test-reporter runs `git ls-files` to resolve the JUnit file paths
+      # to source links, so it needs the repo checked out.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Check for JUnit files
+        id: junit
+        run: |
+          shopt -s nullglob
+          files=(junit/*.xml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No JUnit XML to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # One aggregate report: the per-shard summary table (one row per leg's
+      # JUnit file), expanding only failed suites/tests -- passing shards are not
+      # re-listed under the table. java-junit: dorny v1 has no python reporter but
+      # parses the generic JUnit-XML schema pytest emits.
+      - name: Publish aggregate test report
+        if: ${{ steps.junit.outputs.found == 'true' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Aggregate test report
+          path: junit/*.xml
+          reporter: java-junit
+          list-suites: failed
+          list-tests: failed
+          fail-on-error: false
+
+  # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
   # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
   # one of the matrix configs above: perf runs benchmarks, not pytest markers,

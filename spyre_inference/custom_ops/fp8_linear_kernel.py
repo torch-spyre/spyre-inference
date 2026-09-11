@@ -14,10 +14,13 @@
 
 """Spyre FP8 linear: keep checkpoint FP8 weights, run compiled ``aten._scaled_mm``.
 
-Forward (same graph as torch-spyre ``test_fp8_scaled_mm_cpu``):
+Forward:
 
-    scale_a = amax(x) / 448                         # eager, outside compile
+    scale_a = quantscalepertokenfp8(x)              # in-graph, per-token
     y = _scaled_mm(qfp8ch(x), qfp8wt(W), scale_a, scale_b)   # FP16 out
+
+Per-tensor activations still compute ``scale_a = amax(x) / FP8_E4M3FN_MAX``
+eagerly because ``quantscalepertokenfp8`` always reduces over the hidden dim.
 
 Granite 4096-wide SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128}, so we
 tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
@@ -42,8 +45,12 @@ from vllm.platforms import PlatformEnum
 
 logger = init_logger(__name__)
 
+try:
+    from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
+except ImportError:
+    FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
 _REGISTERED = False
-FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 _WIDE = 4096
 _WIDE_N = (4096, 1024, 128)
@@ -80,12 +87,18 @@ def _join(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
     return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)).clone()
 
 
-def _activation_scale(x: torch.Tensor, per_token: bool) -> torch.Tensor:
-    if per_token:
-        amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-        return (amax / FP8_E4M3FN_MAX).to(dtype=torch.float16)
+def _per_tensor_activation_scale(x: torch.Tensor) -> torch.Tensor:
     amax = x.abs().amax().clamp(min=1e-12)
     return (amax / FP8_E4M3FN_MAX).to(dtype=torch.float16).reshape(1)
+
+
+@torch.compile(backend="inductor", dynamic=False)
+def _compiled_fp8_scale(x: torch.Tensor) -> torch.Tensor:
+    # quantscalepertokenfp8 computes amax, scale, and clip inside the graph.
+    return torch.ops.spyre.quantscalepertokenfp8(
+        x,  # ty: ignore[invalid-argument-type]
+        FP8_E4M3FN_MAX,  # ty: ignore[invalid-argument-type]
+    )
 
 
 @torch.compile(backend="inductor", dynamic=False)
@@ -122,7 +135,10 @@ def _fp8_mm(
     bias: torch.Tensor | None,
     per_token: bool,
 ) -> torch.Tensor:
-    return _compiled_fp8_scaled_mm(x, _activation_scale(x, per_token), weight, weight_scale, bias)
+    if per_token:
+        scale_a = _compiled_fp8_scale(x)
+        return _compiled_fp8_scaled_mm(x, scale_a, weight, weight_scale, bias)
+    return _compiled_fp8_scaled_mm(x, _per_tensor_activation_scale(x), weight, weight_scale, bias)
 
 
 def _fp16_weight_for_qfp8wt(

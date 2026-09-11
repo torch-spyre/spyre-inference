@@ -41,6 +41,8 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import contextmanager
+from copy import copy
+from dataclasses import replace
 from typing import cast
 
 import numpy as np
@@ -686,9 +688,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
+        model = cast(nn.Module, self.model)
+        if granularity == "model" and any(
+            getattr(module, "embed_tokens_per_layer", None) is not None
+            for module in model.modules()
+        ):
+            raise NotImplementedError(
+                "SPYRE_COMPILE_GRANULARITY=model is not supported for models with "
+                "per-layer embeddings; use SPYRE_COMPILE_GRANULARITY=block."
+            )
+
         # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
         # stays isolated. fullgraph=True cannot graph-break.
-        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
+        uses_fp8 = self._model_has_spyre_fp8(model)
         fullgraph = not uses_fp8
         model_name = type(self.model).__name__
 
@@ -1181,6 +1193,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return model_runner_output
 
     # --- KV cache allocation ---
+
+    def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        """Resolve KV-sharing specs without changing physical cache metadata."""
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        attn_config = copy(kv_cache_config)
+        attn_config.kv_cache_groups = []
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                per_layer = dict(spec.kv_cache_specs)
+                for layer_name in group.layer_names:
+                    if layer_name not in per_layer:
+                        target = self.shared_kv_cache_layers[layer_name]
+                        per_layer[layer_name] = per_layer[target]
+                spec = replace(spec, kv_cache_specs=per_layer)
+            attn_config.kv_cache_groups.append(replace(group, kv_cache_spec=spec))
+
+        super().initialize_attn_backend(attn_config, is_profiling=is_profiling)
 
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.

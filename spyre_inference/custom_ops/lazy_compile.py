@@ -50,26 +50,48 @@ class CompileOutermost:
         self.spyre_compiled_kernel: Callable | None = None
 
 
-def compile_when_outermost(method: F) -> F:
-    """Compile ``method`` on its first call that no other graph is already tracing."""
+def compile_when_outermost(method: F | None = None, *, force_compile: bool = False) -> F:
+    """Compile ``method`` on its first call that no other graph is already tracing.
 
-    @functools.wraps(method)
-    def wrapper(self, *args, **kwargs):
-        if torch.compiler.is_compiling() or not self.spyre_compile_enabled:
-            return method(self, *args, **kwargs)
-        if self.spyre_compiled_kernel is None:
-            logger.info_once(
-                "Compiling %s.%s as its own graph: no enclosing graph covers it.",
-                type(self).__name__,
-                method.__name__,
-            )
-            # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
-            self.spyre_compiled_kernel = torch.compile(
-                method.__get__(self),
-                backend=current_platform.simple_compile_backend,
-                fullgraph=True,
-                dynamic=False,
-            )
-        return self.spyre_compiled_kernel(*args, **kwargs)
+    Args:
+        method: The kernel method to wrap. Omitted when the decorator is applied
+            with keyword arguments.
+        force_compile: When ``True``, compile the method in vLLM eager mode.
+            An enclosing Dynamo graph always absorbs the method: nested
+            ``torch.compile`` is not supported while it is tracing.
+    """
 
-    return cast(F, wrapper)
+    def decorator(method: F) -> F:
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if torch.compiler.is_compiling() or (
+                not force_compile and not self.spyre_compile_enabled
+            ):
+                return method(self, *args, **kwargs)
+            if self.spyre_compiled_kernel is None:
+                if force_compile:
+                    logger.info_once(
+                        "Compiling %s.%s as its own graph: force_compile is set.",
+                        type(self).__name__,
+                        method.__name__,
+                    )
+                else:
+                    logger.info_once(
+                        "Compiling %s.%s as its own graph: no enclosing graph covers it.",
+                        type(self).__name__,
+                        method.__name__,
+                    )
+                # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
+                self.spyre_compiled_kernel = torch.compile(
+                    method.__get__(self),
+                    backend=current_platform.simple_compile_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            return self.spyre_compiled_kernel(*args, **kwargs)
+
+        return cast(F, wrapper)
+
+    if method is not None:
+        return decorator(method)
+    return cast(F, decorator)

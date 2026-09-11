@@ -59,15 +59,14 @@ HF_DTYPE = "float32"
 
 MAX_MODEL_LEN = 256
 MAX_NUM_SEQS = 3
-# Passing compile_sizes skips the buckets platform.py would derive, and platform.py clamps
-# max_num_batched_tokens down to the largest one, so this is the top of COMPILE_SIZES.
+# platform.py clamps max_num_batched_tokens to max(compile_sizes), so this is its top entry.
 MAX_NUM_BATCHED_TOKENS = 64
 COMPILE_SIZES = [MAX_NUM_SEQS, MAX_NUM_BATCHED_TOKENS]
 # Stated rather than inherited: VllmRunner always passes a block size, so platform.py never
 # applies the Spyre default, and VllmRunner's 16 would align up to 64 and resize the KV cache.
 BLOCK_SIZE = 128
-# Slack for the prompt-fit guard below: it counts with a bare `tokenizer(prompt)` while the
-# engine tokenizes through vLLM, which can differ by a special token or two.
+# Slack for the guard below: it counts with a bare `tokenizer()`; vLLM can add a
+# special token or two.
 PROMPT_TOKEN_MARGIN = 8
 
 
@@ -189,11 +188,8 @@ def _pinned_tokenizer(model: str, revision: str):
 
 
 def _assert_prompts_fit_prefill_bucket(tokenizer, model: str, prompts: list[str]) -> None:
-    """Fail loudly if a prompt outgrew the largest compiled prefill bucket.
-
-    Past the largest bucket ``SpyreShapeBucketer.find_bucket`` returns None and the shape runs
-    unpadded, so an over-long prompt is a silent Dynamo recompile inside generate().
-    """
+    """Past the largest bucket ``find_bucket`` returns None and the shape recompiles in
+    generate(), so an over-long prompt fails here instead."""
     limit = MAX_NUM_BATCHED_TOKENS - PROMPT_TOKEN_MARGIN
     for prompt in prompts:
         num_tokens = len(tokenizer(prompt).input_ids)

@@ -102,8 +102,9 @@ def configure_spyre_moe_layer(layer: _RoutedExperts, recipe: SpyreMoERecipe) -> 
     if moe.has_bias:
         raise NotImplementedError("Spyre MoE backend does not support expert biases.")
     parallel = moe.moe_parallel_config
+    # TP only narrows each expert's ``M``, and MoERunner all-reduces the partial sums.
+    # The other axes would split the expert stacks the regions hold whole.
     unsupported = {
-        "tp_size": moe.tp_size,
         "ep_size": moe.ep_size,
         "dp_size": moe.dp_size,
         "pcp_size": moe.pcp_size,
@@ -333,9 +334,16 @@ def _reset_named_dims() -> None:
     reset()
 
 
-def _to_spyre_expert_weight(weight: torch.Tensor) -> torch.Tensor:
+def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
+    """Move one expert stack to the device in the gather-friendly MoE layout.
+
+    ``dma_moe_expert_weight_to_spyre`` only takes an ``[E, C, F]`` stack whose free dim
+    spans whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
+    """
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
+    if any(pad):
+        weight = F.pad(weight, pad)
     moved = dma_moe_expert_weight_to_spyre(weight)
     return moved if moved is not None else weight.contiguous().to("spyre")
 
@@ -358,24 +366,29 @@ def _prepare_layer(layer: RoutedExperts) -> None:
             f"unexpected MoE expert weight shapes: w13={tuple(w13.shape)} w2={w2_shape}"
         )
 
-    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2))
-    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2))
+    # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
+    # is inert: the added lanes activate to zero, against zero rows of ``down``.
+    stick = get_elem_in_stick(w13.dtype)
+    pad = -inter % stick
+    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
+    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2))
+    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype
-    layer.spyre_moe_stick = get_elem_in_stick(dtype)
-    layer.spyre_moe_route_identity = torch.eye(layer.spyre_moe_stick, dtype=dtype).to("spyre")
+    layer.spyre_moe_stick = stick
+    layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
     logger.info_once(
-        "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d).",
+        "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
         hidden,
         inter,
+        f" padded to {inter + pad}" if pad else "",
     )
 
 

@@ -27,6 +27,10 @@ dependencies = [
     # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
     # satisfy the transformers import. VLM is x86_64-only for now.
     "torchvision; platform_machine not in 's390x, ppc64le'",
+
+    # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
+    # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
+    "transformers<5.17",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -124,7 +128,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "76978116cb44020b50c8df1a1822d5178629922a" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "c3d949a933b81121a9d1119ccbf73425b6fd3835" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

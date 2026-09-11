@@ -354,18 +354,14 @@ def _apply_probe_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
 
 
 def _apply_model_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """The product-model output-quality gate, split across parallel 1-card jobs.
-
-    Every case compiles a product model, so the spread that matters is decoders (load,
-    compile, then 16 greedy steps) against the much smaller encoder cases.
-    """
-
+    # The product-model output-quality gate (Makefile test-model-quality), split across
+    # parallel 1-card jobs. Every case compiles a product model, so the spread that matters
+    # is the decoders against the much smaller encoder cases.
     def select(item: pytest.Item) -> bool:
         return bool(item.get_closest_marker("model_quality")) and not item.get_closest_marker(
             "upstream"
         )
 
-    # Heavy = a decoder case; the encoder gates share a much smaller compile.
     def weight(item: pytest.Item) -> int:
         return 8 if "test_model_quality" in item.nodeid else 1
 

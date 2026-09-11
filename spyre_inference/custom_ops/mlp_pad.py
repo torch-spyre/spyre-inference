@@ -62,17 +62,45 @@ def _pad_cols_end(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
     return F.pad(w, (0, padded - orig))
 
 
-def _pad_weight(name: str, w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
+def width_multipliers(hf_config) -> tuple[int, ...]:
+    """The multiples of ``intermediate_size`` this model's MLPs are built at:
+    Gemma-4's ``use_double_wide_mlp`` doubles the width on its KV-shared layers.
+    """
+    return (1, 2) if getattr(hf_config, "use_double_wide_mlp", False) else (1,)
+
+
+def _pad_weight(
+    name: str,
+    w: torch.Tensor,
+    orig: int,
+    padded: int,
+    multipliers: tuple[int, ...] = (1,),
+) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right end-padding by its name."""
     # Must precede the up_proj test: "gate_up_proj.*" also ends with "up_proj.*".
-    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")) and w.shape[0] == 2 * orig:
-        gate, up = w.chunk(2, dim=0)
-        return torch.cat([_pad_rows_end(gate, orig, padded), _pad_rows_end(up, orig, padded)])
+    if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")):
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[0] == 2 * width:
+                gate, up = w.chunk(2, dim=0)
+                padded_width = multiplier * padded
+                return torch.cat(
+                    [
+                        _pad_rows_end(gate, width, padded_width),
+                        _pad_rows_end(up, width, padded_width),
+                    ]
+                )
     if name.endswith(("gate_proj.weight", "gate_proj.bias", "up_proj.weight", "up_proj.bias")):
-        return _pad_rows_end(w, orig, padded) if w.shape[0] == orig else w
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[0] == width:
+                return _pad_rows_end(w, width, multiplier * padded)
     # down_proj input columns line up with the padded activation lanes.
-    if name.endswith("down_proj.weight") and w.ndim == 2 and w.shape[1] == orig:
-        return _pad_cols_end(w, orig, padded)
+    if name.endswith("down_proj.weight") and w.ndim == 2:
+        for multiplier in multipliers:
+            width = multiplier * orig
+            if w.shape[1] == width:
+                return _pad_cols_end(w, width, multiplier * padded)
     return w
 
 
@@ -88,20 +116,24 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     if not hasattr(model_loader, "get_all_weights"):
-        logger.warning(
-            "MLP padding active but %s has no get_all_weights; weights not padded.",
-            type(model_loader).__name__,
+        from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+
+        if isinstance(model_loader, DummyModelLoader):
+            return
+        raise NotImplementedError(
+            "Spyre MLP intermediate-size padding requires a model loader that "
+            f"exposes get_all_weights; {type(model_loader).__name__} is unsupported."
         )
-        return
 
     orig = getattr(hf_config, _ORIG_ATTR)
     padded = hf_config.intermediate_size
+    multipliers = width_multipliers(hf_config)
 
     original_get_all_weights = model_loader.get_all_weights
 
     def padded_get_all_weights(model_config, model) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in original_get_all_weights(model_config, model):
-            yield name, _pad_weight(name, weight, orig, padded)
+            yield name, _pad_weight(name, weight, orig, padded, multipliers)
 
     model_loader.get_all_weights = padded_get_all_weights
 
@@ -117,11 +149,23 @@ def verify_padded_intermediate_size(model, hf_config) -> None:
     if not intermediate_padding_active(hf_config):
         return
     padded = hf_config.intermediate_size
+    widths = {multiplier * padded for multiplier in width_multipliers(hf_config)}
+    found = [
+        (name, getattr(module, "input_size", None))
+        for name, module in model.named_modules()
+        if name.endswith("down_proj")
+    ]
+    if not found:
+        raise RuntimeError(
+            f"Spyre padded MLP intermediate_size to {padded}, but the model has no "
+            "down_proj module, so no MLP was widened: this model's MLP naming is not "
+            "supported by the padding pass."
+        )
     bad = sorted(
         {
-            f"{name}(input_size={module.input_size})"
-            for name, module in model.named_modules()
-            if name.endswith("down_proj") and getattr(module, "input_size", padded) != padded
+            f"{name}(input_size={size})"
+            for name, size in found
+            if size is not None and size not in widths
         }
     )
     if bad:

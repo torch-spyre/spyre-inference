@@ -51,7 +51,7 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
-# Cross-encoder rerankers (classify / score path). The two BGE variants share
+# Cross-encoder rerankers (classify / score path). The BGE variants share
 # XLMRobertaForSequenceClassification but not their weights or position table.
 RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
@@ -242,9 +242,8 @@ def test_encoder_rerank_models_compiled(hf_runner, model: str) -> None:
 
 
 def _assert_rerank_scores_match_hf(hf_runner, model: str, enforce_eager: bool) -> None:
-    """Spyre runs the encoder body, not the score: the classifier head stays float32 and
-    torch-spyre has no FP32 batchmatmul (torch-spyre#1794), so the pooling tail runs on CPU
-    even in the compiled case."""
+    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
+    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
     revision = MODEL_REVISIONS[model]
 
     # fp32 reference: the point of comparison is the fp16 device path against ground truth.
@@ -267,8 +266,8 @@ def _assert_rerank_scores_match_hf(hf_runner, model: str, enforce_eager: bool) -
     scores = [out.outputs.score for out in outputs]
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
-    # Ranking is checked apart from the per-score bound: all scores can drift the same
-    # direction without reordering, and a pair can swap while both stay inside tolerance.
+    # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
+    # and all scores can drift one direction without reordering.
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
     hf_order = sorted(range(len(hf_scores)), key=lambda i: hf_scores[i], reverse=True)
     assert order == hf_order, (

@@ -966,7 +966,13 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           if [[ -n "$TORCH_SPYRE_REF" ]]; then
-            uv add --frozen \
+            # `uv add --frozen` edits pyproject/lock only; the `uv sync` below does
+            # the install. The torch-spyre dev image now bakes UV_NO_SYNC=1 (so a bare
+            # `uv run` reuses the shared venv instead of re-resolving), but uv rejects
+            # UV_NO_SYNC together with `--frozen` on `uv add` ("cannot be used with
+            # --frozen"). Shadow it to a false value for this one call so the add
+            # succeeds; the surrounding UV_NO_SYNC=1 is unchanged for every other uv run.
+            UV_NO_SYNC=0 uv add --frozen \
               "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REF}"
             uv sync --verbose --group dev
           else
@@ -985,6 +991,8 @@ jobs:
           # true -> "1" (bypass uv, use the baked venv's python3 directly),
           # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
+          # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).
+          SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
         run: |
           echo "Running vLLM benchmark suite (TEST_TYPE=perf)..."
           make tests TEST_TYPE=perf RESULTS_DIR="${RESULTS_DIR}" \

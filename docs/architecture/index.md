@@ -126,7 +126,10 @@ Two adaptations worth knowing:
   gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
   in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
   `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
-  since the device cannot hold both layouts at once. Each model's own adaptation module
+  since the device cannot hold both layouts at once. Tensor parallelism needs nothing
+  further: upstream shards each expert's intermediate dim, so the forms just see a
+  narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
+  `MoERunner` all-reduces the per-rank partial sums. Each model's own adaptation module
   supplies its recipe and any model-owned scaling (`configure_gemma4_moe_layers` in
   `models/gemma4.py`). `Gemma4DecoderLayer.forward` and `MoERunner` are untouched: vLLM
   reaches the experts through `torch.ops.vllm.moe_forward`, an opaque custom op, so the

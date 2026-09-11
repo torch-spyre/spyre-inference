@@ -93,7 +93,7 @@ def apply_shards(config: pytest.Config, items: list[pytest.Item]) -> None:
     _apply_upstream_shard(config, items)
     _apply_distributed_shard(config, items)
     _apply_probe_shard(config, items)
-    _apply_model_quality_shard(config, items)
+    _apply_quality_shard(config, items)
 
 
 def _load_durations(config: pytest.Config) -> dict[str, float]:
@@ -298,12 +298,14 @@ def _apply_upstream_shard(config: pytest.Config, items: list[pytest.Item]) -> No
     def weight(item: pytest.Item) -> int:
         return 8 if "models/" in item.nodeid else 1
 
+    # The GSM8K gate also carries the `upstream` marker but is part of the quality suite
+    # (_apply_quality_shard); excluded here so its server-based evals stay out of this partition.
     _apply_shard(
         config,
         items,
         num_shards=config.getoption("--upstream-shards"),
         shard_id=config.getoption("--upstream-shard-id"),
-        select=lambda item: True,
+        select=lambda item: not item.get_closest_marker("gsm8k"),
         weight=weight,
         label="upstream",
         durations=_load_durations(config),
@@ -353,17 +355,22 @@ def _apply_probe_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
     )
 
 
-def _apply_model_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
-    # The product-model output-quality gate (Makefile test-model-quality), split across
-    # parallel 1-card jobs. Every case compiles a product model, so the spread that matters
-    # is the decoders against the much smaller encoder cases.
+def _apply_quality_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    # The model-output quality gate (Makefile test-quality), split across parallel 1-card
+    # jobs. Two kinds of heavy case share it: the product-model output checks (`model_quality`,
+    # every case compiles a product model up to the 31B decoders) and the GSM8K accuracy evals
+    # (`gsm8k`, each starts a vLLM server and runs a batched eval). Durations balance them;
+    # the static fallback packs the decoders and the server evals as heavy against the much
+    # smaller encoder cases.
     def select(item: pytest.Item) -> bool:
-        return bool(item.get_closest_marker("model_quality")) and not item.get_closest_marker(
-            "upstream"
+        return bool(item.get_closest_marker("model_quality")) or bool(
+            item.get_closest_marker("gsm8k")
         )
 
     def weight(item: pytest.Item) -> int:
-        return 8 if "test_model_quality" in item.nodeid else 1
+        if item.get_closest_marker("gsm8k") or "test_model_quality" in item.nodeid:
+            return 8
+        return 1
 
     _apply_shard(
         config,

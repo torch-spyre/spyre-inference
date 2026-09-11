@@ -282,60 +282,78 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
-          # Product-model output-quality gate: its own jobs and not in
-          # `integration`, since every case compiles a product model. Sharded
-          # across parallel 1-card jobs like smoke/attention, bounded by the
-          # slowest single case. The plugin owns the weighted partition;
-          # QUALITY_SHARDS (Makefile default) is the count. Adding/removing a
-          # shard = add/remove an entry here and bump that default.
-          - cfg: Spyre model quality tests (shard 1/6)
+          # Model-output quality gate: the product-model output checks (model_quality)
+          # plus the GSM8K accuracy evals (gsm8k). Its own jobs and not in `integration`,
+          # since every case compiles a product model or starts a vLLM server. Sharded
+          # across parallel 1-card jobs like smoke/attention, bounded by the slowest single
+          # case. The plugin owns the weighted partition; QUALITY_SHARDS (Makefile default)
+          # is the count. Adding/removing a shard = add/remove an entry here and bump that
+          # default. (The gsm8k evals need the upstream vLLM checkout; the combo's marker
+          # expression pulls it in automatically, no --upstream flag.)
+          - cfg: Spyre quality gate (shard 1/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-0
-          - cfg: Spyre model quality tests (shard 2/6)
+            test_target: test-quality-shard-0
+          - cfg: Spyre quality gate (shard 2/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-1
-          - cfg: Spyre model quality tests (shard 3/6)
+            test_target: test-quality-shard-1
+          - cfg: Spyre quality gate (shard 3/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-2
-          - cfg: Spyre model quality tests (shard 4/6)
+            test_target: test-quality-shard-2
+          - cfg: Spyre quality gate (shard 4/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-3
-          - cfg: Spyre model quality tests (shard 5/6)
+            test_target: test-quality-shard-3
+          - cfg: Spyre quality gate (shard 5/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-4
-          - cfg: Spyre model quality tests (shard 6/6)
+            test_target: test-quality-shard-4
+          - cfg: Spyre quality gate (shard 6/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-5
+            test_target: test-quality-shard-5
+          - cfg: Spyre quality gate (shard 7/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-6
+          - cfg: Spyre quality gate (shard 8/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-7
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock

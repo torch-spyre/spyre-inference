@@ -408,6 +408,17 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-distributed-shard-2
+          # TP=4 distributed suite. Runs on the 4-card runner (spyre_pf_x4).
+          # A distinct marker (distributed_tp4) keeps these out of the 2-card
+          # distributed job, which would silently skip them.
+          - cfg: Distributed TP4 spyre tests
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x4
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-distributed-tp4
           # torch-spyre backend probes (strict-xfail signals for backend readiness),
           # sharded across parallel 2-card jobs. Deliberately NOT in `integration`: a
           # strict-xfail flipping to xpass means the backend team shipped support and must

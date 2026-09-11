@@ -120,7 +120,8 @@ RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-smoke-shard test-probes test-probes-shard test-attention test-attention-shard \
-        test-distributed test-distributed-shard test-upstream test-upstream-shard \
+        test-distributed test-distributed-shard test-distributed-tp4 \
+        test-upstream test-upstream-shard \
         test-upstream-distributed tests-single-card tests-multi-card
 
 help: ## Show this help message
@@ -256,6 +257,9 @@ test-distributed-shard: ## Run one distributed shard (DIST_SHARDS=N DIST_SHARD_I
 test-distributed-shard-%:
 	$(MAKE) test-distributed-shard DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
+test-distributed-tp4: ## Run the TP=4 distributed marker combo (distributed_tp4). Needs 4 cards.
+	$(MAKE) run-one MARK_OVERRIDE='distributed_tp4 and not upstream' JUNIT_XML=$(JUNIT_XML)
+
 test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed' JUNIT_XML=$(JUNIT_XML)
 
@@ -307,6 +311,7 @@ tests-multi-card: ## Run the 2-card marker combos (distributed shards/upstream-d
 	for i in $$(seq 0 $$(( $(PROBE_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-probes-shard-$$i" && $(MAKE) test-probes-shard PROBE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-probes-shard-$$i/junit-test-probes-shard-$$i.xml" || rc=1; \
 	done; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-distributed-tp4" && $(MAKE) test-distributed-tp4 JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-tp4/junit-test-distributed-tp4.xml" || rc=1; \
 	exit $$rc
 
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same

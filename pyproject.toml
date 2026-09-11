@@ -276,7 +276,8 @@ filterwarnings = [
 
 # --8<-- [start:test-markers-definition]
 markers = [
-    "distributed: Tests requiring multiple spyre cards",
+    "distributed: Tests requiring multiple spyre cards (TP=2, runs on spyre_pf_x2)",
+    "distributed_tp4: Tests requiring 4 Spyre cards (TP=4, runs on spyre_pf_x4)",
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",

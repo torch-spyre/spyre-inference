@@ -31,7 +31,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
-from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
+from .parallel_lm_head import SpyreFp8LMHeadMethod, SpyreUnquantizedLMHeadMethod
 from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
@@ -135,7 +135,7 @@ def promote_tied_lm_head(head: torch.nn.Module) -> None:
     # Exact type: SpyreParallelLMHead is a subclass and brings its own method.
     if type(head) is not SpyreVocabParallelEmbedding:
         return
-    if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
+    if isinstance(head.quant_method, (SpyreUnquantizedLMHeadMethod, SpyreFp8LMHeadMethod)):
         return
 
     method = SpyreUnquantizedLMHeadMethod()

@@ -167,24 +167,21 @@ def test_lm_head_oot_dispatch(tp_group):
 def test_lm_head_fp8_config_accepted(tp_group):
     """SpyreParallelLMHead accepts Fp8Config without raising.
 
-    Fp8Config.get_quant_method returns None for ParallelLMHead (it only
-    handles LinearBase/Attention), so upstream falls back to
-    UnquantizedEmbeddingMethod, which we then replace with
-    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
-    of the checkpoint's quantization config.
+    When ``quant_config=Fp8Config()`` is supplied, ``SpyreParallelLMHead.__init__``
+    detects it and installs ``SpyreFp8LMHeadMethod`` for tiled FP8 projection.
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
         SpyreParallelLMHead,
-        SpyreUnquantizedLMHeadMethod,
     )
 
     layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
 
     assert isinstance(layer, SpyreParallelLMHead)
-    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
 
 
 def _apply_tracked(layer):
@@ -589,6 +586,133 @@ def spyre_or_cpu_device():
         return torch.device("spyre")
     except Exception:
         return torch.device("cpu")
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_lm_head_method_installed_with_fp8_config(tp_group):
+    """SpyreParallelLMHead installs SpyreFp8LMHeadMethod when Fp8Config is supplied."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreParallelLMHead,
+    )
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+    assert isinstance(layer, SpyreParallelLMHead)
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_lm_head_method_not_installed_without_fp8_config(tp_group):
+    """Without Fp8Config, SpyreUnquantizedLMHeadMethod is installed (no FP8)."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert not isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize("vocab_size", [64, 128, 51200])
+def test_fp8_process_weights_creates_weight_scale(tp_group, vocab_size):
+    """process_weights_after_loading creates padded_weight_t AND weight_scale."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    embedding_dim = 64
+    layer = ParallelLMHead(
+        vocab_size, embedding_dim, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert hasattr(layer, "padded_weight_t")
+    assert hasattr(layer, "weight_scale")
+    assert layer.weight_scale.dtype == torch.float16
+    assert layer.weight_scale.numel() == 1
+    assert layer.weight_scale.item() > 0
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_lm_head_weight_scale_on_device_after_to(tp_group):
+    """weight_scale moves to device alongside padded_weight_t."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+    layer.quant_method.process_weights_after_loading(layer)
+
+    assert layer.weight_scale.device.type == "cpu"
+    assert layer.padded_weight_t.device.type == "cpu"
+
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    layer.to("spyre")
+    assert layer.padded_weight_t.device.type == "spyre"
+    assert layer.weight_scale.device.type == "spyre"
+    assert layer.weight.device.type == "cpu"
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_padded_weight_reflects_loaded_weight(tp_group):
+    """FP8 padded_weight_t holds the loaded checkpoint values (not uninitialized)."""
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    vocab_size, embedding_dim = 49216, 64
+    layer = ParallelLMHead(
+        vocab_size, embedding_dim, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    vocab = layer.weight.shape[0]
+    torch.testing.assert_close(
+        layer.padded_weight_t[:, :vocab],
+        layer.weight.t(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+@pytest.mark.parallel_lm_head
+def test_promoted_tied_head_not_fp8(tp_group):
+    """Promoted tied heads stay unquantized even when SpyreFp8LMHeadMethod exists.
+
+    Tied embeddings serve dual duty (gather + project); FP8 noise on the shared
+    table would hurt embedding quality, so promotion always uses the FP16 path.
+    """
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
+    from spyre_inference.custom_ops.vocab_parallel_embedding import promote_tied_lm_head
+
+    embed = VocabParallelEmbedding(49216, 64, params_dtype=torch.float16)
+    embed.quant_method.process_weights_after_loading(embed)
+
+    promote_tied_lm_head(embed)
+
+    assert isinstance(embed.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert not isinstance(embed.quant_method, SpyreFp8LMHeadMethod)
 
 
 if __name__ == "__main__":

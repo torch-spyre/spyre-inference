@@ -608,15 +608,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linears.
+        """True if the model has Spyre FP8 linears or an FP8 LM head.
 
         ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
         Granite ``compressed-tensors`` stores it on the scheme
         (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
         Checkpoint FP8 weights are the fallback: ``process_weights_after_loading``
         keeps ``float8_e4m3fn``.
+        ``SpyreFp8LMHeadMethod`` is installed on ``ParallelLMHead`` when the
+        model's ``quant_config`` is ``Fp8Config``.
         """
         from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
+        from spyre_inference.custom_ops.parallel_lm_head import SpyreFp8LMHeadMethod
 
         def _is_fp8_kernel(obj: object) -> bool:
             return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
@@ -628,6 +631,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
                 return True
             quant_method = getattr(module, "quant_method", None)
+            if isinstance(quant_method, SpyreFp8LMHeadMethod):
+                return True
             if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
                 getattr(quant_method, "scheme", None)
             ):

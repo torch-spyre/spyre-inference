@@ -58,6 +58,7 @@ XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import os
 import re
@@ -67,6 +68,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 import pytest
@@ -1222,3 +1224,33 @@ def pytest_runtest_logreport(report) -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     sharding.write_durations(_log)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Hard-exit a Spyre-host run before interpreter finalization.
+
+    senlib's config singleton is torn down from a libc exit handler after
+    pytest has already reported, and that destructor intermittently aborts
+    ("corrupted double-linked list"), failing an otherwise-green job. os._exit
+    skips it. Remove once senlib no longer aborts at process exit.
+    """
+    outcome = yield
+    if not spyre_hardware_present():
+        return
+    result = outcome.get_result()
+    code = int(result) if result is not None else 0
+    _log(
+        f"Spyre host: hard-exiting (code {code}) past finalization "
+        "to skip the senlib teardown abort"
+    )
+    try:
+        # os._exit skips every atexit handler; run them now so coverage saves,
+        # logging flushes and multiprocessing reaps children. Only the libc
+        # handler where the abort lives is left to be skipped.
+        atexit._run_exitfuncs()
+    except Exception:
+        _log(f"atexit handlers failed before hard-exit:\n{traceback.format_exc()}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

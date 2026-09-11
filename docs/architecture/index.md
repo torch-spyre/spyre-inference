@@ -196,6 +196,11 @@ the write can scatter through a slot-major view of it:
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
+The compiled kernels themselves — the per-sequence page attention, the batched decode
+path, the KV store, and the cache's device layout — live under
+`spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
+the host-side orchestration that calls them.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`

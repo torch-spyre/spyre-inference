@@ -41,6 +41,13 @@ from spyre_inference import envs
 
 logger = init_logger(__name__)
 
+# Batches below this fall back to the per-seq loop: the batched matmul's
+# padded-row overhead exceeds the per-seq cost at small N.
+MIN_BATCHED_SEQS = 4
+
+# 4/3-spaced KV buckets up to this token count; powers-of-two above.
+_KV_DENSE_LADDER_CAP = 4096
+
 # Spacing of the default query buckets above the decode bucket, capped against
 # max_num_batched_tokens. Every non-decode batch pads its query length up to a
 # multiple of this.
@@ -99,6 +106,24 @@ def _resolve_buckets(
     return buckets
 
 
+@dataclass(frozen=True)
+class SpyreBatchedAttnBucket:
+    """One recordable batched decode kernel variant.
+
+    Fields mirror ``SpyreAttentionImpl._get_batched_decode_kernel``'s cache key exactly,
+    so a recorded bucket and a runtime dispatch are the same tuple.
+    """
+
+    num_seqs: int
+    num_blocks: int
+    needs_gather: bool
+    store_out: bool
+
+    @property
+    def key(self) -> tuple[int, int, bool, bool]:
+        return (self.num_seqs, self.num_blocks, self.needs_gather, self.store_out)
+
+
 class SpyreAttnBucketer:
     """Enumerates the attention variants to record, and rounds lengths onto them.
 
@@ -115,30 +140,26 @@ class SpyreAttnBucketer:
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
-        from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            _TOKEN_BUCKET_ANCHOR,
+            _powers_of_two_up_to,
+            _token_buckets_up_to,
+        )
 
-        if block_size & (block_size - 1):
-            # Not fatal: _powers_of_two_up_to rounds the start up to a power of
-            # two, just coarser at the bottom. Reachable because the platform
-            # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
-            logger.warning(
-                "block_size=%d is not a power of two; the smallest KV bucket is the next "
-                "power of two instead, making it larger than one block. Prefer a "
-                "power-of-two block_size.",
-                block_size,
-            )
+        def _default_kv() -> list[int]:
+            cap = min(max_model_len, _KV_DENSE_LADDER_CAP)
+            dense = list(_token_buckets_up_to(cap, anchor=_TOKEN_BUCKET_ANCHOR))
+            if cap < max_model_len:
+                coarse = list(_powers_of_two_up_to(max_model_len, start=cap))
+                dense_set = set(dense)
+                dense = dense + [b for b in coarse if b not in dense_set]
+            return dense
 
-        # Default: powers of two from block_size up to max_model_len. The
-        # recorded set is a product of both axes, so a bucket per KV token at a
-        # 32k context would be tens of thousands of variants; doubling keeps it
-        # affordable, with each bucket's extra padding absorbed by the mask.
-        # Starting at block_size rather than 1 skips buckets that would dedupe
-        # away anyway, since num_blocks = ceil(kv / block_size).
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            _default_kv,
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
@@ -154,9 +175,11 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # num_blocks is what the kernel specializes on. Derived from the kv
-        # buckets, one block count per kv bucket, rather than enumerating every
-        # integer up to max_model_len / block_size.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._num_seqs_buckets: list[int] = [
+            n for n in _powers_of_two_up_to(max_num_seqs) if n >= MIN_BATCHED_SEQS
+        ]
+
         self._num_blocks_buckets: list[int] = sorted(
             {(kv + block_size - 1) // block_size for kv in self._kv_buckets}
         )
@@ -184,6 +207,31 @@ class SpyreAttnBucketer:
     @property
     def num_blocks_buckets(self) -> list[int]:
         return self._num_blocks_buckets
+
+    @property
+    def num_seqs_buckets(self) -> list[int]:
+        return self._num_seqs_buckets
+
+    def batched_variants(self) -> list[SpyreBatchedAttnBucket]:
+        """Every batched decode variant worth recording, largest first."""
+        out: list[SpyreBatchedAttnBucket] = []
+        for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
+            for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+                # At the smallest bucket num_seqs == b_seqs always, so no gather.
+                gathers = (False,) if num_seqs == MIN_BATCHED_SEQS else (False, True)
+                for needs_gather in gathers:
+                    # store_out is only reachable without a gather (dispatch requires it).
+                    store_outs = (False,) if needs_gather else (True, False)
+                    for store_out in store_outs:
+                        out.append(
+                            SpyreBatchedAttnBucket(
+                                num_seqs=num_seqs,
+                                num_blocks=num_blocks,
+                                needs_gather=needs_gather,
+                                store_out=store_out,
+                            )
+                        )
+        return out
 
     def find_kv_bucket(self, kv_len: int) -> int | None:
         return self._round_up(kv_len, self._kv_buckets)

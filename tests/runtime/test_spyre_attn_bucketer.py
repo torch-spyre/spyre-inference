@@ -21,26 +21,50 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    _powers_of_two_up_to,
+    _token_buckets_up_to,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _KV_DENSE_LADDER_CAP,
+    MIN_BATCHED_SEQS,
     SpyreAttnBucketer,
     _parse_buckets,
 )
 
 BLOCK_SIZE = 64
+MAX_NUM_SEQS = 8
 
 
-def make_config(max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK_SIZE):
+def make_config(
+    max_model_len=2048,
+    max_num_batched_tokens=512,
+    block_size=BLOCK_SIZE,
+    max_num_seqs=MAX_NUM_SEQS,
+):
     config = MagicMock()
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    config.scheduler_config.max_num_seqs = max_num_seqs
     return config
 
 
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
-    """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
+    """[start, 2*start, ..., limit]."""
     return list(_powers_of_two_up_to(limit, start=start))
+
+
+def _list_default_kv(limit: int, anchor: int = BLOCK_SIZE) -> list[int]:
+    """The buckets the kv axis defaults to: 4/3-spaced up to _KV_DENSE_LADDER_CAP,
+    powers-of-two above."""
+    cap = min(limit, _KV_DENSE_LADDER_CAP)
+    dense = list(_token_buckets_up_to(cap, anchor=anchor))
+    if cap < limit:
+        coarse = list(_powers_of_two_up_to(limit, start=cap))
+        dense_set = set(dense)
+        dense = dense + [b for b in coarse if b not in dense_set]
+    return dense
 
 
 @pytest.fixture()
@@ -57,9 +81,15 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+    def test_kv_buckets_bound_round_up_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == _list_default_kv(2048)
         assert bucketer.kv_buckets[-1] == 2048
+        # Asserted on block counts, which is what the kernel pads to: token steps are
+        # quantized to the anchor and so are coarser at the bottom.
+        blocks = bucketer.num_blocks_buckets
+        for prev, nxt in zip(blocks, blocks[1:]):
+            if prev >= 4:
+                assert (nxt - (prev + 1)) / nxt <= 1 / 4
 
     def test_kv_buckets_start_at_block_size(self, bucketer):
         """Buckets below block_size all collapse to num_blocks == 1, so the
@@ -67,16 +97,18 @@ class TestBuckets:
         assert bucketer.kv_buckets[0] == BLOCK_SIZE
 
     @pytest.mark.parametrize("block_size", [64, 128, 256])
-    def test_kv_buckets_start_tracks_block_size(self, block_size):
+    def test_kv_buckets_are_block_size_independent(self, block_size):
+        """Buckets are token counts, so block_size only re-quantizes the derived block
+        counts; it does not move where the token boundaries fall."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+        assert b.kv_buckets == _list_default_kv(4096)
 
-    def test_kv_buckets_round_non_power_of_two_block_size_up(self):
+    def test_kv_buckets_unaffected_by_non_power_of_two_block_size(self):
         """The platform only forces block_size to a multiple of 64, so a
-        non-power-of-two value is reachable; buckets stay a clean doubling
-        sequence by starting at the next power of two."""
+        non-power-of-two value is reachable. Token buckets do not depend on it;
+        only the derived block counts are coarser."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == _list_default_kv(4096)
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -92,7 +124,8 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _list_default_kv(3000)
+        assert b.kv_buckets[-1] == 3000
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -114,7 +147,8 @@ class TestFindBucket:
         assert bucketer.find_query_bucket(512) == 512
 
     def test_rounds_up(self, bucketer):
-        assert bucketer.find_kv_bucket(257) == 512
+        # Derived: the kv bucket set is a tunable default (SPYRE_ATTN_KV_BUCKETS).
+        assert bucketer.find_kv_bucket(257) == next(b for b in bucketer.kv_buckets if b >= 257)
         assert bucketer.find_query_bucket(33) == 512
 
     def test_query_len_one_maps_to_decode_bucket(self, bucketer):
@@ -183,6 +217,49 @@ class TestVariants:
         assert padded_query_len is not None and num_blocks is not None
         sizes = {(v.num_blocks, v.padded_query_len) for v in bucketer.variants()}
         assert (num_blocks, padded_query_len) in sizes
+
+    @pytest.mark.parametrize("num_seqs", [4, 5, 7, 8])
+    @pytest.mark.parametrize("kv_len", [64, 300, 1025, 2048])
+    def test_every_batched_size_lands_on_a_recorded_variant(self, bucketer, num_seqs, kv_len):
+        """Same guarantee for the batched kernel: no runtime batch may miss the cache.
+
+        Drives the two lookups the batched dispatch uses -- _round_up onto
+        num_seqs_buckets and onto num_blocks_buckets.
+        """
+        b_seqs = bucketer._round_up(num_seqs, bucketer.num_seqs_buckets)
+        b_blocks = bucketer._round_up(
+            (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, bucketer.num_blocks_buckets
+        )
+        assert b_seqs is not None and b_blocks is not None
+        sizes = {(v.num_seqs, v.num_blocks) for v in bucketer.batched_variants()}
+        assert (b_seqs, b_blocks) in sizes
+
+    def test_batched_variants_cover_both_flag_states(self, bucketer):
+        """needs_gather varies per step, so both values must be recorded at every size.
+
+        store_out additionally needs a fused-store-eligible output buffer, and the
+        dispatch only takes it when needs_gather is False.
+        """
+        by_size: dict[tuple[int, int], set[tuple[bool, bool]]] = {}
+        for v in bucketer.batched_variants():
+            by_size.setdefault((v.num_seqs, v.num_blocks), set()).add((v.needs_gather, v.store_out))
+        from spyre_inference.v1.attention.spyre_attn_bucketer import MIN_BATCHED_SEQS
+
+        assert by_size
+        for (num_seqs, _), flags in by_size.items():
+            assert (False, False) in flags
+            assert (False, True) in flags
+            # A gather needs a query buffer narrower than the bucket, which cannot happen
+            # at the smallest one: build() only enters there and it rounds to itself.
+            assert ((True, False) in flags) == (num_seqs > MIN_BATCHED_SEQS)
+            # store_out with a gather is unreachable: the dispatch requires not needs_gather.
+            assert (True, True) not in flags
+
+    def test_num_seqs_buckets_are_all_reachable(self):
+        """num_seqs_buckets is pre-filtered: every entry is a valid batched-kernel input."""
+        b = SpyreAttnBucketer(make_config(max_num_seqs=16))
+        assert all(n >= MIN_BATCHED_SEQS for n in b.num_seqs_buckets)
+        assert {v.num_seqs for v in b.batched_variants()} == set(b.num_seqs_buckets)
 
     def test_count_stays_tractable_at_long_context(self):
         """Dense buckets here would be tens of thousands of Inductor compiles."""

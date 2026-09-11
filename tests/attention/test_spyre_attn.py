@@ -2278,18 +2278,20 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    ("kv_len", "expected"),
+    "kv_len",
     [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
+        pytest.param(65, id="kv65"),
+        pytest.param(300, id="kv300"),
+        pytest.param(256, id="kv256_exact_noop"),
+        pytest.param(1025, id="kv1025"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len):
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
-    assert expected in buckets
+    # Derived, not hardcoded: the bucket set is a tunable default (SPYRE_ATTN_KV_BUCKETS).
+    real_blocks = (kv_len + 64 - 1) // 64
+    expected = next(b for b in buckets if b >= real_blocks)
 
     metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
 

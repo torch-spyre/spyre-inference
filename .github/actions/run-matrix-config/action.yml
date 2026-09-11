@@ -152,10 +152,46 @@ runs:
         HF_HUB_OFFLINE: '0'
       run: uv run .github/cache_config/manage_cache.py --public
 
-    # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
-    - name: Use a job-scoped torch inductor compile cache dir
+    # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one. The persistent Spyre kernel cache lives under the same path; enable it and persist it across runs with a tightly-keyed actions/cache entry so repeated CI runs can reuse compiled kernels. The cache directory must be stable across runs for restore to find prior artifacts; run_id is intentionally omitted.
+    - name: Materialize runner labels for cache key
       shell: bash
-      run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+      run: printf '%s\n' ${{ inputs.runner_labels }} > "${RUNNER_TEMP}/runner-labels.txt"
+
+    - name: Restore Spyre kernel compile cache
+      id: restore-spyre-kernel-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/inductor-cache-${{ inputs.job_slot }}
+        key: spyre-kernel-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.job_slot }}-${{ hashFiles('pyproject.toml', 'uv.lock', 'spyre-rpms.lock', format('{0}/runner-labels.txt', runner.temp)) }}
+        restore-keys: |
+          spyre-kernel-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.job_slot }}-${{ hashFiles('pyproject.toml', 'uv.lock', 'spyre-rpms.lock') }}-
+          spyre-kernel-cache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.job_slot }}-
+
+    - name: Use a job-scoped compile cache and enable Spyre kernel caching
+      shell: bash
+      run: |
+        echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}" >> "$GITHUB_ENV"
+        echo "SPYRE_KERNEL_CACHE=1" >> "$GITHUB_ENV"
+
+    - name: Debug RPM component versions visible to Spyre runtime
+      shell: bash
+      run: |
+        echo "::group::spyre-rpms.lock contents"
+        cat spyre-rpms.lock
+        echo "::endgroup::"
+        echo "::group::Runtime component files"
+        for f in /opt/ibm/spyre/components.txt /opt/ibm/spyre/components.lock; do
+          if [ -f "$f" ]; then
+            echo "=== $f ==="
+            cat "$f"
+          else
+            echo "=== $f not found ==="
+          fi
+        done
+        echo "::endgroup::"
+        echo "::group::LD_LIBRARY_PATH"
+        echo "$LD_LIBRARY_PATH"
+        echo "::endgroup::"
 
     # All shard jobs of a suite must weight the partition from the SAME durations
     # file or they'd compute different partitions and drop/double-run tests, so
@@ -259,3 +295,10 @@ runs:
         # dorny/test-reporter@v1 has no python-specific reporter; java-junit parses the generic JUnit-XML schema pytest's --junit-xml emits.
         reporter: java-junit
         fail-on-error: false
+
+    - name: Save Spyre kernel compile cache
+      if: always()
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/inductor-cache-${{ inputs.job_slot }}
+        key: ${{ steps.restore-spyre-kernel-cache.outputs.cache-primary-key }}

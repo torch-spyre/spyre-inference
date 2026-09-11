@@ -591,6 +591,7 @@ jobs:
             .github/workflows/_test_matrix.yaml
             .github/actions/override-spyre-rpms/action.yml
             .github/actions/spyre-rpm-install/action.yml
+            .github/actions/run-matrix-config/action.yml
             pyproject.toml
             uv.lock
             spyre-rpms.lock

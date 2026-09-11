@@ -1223,6 +1223,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#model-output-quality-gate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model Output Quality Gate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#upstream-test-integration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1847,6 +1858,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#model-output-quality-gate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model Output Quality Gate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#upstream-test-integration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2050,6 +2072,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#model-output-quality-gate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Model Output Quality Gate
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#upstream-test-integration" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2216,12 +2249,13 @@
 </span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>    <span class="s2">"encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job"</span><span class="p">,</span>
 </span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>    <span class="s2">"probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration"</span><span class="p">,</span>
 </span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>    <span class="s2">"uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device"</span><span class="p">,</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="s2">"rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
-</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)"</span><span class="p">,</span>
-</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    <span class="s2">"conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)"</span><span class="p">,</span>
-</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="s2">"pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
-</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="s2">"multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither"</span><span class="p">,</span>
-</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="p">]</span>
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>    <span class="s2">"model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job"</span><span class="p">,</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>    <span class="s2">"rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>    <span class="s2">"fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)"</span><span class="p">,</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>    <span class="s2">"conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)"</span><span class="p">,</span>
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a>    <span class="s2">"pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)"</span><span class="p">,</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>    <span class="s2">"multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither"</span><span class="p">,</span>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="p">]</span>
 </span></code></pre></div>
 <p>Upstream vLLM tests are opt-in: they are cloned and collected only when the <code>-m</code> expression names the <code>upstream</code> marker, or <code>--upstream</code> is passed. A negative mention doesn't count, so <code>-m "not upstream"</code> and <code>-m "attention and not upstream"</code> skip the clone entirely.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="c1"># Run only local tests (no vLLM clone)</span>
@@ -2237,12 +2271,61 @@
 </span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="c1"># expression that doesn't name `upstream` itself</span>
 </span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>pytest<span class="w"> </span>--upstream<span class="w"> </span>-m<span class="w"> </span><span class="s2">"attention"</span>
 </span></code></pre></div>
+<h4 id="model-output-quality-gate">Model Output Quality Gate<a class="headerlink" href="#model-output-quality-gate" title="Permanent link">&para;</a></h4>
+<p>The <code>model_quality</code> marker gates the product models on their output: each is loaded
+<strong>compiled</strong> (the platform default) and compared against a CPU HF reference — greedy token
+ids and per-token probabilities for the decoders (<code>tests/e2e/test_model_quality.py</code>),
+cosine similarity for the embedding models and sigmoid scores plus document ranking for
+the cross-encoder rerankers (<code>tests/e2e/test_encoder_models.py</code>).</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>make<span class="w"> </span>test-model-quality<span class="w">              </span><span class="c1"># the whole gate, one card</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>make<span class="w"> </span>test-model-quality-shard-0<span class="w">      </span><span class="c1"># one CI shard (QUALITY_SHARDS=6)</span>
+</span></code></pre></div>
+<p>CI runs the gate as <code>QUALITY_SHARDS</code> parallel 1-card jobs, weighted by recorded runtime like
+the smoke and attention suites. The slowest single case bounds the useful shard count, so
+resize with the <code>rebalance-test-shards</code> skill rather than by raising it on a hunch.</p>
+<p>The models are too large to run through transformers in CI, so the references are checked
+into <code>tests/data/</code> and regenerated by hand where the weights are cached:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>python<span class="w"> </span>tests/data/generate_decoder_output_refs.py<span class="w"> </span>--models<span class="w"> </span>ibm-granite/granite-4.1-8b
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>python<span class="w"> </span>tests/data/generate_encoder_embed_refs.py
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>python<span class="w"> </span>tests/data/generate_rerank_score_refs.py
+</span></code></pre></div>
+<p>Regenerate only when the <em>expected</em> output changes (a new model or prompt), never to make a
+failing test pass — that is the regression the gate exists to catch. Prompt sets are per
+model: see <code>MODEL_PROMPTS</code> and <code>MODEL_DOCUMENTS</code> in the generators.</p>
+<p>Every gated model is pinned to a revision, in the generator's <code>MODEL_REVISIONS</code> and in
+<code>.github/cache_config/hf_models_and_datasets.yaml</code>. Each generator records the revision it
+measured in its JSON and the test loads that one back, so bumping a pin means regenerating
+that model's reference.</p>
+<p><code>SPYRE_TEST_MEAN_ABS_TOL</code> / <code>SPYRE_TEST_ABS_TOL</code> / <code>SPYRE_TEST_REL_TOL</code> (decoder
+probabilities) and <code>SPYRE_TEST_SCORE_ABS_TOL</code> / <code>SPYRE_TEST_SCORE_REL_TOL</code> (reranker scores)
+set the tolerances. For a low-confidence reference the stricter of the absolute and relative
+bound applies, so it is held to a fraction rather than to the same absolute margin. Reranker
+ranking is checked separately from the per-score bound.</p>
+<p>The decoder gate is aggregate-first: <code>SPYRE_TEST_MEAN_ABS_TOL</code> bounds each prompt's <em>mean</em>
+error and is what holds quality, while <code>SPYRE_TEST_ABS_TOL</code> only caps a single step against
+gross breakage. A reference near p=0.5 is maximally ill-conditioned (<code>dp/dlogit</code> peaks at
+<code>p(1-p)</code>), and one compiled graph has measured 0.115 apart on such a step between two CI pods
+with every token still exact — a tight per-step bound buys flakiness, not coverage. Each case
+prints <code>mean=</code>/<code>max=</code> per prompt, so a failure is readable without a rerun.
+<code>SPYRE_TEST_TIE_ABS_TOL</code> holds token disagreements to a tighter bound, since picking a
+different token is a stronger signal than drift. The FP8 decoder checkpoints are
+load-and-decode cases with no reference of their own — their unquantized siblings gate the
+numerics.</p>
+<p>A greedy path that diverges from HF on a near-tie cannot be compared past the split, so how
+much of the reference a case compares depends on the prompts. That is <strong>reported, not
+asserted</strong>: the tolerances above are the gate, and coverage is a separate signal, because
+truncation is all-or-nothing per prompt and a floor cannot tell an unlucky prompt from a
+regression. Each decoder case prints <code>compared &lt;n&gt;/&lt;total&gt; reference steps</code>, records it as a
+<code>refcoverage__&lt;n&gt;/&lt;total&gt;</code> JUnit tag, and warns (<code>LowReferenceCoverage</code>) below
+<code>COVERAGE_WARN_FRACTION</code>. A warning means the case gates less than it looks like it does and
+its prompts want replacing — not that the model regressed. The one coverage failure is zero:
+a case where every prompt diverged on its first step asserted nothing at all.</p>
 <h4 id="upstream-test-integration">Upstream Test Integration<a class="headerlink" href="#upstream-test-integration" title="Permanent link">&para;</a></h4>
 <p>Upstream tests are cloned from the vLLM repository at the commit pinned in <code>pyproject.toml</code>, fetching only the <code>tests/</code> directory. The clone happens on demand, the first time a run asks for upstream tests (see the marker gate above). Cloned tests are cached in <code>~/.cache/vllm-upstream-tests</code> (or <code>$XDG_CACHE_HOME/vllm-upstream-tests</code>) with separate worktrees per commit, allowing multiple vLLM versions to be tested simultaneously. All upstream tests run with <code>VLLM_PLUGINS=spyre_inference,spyre_inference_ops</code> set automatically. Pointing the plugin at a vLLM checkout instead of the cache is the one case that still needs the flag by hand: <code>pytest -p spyre_testing_plugin.pytest_plugin -m upstream</code> from the checkout root. See <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> for implementation details.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>To force a re-clone, remove <code>~/.cache/vllm-upstream-tests</code>.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>rm<span class="w"> </span>-rf<span class="w"> </span>~/.cache/vllm-upstream-tests
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>rm<span class="w"> </span>-rf<span class="w"> </span>~/.cache/vllm-upstream-tests
 </span></code></pre></div>
 </div>
 <h4 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h4>
@@ -2257,14 +2340,14 @@
 </div>
 <h3 id="docs">Docs<a class="headerlink" href="#docs" title="Permanent link">&para;</a></h3>
 <p>Install MkDocs along with the <a href="https://github.com/torch-spyre/spyre-inference/blob/main/mkdocs.yaml">plugins</a> used in the Spyre Inference documentation.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements-docs.txt
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements-docs.txt
 </span></code></pre></div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Ensure that your Python version is compatible with the plugins (e.g., <code>mkdocs-awesome-nav</code> requires Python 3.10+)</p>
 </div>
 <p>MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it. Make sure you're in the same directory as the <code>mkdocs.yaml</code> configuration file and run:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>mkdocs<span class="w"> </span>serve
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>mkdocs<span class="w"> </span>serve
 </span></code></pre></div>
 <p>Open up <a href="http://127.0.0.1:8000/">http://127.0.0.1:8000/</a> in your browser to see a live preview. For additional features and advanced configurations, refer to the official <a href="https://www.mkdocs.org/">MkDocs Documentation</a>.</p>
 <h2 id="issues">Issues<a class="headerlink" href="#issues" title="Permanent link">&para;</a></h2>

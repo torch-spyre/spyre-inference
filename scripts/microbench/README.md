@@ -69,10 +69,13 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 
 ## KV layout probes
 
-`page_major` is the default `--kv-layout`: it places the page axis outermost
-in device layout for `index_select` experiments. The startup probe uses the same
-selection, so it cannot seed the compilation cache with the plain layout. This
-is a layout/SDSC probe, not a correctness mode.
+`slot_major_devfill` is the default `--kv-layout`: it matches the worker's
+slot-major allocation and device-side KV history write. The startup probe uses
+the selected layout and block count, so it cannot seed the compilation cache
+with a different specialization.
+
+`page_major` is an opt-in `index_select` layout/SDSC probe. Its device axes are
+`[page, kv_head, D-stick, token, D-element]`.
 
 ## Output
 

@@ -12,23 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict-xfail probe for native RMSNorm at the S=64 prefill.
+"""Regression probe for native FP32 RMSNorm at the S=64 prefill.
 
-Disables the Spyre custom RMSNorm op so the model dispatches to vLLM's upstream
-``RMSNorm.forward_native``, which upcasts fp16->fp32. torch-spyre does lower that
-upcast, but hands back the fp32 reduction as an eager result whose device layout the
-compiled graph does not assume (a ``RetileWarning`` per (64, 1) and (1, 1) reduction),
-so the graph runs and silently produces wrong values: the model answers "+" and stops
-instead of continuing the prompt. When torch-spyre keeps the reduction in the graph the
-probe flips to XPASS, the strict xfail fails CI, and that's the signal to delete the
-custom ``SpyreRMSNorm`` op.
+Disables the Spyre OOT RMSNorm registration so the model dispatches directly to
+vLLM's upstream ``RMSNorm.forward_native``. The native implementation upcasts
+fp16->fp32 and must produce the same greedy prefix as the registered Spyre path.
 
-The comparison is the shared-prefix one ``tests/e2e/test_distributed_tp2.py`` uses against
-its TP=1 twin: native accumulates the norm in fp32 where the custom op stays in fp16, so a
-working native path may tie-break away later but not disagree from the first token.
-Asserting the whole continuation would conflate "native works" with "native is bit-equal
-to fp16"; asserting non-empty output is weaker still, since the broken path does emit a
-token and which one it picks turns on fp16 rounding anywhere in the model.
+The comparison uses the shared-prefix criterion from
+``tests/e2e/test_distributed_tp2.py``. It guards both whole-block compilation
+and the FP32 reduction while allowing a later sampling tie-break to differ.
 
 Runs against the real Spyre device when available; otherwise skips silently.
 """
@@ -78,22 +70,8 @@ def _generate_greedy(native: bool) -> list[int]:
     return token_ids
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Upstream RMSNorm.forward_native upcasts fp16->fp32. torch-spyre lowers the upcast "
-        "but returns the fp32 reduction as an eager result whose device layout the compiled "
-        "graph does not assume, so the S=64 prefill graph runs and silently produces wrong "
-        "values. SpyreRMSNorm (fp16, no upcast) works around it. When this passes, "
-        "torch-spyre keeps the reduction in the graph and the custom op can be removed."
-    ),
-)
 def test_native_rmsnorm_prefill_s64_generates(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Native RMSNorm must open on the same tokens as the shipped custom op.
-
-    Whole-model (block-graph) phenomenon: a lone torch.compile of forward_native does
-    not reproduce it, and S=1 decode does not either -- only the S=64 prefill compile.
-    """
+    """Native RMSNorm must open on the same tokens as the registered OOT path."""
     if spyre_device_count() < 1:
         pytest.skip("Spyre device not available")
 

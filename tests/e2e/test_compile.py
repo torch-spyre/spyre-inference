@@ -45,31 +45,13 @@ _COSINE_MIN = 0.99
             "google/gemma-3-1b-it",
             "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
         ),
-        pytest.param(
-            (
-                "google/gemma-4-31B",
-                "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
-            ),
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Native FP32 RMSNorm exposes Gemma 4's unsupported "
-                    "Mod(4*c0, 5) block-layout coordinate on Spyre."
-                ),
-            ),
+        (
+            "google/gemma-4-31B",
+            "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
         ),
-        pytest.param(
-            (
-                "google/gemma-4-26B-A4B",
-                "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
-            ),
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Native FP32 RMSNorm exposes Gemma 4's unsupported "
-                    "Mod(4*c0, 5) block-layout coordinate on Spyre."
-                ),
-            ),
+        (
+            "google/gemma-4-26B-A4B",
+            "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
         ),
     ],
 )

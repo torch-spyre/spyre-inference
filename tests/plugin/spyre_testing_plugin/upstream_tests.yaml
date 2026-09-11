@@ -113,14 +113,11 @@ tests:
 
     # gemma-3-1b-it is hybrid; test_dummy_loader exercises engine startup + KV
     # cache init (the hybrid block-override path) with dummy weights, isolating
-    # it from gemma-3 generation quality. Native FP32 RMSNorm currently exposes
-    # a torch-spyre layout-propagation limitation, so retain it as a strict
-    # expected failure until that backend fix lands. Injected via override (not
-    # in MODELS).
+    # it from gemma-3 generation quality. Injected via override (not in MODELS).
     - rel_path: tests/models/language/generation/test_gemma.py
       allow_list:
         - test: "test_dummy_loader"
-          mode: xfail_strict
+          mode: mandatory_pass
           tags: [gemma, upstream, uses_subprocess]
           params:
             override:

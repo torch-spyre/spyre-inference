@@ -124,19 +124,7 @@ def test_tp2_llm_generate_matches_tp1() -> None:
 )
 @pytest.mark.parametrize(
     "model",
-    [
-        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        pytest.param(
-            "google/gemma-4-26B-A4B",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Native FP32 RMSNorm exposes Gemma 4's unsupported "
-                    "Mod(4*c0, 5) block-layout coordinate on Spyre."
-                ),
-            ),
-        ),
-    ],
+    ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "google/gemma-4-26B-A4B"],
 )
 def test_tp2_compiled_llm_generate_matches_tp1(model: str) -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.

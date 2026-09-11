@@ -124,12 +124,6 @@ def padded_sdpa(
         q = F.pad(q, pad)
         k = F.pad(k, pad)
         v = F.pad(v, pad)
-    else:
-        # Offset operands read as offset 0 (torch-spyre#3770), so SDPA is silently
-        # wrong here; the padded branch escapes it only because F.pad materializes.
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
 
     out = F.scaled_dot_product_attention(
         q,

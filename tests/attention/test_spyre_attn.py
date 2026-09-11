@@ -29,11 +29,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
-    _batched_decode_kernel,
     _build_query_row_tables,
     _mirror_mask_tiles,
-    _stick_aligned_len,
 )
+from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.layout import stick_aligned_len
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -50,6 +50,24 @@ def enable_batched_decode(monkeypatch):
     makes the monkeypatched value visible to ``envs``.
     """
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+
+
+@pytest.fixture()
+def head_major_kv(monkeypatch):
+    """Allocate the KV cache head-major, so the impl picks the head-major kernels.
+
+    Must take effect before ``SpyreAttentionImpl.__init__``, which is where the layout
+    is read and the kernels are bound.
+    """
+    monkeypatch.setenv("SPYRE_ATTN_HEAD_MAJOR_KV", "1")
+
+
+def _head_major_slot_rows(
+    slot_mapping: torch.Tensor, num_kv_heads: int, block_size: int
+) -> list[torch.Tensor]:
+    """The per-head row indices the head-major KV store takes; see attn_layer.SlotMapping."""
+    pages, offsets = slot_mapping // block_size, slot_mapping % block_size
+    return [(pages * num_kv_heads + h) * block_size + offsets for h in range(num_kv_heads)]
 
 
 @pytest.fixture()
@@ -362,6 +380,7 @@ def _run_spyre_attn_test(
     head_size: int = 128,
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
+    head_major: bool = False,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -438,8 +457,14 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = k_pages_cpu.to(cache_device)
-    v_pages = v_pages_cpu.to(cache_device)
+    if head_major:
+        # Permuted out of the slot-major seed rather than built separately, so the
+        # reference below reads the same values through the shape it expects.
+        k_pages = k_pages_cpu.permute(0, 2, 1, 3).contiguous().to(cache_device)
+        v_pages = v_pages_cpu.permute(0, 2, 1, 3).contiguous().to(cache_device)
+    else:
+        k_pages = k_pages_cpu.to(cache_device)
+        v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -483,12 +508,19 @@ def _run_spyre_attn_test(
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     # The attention layer, not forward(), owns the KV write (see attn_layer.py).
+    if head_major:
+        slot_arg = [
+            convert(rows, cache_device)
+            for rows in _head_major_slot_rows(attn_metadata.slot_mapping, num_kv_heads, block_size)
+        ]
+    else:
+        slot_arg = convert(attn_metadata.slot_mapping, cache_device)
     attn_impl.do_kv_cache_update(
         None,
         key_src,
         value_src,
         kv_cache,
-        convert(attn_metadata.slot_mapping, cache_device),
+        slot_arg,
     )
     # The impl expects q/k/v already on device, as in production (QKV runs
     # on-device); the CPU `query` still feeds the reference below.
@@ -1070,6 +1102,151 @@ def test_spyre_attn_mqa(
         num_query_heads=8,
         num_kv_heads=1,
     )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 130), (1, 300)], id="decode_batch"),
+        pytest.param([(1, 130), (32, 256)], id="mixed_batch"),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_query_heads,num_kv_heads",
+    [
+        pytest.param(32, 8, id="gqa"),
+        pytest.param(8, 8, id="mha"),
+        pytest.param(8, 1, id="mqa"),
+    ],
+)
+def test_spyre_attn_head_major_kv(
+    default_vllm_config,
+    head_major_kv,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+    num_query_heads: int,
+    num_kv_heads: int,
+) -> None:
+    """The head-major cache and its per-sequence kernel agree with the reference.
+
+    Same reference comparison as the slot-major tests, over a cache holding the same
+    values in the other layout, so a wrong gather or a wrong store shows up as a
+    numerical mismatch rather than a shape error.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_major=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "use_alibi,soft_cap,sliding_window",
+    [
+        pytest.param(True, None, None, id="alibi"),
+        pytest.param(False, 30.0, None, id="soft_cap"),
+        pytest.param(False, None, 256, id="sliding_window"),
+    ],
+)
+def test_spyre_attn_head_major_kv_score_modifiers(
+    default_vllm_config,
+    head_major_kv,
+    configure_compilation: str,
+    configure_device: str,
+    use_alibi: bool,
+    soft_cap: float | None,
+    sliding_window: int | None,
+) -> None:
+    """Score-modifying paths are layout-independent, but only if the gather is right."""
+    _run_spyre_attn_test(
+        seq_lens=[(1, 300), (32, 256)],
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=use_alibi,
+        soft_cap=soft_cap,
+        head_major=True,
+    )
+
+
+def test_head_major_slot_mapping_rows(default_vllm_config, head_major_kv):
+    """SlotMapping's head-major expansion lands on the rows a page's kv heads occupy.
+
+    Derived from the allocation rather than from the production formula: under
+    [num_blocks, num_kv_heads, block_size, head_size] flattened to rows of head_size,
+    token (page, offset) of head h is at ((page * KV) + h) * block_size + offset.
+    """
+    from spyre_inference.v1.attention.attn_layer import SlotMapping
+
+    num_kv_heads, block_size = 4, 64
+    slots = torch.tensor([0, 5, block_size + 1, 9 * block_size + 63], dtype=torch.int64)
+
+    holder = SlotMapping([], num_kv_heads, block_size)
+    assert holder._head_major, "the fixture must be visible to envs before construction"
+    # No layers to resolve a device from, so name it directly.
+    holder._device = torch.device("cpu")
+    holder.publish(slots)
+
+    assert holder.slots is not None
+    assert len(holder.slots) == num_kv_heads
+    frame = torch.arange(16 * num_kv_heads * block_size).reshape(16, num_kv_heads, block_size)
+    for h, rows in enumerate(holder.slots):
+        expected = [int(frame[s // block_size, h, s % block_size]) for s in slots.tolist()]
+        assert rows.tolist() == expected
+
+
+def test_batched_decode_is_disabled_under_head_major(
+    default_vllm_config, enable_batched_decode, head_major_kv
+):
+    """The batched kernel only reads slot-major pages, so the flag must not win."""
+    impl = SpyreAttentionImpl(
+        num_heads=8,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=8,
+    )
+    assert impl.head_major_kv
+    metadata = Mock()
+    metadata.padded_num_seqs = 4
+    assert impl._batched_decode_preconditions_met(metadata) is False
 
 
 def test_block_size_validation():
@@ -1698,7 +1875,7 @@ def test_install_patches_layers_not_the_attention_class():
     decoder = _StubAttentionLayer(AttentionType.DECODER)
     encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
 
-    holder = attn_layer.install([decoder, encoder])
+    holder = attn_layer.install([decoder, encoder], num_kv_heads=8, block_size=64)
 
     assert Attention.forward is class_forward
     assert decoder.spyre_slots is holder
@@ -1844,12 +2021,12 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
     # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
-    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
+    block_ids = torch.zeros(num_blocks, stick_aligned_len(num_seqs), dtype=torch.int64)
     block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
 
     def run(cap: float):
-        return _batched_decode_kernel(
+        return batched_decode_kernel(
             query,
             None,
             k_pages,

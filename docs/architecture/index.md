@@ -196,6 +196,16 @@ the write can scatter through a slot-major view of it:
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
+`SPYRE_ATTN_HEAD_MAJOR_KV=1` switches to a second layout, allocated
+`[num_blocks, num_kv_heads, block_size, head_size]` (`head_major_kv_layout`), where a
+(block, kv head) pair is one contiguous tile. The per-sequence kernel then gathers a page
+already in the order the matmuls want, dropping the permute; the cost is that a token's kv
+heads are `block_size` rows apart, so the KV store runs one `index_copy_` per head over a
+per-head slot mapping. Off by default, and it disables the batched decode path, which
+reads the slot-major page shape only. The kernels for both layouts live under
+`spyre_inference/v1/attention/ops/`, and `SpyreAttentionImpl` binds one set at
+construction.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`

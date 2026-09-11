@@ -201,7 +201,7 @@ def build_inputs_from_requests(
     from vllm.utils.torch_utils import set_random_seed
 
     from spyre_inference.custom_ops.utils import convert
-    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+    from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
     assert len(query_lens) == len(seq_lens)
     for ql, sl in zip(query_lens, seq_lens):

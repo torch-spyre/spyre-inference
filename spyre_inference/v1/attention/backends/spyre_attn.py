@@ -42,6 +42,20 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.layout import (
+    INT32_ELEMS_PER_STICK,
+    stick_aligned_len,
+)
+from spyre_inference.v1.attention.ops.page_attn import (
+    alibi_tile_shape,
+    head_major_page_attn_kernel,
+    page_attn_kernel,
+)
+from spyre_inference.v1.attention.ops.reshape_and_cache import (
+    head_major_reshape_and_cache_kernel,
+    reshape_and_cache_kernel,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
@@ -85,12 +99,6 @@ def _record_block(name: str):
         yield
 
 
-# Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
-# padded to this width so each row starts on a stick boundary; see
-# SpyreAttentionMetadata.page_index_tables.
-INT32_ELEMS_PER_STICK = 32
-
-
 # Batches below this fall back to the per-seq loop: the batched matmul's
 # padded-row overhead exceeds the per-seq cost at small N.
 _MIN_BATCHED_SEQS = 4
@@ -126,9 +134,12 @@ def _find_bucket(n: int, buckets: tuple[int, ...]) -> int | None:
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    Each field is one dense tensor of shape
-    [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
-    matching `SpyreAttentionBackend.get_kv_cache_shape`.
+    Each field is one dense tensor on the Spyre device, shaped
+    [num_blocks, block_size, num_kv_heads, head_size] by default, matching
+    `SpyreAttentionBackend.get_kv_cache_shape`, or
+    [num_blocks, num_kv_heads, block_size, head_size] under
+    SPYRE_ATTN_HEAD_MAJOR_KV, where a (block, kv head) pair is one contiguous tile.
+    The KV store reads a flatter view of the same bytes; see `kv_slot_views`.
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
@@ -142,33 +153,6 @@ class SpyrePagedKVCache(NamedTuple):
 
     k_pages: torch.Tensor
     v_pages: torch.Tensor
-
-
-def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
-    """Slot-axis-outermost layout. The default tiled layout spreads the slot index
-    across two device dims, making the indirect store write to the wrong rows
-    (torch-spyre#3705)."""
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
-
-    eps = get_elem_in_stick(dtype)
-    sticks = (head_size + eps - 1) // eps
-    return SpyreTensorLayout(
-        device_size=[num_slots, num_kv_heads, sticks, eps],
-        stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
-        device_dtype=get_device_dtype(dtype),
-    )
-
-
-def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
-    k_slots.index_copy_(0, slot_mapping, key)
-    v_slots.index_copy_(0, slot_mapping, value)
-
-
-def _alibi_tile_shape(
-    num_kv_heads: int, num_queries_per_kv: int, block_size: int
-) -> tuple[int, int, int, int]:
-    """Shape of one per-block ALiBi bias tile; see _online_softmax_attention's derivation."""
-    return (num_kv_heads, num_queries_per_kv, 1, block_size)
 
 
 def _mirror_mask_tiles(
@@ -202,11 +186,6 @@ def _mirror_mask_tiles(
 # ---------------------------------------------------------------------------
 
 
-def _stick_aligned_len(n: int) -> int:
-    """Round n up to a whole number of int32 sticks (see INT32_ELEMS_PER_STICK)."""
-    return (n + INT32_ELEMS_PER_STICK - 1) // INT32_ELEMS_PER_STICK * INT32_ELEMS_PER_STICK
-
-
 def _build_query_row_tables(
     attn_metadata: "SpyreAttentionMetadata", device: torch.device
 ) -> list[torch.Tensor]:
@@ -220,7 +199,7 @@ def _build_query_row_tables(
     starts = attn_metadata.query_start_loc[:num_seqs].cpu()
     lens = attn_metadata.query_start_loc[1 : num_seqs + 1].cpu() - starts
     aligned_query_lens = attn_metadata.aligned_query_lens
-    max_index_len = max((_stick_aligned_len(al) for al in aligned_query_lens), default=0)
+    max_index_len = max((stick_aligned_len(al) for al in aligned_query_lens), default=0)
     rows = torch.zeros(num_seqs, max_index_len, dtype=torch.int32)
     for s, aligned in enumerate(aligned_query_lens):
         last_real = max(int(lens[s]) - 1, 0)
@@ -229,217 +208,15 @@ def _build_query_row_tables(
     # Per-seq clones keep offset 0 for the compiled kernel (torch-spyre#3770), each
     # narrowed to the width the recorder traced for that query length, not the batch max.
     return [
-        rows_dev[s, : _stick_aligned_len(aligned_query_lens[s])].clone() for s in range(num_seqs)
+        rows_dev[s, : stick_aligned_len(aligned_query_lens[s])].clone() for s in range(num_seqs)
     ]
-
-
-def _page_attn_kernel(
-    query,
-    query_row_index,
-    k_pages,
-    v_pages,
-    page_index_table,
-    mask_tiles,
-    scale,
-    num_blocks,
-    padded_query_len,
-    num_heads,
-    num_kv_heads,
-    head_size,
-    logits_soft_cap=0.0,
-    alibi_bias_tiles=None,
-    out=None,
-):
-    """Online softmax attention over ``num_blocks`` KV pages.
-
-    Under `dynamic=False` Dynamo specializes on every non-tensor argument, so the
-    page loop is unrolled per variant.
-
-    Expected shapes:
-        query: [num_tokens, num_heads, head_size], the whole batch's query
-        query_row_index: int32 device tensor whose first padded_query_len
-            entries are this sequence's absolute query rows.
-        k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
-        v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
-        page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
-            tensor, row i holding the i-th active block's page index at
-            column 0.
-        mask_tiles: [num_blocks]
-        alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size],
-            or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
-            per-query-row constants — see the derivation at the bias-tile
-            construction site in _online_softmax_attention.
-        out: buffer to store into, or None to return the result instead.
-
-    Returns [padded_query_len, num_heads, head_size], or ``out`` when this
-    kernel stored the result itself.
-    """
-    num_queries_per_kv = num_heads // num_kv_heads
-    # A compiled region reads a view from offset 0, ignoring storage_offset
-    # (torch-spyre#3770), so the rows are gathered here rather than sliced outside.
-    q_rows = query.index_select(0, query_row_index[:padded_query_len])
-    q = (
-        q_rows.unsqueeze(0)
-        .transpose(1, 2)
-        .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
-    )
-
-    tile_max = None
-    tile_sum = None
-    tile_output = None
-
-    for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:1]
-        k_page = k_pages.index_select(0, page_idx)
-        v_page = v_pages.index_select(0, page_idx)
-        # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-
-        mask_tile = mask_tiles[i]
-
-        scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
-        if logits_soft_cap > 0.0:
-            # Pull logits into (-cap, +cap) before the mask add so masked
-            # positions still map cleanly to -inf. Applied before the ALiBi
-            # bias so the positional term is not squashed by the tanh.
-            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        if alibi_bias_tiles is not None:
-            # ALiBi bias slope[h] * (kv_pos - context_len). The additive
-            # mask_tile below uses finfo.min for masked positions, so this
-            # bias cannot un-mask them.
-            scores = scores + alibi_bias_tiles[i]
-        scores = scores + mask_tile
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
-
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page_4d)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            # i > 0 only reachable after the i == 0 branch initialized these.
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_page_4d)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
-
-    assert tile_output is not None and tile_sum is not None
-    attn = tile_output / tile_sum
-    attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-    attn = attn.reshape(padded_query_len, num_heads, head_size)
-    if out is not None:
-        # `out` and `query` are both indexed by absolute token row. Storing the
-        # full padded extent keeps the sequence's real query_len out of the
-        # arguments, so it is not specialized on; rows past it duplicate the
-        # sequence's last row, so index_copy_'s undefined write order for
-        # duplicate indices is harmless.
-        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
-        return out
-    return attn
-
-
-def _batched_decode_kernel(
-    query,
-    query_row_ids,
-    k_pages,
-    v_pages,
-    block_ids,
-    mask_by_block,
-    scale,
-    num_seqs,
-    num_blocks,
-    num_kv_heads,
-    num_queries_per_kv,
-    block_size,
-    head_size,
-    logits_soft_cap=0.0,
-    out=None,
-):
-    """Batched decode kernel; gathers K/V and the query in-graph.
-
-    Gathers one block at a time; block_ids rows must stay stick-aligned, since a
-    flat per-block slice does not compile.
-
-    k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
-    block_ids: [num_blocks, stick-padded num_seqs] int32, row i holding the
-    i-th block's page index per sequence. mask_by_block:
-    [num_blocks, num_seqs * KV, 1, block_size], pre-broadcast across KV heads
-    by the builder. ``query_row_ids`` None takes the query buffer's first
-    num_seqs rows instead of gathering; ``out`` None returns the result instead
-    of storing it.
-    """
-    num_heads = num_kv_heads * num_queries_per_kv
-    # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
-    # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
-    q_rows = query[:num_seqs] if query_row_ids is None else query.index_select(0, query_row_ids)
-    # lower_bmm's 4-D form takes two batch axes, so num_seqs and KV stay separate.
-    q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size)
-
-    tile_max = None
-    tile_sum = None
-    tile_output = None
-
-    for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = block_ids[i, 0:num_seqs]
-        # Token-major cache page to head-major; a view, so do not add
-        # .contiguous() -- merging these axes is what materializes the page.
-        k_page = k_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
-        v_page = v_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
-        # Builder already broadcast across KV heads; split them back out.
-        mask_tile = mask_by_block[i].reshape(num_seqs, num_kv_heads, 1, block_size)
-
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
-        if logits_soft_cap > 0.0:
-            # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
-            # capping after it would un-mask the padded lanes.
-            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        scores = scores + mask_tile
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
-
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_page)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
-
-    assert tile_output is not None and tile_sum is not None
-    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
-    if out is not None:
-        # The destination prefix starts at offset 0, so torch-spyre#3770 does not
-        # apply; rows past the batch are don't-care and kept finite by the builder.
-        out[:num_seqs].copy_(attn)
-        return out
-    return attn
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
-_page_attn_compiled = torch.compile(_page_attn_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(_batched_decode_kernel, dynamic=False)
+_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
+_head_major_page_attn_compiled = torch.compile(head_major_page_attn_kernel, dynamic=False)
+_batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
 
 _warmup_complete = False
 
@@ -654,7 +431,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         static_ctx = vllm_config.compilation_config.static_forward_context
         self._slot_mapping = attn_layer.install(
-            static_ctx[name] for name in layer_names if name in static_ctx
+            (static_ctx[name] for name in layer_names if name in static_ctx),
+            self.num_kv_heads,
+            self.block_size,
         )
 
         # Buckets for the batched decode fast path. One compiled kernel
@@ -1077,7 +856,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Rows padded to the stick width: a narrower inner dim emits a
                 # Mod(d0, ...) stick expression the inductor rejects.
                 block_ids_padded_cpu = torch.zeros(
-                    b_blocks, _stick_aligned_len(b_seqs), dtype=torch.int32
+                    b_blocks, stick_aligned_len(b_seqs), dtype=torch.int32
                 )
                 bt = block_table[:num_seqs].to(torch.int32)
                 if active_block_indices is None:
@@ -1194,6 +973,8 @@ class SpyreAttentionBackend(AttentionBackend):
         # K and V are separate tensors in SpyrePagedKVCache, each with the same
         # shape. The base vLLM API expects a single tuple here; callers like
         # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        # The logical frame: the head-major allocation permutes block_size and
+        # num_kv_heads, keeping num_blocks at dim 0 and the same element count.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -1212,10 +993,10 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
-    KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
-    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre. Pages are
-    read by indirect access, indexing the dense tensor with a device-resident
-    page index. No gather masks.
+    KV cache is a tuple (k_pages, v_pages) where each is one dense tensor on Spyre,
+    in either of the two layouts `SpyrePagedKVCache` documents. Pages are read by
+    indirect access, indexing the dense tensor with a device-resident page index.
+    No gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile, with their loop counts passed as arguments.
@@ -1274,12 +1055,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        # Read once: the runner allocates the cache before any layer's first forward.
+        self.head_major_kv: bool = envs.SPYRE_ATTN_HEAD_MAJOR_KV
+
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
-        self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
+        self._reshape_fn = torch.compile(
+            head_major_reshape_and_cache_kernel if self.head_major_kv else reshape_and_cache_kernel,
+            dynamic=False,
+        )
 
-        self._attn_fn = _page_attn_compiled if self._compile_attn else _page_attn_kernel
-        self._decode_fn = _batched_decode_compiled if self._compile_attn else _batched_decode_kernel
+        if self.head_major_kv:
+            self._attn_fn = (
+                _head_major_page_attn_compiled
+                if self._compile_attn
+                else head_major_page_attn_kernel
+            )
+        else:
+            self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_kernel
+        self._decode_fn = _batched_decode_compiled if self._compile_attn else batched_decode_kernel
 
         self._kv_slots: SpyrePagedKVCache | None = None
 
@@ -1329,6 +1123,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
         # Set SPYRE_BATCHED_DECODE=1 to restore the path.
         if not envs.SPYRE_BATCHED_DECODE:
+            return False
+        if self.head_major_kv:
+            # The kernel permutes a slot-major page; head-major would need its own
+            # gather and tile index table, which is not implemented yet.
+            logger.warning_once(
+                "SPYRE_BATCHED_DECODE is ignored under SPYRE_ATTN_HEAD_MAJOR_KV: the "
+                "batched decode kernel only reads the slot-major cache."
+            )
             return False
         # Layer 0's builder gates on max_query_len and the bucket lattice;
         # we add ALiBi, which the batched kernel doesn't implement.
@@ -1431,7 +1233,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return 0
 
         k_pages, v_pages = kv_cache
-        num_pages, block_size = k_pages.shape[0], k_pages.shape[1]
+        num_pages = k_pages.shape[0]
+        block_size = k_pages.shape[2] if self.head_major_kv else k_pages.shape[1]
         variants = bucketer.variants()
         t_start = time.time()
 
@@ -1509,7 +1312,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         query = q_staging
 
         # Row table width is stick-aligned exactly as _build_query_row_tables does.
-        index_len = _stick_aligned_len(q_len)
+        index_len = stick_aligned_len(q_len)
         rows = torch.zeros(index_len, dtype=torch.int32)
         rows[:q_len] = torch.arange(q_len, dtype=torch.int32)
         row_table = convert(rows, device=device)
@@ -1529,7 +1332,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         alibi_bias_tiles = None
         if self.alibi_slopes is not None:
-            tile_shape = _alibi_tile_shape(self.num_kv_heads, self.num_queries_per_kv, block_size)
+            tile_shape = alibi_tile_shape(self.num_kv_heads, self.num_queries_per_kv, block_size)
             alibi_bias_tiles = [
                 convert(
                     torch.zeros(tile_shape, dtype=self.model_dtype),
@@ -1557,14 +1360,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
-        """Slot-major views of the pages, built once outside any graph.
+        """The view the KV store scatters into, built once outside any graph.
 
         Inductor cannot lower a store through a view of a Spyre-layout tensor created
-        inside a graph.
+        inside a graph. KV heads stay a trailing axis under slot-major but cannot under
+        head-major, where a token's heads are block_size rows apart. head_size is a
+        multiple of the stick, so collapsing the leading dims is a pure re-view.
         """
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
-            shape = (-1, k_pages.shape[2], k_pages.shape[3])
+            if self.head_major_kv:
+                shape: tuple[int, ...] = (-1, k_pages.shape[3])
+            else:
+                shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
@@ -1574,17 +1382,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         key: torch.Tensor,
         value: torch.Tensor,
         kv_cache: SpyrePagedKVCache,
-        slot_mapping: torch.Tensor,
+        slot_mapping: torch.Tensor | list[torch.Tensor],
     ) -> torch.Tensor:
         """Scatter new K/V tokens into their cache slots.
 
-        Returns the mutated slot-major K view, which the caller hands to the attention
-        op to order the scatter before the read.
+        ``slot_mapping`` is in the row space of ``kv_slot_views``, so head-major takes
+        one index tensor per KV head; see ``attn_layer.SlotMapping``.
+
+        Returns the mutated K view, which the caller hands to the attention op to order
+        the scatter before the read.
         """
         # A source on the wrong device falls back to CPU silently, without raising.
         assert key.device.type == kv_cache[0].device.type, (
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
+
+        if self.head_major_kv:
+            # Cloned in this graph, not inside the kernel: K and V are strided views
+            # into the fused QKV projection, and the store's per-head slices of such a
+            # view read the wrong rows. clone(), not contiguous(): at one token the
+            # view already reports contiguous, so contiguous() is a no-op.
+            key, value = key.clone(), value.clone()
 
         k_slots, v_slots = self.kv_slot_views(kv_cache)
         # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
@@ -1684,8 +1502,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        k_pages/v_pages are dense [num_blocks, block_size, num_kv_heads,
-        head_size] tensors on Spyre; each iteration gathers one page with a
+        k_pages/v_pages are dense tensors on Spyre in whichever layout
+        `SpyrePagedKVCache` documents; each iteration gathers one page with a
         one-element int32 device index, then feeds it to bmm without slicing.
 
         Writes results directly into the caller's output buffer in-place.
@@ -1789,7 +1607,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
             #
-            # Shape enforced via _alibi_tile_shape, matching _record_one's dummy tiles.
+            # Shape enforced via alibi_tile_shape, matching _record_one's dummy tiles.
             alibi_bias_tiles: list[torch.Tensor] | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len

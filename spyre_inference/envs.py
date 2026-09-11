@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_ATTN_HEAD_MAJOR_KV: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -68,6 +69,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1", allocate the paged KV cache head-major within a block --
+    # [num_blocks, num_kv_heads, block_size, head_size] -- so a (block, kv head) pair
+    # is one contiguous tile, and dispatch the per-sequence attention and KV store to
+    # the kernels that read that form. Off by default; incompatible with
+    # SPYRE_BATCHED_DECODE, which still reads the slot-major page shape.
+    "SPYRE_ATTN_HEAD_MAJOR_KV": lambda: bool(int(os.getenv("SPYRE_ATTN_HEAD_MAJOR_KV", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

@@ -1118,7 +1118,7 @@ def patch_backend_list(request, monkeypatch):
                 # The KV write needs the slot-outermost layout, not the default.
                 if blocks.device.type != "spyre":
                     return blocks
-                from spyre_inference.v1.attention.backends.spyre_attn import (
+                from spyre_inference.v1.attention.ops.layout import (
                     slot_major_kv_layout,
                 )
 

@@ -31,6 +31,7 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
@@ -41,12 +42,21 @@ _NULL_SLOT = 0
 
 
 class SlotMapping:
-    """This step's slot mapping on device, shared by every split layer."""
+    """This step's slot mapping on device, shared by every split layer.
 
-    def __init__(self, layers: list[Attention]) -> None:
+    Published in the row space the layer's KV store reads: slot-major takes the
+    (page, token) rows vLLM hands out unchanged, head-major takes one (page, kv head,
+    token) tensor per KV head. Every layer sharing a holder shares a kv-cache spec, so
+    one expansion serves them all.
+    """
+
+    def __init__(self, layers: list[Attention], num_kv_heads: int, block_size: int) -> None:
         self._layers = layers
+        self._num_kv_heads = num_kv_heads
+        self._block_size = block_size
+        self._head_major = envs.SPYRE_ATTN_HEAD_MAJOR_KV
         self._device: torch.device | None = None
-        self.slots: torch.Tensor | None = None
+        self.slots: torch.Tensor | list[torch.Tensor] | None = None
 
     def _resolve_device(self) -> torch.device | None:
         if self._device is None:
@@ -63,18 +73,28 @@ class SlotMapping:
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
-        device = self._resolve_device()
-        if device is None:
-            return
-        self.slots = convert(slot_mapping.clamp(min=_NULL_SLOT), device=device)
+        self._publish_host(slot_mapping.clamp(min=_NULL_SLOT).to(torch.int64))
 
     def publish_null(self, num_tokens: int) -> None:
+        self._publish_host(torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64))
+
+    def _publish_host(self, host: torch.Tensor) -> None:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = convert(
-            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device=device
-        )
+        if not self._head_major:
+            self.slots = convert(host, device=device)
+            return
+        # Expanded here, not in the traced forward, which would trace the arithmetic
+        # into the model graph. One tensor per head rather than a 2-D table: an index
+        # tensor reaches the hardware as a tensor argument, so a row slice would have
+        # its offset dropped (torch-spyre#3770).
+        pages = torch.div(host, self._block_size, rounding_mode="floor")
+        offsets = host - pages * self._block_size
+        self.slots = [
+            convert((pages * self._num_kv_heads + h) * self._block_size + offsets, device=device)
+            for h in range(self._num_kv_heads)
+        ]
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()
@@ -155,10 +175,10 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
-def install(layers: Iterable[Attention]) -> SlotMapping:
+def install(layers: Iterable[Attention], num_kv_heads: int, block_size: int) -> SlotMapping:
     """Opt eligible layers into the traced KV write; returns their shared slot holder."""
     split = [layer for layer in layers if _can_split(layer)]
-    slot_mapping = SlotMapping(split)
+    slot_mapping = SlotMapping(split, num_kv_heads, block_size)
     _holders.add(slot_mapping)
 
     for layer in split:

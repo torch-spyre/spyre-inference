@@ -1,5 +1,7 @@
 name: Test matrix (reusable)
 
+# legacy-image control: trivial edit to trip changed-files so the full matrix runs pytest on the legacy image_torch_spyre runner, giving per-test parity with shadow PR #498 (DO NOT MERGE).
+
 # ---------------------------------------------------------------------------
 # Reusable workflow — not triggered directly. Defines the build + the 6-config
 # test matrix once; two entrypoints call it with the same tests but slightly

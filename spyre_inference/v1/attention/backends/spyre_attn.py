@@ -17,6 +17,7 @@
 import bisect
 import contextlib
 import functools
+import math
 import time
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
@@ -95,6 +96,11 @@ INT32_ELEMS_PER_STICK = 32
 # Batches below this fall back to the per-seq loop: the batched matmul's
 # padded-row overhead exceeds the per-seq cost at small N.
 _MIN_BATCHED_SEQS = 4
+
+# actual_decode_blocks / bucket_capacity: low means a skewed batch is paying for
+# padding it does not use. Calibrated from the crossover sweep; 0.0 disables.
+# Expected to change as path costs and dispatch options evolve.
+_BATCHED_DECODE_MIN_UTILISATION: float = 0.0
 
 
 def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
@@ -568,6 +574,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # axis-0 slicing in the dispatch.
     num_decode_seqs: int = 0  # leading decode-only seqs; == num_seqs for pure-decode batches
     num_decode_tokens: int = 0  # == num_decode_seqs since each decode contributes one token
+    decode_utilisation: float = 0.0  # actual_decode_blocks / bucket_capacity; 0.0 when no bucket
     padded_num_seqs: int | None = None
     padded_batch_blocks: int | None = None
     query_row_ids_cpu: torch.Tensor | None = None  # [B_seqs] int64
@@ -1056,13 +1063,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold or 1,
-            treat_short_extends_as_decodes=common_attn_metadata.is_prefilling is None,
+            treat_short_extends_as_decodes=False,
+        )
+        actual_decode_blocks = sum(
+            math.ceil(seq_lens.tolist()[s] / block_size) for s in range(num_decode_seqs)
         )
         padded_num_seqs = None
         padded_batch_blocks = None
         query_row_ids_cpu = None
         block_ids_padded_cpu = None
         mask_by_block_cpu = None
+        decode_utilisation = 1.0
         if num_decode_seqs >= _MIN_BATCHED_SEQS:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
@@ -1070,6 +1081,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             b_seqs = _find_bucket(num_decode_seqs, self._num_seqs_buckets)
             b_blocks = _find_bucket(max(decode_blocks), self._num_blocks_buckets)
             if b_seqs is not None and b_blocks is not None:
+                decode_utilisation = actual_decode_blocks / (b_seqs * b_blocks)
                 padded_num_seqs = b_seqs
                 padded_batch_blocks = b_blocks
 
@@ -1150,6 +1162,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             padded_num_blocks=padded_num_blocks,
             num_decode_seqs=num_decode_seqs,
             num_decode_tokens=num_decode_tokens,
+            decode_utilisation=decode_utilisation,
             padded_num_seqs=padded_num_seqs,
             padded_batch_blocks=padded_batch_blocks,
             query_row_ids_cpu=query_row_ids_cpu,
@@ -1342,6 +1355,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Layer 0's builder gates on max_query_len and the bucket lattice;
         # we add ALiBi, which the batched kernel doesn't implement.
         if attn_metadata.padded_num_seqs is None:
+            return False
+        if attn_metadata.decode_utilisation < _BATCHED_DECODE_MIN_UTILISATION:
             return False
         return self.alibi_slopes is None
 

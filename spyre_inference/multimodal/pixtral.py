@@ -218,7 +218,7 @@ def patch_vision_rope_vit() -> None:
             # `positions[:, 1]` has storage_offset=1, which the device needs
             # stick-aligned, so fold both columns into a flat index on CPU first.
             row, col = idx
-            flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
+            flat = (convert(row, "cpu") * self._width + convert(col, "cpu")).to(torch.int64)
             flat = convert(flat, device=self._table.device, dtype=torch.int64)
             return self._table.index_select(0, flat)  # (seq, 2, head_dim)
 
@@ -236,8 +236,8 @@ def patch_vision_rope_vit() -> None:
             cos_full = cos.repeat_interleave(2, dim=-1)
             sin_signed = torch.stack([-sin, sin], dim=-1).reshape(*sin.shape[:-1], -1)
             packed = torch.stack([cos_full, sin_signed], dim=-2)  # (H, W, 2, head_dim)
-            self._freqs_cis = packed.reshape(-1, packed.shape[-2], packed.shape[-1]).to(
-                torch.float16
+            self._freqs_cis = convert(
+                packed.reshape(-1, packed.shape[-2], packed.shape[-1]), dtype=torch.float16
             )  # (H*W, 2, head_dim) on CPU
         if self._freqs_cis.device != self.device:
             self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
@@ -312,7 +312,7 @@ def patch_patch_merger() -> None:
 
     def _forward(self, x, image_sizes):
         dev = x.device
-        x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
+        x_perm = self.permute(convert(x, "cpu"), image_sizes)  # unfold on CPU
         return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
 
     _forward._spyre_patched = True

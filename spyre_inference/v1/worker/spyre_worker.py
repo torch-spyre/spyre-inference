@@ -35,7 +35,9 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
+from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
@@ -43,7 +45,7 @@ logger = init_logger(__name__)
 
 
 def _get_spyre_pcie_address(local_rank: int) -> str:
-    requested_devices = os.environ.get("SPYRE_DEVICES")
+    requested_devices = envs.SPYRE_DEVICES
     if not requested_devices:
         return "unknown"
 
@@ -125,10 +127,13 @@ class TorchSpyreWorker(Worker):
             _get_spyre_pcie_address(self.local_rank),
         )
 
-        # Register all the custom ops here when a worker is created.
-        # This has to happen before the model is loaded, so that all the
-        # layers will be swapped out with the custom implementations for spyre.
+        # Register all the custom ops and Spyre model architectures here when a
+        # worker is created. This has to happen before the model is loaded, so
+        # that all the layers will be swapped out with the custom
+        # implementations for spyre. Both also run from the `vllm.general_plugins`
+        # entry point, which `VLLM_PLUGINS` allowlists commonly leave out.
         register_all()
+        register_models()
 
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
@@ -153,8 +158,9 @@ class TorchSpyreWorker(Worker):
     def determine_available_memory(self) -> int:
         # Spyre's KV cache lives on-device with a fixed budget set by
         # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
-        # num_gpu_blocks_override is also set, so this value is only used as
-        # an upper bound sanity check by the engine.
+        # For decoder models num_gpu_blocks_override is also set; pooling /
+        # encoder models leave it unset (no KV cache). This return is an upper
+        # bound sanity check for the engine.
         assert self.cache_config.kv_cache_memory_bytes is not None
         return self.cache_config.kv_cache_memory_bytes
 

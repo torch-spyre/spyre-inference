@@ -16,6 +16,7 @@ import torch
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
 from .utils import convert
+from .vocab_parallel_embedding import promote_tied_lm_head
 
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
@@ -30,6 +31,10 @@ class SpyreLogitsProcessor(LogitsProcessor):
         ``logits.to(torch.float32)`` crashes torch-spyre's ``copy_from_d2d``.
         Move them to CPU here so downstream sampling always gets CPU logits.
         """
+        # A model may hand us its embedding table as the head; give it a padded `Wᵀ`
+        # on the first call, where the head's identity is finally unambiguous.
+        promote_tied_lm_head(lm_head)
+
         logits = super()._apply_head(lm_head, hidden_states, embedding_bias)
         if lm_head.tp_size <= 1:
             logits = convert(logits, device="cpu")

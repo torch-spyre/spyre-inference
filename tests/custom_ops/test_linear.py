@@ -14,17 +14,22 @@
 
 """Tests for the transposed-weight linear method (custom_ops/linear.py).
 
-These run on CPU (no Spyre device needed): `process_weights_after_loading` is a
-pure host-side weight mutation and `spyre_linear_t` is a plain `torch.matmul`,
-arithmetically identical to `F.linear` on any device. The generic
-`LinearBase` path (gate_up_proj, down_proj, ...) is covered here; QKV and the
-LM head have their own tests (test_mlp.py, test_parallel_lm_head.py).
+Most of these run on CPU (no Spyre device needed): `process_weights_after_loading`
+is a pure host-side weight mutation. The generic `LinearBase` path (gate_up_proj,
+down_proj, ...) is covered here; QKV and the LM head have their own tests
+(test_mlp.py, test_parallel_lm_head.py).
+
+`spyre_linear_t` is *not* device-agnostic, despite being a plain `torch.matmul`:
+torch-spyre computes a 3-D @ 2-D matmul incorrectly, so a CPU-only test of it
+proves nothing about a batched input. That case needs a card and lives in the
+on-card section at the bottom.
 """
 
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
 
 def _make_mlp_module(hidden, inter, bias=False):
@@ -151,3 +156,118 @@ def test_unquantized_layers_get_spyre_method(tp_group):
     assert isinstance(mlp.down_proj.quant_method, SpyreUnquantizedLinearMethod)
     # SpyreUnquantizedLinearMethod is itself an UnquantizedLinearMethod subclass.
     assert isinstance(mlp.down_proj.quant_method, UnquantizedLinearMethod)
+
+
+def _rows_reaching_gemm(gate_up, x, monkeypatch):
+    """Rows reaching the GEMM: on CPU `out[:m]` is identical whether or not padding fired."""
+    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
+
+    seen = []
+    real_apply = SpyreUnquantizedLinearMethod.apply
+
+    def spy(self, layer, activations, bias=None):
+        seen.append(activations.shape[0])
+        return real_apply(self, layer, activations, bias)
+
+    monkeypatch.setattr(SpyreUnquantizedLinearMethod, "apply", spy)
+    out = _forward(gate_up, x)
+    assert len(seen) == 1
+    return seen[0], out
+
+
+@pytest.mark.mlp
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_rows"),
+    [(1, 8), (4, 8), (7, 8), (8, 8), (9, 9), (64, 64)],
+)
+def test_short_rows_padded_on_gate_up(tp_group, monkeypatch, num_tokens, expected_rows):
+    """A partial row block reaches the GEMM padded to `_PAD_ROWS`; a full one is untouched."""
+    from spyre_inference.custom_ops.linear import (
+        SpyrePaddedRowsLinearMethod,
+        SpyreUnquantizedLinearMethod,
+    )
+
+    hidden, inter = 128, 256
+    torch.manual_seed(0)
+    mlp = _make_mlp_module(hidden, inter)
+    assert isinstance(mlp.gate_up_proj.quant_method, SpyrePaddedRowsLinearMethod)
+    assert not isinstance(mlp.down_proj.quant_method, SpyrePaddedRowsLinearMethod)
+
+    gate_up = mlp.gate_up_proj
+    gate_up.weight.data.normal_(std=0.02)
+    gate_up.quant_method.process_weights_after_loading(gate_up)
+
+    torch.manual_seed(1)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16)
+    reference = SpyreUnquantizedLinearMethod().apply(gate_up, x, None)
+
+    rows, out = _rows_reaching_gemm(gate_up, x, monkeypatch)
+    assert rows == expected_rows
+    assert out.shape == (num_tokens, 2 * inter)
+    torch.testing.assert_close(out.float(), reference.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.mlp
+def test_large_weights_not_padded(tp_group, monkeypatch):
+    """The weight bound disables padding, since past it the pad rows cost more."""
+    from spyre_inference.custom_ops import linear as linear_mod
+
+    hidden, inter = 128, 256
+    torch.manual_seed(0)
+    gate_up = _make_mlp_module(hidden, inter).gate_up_proj
+    gate_up.weight.data.normal_(std=0.02)
+    gate_up.quant_method.process_weights_after_loading(gate_up)
+
+    x = torch.randn(1, hidden, dtype=torch.float16)
+    monkeypatch.setattr(linear_mod, "_MAX_PAD_WEIGHT", gate_up.weight.numel() - 1)
+    rows, _ = _rows_reaching_gemm(gate_up, x, monkeypatch)
+    assert rows == 1
+
+
+# ---------------------------------------------------------------------------
+# Numeric correctness on-card
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.mlp
+@pytest.mark.parametrize(
+    "batch,seq",
+    [
+        (1, 528),  # the production shape: one image, 24x22 patch grid
+        (2, 64),  # batch > 1, so a fold that mishandles the leading dim is caught
+    ],
+)
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_transposed_linear_3d_matches_reference_on_spyre(tp_group, batch, seq, use_bias):
+    """A 3-D `[B, T, hidden]` input through the layer on-card matches `F.linear`.
+
+    Regression guard for the 3-D fold in `spyre_linear_t` (torch-spyre#4155): without
+    it this returns confident garbage. Every other test here passes 2-D, as the
+    decoder does; the Pixtral vision tower is the only 3-D caller.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    # hidden 1024 / 2x1536 reproduces the vision qkv_proj's 1024 -> 3072 GEMM.
+    hidden, inter = 1024, 1536
+    torch.manual_seed(0)
+    mlp = _make_mlp_module(hidden, inter, bias=use_bias)
+    layer = mlp.gate_up_proj
+    layer.weight.data.normal_(std=0.02)
+    if layer.bias is not None:
+        layer.bias.data.normal_(std=0.02)
+
+    torch.manual_seed(1)
+    x = torch.randn(batch, seq, hidden, dtype=torch.float16)
+
+    # Capture the reference BEFORE process_weights_after_loading transposes.
+    # std-1 activations keep the output O(0.6), so atol=1e-2 is a real bound
+    # rather than a tolerance wide enough to accept a wrong answer.
+    expected = F.linear(x, layer.weight.data, _bias(layer))
+
+    layer.quant_method.process_weights_after_loading(layer)
+    layer = layer.to("spyre")
+    actual = _forward(layer, x.to("spyre"))
+
+    assert actual.shape == expected.shape
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)

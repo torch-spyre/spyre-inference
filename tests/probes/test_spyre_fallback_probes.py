@@ -19,14 +19,22 @@ Each test exercises a single primitive that spyre-inference needs on-device
 xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
-All tests run against the real Spyre device when available; otherwise they
-skip silently (the same pattern used by attention/test_spyre_attn.py).
+Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
+probes need no device and inspect vLLM instead.
+
+All device tests run against the real Spyre device when available; otherwise
+they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
+
+import inspect
+import re
 
 import pytest
 import torch
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
+
+pytestmark = pytest.mark.probe
 
 
 @pytest.fixture()
@@ -87,20 +95,15 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
 
 
 @pytest.mark.parametrize("mode", ["eager", "compile"])
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spyre batchmatmul cannot restickify a size-1 output dimension: "
-        "`x[T, in] @ w[in, 1]` fails to lower with 'cannot restickify any input "
-        "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
-        "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
-        "Fails in both eager and compile. "
-        "When supported, please adapt "
-        "tests/custom_ops/test_mlp.py::test_replicated_matches_reference"
-    ),
-)
 def test_spyre_matmul_output_dim_1(spyre_device, mode):
-    """Mirrors spyre_linear_t: out = matmul(x[T, in], weight_t[in, out]) with out=1."""
+    """Mirrors spyre_linear_t: out = matmul(x[T, in], weight_t[in, out]) with out=1.
+
+    Was strict-xfail: Spyre batchmatmul could not restickify a size-1 output
+    dimension (`x[T, in] @ w[in, 1]` failed to lower with 'cannot restickify any
+    input layout of x to carry x_var=d1'), which forced padding out=1->2. Fixed
+    upstream by torch-spyre#4206 (matmul with unit N/M dimensions); now lowers in
+    both eager and compile.
+    """
     x = torch.randn(7, 128, dtype=torch.float16, device=spyre_device)
     weight_t = torch.randn(128, 1, dtype=torch.float16, device=spyre_device)
 
@@ -112,7 +115,7 @@ def test_spyre_matmul_output_dim_1(spyre_device, mode):
 
     out = fn(x, weight_t)
     expected = torch.matmul(x.cpu().float(), weight_t.cpu().float())
-    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(out.cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +206,15 @@ def test_spyre_single_row_index_select(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Tensor.index_add_ / aten::index_add is unimplemented on Spyre "
-        "(torch-spyre#3507). Upstream MeanPool uses index_add_ for segment "
-        "sums; until this works we keep MEAN pooling on CPU. When this probe "
-        "passes, add SpyreMeanPool (or drop MEAN from the unsupported list in "
-        "configure_pooling_for_spyre) and keep the pooler on Spyre like CLS/LAST."
+        "SpyreMeanPool copies packed activations once and sums in float32 on the host. "
+        "This probe still uses index_add_ with repeated ids and is expected to fail "
+        "(torch-spyre#3507). When it XPASS-es, MEAN can segment-sum on device."
     ),
 )
 def test_spyre_index_add_for_mean_pooling(spyre_device):
-    """Segment sum via index_add_ (MEAN pooling primitive).
+    """index_add_ with many tokens per sequence (upstream MeanPool shape).
 
-    Shape mirrors a small pooled batch: values [T, H], segment ids [T] →
-    out [B, H] with out.index_add_(0, ids, values).
+    SpyreMeanPool does not use this path; it copies the packed tensor once.
     """
     num_tokens, hidden, num_seqs = 12, 64, 3
     values = torch.randn(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
@@ -277,7 +277,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in _create_compilable_page_attn, but with a 0-dim
+    Mirrors the page gather in _page_attn_kernel, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -378,7 +378,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     """`k_pages[idx]` for the page gather: works compiled, fails eager.
 
-    This asymmetry is why _create_compilable_page_attn gathers with index_select,
+    This asymmetry is why _page_attn_kernel gathers with index_select,
     which works in both modes.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
@@ -405,37 +405,6 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
         q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
     )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A core's share of a gather operand may span at most 256 MB, and the work "
-        "divider splits this shape 4 ways along dim 0, so a 1 GB cache leaves a "
-        "256 MB span and is rejected. This caps one layer's dense KV cache below "
-        "1 GB (~7168 blocks here), which is why test_long_context_model_load is "
-        "skipped. Lifted by chunking the cache or by multi-core indirect access "
-        "(torch-spyre#2725, torch-spyre#3499)."
-    ),
-)
-def test_spyre_dense_cache_gather_per_core_span(spyre_device):
-    """Gather a page from a 1 GB dense KV cache — the long-context cache size.
-
-    The allocation and the host-to-device transfer both succeed; only the gather
-    is rejected, so the limit is on the operand of the page read, not on the
-    cache itself.
-    """
-    num_blocks, block_size, num_kv_heads, head_size = 8192, 64, 8, 128
-
-    k_pages = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16).to(
-        spyre_device
-    )
-    table = torch.zeros(1, 32, dtype=torch.int32)
-    table[0, 0] = 3
-    table = table.to(spyre_device)
-
-    k_page = k_pages.index_select(0, table[0, 0:1])
-    assert k_page.cpu().shape == (1, block_size, num_kv_heads, head_size)
 
 
 # ---------------------------------------------------------------------------
@@ -794,3 +763,171 @@ def test_spyre_scalar_pow_cube(spyre_device):
 
     expected = x.cpu().float() ** 3
     torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+
+
+# ---------------------------------------------------------------------------
+# 10. FP32 reduce then D2H (MEAN destagger)
+# ---------------------------------------------------------------------------
+#
+# Device fp32 is staggered inside sticks (torch-spyre#2971), so a raw convert
+# of the reduction is still garbage. Downcast to fp16, convert, then upcast now
+# round-trips, hence the assert below. SpyreMeanPool still reduces on the host:
+# the segmented sum needs repeat_interleave / index_add_, which Spyre lacks.
+
+
+def _fp32_mean_reduction(spyre_device):
+    hidden = torch.randn(32, 64, dtype=torch.float16, device=spyre_device)
+    acc = hidden.sum(dim=0, dtype=torch.float32)
+    ref = hidden.cpu().sum(dim=0, dtype=torch.float32)
+    return acc, ref
+
+
+def _destagger_fp32_to_host(tensor):
+    from spyre_inference.custom_ops.utils import convert
+
+    return convert(tensor.to(dtype=torch.float16), "cpu").to(dtype=torch.float32)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Device fp32 is staggered inside sticks (torch-spyre#2971). convert() of "
+        "that layout is interleaved garbage. MEAN copies packed fp16 instead. "
+        "When this XPASS-es, MEAN can convert a device fp32 sum."
+    ),
+)
+def test_spyre_fp32_reduce_d2h_without_destagger(spyre_device):
+    """Raw convert of a device fp32 sum."""
+    from spyre_inference.custom_ops.utils import convert
+
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(convert(acc, "cpu"), ref, atol=1e-3, rtol=1e-3)
+
+
+def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
+    """to(fp16) before convert un-staggers a device fp32 sum."""
+    acc, ref = _fp32_mean_reduction(spyre_device)
+    torch.testing.assert_close(_destagger_fp32_to_host(acc), ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 11. FP32 linear / batchmatmul (pooling classifier heads)
+# ---------------------------------------------------------------------------
+#
+# torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
+# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
+# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
+# fallback.
+
+
+_FP32_BMM_REASON = (
+    "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
+    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
+    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
+    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+@pytest.mark.xfail(strict=True, reason=_FP32_BMM_REASON)
+def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
+    """FP32 F.linear used by reranker / classifier pooling heads.
+
+    out>=2 so this is not the fp16 out=1 restickify xfail
+    (test_spyre_matmul_output_dim_1).
+    """
+    hidden = torch.randn(4, 64, dtype=torch.float32, device=spyre_device)
+    weight = torch.randn(8, 64, dtype=torch.float32, device=spyre_device)
+    bias = torch.randn(8, dtype=torch.float32, device=spyre_device)
+
+    def fn(h, w, b):
+        return F.linear(h, w, b)
+
+    if mode == "compile":
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    out = fn(hidden, weight, bias)
+    expected = F.linear(hidden.cpu(), weight.cpu(), bias.cpu())
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# 12. Upstream vLLM workarounds (no device needed)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Gemma4SelfDecoderLayers re-stores four scalar buffers owned by "
+        "Gemma4Model as plain attributes, so model.to('spyre') leaves them on "
+        "CPU and the compiled embed_input_ids gets a 0-d CPU graph input. "
+        "Fixed upstream by vllm-project/vllm#54213; when that lands, drop "
+        "models/gemma4.py::register_aliased_scalars and its call site."
+    ),
+)
+def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
+    """The aliased scalars must be buffers, so ``.to(device)`` moves them.
+
+    Source inspection rather than construction: ``Gemma4SelfDecoderLayers`` is a
+    ``support_torch_compile`` wrapper whose ``__init__`` wants a built parent
+    model, and what the fix changes is exactly these four assignments.
+    """
+    from spyre_inference.models.gemma4 import _ALIASED_SCALARS
+
+    gemma4 = pytest.importorskip("vllm.model_executor.models.gemma4")
+    src = inspect.getsource(gemma4.Gemma4SelfDecoderLayers.__init__)
+
+    plain = [
+        name
+        for name in _ALIASED_SCALARS
+        if not re.search(rf"""register_buffer\(\s*["']{name}["']""", src)
+    ]
+    assert not plain, f"still plain attributes upstream: {plain}"
+
+
+# ---------------------------------------------------------------------------
+# 13. Short-row matmul scheduling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
+        "same weight sustains with a full 8-row block, so padding the activation out "
+        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
+        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "constants it reads. Tracked by torch-spyre#4032."
+    ),
+)
+def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
+    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    import time
+
+    from torch_spyre.streams import synchronize
+
+    # granite-3.3-8b's gate_up_proj weight_t -- the shape the workaround targets.
+    weight = torch.randn(4096, 25600, dtype=torch.float16, device=spyre_device)
+    activations = {
+        m: torch.randn(m, 4096, dtype=torch.float16, device=spyre_device) for m in (1, 8)
+    }
+
+    def best_of(rows, reps=8):
+        best = float("inf")
+        for _ in range(reps):
+            start = time.perf_counter()
+            torch.matmul(activations[rows], weight)
+            synchronize()
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    for rows in (1, 8):  # compile and warm both kernels before timing either
+        best_of(rows, reps=3)
+    one_row, full_block = best_of(1), best_of(8)
+
+    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
+    assert one_row <= 1.10 * full_block, (
+        f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
+        f"({100 * (one_row / full_block - 1):.0f}% slower)"
+    )

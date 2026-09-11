@@ -1,0 +1,162 @@
+{
+  "run_label": "granite33_8b_bs128_decode",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 64,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "decode_ctx32",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        32
+      ],
+      "extra_cols": {
+        "seqlen": 32,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx64",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        64
+      ],
+      "extra_cols": {
+        "seqlen": 64,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx128",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        128
+      ],
+      "extra_cols": {
+        "seqlen": 128,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx256",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        256
+      ],
+      "extra_cols": {
+        "seqlen": 256,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx512",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        512
+      ],
+      "extra_cols": {
+        "seqlen": 512,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx1024",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        1024
+      ],
+      "extra_cols": {
+        "seqlen": 1024,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx2048",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        2048
+      ],
+      "extra_cols": {
+        "seqlen": 2048,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx3000",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        3000
+      ],
+      "extra_cols": {
+        "seqlen": 3000,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx4096",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        4096
+      ],
+      "extra_cols": {
+        "seqlen": 4096,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx8192",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        8192
+      ],
+      "extra_cols": {
+        "seqlen": 8192,
+        "decode_share": 1.0
+      }
+    }
+  ],
+  "block_sizes": [
+    128
+  ]
+}

@@ -70,7 +70,7 @@ def _build_rotation_cache(
         identity[:, 1, 1, :] = 1.0
         rot = torch.cat([rot, identity], dim=-1)
 
-    return rot.contiguous().to(dtype)
+    return rot.to(dtype)
 
 
 def _apply_rope_matmul(x: torch.Tensor, rot: torch.Tensor) -> torch.Tensor:

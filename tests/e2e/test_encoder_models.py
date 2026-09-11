@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre product embed tests vs cached HF refs and reranker smoke tests.
+"""Spyre product encoder tests vs cached HF refs: embeddings, reranker scores, labels.
 
-Regenerate embed refs: ``python tests/data/generate_encoder_embed_refs.py``
+Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py``
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,13 @@ EMBEDDING_MODELS = [
     "sentence-transformers/all-roberta-large-v1",
 ]
 
+# MEAN product models. The default embed e2e uses max_num_seqs=1; batched MEAN
+# is ``test_encoder_embed_mean_multi_seq``.
+MEAN_POOLING_MODELS = [
+    "intfloat/multilingual-e5-large",
+    "sentence-transformers/all-roberta-large-v1",
+]
+
 # None of the product encoder models above ship with LAST pooling (CLS or MEAN).
 # Force LAST on a small CLS model so SpyreLastPool is covered end-to-end.
 LAST_POOLING_MODEL = "ibm-granite/granite-embedding-125m-english"
@@ -44,17 +52,37 @@ LAST_POOLING_PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
 ]
 
-# Cross-encoder reranker smoke (classify / score path). One model is enough —
-# both BGE variants share XLMRobertaForSequenceClassification.
+# Cross-encoder rerankers (classify / score path). The BGE variants share
+# XLMRobertaForSequenceClassification but not their weights or position table.
 RERANKER_MODELS = [
     "BAAI/bge-reranker-v2-m3",
+    "BAAI/bge-reranker-large",
+]
+
+# Token classification: the model applies its own classifier after casting to
+# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
+# runs on Spyre instead of detouring through SpyreCpuClassifier.
+TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
+TOKEN_CLASSIFY_PROMPTS = [
+    "My name is Wolfgang and I live in Berlin",
+    "George Washington went to Washington",
 ]
 
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
+# Sigmoid probabilities, most just above zero where an absolute bound permits an arbitrary
+# relative error, so the stricter of the two applies.
+SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
+SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
+
 _REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
+
+_RERANK_REF_PATH = Path(__file__).parent.parent / "data" / "rerank_score_refs.json"
+_RERANK_REFERENCES: dict = (
+    json.loads(_RERANK_REF_PATH.read_text()) if _RERANK_REF_PATH.exists() else {}
+)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -65,12 +93,12 @@ def _cosine(a: list[float], b: list[float]) -> float:
     ).item()
 
 
-def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float]]:
+def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> list[list[float]]:
     """CPU HF last-nonpad-token + L2 (matches vLLM LastPool + normalize)."""
     from transformers import AutoModel, AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model)
-    hf = AutoModel.from_pretrained(model)
+    tok = AutoTokenizer.from_pretrained(model, revision=revision)
+    hf = AutoModel.from_pretrained(model, revision=revision)
     hf.eval()
     with torch.inference_mode():
         enc = tok(
@@ -91,6 +119,18 @@ def _hf_last_token_embeddings(model: str, prompts: list[str]) -> list[list[float
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
 def test_encoder_embed_models(model: str) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
+    _assert_embeddings_match_refs(model, enforce_eager=True)
+
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", EMBEDDING_MODELS)
+def test_encoder_embed_models_compiled(model: str) -> None:
+    """Same models and references, compiled rather than eager."""
+    _assert_embeddings_match_refs(model, enforce_eager=False)
+
+
+def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
     ref = _REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
@@ -98,10 +138,12 @@ def test_encoder_embed_models(model: str) -> None:
     prompts = ref["prompts"]
     llm = LLM(
         model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
     )
     outputs = llm.embed(prompts)
     assert len(outputs) == len(prompts)
@@ -119,6 +161,44 @@ def test_encoder_embed_models(model: str) -> None:
 
 
 @pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", MEAN_POOLING_MODELS)
+def test_encoder_embed_mean_multi_seq(model: str) -> None:
+    """MEAN with ``max_num_seqs=2`` so two requests share one packed ``[T, H]``.
+
+    The default embed e2e is ``max_num_seqs=1`` and never hits two sequences
+    in one packed ``[T, H]`` copy.
+    """
+    ref = _REFERENCES.get(model)
+    if ref is None:
+        pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
+
+    prompts = ref["prompts"]
+    llm = LLM(
+        model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=2,
+        enforce_eager=True,
+    )
+    outputs = llm.embed(prompts)
+    assert len(outputs) == len(prompts)
+
+    for prompt, out, ref_emb in zip(prompts, outputs, ref["embeddings"]):
+        emb = out.outputs.embedding
+        assert len(emb) == len(ref_emb), (
+            f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
+        )
+        assert all(math.isfinite(x) for x in emb)
+        sim = _cosine(emb, ref_emb)
+        assert sim >= COSINE_MIN, (
+            f"{model} batched MEAN: cosine {sim:.4f} < {COSINE_MIN} "
+            f"vs cached HF reference for prompt {prompt!r}"
+        )
+
+
+@pytest.mark.uses_subprocess
 def test_encoder_embed_last_pooling() -> None:
     """SpyreLastPool path: force LAST on granite-125m and match HF last-token.
 
@@ -126,11 +206,21 @@ def test_encoder_embed_last_pooling() -> None:
     override exercises the LAST gather + normalize path that
     ``configure_pooling_for_spyre`` patches to ``SpyreLastPool``.
     """
+    # Both sides are computed here, so the pin buys reproducibility, not a valid comparison.
+    ref = _REFERENCES.get(LAST_POOLING_MODEL)
+    if ref is None:
+        pytest.skip(
+            f"No HF ref for {LAST_POOLING_MODEL}; run tests/data/generate_encoder_embed_refs.py"
+        )
+
+    revision = ref["revision"]
     prompts = LAST_POOLING_PROMPTS
-    ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, prompts)
+    ref_embs = _hf_last_token_embeddings(LAST_POOLING_MODEL, revision, prompts)
 
     llm = LLM(
         model=LAST_POOLING_MODEL,
+        revision=revision,
+        tokenizer_revision=revision,
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
@@ -156,14 +246,87 @@ def test_encoder_embed_last_pooling() -> None:
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
 def test_encoder_rerank_models(model: str) -> None:
-    """Load reranker and return one finite score via LLM.score()."""
+    """Spyre reranker scores match the cached HF references within tolerance."""
+    _assert_rerank_scores_match_refs(model, enforce_eager=True)
+
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+@pytest.mark.parametrize("model", RERANKER_MODELS)
+def test_encoder_rerank_models_compiled(model: str) -> None:
+    """Same models and references, compiled rather than eager."""
+    _assert_rerank_scores_match_refs(model, enforce_eager=False)
+
+
+def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
+    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
+    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
+    ref = _RERANK_REFERENCES.get(model)
+    if ref is None:
+        pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
+
+    documents = ref["documents"]
+    ref_scores = ref["scores"]
     llm = LLM(
         model=model,
+        revision=ref["revision"],
+        tokenizer_revision=ref["revision"],
         runner="pooling",
         max_model_len=64,
         max_num_seqs=1,
+        enforce_eager=enforce_eager,
+    )
+    outputs = llm.score(ref["query"], documents)
+    assert len(outputs) == len(documents)
+
+    scores = [out.outputs.score for out in outputs]
+    assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
+
+    # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
+    # and all scores can drift one direction without reordering.
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    ref_order = sorted(range(len(ref_scores)), key=lambda i: ref_scores[i], reverse=True)
+    assert order == ref_order, (
+        f"{model}: ranked documents {order} vs cached HF {ref_order}; "
+        f"scores {scores} vs {ref_scores}"
+    )
+
+    for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
+        tol = min(SCORE_ABS_TOL, SCORE_REL_TOL * ref_score)
+        assert abs(score - ref_score) <= tol, (
+            f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
+            f"for {document!r}"
+        )
+
+
+@pytest.mark.uses_subprocess
+def test_encoder_token_classify() -> None:
+    """Per-token scores match softmax(HF fp32 logits) and agree on every label."""
+    from transformers import AutoModelForTokenClassification, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(TOKEN_CLASSIFY_MODEL)
+    hf = AutoModelForTokenClassification.from_pretrained(TOKEN_CLASSIFY_MODEL, dtype=torch.float32)
+    hf.eval()
+    with torch.inference_mode():
+        refs = [
+            hf(**tok(p, return_tensors="pt")).logits[0].float().softmax(-1)
+            for p in TOKEN_CLASSIFY_PROMPTS
+        ]
+
+    llm = LLM(
+        model=TOKEN_CLASSIFY_MODEL,
+        runner="pooling",
+        max_model_len=64,
+        max_num_seqs=2,
         enforce_eager=True,
     )
-    scores = llm.score("What is Spyre?", "An IBM AI accelerator.")
-    assert len(scores) == 1
-    assert math.isfinite(scores[0].outputs.score)
+    outputs = llm.encode(TOKEN_CLASSIFY_PROMPTS, pooling_task="token_classify")
+    assert len(outputs) == len(TOKEN_CLASSIFY_PROMPTS)
+
+    for prompt, out, ref in zip(TOKEN_CLASSIFY_PROMPTS, outputs, refs):
+        got = torch.as_tensor(out.outputs.data).float()
+        assert got.shape == ref.shape, f"{prompt!r}: {tuple(got.shape)} vs {tuple(ref.shape)}"
+        assert torch.equal(got.argmax(-1), ref.argmax(-1)), (
+            f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
+        )
+        assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"

@@ -19,9 +19,11 @@ Reads benchmark configs from the specified directory, builds the appropriate
 and executes them.
 """
 
+import contextlib
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -244,9 +246,26 @@ def run_serve_benchmark(
     log.info("=== Starting vLLM server for serve test: %s ===", test_name)
     log.info("Server command: %s", " ".join(server_cmd))
 
+    def _kill_server(proc: subprocess.Popen) -> None:
+        """Kill the server and its entire process group."""
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
     server_log = results_dir / f"{test_name}_server.log"
     with open(server_log, "w") as server_lf:
-        server_proc = subprocess.Popen(server_cmd, env=env, stdout=server_lf, stderr=server_lf)
+        server_proc = subprocess.Popen(
+            server_cmd,
+            env=env,
+            stdout=server_lf,
+            stderr=server_lf,
+            start_new_session=True,
+        )
 
         # Wait for server health
         health_url = f"http://{host}:{port}/health"
@@ -254,6 +273,8 @@ def run_serve_benchmark(
         for i in range(1, health_timeout + 1):
             if server_proc.poll() is not None:
                 log.error("Server process died with exit code %d", server_proc.returncode)
+                if server_log.exists():
+                    log.error("Server log:\n%s", server_log.read_text())
                 return False
             try:
                 urllib.request.urlopen(health_url, timeout=2)
@@ -265,8 +286,9 @@ def run_serve_benchmark(
 
         if not server_ready:
             log.error("Server did not become healthy within %ds", health_timeout)
-            server_proc.terminate()
-            server_proc.wait(timeout=10)
+            if server_log.exists():
+                log.error("Server log:\n%s", server_log.read_text())
+            _kill_server(server_proc)
             return False
 
         # Run bench serve
@@ -291,13 +313,7 @@ def run_serve_benchmark(
                 bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
             )
 
-        # Cleanup server
-        server_proc.terminate()
-        try:
-            server_proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            server_proc.kill()
-            server_proc.wait()
+        _kill_server(server_proc)
 
     if result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, result.returncode)

@@ -15,14 +15,14 @@
 """Encoder / pooling helpers kept out of ``TorchSpyreModelRunner``."""
 
 from spyre_inference.v1.pool.spyre_pooler import (
-    TOKEN_POOLING_TASKS,
+    SpyreAllPool,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
 )
 
 __all__ = [
-    "TOKEN_POOLING_TASKS",
+    "SpyreAllPool",
     "configure_pooling_for_spyre",
     "copy_pooler_output_to_cpu",
     "select_rows",

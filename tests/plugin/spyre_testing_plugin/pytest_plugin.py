@@ -77,6 +77,7 @@ import yaml
 from _pytest.mark.expression import IDENT_PREFIX, Expression
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from spyre_testing_plugin import sharding
 from spyre_testing_plugin.models import (
     AllowEntry,
     BlockEntry,
@@ -87,6 +88,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.tags import result_tags
 from spyre_testing_plugin.vfio_reaper import (
     reap_vfio_holders,
     spyre_hardware_present,
@@ -510,19 +512,7 @@ def pytest_addoption(parser):
         help="Collect upstream vLLM tests even when the -m expression doesn't name the "
         "`upstream` marker (cloning vLLM if it isn't cached yet).",
     )
-    group = parser.getgroup("spyre-attention-shard")
-    group.addoption(
-        "--attn-shards",
-        type=int,
-        default=0,
-        help="Partition attention (non-encoder) tests into this many shards (0 = off).",
-    )
-    group.addoption(
-        "--attn-shard-id",
-        type=int,
-        default=0,
-        help="0-based index of the shard to run when --attn-shards is set.",
-    )
+    sharding.add_shard_options(parser)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -534,11 +524,21 @@ def pytest_configure(config):
     # Set env vars BEFORE any vllm imports
     os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+    # Let a shutting-down worker take longer to release the VFIO card: the default
+    # 5s can expire mid-teardown (e.g. finishing a Spyre compile), leaving the card
+    # busy for the next test. Governs both the executor worker-exit wait and the
+    # engine process-manager join.
+    os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")
 
     # Load plugins early to register custom ops before test modules import RMSNorm
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    # Register sharding for its own trylast pytest_collection_modifyitems, which must
+    # land after pytest's -m deselection. Registered here (not via the plugin's -p
+    # entry) and before the upstream return so it applies to `not upstream` shard jobs.
+    config.pluginmanager.register(sharding, "spyre-sharding")
 
     config._upstream_tests_base = None
     if not _upstream_requested(config):
@@ -659,6 +659,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
             item.add_marker(upstream_marker)
 
+            # Tag upstream items here (the conftest fixture binds only under
+            # tests/). Before the skip/xfail branches so a tag lands regardless
+            # of the item's eventual disposition.
+            params = getattr(getattr(item, "callspec", None), "params", {})
+            for name, value in result_tags(params):
+                item.user_properties.append((name, value))
+
             fc = _find_file_config(test_path, file_configs)
             if fc is None:
                 item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
@@ -699,60 +706,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
 
-    # Must run for local selections too: the shard jobs run `not upstream`, so gating
-    # this on upstream_tests_base makes the partition a silent no-op (every shard runs
-    # the whole suite).
     _reorder_tests_by_name(items)
-    _apply_attention_shard(config, items)
-
-
-def _apply_attention_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Keep only the attention items for this shard.
-
-    Every shard job computes the same partition and keeps its own slice, so no
-    cross-job coordination is needed.
-    """
-    num_shards = config.getoption("--attn-shards")
-    if not num_shards or num_shards <= 1:
-        return
-    shard_id = config.getoption("--attn-shard-id")
-    if not 0 <= shard_id < num_shards:
-        raise pytest.UsageError(f"--attn-shard-id must be in [0, {num_shards}); got {shard_id}")
-
-    attn_items = [
-        it
-        for it in items
-        if it.get_closest_marker("attention") and not it.get_closest_marker("encoder_attention")
-    ]
-    if not attn_items:
-        return
-
-    # Heavy = compiled kernel on device; those dominate wall time and HBM growth.
-    def _weight(item: pytest.Item) -> int:
-        nid = item.nodeid
-        return 8 if "device_spyre" in nid and "STOCK" in nid else 1
-
-    # Greedy longest-processing-time first over a stable order.
-    attn_items.sort(key=lambda it: it.nodeid)
-    attn_items.sort(key=_weight, reverse=True)
-    loads = [0] * num_shards
-    assigned: dict[str, int] = {}
-    for item in attn_items:
-        target = min(range(num_shards), key=lambda s: loads[s])
-        assigned[item.nodeid] = target
-        loads[target] += _weight(item)
-
-    attn_nodeids = {it.nodeid for it in attn_items}
-    kept, dropped = [], []
-    for item in items:
-        if item.nodeid in attn_nodeids and assigned[item.nodeid] != shard_id:
-            dropped.append(item)
-        else:
-            kept.append(item)
-
-    if dropped:
-        config.hook.pytest_deselected(items=dropped)
-        items[:] = kept
 
 
 def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
@@ -1092,6 +1046,23 @@ def inference_mode():
 
 
 @pytest.fixture()
+def register_ministral_14b(request, monkeypatch):
+    """Make `mistralai/Ministral-3-14B-Instruct-2512-BF16` resolvable upstream.
+
+    Upstream's registry only knows the 3B, and `find_hf_info` raises for unknown ids,
+    so register the 14B as another extra on the same architecture entry. `setitem`
+    because `_HfExamplesInfo` is frozen — the `extras` dict is not.
+    """
+    hf_models = request.node.module.HF_EXAMPLE_MODELS.hf_models
+    info = hf_models["PixtralForConditionalGeneration"]
+    monkeypatch.setitem(
+        info.extras,
+        "ministral-3-14b",
+        "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    )
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 
@@ -1139,6 +1110,7 @@ def patch_backend_list(request, monkeypatch):
         attn_type=None,
         sliding_window=None,
         kv_cache_dtype="auto",
+        sinks=None,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
 
@@ -1176,6 +1148,7 @@ def patch_backend_list(request, monkeypatch):
             attn_type,
             sliding_window,
             kv_cache_dtype,
+            sinks,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
@@ -1202,37 +1175,53 @@ def pytest_fixture_setup(fixturedef, request):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Record whether a test failed/errored, so teardown only reaps after failures."""
-    outcome = yield
-    report = outcome.get_result()
-    if report.failed:
-        item._spyre_test_failed = True
+    """Flag every `uses_subprocess` test's teardown to reap the card, not just wait.
+
+    Only a subprocess test can orphan a worker (EngineCore, TP rank) still holding
+    the VFIO fd -- on failure, but also on a pass, when a worker outlives vLLM's
+    shutdown grace period and lingers on the card as the engine force-kills its
+    parent. `wait_until_card_free` cannot free a still-alive holder; only a SIGKILL
+    can. So reap on the marker alone, regardless of outcome -- a safe gate, since
+    subprocess tests keep the main pytest process (which the reap excludes) off the
+    card.
+    """
+    yield
+    if any(m.name == "uses_subprocess" for m in item.iter_markers()):
+        item._spyre_reap_card = True
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
     """Free the Spyre card at each test boundary on a Spyre host.
 
-    A failed test can orphan a holder outright, so after a failure we reap
-    (SIGKILL the holder, then wait for the card).
+    A `uses_subprocess` test (flagged above) can orphan a subprocess holder, so we
+    reap: SIGKILL the holder, then wait for the card. The reap excludes the main
+    pytest pid, so it cannot recover a card the main process opened in-process --
+    uses_subprocess tests must keep off the card (guard on spyre_device_count,
+    never spyre_available) so no subprocess is blocked.
 
-    A *passing* test can also leave the card transiently busy: an out-of-process
-    vLLM engine is force-killed during shutdown and the kernel's VFIO release is
-    asynchronous, so the holder is already on its way out but may not be gone by
-    the time the next test opens the device. There we only wait — killing would
-    take down a legitimately cached `LLM`, or the in-process device tests whose
-    card belongs to the still-alive pytest process.
+    Every other test only waits: the card may be transiently busy (an in-process
+    device test whose card belongs to the still-alive pytest process, or a cached
+    `LLM`), and killing there would take down a legitimate holder.
 
     `trylast` runs this after all other teardown (fixture finalizers, the tests'
     own `del llm`).
     """
     if not spyre_hardware_present():
         return
-    if getattr(item, "_spyre_test_failed", False):
+    if getattr(item, "_spyre_reap_card", False):
         reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
+
+
+def pytest_runtest_logreport(report) -> None:
+    sharding.record_duration(report)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    sharding.write_durations(_log)
 
 
 @pytest.hookimpl(hookwrapper=True)

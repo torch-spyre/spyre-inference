@@ -86,22 +86,19 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/spyre-rpms
-          key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+          key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}
           lookup-only: true
 
-      - name: List Artifactory RPMs
+      # We only build/cache on x86_64, but validate resolves all arches so a lock
+      # that pins a commit missing on ppc64le/s390x fails review, not a later
+      # (untested) P/Z install.
+      - name: Validate lock resolves on all arches
         if: steps.rpm-cache.outputs.cache-hit != 'true'
         env:
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-        run: |
-          # List the next/ subdir — the tree download_rpms.sh pulls from by
-          # default (see spyre-rpms.lock).
-          curl -fSL \
-            -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
-            "${ARTIFACTORY_BASE_URL}/artifactory/api/storage/${ARTIFACTORY_RPM_PATH}/next/x86_64?list&deep=0" \
-            | jq -r '.files[].uri'
+        run: python3 .github/scripts/resolve_rpms.py validate
 
       - name: Download RPMs
         if: steps.rpm-cache.outputs.cache-hit != 'true'
@@ -109,13 +106,24 @@ jobs:
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-          RPM_NAMES_TXT: spyre-rpms.lock
-          RPMS_DOWNLOAD_DIR: /tmp/spyre-rpms
-        run: bash .github/scripts/download_rpms.sh
+        run: |
+          set -euo pipefail
+          DEST=/tmp/spyre-rpms
+          mkdir -p "$DEST"
+          BASE="${ARTIFACTORY_BASE_URL%/}/artifactory/${ARTIFACTORY_RPM_PATH}"
+          # One repo-relative path per package: newest build of the pinned commit.
+          python3 .github/scripts/resolve_rpms.py resolve --arch x86_64 > /tmp/rpm-relpaths.txt
+          while IFS= read -r relpath; do
+            [[ -z "$relpath" ]] && continue
+            fn="$(basename "$relpath")"
+            echo "Downloading ${fn} ..."
+            curl -fSL -H "Authorization: Bearer ${ARTIFACTORY_TOKEN}" \
+              -o "${DEST}/${fn}" "${BASE}/${relpath}"
+          done < /tmp/rpm-relpaths.txt
 
       - name: Save RPM cache
         if: steps.rpm-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /tmp/spyre-rpms
-          key: spyre-rpms-${{ hashFiles('spyre-rpms.lock') }}
+          key: spyre-rpms-x86_64-${{ hashFiles('spyre-rpms.lock') }}

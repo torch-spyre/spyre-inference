@@ -1,14 +1,17 @@
 # Serve benchmarks for Spyre devices
 - test_name: serve_granite8B_tp1_in64_out64
+  server_health_timeout: 1800
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
   server_parameters:
     model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
     dtype: float16
     load-format: auto
     max-num-seqs: 4
+    max-model-len: 128
     port: 8000
     host: 127.0.0.1
   parameters:
@@ -22,19 +25,18 @@
     max-concurrency: 4
     request-rate: inf
 - test_name: serve_granite33-8b_tp1_in64_out64
-  # Extra time for compilation
   server_health_timeout: 1800
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
     SPYRE_DEVICES: '0'
-    # Extra time for compilation
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
   server_parameters:
     model: ibm-granite/granite-3.3-8b-instruct
     dtype: float16
     load-format: auto
     max-num-seqs: 4
+    max-model-len: 128
     port: 8000
     host: 127.0.0.1
   parameters:

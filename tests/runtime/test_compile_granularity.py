@@ -201,6 +201,19 @@ def test_compile_blocks_wraps_every_block_in_place() -> None:
         assert original._compiled_call_impl is not None
 
 
+def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
+    """Gemma-4 slices ``layers`` into a self- and a cross-decoder, aliasing every block."""
+    model = _Model(num_layers=4)
+    model.model.self_decoder = nn.Module()
+    model.model.self_decoder.decoder_layers = model.model.layers[:2]
+    model.model.cross_decoder = nn.Module()
+    model.model.cross_decoder.decoder_layers = model.model.layers[2:]
+    assert len(_repeated_block_lists(model)) == 3
+
+    assert _runner(model)._compile_blocks() == 4
+    assert all(block._compiled_call_impl is not None for block in model.model.layers)
+
+
 def test_compile_blocks_preserves_parameter_names() -> None:
     """An ``_orig_mod.`` segment in a parameter path breaks weight save/reload."""
     model = _Model(num_layers=4)
@@ -273,7 +286,6 @@ def test_eager_compiles_nothing(monkeypatch) -> None:
     assert all(block._compiled_call_impl is None for block in model.model.layers)
 
 
-@pytest.mark.compile
 def test_identical_blocks_share_compiled_artifacts_regardless_of_depth(
     isolated_dynamo_state,
 ) -> None:

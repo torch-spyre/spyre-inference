@@ -6,6 +6,8 @@
 
 gated_models:
   - meta-llama/Meta-Llama-3-8B
+  - repo: meta-llama/Llama-3.1-8B-Instruct
+    revision: 0e9e39f249a16976918f6564b8830bc894c89659
   - meta-llama/Llama-3.2-1B-Instruct
   - google/gemma-3-1b-it
   - google/gemma-1.1-2b-it
@@ -13,12 +15,33 @@ gated_models:
 
 public_models:
   - mistralai/Mistral-7B-Instruct-v0.3
+  - mistralai/Ministral-3-14B-Instruct-2512-BF16
   - BAAI/bge-base-en-v1.5
   - sentence-transformers/all-MiniLM-L12-v2
-  - ibm-granite/granite-embedding-125m-english
-  - ibm-granite/granite-embedding-278m-multilingual
-  - intfloat/multilingual-e5-large
-  - sentence-transformers/all-roberta-large-v1
-  - BAAI/bge-reranker-v2-m3
+  - repo: ibm-granite/granite-embedding-125m-english
+    revision: 4ab61ffd423be45cd932b21a7c696063d82bf45f
+  - repo: ibm-granite/granite-embedding-278m-multilingual
+    revision: a9cb5338491faf32b73dd17b714a31821c021bbf
+  - repo: intfloat/multilingual-e5-large
+    revision: 3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3
+  - repo: sentence-transformers/all-roberta-large-v1
+    revision: cf74d8acd4f198de950bf004b262e6accfed5d2c
+  - repo: BAAI/bge-reranker-v2-m3
+    revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
+  - repo: BAAI/bge-reranker-large
+    revision: 55611d7bca2a7133960a6d3b71e083071bbfc312
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
+  - repo: ibm-granite/granite-3.3-8b-instruct
+    revision: 51dd4bc2ade4059a6bd87649d68aa11e4fb2529b
+  - repo: ibm-granite/granite-4.1-8b
+    revision: 1504002f650e656a0a3789d99574df12e3e94ed0
+  - repo: ibm-granite/granite-3.3-8b-instruct-FP8
+    revision: 4b5990b8d402a75febe0086abbf1e490af494e3d
+  - repo: ibm-granite/granite-4.1-8b-fp8
+    revision: 070021b3608433b6107a00733d561c9779b9937e
+  - repo: google/gemma-4-31B
+    revision: 5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89
+  - repo: google/gemma-4-26B-A4B
+    revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  - qwrt/Swedish0.1M

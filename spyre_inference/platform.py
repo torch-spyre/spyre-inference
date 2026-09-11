@@ -49,16 +49,19 @@ logger = init_logger(__name__)
 
 
 def _disable_torch_accelerator() -> None:
-    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
-    # raise "Cannot access accelerator device when none is available." Our OOT
-    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
-    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
-    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
+    # empty_host_cache() raise "Cannot access accelerator device when none is
+    # available." Our OOT platform (not CPU) makes vLLM's
+    # cleanup_dist_env_and_memory() skip its is_cpu() guard and call these at
+    # EngineCore shutdown. Patch at import to cover every process; matches
+    # vLLM's CPU worker (issue #327).
     def _noop(*args, **kwargs) -> None:
         return None
 
     torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+    if hasattr(torch.accelerator, "empty_host_cache"):
+        torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -112,6 +115,15 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
+    # 2 bytes for fp16).
+    _BLOCK_SIZE_MULTIPLE = 64
+    _DEFAULT_BLOCK_SIZE = 128
+
+    # Gated activations whose padded lanes are provably inert: `act(0)` meets an equally
+    # zero up lane, so the lane is zero whatever `act` does.
+    _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
+
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
@@ -145,6 +157,19 @@ class TorchSpyrePlatform(CpuPlatform):
 
         _spyre_patched._spyre_patched = True
         EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+
+        # Delegate per-model EngineArgs overrides (e.g. text-only backbone
+        # selection) to spyre_inference.models before ModelConfig is built.
+        create_model_config = EngineArgs.create_model_config
+
+        @functools.wraps(create_model_config)
+        def _spyre_create_model_config(self):
+            from spyre_inference.models import apply_prelaunch_overrides
+
+            apply_prelaunch_overrides(self)
+            return create_model_config(self)
+
+        EngineArgs.create_model_config = _spyre_create_model_config  # ty: ignore[invalid-assignment]
 
     @classmethod
     def import_kernels(cls) -> None:
@@ -203,6 +228,11 @@ class TorchSpyrePlatform(CpuPlatform):
         """Set Spyre-specific config defaults before vLLM's defaulting logic."""
         from vllm.config import CompilationMode
 
+        # A bare VllmConfig() (no model) reaches this hook too; every default below
+        # is model-specific.
+        if vllm_config.model_config is None:
+            return
+
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
         # subprocess), while enforce_eager persists, so it's the only stable signal.
@@ -226,37 +256,46 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Build bucket sizes for pre-compilation warmup.
-            # Pooling models skip bucketing (their token counts depend on
-            # variable input sequence lengths, not the decode heuristic).
-            if vllm_config.model_config.runner_type != "pooling":
-                if vllm_config.compilation_config.compile_sizes:
-                    compile_sizes = vllm_config.compilation_config.compile_sizes
+            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
+            # is independent — see SpyreEncoderAttentionImpl gather-pack.
+            # Honor a user-set list (#638); otherwise generate defaults.
+            if vllm_config.compilation_config.compile_sizes:
+                compile_sizes = vllm_config.compilation_config.compile_sizes
+            else:
+                # Largest default bucket: scheduler limit and 512 (Spyre max).
+                max_capture_size = min(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    512,
+                )
+                if vllm_config.model_config.runner_type != "pooling":
+                    # Decode packs one token per running sequence; prefill lands on
+                    # the single largest bucket. Denser sizes only cost warmup time.
+                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                    sizes = {max_capture_size, num_seqs}
+                    size = 1
+                    while size < num_seqs:
+                        sizes.add(size)
+                        size *= 2
+                    compile_sizes = sorted(sizes)
                 else:
-                    # max_capture_size is the largest bucket we compile for.
-                    # Bounded by max_num_batched_tokens (scheduler limit) and
-                    # 512 (max supported shape for torch-spyre).
-                    max_capture_size = min(
-                        vllm_config.scheduler_config.max_num_batched_tokens,
-                        512,
+                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
+                        default_encoder_len_buckets,
                     )
 
-                    compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
-                    if max_capture_size >= 8:
-                        compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
-                    if max_capture_size >= 256:
-                        compile_sizes += list(range(256, max_capture_size + 1, 16))
-                    vllm_config.compilation_config.compile_sizes = compile_sizes
+                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
+                    logger.info(
+                        "Pooling body token buckets (1D compile_sizes): %s",
+                        compile_sizes,
+                    )
+                vllm_config.compilation_config.compile_sizes = compile_sizes
 
-                max_capture_size = max(compile_sizes)
-
-                # Ensure the scheduler never sends more tokens than the
-                # largest compiled bucket to avoid runtime recompilation.
-                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-                logger.warning(
-                    "Capping max_num_batched_tokens to %d ",
-                    max_capture_size,
-                )
+            max_capture_size = max(int(s) for s in compile_sizes)
+            # Scheduler must not send more tokens than the largest body bucket.
+            vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+            logger.warning(
+                "Capping max_num_batched_tokens to %d ",
+                max_capture_size,
+            )
 
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
@@ -298,8 +337,15 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
-        # Route TP collectives through the opaque `torch.ops.vllm.{all_reduce,
-        # all_gather,...}` custom ops rather than plain `dist.*`.
+        # `False` reaches `device_communicator.<op>` directly, which dynamo inlines
+        # so the reduction compiles into the graph. The `torch.ops.vllm.*` wrappers
+        # are opaque to inductor, and their no-mutation declaration is wrong for the
+        # in-place `dist.all_reduce` they wrap, which corrupted compiled TP output.
+        return False
+
+    @classmethod
+    def supports_fp8(cls) -> bool:
+        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
         return True
 
     @classmethod
@@ -361,34 +407,105 @@ class TorchSpyrePlatform(CpuPlatform):
         )
 
     @classmethod
+    def _maybe_pad_intermediate_size(cls, vllm_config: VllmConfig) -> None:
+        """Round intermediate_size up so each TP rank's shard is a 64-multiple,
+        stashing the original as ``_spyre_orig_intermediate_size``.
+
+        A gated MLP whose per-rank ``intermediate_size`` is not a multiple of the fp16
+        stick fuses gate+up and slices the up half at an unaligned offset, which Spyre
+        inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3``/``Gemma4MLP``
+        read ``config.intermediate_size`` directly, so overriding the config value
+        before the model is built widens the modules with no per-class shim.
+
+        Dense MLPs only: routed experts are widened in ``spyre_inference.moe`` instead,
+        and a MoE that sizes its experts from ``intermediate_size`` is skipped, since the
+        loader cannot reach the stacked expert tensors to pad them. Zero-padding is inert
+        for a gated MLP (see ``custom_ops.mlp_pad``).
+        """
+        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
+
+        # The text config is where a multimodal checkpoint keeps the decoder's MLP width.
+        text_config = vllm_config.model_config.hf_text_config
+        orig = getattr(text_config, "intermediate_size", None)
+        if orig is not None and not isinstance(orig, int):
+            raise NotImplementedError(
+                "Spyre MLP intermediate-size padding does not support per-layer "
+                f"intermediate_size values (got {type(orig).__name__})."
+            )
+        # TP shards the intermediate dim, so it is the per-rank shard that has to land
+        # on a stick boundary.
+        align = BLOCK_SIZE * vllm_config.parallel_config.tensor_parallel_size
+        if not orig or orig % align == 0:
+            return
+        moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
+        is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
+        expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
+            text_config, "expert_intermediate_size", None
+        )
+        act = getattr(text_config, "hidden_act", None) or getattr(
+            text_config, "hidden_activation", None
+        )
+        # Experts sized from ``intermediate_size``, or from its double-wide ``2x``
+        # form (e.g. gemma4), would load truncated: the loader cannot reach the
+        # stacked tensors to widen them.
+        if (is_moe and expert_size in (None, orig, 2 * orig)) or act not in cls._GATED_ACTS:
+            return
+
+        padded = ((orig + align - 1) // align) * align
+        text_config._spyre_orig_intermediate_size = orig
+        text_config.intermediate_size = padded
+        logger.info(
+            "Padding MLP intermediate_size %d -> %d for Spyre stick alignment "
+            "(original preserved as _spyre_orig_intermediate_size).",
+            orig,
+            padded,
+        )
+
+    @classmethod
+    def _align_block_size(cls, vllm_config: VllmConfig) -> None:
+        cache_config = vllm_config.cache_config
+
+        if not cache_config.user_specified_block_size:
+            if cache_config.block_size != cls._DEFAULT_BLOCK_SIZE:
+                logger.info(
+                    "Setting kv cache block size to %d for the Spyre paged attention backend.",
+                    cls._DEFAULT_BLOCK_SIZE,
+                )
+                cache_config.block_size = cls._DEFAULT_BLOCK_SIZE
+            return
+
+        multiple = cls._BLOCK_SIZE_MULTIPLE
+        aligned = ((cache_config.block_size + multiple - 1) // multiple) * multiple
+        if aligned != cache_config.block_size:
+            logger.warning(
+                "Block size must be a multiple of %d for the Spyre paged attention "
+                "backend. Overriding block_size from %d to %d.",
+                multiple,
+                cache_config.block_size,
+                aligned,
+            )
+            cache_config.block_size = aligned
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
-        # Check if the model dtype is different from float16,
-        # which is only currently supported in torch-spyre
-        if vllm_config.model_config.dtype != torch.float16:
-            raise ValueError(
-                f"The model dtype needs to be torch.float16 for spyre, "
-                f"but was specified to be {vllm_config.model_config.dtype}"
-            )
+        # A bare VllmConfig() (no model) reaches this hook too; guard each
+        # model_config access like upstream CpuPlatform.
+        if vllm_config.model_config is not None:
+            # Check if the model dtype is different from float16,
+            # which is only currently supported in torch-spyre
+            if vllm_config.model_config.dtype != torch.float16:
+                raise ValueError(
+                    f"The model dtype needs to be torch.float16 for spyre, "
+                    f"but was specified to be {vllm_config.model_config.dtype}"
+                )
 
-        # Pad attention head_dim up to a stick-aligned size on the native path.
-        cls._maybe_pad_head_dim(vllm_config)
+            # Pad attention head_dim up to a stick-aligned size on the native path.
+            cls._maybe_pad_head_dim(vllm_config)
 
-        # Override block_size to a multiple of 64 if the user didn't explicitly set it.
-        # The Spyre paged attention backend requires 64-element stick alignment for
-        # torch.compile.
-        cache_config = vllm_config.cache_config
-        original_block_size = cache_config.block_size
-        if original_block_size % 64 != 0:
-            new_block_size = ((original_block_size + 63) // 64) * 64
-            logger.warning(
-                "Block size must be a multiple of 64 for the Spyre paged attention "
-                "backend. Overriding block_size from %d to %d.",
-                original_block_size,
-                new_block_size,
-            )
-            cache_config.block_size = new_block_size
+        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
+        cls._maybe_pad_intermediate_size(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 
@@ -401,6 +518,21 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"Spyre does not support data_parallel_size > 1 "
                 f"(got {parallel_config.data_parallel_size})."
             )
+
+        # The collectives torch-spyre lowers to reduce over the whole comms world
+        # and ignore the group name they are handed, so the TP group must *be* the
+        # world: with DP already rejected, pipeline parallelism has to go too.
+        if parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                f"Spyre does not support pipeline_parallel_size > 1 "
+                f"(got {parallel_config.pipeline_parallel_size})."
+            )
+
+        # Clamp CPU threading env vars before workers fork so they inherit the
+        # corrected values. DP is rejected above, so world_size is the worker count.
+        from spyre_inference.threading_config import configure_threading
+
+        configure_threading(parallel_config.world_size)
 
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
@@ -417,6 +549,12 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
+        # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
+        # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
+        # KV-cache manager gives every layer its own buffer; SWA is still computed
+        # in the model runner. No-op for non-hybrid models.
+        scheduler_config.disable_hybrid_kv_cache_manager = True
+
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
         # math in CpuPlatform.check_and_update_config is meaningless for us.
         # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
@@ -429,18 +567,20 @@ class TorchSpyrePlatform(CpuPlatform):
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
 
+        # Must run after super(), which sets a block_size default of its own, and before
+        # the num_gpu_blocks_override math below, which reads block_size.
+        cls._align_block_size(vllm_config)
+
         # Pin the on-device KV cache to what's needed to fill the batch area:
-        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
-        # single-group formula only holds for homogeneous models; hybrid models
-        # build several KV cache groups whose block count depends on vLLM's
-        # internal layer-grouping (not knowable here), so we skip the cap and
-        # let vLLM size the cache from the profiled memory budget instead.
+        # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
+        # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
+        # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
+        # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
-        if cache_config.num_gpu_blocks_override is None:
-            if cls._is_hybrid_attention(vllm_config):
+        if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
+            if cls._is_pooling_model(vllm_config):
                 logger.info(
-                    "Hybrid attention model detected; leaving num_gpu_blocks "
-                    "to vLLM (skipping the single-group block-count override)."
+                    "Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset."
                 )
             else:
                 max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -456,13 +596,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
     @staticmethod
-    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
-        """Whether the model interleaves multiple attention types.
-
-        More than one distinct HF `layer_types` value means vLLM builds
-        multiple KV cache groups (a hybrid model).
-        """
+    def _is_pooling_model(vllm_config: VllmConfig) -> bool:
+        """Encoder / embedding / scoring models (no paged KV cache)."""
         model_config = vllm_config.model_config
-        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
-        layer_types = getattr(hf_config, "layer_types", None)
-        return bool(layer_types) and len(set(layer_types)) > 1
+        return getattr(model_config, "runner_type", None) == "pooling"

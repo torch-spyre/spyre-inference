@@ -25,10 +25,6 @@ from typing import Any
 # library can't load before init_device runs.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
-# torch-spyre#3707's pool planner aliases allocations across a fallback boundary
-# and corrupts compiled output; our eager RoPE op makes every RoPE call one.
-os.environ.setdefault("HBM_POOL_PLANNING", "0")
-
 __version__ = importlib.metadata.version("spyre_inference")
 
 
@@ -38,18 +34,12 @@ def register():
 
 
 def register_ops():
-    """Register the Spyre OOT custom ops and Transformers backend."""
-    from vllm.model_executor.models import ModelRegistry
-
+    """Register the Spyre OOT custom ops and model adaptations."""
     from spyre_inference.custom_ops import register_all
+    from spyre_inference.models import register_models
 
     register_all()
-
-    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
-    ModelRegistry.register_model(
-        "TransformersForCausalLM",
-        "spyre_inference.transformers_backend:SpyreTransformersForCausalLM",
-    )
+    register_models()
 
 
 def _init_logging():

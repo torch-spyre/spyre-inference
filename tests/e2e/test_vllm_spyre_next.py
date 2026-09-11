@@ -37,16 +37,6 @@ def test_basic_model_load():
 
 
 @pytest.mark.uses_subprocess
-@pytest.mark.skip(
-    reason=(
-        "At max_model_len=131072 one layer's dense KV cache exceeds 1 GB, and the "
-        "page gather is then rejected for exceeding the 256 MB per-core tensor span "
-        "(see test_spyre_dense_cache_gather_per_core_span). The previous "
-        "one-tensor-per-page layout stayed under the limit but could not express an "
-        "indirect gather. Unskip once the cache is chunked or multi-core indirect "
-        "access lands (torch-spyre#2725, torch-spyre#3499)."
-    )
-)
 def test_long_context_model_load():
     """Verify that user-specified large max_model_len values are honored, and
     that long contexts don't crash."""
@@ -64,3 +54,40 @@ def test_long_context_model_load():
     )
 
     assert len(output[0].outputs[0].text) > 0
+
+
+# On-device counterpart to the CPU pad-shim unit tests: qwrt/Swedish0.1M is the
+# smallest public model that trips BOTH pads at once — head_dim 16 -> 128 (QK-norm)
+# and intermediate_size 160 -> 192 (SwiGLU) — and must still decode correctly.
+# Its tokenizer stub is broken (returns [] for everything); the model is byte-level
+# (vocab 256), so the prompt is fed as raw UTF-8 byte ids, not through the tokenizer.
+_PADDED_PROMPT_TOKEN_IDS = list("Sverige är ett land i norra Europa".encode())
+
+# Greedy continuation from transformers CPU (fp32, unpadded) on the same byte-id
+# prompt, kept only up to the first near-tie.
+_PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
+
+
+@pytest.mark.uses_subprocess
+def test_padded_head_dim_and_intermediate_size_generate() -> None:
+    """Loading the model fires both pads; greedy decode matches the unpadded
+    reference token ids."""
+    llm = LLM(
+        model="qwrt/Swedish0.1M",
+        dtype="float16",
+        enforce_eager=True,
+        max_model_len=128,
+        max_num_seqs=1,
+    )
+
+    # Both padding passes must have run during check_and_update_config.
+    hf_config = llm.llm_engine.model_config.hf_config
+    assert hf_config.head_dim == 128
+    assert hf_config._spyre_orig_head_dim == 16
+    assert hf_config.intermediate_size == 192
+    assert hf_config._spyre_orig_intermediate_size == 160
+
+    sp = SamplingParams(temperature=0.0, max_tokens=len(_PADDED_REFERENCE_TOKEN_IDS))
+    outputs = llm.generate({"prompt_token_ids": _PADDED_PROMPT_TOKEN_IDS}, sp, use_tqdm=False)
+
+    assert list(outputs[0].outputs[0].token_ids) == _PADDED_REFERENCE_TOKEN_IDS

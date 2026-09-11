@@ -18,9 +18,10 @@ A head_dim whose half is not a multiple of the 64-element fp16 stick (e.g.
 head_size=64) cannot restickify after RoPE, so the KV write-back fails to lower
 on Spyre. ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to a
 128-multiple before the model is built (sizing QKV/o_proj/Attention/KV-cache/RoPE
-at the padded width); the passes here fill the padded region on load and restore
-the two things the width override would otherwise corrupt — the RoPE frequencies
-and the attention scale.
+at the padded width); the passes here fill the padded region on load (including the
+QK-norm weights of models that normalize over head_dim) and restore the two things
+the width override would otherwise corrupt — the RoPE frequencies and the attention
+scale.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the
@@ -102,6 +103,17 @@ def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> tor
     return new.reshape(hidden, n_heads * padded)
 
 
+def _pad_qk_norm_weight(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor:
+    """Pad a per-head QK-norm weight ``[orig] -> [padded]`` to match padded Q/K.
+
+    RMS over the padded head divides by ``padded`` not ``orig``; folding
+    ``sqrt(orig/padded)`` into the weight restores the original scale. Exact but
+    for the eps term (the wider divisor scales it by ``padded/orig``), which is
+    negligible at the usual eps=1e-6.
+    """
+    return _pad_qk_interleaved(w * math.sqrt(orig / padded), 1, orig, padded)
+
+
 def _pad_fused_qkv(
     w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
@@ -131,6 +143,9 @@ def _pad_weight(
         return _pad_output_end(w, n_kv_heads, orig, padded)
     if name.endswith("o_proj.weight"):
         return _pad_input_end(w, n_heads, orig, padded)
+    # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
+    if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:
+        return _pad_qk_norm_weight(w, orig, padded)
     return w
 
 
@@ -243,28 +258,6 @@ def verify_padded_head_dim(model, hf_config) -> None:
             f"built at a different width, so their weights would load truncated: "
             f"{', '.join(bad)}"
         )
-
-
-def reject_padded_qk_norm(model, hf_config) -> None:
-    """Reject models that normalize over head_dim (QK-norm).
-
-    Padding fills the extra dims with zeros, which is invisible to the QK dot
-    product and to V/O, but an RMSNorm taken over the padded head_dim divides by
-    the RMS of 128 values of which half are zero — silently rescaling Q/K.
-    """
-    if not head_padding_active(hf_config):
-        return
-    padded = hf_config.head_dim
-    for name, module in model.named_modules():
-        for norm_attr in ("q_norm", "k_norm"):
-            norm = getattr(module, norm_attr, None)
-            weight = getattr(norm, "weight", None)
-            if weight is not None and weight.numel() == padded:
-                raise NotImplementedError(
-                    f"Spyre must pad attention head_dim to {padded} for stick "
-                    f"alignment, but {name}.{norm_attr} normalizes over head_dim; "
-                    "zero-padded dims would change the RMS and rescale Q/K."
-                )
 
 
 def install_head_pad_weight_loader(model_loader, hf_config) -> None:

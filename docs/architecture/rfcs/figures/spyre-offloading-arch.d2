@@ -1,0 +1,42 @@
+direction: down
+
+vllm: vllm (upstream - unchanged) {
+  style.fill: "#eef5ff"
+  style.stroke: "#3b6fb3"
+  Factory: "OffloadingSpecFactory\n.create_spec(spec_name=\"SpyreOffloadingSpec\",\nspec_module_path=\"spyre_inference.kv_offload.spec\")"
+  KVFactory: "KVConnectorFactory\n(kv_connector_module_path)"
+  Mgr: "CPUOffloadingManager\nreused verbatim - cache policy, admission, LRU eviction, hit/miss"
+  Sched: OffloadingConnectorScheduler
+  Sched -> Mgr
+}
+
+spyre: spyre-inference (new code - this RFC) {
+  style.fill: "#fff4e6"
+  style.stroke: "#c1620a"
+  Conn: "SpyreOffloadingConnector\nsubclasses OffloadingConnector"
+  CWorker: "SpyreOffloadingConnectorWorker\noverrides register_kv_caches ONLY:\nSpyrePagedKVCache -> CanonicalKVCaches\n(no untyped_storage / .set_)\nthen inherited _init_worker()"
+  Spec: "SpyreOffloadingSpec\nsubclasses OffloadingSpec directly\n(so no is_cuda_alike / is_xpu gate)"
+  Worker: "SpyreOffloadingWorker(OffloadingWorker)\nsubmit_store / submit_load / get_finished / wait"
+  D2H: "_SpyreDirectionHandler (store: device page -> host slot)"
+  H2D: "_SpyreDirectionHandler (load: host slot -> device page)"
+  Copier: "SpyreKvDmaCopier\nbyte-exact; addresses a pool slot by integer slot_id" {
+    style.fill: "#ffe4e1"
+    style.stroke: "#a83232"
+  }
+  Backend: "torch_spyre._C.copy_tensor_raw(dev_tensor, pool, slot_id, to_device)\nhardware-runtime raw DMA (no dtype/layout conversion)" {
+    style.fill: "#ffe4e1"
+    style.stroke: "#a83232"
+  }
+  Conn -> CWorker
+  Spec -> Worker: "get_worker(CanonicalKVCaches)"
+  Worker -> D2H
+  Worker -> H2D
+  D2H -> Copier
+  H2D -> Copier
+  Copier -> Backend
+}
+
+vllm.KVFactory -> spyre.Conn: "resolves to" { style.stroke-dash: 3 }
+vllm.Factory -> spyre.Spec: "resolves to" { style.stroke-dash: 3 }
+spyre.CWorker -> spyre.Spec: "_init_worker -> spec.get_worker"
+spyre.Spec -> vllm.Mgr: "get_manager()"

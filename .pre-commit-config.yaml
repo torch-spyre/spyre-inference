@@ -16,9 +16,6 @@ repos:
   rev: v1.41.0
   hooks:
   - id: typos
-    # Reference data holds tokenizer fragments, which split words mid-token and which
-    # this hook's --write-changes silently rewrites into real words.
-    exclude: '^tests/data/.*\.json$'
 - repo: https://github.com/igorshubovych/markdownlint-cli
   rev: v0.45.0
   hooks:

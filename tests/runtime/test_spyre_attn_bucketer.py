@@ -21,20 +21,23 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     _parse_buckets,
+    _powers_of_two_up_to,
 )
 
 BLOCK_SIZE = 64
 
 
-def make_config(max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK_SIZE):
+def make_config(
+    max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK_SIZE, max_num_seqs=8
+):
     config = MagicMock()
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    config.scheduler_config.max_num_seqs = max_num_seqs
     return config
 
 
@@ -189,14 +192,26 @@ class TestVariants:
         b = SpyreAttnBucketer(make_config(32768, 2048))
         assert len(b.variants()) < 500
 
+    def test_num_seqs_buckets_ladder_from_min_batched_to_max_num_seqs(self):
+        """Below _MIN_BATCHED_SEQS a batch takes the per-seq loop, so the ladder
+        starts there rather than at 1, and tops out at max_num_seqs."""
+        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [4, 8]
+        assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [4, 6]
+
+    def test_num_blocks_buckets_follow_the_kv_buckets(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config())
+        assert b.num_blocks_buckets == [8, 16, 32]
+
 
 class TestEnvOverride:
     def test_kv_buckets_override(self, monkeypatch):
-        """Kept verbatim: the top entry already covers max_model_len=2048."""
-        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,512,4096")
+        """Kept verbatim: the top entry is exactly max_model_len=2048."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,512,2048")
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config())
-        assert b.kv_buckets == [128, 512, 4096]
+        assert b.kv_buckets == [128, 512, 2048]
 
     def test_query_buckets_override_is_sorted_and_deduped(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "64,1,16,64")
@@ -219,12 +234,18 @@ class TestEnvOverride:
         assert b.query_buckets == [1, 16, 512]
         assert b.find_query_bucket(512) == 512
 
-    def test_override_above_the_limit_is_left_alone(self, monkeypatch):
-        """Entries past the limit are unreachable, not wrong; don't prune them."""
+    def test_override_above_the_limit_is_dropped(self, monkeypatch):
+        """Entries past the limit are unreachable; drop them and cover the limit."""
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,8192")
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(max_model_len=2048))
-        assert b.kv_buckets == [128, 8192]
+        assert b.kv_buckets == [128, 2048]
+
+    def test_override_entirely_above_the_limit_keeps_only_the_limit(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "4096,8192")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.kv_buckets == [2048]
 
     def test_covers_every_in_contract_length_under_a_short_override(self, monkeypatch):
         """The point of the top-up: no in-contract batch falls off either axis."""
@@ -307,3 +328,29 @@ class TestBuilderAttnBucketer:
         bucketer = SpyreAttnBucketer(make_config())
         runner = self._runner([None, bucketer])
         assert runner._resolve_builder_attn_bucketer() is bucketer
+
+    def test_batched_decode_dispatches_onto_a_recorded_block_count(
+        self, monkeypatch, default_vllm_config
+    ):
+        """The regression this guards: ``build()`` and warmup must agree."""
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+
+        from vllm.config import get_current_vllm_config
+
+        # block_size pinned to match what _padded_mask_metadata builds with, so
+        # the override resolves onto the same block counts build() produces.
+        vllm_config = get_current_vllm_config()
+        vllm_config.cache_config.block_size = BLOCK_SIZE
+        bucketer = SpyreAttnBucketer(vllm_config)
+
+        # 4 blocks of real KV, and enough sequences to clear _MIN_BATCHED_SEQS.
+        metadata = _padded_mask_metadata(
+            [(1, 4 * BLOCK_SIZE)] * 4, max_num_blocks=bucketer.num_blocks_buckets[-1]
+        )
+
+        assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
+        assert metadata.padded_num_seqs in bucketer.num_seqs_buckets

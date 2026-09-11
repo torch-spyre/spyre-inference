@@ -14,7 +14,6 @@
 
 """Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
-import bisect
 import contextlib
 import functools
 import time
@@ -44,6 +43,7 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
@@ -91,37 +91,7 @@ def _record_block(name: str):
 # SpyreAttentionMetadata.page_index_tables.
 INT32_ELEMS_PER_STICK = 32
 
-
-# Batches below this fall back to the per-seq loop: the batched matmul's
-# padded-row overhead exceeds the per-seq cost at small N.
-_MIN_BATCHED_SEQS = 4
-
-
-def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
-    """Powers of 2 in [start, n], plus n itself if it is not already a power of 2.
-
-    ``start`` is rounded up to a power of 2 first, keeping a pure doubling
-    sequence. A ``start`` above ``n`` yields just ``(n,)``.
-    """
-    if n < 1:
-        return ()
-    v = 1
-    while v < start:
-        v *= 2
-    result = []
-    while v < n:
-        result.append(v)
-        v *= 2
-    result.append(n)
-    return tuple(result)
-
-
-def _find_bucket(n: int, buckets: tuple[int, ...]) -> int | None:
-    """Smallest bucket >= n, or None when n exceeds the top bucket."""
-    idx = bisect.bisect_left(buckets, n)
-    if idx < len(buckets):
-        return buckets[idx]
-    return None
+_SPYRE_CORE_COUNT = 32
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -351,14 +321,14 @@ def _page_attn_kernel(
 
 def _batched_decode_kernel(
     query,
-    query_row_ids,
+    rep_row_ids,
     k_pages,
     v_pages,
-    block_ids,
-    mask_by_block,
+    chunk_page_ids,
+    mask_by_chunk,
     scale,
     num_seqs,
-    num_blocks,
+    blocks_per_chunk,
     num_kv_heads,
     num_queries_per_kv,
     block_size,
@@ -368,38 +338,39 @@ def _batched_decode_kernel(
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
-    Gathers one block at a time; block_ids rows must stay stick-aligned, since a
-    flat per-block slice does not compile.
+    Gathers blocks_per_chunk blocks per sequence per step, so the gather's entry
+    axis is entries = num_seqs * blocks_per_chunk. A gather is core-split only on
+    that axis, and behind a 1-D index it is counted in whole 32-entry sticks, so
+    a narrow 1-D gather has no splittable unit and runs on one core.
 
     k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache).
-    block_ids: [num_blocks, stick-padded num_seqs] int32, row i holding the
-    i-th block's page index per sequence. mask_by_block:
-    [num_blocks, num_seqs * KV, 1, block_size], pre-broadcast across KV heads
-    by the builder. ``query_row_ids`` None takes the query buffer's first
-    num_seqs rows instead of gathering; ``out`` None returns the result instead
-    of storing it.
+    chunk_page_ids: one [entries, 1] int32 tensor per chunk, entry (s, j) holding
+    sequence s's (c * blocks_per_chunk + j)-th page. mask_by_chunk:
+    [num_chunks, entries * KV, 1, block_size], pre-broadcast across KV heads by
+    the builder. rep_row_ids: [entries] int32, each query row repeated
+    blocks_per_chunk times. ``out`` None returns the result instead of storing it.
     """
     num_heads = num_kv_heads * num_queries_per_kv
-    # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
-    # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
-    q_rows = query[:num_seqs] if query_row_ids is None else query.index_select(0, query_row_ids)
-    # lower_bmm's 4-D form takes two batch axes, so num_seqs and KV stay separate.
-    q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size)
+    entries = num_seqs * blocks_per_chunk
+    q = query.index_select(0, rep_row_ids).reshape(
+        entries, num_kv_heads, num_queries_per_kv, head_size
+    )
 
     tile_max = None
     tile_sum = None
     tile_output = None
 
-    for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = block_ids[i, 0:num_seqs]
+    for c, page_idx in enumerate(chunk_page_ids):
+        # Advanced indexing on a [entries, 1] index, not index_select on a 1-D
+        # one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
+        # so a narrow gather gets one core. It costs the eager path, which
+        # _batched_decode_preconditions_met gives up.
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
-        k_page = k_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
-        v_page = v_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+        k_page = k_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
+        v_page = v_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
         # Builder already broadcast across KV heads; split them back out.
-        mask_tile = mask_by_block[i].reshape(num_seqs, num_kv_heads, 1, block_size)
+        mask_tile = mask_by_chunk[c].reshape(entries, num_kv_heads, 1, block_size)
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
@@ -407,24 +378,44 @@ def _batched_decode_kernel(
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         scores = scores + mask_tile
-        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+        # Leading-axis split only: merging a permuted axis pair is what
+        # torch-spyre rejects.
+        sc = scores.reshape(
+            num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
+        )
+        chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
 
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+        # The running max drives exp(), not the chunk's own: a chunk wholly past
+        # a sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
+        # Every row has a valid block 0, so the chunk-0 max is finite.
+        if c == 0:
+            new_max = chunk_max
+        else:
+            assert tile_max is not None
+            new_max = torch.maximum(tile_max, chunk_max)
+        probs = torch.exp(sc - new_max)
+        # The chunk's slots share one max, so summing them needs no rescale.
+        chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=1, keepdim=True)
+        chunk_out = torch.sum(
+            torch.matmul(
+                probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size),
+                v_page,
+            ).reshape(num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, head_size),
+            dim=1,
+            keepdim=True,
+        )
+
+        if c == 0:
+            tile_max = new_max
+            tile_sum = chunk_sum
+            tile_output = chunk_out
         else:
             assert tile_max is not None
             assert tile_sum is not None
             assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
             rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output += torch.matmul(tile_probs, v_page)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+            tile_output = tile_output * rescale + chunk_out
+            tile_sum = tile_sum * rescale + chunk_sum
             tile_max = new_max
 
     assert tile_output is not None and tile_sum is not None
@@ -563,19 +554,18 @@ class SpyreAttentionMetadata(AttentionMetadata):
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
-    # (callers fall back to the per-seq loop). query_row_ids is int64 because
-    # Spyre's index_copy_ requires int64. mask_by_block is pre-permuted for cheap
-    # axis-0 slicing in the dispatch.
+    # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
     num_decode_seqs: int = 0  # leading decode-only seqs; == num_seqs for pure-decode batches
     num_decode_tokens: int = 0  # == num_decode_seqs since each decode contributes one token
     padded_num_seqs: int | None = None
     padded_batch_blocks: int | None = None
-    query_row_ids_cpu: torch.Tensor | None = None  # [B_seqs] int64
-    query_row_ids_dev: torch.Tensor | None = None
-    block_ids_padded_cpu: torch.Tensor | None = None  # [B_blocks, padded B_seqs] int32
-    block_ids_padded_dev: torch.Tensor | None = None
-    mask_by_block_cpu: torch.Tensor | None = None  # [B_blocks, B_seqs * KV, 1, block_size] fp16
-    mask_by_block_dev: torch.Tensor | None = None
+    blocks_per_chunk: int | None = None
+    rep_row_ids_cpu: torch.Tensor | None = None  # [entries] int32
+    rep_row_ids_dev: torch.Tensor | None = None
+    chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
+    chunk_page_ids_dev: list[torch.Tensor] | None = None
+    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
+    mask_by_chunk_dev: torch.Tensor | None = None
 
     # Encoder scatter dest ``[T]`` (int32 on Spyre) and gather unpack.
     # Filled on the first layer of a step (page_index_tables pattern).
@@ -660,15 +650,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
-        # Buckets for the batched decode fast path. One compiled kernel
-        # per bucket. TODO: expose as engine args if configurability is needed.
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        max_num_blocks_per_seq = (
-            model_config.max_model_len + self.block_size - 1
-        ) // self.block_size
-        self._num_seqs_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_seqs)
-        self._num_blocks_buckets: tuple[int, ...] = _powers_of_two_up_to(max_num_blocks_per_seq)
-
         # Owned here, not by the recorder, so a bucket build() can emit is
         # always a bucket that was compiled: the warmup recorder reads this
         # same instance back (spyre_model_runner._record_attention_graphs)
@@ -704,7 +685,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # A fully-masked padded tile would divide by a zero softmax
             # denominator, so zero real blocks must stay zero.
             return 0
-        padded = SpyreAttnBucketer._round_up(num_blocks, self._attn_bucketer.num_blocks_buckets)
+        padded = self._attn_bucketer.find_blocks_bucket(num_blocks)
         # Unreachable: the top bucket covers ceil(max_model_len / block_size),
         # and num_blocks here is bounded by the same max_model_len.
         assert padded is not None, (
@@ -1060,32 +1041,39 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         )
         padded_num_seqs = None
         padded_batch_blocks = None
-        query_row_ids_cpu = None
-        block_ids_padded_cpu = None
-        mask_by_block_cpu = None
+        blocks_per_chunk = None
+        rep_row_ids_cpu = None
+        chunk_page_ids_cpu = None
+        mask_by_chunk_cpu = None
         if num_decode_seqs >= _MIN_BATCHED_SEQS:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
+
             decode_blocks = blocks_per_seq[:num_decode_seqs]
-            b_seqs = _find_bucket(num_decode_seqs, self._num_seqs_buckets)
-            b_blocks = _find_bucket(max(decode_blocks), self._num_blocks_buckets)
+            b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
+            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+
             if b_seqs is not None and b_blocks is not None:
                 padded_num_seqs = b_seqs
-                padded_batch_blocks = b_blocks
+                # Entries target the cores: fewer under-fills them, more than one
+                # stick's worth hits a backend axis-merge limit.
+                blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+                # blocks_per_chunk need not divide b_blocks, so pad the block axis
+                # up to a whole chunk. Padding columns gather page 0 under an
+                # all--inf mask and contribute zero; chunk 0 still holds every real
+                # row's block 0, so the running max stays finite.
+                num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+                padded_batch_blocks = num_chunks * blocks_per_chunk
+                assert padded_batch_blocks >= b_blocks
+                entries = b_seqs * blocks_per_chunk
 
-                # int64 (not int32): Spyre's index_copy_ requires int64 indices.
-                query_row_ids_cpu = torch.zeros(b_seqs, dtype=torch.int64)
-                query_row_ids_cpu[:num_decode_seqs] = query_start_loc[:num_decode_seqs].to(
-                    torch.int64
-                )
+                query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
+                query_row_ids[:num_decode_seqs] = query_start_loc[:num_decode_seqs].to(torch.int32)
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
-                assert query_row_ids_cpu[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
+                assert query_row_ids[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
+                rep_row_ids_cpu = query_row_ids.repeat_interleave(blocks_per_chunk)
 
-                # Rows padded to the stick width: a narrower inner dim emits a
-                # Mod(d0, ...) stick expression the inductor rejects.
-                block_ids_padded_cpu = torch.zeros(
-                    b_blocks, _stick_aligned_len(b_seqs), dtype=torch.int32
-                )
+                block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
                 bt = block_table[:num_decode_seqs].to(torch.int32)
                 if active_block_indices is None:
                     n_use_list = [min(n, b_blocks) for n in decode_blocks]
@@ -1094,18 +1082,34 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     in_range = cols.unsqueeze(0) < torch.tensor(
                         n_use_list, dtype=torch.int64
                     ).unsqueeze(1)
-                    block_ids_padded_cpu[:w, :num_decode_seqs] = (bt[:, :w] * in_range).t()
+                    block_ids_padded[:w, :num_decode_seqs] = (bt[:, :w] * in_range).t()
                 else:
+                    # Position i is the i-th ACTIVE block, matching the mask tiles.
                     for s, abs_blocks in enumerate(active_block_indices[:num_decode_seqs]):
                         n_use = min(len(abs_blocks), b_blocks)
                         for b, abs_b in enumerate(abs_blocks[:n_use]):
-                            block_ids_padded_cpu[b, s] = bt[s, abs_b]
+                            block_ids_padded[b, s] = bt[s, abs_b]
+                # Entry order (s, j), s major, matching rep_row_ids and the mask.
+                # One tensor per chunk, not slices of a stack: an index tensor
+                # reaches the device as a real argument and a view's storage
+                # offset is dropped (torch-spyre#3770), so a sliced chunk c > 0
+                # would silently gather chunk 0's pages. Probed by
+                # test_spyre_compile_input_honors_storage_offset; when that
+                # strict xfail flips, one stacked tensor also collapses the
+                # per-chunk H2D transfers into one.
+                chunk_page_ids_cpu = [
+                    block_ids_padded[c * blocks_per_chunk : (c + 1) * blocks_per_chunk]
+                    .t()
+                    .reshape(entries, 1)
+                    .contiguous()
+                    for c in range(num_chunks)
+                ]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
-                # kernel input shape [B_blocks, B_seqs * KV, 1, block_size].
+                # kernel input shape [num_chunks, entries * KV, 1, block_size].
                 mask_bs_bb = torch.full(
-                    (b_seqs, b_blocks, block_size),
+                    (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
                     dtype=torch.float16,
                 )
@@ -1120,13 +1124,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # block 0, so its padded blocks can stay -inf and contribute zero.
                 # Holds under a window too: first_active <= num_blocks - 1.
                 mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(torch.float16).min
-                # 4-D, not 5-D: the kernel slices dim 0 per block, and a dim-0 slice
-                # of a 5-D base fails torch-spyre layout propagation.
-                mask_by_block_cpu = (
-                    mask_bs_bb.permute(1, 0, 2)
-                    .unsqueeze(2)
-                    .expand(b_blocks, b_seqs, self.num_kv_heads, block_size)
-                    .reshape(b_blocks, b_seqs * self.num_kv_heads, 1, block_size)
+                # 4-D, not 5-D: the kernel slices dim 0 per chunk, and a dim-0
+                # slice of a 5-D base fails torch-spyre layout propagation.
+                mask_by_chunk_cpu = (
+                    mask_bs_bb.reshape(b_seqs, num_chunks, blocks_per_chunk, block_size)
+                    .permute(1, 0, 2, 3)
+                    .unsqueeze(3)
+                    .expand(num_chunks, b_seqs, blocks_per_chunk, self.num_kv_heads, block_size)
+                    .reshape(num_chunks, entries * self.num_kv_heads, 1, block_size)
                     .contiguous()
                 )
 
@@ -1152,9 +1157,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_decode_tokens=num_decode_tokens,
             padded_num_seqs=padded_num_seqs,
             padded_batch_blocks=padded_batch_blocks,
-            query_row_ids_cpu=query_row_ids_cpu,
-            block_ids_padded_cpu=block_ids_padded_cpu,
-            mask_by_block_cpu=mask_by_block_cpu,
+            blocks_per_chunk=blocks_per_chunk,
+            rep_row_ids_cpu=rep_row_ids_cpu,
+            chunk_page_ids_cpu=chunk_page_ids_cpu,
+            mask_by_chunk_cpu=mask_by_chunk_cpu,
         )
 
 
@@ -1288,7 +1294,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
         self._attn_fn = _page_attn_compiled if self._compile_attn else _page_attn_kernel
-        self._decode_fn = _batched_decode_compiled if self._compile_attn else _batched_decode_kernel
+        # Always the compiled variant: the 2-D page index lowers to aten.index,
+        # which fails eager, so _batched_decode_preconditions_met declines the
+        # whole path when self._compile_attn is False.
+        self._decode_fn = _batched_decode_compiled
 
         self._kv_slots: SpyrePagedKVCache | None = None
 
@@ -1339,7 +1348,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Set SPYRE_BATCHED_DECODE=1 to restore the path.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
-        # Layer 0's builder gates on max_query_len and the bucket lattice;
+        # The 2-D page index lowers to aten.index, which upcasts the int32 index
+        # to int64 and fails eager; eager takes the per-seq loop instead.
+        if not self._compile_attn:
+            return False
+        # Layer 0's builder gates on the decode count and the bucket lattice;
         # we add ALiBi, which the batched kernel doesn't implement.
         if attn_metadata.padded_num_seqs is None:
             return False
@@ -1394,19 +1407,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # and soft-cap layers).
         if (
             self._batched_decode_preconditions_met(attn_metadata)
-            and attn_metadata.query_row_ids_dev is None
+            and attn_metadata.rep_row_ids_dev is None
         ):
-            assert attn_metadata.query_row_ids_cpu is not None
-            assert attn_metadata.block_ids_padded_cpu is not None
-            assert attn_metadata.mask_by_block_cpu is not None
-            attn_metadata.query_row_ids_dev = convert(
-                attn_metadata.query_row_ids_cpu, device=_target_device
+            assert attn_metadata.rep_row_ids_cpu is not None
+            assert attn_metadata.chunk_page_ids_cpu is not None
+            assert attn_metadata.mask_by_chunk_cpu is not None
+            attn_metadata.rep_row_ids_dev = convert(
+                attn_metadata.rep_row_ids_cpu, device=_target_device
             )
-            attn_metadata.block_ids_padded_dev = convert(
-                attn_metadata.block_ids_padded_cpu, device=_target_device
-            )
-            attn_metadata.mask_by_block_dev = convert(
-                attn_metadata.mask_by_block_cpu, device=_target_device
+            attn_metadata.chunk_page_ids_dev = [
+                convert(t, device=_target_device) for t in attn_metadata.chunk_page_ids_cpu
+            ]
+            attn_metadata.mask_by_chunk_dev = convert(
+                attn_metadata.mask_by_chunk_cpu, device=_target_device
             )
 
         output = self._online_softmax_attention(
@@ -1611,39 +1624,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
     ) -> None:
-        # Spyre-lowering shapes drive several structural choices here:
-        # (1) block_ids_padded_cpu rows are stick-padded, so the kernel's row
-        # slice emits no Mod(d0, ...) stick expression; (2) K/V/q keep (B_seqs, KV)
-        # as the two batch axes lower_bmm allows; (3) the kernel's per-block
-        # index stays at Dynamo-trace time (torch-spyre would emit
-        # Mod(d0, num_blocks) for a runtime .select); (4) result scatter is a
-        # single contiguous copy_ at offset 0, valid because Q=1 forces
-        # query_row_ids_cpu[:num_seqs] == range(num_seqs) (asserted in builder).
+        # Spyre-lowering shapes drive several structural choices here: K/V/q keep
+        # (entries, KV) as the two batch axes lower_bmm allows; the kernel's
+        # per-chunk index stays at Dynamo-trace time (torch-spyre would emit
+        # Mod(d0, num_chunks) for a runtime .select); and the result scatter is a
+        # single contiguous copy_ at offset 0, valid because the decode prefix's
+        # query rows are range(num_decode_seqs) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
-        b_blocks = attn_metadata.padded_batch_blocks
+        blocks_per_chunk = attn_metadata.blocks_per_chunk
         num_decode_seqs = attn_metadata.num_decode_seqs
         num_heads = self.num_heads
         head_size = self.head_size
         block_size = attn_metadata.block_size
 
-        assert b_seqs is not None and b_blocks is not None
-        assert attn_metadata.query_row_ids_dev is not None
-        assert attn_metadata.block_ids_padded_dev is not None
-        assert attn_metadata.mask_by_block_dev is not None
+        assert b_seqs is not None and blocks_per_chunk is not None
+        assert attn_metadata.rep_row_ids_dev is not None
+        assert attn_metadata.chunk_page_ids_dev is not None
+        assert attn_metadata.mask_by_chunk_dev is not None
 
-        # K/V are gathered in-graph by the kernel: an out-of-graph per-block slice
-        # has storage_offset > 0, which a compiled kernel reads as 0
-        # (torch-spyre#3770), so each block needed a .clone().
-        block_ids = attn_metadata.block_ids_padded_dev
-
-        # Short of b_seqs rows only when the runner's compile bucket is tighter than
-        # the power-of-two seq bucket; the kernel slices a prefix otherwise.
-        needs_gather = query_dev.shape[0] < b_seqs
-        # The kernel writes b_seqs rows, so output must have them. Re-checked per call:
-        # vLLM hands out a fresh buffer per layer.
+        # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
+        # b_seqs, not the real count -- so the destination needs that many rows and a
+        # plain offset-0 layout; the scatter below covers every other case, including
+        # a query buffer narrower than the seq bucket. Re-checked per call: vLLM hands
+        # out a fresh buffer per layer.
         store_out = (
-            self._compile_attn
-            and not needs_gather
+            query_dev.shape[0] >= b_seqs
             and output.shape[0] >= b_seqs
             and output.dtype == query_dev.dtype
             and output.storage_offset() == 0
@@ -1653,14 +1658,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "batched decode attention",
             self._decode_fn,
             query_dev,
-            attn_metadata.query_row_ids_dev if needs_gather else None,
+            attn_metadata.rep_row_ids_dev,
             k_pages,
             v_pages,
-            block_ids,
-            attn_metadata.mask_by_block_dev,
+            attn_metadata.chunk_page_ids_dev,
+            attn_metadata.mask_by_chunk_dev,
             self.scale,
             b_seqs,
-            b_blocks,
+            blocks_per_chunk,
             self.num_kv_heads,
             self.num_queries_per_kv,
             block_size,
@@ -1671,8 +1676,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if store_out:
             return
 
-        # Q=1 makes query_row_ids_cpu[:num_decode_seqs] == range(num_decode_seqs),
-        # so the scatter is a contiguous prefix write at (0, 0). Neither per-row
+        # The decode prefix's query rows are range(num_decode_seqs), so the scatter
+        # is a contiguous prefix write at (0, 0). Neither per-row
         # slice-assign (spyre::copy_from_d2d specialises on (src_off, dst_off)
         # via @compile_once and can return a stale binary) nor index_copy_
         # (CPU-fallback segfaults on vLLM output buffers) is safe here.

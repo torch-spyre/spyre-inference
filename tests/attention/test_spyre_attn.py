@@ -26,13 +26,13 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    _MIN_BATCHED_SEQS,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _batched_decode_kernel,
     _build_query_row_tables,
     _mirror_mask_tiles,
-    _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1765,7 +1765,14 @@ def test_spyre_attn_batched_decode_correctness(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Batched decode fast path: bit-exact vs the per-seq reference."""
+    """Batched decode fast path agrees with the per-seq reference.
+
+    Not bit-exact, and cannot be: the chunked reduction sums in a different
+    order and gives blocks_per_chunk blocks one shared max, so in fp16 a logit
+    far below its chunk max underflows where the per-seq kernel keeps it. The
+    runner's tolerances are correspondingly loose; the accuracy claim for the
+    reduction itself is carried by test_batched_decode_matches_fp32_reference.
+    """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -1838,29 +1845,40 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     set_random_seed(0)
 
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
-    lead = num_seqs * num_kv_heads
+    # One chunk covering both blocks, so entries = num_seqs * 2.
+    bpc = num_blocks
+    num_chunks = num_blocks // bpc
+    entries = num_seqs * bpc
 
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
-    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
-    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
-    mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
+    # int64 here, not the production int32: this runs eager on CPU, where
+    # advanced indexing needs int64.
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat_interleave(bpc)
+    # [num_blocks, num_seqs] transposed to entry order (seq major, slot minor).
+    block_ids = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
+    chunk_page_ids = [
+        block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = torch.zeros(
+        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
+    )
 
     def run(cap: float):
         return _batched_decode_kernel(
             query,
-            None,
+            rep_row_ids,
             k_pages,
             v_pages,
-            block_ids,
-            mask_by_block,
+            chunk_page_ids,
+            mask_by_chunk,
             1.0,
             num_seqs,
-            num_blocks,
+            bpc,
             num_kv_heads,
             qpk,
             block_size,
@@ -1875,6 +1893,223 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
         "soft-cap did not change the output; the capped kernel may be ignoring it"
     )
     assert torch.isfinite(capped).all()
+
+
+@pytest.mark.parametrize("max_num_seqs", [4, 5, 6, 8, 10, 16, 32])
+@pytest.mark.parametrize("max_model_len", [512, 1536, 2048, 4096, 10000])
+def test_batched_decode_chunking_covers_every_block(
+    default_vllm_config,
+    enable_batched_decode,
+    max_num_seqs: int,
+    max_model_len: int,
+) -> None:
+    """Every block of every sequence reaches a chunk, for any bucket pair.
+
+    blocks_per_chunk is capped, not chosen as a divisor, so the block axis has to
+    be padded up to a multiple of it. Neither bucket lattice is all powers of two
+    -- _powers_of_two_up_to appends n itself -- so an uneven pair is reachable
+    from ordinary engine args (max_model_len=1536 gives 12 blocks, and 8 does not
+    divide 12). Getting this wrong drops the tail blocks and then raises on the
+    mask reshape, i.e. crashes a decode step. Card-free on purpose: the
+    integration tests all land on power-of-two buckets, where it cannot fire.
+    """
+    from vllm.config import get_current_vllm_config
+
+    torch.set_default_device("cpu")
+    block_size = 128
+    num_kv_heads, head_size = 2, 64
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.model_config.max_model_len = max_model_len
+
+    max_blocks = (max_model_len + block_size - 1) // block_size
+    # Longest sequence the config allows: the block bucket is picked off the
+    # real block count, so this is what reaches the lattice's top entry.
+    ctx = max_model_len
+
+    for num_seqs in range(_MIN_BATCHED_SEQS, max_num_seqs + 1):
+        seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
+        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+        block_table = torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
+            num_seqs, max_blocks
+        )
+        slot_mapping = (seq_lens.to(torch.int64) - 1) + torch.arange(num_seqs) * ctx
+
+        md = _build_metadata(
+            num_query_heads=num_kv_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            block_size=block_size,
+            seq_lens=seq_lens,
+            query_start_loc=query_start_loc,
+            block_table=block_table,
+            slot_mapping=slot_mapping,
+        )
+
+        assert md.blocks_per_chunk is not None, (
+            f"batched decode declined num_seqs={num_seqs}, which it should accept"
+        )
+        bpc = md.blocks_per_chunk
+        padded = md.padded_batch_blocks
+        assert padded is not None
+        assert padded % bpc == 0, (
+            f"max_num_seqs={max_num_seqs} max_model_len={max_model_len} "
+            f"num_seqs={num_seqs}: {padded} blocks is not a multiple of "
+            f"blocks_per_chunk={bpc}"
+        )
+        assert padded >= max_blocks, (
+            f"max_num_seqs={max_num_seqs} max_model_len={max_model_len} "
+            f"num_seqs={num_seqs}: chunks cover {padded} of {max_blocks} blocks"
+        )
+        # The mask carries the same axis, so a mismatch here is the reshape that
+        # would have raised inside build().
+        assert md.mask_by_chunk_cpu is not None
+        num_chunks = md.mask_by_chunk_cpu.shape[0]
+        assert num_chunks * bpc == padded
+
+
+def _decode_reference_fp32(
+    query: torch.Tensor,
+    k_pages: torch.Tensor,
+    v_pages: torch.Tensor,
+    page_ids: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    qpk: int,
+    head_size: int,
+) -> torch.Tensor:
+    """Per-sequence softmax over each sequence's own blocks, no chunking.
+
+    page_ids: [num_seqs, num_blocks]. mask: [num_seqs, num_blocks, block_size].
+    """
+    num_seqs, num_blocks = page_ids.shape
+    out = torch.zeros(num_seqs, num_kv_heads * qpk, head_size, dtype=torch.float32)
+    for s in range(num_seqs):
+        q = query[s].reshape(num_kv_heads, qpk, head_size)
+        k = torch.cat([k_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
+        v = torch.cat([v_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
+        # [KV, qpk, kv_len]
+        scores = torch.einsum("hqd,thd->hqt", q, k) * scale + mask[s].reshape(-1)
+        probs = torch.softmax(scores, dim=-1)
+        out[s] = torch.einsum("hqt,thd->hqd", probs, v).reshape(num_kv_heads * qpk, head_size)
+    return out.reshape(num_seqs, num_kv_heads * qpk, head_size)
+
+
+@pytest.mark.parametrize(
+    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged",
+    [
+        pytest.param(4, 4, 8, 8, 2, 1, False, id="one_chunk"),
+        pytest.param(4, 4, 8, 2, 2, 1, False, id="four_chunks"),
+        pytest.param(4, 4, 8, 1, 2, 1, False, id="bpc_1"),
+        pytest.param(3, 4, 8, 4, 2, 1, False, id="padded_batch_rows"),
+        pytest.param(4, 4, 8, 2, 2, 4, True, id="gqa_ragged"),
+        pytest.param(5, 8, 12, 4, 1, 2, True, id="uneven_buckets_ragged"),
+        # blocks_per_chunk does not divide the block count, so the kernel sees the
+        # padded block axis the builder rounds up to.
+        pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
+        pytest.param(6, 6, 10, 5, 2, 1, True, id="non_pow2_seq_bucket_ragged"),
+    ],
+)
+def test_batched_decode_matches_fp32_reference(
+    num_seqs: int,
+    b_seqs: int,
+    num_blocks: int,
+    bpc: int,
+    num_kv_heads: int,
+    qpk: int,
+    ragged: bool,
+) -> None:
+    """The chunked reduction equals an unchunked per-sequence softmax.
+
+    Card-free and in fp32, so it pins the reduction itself rather than the fp16
+    tolerances the integration tests have to use. ``ragged`` masks each sequence
+    down to a different length, which is what puts wholly--inf chunks and -inf
+    padding columns in front of the running max.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    block_size, head_size = 16, 8
+    num_heads = num_kv_heads * qpk
+    padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
+    num_chunks = padded_blocks // bpc
+    entries = b_seqs * bpc
+    scale = 0.5
+
+    n_pages = padded_blocks * b_seqs + 1
+    query = torch.randn(num_seqs, num_heads * head_size, dtype=torch.float32)
+    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+
+    # Page 0 is the padding page, exactly as the builder leaves it.
+    page_ids = torch.zeros(b_seqs, padded_blocks, dtype=torch.int64)
+    mask = torch.full((b_seqs, padded_blocks, block_size), float("-inf"), dtype=torch.float32)
+    kv_lens = []
+    for s in range(num_seqs):
+        # A ragged batch ends each sequence mid-block, at a different block.
+        n_use = num_blocks - s if ragged else num_blocks
+        n_use = max(1, n_use)
+        tail = (block_size // 2) if ragged else block_size
+        kv_len = (n_use - 1) * block_size + tail
+        kv_lens.append(kv_len)
+        for b in range(n_use):
+            page_ids[s, b] = 1 + s * padded_blocks + b
+            valid = min(block_size, kv_len - b * block_size)
+            mask[s, b, :valid] = 0.0
+    # A row past the batch is -inf everywhere, which would make its softmax NaN;
+    # the builder keeps block 0 finite for exactly this reason.
+    mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+
+    rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
+    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
+    chunk_page_ids = [
+        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = (
+        mask.reshape(b_seqs, num_chunks, bpc, block_size)
+        .permute(1, 0, 2, 3)
+        .unsqueeze(3)
+        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
+        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .contiguous()
+    )
+
+    query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
+    query_padded[:num_seqs] = query
+
+    actual = _batched_decode_kernel(
+        query_padded,
+        rep_row_ids,
+        k_pages,
+        v_pages,
+        chunk_page_ids,
+        mask_by_chunk,
+        scale,
+        b_seqs,
+        bpc,
+        num_kv_heads,
+        qpk,
+        block_size,
+        head_size,
+    )
+
+    expected = _decode_reference_fp32(
+        query_padded,
+        k_pages,
+        v_pages,
+        page_ids,
+        mask,
+        scale,
+        num_kv_heads,
+        qpk,
+        head_size,
+    )
+
+    assert torch.isfinite(actual[:num_seqs]).all()
+    torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1981,9 +2216,20 @@ def test_bucketed_block_ids_match_scalar_fill(
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]
     metadata = _padded_mask_metadata(seq_lens, block_size=block_size, sliding_window=sliding_window)
-    assert metadata.block_ids_padded_cpu is not None
+    assert metadata.chunk_page_ids_cpu is not None
+    assert metadata.blocks_per_chunk is not None
+    assert metadata.padded_num_seqs is not None
 
-    got = metadata.block_ids_padded_cpu
+    # Unpack the per-chunk [entries, 1] index tensors back into the
+    # [padded_batch_blocks, b_seqs] fill they were built from. Entry order is
+    # (s, j) with s major, so each chunk transposes back.
+    bpc = metadata.blocks_per_chunk
+    b_seqs = metadata.padded_num_seqs
+    chunks = metadata.chunk_page_ids_cpu
+    got = torch.zeros(len(chunks) * bpc, b_seqs, dtype=torch.int32)
+    for c, chunk in enumerate(chunks):
+        got[c * bpc : (c + 1) * bpc] = chunk.reshape(b_seqs, bpc).t()
+    assert got.shape[0] == metadata.padded_batch_blocks
     bt = metadata.block_table
     active = metadata.active_block_indices
     b_blocks = got.shape[0]

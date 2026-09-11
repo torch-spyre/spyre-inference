@@ -885,17 +885,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if first is None:
                     first = bucketer
                     continue
-                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
+                assert (
+                    bucketer.block_size,
+                    bucketer.num_blocks_buckets,
+                    bucketer.num_seqs_buckets,
+                ) == (
                     first.block_size,
                     first.num_blocks_buckets,
+                    first.num_seqs_buckets,
                 ), (
                     "Attention bucketer buckets diverge between metadata builders: "
                     f"{type(builder).__name__} has block_size={bucketer.block_size} "
-                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
+                    f"num_blocks={bucketer.num_blocks_buckets} "
+                    f"num_seqs={bucketer.num_seqs_buckets}, expected "
                     f"block_size={first.block_size} "
-                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
+                    f"num_blocks={first.num_blocks_buckets} "
+                    f"num_seqs={first.num_seqs_buckets}. Only one set can be "
                     "recorded, so a mismatch means some builder pads onto block "
-                    "counts no kernel was compiled for."
+                    "or sequence counts no kernel was compiled for."
                 )
         return first
 

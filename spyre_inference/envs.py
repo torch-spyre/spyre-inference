@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
+    SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
@@ -64,6 +65,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
+    # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
+    # default buckets of powers of two from 4 up to max_num_seqs.
+    "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.

@@ -46,6 +46,11 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
+# Batches below this fall back to the per-seq loop: the batched matmul's
+# padded-row overhead exceeds the per-seq cost at small N. So the num_seqs ladder
+# starts here -- smaller batches never dispatch to a batched variant.
+_MIN_BATCHED_SEQS = 4
+
 
 @dataclass(frozen=True)
 class SpyreAttnBucket:
@@ -69,34 +74,54 @@ def _parse_buckets(raw: str | None) -> list[int] | None:
     return values
 
 
+def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
+    """Powers of 2 in [start, n] (start rounded up to a power of 2), plus n itself."""
+    if n < 1:
+        return ()
+    v = 1
+    while v < start:
+        v *= 2
+    result = []
+    while v < n:
+        result.append(v)
+        v *= 2
+    result.append(n)
+    return tuple(result)
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
-    """One axis's buckets: the env override topped up to ``limit``, else ``default()``.
+    """One axis's buckets: the env override clamped to ``limit``, else ``default()``.
 
     ``limit`` bounds the lengths the engine can schedule (max_model_len for kv,
-    max_num_batched_tokens for query); an override topping out below it would
-    leave that range with no bucket, missing the lookup for batches warmup was
-    meant to cover. Only an override can be short (defaults already end at their
-    limit). Entries above the limit are left alone -- unreachable, not wrong.
+    max_num_batched_tokens for query, max_num_seqs for the batch axis). Entries
+    above it are unreachable, so they are dropped, and ``limit`` itself is added
+    when missing.
     """
     buckets = _parse_buckets(raw)
     if buckets is None:
         return default()
-    if buckets[-1] < limit:
+    kept = [b for b in buckets if b <= limit]
+    if len(kept) != len(buckets):
         logger.warning(
-            "%s tops out at %d, below the %d it must cover; appending %d. Lengths in "
-            "(%d, %d] would otherwise have no recorded bucket and would compile an "
-            "attention kernel in the serving path.",
+            "%s lists %s above the %d it must cover; dropping them as unreachable.",
             name,
-            buckets[-1],
-            limit,
-            limit,
-            buckets[-1],
+            [b for b in buckets if b > limit],
             limit,
         )
-        buckets = [*buckets, limit]
-    return buckets
+    if not kept or kept[-1] < limit:
+        logger.warning(
+            "%s does not cover %d; appending it. Lengths in (%d, %d] would otherwise "
+            "have no recorded bucket and would compile an attention kernel in the "
+            "serving path.",
+            name,
+            limit,
+            kept[-1] if kept else 0,
+            limit,
+        )
+        kept.append(limit)
+    return kept
 
 
 class SpyreAttnBucketer:
@@ -113,10 +138,6 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
-        # Imported at call time, not module scope: spyre_attn imports this
-        # module, so a top-level import back into it would be circular.
-        from spyre_inference.v1.attention.backends.spyre_attn import _powers_of_two_up_to
-
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform
@@ -128,30 +149,35 @@ class SpyreAttnBucketer:
                 block_size,
             )
 
-        # Default: powers of two from block_size up to max_model_len. The
-        # recorded set is a product of both axes, so a bucket per KV token at a
-        # 32k context would be tens of thousands of variants; doubling keeps it
-        # affordable, with each bucket's extra padding absorbed by the mask.
-        # Starting at block_size rather than 1 skips buckets that would dedupe
-        # away anyway, since num_blocks = ceil(kv / block_size).
-        self._kv_buckets: list[int] = _resolve_buckets(
-            envs.SPYRE_ATTN_KV_BUCKETS,
-            max_model_len,
-            "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+        # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
+        # batch sizes the batched decode kernel can be asked for.
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._num_seqs_buckets: list[int] = _resolve_buckets(
+            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+            max_num_seqs,
+            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+            lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
-        # build()) then multiples of a step up to max_num_batched_tokens. Coarse
-        # bucketing: a prefill pays padding up to the next bucket, which the mask
-        # discards. The step is capped at 512 so a large max_num_batched_tokens
-        # doesn't make the one non-decode bucket enormous.
+        # build()) then multiples of a step up to max_num_batched_tokens, the
+        # query lengths a prefill pads up to.
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
         self._query_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
+        )
+
+        # Default: powers of two from block_size up to max_model_len. Geometric
+        # because the recorded set is a product of both axes; the extra padding
+        # each bucket costs is absorbed by the mask.
+        self._kv_buckets: list[int] = _resolve_buckets(
+            envs.SPYRE_ATTN_KV_BUCKETS,
+            max_model_len,
+            "SPYRE_ATTN_KV_BUCKETS",
+            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv
@@ -185,11 +211,21 @@ class SpyreAttnBucketer:
     def num_blocks_buckets(self) -> list[int]:
         return self._num_blocks_buckets
 
+    @property
+    def num_seqs_buckets(self) -> list[int]:
+        return self._num_seqs_buckets
+
     def find_kv_bucket(self, kv_len: int) -> int | None:
         return self._round_up(kv_len, self._kv_buckets)
 
     def find_query_bucket(self, query_len: int) -> int | None:
         return self._round_up(query_len, self._query_buckets)
+
+    def find_sequence_bucket(self, num_seqs: int) -> int | None:
+        return self._round_up(num_seqs, self._num_seqs_buckets)
+
+    def find_blocks_bucket(self, num_blocks: int) -> int | None:
+        return self._round_up(num_blocks, self._num_blocks_buckets)
 
     @staticmethod
     def _round_up(n: int, buckets: list[int]) -> int | None:

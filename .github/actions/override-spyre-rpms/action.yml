@@ -83,3 +83,11 @@ runs:
           echo "Extracting $(basename "$rpm")..."
           rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
         done
+
+        # Refresh the synthesized components.txt so the cache key reflects the
+        # override. --merge because an override carries only a subset of packages.
+        python3 .github/scripts/write_components_file.py \
+          --rpm-dir "$RPMS_DIR" \
+          --arch "$(uname -m)" \
+          --output "${SENTIENT_BASE_INSTALL_DIR}/components.txt" \
+          --merge

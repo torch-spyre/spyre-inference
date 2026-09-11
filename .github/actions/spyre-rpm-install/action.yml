@@ -52,3 +52,10 @@ runs:
         # subsequent steps rather than using the stale image-baked /opt/ibm/spyre.
         echo "SENTIENT_BASE_INSTALL_DIR=${SPYRE_LIBS}/opt/ibm/spyre" >> "$GITHUB_ENV"
         echo "_IBM_AIU_SETUP=" >> "$GITHUB_ENV"
+        # No RPM owns components.txt, and the image bakes LIB_VERSION_FILE to its
+        # own copy, so torch-spyre's kernel cache key would ignore spyre-rpms.lock.
+        python3 .github/scripts/write_components_file.py \
+          --rpm-dir /tmp/spyre-rpms \
+          --arch "$ARCH" \
+          --output "${SPYRE_LIBS}/opt/ibm/spyre/components.txt"
+        echo "LIB_VERSION_FILE=${SPYRE_LIBS}/opt/ibm/spyre/components.txt" >> "$GITHUB_ENV"

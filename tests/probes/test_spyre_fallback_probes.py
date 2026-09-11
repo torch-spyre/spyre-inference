@@ -891,18 +891,14 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
-        "same weight sustains with a full 8-row block, so padding the activation out "
-        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
-        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
-        "constants it reads. Tracked by torch-spyre#4032."
-    ),
-)
 def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
-    """A 1-row GEMM should not cost more than the same weight against 8 rows."""
+    """A 1-row GEMM should not cost more than the same weight against 8 rows.
+
+    Was strict-xfail: a 1-row matmul against a fused gate/up weight ran far below the
+    rate a full 8-row block sustained, so SpyrePaddedRowsLinearMethod padded the
+    activation out to 8 rows. Fixed by torch-spyre#4032 (short-row matmul scheduling);
+    the custom method and its `_PAD_ROWS` constant are gone.
+    """
     import time
 
     from torch_spyre.streams import synchronize

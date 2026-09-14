@@ -1509,6 +1509,27 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
 # ---------------------------------------------------------------------------
 
 
+def test_clear_kv_tail_only_when_step_enters_block(default_vllm_config):
+    impl = SpyreAttentionImpl(num_heads=2, head_size=64, scale=0.125, num_kv_heads=2)
+    shape = (3, 64, 2, 64)
+    cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
+    impl.kv_slot_views(cache)
+
+    metadata = Mock(
+        block_size=64,
+        num_seqs=2,
+        seq_lens=torch.tensor([70, 80]),
+        query_lens=torch.tensor([10, 1]),
+        block_table=torch.tensor([[0, 1], [0, 2]], dtype=torch.int32),
+    )
+    impl._clear_new_kv_block_tails(metadata)
+
+    for pages in cache:
+        assert torch.count_nonzero(pages[1, 6:]) == 0
+        assert torch.all(pages[1, :6] == -7)
+        assert torch.all(pages[2] == -7)
+
+
 # (label, block_indices, block_offsets)
 _SLOT_MAPPINGS = [
     ("aligned_prefill", [3, 3, 3, 3, 7, 7, 7, 7], [0, 1, 2, 3, 0, 1, 2, 3]),

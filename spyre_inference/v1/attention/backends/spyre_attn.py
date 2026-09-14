@@ -1335,37 +1335,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
-    def _clear_kv_block_tails(self, attn_metadata: "SpyreAttentionMetadata") -> None:
-        """Zero the unused slots of each sequence's last, partially-filled KV block.
-
-        The kernel gathers whole pages, so it reads the slots past a sequence's end. The
-        mask covers them but their contribution is not exactly zero, and vLLM hands the
-        same block to later requests, so their content -- a previous owner's KV -- makes
-        one forward pass depend on the requests before it: a fresh process then answers
-        the same request differently until block reuse stops changing them.
-
-        Written through the slot-major views, so each clear is one contiguous slice
-        rather than a strided page index. Assigning into the slice is deliberate: a
-        ``zero_()`` on a ``narrow`` of these views does not reach the same memory.
-        Idempotent -- the slots stay zero until the sequence grows into them.
-        """
+    def _clear_new_kv_block_tails(self, attn_metadata: "SpyreAttentionMetadata") -> None:
+        """Zero a partial block's tail on the step that first writes that block."""
         slots = self._kv_slots
-        tables = attn_metadata.page_index_tables_cpu
-        if slots is None or tables is None:
+        if slots is None:
             return
         k_slots, v_slots = slots
         block_size = attn_metadata.block_size
+        query_lens = attn_metadata.query_lens
         for seq in range(attn_metadata.num_seqs):
             kv_len = int(attn_metadata.seq_lens[seq].item())
+            query_len = int(query_lens[seq].item())
             if kv_len <= 0:
                 continue
             last = (kv_len - 1) // block_size
             used = kv_len - last * block_size
-            if used >= block_size or last >= tables[seq].shape[0]:
+            block_start = last * block_size
+            if used >= block_size or kv_len - query_len > block_start:
                 continue
-            base = int(tables[seq][last, 0].item()) * block_size
-            k_slots[base + used : base + block_size] = 0.0
-            v_slots[base + used : base + block_size] = 0.0
+            block_id = int(attn_metadata.block_table[seq, last].item())
+            start = block_id * block_size + used
+            end = (block_id + 1) * block_size
+            k_slots[start:end] = 0.0
+            v_slots[start:end] = 0.0
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
@@ -1759,6 +1751,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
+        # The KV scatter is ordered ahead of this op by `kv_cache_dummy_dep`.
+        # Clear only when this step first writes the final block; later decode
+        # steps retain that zero tail without paying another device write.
+        self._clear_new_kv_block_tails(attn_metadata)
+
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
         if self._batched_decode_preconditions_met(attn_metadata):
@@ -1766,10 +1763,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
-
-        # After the KV scatter, which `kv_cache_dummy_dep` orders ahead of this op, and
-        # before the loop below reads a page.
-        self._clear_kv_block_tails(attn_metadata)
 
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.

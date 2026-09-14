@@ -23,6 +23,7 @@ guards it trips.
 """
 
 import logging
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -160,8 +161,12 @@ def _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len):
 
 
 def _dispatch_batched(impl, builder, kv_cache, bucket):
-    """``_dispatch`` for the batched decode kernel."""
-    impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set())
+    """``_dispatch`` for the batched decode kernel.
+
+    The page budget is unbounded: real dispatch has no such check, so this traces
+    whatever the bucket realizes onto, the way a request would.
+    """
+    impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
 
 class TestRecordGraphs:
@@ -620,6 +625,33 @@ class TestRecordBatchedDecode:
         batched = self._recordable_batched(bucketer, pages=NUM_PAGES)
         assert len(batched) < len(bucketer.batched_decode_variants())
         assert recorded == len(_recordable(bucketer)) + len(batched)
+
+    def test_window_variants_over_the_requested_budget_still_record(
+        self, impl, kv_cache, sliding_window_builder
+    ):
+        """A window shrinks the realized entry axis, so the skip must key on that.
+
+        Keying on the bucket's window-agnostic ``blocks_per_chunk`` would drop
+        variants whose realized gather fits the cache, putting their compile back
+        in the serving path.
+        """
+        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        # Over the budget as requested, but the window shrinks blocks_per_chunk to 1,
+        # so what the kernel actually gathers fits and dispatch does reach these.
+        reachable = [
+            v
+            for v in bucketer.batched_decode_variants()
+            if v.num_seqs * v.blocks_per_chunk >= NUM_PAGES and v.num_seqs < NUM_PAGES
+        ]
+        assert reachable, "no variant exceeds the requested budget; nothing under test"
+
+        _record(impl, kv_cache, sliding_window_builder)
+
+        # Each one must have been traced during recording, so dispatch compiles nothing.
+        snapshot = compiles()
+        for bucket in reachable:
+            _dispatch_batched(impl, sliding_window_builder, kv_cache, bucket)
+        assert compiles() == snapshot
 
     def test_re_recording_compiles_nothing(self, impl, wide_cache, builder):
         builder._attn_bucketer = make_bucketer()

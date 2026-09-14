@@ -1394,13 +1394,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         recorded: set[tuple[int, int, int]] = set()
         for i, bucket in enumerate(variants, start=1):
-            # The kernel gathers `entries` pages per chunk, not num_blocks of them,
-            # and selecting a whole source faults the device (torch-spyre#4033).
-            if bucket.num_seqs * bucket.blocks_per_chunk >= num_pages:
-                continue
             t0 = time.time()
             try:
-                realized = self._record_batched_one(bucket, layer, kv_cache, builder, recorded)
+                realized = self._record_batched_one(
+                    bucket, layer, kv_cache, builder, recorded, num_pages
+                )
             except Exception:
                 logger.warning(
                     "Batched decode variant %s failed to record; it will compile on first "
@@ -1428,8 +1426,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kv_cache: SpyrePagedKVCache,
         builder: "SpyreAttentionMetadataBuilder",
         recorded: "set[tuple[int, int, int]]",
+        num_pages: int,
     ) -> "tuple[int, int, int] | None":
-        """Trace the batched kernel ``bucket`` needs; None if already traced.
+        """Trace the batched kernel ``bucket`` needs; None if already traced or unreachable.
 
         Returns the ``(num_seqs, blocks_per_chunk, num_chunks)`` key the metadata
         ``build()`` produced actually dispatches on, not ``bucket``'s own.
@@ -1456,6 +1455,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 requested,
                 realized,
             )
+        # The kernel gathers `entries` pages per chunk, not num_blocks of them, and
+        # selecting a whole source faults the device (torch-spyre#4033). A sliding
+        # window leaves the block count unpadded, so this keys on what build()
+        # realized, not the bucket's window-agnostic count, to skip only the
+        # variants dispatch cannot reach either.
+        if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
+            return None
         if realized in recorded:
             return None
 

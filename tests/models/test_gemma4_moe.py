@@ -118,6 +118,68 @@ def test_routing_recipes_agree_under_renormalization():
     torch.testing.assert_close(standard, gemma)
 
 
+def test_the_float32_stick_literal_matches_the_device():
+    """The routing regions read the literal, so a stale one would be a compile failure."""
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import FP32_ELEMS_PER_STICK
+
+    assert get_elem_in_stick(torch.float32) == FP32_ELEMS_PER_STICK
+
+
+def test_float32_routing_is_claimed_only_for_whole_stick_expert_counts():
+    """A float32 expert-axis reduction only lowers when the axis spans whole float32 sticks."""
+    from spyre_inference.moe import FP32_ELEMS_PER_STICK, _routes_in_float32
+
+    assert _routes_in_float32(128), "gemma-4's expert count must reach the promotion"
+    assert _routes_in_float32(FP32_ELEMS_PER_STICK)
+    assert not _routes_in_float32(FP32_ELEMS_PER_STICK // 2), "a partial stick keeps float16"
+    assert not _routes_in_float32(FP32_ELEMS_PER_STICK + 1)
+
+
+@pytest.mark.parametrize(
+    ("experts", "reduced_in"), [(128, torch.float32), (EXPERTS, torch.float16)]
+)
+def test_the_expert_axis_softmax_reduces_by_expert_count(monkeypatch, experts, reduced_in):
+    """The expert-axis softmax follows the count; the top-k recipe's stays float16."""
+    from spyre_inference.moe import _probs, _routing_weights, _topk_probs
+
+    seen: list[torch.dtype] = []
+    real_softmax = torch.softmax
+
+    def recording_softmax(x, *args, **kwargs):
+        seen.append(x.dtype)
+        return real_softmax(x, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "softmax", recording_softmax)
+    logits = torch.randn(4, experts, dtype=torch.float16)
+
+    cases = (
+        ("_probs", reduced_in, lambda: _probs(logits)),
+        ("full_softmax", reduced_in, lambda: _routing_weights(logits, TOP_K, "full_softmax")[0]),
+        ("topk_softmax", torch.float16, lambda: _routing_weights(logits, TOP_K, "topk_softmax")[0]),
+        ("_topk_probs", torch.float16, lambda: _topk_probs(logits, TOP_K)),
+    )
+    for name, expected, produce in cases:
+        seen.clear()
+        result = produce()
+        assert seen == [expected], f"{name} reduced in {seen}, expected {expected}"
+        assert result.dtype == torch.float16, f"{name} must return the transport dtype"
+
+
+def test_promoted_probabilities_are_a_float32_softmax_rounded_once():
+    """Pinned exactly: torch's CPU float16 softmax accumulates in float32 of its own
+    accord, so an approximate assertion would pass with the promotion anywhere."""
+    from spyre_inference.moe import _probs
+
+    torch.manual_seed(0)
+    logits = torch.randn(8, 128, dtype=torch.float16) * 2.0
+
+    torch.testing.assert_close(
+        _probs(logits), torch.softmax(logits.float(), dim=-1).to(torch.float16), atol=0, rtol=0
+    )
+
+
 def test_dense_topk_weights_are_softmax_over_the_selected_logits():
     """The dense prefill weights, against the formula rather than against the decode form.
 

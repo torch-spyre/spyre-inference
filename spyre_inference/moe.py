@@ -51,6 +51,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Elements per stick for float32 (128-byte stick / 4 bytes), as INT32_ELEMS_PER_STICK is
+# for int32. A literal because the routing regions read it and Dynamo will not trace
+# ``get_elem_in_stick``; ``_prepare_layer`` asserts it against the device.
+FP32_ELEMS_PER_STICK = 32
+
 _MOE_COMPILER_CONFIG = {"frontend_pool_allocation": True}
 _PERSISTENT_COMPILER_CONFIG = {"allow_all_ops_in_lx_planning": True}
 
@@ -143,13 +148,27 @@ def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]
     return weights[:tokens], indices[:tokens]
 
 
+def _routes_in_float32(experts: int) -> bool:
+    # A float32 reduction over the expert axis needs coordinate masking unless the axis
+    # spans whole float32 sticks, and the backend masks only up to 16-bit elements.
+    return experts % FP32_ELEMS_PER_STICK == 0
+
+
+def _expert_softmax(values: torch.Tensor) -> torch.Tensor:
+    # Cast straight back: nothing crosses a region boundary in float32, and the float32
+    # keep_by_index a float32 ``_route`` would need is unsupported.
+    if _routes_in_float32(values.shape[-1]):
+        return torch.softmax(values.float(), dim=-1).to(values.dtype)
+    return torch.softmax(values, dim=-1)
+
+
 def _routing_weights(
     router_logits: torch.Tensor,
     top_k: int,
     routing: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if routing == "full_softmax":
-        selected_values, indices = _topk(torch.softmax(router_logits, dim=-1), top_k)
+        selected_values, indices = _topk(_expert_softmax(router_logits), top_k)
         weights = selected_values / selected_values.sum(-1, keepdim=True)
     else:
         selected_logits, indices = _topk(router_logits, top_k)
@@ -285,7 +304,7 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 
 
 def _probs(router_logits: torch.Tensor) -> torch.Tensor:
-    return torch.softmax(router_logits, dim=-1)
+    return _expert_softmax(router_logits)
 
 
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -382,6 +401,7 @@ def _prepare_layer(layer: RoutedExperts) -> None:
 
     dtype = layer.spyre_moe_gate.dtype
     layer.spyre_moe_stick = stick
+    assert get_elem_in_stick(torch.float32) == FP32_ELEMS_PER_STICK
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",

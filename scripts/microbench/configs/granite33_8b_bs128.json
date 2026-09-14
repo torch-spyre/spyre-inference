@@ -6,6 +6,9 @@
   "head_size": 128,
   "block_size": 128,
   "num_blocks": 128,
+  "max_model_len": 8192,
+  "max_num_batched_tokens": 512,
+  "max_num_seqs": 1,
   "seed": 0,
   "warmup": 2,
   "iterations": 10,
@@ -226,73 +229,78 @@
       }
     },
     {
-      "name": "prefill_1024",
+      "name": "prefill_chunk512_ctx1024",
       "capture_type": "prefill",
       "query_lens": [
-        1024
+        512
       ],
       "seq_lens": [
         1024
       ],
       "extra_cols": {
         "seqlen": 1024,
-        "decode_share": 0.0
+        "decode_share": 0.0,
+        "chunked_prefill": true
       }
     },
     {
-      "name": "prefill_2048",
+      "name": "prefill_chunk512_ctx2048",
       "capture_type": "prefill",
       "query_lens": [
-        2048
+        512
       ],
       "seq_lens": [
         2048
       ],
       "extra_cols": {
         "seqlen": 2048,
-        "decode_share": 0.0
+        "decode_share": 0.0,
+        "chunked_prefill": true
       }
     },
     {
-      "name": "prefill_3000",
+      "name": "prefill_chunk512_ctx3000",
       "capture_type": "prefill",
       "query_lens": [
-        3000
+        512
       ],
       "seq_lens": [
         3000
       ],
       "extra_cols": {
         "seqlen": 3000,
-        "decode_share": 0.0
+        "decode_share": 0.0,
+        "chunked_prefill": true
       }
     },
     {
-      "name": "prefill_4096",
+      "name": "prefill_chunk512_ctx4096",
       "capture_type": "prefill",
       "query_lens": [
-        4096
+        512
       ],
       "seq_lens": [
         4096
       ],
       "extra_cols": {
         "seqlen": 4096,
-        "decode_share": 0.0
+        "decode_share": 0.0,
+        "chunked_prefill": true
       }
     },
     {
-      "name": "prefill_8192",
+      "name": "prefill_chunk512_ctx8192",
       "capture_type": "prefill",
       "query_lens": [
-        8192
+        512
       ],
       "seq_lens": [
         8192
       ],
       "extra_cols": {
         "seqlen": 8192,
-        "decode_share": 0.0
+        "decode_share": 0.0,
+        "chunked_prefill": true
       }
     }
   ],

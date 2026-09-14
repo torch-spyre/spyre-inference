@@ -87,11 +87,11 @@ from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
     mark_warmup_complete,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -816,11 +816,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
-        self._record_attention_graphs(bucket_sizes)
+        self._record_attention_graphs()
 
     @torch.inference_mode()
-    def _record_attention_graphs(self, token_counts: list[int]) -> None:
-        """Pre-compile the attention.
+    def _record_attention_graphs(self) -> None:
+        """Pre-compile the attention kernels, per-sequence and batched decode.
 
         The model-level warmup above cannot cover these: ``_dummy_run`` delegates
         upstream, which passes ``attn_metadata=None``, so ``forward`` returns
@@ -844,18 +844,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         static_ctx = self.compilation_config.static_forward_context
         t0 = time.time()
         total = 0
-        # The metadata builders' own bucketer, not a second one built here, so
-        # every bucket recorded is one build() can actually produce.
-        bucketer = self._resolve_builder_attn_bucketer()
-        assert bucketer is not None, "No attention metadata builder exposes a bucketer"
+        builders = self._attn_metadata_builders()
         with _set_spyre_compilation_settings(self.vllm_config):
             for layer_name, kv_cache in self._spyre_kv_caches.items():
                 layer = static_ctx.get(layer_name)
                 impl = getattr(layer, "impl", None)
                 if not isinstance(impl, SpyreAttentionImpl):
                     continue
+                builder = builders.get(layer_name)
+                # A KV-cache layer on this impl is always in an attention group whose
+                # backend builds SpyreAttentionMetadataBuilder, so a miss is a wiring or
+                # ordering bug (recording before initialize_attn_backend), not a config.
+                assert builder is not None, (
+                    f"Layer {layer_name} has a Spyre attention impl and a KV cache but no "
+                    "Spyre metadata builder; initialize_attn_backend() must run first."
+                )
                 logger.info("Recording attention graphs for layer %s...", layer_name)
-                total += impl.record_graphs(self._spyre_device, bucketer, kv_cache)
+                total += impl.record_graphs(layer, kv_cache, builder)
         logger.info(
             "Attention graph recording complete: %d graphs in %.3fs.",
             total,
@@ -864,40 +869,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Past the early returns: with recording off, first-use compiles are intended.
         mark_warmup_complete()
 
-    def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
-        """The attention bucketer the metadata builders dispatch against.
-
-        Returned rather than constructed here, so the recorder compiles exactly
-        the buckets ``build()`` rounds onto -- a second, independently built
-        instance could drift and make every request pad to an unrecorded block
-        count. A model can have several attention groups and, under ubatching,
-        several builders per group; the assert below guards against a future
-        spec-dependent bucket, since today all builders derive buckets from
-        ``cache_config``/``model_config`` alone and so agree by construction.
-        Returns None when no builder exposes a bucketer.
-        """
-        first: SpyreAttnBucketer | None = None
+    def _attn_metadata_builders(self) -> dict[str, SpyreAttentionMetadataBuilder]:
+        """Each layer's metadata builder: attention groups' specs (block size, sliding
+        window) need not agree, and a group's ubatch builders differ only in internal
+        buffers, so the first stands for all."""
+        builders: dict[str, SpyreAttentionMetadataBuilder] = {}
         for group in self._attn_group_iterator():
-            for builder in group.metadata_builders:
-                bucketer = getattr(builder, "_attn_bucketer", None)
-                if bucketer is None:
-                    continue
-                if first is None:
-                    first = bucketer
-                    continue
-                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
-                    first.block_size,
-                    first.num_blocks_buckets,
-                ), (
-                    "Attention bucketer buckets diverge between metadata builders: "
-                    f"{type(builder).__name__} has block_size={bucketer.block_size} "
-                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
-                    f"block_size={first.block_size} "
-                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
-                    "recorded, so a mismatch means some builder pads onto block "
-                    "counts no kernel was compiled for."
-                )
-        return first
+            builder = group.metadata_builders[0] if group.metadata_builders else None
+            if not isinstance(builder, SpyreAttentionMetadataBuilder):
+                continue
+            for layer_name in group.layer_names:
+                builders[layer_name] = builder
+        return builders
 
     def _determine_batch_execution_and_padding(
         self,
@@ -1193,7 +1176,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+        from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs

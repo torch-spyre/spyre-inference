@@ -92,11 +92,8 @@ def len_buckets(
 
 
 def batch_buckets(max_num_seqs: int) -> list[int]:
-    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself.
-
-    Same buckets as decoder attention (``_powers_of_two_up_to``): clip with
-    ``--max-num-seqs``, no extra env var.
-    """
+    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself."""
+    # TODO need to concile with the batching bucketting in spyre_attn_bucketer.py
     cap = max(1, max_num_seqs)
     out: list[int] = []
     size = 1

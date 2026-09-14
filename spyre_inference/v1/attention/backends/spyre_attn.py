@@ -1614,6 +1614,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             t0 = time.time()
             try:
                 self._record_batched_one(bucket, k_pages, v_pages, block_size, device)
+            except AssertionError:
+                # The staging-width precondition. Swallowing it would leave dispatch
+                # reaching an unrecorded graph, which is the failure this pass exists
+                # to prevent -- so it stays fatal rather than becoming a warning.
+                raise
             except Exception:
                 logger.warning(
                     "Batched decode variant %s failed to record; it will compile on first "

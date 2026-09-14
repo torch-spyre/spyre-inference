@@ -522,8 +522,23 @@ class TestRecordBatchedDecode:
         """
         from tests.attention.test_spyre_attn import _padded_mask_metadata
 
-        bucketer = SpyreAttnBucketer(get_current_vllm_config())
-        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+        # make_bucketer, not the live config the per-seq tests above use: the batched
+        # key includes num_seqs, and the live config's max_num_seqs=128 outruns the
+        # staging buffers, so those variants would fail the width precondition.
+        bucketer = make_bucketer()
+
+        # _padded_mask_metadata's block table is arange(num_seqs * max_num_blocks), so
+        # a real batched gather reaches page ids well past the shared kv_cache
+        # fixture's NUM_PAGES. Only this test feeds the builder's own block table to
+        # the kernel -- the per-seq tests fabricate indices -- so it needs a cache
+        # wide enough to index. Recording still runs against NUM_PAGES so the
+        # recordable set is the one the other tests assert on.
+        pages = _MIN_BATCHED_SEQS * NUM_PAGES
+        wide_cache = SpyrePagedKVCache(
+            k_pages=torch.zeros(pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16),
+            v_pages=torch.zeros(pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16),
+        )
+        impl.record_graphs(torch.device("cpu"), bucketer, wide_cache)
 
         snapshot = compiles()
         for kv_len in (65, 200):
@@ -537,8 +552,9 @@ class TestRecordBatchedDecode:
             )
             assert metadata.padded_num_seqs is not None, "builder declined the batched path"
             assert metadata.padded_batch_blocks is not None
-            if metadata.padded_batch_blocks > NUM_PAGES:
-                pytest.skip("variant would have been skipped when recording")
+            assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets, (
+                f"kv_len={kv_len} produced an unrecorded block count"
+            )
 
             # What forward() does before dispatch; no device, so a plain alias.
             assert metadata.rep_row_ids_cpu is not None
@@ -549,6 +565,6 @@ class TestRecordBatchedDecode:
             metadata.mask_by_chunk_dev = metadata.mask_by_chunk_cpu
 
             query, output = impl.staging_buffers(torch.device("cpu"))
-            impl._run_batched_decode_dispatch(query, *kv_cache, metadata, output)
+            impl._run_batched_decode_dispatch(query, *wide_cache, metadata, output)
 
         assert compiles() == snapshot

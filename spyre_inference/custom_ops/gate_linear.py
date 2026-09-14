@@ -16,8 +16,6 @@
 
 Spyre cannot restickify fp32 (``spyre::ReStickifyOpHBM`` is unsupported for
 IEEE_FP32), so the routing softmax over upstream's fp32 logits fails to lower.
-
-The reduction that fp32 was for is recovered in ``moe._expert_softmax`` instead.
 """
 
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear

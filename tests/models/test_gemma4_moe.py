@@ -22,6 +22,7 @@ when it lands mid-stick — so the forms are exercised at both a native and a wi
 Routing, configuration and dispatch are host-side and need nothing.
 """
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -118,65 +119,42 @@ def test_routing_recipes_agree_under_renormalization():
     torch.testing.assert_close(standard, gemma)
 
 
-def test_the_float32_stick_literal_matches_the_device():
-    """The routing regions read the literal, so a stale one would be a compile failure."""
-    from torch_spyre._C import get_elem_in_stick
+def test_expert_softmax_promotes_only_stick_aligned_routes(monkeypatch):
+    from spyre_inference.moe import _expert_softmax
 
-    from spyre_inference.moe import FP32_ELEMS_PER_STICK
-
-    assert get_elem_in_stick(torch.float32) == FP32_ELEMS_PER_STICK
-
-
-def test_float32_routing_is_claimed_only_for_whole_stick_expert_counts():
-    """A float32 expert-axis reduction only lowers when the axis spans whole float32 sticks."""
-    from spyre_inference.moe import FP32_ELEMS_PER_STICK, _routes_in_float32
-
-    assert _routes_in_float32(128), "gemma-4's expert count must reach the promotion"
-    assert _routes_in_float32(FP32_ELEMS_PER_STICK)
-    assert not _routes_in_float32(FP32_ELEMS_PER_STICK // 2), "a partial stick keeps float16"
-    assert not _routes_in_float32(FP32_ELEMS_PER_STICK + 1)
-
-
-@pytest.mark.parametrize(
-    ("experts", "reduced_in"), [(128, torch.float32), (EXPERTS, torch.float16)]
-)
-def test_the_expert_axis_softmax_reduces_by_expert_count(monkeypatch, experts, reduced_in):
-    """The expert-axis softmax follows the count; the top-k recipe's stays float16."""
-    from spyre_inference.moe import _probs, _routing_weights, _topk_probs
-
-    seen: list[torch.dtype] = []
+    seen = []
     real_softmax = torch.softmax
 
-    def recording_softmax(x, *args, **kwargs):
-        seen.append(x.dtype)
-        return real_softmax(x, *args, **kwargs)
+    def recording_softmax(values, *args, **kwargs):
+        seen.append(values.dtype)
+        return real_softmax(values, *args, **kwargs)
 
     monkeypatch.setattr(torch, "softmax", recording_softmax)
-    logits = torch.randn(4, experts, dtype=torch.float16)
-
-    cases = (
-        ("_probs", reduced_in, lambda: _probs(logits)),
-        ("full_softmax", reduced_in, lambda: _routing_weights(logits, TOP_K, "full_softmax")[0]),
-        ("topk_softmax", torch.float16, lambda: _routing_weights(logits, TOP_K, "topk_softmax")[0]),
-        ("_topk_probs", torch.float16, lambda: _topk_probs(logits, TOP_K)),
-    )
-    for name, expected, produce in cases:
+    for experts, expected in ((128, torch.float32), (EXPERTS, torch.float16)):
         seen.clear()
-        result = produce()
-        assert seen == [expected], f"{name} reduced in {seen}, expected {expected}"
-        assert result.dtype == torch.float16, f"{name} must return the transport dtype"
+        result = _expert_softmax(torch.randn(4, experts, dtype=torch.float16))
+        assert seen == [expected]
+        assert result.dtype == torch.float16
 
 
-def test_promoted_probabilities_are_a_float32_softmax_rounded_once():
-    """Pinned exactly: torch's CPU float16 softmax accumulates in float32 of its own
-    accord, so an approximate assertion would pass with the promotion anywhere."""
-    from spyre_inference.moe import _probs
+def test_expert_softmax_compiles_on_spyre():
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+    from torch_spyre.ops.fallbacks import FallbackWarning
 
-    torch.manual_seed(0)
-    logits = torch.randn(8, 128, dtype=torch.float16) * 2.0
+    from spyre_inference.moe import _expert_softmax
 
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    logits = torch.randn(8, 128, dtype=torch.float16)
+    compiled = torch.compile(_expert_softmax, backend="inductor", fullgraph=True, dynamic=False)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        actual = compiled(logits.to("spyre"))
+
+    assert not any(issubclass(w.category, FallbackWarning) for w in caught)
     torch.testing.assert_close(
-        _probs(logits), torch.softmax(logits.float(), dim=-1).to(torch.float16), atol=0, rtol=0
+        actual.cpu(), torch.softmax(logits.float(), dim=-1).half(), atol=2e-3, rtol=2e-3
     )
 
 

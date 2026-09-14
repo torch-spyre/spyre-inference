@@ -30,10 +30,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
-    _batched_decode_kernel,
     _build_query_row_tables,
     _mirror_mask_tiles,
 )
+from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -1869,7 +1869,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     )
 
     def run(cap: float):
-        return _batched_decode_kernel(
+        return batched_decode_kernel(
             query,
             rep_row_ids,
             k_pages,
@@ -2080,7 +2080,7 @@ def test_batched_decode_matches_fp32_reference(
     query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
     query_padded[:num_seqs] = query
 
-    actual = _batched_decode_kernel(
+    actual = batched_decode_kernel(
         query_padded,
         rep_row_ids,
         k_pages,

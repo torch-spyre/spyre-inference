@@ -46,8 +46,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    slot_major_kv_layout,
 )
+from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 from spyre_inference.v1.pool import select_rows
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,

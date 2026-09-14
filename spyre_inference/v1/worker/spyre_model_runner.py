@@ -1200,7 +1200,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+        from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs

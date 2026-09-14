@@ -1,0 +1,74 @@
+{
+  "run_label": "granite33_8b_e2e_ref",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 65,
+  "max_model_len": 2048,
+  "max_num_batched_tokens": 512,
+  "max_num_seqs": 4,
+  "attn_kv_buckets": "2048",
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "prefill_chunk0",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [512]
+    },
+    {
+      "name": "prefill_chunk1",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [1024]
+    },
+    {
+      "name": "prefill_chunk2",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [1536]
+    },
+    {
+      "name": "prefill_chunk3",
+      "capture_type": "prefill",
+      "query_lens": [448],
+      "seq_lens": [1984]
+    },
+    {
+      "name": "decode_1seq",
+      "capture_type": "decode",
+      "query_lens": [1],
+      "seq_lens": [2048]
+    },
+    {
+      "name": "decode_2seq",
+      "capture_type": "decode",
+      "query_lens": [1, 1],
+      "seq_lens": [2048, 2048]
+    },
+    {
+      "name": "decode_4seq",
+      "capture_type": "decode",
+      "query_lens": [1, 1, 1, 1],
+      "seq_lens": [2048, 2048, 2048, 2048]
+    },
+    {
+      "name": "mixed_1decode_1chunk",
+      "capture_type": "mixed",
+      "query_lens": [1, 511],
+      "seq_lens": [2048, 1024]
+    }
+  ],
+  "block_sizes": [
+    128
+  ]
+}

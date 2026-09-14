@@ -19,7 +19,8 @@ tests that run them, and the relayout test, need the card: the shapes are scaled
 every dim the device sees stays stick-aligned, because the layouts in those regions depend
 on it. The intermediate dim reaches that alignment the way a TP shard does — zero-widened
 when it lands mid-stick — so the forms are exercised at both a native and a widened width.
-Routing, configuration and dispatch are host-side and need nothing.
+Routing semantics, configuration and dispatch are host-side. The promoted softmax lowering
+has a targeted Spyre test.
 """
 
 import warnings

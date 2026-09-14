@@ -121,8 +121,8 @@ def test_num_gpu_blocks_override_homogeneous():
 def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
     """Hybrid models get the same block count: one collapsed KV cache group.
 
-    ``disable_hybrid_kv_cache_manager`` merges every layer into a single
-    ``UniformTypeKVCacheSpecs`` group, so the single-group formula applies unchanged.
+    ``disable_hybrid_kv_cache_manager`` merges every layer into a single group, so the
+    single-group formula applies unchanged.
     """
     from spyre_inference.platform import TorchSpyrePlatform
 

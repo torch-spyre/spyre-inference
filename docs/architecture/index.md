@@ -207,8 +207,8 @@ Key constraints:
   `block_size` is rounded up to the next multiple of 64
 - **GQA only**: MHA (`num_queries_per_kv = 1`) currently fails in the Spyre compiler's
   layout-propagation pass; only GQA configurations are exercised today
-- **Supported**: sliding-window masking and logits soft-capping are both handled;
-  ALiBi slopes are not
+- **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
+  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not
 
 ### Encoder-only attention
 

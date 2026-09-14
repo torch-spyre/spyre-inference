@@ -1248,10 +1248,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
 
-        # One spec per layer. disable_hybrid_kv_cache_manager (set in the
-        # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
-        # group; unwrap it to the real per-layer specs so each layer keeps its own
-        # num_kv_heads/head_size. Non-hybrid groups expose the spec directly.
+        # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
+        # collapses hybrid models into a single group; when the layers' head shapes differ
+        # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
+        # so each layer keeps its own num_kv_heads/head_size. A merged spec is direct.
         spec_by_layer = {}
         for group in kv_cache_config.kv_cache_groups:
             per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)

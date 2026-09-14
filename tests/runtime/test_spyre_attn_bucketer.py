@@ -25,6 +25,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     _parse_buckets,
     _powers_of_two_up_to,
+    batched_decode_chunking,
 )
 
 BLOCK_SIZE = 64
@@ -354,3 +355,73 @@ class TestBuilderAttnBucketer:
 
         assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
         assert metadata.padded_num_seqs in bucketer.num_seqs_buckets
+
+        # The anti-drift guard: the shapes build() just produced must be a variant
+        # warmup enumerated, or that batch compiles a kernel mid-serving.
+        assert metadata.chunk_page_ids_cpu is not None
+        keys = {
+            (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
+            for v in bucketer.batched_decode_variants()
+        }
+        assert (
+            metadata.padded_num_seqs,
+            metadata.blocks_per_chunk,
+            len(metadata.chunk_page_ids_cpu),
+        ) in keys
+
+
+class TestBatchedDecodeVariants:
+    """The batched decode kernel's own enumeration, keyed on
+    (num_seqs, blocks_per_chunk, num_chunks) rather than the per-seq 2-D key."""
+
+    @pytest.fixture()
+    def enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        return SpyreAttnBucketer(make_config())
+
+    def test_empty_when_the_path_is_disabled(self, bucketer):
+        """Off by default, so recording it would trace a kernel nothing dispatches to."""
+        assert bucketer.batched_decode_variants() == []
+
+    def test_covers_the_full_num_seqs_by_num_blocks_grid(self, enabled):
+        assert {(v.num_seqs, v.num_blocks) for v in enabled.batched_decode_variants()} == {
+            (s, n) for n in enabled.num_blocks_buckets for s in enabled.num_seqs_buckets
+        }
+
+    def test_no_duplicates(self, enabled):
+        variants = enabled.batched_decode_variants()
+        assert len(set(variants)) == len(variants)
+
+    def test_stable_across_calls(self, enabled):
+        assert enabled.batched_decode_variants() == enabled.batched_decode_variants()
+
+    def test_largest_first(self, enabled):
+        blocks = [v.num_blocks for v in enabled.batched_decode_variants()]
+        assert blocks == sorted(blocks, reverse=True)
+
+    def test_descriptor_is_frozen(self, enabled):
+        with pytest.raises(FrozenInstanceError):
+            enabled.batched_decode_variants()[0].num_seqs = 1  # ty: ignore[invalid-assignment]
+
+    def test_chunking_matches_the_shared_helper(self, enabled):
+        """One rule, so a recorded variant is the one build() dispatches onto."""
+        for v in enabled.batched_decode_variants():
+            assert batched_decode_chunking(v.num_seqs, v.num_blocks) == (
+                v.blocks_per_chunk,
+                v.num_chunks,
+            )
+            # The block axis pads up to a whole chunk, never truncates.
+            assert v.blocks_per_chunk * v.num_chunks >= v.num_blocks
+
+    def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
+        """Why the helper is shared rather than re-derived: with power-of-two
+        buckets the padding vanishes, so a drifting copy would look correct."""
+        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
+        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+
+    def test_count_stays_tractable_at_long_context(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
+        assert len(b.batched_decode_variants()) < 100

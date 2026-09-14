@@ -44,8 +44,10 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
+    SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
+    batched_decode_chunking,
 )
 
 logger = init_logger(__name__)
@@ -90,8 +92,6 @@ def _record_block(name: str):
 # padded to this width so each row starts on a stick boundary; see
 # SpyreAttentionMetadata.page_index_tables.
 INT32_ELEMS_PER_STICK = 32
-
-_SPYRE_CORE_COUNT = 32
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -1055,14 +1055,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             if b_seqs is not None and b_blocks is not None:
                 padded_num_seqs = b_seqs
-                # Entries target the cores: fewer under-fills them, more than one
-                # stick's worth hits a backend axis-merge limit.
-                blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
-                # blocks_per_chunk need not divide b_blocks, so pad the block axis
-                # up to a whole chunk. Padding columns gather page 0 under an
+                # Shared with the warmup recorder, so a dispatch here reaches a
+                # variant it traced. Padding columns gather page 0 under an
                 # all--inf mask and contribute zero; chunk 0 still holds every real
                 # row's block 0, so the running max stays finite.
-                num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+                blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
                 entries = b_seqs * blocks_per_chunk
@@ -1341,7 +1338,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+    def _batched_decode_supported(self) -> bool:
+        """Whether this layer can ever take the batched decode path.
+
+        The batch-independent half of the preconditions, so the warmup recorder
+        gates on exactly the rules dispatch does.
+        """
         # Off by default: the batched matmul pads every sequence row up to the
         # bucket width, and that overhead is uncharacterised at the smallest
         # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
@@ -1352,11 +1354,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # to int64 and fails eager; eager takes the per-seq loop instead.
         if not self._compile_attn:
             return False
-        # Layer 0's builder gates on the decode count and the bucket lattice;
-        # we add ALiBi, which the batched kernel doesn't implement.
-        if attn_metadata.padded_num_seqs is None:
-            return False
+        # ALiBi, which the batched kernel doesn't implement.
         return self.alibi_slopes is None
+
+    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+        # Layer 0's builder gates on the decode count and the bucket lattice.
+        return self._batched_decode_supported() and attn_metadata.padded_num_seqs is not None
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1445,6 +1448,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         ``index_select``s real pages. Dynamo traces on the first *call*, so each
         variant is invoked once here.
 
+        Covers both kernels: the per-sequence one always, and the batched decode
+        one only when this layer can reach it (``_batched_decode_supported``).
+
         Returns the number of variants invoked. A failing variant is logged and
         skipped, not raised, so it can't take down engine startup; dispatch
         falls back to compiling it on first use.
@@ -1455,28 +1461,40 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         num_pages, block_size = k_pages.shape[0], k_pages.shape[1]
         variants = bucketer.variants()
+        decode_variants = (
+            bucketer.batched_decode_variants() if self._batched_decode_supported() else []
+        )
         t_start = time.time()
 
         # Belt-and-suspenders: platform._raise_dynamo_recompile_limits already
         # raises this globally, but bump it here too in case that hasn't run.
         prev_limit = torch._dynamo.config.accumulated_recompile_limit
         torch._dynamo.config.accumulated_recompile_limit = max(  # ty: ignore[invalid-assignment]
-            prev_limit, 4 * len(variants) + 64
+            prev_limit, 4 * (len(variants) + len(decode_variants)) + 64
         )
 
-        logger.info("Recording %d attention variants for layer...", len(variants))
+        logger.info(
+            "Recording %d per-seq + %d batched-decode attention variants for layer...",
+            len(variants),
+            len(decode_variants),
+        )
         try:
             recorded = self._record_all(variants, k_pages, v_pages, num_pages, block_size, device)
+            recorded_decode = self._record_batched_all(
+                decode_variants, k_pages, v_pages, num_pages, block_size, device
+            )
         finally:
             torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
 
         logger.info(
-            "Recorded %d/%d attention variants in %.2fs.",
+            "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
             len(variants),
+            recorded_decode,
+            len(decode_variants),
             time.time() - t_start,
         )
-        return recorded
+        return recorded + recorded_decode
 
     def _record_all(
         self,
@@ -1575,6 +1593,111 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.head_size,
             self.logits_soft_cap,
             alibi_bias_tiles,
+            out_staging,
+        )
+
+    def _record_batched_all(
+        self,
+        variants: "list[SpyreAttnBatchedDecodeBucket]",
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        num_pages: int,
+        block_size: int,
+        device: torch.device,
+    ) -> int:
+        recorded = 0
+        for i, bucket in enumerate(variants, start=1):
+            if bucket.num_blocks > num_pages:
+                # The buckets are sized from max_model_len; a small KV allocation
+                # cannot host that many distinct pages to gather.
+                continue
+            t0 = time.time()
+            try:
+                self._record_batched_one(bucket, k_pages, v_pages, block_size, device)
+            except Exception:
+                logger.warning(
+                    "Batched decode variant %s failed to record; it will compile on first "
+                    "use instead.",
+                    bucket,
+                    exc_info=True,
+                )
+                continue
+            recorded += 1
+            logger.debug(
+                "  [%d/%d] recorded %s in %.2fs",
+                i,
+                len(variants),
+                bucket,
+                time.time() - t0,
+            )
+        return recorded
+
+    def _record_batched_one(
+        self,
+        bucket: "SpyreAttnBatchedDecodeBucket",
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        block_size: int,
+        device: torch.device,
+    ) -> None:
+        """Trace one batched decode variant on dummy args matching the builder's shapes."""
+        b_seqs = bucket.num_seqs
+        blocks_per_chunk = bucket.blocks_per_chunk
+        entries = b_seqs * blocks_per_chunk
+
+        # The kernel's store writes out[:b_seqs], and dispatch takes that in-place
+        # path (_run_batched_decode_dispatch's store_out) whenever the buffer is
+        # wide enough. The staging buffers are contiguous at offset 0 in the model
+        # dtype, so they satisfy every other clause of that test; only the width
+        # can fail, and then dispatch would trace the out=None graph instead of
+        # this one.
+        assert self.staging_rows >= b_seqs, (
+            f"staging buffers hold {self.staging_rows} rows, below the num_seqs bucket "
+            f"{b_seqs}; the recorded variant would not be the one dispatch reaches"
+        )
+
+        # Trace on the buffers dispatch passes: Dynamo also guards device layout and
+        # dispatch key set, which a same-shaped fresh allocation would not match.
+        q_staging, out_staging = self._staging_buffers(device)
+
+        # Zeros throughout: page 0 and query row 0 are always valid gathers, and
+        # the values are irrelevant to tracing. Fresh offset-0 tensors per chunk,
+        # matching the builder -- a compiled kernel reads its arguments from
+        # storage offset 0 (torch-spyre#3770), so slices of one stack would not.
+        rep_row_ids = convert(torch.zeros(entries, dtype=torch.int32), device=device)
+        chunk_page_ids = [
+            convert(torch.zeros(entries, 1, dtype=torch.int32), device=device)
+            for _ in range(bucket.num_chunks)
+        ]
+        # All-zero additive mask: the one choice that cannot leave a row fully
+        # masked, which would make tile_sum 0 and the result NaN. The builder's
+        # -inf on padded rows and blocks is runtime correctness, not shape.
+        mask_by_chunk = convert(
+            torch.zeros(
+                bucket.num_chunks,
+                entries * self.num_kv_heads,
+                1,
+                block_size,
+                dtype=self.model_dtype,
+            ),
+            device=device,
+        )
+
+        self._decode_fn(
+            q_staging,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_page_ids,
+            mask_by_chunk,
+            self.scale,
+            b_seqs,
+            blocks_per_chunk,
+            self.num_kv_heads,
+            self.num_queries_per_kv,
+            block_size,
+            self.head_size,
+            self.logits_soft_cap,
             out_staging,
         )
 

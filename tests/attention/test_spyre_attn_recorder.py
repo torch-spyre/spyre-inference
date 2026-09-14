@@ -30,6 +30,7 @@ from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import _print_warning_once
 
+from spyre_inference import envs
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     INT32_ELEMS_PER_STICK,
@@ -39,6 +40,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
@@ -399,8 +401,8 @@ def _toy_kernel(x, n):
 
 class TestLateCompileWarning:
     """The runtime half of the acceptance criterion, for what the tests above cannot see:
-    a real config whose buckets miss something, or the batched decode kernel, which the
-    recorder never traces. ``backend="eager"`` suffices since the counter is Dynamo's.
+    a real config whose buckets miss something. ``backend="eager"`` suffices since the
+    counter is Dynamo's.
     """
 
     @pytest.fixture(autouse=True)
@@ -442,3 +444,111 @@ class TestLateCompileWarning:
         assert spyre_attn._warmup_complete is False
         spyre_attn.mark_warmup_complete()
         assert spyre_attn._warmup_complete is True
+
+
+class TestRecordBatchedDecode:
+    """The batched decode kernel's variants, which the recorder used to skip entirely."""
+
+    @pytest.fixture(autouse=True)
+    def _enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        yield
+        envs.clear_env_cache()
+
+    @staticmethod
+    def _recordable_batched(bucketer) -> list:
+        return [v for v in bucketer.batched_decode_variants() if v.num_blocks <= NUM_PAGES]
+
+    def test_records_every_enumerated_batched_variant(self, impl, kv_cache):
+        bucketer = make_bucketer()
+
+        recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        batched = self._recordable_batched(bucketer)
+        assert batched, "config enumerates no batched variants, so this would pass vacuously"
+        assert recorded == len(_recordable(bucketer)) + len(batched)
+
+    def test_records_nothing_batched_when_the_flag_is_off(self, impl, kv_cache, monkeypatch):
+        monkeypatch.delenv("SPYRE_BATCHED_DECODE", raising=False)
+        envs.clear_env_cache()
+        bucketer = make_bucketer()
+
+        assert impl.record_graphs(torch.device("cpu"), bucketer, kv_cache) == len(
+            _recordable(bucketer)
+        )
+
+    def test_alibi_layer_records_nothing_batched(self, default_vllm_config, kv_cache):
+        """The batched kernel doesn't implement ALiBi, so those layers never dispatch to it."""
+        torch._dynamo.reset()
+        get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        alibi_impl = SpyreAttentionImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=1.0 / (HEAD_SIZE**0.5),
+            num_kv_heads=NUM_KV_HEADS,
+            alibi_slopes=[0.5] * NUM_HEADS,
+            sliding_window=None,
+        )
+        bucketer = make_bucketer()
+
+        assert alibi_impl.record_graphs(torch.device("cpu"), bucketer, kv_cache) == len(
+            _recordable(bucketer)
+        )
+
+    def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache):
+        bucketer = make_bucketer(max_model_len=4096)
+
+        recorded = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        batched = self._recordable_batched(bucketer)
+        assert len(batched) < len(bucketer.batched_decode_variants())
+        assert recorded == len(_recordable(bucketer)) + len(batched)
+
+    def test_re_recording_compiles_nothing(self, impl, kv_cache):
+        bucketer = make_bucketer()
+        first = impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        snapshot = compiles()
+        assert impl.record_graphs(torch.device("cpu"), bucketer, kv_cache) == first
+        assert compiles() == snapshot
+
+    def test_batched_dispatch_after_recording_compiles_nothing(self, impl, kv_cache):
+        """The acceptance criterion: a real batched decode batch compiles nothing.
+
+        Drives ``_run_batched_decode_dispatch`` on metadata ``build()`` produced, so a
+        drift between the chunking the builder derives and the one the recorder
+        traces shows up here.
+        """
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
+        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+
+        snapshot = compiles()
+        for kv_len in (65, 200):
+            metadata = _padded_mask_metadata(
+                [(1, kv_len)] * _MIN_BATCHED_SEQS,
+                block_size=BLOCK_SIZE,
+                num_query_heads=NUM_HEADS,
+                num_kv_heads=NUM_KV_HEADS,
+                head_size=HEAD_SIZE,
+                max_num_blocks=NUM_PAGES,
+            )
+            assert metadata.padded_num_seqs is not None, "builder declined the batched path"
+            assert metadata.padded_batch_blocks is not None
+            if metadata.padded_batch_blocks > NUM_PAGES:
+                pytest.skip("variant would have been skipped when recording")
+
+            # What forward() does before dispatch; no device, so a plain alias.
+            assert metadata.rep_row_ids_cpu is not None
+            assert metadata.chunk_page_ids_cpu is not None
+            assert metadata.mask_by_chunk_cpu is not None
+            metadata.rep_row_ids_dev = metadata.rep_row_ids_cpu
+            metadata.chunk_page_ids_dev = metadata.chunk_page_ids_cpu
+            metadata.mask_by_chunk_dev = metadata.mask_by_chunk_cpu
+
+            query, output = impl.staging_buffers(torch.device("cpu"))
+            impl._run_batched_decode_dispatch(query, *kv_cache, metadata, output)
+
+        assert compiles() == snapshot

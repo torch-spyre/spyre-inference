@@ -20,8 +20,12 @@ path. This module enumerates the pairs a run can reach so warmup can record them
 all up front.
 
 Separate from ``SpyreShapeBucketer``, which dispatches a single ``num_tokens``
-int for the model graph; an attention variant is 2-D (kv_len and query_len
-buckets).
+int for the model graph; a per-sequence attention variant is 2-D (kv_len and
+query_len buckets).
+
+The batched decode kernel specializes on its own key,
+``(num_seqs, blocks_per_chunk, num_chunks)``, so it has its own bucket type and
+its own enumerator (``batched_decode_variants``).
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
@@ -51,10 +55,30 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # starts here -- smaller batches never dispatch to a batched variant.
 _MIN_BATCHED_SEQS = 4
 
+# Cores available to split a gather's entry axis across.
+_SPYRE_CORE_COUNT = 32
+
+
+def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+    """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
+
+    The rule the batched decode kernel's traced shapes come from, shared by the
+    metadata builder and the warmup recorder so a recorded variant is the one
+    dispatch reaches.
+
+    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
+    them, more than one stick's worth hits a backend axis-merge limit.
+    ``blocks_per_chunk`` need not divide ``b_blocks``, so the block axis pads up
+    to a whole chunk -- ``blocks_per_chunk * num_chunks >= b_blocks``.
+    """
+    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+    return blocks_per_chunk, num_chunks
+
 
 @dataclass(frozen=True)
 class SpyreAttnBucket:
-    """One recordable attention kernel variant.
+    """One recordable per-sequence attention kernel variant.
 
     Fields are the values the kernel specializes on, so a recorded bucket and a
     runtime dispatch reach the same Dynamo entry.
@@ -62,6 +86,24 @@ class SpyreAttnBucket:
 
     num_blocks: int
     padded_query_len: int
+
+
+@dataclass(frozen=True)
+class SpyreAttnBatchedDecodeBucket:
+    """One recordable batched decode kernel variant.
+
+    ``num_seqs`` and ``blocks_per_chunk`` are kernel arguments; ``num_chunks`` is
+    the length of its per-chunk index list, which it unrolls at trace time. All
+    three are what it specializes on. ``num_blocks`` is the block-count bucket
+    they were derived from, kept so the recorder can skip a bucket that outruns
+    the KV allocation; the padded extent the kernel walks is
+    ``blocks_per_chunk * num_chunks``, which is ``>= num_blocks``.
+    """
+
+    num_seqs: int
+    num_blocks: int
+    blocks_per_chunk: int
+    num_chunks: int
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -259,5 +301,32 @@ class SpyreAttnBucketer:
                     continue
                 out.append(
                     SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len)
+                )
+        return out
+
+    def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
+        """Every batched decode variant worth recording, largest first.
+
+        Empty unless the batched decode path is enabled: it is off by default, and
+        enumerating it would spend warmup tracing a kernel nothing dispatches to.
+
+        The full ``num_seqs_buckets x num_blocks_buckets`` grid, with no pruning:
+        both axes are geometric, so it is ~40 entries even at a 32k context with
+        max_num_seqs=64. Unlike ``variants()`` there is no inter-axis bound to
+        exploit -- a decode batch of any size can sit at any context length.
+        """
+        if not envs.SPYRE_BATCHED_DECODE:
+            return []
+        out: list[SpyreAttnBatchedDecodeBucket] = []
+        for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+            for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
+                blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+                out.append(
+                    SpyreAttnBatchedDecodeBucket(
+                        num_seqs=num_seqs,
+                        num_blocks=num_blocks,
+                        blocks_per_chunk=blocks_per_chunk,
+                        num_chunks=num_chunks,
+                    )
                 )
         return out

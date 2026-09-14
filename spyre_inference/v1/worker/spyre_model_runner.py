@@ -820,7 +820,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:
-        """Pre-compile the attention.
+        """Pre-compile the attention kernels, per-sequence and batched decode.
 
         The model-level warmup above cannot cover these: ``_dummy_run`` delegates
         upstream, which passes ``attn_metadata=None``, so ``forward`` returns

@@ -800,10 +800,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
-                # Shared with the warmup recorder, so a dispatch here reaches a
-                # variant it traced. Padding columns gather page 0 under an
-                # all--inf mask and contribute zero; chunk 0 still holds every real
-                # row's block 0, so the running max stays finite.
+                # Padding columns gather page 0 under an all--inf mask and
+                # contribute zero; chunk 0 still holds every real row's block 0,
+                # so the running max stays finite.
                 blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
@@ -1085,11 +1084,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
     def _batched_decode_supported(self) -> bool:
-        """Whether this layer can ever take the batched decode path.
-
-        The batch-independent half of the preconditions, so the warmup recorder
-        gates on exactly the rules dispatch does.
-        """
+        """The batch-independent preconditions, so the warmup recorder can share them."""
         # Off by default: the batched matmul pads every sequence row up to the
         # bucket width, and that overhead is uncharacterised at the smallest
         # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
@@ -1100,7 +1095,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # to int64 and fails eager; eager takes the per-seq loop instead.
         if not self._compile_attn:
             return False
-        # ALiBi, which the batched kernel doesn't implement.
+        # The batched kernel doesn't implement ALiBi.
         return self.alibi_slopes is None
 
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
@@ -1109,8 +1104,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
             return False
-        # Batch-dependent, so it cannot move into _batched_decode_supported: the
-        # recorder has no batch and must not gate on this.
         return attn_metadata.decode_uniformity >= _BATCHED_DECODE_MIN_UNIFORMITY
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
@@ -1199,9 +1192,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         Called from warmup, after the KV cache exists, since the kernel
         ``index_select``s real pages. Dynamo traces on the first *call*, so each
         variant is invoked once here.
-
-        Covers both kernels: the per-sequence one always, and the batched decode
-        one only when this layer can reach it (``_batched_decode_supported``).
 
         Returns the number of variants invoked. A failing variant is logged and
         skipped, not raised, so it can't take down engine startup; dispatch
@@ -1367,9 +1357,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             try:
                 self._record_batched_one(bucket, k_pages, v_pages, block_size, device)
             except AssertionError:
-                # The staging-width precondition. Swallowing it would leave dispatch
-                # reaching an unrecorded graph, which is the failure this pass exists
-                # to prevent -- so it stays fatal rather than becoming a warning.
+                # Staging-width precondition: swallowing it would leave dispatch
+                # reaching an unrecorded graph, the failure this pass prevents.
                 raise
             except Exception:
                 logger.warning(
@@ -1402,12 +1391,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         blocks_per_chunk = bucket.blocks_per_chunk
         entries = b_seqs * blocks_per_chunk
 
-        # The kernel's store writes out[:b_seqs], and dispatch takes that in-place
-        # path (_run_batched_decode_dispatch's store_out) whenever the buffer is
-        # wide enough. The staging buffers are contiguous at offset 0 in the model
-        # dtype, so they satisfy every other clause of that test; only the width
-        # can fail, and then dispatch would trace the out=None graph instead of
-        # this one.
+        # Width is the only clause of _run_batched_decode_dispatch's store_out test
+        # the staging buffers can fail; too narrow and dispatch traces the out=None
+        # graph instead of this one.
         assert self.staging_rows >= b_seqs, (
             f"staging buffers hold {self.staging_rows} rows, below the num_seqs bucket "
             f"{b_seqs}; the recorded variant would not be the one dispatch reaches"
@@ -1417,18 +1403,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # dispatch key set, which a same-shaped fresh allocation would not match.
         q_staging, out_staging = self._staging_buffers(device)
 
-        # Zeros throughout: page 0 and query row 0 are always valid gathers, and
-        # the values are irrelevant to tracing. Fresh offset-0 tensors per chunk,
-        # matching the builder -- a compiled kernel reads its arguments from
-        # storage offset 0 (torch-spyre#3770), so slices of one stack would not.
+        # Fresh tensor per chunk, matching the builder: a compiled kernel reads its
+        # arguments from storage offset 0 (torch-spyre#3770), so slices of one stack
+        # would not work.
         rep_row_ids = convert(torch.zeros(entries, dtype=torch.int32), device=device)
         chunk_page_ids = [
             convert(torch.zeros(entries, 1, dtype=torch.int32), device=device)
             for _ in range(bucket.num_chunks)
         ]
         # All-zero additive mask: the one choice that cannot leave a row fully
-        # masked, which would make tile_sum 0 and the result NaN. The builder's
-        # -inf on padded rows and blocks is runtime correctness, not shape.
+        # masked (which would make tile_sum 0 and attn NaN).
         mask_by_chunk = convert(
             torch.zeros(
                 bucket.num_chunks,

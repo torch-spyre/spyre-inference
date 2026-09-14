@@ -24,8 +24,8 @@ int for the model graph; a per-sequence attention variant is 2-D (kv_len and
 query_len buckets).
 
 The batched decode kernel specializes on its own key,
-``(num_seqs, blocks_per_chunk, num_chunks)``, so it has its own bucket type and
-its own enumerator (``batched_decode_variants``).
+``(num_seqs, blocks_per_chunk, num_chunks)``, hence a second bucket type and
+enumerator.
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
@@ -62,14 +62,9 @@ _SPYRE_CORE_COUNT = 32
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
-    The rule the batched decode kernel's traced shapes come from, shared by the
-    metadata builder and the warmup recorder so a recorded variant is the one
-    dispatch reaches.
-
     ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
-    them, more than one stick's worth hits a backend axis-merge limit.
-    ``blocks_per_chunk`` need not divide ``b_blocks``, so the block axis pads up
-    to a whole chunk -- ``blocks_per_chunk * num_chunks >= b_blocks``.
+    them, more than one stick's worth hits a backend axis-merge limit. The block
+    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
     blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
@@ -92,12 +87,10 @@ class SpyreAttnBucket:
 class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
-    ``num_seqs`` and ``blocks_per_chunk`` are kernel arguments; ``num_chunks`` is
-    the length of its per-chunk index list, which it unrolls at trace time. All
-    three are what it specializes on. ``num_blocks`` is the block-count bucket
-    they were derived from, kept so the recorder can skip a bucket that outruns
-    the KV allocation; the padded extent the kernel walks is
-    ``blocks_per_chunk * num_chunks``, which is ``>= num_blocks``.
+    The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
+    ``num_chunks`` (the per-chunk index list it unrolls at trace time).
+    ``num_blocks`` is the bucket they were derived from, kept so the recorder can
+    skip a bucket that outruns the KV allocation.
     """
 
     num_seqs: int
@@ -307,13 +300,10 @@ class SpyreAttnBucketer:
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        Empty unless the batched decode path is enabled: it is off by default, and
-        enumerating it would spend warmup tracing a kernel nothing dispatches to.
-
-        The full ``num_seqs_buckets x num_blocks_buckets`` grid, with no pruning:
-        both axes are geometric, so it is ~40 entries even at a 32k context with
-        max_num_seqs=64. Unlike ``variants()`` there is no inter-axis bound to
-        exploit -- a decode batch of any size can sit at any context length.
+        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
+        ``variants()`` there is no inter-axis bound to exploit, since a decode
+        batch of any size can sit at any context length. Both axes are geometric,
+        so the grid stays small.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []

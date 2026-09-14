@@ -449,7 +449,7 @@ class TestLateCompileWarning:
 
 
 class TestRecordBatchedDecode:
-    """The batched decode kernel's variants, which the recorder used to skip entirely."""
+    """Recording the batched decode kernel's variants."""
 
     @pytest.fixture(autouse=True)
     def _enabled(self, monkeypatch):
@@ -518,23 +518,18 @@ class TestRecordBatchedDecode:
     def test_batched_dispatch_after_recording_compiles_nothing(self, impl, kv_cache):
         """The acceptance criterion: a real batched decode batch compiles nothing.
 
-        Drives ``_run_batched_decode_dispatch`` on metadata ``build()`` produced, so a
-        drift between the chunking the builder derives and the one the recorder
-        traces shows up here.
+        Drives dispatch on metadata ``build()`` produced, so a drift between the
+        builder's chunking and the recorder's shows up here.
         """
         from tests.attention.test_spyre_attn import _padded_mask_metadata
 
-        # make_bucketer, not the live config the per-seq tests above use: the batched
-        # key includes num_seqs, and the live config's max_num_seqs=128 outruns the
-        # staging buffers, so those variants would fail the width precondition.
+        # Not the live config the per-seq tests use: its max_num_seqs=128 outruns the
+        # staging buffers, so those variants fail the width precondition.
         bucketer = make_bucketer()
 
-        # _padded_mask_metadata's block table is arange(num_seqs * max_num_blocks), so
-        # a real batched gather reaches page ids well past the shared kv_cache
-        # fixture's NUM_PAGES. Only this test feeds the builder's own block table to
-        # the kernel -- the per-seq tests fabricate indices -- so it needs a cache
-        # wide enough to index. Recording still runs against NUM_PAGES so the
-        # recordable set is the one the other tests assert on.
+        # _padded_mask_metadata's block table is arange(num_seqs * max_num_blocks), and
+        # this is the only test that feeds it to the kernel, so the cache has to be
+        # wide enough to index those page ids.
         pages = _MIN_BATCHED_SEQS * NUM_PAGES
         wide_cache = SpyrePagedKVCache(
             k_pages=torch.zeros(pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16),

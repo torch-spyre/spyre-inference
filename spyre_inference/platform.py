@@ -486,6 +486,15 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = aligned
 
+        # The attention KV buckets are powers of two starting at block_size; a
+        # non-power-of-two block size makes that ladder start off-grid, so block
+        # counts stop being a clean doubling sequence.
+        if aligned & (aligned - 1):
+            raise ValueError(
+                f"Block size must be a power of two for the Spyre paged attention "
+                f"backend, got {aligned}."
+            )
+
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)

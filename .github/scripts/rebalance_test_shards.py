@@ -68,6 +68,12 @@ SUITES = [
         "collect_upstream": False,
     },
     {"key": "probe", "makefile_name": "probes", "var": "PROBE_SHARDS", "collect_upstream": False},
+    {
+        "key": "quality",
+        "makefile_name": "model-quality",
+        "var": "QUALITY_SHARDS",
+        "collect_upstream": False,
+    },
 ]
 
 

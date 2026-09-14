@@ -219,9 +219,8 @@ tests:
         - test: "test_replace_token_matches"
           mode: mandatory_pass
           tags: [multimodal, upstream]
-        - test: "test_apply_matches_*"
-          mode: mandatory_pass
-          tags: [multimodal, upstream]
+        # test_apply_matches_* excluded: upstream wall-clock perf guards, not Spyre
+        # coverage, and the scaling ratio flakes under GC/host contention here.
 
     - rel_path: tests/multimodal/test_inputs.py
       allow_list:

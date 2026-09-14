@@ -17,14 +17,6 @@
 import torch
 
 
-def alibi_tile_shape(
-    num_kv_heads: int, num_queries_per_kv: int, block_size: int
-) -> tuple[int, int, int, int]:
-    """Shape of one per-block ALiBi bias tile; derived at the construction site in
-    ``SpyreAttentionImpl._online_softmax_attention``."""
-    return (num_kv_heads, num_queries_per_kv, 1, block_size)
-
-
 def page_attn_kernel(
     query,
     query_row_index,

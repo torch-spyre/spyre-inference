@@ -44,7 +44,7 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK, stick_aligned_len
-from spyre_inference.v1.attention.ops.page_attn import alibi_tile_shape, page_attn_kernel
+from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
@@ -391,15 +391,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
-        # Owned here, not by the recorder, so a bucket build() can emit is
-        # always a bucket that was compiled: the warmup recorder reads this
-        # same instance back (spyre_model_runner._record_attention_graphs)
-        # rather than constructing a second one that could drift.
+        # record_graphs() enumerates this same instance, so the buckets warmup
+        # compiles are exactly the ones build() can round onto.
         self._attn_bucketer = SpyreAttnBucketer(vllm_config)
 
         self._init_reorder_batch_threshold(
             reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
         )
+
+    @property
+    def attn_bucketer(self) -> SpyreAttnBucketer:
+        return self._attn_bucketer
 
     def _get_zero_tile(self, aligned_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
@@ -708,8 +710,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             # Padded tiles need no special construction — kv_valid = kv_pos <
             # seq_lens already emits finfo.min past the true length.
-            # Each tile is [aligned_query_lens[s], block_size] -- _record_one
-            # builds same-shaped zero tiles by hand; keep them in sync.
             attention_mask_tiles = [[] for _ in range(num_seqs)]
             for aligned_query_len in sorted(set(aligned_query_lens)):
                 group = [s for s in range(num_seqs) if aligned_query_lens[s] == aligned_query_len]
@@ -762,7 +762,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 attention_mask_tiles.append(tiles)
 
         # Sized per sequence, each its own allocation: a batch-max width becomes a
-        # Dynamo guard the key cannot carry, and a fresh buffer matches _record_one's.
+        # Dynamo guard the key cannot carry.
         num_active = [len(tiles) for tiles in attention_mask_tiles]
         page_index_tables_cpu = []
         for s, n in enumerate(num_active):
@@ -903,6 +903,30 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             rep_row_ids_cpu=rep_row_ids_cpu,
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
+        )
+
+    def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
+        """Metadata for the one-sequence batch that dispatches to ``bucket``."""
+        query_len = self._attn_bucketer.min_real_query_len(bucket.padded_query_len)
+        kv_len = bucket.num_blocks * self.block_size
+        assert query_len <= kv_len, f"{bucket} pairs a query length no sequence can reach"
+        query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
+        # Every block points at page 0, vLLM's null block: nothing real is read.
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=CommonAttentionMetadata(
+                query_start_loc=query_start_loc,
+                query_start_loc_cpu=query_start_loc,
+                seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+                num_reqs=1,
+                num_actual_tokens=query_len,
+                max_query_len=query_len,
+                max_seq_len=kv_len,
+                block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
+                slot_mapping=torch.zeros(query_len, dtype=torch.int64),
+                causal=True,
+                is_prefilling=torch.tensor([query_len > 1]),
+            ),
         )
 
 
@@ -1134,7 +1158,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if attn_metadata.page_index_tables is None:
             tables_cpu = attn_metadata.page_index_tables_cpu
             assert tables_cpu is not None
-            # Fresh offset-0 allocations, matching what _record_one traces.
+            # Fresh offset-0 allocations (torch-spyre#3770).
             attn_metadata.page_index_tables = [
                 convert(table, device=_target_device) for table in tables_cpu
             ]
@@ -1183,28 +1207,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def record_graphs(
         self,
-        device: torch.device,
-        bucketer: "SpyreAttnBucketer",
+        layer: AttentionLayer,
         kv_cache: SpyrePagedKVCache,
+        builder: "SpyreAttentionMetadataBuilder",
     ) -> int:
-        """Compile every attention variant the bucketer enumerates.
+        """Compile every attention variant the builder's bucketer enumerates.
 
         Called from warmup, after the KV cache exists, since the kernel
-        ``index_select``s real pages. Dynamo traces on the first *call*, so each
-        variant is invoked once here.
-
-        Returns the number of variants invoked. A failing variant is logged and
-        skipped, not raised, so it can't take down engine startup; dispatch
-        falls back to compiling it on first use.
+        ``index_select``s real pages. A failing variant is logged and skipped, not
+        raised, so it cannot take down engine startup; dispatch then compiles it on
+        first use.
         """
         if not self._compile_attn:
             return 0
 
         k_pages, v_pages = kv_cache
         num_pages, block_size = k_pages.shape[0], k_pages.shape[1]
-        variants = bucketer.variants()
+        variants = builder.attn_bucketer.variants()
         decode_variants = (
-            bucketer.batched_decode_variants() if self._batched_decode_supported() else []
+            builder.attn_bucketer.batched_decode_variants()
+            if self._batched_decode_supported()
+            else []
         )
         t_start = time.time()
 
@@ -1221,13 +1244,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             len(decode_variants),
         )
         try:
-            recorded = self._record_all(variants, k_pages, v_pages, num_pages, block_size, device)
+            recorded = self._record_all(variants, layer, kv_cache, builder, num_pages)
             recorded_decode = self._record_batched_all(
-                decode_variants, k_pages, v_pages, num_pages, block_size, device
+                decode_variants, k_pages, v_pages, num_pages, block_size, k_pages.device
             )
         finally:
             torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
 
+        if recorded == 0 and variants:
+            # Recording nothing is a broken pass, not a degenerate bucket set: the
+            # fallback is a full Inductor compile on every shape mid-serving.
+            logger.warning_once(
+                "Recorded none of the %d attention variants; every shape will compile "
+                "on first use. The per-variant warnings above carry the reason.",
+                len(variants),
+            )
         logger.info(
             "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
@@ -1241,21 +1272,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _record_all(
         self,
         variants: "list[SpyreAttnBucket]",
-        k_pages: torch.Tensor,
-        v_pages: torch.Tensor,
+        layer: AttentionLayer,
+        kv_cache: SpyrePagedKVCache,
+        builder: "SpyreAttentionMetadataBuilder",
         num_pages: int,
-        block_size: int,
-        device: torch.device,
     ) -> int:
-        recorded = 0
+        recorded: set[SpyreAttnBucket] = set()
         for i, bucket in enumerate(variants, start=1):
             if bucket.num_blocks > num_pages:
-                # The buckets are sized from max_model_len; a small KV allocation
-                # cannot host that many distinct pages to gather.
+                # The buckets are sized from max_model_len; a memory-constrained cache
+                # allocates fewer pages than that many distinct blocks to gather.
                 continue
             t0 = time.time()
             try:
-                self._record_one(bucket, k_pages, v_pages, block_size, device)
+                realized = self._record_one(bucket, layer, kv_cache, builder, recorded)
             except Exception:
                 logger.warning(
                     "Attention variant %s failed to record; it will compile on first use instead.",
@@ -1263,80 +1293,53 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     exc_info=True,
                 )
                 continue
-            recorded += 1
+            if realized is None:
+                continue
+            recorded.add(realized)
             logger.debug(
                 "  [%d/%d] recorded %s in %.2fs",
                 i,
                 len(variants),
-                bucket,
+                realized,
                 time.time() - t0,
             )
-        return recorded
+        return len(recorded)
 
     def _record_one(
         self,
         bucket: "SpyreAttnBucket",
-        k_pages: torch.Tensor,
-        v_pages: torch.Tensor,
-        block_size: int,
-        device: torch.device,
-    ) -> None:
-        """Trace one variant on dummy args matching the kernel's shape contract."""
-        q_len = bucket.padded_query_len
-        self._assert_query_fits_staging(q_len)
-
-        # Trace on the buffers dispatch passes: Dynamo also guards device layout and
-        # dispatch key set, which a same-shaped fresh allocation would not match.
-        q_staging, out_staging = self._staging_buffers(device)
-        query = q_staging
-
-        # Row table width is stick-aligned exactly as _build_query_row_tables does.
-        index_len = stick_aligned_len(q_len)
-        rows = torch.zeros(index_len, dtype=torch.int32)
-        rows[:q_len] = torch.arange(q_len, dtype=torch.int32)
-        row_table = convert(rows, device=device)
-
-        page_index_table = convert(
-            torch.zeros(bucket.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
-            device=device,
+        layer: AttentionLayer,
+        kv_cache: SpyrePagedKVCache,
+        builder: "SpyreAttentionMetadataBuilder",
+        recorded: "set[SpyreAttnBucket]",
+    ) -> "SpyreAttnBucket | None":
+        """Trace the kernel ``bucket`` needs; None if ``build()`` realized one already traced."""
+        attn_metadata = builder.build_for_variant(bucket)
+        assert attn_metadata.attention_mask_tiles is not None
+        realized = SpyreAttnBucket(
+            num_blocks=len(attn_metadata.attention_mask_tiles[0]),
+            padded_query_len=attn_metadata.aligned_query_lens[0],
         )
+        # Several requested buckets realize onto one kernel: a sliding window leaves
+        # the block count unpadded. Without a window build() rounds onto the bucketer's
+        # own buckets, so a mismatch means the two have drifted and dispatch can ask
+        # for a kernel warmup never recorded.
+        if realized != bucket and builder.sliding_window is None:
+            logger.warning(
+                "Attention variant %s realized as %s without a sliding window; the "
+                "bucketer and build() have diverged and some shapes will compile on "
+                "first use.",
+                bucket,
+                realized,
+            )
+        if realized in recorded:
+            return None
 
-        # All-zero additive tiles: values are irrelevant to tracing, and zero is
-        # the one choice that cannot leave a row fully masked (which would make
-        # tile_sum 0 and attn NaN).
-        mask_tiles = [
-            convert(torch.zeros(q_len, block_size, dtype=self.model_dtype), device=device)
-            for _ in range(bucket.num_blocks)
-        ]
-
-        alibi_bias_tiles = None
-        if self.alibi_slopes is not None:
-            tile_shape = alibi_tile_shape(self.num_kv_heads, self.num_queries_per_kv, block_size)
-            alibi_bias_tiles = [
-                convert(
-                    torch.zeros(tile_shape, dtype=self.model_dtype),
-                    device=device,
-                )
-                for _ in range(bucket.num_blocks)
-            ]
-
-        self._attn_fn(
-            query,
-            row_table,
-            k_pages,
-            v_pages,
-            page_index_table,
-            mask_tiles,
-            self.scale,
-            bucket.num_blocks,
-            q_len,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_size,
-            self.logits_soft_cap,
-            alibi_bias_tiles,
-            out_staging,
-        )
+        # The staging buffers take the same pre-staged path attn_layer takes, so no
+        # extra copies get traced. key/value are unused: attn_layer does the KV write.
+        q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
+        self.forward(layer, q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
+        return realized
 
     def _record_batched_all(
         self,
@@ -1673,8 +1676,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             #
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
-            #
-            # Shape enforced via alibi_tile_shape, matching _record_one's dummy tiles.
             alibi_bias_tiles: list[torch.Tensor] | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len

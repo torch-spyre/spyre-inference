@@ -262,6 +262,11 @@ class SpyreAttnBucketer:
     def find_blocks_bucket(self, num_blocks: int) -> int | None:
         return self._round_up(num_blocks, self._num_blocks_buckets)
 
+    def min_real_query_len(self, padded_query_len: int) -> int:
+        """Smallest runtime query_len that rounds up onto ``padded_query_len``."""
+        idx = bisect.bisect_left(self._query_buckets, padded_query_len)
+        return self._query_buckets[idx - 1] + 1 if idx else 1
+
     @staticmethod
     def _round_up(n: int, buckets: list[int]) -> int | None:
         idx = bisect.bisect_left(buckets, n)
@@ -280,17 +285,11 @@ class SpyreAttnBucketer:
         dispatches to a large padded bucket; bounding by the bucket would prune
         that variant and put a compile back in the serving path.
         """
-        # Smallest real query_len that rounds up to each bucket: one past the
-        # bucket below (1 for the smallest).
-        ascending = sorted(self._query_buckets)
-        min_real_query = {
-            bucket: (ascending[i - 1] + 1 if i else 1) for i, bucket in enumerate(ascending)
-        }
         out: list[SpyreAttnBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             max_query_here = num_blocks * self.block_size
             for padded_query_len in sorted(self._query_buckets, reverse=True):
-                if min_real_query[padded_query_len] > max_query_here:
+                if self.min_real_query_len(padded_query_len) > max_query_here:
                     continue
                 out.append(
                     SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len)

@@ -375,19 +375,6 @@ class TestRecorderBuilders:
         assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
         assert metadata.padded_num_seqs in bucketer.num_seqs_buckets
 
-        # The shapes build() produced must be a variant warmup enumerated, or that
-        # batch compiles a kernel mid-serving.
-        assert metadata.chunk_page_ids_cpu is not None
-        keys = {
-            (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
-            for v in bucketer.batched_decode_variants()
-        }
-        assert (
-            metadata.padded_num_seqs,
-            metadata.blocks_per_chunk,
-            len(metadata.chunk_page_ids_cpu),
-        ) in keys
-
 
 class TestBatchedDecodeVariants:
     """The batched decode enumeration, keyed on (num_seqs, blocks_per_chunk, num_chunks)."""

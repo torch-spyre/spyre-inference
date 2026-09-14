@@ -142,8 +142,8 @@ def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
     return SpyreAttnBucketer(config)
 
 
-def _recordable(bucketer) -> list[SpyreAttnBucket]:
-    return [v for v in bucketer.variants() if v.num_blocks <= NUM_PAGES]
+def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
+    return [v for v in bucketer.variants() if v.num_blocks <= pages]
 
 
 def _record(impl, kv_cache, builder) -> int:
@@ -157,6 +157,11 @@ def _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len):
     impl._record_one(
         SpyreAttnBucket(num_blocks, padded_query_len), MagicMock(), kv_cache, builder, set()
     )
+
+
+def _dispatch_batched(impl, builder, kv_cache, bucket):
+    """``_dispatch`` for the batched decode kernel."""
+    impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set())
 
 
 class TestRecordGraphs:
@@ -540,6 +545,11 @@ class TestLateCompileWarning:
 class TestRecordBatchedDecode:
     """Recording the batched decode kernel's variants."""
 
+    # entries = num_seqs * blocks_per_chunk tops out at the core count, so a cache
+    # this wide clears the recorder's page-budget skip for every variant. The
+    # per-seq recorder is still bounded by NUM_PAGES, hence the two page counts.
+    PAGES = 64
+
     @pytest.fixture(autouse=True)
     def _enabled(self, monkeypatch):
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
@@ -547,29 +557,45 @@ class TestRecordBatchedDecode:
         yield
         envs.clear_env_cache()
 
-    @staticmethod
-    def _recordable_batched(bucketer) -> list:
-        return [v for v in bucketer.batched_decode_variants() if v.num_blocks <= NUM_PAGES]
+    @pytest.fixture()
+    def wide_cache(self):
+        shape = (self.PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        return SpyrePagedKVCache(
+            k_pages=torch.zeros(shape, dtype=torch.float16),
+            v_pages=torch.zeros(shape, dtype=torch.float16),
+        )
 
-    def test_records_every_enumerated_batched_variant(self, impl, kv_cache, builder):
+    @classmethod
+    def _recordable_batched(cls, bucketer, pages: int | None = None) -> list:
+        pages = cls.PAGES if pages is None else pages
+        return [
+            v for v in bucketer.batched_decode_variants() if v.num_seqs * v.blocks_per_chunk < pages
+        ]
+
+    def _expected(self, bucketer, batched: int) -> int:
+        return len(_recordable(bucketer, self.PAGES)) + batched
+
+    def test_records_every_enumerated_batched_variant(self, impl, wide_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
 
-        recorded = _record(impl, kv_cache, builder)
+        recorded = _record(impl, wide_cache, builder)
 
         batched = self._recordable_batched(bucketer)
-        assert batched, "config enumerates no batched variants, so this would pass vacuously"
-        assert recorded == len(_recordable(bucketer)) + len(batched)
+        assert len(batched) == len(bucketer.batched_decode_variants()), (
+            "the cache is too small to record the whole enumeration, so this would not cover it"
+        )
+        assert recorded == self._expected(bucketer, len(batched))
 
     def test_records_nothing_batched_when_the_flag_is_off(
-        self, impl, kv_cache, builder, monkeypatch
+        self, impl, wide_cache, builder, monkeypatch
     ):
         monkeypatch.delenv("SPYRE_BATCHED_DECODE", raising=False)
         envs.clear_env_cache()
         bucketer = builder._attn_bucketer = make_bucketer()
 
-        assert _record(impl, kv_cache, builder) == len(_recordable(bucketer))
+        assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
 
-    def test_alibi_layer_records_nothing_batched(self, default_vllm_config, kv_cache, builder):
+    def test_alibi_layer_records_nothing_batched(self, default_vllm_config, wide_cache, builder):
         """The batched kernel doesn't implement ALiBi, so those layers never dispatch to it."""
         torch._dynamo.reset()
         get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
@@ -583,72 +609,85 @@ class TestRecordBatchedDecode:
         )
         bucketer = builder._attn_bucketer = make_bucketer()
 
-        assert _record(alibi_impl, kv_cache, builder) == len(_recordable(bucketer))
+        assert _record(alibi_impl, wide_cache, builder) == self._expected(bucketer, 0)
 
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
-        bucketer = builder._attn_bucketer = make_bucketer(max_model_len=4096)
+        """The gather's entry axis, not the block count, is what a small cache bounds."""
+        bucketer = builder._attn_bucketer = make_bucketer()
 
         recorded = _record(impl, kv_cache, builder)
 
-        batched = self._recordable_batched(bucketer)
+        batched = self._recordable_batched(bucketer, pages=NUM_PAGES)
         assert len(batched) < len(bucketer.batched_decode_variants())
         assert recorded == len(_recordable(bucketer)) + len(batched)
 
-    def test_re_recording_compiles_nothing(self, impl, kv_cache, builder):
+    def test_re_recording_compiles_nothing(self, impl, wide_cache, builder):
         builder._attn_bucketer = make_bucketer()
-        first = _record(impl, kv_cache, builder)
+        first = _record(impl, wide_cache, builder)
 
         snapshot = compiles()
-        assert _record(impl, kv_cache, builder) == first
+        assert _record(impl, wide_cache, builder) == first
         assert compiles() == snapshot
 
-    def test_batched_dispatch_after_recording_compiles_nothing(self, impl, kv_cache, builder):
-        """The acceptance criterion: a real batched decode batch compiles nothing.
+    def test_batched_buckets_collapsing_onto_one_kernel_record_once(
+        self, impl, wide_cache, sliding_window_builder
+    ):
+        """Deduping on the realized key must not drop a graph dispatch needs."""
+        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        requested = self._recordable_batched(bucketer)
 
-        Drives dispatch on metadata ``build()`` produced, so a drift between the
-        builder's chunking and the recorder's shows up here.
-        """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
-
-        # Not the live config the per-seq tests use: its max_num_seqs=128 outruns the
-        # staging buffers, so those variants fail the width precondition.
-        bucketer = builder._attn_bucketer = make_bucketer()
-
-        # _padded_mask_metadata's block table is arange(num_seqs * max_num_blocks), and
-        # this is the only test that feeds it to the kernel, so the cache has to be
-        # wide enough to index those page ids.
-        pages = _MIN_BATCHED_SEQS * NUM_PAGES
-        wide_cache = SpyrePagedKVCache(
-            k_pages=torch.zeros(pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16),
-            v_pages=torch.zeros(pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE, dtype=torch.float16),
+        recorded = _record(impl, wide_cache, sliding_window_builder)
+        # The window collapses both axes, so the total is below what either
+        # enumeration asks for on its own.
+        assert recorded < self._expected(bucketer, len(requested)), (
+            "nothing collapsed; the dedupe path is untested"
         )
+
+        # Every requested bucket must still reach a traced graph.
+        snapshot = compiles()
+        for bucket in requested:
+            _dispatch_batched(impl, sliding_window_builder, wide_cache, bucket)
+        assert compiles() == snapshot
+
+    def test_batched_dispatch_after_recording_compiles_nothing(self, impl, wide_cache, builder):
+        """The acceptance criterion: no batched decode batch compiles a new variant.
+
+        Dispatch goes through ``build()`` and ``forward()``, so a drift between the
+        builder's chunking and what the bucketer enumerates shows up here.
+        """
+        bucketer = builder._attn_bucketer = make_bucketer()
         _record(impl, wide_cache, builder)
 
         snapshot = compiles()
-        for kv_len in (65, 200):
-            metadata = _padded_mask_metadata(
-                [(1, kv_len)] * _MIN_BATCHED_SEQS,
-                block_size=BLOCK_SIZE,
-                num_query_heads=NUM_HEADS,
-                num_kv_heads=NUM_KV_HEADS,
-                head_size=HEAD_SIZE,
-                max_num_blocks=NUM_PAGES,
-            )
-            assert metadata.padded_num_seqs is not None, "builder declined the batched path"
-            assert metadata.padded_batch_blocks is not None
-            assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets, (
-                f"kv_len={kv_len} produced an unrecorded block count"
-            )
-
-            # What forward() does before dispatch; no device, so a plain alias.
-            assert metadata.rep_row_ids_cpu is not None
-            assert metadata.chunk_page_ids_cpu is not None
-            assert metadata.mask_by_chunk_cpu is not None
-            metadata.rep_row_ids_dev = metadata.rep_row_ids_cpu
-            metadata.chunk_page_ids_dev = metadata.chunk_page_ids_cpu
-            metadata.mask_by_chunk_dev = metadata.mask_by_chunk_cpu
-
-            query, output = impl.staging_buffers(torch.device("cpu"))
-            impl._run_batched_decode_dispatch(query, *wide_cache, metadata, output)
-
+        for bucket in self._recordable_batched(bucketer):
+            _dispatch_batched(impl, builder, wide_cache, bucket)
         assert compiles() == snapshot
+
+    def test_real_decode_batch_lands_on_a_recorded_key(self, builder):
+        """A batch the scheduler could hand over must realize a key warmup enumerated."""
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = builder._attn_bucketer = make_bucketer()
+        keys = {
+            (v.num_seqs, v.blocks_per_chunk, v.num_chunks)
+            for v in bucketer.batched_decode_variants()
+        }
+
+        for num_seqs in (_MIN_BATCHED_SEQS, _MIN_BATCHED_SEQS + 1):
+            for kv_len in (65, 200):
+                metadata = _padded_mask_metadata(
+                    [(1, kv_len)] * num_seqs,
+                    block_size=BLOCK_SIZE,
+                    num_query_heads=NUM_HEADS,
+                    num_kv_heads=NUM_KV_HEADS,
+                    head_size=HEAD_SIZE,
+                    max_num_blocks=NUM_PAGES,
+                )
+                assert metadata.padded_num_seqs is not None, "builder declined the batched path"
+                assert metadata.chunk_page_ids_cpu is not None
+                key = (
+                    metadata.padded_num_seqs,
+                    metadata.blocks_per_chunk,
+                    len(metadata.chunk_page_ids_cpu),
+                )
+                assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"

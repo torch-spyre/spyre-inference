@@ -67,6 +67,52 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 
 `block_sizes: [64, 128]` sweeps block size as an extra axis.
 
+## LX-resident kernel
+
+`--kv-layout lx` measures `_lx_page_attn_kernel` instead of the default kernel. It sets
+`SPYRE_LX_KV_LAYOUT=1` before the impl is constructed, allocates the
+`(page, kv_head)`-folded cache with `head_major_kv_layout` exactly as
+`TorchSpyreModelRunner.initialize_kv_cache_tensors` does, and writes both the history
+and the step's KV through `do_kv_cache_update` with the per-kv-head slot mapping
+`attn_layer.SlotMapping` builds. The folded cache is allocated zeroed and filled on
+device rather than host-populated, so the per-kv-head store path is exercised too. The
+CPU reference reads the pages back and unfolds them, so the gate still compares against
+what the kernel actually read.
+
+Only this layout needs the `SPYRE_LX_KV_LAYOUT` feature to be present; the others run on
+a checkout without it, which is what makes a baseline arm possible.
+
+```bash
+SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbench.py \
+    --config scripts/microbench/configs/granite33_8b_bs128_decode.json --kv-layout lx
+```
+
+Compiled variants only — eager cannot lower the 2-D page gather. Note the LX path caps
+the attention compile's core count for small decode shapes (`_attn_max_cores`);
+`SPYRE_ATTN_MAX_CORES` overrides it.
+
+Shipped sweep configs for the LX-vs-baseline comparison, each run twice — once plain,
+once with `--kv-layout lx`:
+
+| config | axis |
+| --- | --- |
+| `lx_ab_short` | context length, single sequence |
+| `lx_multiseq` | batch size at fixed context |
+| `lx_mixed` | mixed prefill + decode in one batch |
+| `lx_study_chunked_prefill` | chunked prefill, on- and off-bucket kv extents |
+| `lx_pin_probe` | one shape, for reading the LX pin report |
+
+Because `num_blocks` is itself a latency axis — steeply so for the default kernel — every
+config pins it.
+
+`max_model_len` (config key, or `--max-model-len`) sizes the bucketer's `num_blocks`
+buckets. The stub model defaults to 2048, so a sweep reaching longer contexts must raise
+it or those shapes come back as `error` rows.
+
+`--staging-rows` (config key `staging_rows`) shrinks the impl's staging buffers without
+changing the measured shape, to separate the kernel's own cost from the staging
+gather/store cost.
+
 ## Output
 
 Tab-separated, written after every measurement (a crash keeps what completed) plus a

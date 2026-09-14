@@ -1,0 +1,69 @@
+{
+  "run_label": "lx_chunked_prefill",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 64,
+  "max_model_len": 8192,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "chunk_ctx0_kv512",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [512],
+      "extra_cols": {"seqlen": 512, "context_len_cfg": 0, "on_bucket": true, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx512_kv1024",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [1024],
+      "extra_cols": {"seqlen": 1024, "context_len_cfg": 512, "on_bucket": true, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx1024_kv1536",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [1536],
+      "extra_cols": {"seqlen": 1536, "context_len_cfg": 1024, "on_bucket": false, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx1536_kv2048",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [2048],
+      "extra_cols": {"seqlen": 2048, "context_len_cfg": 1536, "on_bucket": true, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx2560_kv3072",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [3072],
+      "extra_cols": {"seqlen": 3072, "context_len_cfg": 2560, "on_bucket": false, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx3584_kv4096",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [4096],
+      "extra_cols": {"seqlen": 4096, "context_len_cfg": 3584, "on_bucket": true, "decode_share": 0.0}
+    },
+    {
+      "name": "chunk_ctx7680_kv8192",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [8192],
+      "extra_cols": {"seqlen": 8192, "context_len_cfg": 7680, "on_bucket": true, "decode_share": 0.0}
+    }
+  ]
+}

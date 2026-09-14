@@ -1,0 +1,50 @@
+{
+  "run_label": "lx_ab_short",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 64,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "decode_ctx512",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        512
+      ],
+      "extra_cols": {
+        "seqlen": 512,
+        "decode_share": 1.0
+      }
+    },
+    {
+      "name": "decode_ctx1024",
+      "capture_type": "decode",
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        1024
+      ],
+      "extra_cols": {
+        "seqlen": 1024,
+        "decode_share": 1.0
+      }
+    }
+  ],
+  "block_sizes": [
+    128
+  ]
+}

@@ -1248,10 +1248,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
-        # Off by default: the batched matmul pads every sequence row up to the
-        # bucket width, and that overhead is uncharacterised at the smallest
-        # bucket (num_seqs == _MIN_BATCHED_SEQS), where there is no headroom.
-        # Set SPYRE_BATCHED_DECODE=1 to restore the path.
+        # Batches below _MIN_BATCHED_SEQS take the per-seq loop regardless: the
+        # num_seqs ladder starts there, so they have no batched variant to
+        # dispatch to. Set SPYRE_BATCHED_DECODE=0 to force the loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index

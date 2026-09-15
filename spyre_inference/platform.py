@@ -583,10 +583,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
-        # default scheduler
-        scheduler_class = "vllm.v1.core.sched.scheduler.Scheduler"
-        # if a torch spyre specific scheduler class is needed it can be loaded with
-        # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
+        # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
+        scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 

@@ -1511,25 +1511,28 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
 # ---------------------------------------------------------------------------
 
 
-def test_clear_kv_tail_only_when_step_enters_block(default_vllm_config):
-    impl = SpyreAttentionImpl(num_heads=2, head_size=64, scale=0.125, num_kv_heads=2)
-    shape = (3, 64, 2, 64)
-    cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
-    impl.kv_slot_views(cache)
-
-    metadata = Mock(
-        block_size=64,
+def test_masked_kv_slot_ranges_covers_tail_only_when_step_enters_block():
+    """Seq 0's step first writes into block 1; seq 1 entered its last block earlier."""
+    ranges = SpyreAttentionMetadataBuilder._masked_kv_slot_ranges(
         num_seqs=2,
-        seq_lens=torch.tensor([70, 80]),
-        query_lens=torch.tensor([10, 1]),
+        block_size=64,
+        seq_lens_list=[70, 80],
+        query_lens_list=[10, 1],
         block_table=torch.tensor([[0, 1], [0, 2]], dtype=torch.int32),
     )
-    impl._clear_masked_kv_slots(metadata)
+    # Null slot always; then block 1's tail (slots 70..128). Seq 1 contributes nothing.
+    assert ranges == [(NULL_SLOT, NULL_SLOT + 1), (70, 128)]
 
-    for pages in cache:
-        assert torch.count_nonzero(pages[1, 6:]) == 0
-        assert torch.all(pages[1, :6] == -7)
-        assert torch.all(pages[2] == -7)
+
+def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
+    ranges = SpyreAttentionMetadataBuilder._masked_kv_slot_ranges(
+        num_seqs=1,
+        block_size=64,
+        seq_lens_list=[128],
+        query_lens_list=[1],
+        block_table=torch.tensor([[1, 2]], dtype=torch.int32),
+    )
+    assert ranges == [(NULL_SLOT, NULL_SLOT + 1)]
 
 
 @pytest.mark.parametrize(
@@ -1639,27 +1642,21 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
     )
 
 
-def test_clear_masked_kv_slots_zeroes_the_null_slot(default_vllm_config):
-    """Every padded block column gathers the null slot, so it cannot keep a value."""
+def test_clear_masked_kv_slots_zeroes_exactly_the_given_ranges(default_vllm_config):
+    """Including for a layer whose views were never pre-built (`attn_layer` declined it)."""
     impl = SpyreAttentionImpl(num_heads=2, head_size=64, scale=0.125, num_kv_heads=2)
     shape = (3, 64, 2, 64)
     cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
-    impl.kv_slot_views(cache)
+    metadata = Mock(masked_kv_slot_ranges=[(NULL_SLOT, NULL_SLOT + 1), (70, 128)])
 
-    metadata = Mock(
-        # Block-aligned, so the tail branch clears nothing.
-        block_size=64,
-        num_seqs=1,
-        seq_lens=torch.tensor([128]),
-        query_lens=torch.tensor([1]),
-        block_table=torch.tensor([[1, 2]], dtype=torch.int32),
-    )
-    impl._clear_masked_kv_slots(metadata)
+    impl._clear_masked_kv_slots(cache, metadata)
 
     for pages in cache:
         assert torch.all(pages[0, NULL_SLOT] == 0), "the null slot kept a value"
         assert torch.all(pages[0, NULL_SLOT + 1 :] == -7)
-        assert torch.all(pages[1] == -7) and torch.all(pages[2] == -7)
+        assert torch.count_nonzero(pages[1, 6:]) == 0
+        assert torch.all(pages[1, :6] == -7)
+        assert torch.all(pages[2] == -7)
 
 
 # (label, block_indices, block_offsets)

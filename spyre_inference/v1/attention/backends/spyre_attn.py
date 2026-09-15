@@ -270,6 +270,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # (1 for a decoding sequence), for stable kernel compilation.
     aligned_query_lens: list[int] = field(default_factory=list)
 
+    # Slot ranges the impl zeroes before reading (torch-spyre#4517): the null slot, plus
+    # any partial block this step first wrote into. Computed here so a 40-layer model
+    # pays the host cost once per step, not once per layer.
+    masked_kv_slot_ranges: list[tuple[int, int]] = field(default_factory=list)
+
     # Per-sequence padded active-block count, rounded up onto the recorder's
     # buckets; equals len(attention_mask_tiles[s]). None on the sliding-window
     # path, which is left unpadded (see build()).
@@ -417,6 +422,33 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             tile = torch.zeros((aligned_query_len, self.block_size), dtype=self.model_dtype)
             self._zero_tiles[aligned_query_len] = tile
         return tile
+
+    @staticmethod
+    def _masked_kv_slot_ranges(
+        num_seqs: int,
+        block_size: int,
+        seq_lens_list: list[int],
+        query_lens_list: list[int],
+        block_table: torch.Tensor,
+    ) -> list[tuple[int, int]]:
+        """Slot ranges the kernel gathers under the mask but no real token wrote.
+
+        The null slot every step; a partial block's tail only on the step that first
+        writes that block, since later decode steps retain the zero tail.
+        """
+        ranges = [(attn_layer.NULL_SLOT, attn_layer.NULL_SLOT + 1)]
+        for seq in range(num_seqs):
+            kv_len = int(seq_lens_list[seq])
+            if kv_len <= 0:
+                continue
+            last = (kv_len - 1) // block_size
+            block_start = last * block_size
+            used = kv_len - block_start
+            if used >= block_size or kv_len - int(query_lens_list[seq]) > block_start:
+                continue
+            block_id = int(block_table[seq, last].item())
+            ranges.append((block_id * block_size + used, (block_id + 1) * block_size))
+        return ranges
 
     def _pad_num_blocks(self, num_blocks: int) -> int:
         """Round an active-block count up onto the recorder's num_blocks buckets.
@@ -673,9 +705,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         num_seqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc[1 : num_seqs + 1] - query_start_loc[:num_seqs]
+        query_lens_list = query_lens.tolist()
+        seq_lens_list = seq_lens.tolist()
 
         aligned_query_lens: list[int] = []
-        for query_len in query_lens.tolist():
+        for query_len in query_lens_list:
             if query_len <= 1:
                 aligned_query_lens.append(1)
                 continue
@@ -704,7 +738,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # causal context_len, and ALiBi offset, all of which need the true
             # length. The padded block count is carried separately.
             for s in range(num_seqs):
-                n = (int(seq_lens[s].item()) + block_size - 1) // block_size
+                n = (int(seq_lens_list[s]) + block_size - 1) // block_size
                 real_num_blocks.append(n)
             padded_num_blocks = [self._pad_num_blocks(n) for n in real_num_blocks]
 
@@ -743,8 +777,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # window-width quantity, already near-constant across decode steps.
             # TODO: give this its own window-width buckets if it ever needs recording.
             active_block_indices = []
-            query_lens_list = query_lens.tolist()
-            seq_lens_list = seq_lens.tolist()
 
             for s in range(num_seqs):
                 kv_len_s = int(seq_lens_list[s])
@@ -890,6 +922,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             apply_causal_mask=apply_causal_mask,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
+            masked_kv_slot_ranges=self._masked_kv_slot_ranges(
+                num_seqs, block_size, seq_lens_list, query_lens_list, block_table
+            ),
             attention_mask_tiles=attention_mask_tiles,
             active_block_indices=active_block_indices,
             page_index_tables_cpu=page_index_tables_cpu,
@@ -1137,37 +1172,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
-    def _clear_masked_kv_slots(self, attn_metadata: "SpyreAttentionMetadata") -> None:
-        """Zero the gathered-but-unwritten slots: the null slot, and a partial block's tail.
+    def _clear_masked_kv_slots(
+        self, kv_cache: SpyrePagedKVCache, attn_metadata: "SpyreAttentionMetadata"
+    ) -> None:
+        """Zero the slots build() flagged as gathered under the mask but never written.
 
         torch-spyre#4517: fp16 ``exp()`` floors at ``2**-24``, so masked positions keep a
-        softmax weight and their V reaches the output.
+        softmax weight and their V reaches the output. Takes ``kv_cache`` rather than
+        reading ``self._kv_slots`` so layers ``attn_layer`` declines to split -- whose
+        KV write upstream owns -- are covered too.
         """
-        slots = self._kv_slots
-        if slots is None:
-            return
-        k_slots, v_slots = slots
-        block_size = attn_metadata.block_size
-
-        # Rewritten every step (one arbitrary padding token wins `index_copy_`); the
-        # rest of the block is allocated zero and is never a scatter target.
-        k_slots[attn_layer.NULL_SLOT : attn_layer.NULL_SLOT + 1] = 0.0
-        v_slots[attn_layer.NULL_SLOT : attn_layer.NULL_SLOT + 1] = 0.0
-
-        query_lens = attn_metadata.query_lens
-        for seq in range(attn_metadata.num_seqs):
-            kv_len = int(attn_metadata.seq_lens[seq].item())
-            query_len = int(query_lens[seq].item())
-            if kv_len <= 0:
-                continue
-            last = (kv_len - 1) // block_size
-            used = kv_len - last * block_size
-            block_start = last * block_size
-            if used >= block_size or kv_len - query_len > block_start:
-                continue
-            block_id = int(attn_metadata.block_table[seq, last].item())
-            start = block_id * block_size + used
-            end = (block_id + 1) * block_size
+        k_slots, v_slots = self.kv_slot_views(kv_cache)
+        for start, end in attn_metadata.masked_kv_slot_ranges:
             k_slots[start:end] = 0.0
             v_slots[start:end] = 0.0
 
@@ -1653,8 +1669,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
-        # `kv_cache_dummy_dep` orders the scatter ahead of this op.
-        self._clear_masked_kv_slots(attn_metadata)
+        # Must follow the scatter, which `kv_cache_dummy_dep` orders ahead of this op:
+        # the padding tokens it clamps into the null slot are what needs undoing. The
+        # block tails are disjoint from this step's writes, so only the null slot cares.
+        self._clear_masked_kv_slots(SpyrePagedKVCache(k_pages, v_pages), attn_metadata)
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False

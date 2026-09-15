@@ -31,7 +31,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _mirror_mask_tiles,
+    _mirror_mask_stacks,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -1441,12 +1441,14 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"
 
 
-def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, monkeypatch):
-    """Interior blocks sharing the zero tile must cost a single H2D transfer.
+def test_mirror_mask_stacks_one_transfer_per_sequence(default_vllm_config, monkeypatch):
+    """Each sequence's mask tiles become one block-major stack, in one transfer.
 
-    Guards against a regression back to one transfer per block, which is
-    invisible in outputs: the mirrored tiles compare equal either way, so only
-    the transfer count and the device-side object identity distinguish them.
+    `page_attn_kernel` tiles the block axis with for_each_tile, so the tiles
+    must arrive stacked rather than as a list. Two things are worth pinning:
+    the transfer count stays at one per sequence (not one per block), and the
+    stack preserves per-block content and order — a wrong axis order compares
+    equal in shape for a square tile and would only show up as garbled masking.
     """
     torch.set_default_device("cpu")
 
@@ -1469,15 +1471,8 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
     tiles_cpu = metadata.attention_mask_tiles
     assert tiles_cpu is not None
     seq_tiles = tiles_cpu[0]
-    num_distinct = len({id(t) for t in seq_tiles})
-    assert num_distinct < len(seq_tiles), (
-        "builder no longer shares one CPU tile across interior blocks, so this "
-        "test cannot observe the memoization"
-    )
+    assert len(seq_tiles) > 1, "need several blocks for the stack to be meaningful"
 
-    # `convert` short-circuits same-device/same-dtype, so a real CPU->CPU call
-    # would hand back the input and make identity checks vacuous. Count the
-    # calls and return a distinct tensor from each instead.
     calls: list[torch.Tensor] = []
 
     def counting_convert(tensor, device=None, dtype=None):
@@ -1485,19 +1480,27 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
         return tensor.clone()
 
     monkeypatch.setattr(spyre_attn, "convert", counting_convert)
-    tiles_device = _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
+    stacks = _mirror_mask_stacks(tiles_cpu, torch.device("cpu"))
 
-    assert len(calls) == num_distinct, (
-        f"expected {num_distinct} transfers for {len(seq_tiles)} blocks, got {len(calls)}"
+    assert len(calls) == len(tiles_cpu), (
+        f"expected one transfer per sequence ({len(tiles_cpu)}), got {len(calls)}"
     )
 
-    # Blocks that shared a CPU tile must share the mirrored device tensor.
-    for i, tile_i in enumerate(seq_tiles):
-        for j, tile_j in enumerate(seq_tiles):
-            if tile_i is tile_j:
-                assert tiles_device[0][i] is tiles_device[0][j]
-            else:
-                assert tiles_device[0][i] is not tiles_device[0][j]
+    stack = stacks[0]
+    assert stack is not None
+    assert stack.shape == (len(seq_tiles), *seq_tiles[0].shape)
+    for i, tile in enumerate(seq_tiles):
+        torch.testing.assert_close(stack[i], tile)
+
+
+def test_mirror_mask_stacks_none_for_empty_sequence(default_vllm_config):
+    """A sequence with no active blocks yields None, not an empty stack.
+
+    `torch.stack([])` raises, and the dispatch writes zeros for such sequences
+    without consulting the mask, so None is the honest placeholder.
+    """
+    torch.set_default_device("cpu")
+    assert _mirror_mask_stacks([[]], torch.device("cpu")) == [None]
 
 
 # ---------------------------------------------------------------------------

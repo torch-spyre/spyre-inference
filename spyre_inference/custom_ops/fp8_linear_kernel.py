@@ -111,6 +111,8 @@ def _compiled_fp8_scaled_mm(
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
+        # A bfloat16 model cannot use this kernel; `check_and_update_config` rejects
+        # that pairing rather than let float16 output reach a bfloat16 graph.
         out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
     )
 

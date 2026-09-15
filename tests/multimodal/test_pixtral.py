@@ -427,7 +427,7 @@ def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind)
 def test_padded_mask_is_cached_across_layers():
     """The tower hands all 24 layers the same mask object; the O(L²) padded mask
     must be built and uploaded once, not per layer."""
-    from spyre_inference.multimodal.pixtral import _padded_attn_mask
+    from spyre_inference.multimodal.utils import _padded_attn_mask
 
     mask = torch.ones(67, 67, dtype=torch.bool).tril()
     args = (mask, 1, 67, 128, torch.float16, torch.device("cpu"))
@@ -440,7 +440,7 @@ def test_padded_mask_is_cached_across_layers():
 def test_padded_mask_cache_misses_on_a_new_mask():
     """A second image brings a new mask object — the cache must not serve the
     previous image's mask."""
-    from spyre_inference.multimodal.pixtral import _padded_attn_mask
+    from spyre_inference.multimodal.utils import _padded_attn_mask
 
     tril = torch.ones(67, 67, dtype=torch.bool).tril()
     first = _padded_attn_mask(tril, 1, 67, 128, torch.float16, torch.device("cpu"))
@@ -459,7 +459,7 @@ def test_padded_mask_is_released_with_its_source_mask():
     import gc
     import weakref
 
-    from spyre_inference.multimodal.pixtral import _padded_attn_mask
+    from spyre_inference.multimodal.utils import _padded_attn_mask
 
     mask = torch.ones(67, 67, dtype=torch.bool).tril()
     padded = weakref.ref(_padded_attn_mask(mask, 1, 67, 128, torch.float16, torch.device("cpu")))
@@ -475,7 +475,7 @@ def test_padded_mask_is_released_with_its_source_mask():
 def test_padded_keys_are_masked_off(seq, seq_pad):
     """Padded key columns must be `-inf` and real ones must stay unmasked; a
     full-attention source mask (all-zero) must not add masking of its own."""
-    from spyre_inference.multimodal.pixtral import _padded_attn_mask
+    from spyre_inference.multimodal.utils import _padded_attn_mask
 
     source = torch.zeros(seq, seq, dtype=torch.float16)
     m = _padded_attn_mask(source, 1, seq, seq_pad, torch.float16, torch.device("cpu"))

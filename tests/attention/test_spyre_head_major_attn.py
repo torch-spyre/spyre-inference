@@ -114,7 +114,7 @@ def _fresh_pages(
         head_size=head_size,
         dtype=DTYPE,
     )
-    cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, device)
+    cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, device, dtype=DTYPE)
     return cache.k_pages, cache.v_pages
 
 
@@ -756,7 +756,7 @@ def test_head_major_matches_token_major(
             head_size=head_size,
             dtype=DTYPE,
         )
-        kv_cache = impl_cls.allocate_pages(num_blocks, spec, cache_device)
+        kv_cache = impl_cls.allocate_pages(num_blocks, spec, cache_device, dtype=DTYPE)
         _write(impl, kv_cache, hk, hv, hist_slots_t, cache_device)
         _write(impl, kv_cache, key_src, value_src, slot_mapping_t, cache_device)
 

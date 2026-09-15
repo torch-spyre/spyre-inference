@@ -801,6 +801,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
             table[:, 0] = block_table[s, blocks_s]
+            if active_block_indices is None:
+                # vLLM zeroes a row only to its own width, so padded columns can name a
+                # previous tenant's pages. Block 0 is the null block, held at zero.
+                table[real_num_blocks[s] :, 0] = 0
             page_index_tables_cpu.append(table)
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is

@@ -1542,9 +1542,11 @@ def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
     indirect=True,
 )
 def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_device: str):
-    """The same attention twice, changing only the null slot's V, must be bit-identical.
+    """The same attention twice, changing only what the padded blocks can see.
 
-    Padded block columns are zero, so they gather the null slot. The poison is huge
+    Two things a padded block column can name: a previous tenant's page (a reused vLLM
+    row leaves stale ids past the new width) and the null slot (every padding token's K/V
+    is clamped there). Poisoning either must not move the output. The poison is huge
     because one slot at 2**-24 is otherwise below fp16 resolution.
     """
     block_size, num_q_heads, num_kv_heads, head_size = 128, 4, 2, 64
@@ -1570,8 +1572,10 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
     key = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
     value = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
 
-    # Padded columns stay 0, as a cleared vLLM block-table row leaves them.
-    block_table = torch.zeros(1, padded_blocks, dtype=torch.int32)
+    # A reused row leaves a previous tenant's ids past the new width: add_row rewrites
+    # only that width, and clear_row/move_row zero only their own.
+    stale_page = real_blocks + 1
+    block_table = torch.full((1, padded_blocks), stale_page, dtype=torch.int32)
     block_table[0, :real_blocks] = torch.arange(1, real_blocks + 1, dtype=torch.int32)
 
     k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
@@ -1597,11 +1601,12 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
         slot_mapping=slot_mapping,
     )
 
-    def run(null_slot_value: float) -> torch.Tensor:
+    def run(poison: float) -> torch.Tensor:
         cache_device = torch.device(configure_device)
         k_pages = k_pages_cpu.to(cache_device)
         v_pages = v_pages_cpu.clone()
-        v_pages[NULL_SLOT // block_size, NULL_SLOT % block_size] = null_slot_value
+        v_pages[stale_page] = poison
+        v_pages[NULL_SLOT // block_size, NULL_SLOT % block_size] = poison
         v_pages = v_pages.to(cache_device)
 
         impl = SpyreAttentionImpl(
@@ -1636,9 +1641,9 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
     assert not clean.isnan().any(), "attention wrote no output"
     delta = (clean - poisoned).abs().max()
     assert torch.equal(clean, poisoned), (
-        f"the null slot reached the output of a padded block: real={real_blocks} "
-        f"padded={padded_blocks} blocks, max|delta|={float(delta):g}. "
-        f"_clear_masked_kv_slots must hold slot {NULL_SLOT} at zero."
+        f"a padded block reached masked KV: real={real_blocks} padded={padded_blocks} "
+        f"blocks, max|delta|={float(delta):g}. build() must point the padded columns at "
+        f"the null block, and _clear_masked_kv_slots must hold slot {NULL_SLOT} at zero."
     )
 
 

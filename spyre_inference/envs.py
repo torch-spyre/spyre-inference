@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
+    SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
@@ -74,6 +75,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
     #    the per-page permute the kernels do before the matmuls
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
+    # Core cap for the attention compile only, leaving the rest of the model on all 32.
+    # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
+    "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.

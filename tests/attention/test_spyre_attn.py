@@ -1907,11 +1907,10 @@ def test_batched_decode_chunking_covers_every_block(
 
     blocks_per_chunk is capped, not chosen as a divisor, so the block axis has to
     be padded up to a multiple of it. Neither bucket lattice is all powers of two
-    -- _powers_of_two_up_to appends n itself -- so an uneven pair is reachable
-    from ordinary engine args (max_model_len=1536 gives 12 blocks, and 8 does not
-    divide 12). Getting this wrong drops the tail blocks and then raises on the
-    mask reshape, i.e. crashes a decode step. Card-free on purpose: the
-    integration tests all land on power-of-two buckets, where it cannot fire.
+    -- the kv ladder steps by 4/3, and _powers_of_two_up_to appends n itself -- so
+    an uneven pair is reachable from ordinary engine args (max_model_len=1536
+    gives 12 blocks, and 8 does not divide 12). Getting this wrong drops the tail
+    blocks and then raises on the mask reshape, i.e. crashes a decode step.
     """
     from vllm.config import get_current_vllm_config
 
@@ -2524,22 +2523,29 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    ("kv_len", "expected"),
+    "kv_len",
     [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
+        pytest.param(65, id="kv65_just_past_one_block"),
+        pytest.param(300, id="kv300_mid_ladder"),
+        pytest.param(256, id="kv256_exact_noop"),
+        pytest.param(1025, id="kv1025_high_ladder"),
     ],
 )
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len):
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
-    assert expected in buckets
+    block_size = 64
+    real_blocks = (kv_len + block_size - 1) // block_size
+    # Derived, not hardcoded: the ladder's spacing is the bucketer's business, and
+    # the contract here is only that build() rounds up onto it.
+    expected = next(b for b in buckets if b >= real_blocks)
 
     metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
 
     assert metadata.padded_num_blocks == [expected]
+    # The smallest fitting bucket, not merely a fitting one: rounding past it would
+    # pad blocks the sequence never reads.
+    assert not [b for b in buckets if real_blocks <= b < expected]
     assert len(metadata.attention_mask_tiles[0]) == expected
     # One table per sequence, sized to that sequence's own active-block count.
     assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]

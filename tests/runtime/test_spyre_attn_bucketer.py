@@ -22,9 +22,12 @@ import pytest
 
 from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _KV_DENSE_LADDER_CAP,
+    _TOKEN_BUCKET_ANCHOR,
     SpyreAttnBucketer,
     _parse_buckets,
     _powers_of_two_up_to,
+    _token_buckets_up_to,
     batched_decode_chunking,
 )
 
@@ -43,8 +46,18 @@ def make_config(
 
 
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
-    """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
+    """[start, 2*start, ..., limit]."""
     return list(_powers_of_two_up_to(limit, start=start))
+
+
+def _expected_kv(limit: int) -> list[int]:
+    """The kv axis default: 4/3-spaced to the cap, powers of two above."""
+    cap = min(limit, _KV_DENSE_LADDER_CAP)
+    dense = list(_token_buckets_up_to(cap))
+    if cap < limit:
+        seen = set(dense)
+        dense += [b for b in _powers_of_two_up_to(limit, start=cap) if b not in seen]
+    return dense
 
 
 @pytest.fixture()
@@ -61,26 +74,36 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+    def test_kv_buckets_step_by_four_thirds_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == [64, 128, 192, 256, 384, 512, 704, 960, 1024, 2048]
         assert bucketer.kv_buckets[-1] == 2048
 
-    def test_kv_buckets_start_at_block_size(self, bucketer):
-        """Buckets below block_size all collapse to num_blocks == 1, so the
-        smallest bucket is block_size rather than 1."""
-        assert bucketer.kv_buckets[0] == BLOCK_SIZE
+    def test_kv_buckets_step_by_the_ratio_rounded_to_the_anchor(self, bucketer):
+        """Each step is 4/3 rounded up to an anchor multiple, so at worst 1.5x vs 2.0x."""
+        anchor = _TOKEN_BUCKET_ANCHOR
+        # Only the dense rungs follow the ratio: the cap and everything above it are
+        # powers of two, and the top bucket is max_model_len itself.
+        rungs = [kv for kv in bucketer.kv_buckets[:-1] if kv < _KV_DENSE_LADDER_CAP]
+        for lo, hi in zip(rungs, rungs[1:]):
+            expected = max(lo + anchor, -(-lo * 4 // 3))
+            assert hi == -(-expected // anchor) * anchor, f"{lo} -> {hi}"
+            # The anchor floor dominates the first step only; past it the ratio leads.
+            assert hi <= lo * 1.5 or lo == anchor
 
-    @pytest.mark.parametrize("block_size", [64, 128, 256])
-    def test_kv_buckets_start_tracks_block_size(self, block_size):
+    def test_kv_buckets_are_multiples_of_the_anchor(self, bucketer):
+        assert all(kv % _TOKEN_BUCKET_ANCHOR == 0 for kv in bucketer.kv_buckets)
+
+    def test_kv_ladder_switches_to_powers_of_two_above_the_cap(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=32768))
+        above = [kv for kv in b.kv_buckets if kv > _KV_DENSE_LADDER_CAP]
+        assert above == [2048, 4096, 8192, 16384, 32768]
+
+    @pytest.mark.parametrize("block_size", [64, 128, 192, 256])
+    def test_kv_buckets_do_not_track_block_size(self, block_size):
+        """The ladder anchors at a fixed token count; entries below block_size
+        dedupe away in num_blocks_buckets, so block_size does not shape it."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
-
-    def test_kv_buckets_round_non_power_of_two_block_size_up(self):
-        """The platform only forces block_size to a multiple of 64, so a
-        non-power-of-two value is reachable; buckets stay a clean doubling
-        sequence by starting at the next power of two."""
-        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == _expected_kv(4096)
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -96,7 +119,8 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _expected_kv(3000)
+        assert b.kv_buckets[-1] == 3000
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -118,7 +142,7 @@ class TestFindBucket:
         assert bucketer.find_query_bucket(512) == 512
 
     def test_rounds_up(self, bucketer):
-        assert bucketer.find_kv_bucket(257) == 512
+        assert bucketer.find_kv_bucket(257) == 384
         assert bucketer.find_query_bucket(33) == 512
 
     def test_query_len_one_maps_to_decode_bucket(self, bucketer):
@@ -129,7 +153,7 @@ class TestFindBucket:
         for query_len in (2, 33, 129, 511, 512):
             assert bucketer.find_query_bucket(query_len) == 512
 
-    def test_kv_below_block_size_rounds_to_block_size(self, bucketer):
+    def test_kv_below_the_smallest_bucket_rounds_up_to_it(self, bucketer):
         assert bucketer.find_kv_bucket(1) == BLOCK_SIZE
         assert bucketer.find_kv_bucket(BLOCK_SIZE) == BLOCK_SIZE
 

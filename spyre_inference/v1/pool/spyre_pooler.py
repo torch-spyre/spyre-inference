@@ -34,6 +34,7 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.pool.spyre_upcast_linear import replace_linears_with_upcast
 
 logger = init_logger(__name__)
 
@@ -234,6 +235,57 @@ class SpyreCpuClassifier(nn.Module):
         return self.classifier(convert(hidden_states, "cpu").to(self.param_dtype))
 
 
+def _head_modules(model: nn.Module, pooler: nn.Module) -> list[nn.Module]:
+    """Classifier / BERT-style dense heads that hold the large GEMM."""
+    modules: list[nn.Module] = []
+    classifier = getattr(model, "classifier", None)
+    if classifier is not None and not isinstance(classifier, SpyreCpuClassifier):
+        modules.append(classifier)
+    for m in pooler.modules():
+        owned = getattr(m, "classifier", None)
+        if owned is not None and owned is not classifier:
+            modules.append(owned)
+    for encoder_name in ("bert", "roberta"):
+        encoder = getattr(model, encoder_name, None)
+        if encoder is None:
+            continue
+        inner_pooler = getattr(encoder, "pooler", None)
+        if inner_pooler is not None and inner_pooler is not pooler:
+            modules.append(inner_pooler)
+    return modules
+
+
+def prepare_upcast_heads_for_spyre(
+    model: nn.Module, pooler: nn.Module, spyre_device: torch.device
+) -> int:
+    """Swap small fp32 classifier / pooler-dense linears to staggered-K GEMM.
+
+    BERT/RoBERTa sequence heads are the target (issue #868). Already-fp16
+    token heads keep native ``F.linear``. Unaligned-K or wide (vocab-scale)
+    linears stay fp32 and trigger the CPU fallback.
+    """
+    replaced = 0
+    classifier = getattr(model, "classifier", None)
+    if classifier is not None and not isinstance(classifier, SpyreCpuClassifier):
+        wrapped, n = replace_linears_with_upcast(classifier, spyre_device)
+        if wrapped is not classifier:
+            model.classifier = wrapped
+        replaced += n
+    for module in _head_modules(model, pooler):
+        if module is getattr(model, "classifier", None):
+            continue
+        _, n = replace_linears_with_upcast(module, spyre_device)
+        replaced += n
+    if replaced and getattr(model, "head_dtype", None) is not None:
+        model.head_dtype = torch.float16
+    if replaced:
+        logger.info(
+            "Pooling: wrapped %d classifier/pooler Linear(s) with staggered-K upcast GEMM",
+            replaced,
+        )
+    return replaced
+
+
 def run_pooling_tail_on_cpu(model: nn.Module, pooler: nn.Module) -> None:
     """Move pooler and classifier to CPU, wrapping a model-applied classifier."""
     pooler.to("cpu")
@@ -338,8 +390,10 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
 
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
-    is garbage (torch-spyre#2971). False if the method is unknown or the
-    head is an FP32 linear.
+    is garbage (torch-spyre#2971). Small BERT/RoBERTa classifier GEMMs use
+    staggered-K fp32 mul+sum (#868) instead of native fp32 ``F.linear``
+    (torch-spyre#1794). False if the method is unknown or a remaining head
+    is an FP32 linear we cannot wrap.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
@@ -361,9 +415,11 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
     if token_level:
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 
-    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
-    # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
-    # stay on CPU.
+    # Native fp32 F.linear is missing (torch-spyre#1794). Small BERT/RoBERTa
+    # heads use staggered-K mul+sum instead of a CPU GEMM (#868).
+    prepare_upcast_heads_for_spyre(model, pooler, spyre_device)
+    classifier = getattr(model, "classifier", None)
+
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )

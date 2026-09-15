@@ -31,6 +31,7 @@ import re
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
 
@@ -849,6 +850,31 @@ def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
     out = fn(hidden, weight, bias)
     expected = F.linear(hidden.cpu(), weight.cpu(), bias.cpu())
     torch.testing.assert_close(out.cpu(), expected, atol=1e-4, rtol=1e-4)
+
+
+def test_spyre_upcast_linear_classifier_gemm(spyre_device):
+    """BERT-scale ``F.linear`` via staggered-K fp32 mul+sum (issue #868).
+
+    Native fp32 batchmatmul is still missing (the xfail above). This is the
+    serving workaround: fp16 K-innermost inputs, ``.float()`` to DL16_T0_FP32,
+    broadcast mul, sum over K, destagger with ``.to(fp16)``, D2H, then host
+    bias. 1-D ``[N]`` cannot restick onto ``[M, N]`` even after destagger.
+    """
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    torch.manual_seed(0)
+    linear = nn.Linear(64, 3, dtype=torch.float32)
+    x_cpu = torch.randn(8, 64, dtype=torch.float16)
+    ref = F.linear(x_cpu.float(), linear.weight.float(), linear.bias.float())
+
+    wrapped = SpyreUpcastLinear.from_linear(linear, spyre_device)
+    x = x_cpu.to(spyre_device)
+    out = wrapped(x)
+    torch.testing.assert_close(out.cpu().float(), ref, atol=2e-2, rtol=2e-2)
+    del wrapped, x, out
+    import gc
+
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------

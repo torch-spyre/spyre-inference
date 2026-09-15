@@ -574,7 +574,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model.to(device=self._spyre_device)
 
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
-        # FP32 linear heads stay on CPU.
+        # FP32 linear heads stay on CPU unless they are a stick-aligned
+        # BERT/RoBERTa-scale classifier, which uses staggered-K upcast GEMM.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)

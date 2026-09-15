@@ -16,7 +16,8 @@
 
 No Spyre hardware: builds minimal ``SequencePooler`` / ``DispatchPooler`` /
 ``TokenPooler`` graphs and checks CLS/LAST/MEAN/AllPool become Spyre forms.
-FP32 linear heads stay on CPU.
+Stick-aligned BERT/RoBERTa-scale FP32 heads use staggered-K upcast GEMM;
+other FP32 linears still stay on CPU.
 
 Host MEAN crop lives in ``tests/pool/test_spyre_mean_pool.py``. Destagger
 of a device fp32 sum is ``test_spyre_fp32_reduce_d2h_with_destagger``
@@ -113,10 +114,99 @@ def test_configure_pooling_dispatch_patches_embed_last():
 
 def test_configure_pooling_fp32_classifier_falls_back_to_cpu():
     model = _model_with_pooler(_embed_pooler(CLSPool()))
-    model.classifier = nn.Linear(8, 2)  # float32 linear still not on Spyre
+    model.classifier = nn.Linear(8, 2)  # K not stick-aligned; upcast GEMM refuses it
     assert configure_pooling_for_spyre(model, _SPYRE) is False
     # CLS is swapped first; the FP32 linear still forces CPU.
     assert isinstance(model.pooler.pooling, SpyreCLSPool)
+
+
+def test_configure_pooling_upcast_classifier_stays_on_device():
+    """Stick-aligned BERT-scale classifier uses staggered-K GEMM (#868)."""
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    model.classifier = nn.Linear(64, 3)
+    model.head_dtype = torch.float32
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert isinstance(model.classifier, SpyreUpcastLinear)
+    assert model.head_dtype == torch.float16
+    assert model.classifier.weight.dtype == torch.float16
+
+
+def test_configure_pooling_roberta_style_head_is_upcast():
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    class RobertaStyleHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dense = nn.Linear(64, 64)
+            self.out_proj = nn.Linear(64, 2)
+
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    model.classifier = RobertaStyleHead()
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert isinstance(model.classifier.dense, SpyreUpcastLinear)
+    assert isinstance(model.classifier.out_proj, SpyreUpcastLinear)
+
+
+def test_configure_pooling_bert_inner_pooler_is_upcast():
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    class InnerPooler(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dense = nn.Linear(64, 64)
+
+    class Bert(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.pooler = InnerPooler()
+
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    model.bert = Bert()
+    model.classifier = nn.Linear(64, 2)
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert isinstance(model.classifier, SpyreUpcastLinear)
+    assert isinstance(model.bert.pooler.dense, SpyreUpcastLinear)
+
+
+def test_configure_pooling_wide_head_falls_back_to_cpu():
+    """N too large and not square: do not materialize [M, N, K] (vocab heads)."""
+    model = _model_with_pooler(_embed_pooler(CLSPool()))
+    model.classifier = nn.Linear(64, 300)
+    assert configure_pooling_for_spyre(model, _SPYRE) is False
+
+
+def test_upcast_linear_matches_fp32_f_linear():
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    torch.manual_seed(0)
+    linear = nn.Linear(64, 3, dtype=torch.float32)
+    wrapped = SpyreUpcastLinear.from_linear(linear, torch.device("cpu"))
+    x = torch.randn(4, 64, dtype=torch.float16)
+    got = wrapped(x).float()
+    ref = torch.nn.functional.linear(x.float(), linear.weight.float(), linear.bias.float())
+    torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+    x3 = torch.randn(2, 5, 64, dtype=torch.float16)
+    got3 = wrapped(x3).float()
+    ref3 = torch.nn.functional.linear(x3.float(), linear.weight.float(), linear.bias.float())
+    torch.testing.assert_close(got3, ref3, atol=2e-3, rtol=2e-3)
+
+
+def test_upcast_linear_stacked_head_matches_cpu():
+    """Roberta dense then out_proj: first layer D2Hs, second must follow."""
+    from spyre_inference.v1.pool.spyre_upcast_linear import SpyreUpcastLinear
+
+    torch.manual_seed(0)
+    dense = nn.Linear(64, 64, dtype=torch.float32)
+    out_proj = nn.Linear(64, 1, dtype=torch.float32)
+    w_dense = SpyreUpcastLinear.from_linear(dense, torch.device("cpu"))
+    w_out = SpyreUpcastLinear.from_linear(out_proj, torch.device("cpu"))
+    x = torch.randn(4, 64, dtype=torch.float16)
+    got = w_out(torch.tanh(w_dense(x))).float()
+    ref = out_proj(torch.tanh(dense(x.float())))
+    torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
 
 def test_configure_pooling_no_pooler_returns_false():

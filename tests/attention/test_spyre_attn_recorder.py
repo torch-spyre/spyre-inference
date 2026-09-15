@@ -41,9 +41,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _build_query_row_tables,
 )
-from spyre_inference.v1.attention.ops.layout import (
-    stick_aligned_len,
-)
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
@@ -395,7 +392,7 @@ class TestRecordGraphs:
 
         row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
 
-        widths = [(t.shape[-1], stick_aligned_len(al)) for t, al in zip(row_tables, aligned)]
+        widths = [(t.shape[-1], al) for t, al in zip(row_tables, aligned)]
         assert all(got == want for got, want in widths), (
             f"row-table widths {widths} (got, want) differ from the recorder's, so these "
             "sequences dispatch to an unrecorded graph"

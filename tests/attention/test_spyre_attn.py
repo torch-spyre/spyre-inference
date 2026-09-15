@@ -2207,7 +2207,7 @@ def test_spyre_attn_batched_decode_sliding_window(
     ],
 )
 def test_bucketed_block_ids_match_scalar_fill(
-    default_vllm_config, kv_lens: list[int], sliding_window: int | None
+    default_vllm_config, enable_batched_decode, kv_lens: list[int], sliding_window: int | None
 ) -> None:
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]

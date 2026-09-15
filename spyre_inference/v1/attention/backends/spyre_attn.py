@@ -46,7 +46,6 @@ from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kerne
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
     slot_major_kv_layout,
-    stick_aligned_len,
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
@@ -164,10 +163,8 @@ def _build_query_row_tables(
     tables = []
     for s, aligned in enumerate(aligned_query_lens):
         # Width the recorder traced for this query length, not the batch max.
-        index_len = stick_aligned_len(aligned)
-        row = torch.zeros(index_len, dtype=torch.int32)
         last_real = max(int(lens[s]) - 1, 0)
-        row[:aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
+        row = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
         tables.append(convert(row, device=device))
     return tables
 
@@ -836,7 +833,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
         decode_uniformity = 0.0
-        if num_decode_seqs >= _MIN_BATCHED_SEQS:
+        if envs.SPYRE_BATCHED_DECODE and num_decode_seqs >= _MIN_BATCHED_SEQS:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 

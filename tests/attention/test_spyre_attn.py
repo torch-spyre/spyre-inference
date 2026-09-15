@@ -41,13 +41,9 @@ pytestmark = pytest.mark.attention
 
 @pytest.fixture()
 def enable_batched_decode(monkeypatch):
-    """Enable the batched decode kernel for tests that exercise it.
-
-    The path ships gated off (``SPYRE_BATCHED_DECODE``, default "0") pending
-    performance characterisation at the smallest bucket. Without this fixture the
-    batched tests would silently fall back to the per-seq loop and pass while
-    testing nothing. The autouse cache-clearing fixture in ``tests/conftest.py``
-    makes the monkeypatched value visible to ``envs``.
+    """Pin ``SPYRE_BATCHED_DECODE`` on, so the batched tests cannot silently fall
+    back to the per-seq loop if the default changes. The autouse cache-clearing
+    fixture in ``tests/conftest.py`` makes the value visible to ``envs``.
     """
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
@@ -1684,7 +1680,7 @@ class _StubAttentionLayer:
 
     def __init__(self, attn_type: str):
         self.attn_type = attn_type
-        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views", "kv_write_index"])
         self.kv_sharing_target_layer_name = None
         self.query_quant = None
         self.kv_cache: list[torch.Tensor] = []

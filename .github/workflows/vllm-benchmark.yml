@@ -33,6 +33,15 @@ on:
         required: false
         type: boolean
         default: false
+      use_prebaked_image:
+        description: >
+          When true, skip the "Install Spyre RPMs" step. That step pins the
+          spyre-rpms.lock baseline and overrides the runner image's Spyre
+          stack, so a prebaked (spyre-test) run must skip it to test the baked
+          stack as-is. Matches _test_matrix.yaml.
+        required: false
+        type: boolean
+        default: false
       clickhouse_env:
         description: >
           ClickHouse instance to ingest into: "prod" (the CLICKHOUSE_* secret
@@ -116,6 +125,7 @@ jobs:
 
       - name: Install Spyre RPMs
         id: spyre-rpms
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
@@ -138,6 +148,16 @@ jobs:
           uv sync --frozen --verbose --group dev
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
+
+      # Ephemeral runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv that
+      # the sync above ignored; repoint and remove it so `uv run --active` in
+      # perf-tests finds the workspace venv. Mirrors run-matrix-config.
+      - name: Activate the freshly-built venv
+        if: ${{ !inputs.use_prebaked_image }}
+        run: |
+          rm -rf /home/senuser/.venv
+          echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
+          echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
 
       # Slim the cache for setup-uv's post-job save without discarding the
       # compiled torch-spyre/vllm wheels. Must run after the uv sync above.

@@ -126,7 +126,21 @@ class TorchSpyrePlatform(CpuPlatform):
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
+    _head_major_backend_path = (
+        "spyre_inference.v1.attention.backends.spyre_head_major_attn.SpyreHeadMajorAttentionBackend"
+    )
+    _KV_LAYOUTS = ("token_major", "head_major")
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    @classmethod
+    def _decoder_backend_path(cls) -> str:
+        """The decoder attention backend for the requested KV cache layout."""
+        from spyre_inference import envs
+
+        layout = envs.SPYRE_ATTN_KV_LAYOUT
+        if layout not in cls._KV_LAYOUTS:
+            raise ValueError(f"SPYRE_ATTN_KV_LAYOUT={layout!r} is not one of {cls._KV_LAYOUTS}.")
+        return cls._head_major_backend_path if layout == "head_major" else cls._backend_path
 
     @classmethod
     def check_max_model_len(cls, max_model_len: int) -> int:
@@ -263,21 +277,30 @@ class TorchSpyrePlatform(CpuPlatform):
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
+                # Pooling has no 512 limit -- encoder attention compiles (B, L) cells,
+                # not a 512-token body. 2048 is the measured throughput argmax across
+                # pooling models; they regress above it.
+                is_pooling = vllm_config.model_config.runner_type == "pooling"
                 max_capture_size = min(
                     vllm_config.scheduler_config.max_num_batched_tokens,
-                    512,
+                    2048 if is_pooling else 512,
                 )
-                if vllm_config.model_config.runner_type != "pooling":
-                    # Decode packs one token per running sequence; prefill lands on
-                    # the single largest bucket. Denser sizes only cost warmup time.
-                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                    sizes = {max_capture_size, num_seqs}
-                    size = 1
-                    while size < num_seqs:
-                        sizes.add(size)
-                        size *= 2
-                    compile_sizes = sorted(sizes)
-                else:
+                if is_pooling:
+                    # A max-length request must fit the budget or it is never admitted:
+                    # encoder prefill cannot be chunked, so the scheduler head-of-line
+                    # blocks forever. vLLM's verify_max_model_len checks this in
+                    # SchedulerConfig.__post_init__, before this hook, so the cap below
+                    # would slip past it.
+                    model_len = vllm_config.model_config.max_model_len
+                    if max_capture_size < model_len:
+                        logger.warning(
+                            "Raising pooling token budget %d -> %d to fit max_model_len; "
+                            "encoder prefill cannot be chunked.",
+                            max_capture_size,
+                            model_len,
+                        )
+                        max_capture_size = model_len
+
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
                         default_encoder_len_buckets,
                     )
@@ -287,6 +310,16 @@ class TorchSpyrePlatform(CpuPlatform):
                         "Pooling body token buckets (1D compile_sizes): %s",
                         compile_sizes,
                     )
+                else:
+                    # Decode packs one token per running sequence; prefill lands on
+                    # the single largest bucket. Denser sizes only cost warmup time.
+                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                    sizes = {max_capture_size, num_seqs}
+                    size = 1
+                    while size < num_seqs:
+                        sizes.add(size)
+                        size *= 2
+                    compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
             max_capture_size = max(int(s) for s in compile_sizes)
@@ -328,8 +361,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 "SpyreEncoderAttentionBackend"
             )
         else:
-            # Standard Spyre attention.
-            backend_path = cls._backend_path
+            backend_path = cls._decoder_backend_path()
 
         # Register the selected Spyre attention implementation as CUSTOM.
         register_backend(AttentionBackendEnum.CUSTOM, backend_path)
@@ -551,10 +583,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
-        # default scheduler
-        scheduler_class = "vllm.v1.core.sched.scheduler.Scheduler"
-        # if a torch spyre specific scheduler class is needed it can be loaded with
-        # scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
+        # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
+        scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 

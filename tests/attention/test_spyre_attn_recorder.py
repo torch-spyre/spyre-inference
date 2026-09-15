@@ -170,6 +170,15 @@ def _dispatch_batched(impl, builder, kv_cache, bucket):
 
 
 class TestRecordGraphs:
+    @pytest.fixture(autouse=True)
+    def _per_seq_only(self, monkeypatch):
+        """These counts are the per-seq recorder's; the batched ones are
+        TestRecordBatchedDecode's."""
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        yield
+        envs.clear_env_cache()
+
     def test_records_every_enumerated_variant(self, impl, kv_cache, builder):
         bucketer = builder._attn_bucketer = make_bucketer()
 
@@ -594,7 +603,7 @@ class TestRecordBatchedDecode:
     def test_records_nothing_batched_when_the_flag_is_off(
         self, impl, wide_cache, builder, monkeypatch
     ):
-        monkeypatch.delenv("SPYRE_BATCHED_DECODE", raising=False)
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
         envs.clear_env_cache()
         bucketer = builder._attn_bucketer = make_bucketer()
 

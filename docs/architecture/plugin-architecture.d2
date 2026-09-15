@@ -6,21 +6,23 @@ bookends: "Model Bookends" {
   style.font-color: "#212121"
   direction: right
 
-  EMB: "SpyreVocabParallelEmbedding\n(on-device gather; TP shard\nmask on CPU when TP>1)" {
+  EMB: "SpyreVocabParallelEmbedding\n(on-device gather; TP shard tables\nbuilt on CPU at load, applied on-device)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  LP: "SpyreLogitsProcessor\n(logits.contiguous())" {
+  LM: "SpyreParallelLMHead\nx @ Wᵀ on Spyre; logits stay on\nSpyre for TP all_gather\n(TP≥1 vocab shard; pad to 64×32)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  LM: "SpyreParallelLMHead\nx @ Wᵀ on Spyre → logits→CPU\n(TP≥1 vocab shard; pad to 64×32)" {
+  LP: "SpyreLogitsProcessor\nD2H logits → CPU after head /\nTP all_gather (host-side sampling)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
+
+  LM -> LP: "logits"
 }
 
 granite: "Granite Decoder Layer (× N)" {
@@ -43,7 +45,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ATTN: "SpyreAttentionImpl\n(mixed CPU+Spyre)" {
+  ATTN: "SpyreAttentionImpl\n(Spyre kernels;\nhost-side metadata & loop)" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -63,7 +65,7 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ACT: "SpyreSiluAndMul\nsilu(gate) * up on Spyre" {
+  ACT: "SiluAndMul (upstream)\nsilu(gate)·up in the Spyre graph\n(mlp_pad stick-aligns the split)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -84,33 +86,28 @@ attn_detail: "SpyreAttentionImpl Pipeline" {
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
 
-  S1: "Bring q/k/v to CPU\n(Spyre slicing corrupts views)" {
-    style.fill: "#e65100"
-    style.stroke: "#bf360c"
-    style.font-color: "#ffffff"
-  }
-  S2: "Reshape & cache new K/V\n(per-token overwrite into\nlist-of-pages on Spyre)" {
+  S1: "Build metadata & masks (host)\nread query_start_loc / seq_lens, pad query &\nKV blocks to buckets, build index tables +\nadditive mask on CPU → copy to Spyre" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  S3: "Per-sequence varlen loop\n(query_start_loc; pad q_len to 32)" {
-    style.fill: "#e65100"
-    style.stroke: "#bf360c"
-    style.font-color: "#ffffff"
-  }
-  S4: "Online softmax over pages\nQ @ Kᵀ·scale → soft-cap? →\n+mask → softmax → @V\n(compiled per (num_blocks, q_len))" {
+  S2: "Write new K/V into the paged cache\n(compiled index_copy_ through a\nslot-major view) on Spyre" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  S5: "Stage result on CPU,\nthen bulk-copy into\nSpyre output buffer" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  S3: "Per-sequence page attention (compiled):\ngather query rows on-device →\nQ @ Kᵀ·scale → soft-cap? → +mask →\nonline softmax → @V" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  S4: "Write each result into the Spyre\noutput buffer (device→device copy)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
 
-  S1 -> S2 -> S3 -> S4 -> S5
+  S1 -> S2 -> S3 -> S4
 }
 
 encoder_attn: "SpyreEncoderAttentionImpl (no KV cache)" {
@@ -118,19 +115,19 @@ encoder_attn: "SpyreEncoderAttentionImpl (no KV cache)" {
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
 
-  E1: "Ragged→dense batch on CPU\n(per-seq slice/transpose/scatter;\npad L & D to 64-stick)" {
-    style.fill: "#e65100"
-    style.stroke: "#bf360c"
+  E1: "Ragged→dense pack: build pack indices +\nadditive mask on CPU, then scatter Q/K/V into\nthe dense [B,H,L,Dp] batch on Spyre\n(compiled index_copy_; L-pad structural)" {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  E2: "Single batched padded SDPA on Spyre\nF.scaled_dot_product_attention\n(is_causal=False, additive mask, enable_gqa)" {
+  E2: "Batched attention on Spyre\nfused F.sdpa (B=1, no live pad) OR\ncompiled QK-matmul + on-device mask-add\n+ compiled P·V (additive-mask path)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  E3: "Scatter to CPU, then per-token\noverwrite back into Spyre output" {
-    style.fill: "#2e7d32"
-    style.stroke: "#1b5e20"
+  E3: "Unpack (index_select) + write-back\n(output.copy_) on Spyre\n(CPU round-trip only for non-stick head\ndims, e.g. MiniLM D=32)" {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
 
@@ -138,8 +135,7 @@ encoder_attn: "SpyreEncoderAttentionImpl (no KV cache)" {
 }
 
 bookends.EMB -> granite: "hidden states"
-granite -> bookends.LP: "final hidden"
-bookends.LP -> bookends.LM: "lm_head"
+granite -> bookends.LM: "final hidden"
 granite.ATTN -> attn_detail: "detail" {style.stroke-dash: 3}
 granite.ATTN -> encoder_attn: "encoder-only models\nuse this impl instead" {style.stroke-dash: 3}
 
@@ -154,12 +150,7 @@ legend: " " {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  L2: "CPU fallback" {
-    style.fill: "#e65100"
-    style.stroke: "#bf360c"
-    style.font-color: "#ffffff"
-  }
-  L3: "Mixed CPU + Spyre" {
+  L3: "Mixed: Spyre compute + host-side metadata" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"

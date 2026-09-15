@@ -189,6 +189,137 @@ def test_finds_heterogeneous_hybrid_stacks() -> None:
     assert _repeated_block_lists(model) == [model.model.layers]
 
 
+def test_finds_blocks_with_hf_style_attention_class_names() -> None:
+    """TransformersForCausalLM wraps HF layers named ``GraniteAttention``, not vLLM ``Attention``.
+
+    ``test_transformers_backend_compile`` only asserts tokens. Dropping the class-name
+    check still compiles the whole model and would pass; discovery here is the signal.
+    """
+
+    class GraniteAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+
+    class GraniteDecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = GraniteAttention()
+
+    class GraniteModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([GraniteDecoderLayer() for _ in range(3)])
+
+    model = GraniteModel()
+    assert not isinstance(model.layers[0].self_attn, Attention)
+    assert _repeated_block_lists(model) == [model.layers]
+
+
+def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
+    """Pixtral's tower uses a local ``class Attention`` and ``MMEncoderAttention``.
+
+    Matching any name containing ``Attention`` wraps those blocks; first
+    ``embed_multimodal`` then dies in coarse-tile (``hint_id`` split across nests).
+    """
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(4, 4)
+
+    class MMEncoderAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = 1.0
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Attention()
+            self.attn = MMEncoderAttention()
+
+    class VisionTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+
+    class Pixtral(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = VisionTransformer()
+
+    class PixtralHFAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+
+    class PixtralHFBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = PixtralHFAttention()
+
+    class PixtralHF(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # No vision_* path segment: the class-name exclusion must be enough.
+            self.layers = nn.ModuleList([PixtralHFBlock() for _ in range(2)])
+
+    assert _repeated_block_lists(Pixtral()) == []
+    assert _repeated_block_lists(PixtralHF()) == []
+
+
+def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
+    """Ministral-style VLM: decoder ``GraniteAttention`` compiles; vision stays eager."""
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(4, 4)
+
+    class MMEncoderAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = 1.0
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Attention()
+            self.attn = MMEncoderAttention()
+
+    class GraniteAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+
+    class DecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = GraniteAttention()
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = nn.Module()
+            self.vision_encoder.transformer = nn.Module()
+            self.vision_encoder.transformer.layers = nn.ModuleList(
+                [VisionBlock() for _ in range(2)]
+            )
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList([DecoderLayer() for _ in range(3)])
+
+    model = VLM()
+    vision_layers = model.vision_encoder.transformer.layers
+    decoder_layers = model.language_model.layers
+    assert _repeated_block_lists(model) == [decoder_layers]
+
+    originals = list(vision_layers)
+    assert _runner(model)._compile_blocks() == 3
+    assert all(block._compiled_call_impl is None for block in originals)
+    assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
+
+
 def test_compile_blocks_wraps_every_block_in_place() -> None:
     model = _Model(num_layers=4)
     originals = list(model.model.layers)

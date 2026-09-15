@@ -186,7 +186,14 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform returns 1 (CPU = single device); for TP>1 we need the
         # actual Spyre card count so upstream gates like
         # `@multi_gpu_test(num_gpus=2)` don't skip on multi-card hosts.
-        return torch.spyre.device_count()
+        # torch.spyre is only available once torch_spyre is loaded; in
+        # subprocesses where the extension hasn't been initialised (e.g. the
+        # EngineCore during cloudpickle re-imports) fall back to the
+        # AIU_WORLD_SIZE env var set by the Spyre runtime.
+        try:
+            return torch.spyre.device_count()
+        except AttributeError:
+            return int(os.environ.get("AIU_WORLD_SIZE", "0"))
 
     @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:

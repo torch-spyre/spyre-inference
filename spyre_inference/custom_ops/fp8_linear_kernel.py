@@ -106,8 +106,8 @@ def _compiled_fp8_scaled_mm(
         weight_scale,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,  # ty: ignore[invalid-argument-type]
-        w_fp8,  # ty: ignore[invalid-argument-type]
+        x_fp8,
+        w_fp8,
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]

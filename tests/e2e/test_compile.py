@@ -109,7 +109,27 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
-def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compile the Transformers backend and check against a known reference.
+
+    Guards the Spyre-safe attention forward (transpose + contiguous + reshape)
+    against the silent data corruption that the unfused view chain caused.
+    """
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "\n\nIBMs main businesses are the companies that provide the services of the",
+        monkeypatch,
+        model_impl="transformers",
+    )
+
+
+def _assert_compiled_output(
+    model: str,
+    ref_output: str,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_impl: str | None = None,
+) -> None:
     from vllm import LLM, SamplingParams
     from vllm.config import CompilationConfig
 
@@ -117,7 +137,7 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
 
     prompt = "What are IBMs main businesses?"
 
-    engine = LLM(
+    kwargs: dict = dict(
         model=model,
         enforce_eager=False,
         max_model_len=128,
@@ -125,6 +145,10 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
         max_num_batched_tokens=8,
         compilation_config=CompilationConfig(compile_sizes=[1, 8]),
     )
+    if model_impl is not None:
+        kwargs["model_impl"] = model_impl
+
+    engine = LLM(**kwargs)
 
     output = engine.generate(
         prompt,

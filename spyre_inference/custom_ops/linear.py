@@ -50,15 +50,8 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
 
-    A 3-D input is folded to 2-D first: torch-spyre computes 3-D @ 2-D wrongly under
-    torch.compile — right shape, uncorrelated values, no warning (torch-spyre#4155).
-    The decoder only passes 2-D, so this surfaces only in the Pixtral vision tower.
     """
-    if x.dim() == 3:
-        out = torch.matmul(x.reshape(-1, x.shape[-1]), weight_t)
-        out = out.reshape(x.shape[0], x.shape[1], weight_t.shape[-1])
-    else:
-        out = torch.matmul(x, weight_t)
+    out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     return out

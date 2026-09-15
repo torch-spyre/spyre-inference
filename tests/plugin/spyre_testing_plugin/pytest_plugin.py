@@ -215,6 +215,7 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                 rel_path=file_entry["rel_path"],
                 allow_list=tuple(allow_list),
                 block_list=tuple(block_list),
+                config_list=file_entry.get("config_list"),
             )
         )
     return UpstreamTestConfig(files=tuple(files))
@@ -771,6 +772,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     fc = _find_file_config(test_path, file_configs)
     if not fc:
         return
+
+    # Tests parametrized by an upstream `config_filename` fixture (e.g. gsm8k evals)
+    # aren't reachable via param_overrides, which only rewrites the test's own
+    # parametrize markers. Instead, point the upstream conftest's --config-list-file at
+    # a Spyre-owned list; its own (later-running) pytest_generate_tests then parametrizes
+    # config_filename from our configs. tryfirst here guarantees we set it first.
+    if fc.config_list and "config_filename" in metafunc.fixturenames:
+        list_path = (_YAML_PATH.parent / fc.config_list).resolve()
+        metafunc.config.option.config_list_file = str(list_path)
 
     test_name = metafunc.definition.originalname or metafunc.definition.name
     allow_entry = _find_allow_entry(test_name, fc.allow_list)

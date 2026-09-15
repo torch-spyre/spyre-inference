@@ -1,0 +1,11 @@
+# GSM8K accuracy gate for granite-4.1-3b on Spyre (fp16, no quantized variant).
+# accuracy_threshold is the measured on-device baseline; num_questions is small to gate cheaply.
+# request_timeout_seconds is a *total* per-request budget (incl. queue-wait), so it must exceed the whole batched run's wall-clock.
+model_name: "ibm-granite/granite-4.1-3b"
+accuracy_threshold: 0.625
+num_questions: 64
+num_fewshot: 5
+max_concurrency: 4
+server_args: "--max-model-len 4096"
+request_timeout_seconds: 2400
+startup_max_wait_seconds: 1800

@@ -1,0 +1,98 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""SpyreTopKTopPSampler takes the sort-free top-k path without changing tokens."""
+
+import pytest
+import torch
+from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+from vllm.v1.sample.sampler import Sampler
+
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
+
+
+def _meta(rows: int, k: int) -> SamplingMetadata:
+    z = torch.zeros(rows)
+    return SamplingMetadata(
+        temperature=torch.full((rows,), 0.8),
+        all_greedy=False,
+        all_random=True,
+        top_p=None,
+        top_k=torch.full((rows,), k, dtype=torch.long),
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=z.clone(),
+        presence_penalties=z.clone(),
+        repetition_penalties=torch.ones(rows),
+        output_token_ids=[[] for _ in range(rows)],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("vocab", [4096, 32000])
+def test_topk_filter_matches_full_sort(rows: int, vocab: int) -> None:
+    x = torch.randn(rows, vocab, dtype=torch.float32)
+    k = torch.full((rows,), 50, dtype=torch.long)
+    sort_path = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=False)
+    topk_path = apply_top_k_top_p_pytorch(x.clone(), k, None, allow_cpu_sync=True)
+    kept_sort = ~torch.isinf(sort_path)
+    kept_topk = ~torch.isinf(topk_path)
+    assert torch.equal(kept_sort, kept_topk)
+    assert torch.equal(sort_path[kept_sort], topk_path[kept_topk])
+
+
+@pytest.mark.parametrize("rows", [1, 8])
+@pytest.mark.parametrize("vocab", [4096, 32000])
+def test_swapped_sampler_matches_stock_tokens(rows: int, vocab: int) -> None:
+    meta = _meta(rows, k=50)
+    logits = torch.randn(rows, vocab, dtype=torch.float16)
+
+    stock = Sampler()
+    torch.manual_seed(1234)
+    out_stock = stock(logits=logits.clone(), sampling_metadata=meta).sampled_token_ids
+
+    swapped = Sampler()
+    swapped.topk_topp_sampler = SpyreTopKTopPSampler(swapped.logprobs_mode, swapped.use_fp64_gumbel)
+    torch.manual_seed(1234)
+    out_swap = swapped(logits=logits.clone(), sampling_metadata=meta).sampled_token_ids
+
+    assert torch.equal(out_stock, out_swap)
+
+
+def test_runner_installs_spyre_topk_sampler() -> None:
+    """The runner's __init__ installs SpyreTopKTopPSampler -- guards the swap itself."""
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config.compilation import CompilationConfig
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
+        cache_config=CacheConfig(block_size=128),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    assert type(runner.sampler.topk_topp_sampler) is SpyreTopKTopPSampler

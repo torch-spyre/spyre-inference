@@ -204,9 +204,13 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply(self, num_tokens):
-        """apply_weights runs aten._scaled_mm on Spyre."""
+        """apply_weights runs aten._scaled_mm on Spyre.
+
+        num_tokens=5 and 130 exercise M-padding (not in _SMALL_M, not aligned
+        to _M_ALIGN=128), verifying the trim-before-reshape path.
+        """
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -228,7 +232,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.dtype == torch.float16
         assert actual.shape == (num_tokens, out_features)
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
         if not spyre_available():

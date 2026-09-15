@@ -19,9 +19,11 @@ tests that run them, and the relayout test, need the card: the shapes are scaled
 every dim the device sees stays stick-aligned, because the layouts in those regions depend
 on it. The intermediate dim reaches that alignment the way a TP shard does — zero-widened
 when it lands mid-stick — so the forms are exercised at both a native and a widened width.
-Routing, configuration and dispatch are host-side and need nothing.
+Routing semantics, configuration and dispatch are host-side; only the promoted softmax's
+lowering needs the card.
 """
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,8 @@ import torch
 import torch.nn.functional as F
 
 EXPERTS, HIDDEN, INTER, TOP_K = 16, 256, 128, 4
+# gemma-4-26B-A4B's expert count: a whole number of fp32 sticks, so its routing promotes.
+GEMMA4_EXPERTS = 128
 
 
 def _dense_reference(x, probs, gate, up, down, scale, top_k):
@@ -104,18 +108,72 @@ def test_routing_recipes_agree_under_renormalization():
 
     logits = torch.tensor([[0.5, -1.0, 2.0, 1.5]], dtype=torch.float32)
 
-    standard, standard_indices = _routing_weights(logits, 2, "topk_softmax")
+    standard, standard_indices = _routing_weights(logits, 2, "topk_softmax", logits.dtype)
     selected, expected_indices = torch.topk(logits, 2, dim=-1)
     torch.testing.assert_close(standard_indices, expected_indices)
     torch.testing.assert_close(standard, torch.softmax(selected, dim=-1))
 
-    gemma, gemma_indices = _routing_weights(logits, 2, "full_softmax")
+    gemma, gemma_indices = _routing_weights(logits, 2, "full_softmax", logits.dtype)
     top_probs, expected_indices = torch.topk(torch.softmax(logits, dim=-1), 2, dim=-1)
     torch.testing.assert_close(gemma_indices, expected_indices)
     torch.testing.assert_close(gemma, top_probs / top_probs.sum(-1, keepdim=True))
 
     torch.testing.assert_close(standard_indices, gemma_indices)
     torch.testing.assert_close(standard, gemma)
+
+
+def test_routing_promotes_only_across_whole_float32_sticks(monkeypatch):
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference import moe as moe_module
+
+    warned = []
+    monkeypatch.setattr(moe_module.logger, "warning_once", lambda msg, *args: warned.append(args))
+
+    stick = get_elem_in_stick(torch.float32)
+    assert moe_module._route_reduce_dtype(2 * stick, torch.float16) is torch.float32
+    assert warned == [], "the promoted reduction is not a degraded path"
+    assert moe_module._route_reduce_dtype(stick + 1, torch.float16) is torch.float16
+    assert warned == [(stick + 1, torch.float16, stick)]
+
+
+def test_probs_reduce_in_the_given_dtype_and_return_the_transport_dtype():
+    from spyre_inference.moe import _probs
+
+    logits = torch.randn(4, GEMMA4_EXPERTS, dtype=torch.float16)
+    promoted = _probs(logits, torch.float32)
+    assert promoted.dtype == torch.float16
+    torch.testing.assert_close(promoted, torch.softmax(logits.float(), dim=-1).half())
+    torch.testing.assert_close(_probs(logits, torch.float16), torch.softmax(logits, dim=-1))
+
+
+def test_promoted_routing_softmax_lowers_on_spyre():
+    """``frontend_pool_allocation`` is the config ``apply_monolithic`` runs the region under;
+    a fallback that only manifests there would otherwise escape.
+    """
+    from spyre_testing_plugin.pytest_plugin import spyre_available
+    from torch_spyre._inductor import config as spyre_config
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    from spyre_inference.moe import _probs
+
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    logits = torch.randn(8, GEMMA4_EXPERTS, dtype=torch.float16)
+    region = torch.compile(_probs, backend="inductor", fullgraph=True, dynamic=False)
+    with (
+        spyre_config.patch({"frontend_pool_allocation": True}),
+        warnings.catch_warnings(record=True) as caught,
+    ):
+        warnings.simplefilter("always", FallbackWarning)
+        actual = region(logits.to("spyre"), torch.float32)
+
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the promoted routing softmax fell back to CPU: {fallbacks}"
+    torch.testing.assert_close(
+        actual.cpu(), torch.softmax(logits.float(), dim=-1).half(), atol=2e-3, rtol=2e-3
+    )
 
 
 def test_dense_topk_weights_are_softmax_over_the_selected_logits():
@@ -307,6 +365,7 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
+        spyre_moe_route_dtype=torch.float16,
         top_k=TOP_K,
     )
 
@@ -351,7 +410,10 @@ def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
 
 
 def test_gathered_matches_dense_reference(moe_weights):
-    """The decode form, at the single token whose combine has a legal device layout."""
+    """The decode form, at the single token whose combine has a legal device layout.
+
+    ``EXPERTS`` does not span whole fp32 sticks, so routing reduces in the transport dtype.
+    """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
 
@@ -371,6 +433,7 @@ def test_gathered_matches_dense_reference(moe_weights):
             device["down"],
             TOP_K,
             stick,
+            logits.dtype,
             "full_softmax",
             "gelu_tanh",
         )
@@ -417,7 +480,7 @@ def test_persistent_matches_dense_reference(moe_weights, num_tokens):
     experts = torch.compile(_moe_persistent, backend="inductor", fullgraph=True, dynamic=False)
 
     with spyre_config.patch({"frontend_pool_allocation": True}):
-        route = routing(probs(logits.to("spyre")), identity, TOP_K, stick)
+        route = routing(probs(logits.to("spyre"), logits.dtype), identity, TOP_K, stick)
         _name_persistent_dims(x_dev, device["gate"], device["up"], device["down"])
         try:
             with spyre_config.patch({"allow_all_ops_in_lx_planning": True}):

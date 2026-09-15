@@ -385,8 +385,10 @@ class TestBatchedDecodeVariants:
         envs.clear_env_cache()
         return SpyreAttnBucketer(make_config())
 
-    def test_empty_when_the_path_is_disabled(self, bucketer):
-        assert bucketer.batched_decode_variants() == []
+    def test_empty_when_the_path_is_disabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        assert SpyreAttnBucketer(make_config()).batched_decode_variants() == []
 
     def test_covers_the_full_num_seqs_by_num_blocks_grid(self, enabled):
         assert {(v.num_seqs, v.num_blocks) for v in enabled.batched_decode_variants()} == {

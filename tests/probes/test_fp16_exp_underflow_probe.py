@@ -20,7 +20,7 @@ masked position and that position's V reaches the attention output, including th
 tail slots of a partially-filled KV block that vLLM later hands to another request.
 
 PR #873 works around it by zeroing those slots
-(``SpyreAttentionImpl._clear_new_kv_block_tails``). When this probe XPASSes the backend
+(``SpyreAttentionImpl._clear_masked_kv_slots``). When this probe XPASSes the backend
 underflows correctly: **revert PR #873** -- the workaround, its unit test in
 ``tests/attention/test_spyre_attn.py`` and the e2e guard
 ``tests/e2e/test_kv_cache_determinism.py`` -- and delete this probe.
@@ -42,7 +42,7 @@ _REASON = (
     "torch-spyre#4517: the device's fp16 exp() saturates at 2**-24 instead of underflowing "
     "to zero, so additively masked positions keep a softmax weight and leak their V into the "
     "attention output. When this passes, revert PR #873 "
-    "(SpyreAttentionImpl._clear_new_kv_block_tails and its tests) and delete this probe."
+    "(SpyreAttentionImpl._clear_masked_kv_slots and its tests) and delete this probe."
 )
 
 

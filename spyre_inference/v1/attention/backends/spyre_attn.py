@@ -800,9 +800,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
-                # Padding columns gather page 0 under an all--inf mask and
-                # contribute zero; chunk 0 still holds every real row's block 0,
-                # so the running max stays finite.
+                # Padding columns gather the null block, held at zero by
+                # `_clear_masked_kv_slots`, so they contribute zero; chunk 0 still holds
+                # every real row's block 0, so the running max stays finite.
                 blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
@@ -862,7 +862,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         )
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
-                # block 0, so its padded blocks can stay -inf and contribute zero.
+                # block 0, so its padded blocks can stay -inf and contribute zero --
+                # given the null block they gather is held at zero (torch-spyre#4517).
                 # Holds under a window too: first_active <= num_blocks - 1.
                 mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(torch.float16).min
                 # 4-D, not 5-D: the kernel slices dim 0 per chunk, and a dim-0
@@ -1136,13 +1137,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
-    def _clear_new_kv_block_tails(self, attn_metadata: "SpyreAttentionMetadata") -> None:
-        """Zero a partial block's tail on the step that first writes that block."""
+    def _clear_masked_kv_slots(self, attn_metadata: "SpyreAttentionMetadata") -> None:
+        """Zero the gathered-but-unwritten slots: the null slot, and a partial block's tail.
+
+        torch-spyre#4517: fp16 ``exp()`` floors at ``2**-24``, so masked positions keep a
+        softmax weight and their V reaches the output.
+        """
         slots = self._kv_slots
         if slots is None:
             return
         k_slots, v_slots = slots
         block_size = attn_metadata.block_size
+
+        # Rewritten every step (one arbitrary padding token wins `index_copy_`); the
+        # rest of the block is allocated zero and is never a scatter target.
+        k_slots[attn_layer.NULL_SLOT : attn_layer.NULL_SLOT + 1] = 0.0
+        v_slots[attn_layer.NULL_SLOT : attn_layer.NULL_SLOT + 1] = 0.0
+
         query_lens = attn_metadata.query_lens
         for seq in range(attn_metadata.num_seqs):
             kv_len = int(attn_metadata.seq_lens[seq].item())
@@ -1642,10 +1653,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
-        # The KV scatter is ordered ahead of this op by `kv_cache_dummy_dep`.
-        # Clear only when this step first writes the final block; later decode
-        # steps retain that zero tail without paying another device write.
-        self._clear_new_kv_block_tails(attn_metadata)
+        # `kv_cache_dummy_dep` orders the scatter ahead of this op.
+        self._clear_masked_kv_slots(attn_metadata)
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
@@ -1688,9 +1697,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Restrict to active (non-fully-masked) blocks when sliding window
             # is set. Otherwise all blocks are active, padded up onto the
-            # recorder's buckets by build() (trailing padded blocks are fully
-            # masked, hence inert), so the num_blocks key below hits a variant
-            # warmup already traced.
+            # recorder's buckets by build(), so the num_blocks key below hits a
+            # variant warmup already traced. Padded blocks are only inert because their
+            # block-table column is zero and `_clear_masked_kv_slots` zeroes that block.
             if active_block_indices_all is not None:
                 active_bs = active_block_indices_all[seq_idx]
             elif padded_num_blocks is not None:
@@ -1723,9 +1732,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # form, and each tile stays 1D over KV (block_size floats per head)
             # instead of 2D (aligned_query_len * block_size).
             #
-            # Padded blocks get a tile too (the loop iterates active_bs); their
-            # values stay finite (slopes are small negative powers of two) and
-            # saturate under the mask's finfo.min, so they stay inert.
+            # Padded blocks get a tile too (the loop iterates active_bs); their bias
+            # stays finite (slopes are small negative powers of two), so the mask's
+            # finfo.min still dominates the score.
             #
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.

@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.attn_layer import NULL_SLOT
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     _MIN_BATCHED_SEQS,
@@ -403,8 +404,9 @@ def _run_spyre_attn_test(
 
     # Widened to the recorder's num_blocks buckets, as a real engine's block
     # table is, so build()'s padding isn't suppressed by an exactly-sized table.
-    # The extra entries point at garbage pages on purpose: padded blocks are
-    # fully masked and must not affect the result.
+    # The extra entries point at garbage pages on purpose: padded blocks are fully
+    # masked and must not affect the result. The tolerances below are far looser than a
+    # masked slot's 2**-24 leak; `test_padded_blocks_do_not_read_the_null_slot` is tight.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     from vllm.config import get_current_vllm_config
 
@@ -1522,12 +1524,142 @@ def test_clear_kv_tail_only_when_step_enters_block(default_vllm_config):
         query_lens=torch.tensor([10, 1]),
         block_table=torch.tensor([[0, 1], [0, 2]], dtype=torch.int32),
     )
-    impl._clear_new_kv_block_tails(metadata)
+    impl._clear_masked_kv_slots(metadata)
 
     for pages in cache:
         assert torch.count_nonzero(pages[1, 6:]) == 0
         assert torch.all(pages[1, :6] == -7)
         assert torch.all(pages[2] == -7)
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    # Spyre only: CPU `exp(finfo.min)` underflows to zero, so this holds trivially there.
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_device: str):
+    """The same attention twice, changing only the null slot's V, must be bit-identical.
+
+    Padded block columns are zero, so they gather the null slot. The poison is huge
+    because one slot at 2**-24 is otherwise below fp16 resolution.
+    """
+    block_size, num_q_heads, num_kv_heads, head_size = 128, 4, 2, 64
+    num_blocks, kv_len = 64, 300
+    dtype = torch.float16
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    from vllm.config import get_current_vllm_config
+
+    real_blocks = (kv_len + block_size - 1) // block_size
+    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    padded_blocks = SpyreAttnBucketer._round_up(real_blocks, buckets)
+    if padded_blocks is None or padded_blocks <= real_blocks:
+        pytest.skip(
+            f"kv_len={kv_len} gives real=={real_blocks} blocks, already a bucket "
+            f"({buckets}); nothing is padded, so there is nothing to test."
+        )
+
+    scale = head_size**-0.5
+    query = torch.randn(1, num_q_heads, head_size, dtype=dtype)
+    key = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
+
+    # Padded columns stay 0, as a cleared vLLM block-table row leaves them.
+    block_table = torch.zeros(1, padded_blocks, dtype=torch.int32)
+    block_table[0, :real_blocks] = torch.arange(1, real_blocks + 1, dtype=torch.int32)
+
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    for pos in range(kv_len - 1):
+        page = int(block_table[0, pos // block_size])
+        k_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+        v_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+
+    last = kv_len - 1
+    slot_mapping = torch.tensor(
+        [int(block_table[0, last // block_size]) * block_size + last % block_size],
+        dtype=torch.int64,
+    )
+    attn_metadata = _build_metadata(
+        num_query_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+    )
+
+    def run(null_slot_value: float) -> torch.Tensor:
+        cache_device = torch.device(configure_device)
+        k_pages = k_pages_cpu.to(cache_device)
+        v_pages = v_pages_cpu.clone()
+        v_pages[NULL_SLOT // block_size, NULL_SLOT % block_size] = null_slot_value
+        v_pages = v_pages.to(cache_device)
+
+        impl = SpyreAttentionImpl(
+            num_heads=num_q_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            kv_cache_dtype="auto",
+        )
+        kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+        key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+        impl.do_kv_cache_update(
+            None, key_src, value_src, kv_cache, convert(attn_metadata.slot_mapping, cache_device)
+        )
+        output = torch.full_like(query, float("nan")).to(cache_device)
+        impl.forward(
+            layer=None,
+            query=convert(query, cache_device),
+            key=key_src,
+            value=value_src,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            output=output,
+        )
+        result = output.to("cpu")
+        del k_pages, v_pages, kv_cache, output
+        return result
+
+    clean = run(0.0)
+    poisoned = run(60000.0)
+
+    assert not clean.isnan().any(), "attention wrote no output"
+    delta = (clean - poisoned).abs().max()
+    assert torch.equal(clean, poisoned), (
+        f"the null slot reached the output of a padded block: real={real_blocks} "
+        f"padded={padded_blocks} blocks, max|delta|={float(delta):g}. "
+        f"_clear_masked_kv_slots must hold slot {NULL_SLOT} at zero."
+    )
+
+
+def test_clear_masked_kv_slots_zeroes_the_null_slot(default_vllm_config):
+    """Every padded block column gathers the null slot, so it cannot keep a value."""
+    impl = SpyreAttentionImpl(num_heads=2, head_size=64, scale=0.125, num_kv_heads=2)
+    shape = (3, 64, 2, 64)
+    cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
+    impl.kv_slot_views(cache)
+
+    metadata = Mock(
+        # Block-aligned, so the tail branch clears nothing.
+        block_size=64,
+        num_seqs=1,
+        seq_lens=torch.tensor([128]),
+        query_lens=torch.tensor([1]),
+        block_table=torch.tensor([[1, 2]], dtype=torch.int32),
+    )
+    impl._clear_masked_kv_slots(metadata)
+
+    for pages in cache:
+        assert torch.all(pages[0, NULL_SLOT] == 0), "the null slot kept a value"
+        assert torch.all(pages[0, NULL_SLOT + 1 :] == -7)
+        assert torch.all(pages[1] == -7) and torch.all(pages[2] == -7)
 
 
 # (label, block_indices, block_offsets)

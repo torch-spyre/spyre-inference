@@ -92,6 +92,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
     mark_warmup_complete,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    SpyreEncoderAttentionImpl,
+)
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -99,7 +102,9 @@ from spyre_inference.v1.pool import (
 )
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    default_encoder_len_buckets,
     logits_row_buckets,
+    next_bucket,
     pooling_warmup_shapes,
 )
 
@@ -577,7 +582,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
-            self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
+            self._pooling_on_spyre = configure_pooling_for_spyre(
+                self.model, self._spyre_device, self.model_config.max_model_len
+            )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
@@ -768,8 +775,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._dummy_run(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
+                self._record_encoder_pack_graphs()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
+            # Pooling never reaches _record_attention_graphs (encoder layers have
+            # no KV cache to record against), so claim coverage here instead --
+            # otherwise _call_kernel stays silent for the encoder kernels.
+            mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -817,6 +829,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _record_encoder_pack_graphs(self) -> None:
+        """Trace the encoder pack kernel on every reachable shape.
+
+        The dummy runs above cannot: the kernel keys on the cell *and* the body token
+        bucket, and one run visits a single pair.
+        """
+        if not envs.SPYRE_ATTN_RECORD:
+            logger.info("Encoder pack graph recording disabled (SPYRE_ATTN_RECORD=0)")
+            return
+        static_ctx = self.compilation_config.static_forward_context
+        t0 = time.time()
+        total = 0
+        # Layers with the same head config share a graph; only the first pays a compile.
+        for layer in static_ctx.values():
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, SpyreEncoderAttentionImpl):
+                total += impl.record_pack_graphs(self._spyre_device)
+        logger.info(
+            "Encoder pack graph recording complete: %d graphs in %.3fs.",
+            total,
+            time.time() - t0,
+        )
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:
@@ -1015,20 +1051,64 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             return
 
+        budget = self.scheduler_config.max_num_batched_tokens
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
         try:
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
-                num_tokens = batch_size * prompt_len
+                # A cell may sit above the token budget (ENCODER_CELL_BUDGET_SLACK) while
+                # _dummy_run asserts num_tokens <= budget, so a uniform B*L fill cannot
+                # warm it. One full-length sequence plus B-1 single-token ones carries the
+                # same num_seqs and max_query_len, all the cell keys on. That fill can
+                # overrun the budget too (L == budget suffices), so clamp it.
+                skewed = batch_size * prompt_len > budget
+                num_tokens = (
+                    min(prompt_len + batch_size - 1, budget) if skewed else batch_size * prompt_len
+                )
+                if skewed:
+                    # create_mixed_batch takes min(B-1, num_tokens//2) single-token rows
+                    # and gives the rest to one prefill row, so the traced cell is
+                    # (rows, bucket(prefill_len)) -- the requested one only if both match.
+                    # Skip rather than mislabel; serving snaps such a batch onto the ladder.
+                    decode_rows = min(batch_size - 1, num_tokens // 2)
+                    prefill_len = num_tokens - decode_rows
+                    lengths = default_encoder_len_buckets(self.model_config.max_model_len)
+                    if (
+                        decode_rows != batch_size - 1
+                        or next_bucket(prefill_len, lengths) != prompt_len
+                    ):
+                        logger.warning(
+                            "Pooling attention warmup: skipping cell batch_size=%d "
+                            "prompt_len=%d -- no skewed batch within the token budget "
+                            "carries it.",
+                            batch_size,
+                            prompt_len,
+                        )
+                        continue
                 logger.info(
-                    "Pooling attention warmup: exact bucket "
-                    "batch_size=%d prompt_len=%d (%d tokens)",
+                    "Pooling attention warmup: %s bucket batch_size=%d prompt_len=%d (%d tokens)",
+                    "skewed" if skewed else "exact",
                     batch_size,
                     prompt_len,
                     num_tokens,
                 )
-                hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
+                hidden_states, _ = self._dummy_run(
+                    num_tokens, force_attention=True, create_mixed_batch=skewed
+                )
                 self._dummy_pooler_run(hidden_states)
+                if batch_size == 1:
+                    # An exact fill satisfies _is_b1_fused_sdpa, so the run above
+                    # traces only the fused kernel. One token short takes the
+                    # packed QK/P.V kernels instead, which is what serving hits
+                    # for every prompt whose length is not already a bucket.
+                    logger.info(
+                        "Pooling attention warmup: partial bucket "
+                        "batch_size=1 prompt_len=%d (bucket %d)",
+                        prompt_len - 1,
+                        prompt_len,
+                    )
+                    hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
+                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
 

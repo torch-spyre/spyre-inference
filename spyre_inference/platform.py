@@ -277,21 +277,30 @@ class TorchSpyrePlatform(CpuPlatform):
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
+                # Pooling has no 512 limit -- encoder attention compiles (B, L) cells,
+                # not a 512-token body. 2048 is the measured throughput argmax across
+                # pooling models; they regress above it.
+                is_pooling = vllm_config.model_config.runner_type == "pooling"
                 max_capture_size = min(
                     vllm_config.scheduler_config.max_num_batched_tokens,
-                    512,
+                    2048 if is_pooling else 512,
                 )
-                if vllm_config.model_config.runner_type != "pooling":
-                    # Decode packs one token per running sequence; prefill lands on
-                    # the single largest bucket. Denser sizes only cost warmup time.
-                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                    sizes = {max_capture_size, num_seqs}
-                    size = 1
-                    while size < num_seqs:
-                        sizes.add(size)
-                        size *= 2
-                    compile_sizes = sorted(sizes)
-                else:
+                if is_pooling:
+                    # A max-length request must fit the budget or it is never admitted:
+                    # encoder prefill cannot be chunked, so the scheduler head-of-line
+                    # blocks forever. vLLM's verify_max_model_len checks this in
+                    # SchedulerConfig.__post_init__, before this hook, so the cap below
+                    # would slip past it.
+                    model_len = vllm_config.model_config.max_model_len
+                    if max_capture_size < model_len:
+                        logger.warning(
+                            "Raising pooling token budget %d -> %d to fit max_model_len; "
+                            "encoder prefill cannot be chunked.",
+                            max_capture_size,
+                            model_len,
+                        )
+                        max_capture_size = model_len
+
                     from spyre_inference.v1.worker.spyre_shape_bucketer import (
                         default_encoder_len_buckets,
                     )
@@ -301,6 +310,16 @@ class TorchSpyrePlatform(CpuPlatform):
                         "Pooling body token buckets (1D compile_sizes): %s",
                         compile_sizes,
                     )
+                else:
+                    # Decode packs one token per running sequence; prefill lands on
+                    # the single largest bucket. Denser sizes only cost warmup time.
+                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                    sizes = {max_capture_size, num_seqs}
+                    size = 1
+                    while size < num_seqs:
+                        sizes.add(size)
+                        size *= 2
+                    compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
             max_capture_size = max(int(s) for s in compile_sizes)

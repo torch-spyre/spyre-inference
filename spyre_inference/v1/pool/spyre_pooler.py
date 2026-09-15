@@ -34,6 +34,10 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    default_encoder_len_buckets,
+    next_bucket,
+)
 
 logger = init_logger(__name__)
 
@@ -154,9 +158,61 @@ class SpyreMeanPool(MeanPool):
         cursor = pooling_metadata.get_pooling_cursor()
         prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
         total = int(prompt_lens.sum().item()) if prompt_lens.numel() else 0
+        # Crop on the host, after the D2H: SpyreDispatchPooler leaves
+        # hidden_states at its bucketed length, so this crop now fires on every
+        # padded batch. Cropping on device would need a real-length index_select,
+        # adding a torch.compile specialization per distinct prompt length -- the
+        # defect the dispatcher exists to remove. The D2H is bucket-sized rather
+        # than the real length it used to be while upstream still sliced, so it
+        # is slightly larger; a host slice after it costs nothing.
+        hidden_states = convert(hidden_states, "cpu")
         if hidden_states.shape[0] > total:
-            hidden_states = select_rows(hidden_states, torch.arange(total, dtype=torch.int64))
-        return super().forward(convert(hidden_states, "cpu"), pooling_metadata)
+            hidden_states = hidden_states[:total]
+        return super().forward(hidden_states, pooling_metadata)
+
+
+class SpyreDispatchPooler(DispatchPooler):
+    """``DispatchPooler`` that leaves ``hidden_states`` at its bucketed length.
+
+    Upstream slices ``hidden_states`` down to the group's *real* token count
+    before handing it to the sub-pooler (``DispatchPooler.forward``:
+    ``hidden_states[token_offset : token_offset + num_group_tokens]``). On Spyre
+    that makes ``select_rows``' ``index_select`` source shape track the prompt
+    length, so ``torch.compile(dynamic=False)`` adds a specialization per distinct
+    length and Dynamo rescans a growing guard chain on every later call —
+    throughput decays as more distinct lengths are seen, which is why
+    ``TorchSpyreModelRunner._pool`` deliberately hands this a padded tensor in the
+    first place. Undoing the slice here is what makes that intent hold.
+
+    Safe because the Spyre seqwise poolers address rows through
+    ``cursor_row_indices_cpu``, which only ever names rows inside the real range —
+    they never read the padding the slice would have removed.
+
+    Only the single-task-group case is handled. With several groups each one
+    starts at a nonzero token offset and upstream rebases the cursor's row
+    indices onto its slice; without the slice those indices would need the offset
+    added back instead, so anything else defers to upstream unchanged.
+    """
+
+    def forward(self, hidden_states, pooling_metadata):
+        tasks = list(pooling_metadata.tasks)
+        if (
+            hidden_states.device.type != "spyre"
+            or pooling_metadata.pooling_cursor is None
+            or len(set(tasks)) != 1
+        ):
+            return super().forward(hidden_states, pooling_metadata)
+
+        task = tasks[0]
+        if not (pooler := self.poolers_by_task.get(task)):
+            raise ValueError(
+                f"Unsupported task: {task!r} Supported tasks: {self.get_supported_tasks()}"
+            )
+        # Mirror upstream's accumulation: a sub-pooler may return a stacked
+        # tensor, which upstream flattens into one entry per request.
+        outputs: list[torch.Tensor | None] = []
+        outputs.extend(pooler(hidden_states, pooling_metadata))
+        return outputs
 
 
 class SpyreNormalize(PoolerNormalize):
@@ -174,22 +230,94 @@ class SpyreNormalize(PoolerNormalize):
 class SpyreAllPool(AllPool):
     """Per-request rows via ``index_select``; ``torch.split`` gives unsafe views."""
 
-    def __init__(self, enable_chunked_prefill: bool) -> None:
+    def __init__(
+        self,
+        enable_chunked_prefill: bool,
+        defer_trim: bool = False,
+        len_ladder: list[int] | None = None,
+    ) -> None:
         nn.Module.__init__(self)
         self.enable_chunked_prefill = enable_chunked_prefill
+        # Only a SpyreTokenPooler that will trim afterwards may set this; on its
+        # own this class keeps AllPool's contract of one real-length chunk per
+        # request, so an unpaired use cannot silently ship padded rows.
+        self.defer_trim = defer_trim
+        # Passed in from configure_pooling_for_spyre, which runs inside
+        # load_model's set_current_vllm_config context. Resolving it here from
+        # get_current_vllm_config() would not work: forward runs outside that
+        # context (WorkerWrapperBase wraps __init__/init_device/
+        # initialize_from_config, not execute_model), so the lookup raises and
+        # the ladder would silently stay empty for the life of the process.
+        # Empty means plain stick alignment, which still bounds the
+        # specialization count but at every 64-multiple instead of the
+        # powers of two.
+        self.len_ladder = list(len_ladder) if len_ladder else []
 
     def forward(self, hidden_states, pooling_metadata):
         if self.enable_chunked_prefill:
             raise NotImplementedError(
                 "chunked prefill is unsupported with token-level pooling on Spyre"
             )
+        # Gather a bucketed row count, not the request's real token count: an
+        # index sized on the real length makes index_select's output shape track
+        # it, which adds a torch.compile specialization per distinct prompt
+        # length and leaves Dynamo rescanning a growing guard chain on every
+        # later call. Rows past the real length clamp to the last real row, so
+        # they stay in bounds and cost only duplicate work; SpyreTokenPooler
+        # drops them after the head, whose ops are all row-wise.
         counts = pooling_metadata.get_pooling_cursor().num_scheduled_tokens_cpu.tolist()
         out = []
         start = 0
         for n in counts:
-            out.append(select_rows(hidden_states, torch.arange(start, start + n)))
+            # n == 0 has no last real row to clamp onto (the clamp would index
+            # start - 1), so it takes the plain path and yields an empty chunk.
+            # Not reachable while chunked prefill is rejected, but the plain path
+            # handled it and this keeps that.
+            if self.defer_trim and n > 0:
+                aligned = next_bucket(n, self.len_ladder)
+                idx = start + torch.arange(aligned, dtype=torch.int64).clamp(max=n - 1)
+            else:
+                idx = torch.arange(start, start + n, dtype=torch.int64)
+            out.append(select_rows(hidden_states, idx))
             start += n
         return out
+
+
+class SpyreTokenPooler(TokenPooler):
+    """Trim ``SpyreAllPool``'s bucketed rows back to real lengths, after the head.
+
+    ``SpyreAllPool`` gathers a bucketed row count so ``index_select``'s shape does
+    not track the request's token count. Every op in the token head is row-wise
+    (``to(head_dtype)``, the ST projector, the last-dim slice, and
+    normalize over ``dim=-1``), so the duplicate rows past the real length change
+    nothing for the real ones and the head keeps running on device at a bucketed
+    shape. They are dropped here instead, at the D2H every token-pooling output
+    has to make anyway — a Spyre dim-0 slice view would not be safe.
+    """
+
+    def forward(self, hidden_states, pooling_metadata):
+        pooled = super().forward(hidden_states, pooling_metadata)
+        cursor = pooling_metadata.get_pooling_cursor()
+        if cursor is None:
+            return pooled
+        counts = cursor.num_scheduled_tokens_cpu.tolist()
+        trimmed: list[torch.Tensor | None] = []
+        for item, n in zip(pooled, counts):
+            if item is None:
+                trimmed.append(item)
+                continue
+            # Unconditional, including when the shape already matches: skipping
+            # the D2H for an item that happens to land on a bucket would leave
+            # that one on device while its neighbours came back on CPU, and _pool
+            # runs late_interaction_runner.postprocess_pooler_output before
+            # copy_pooler_output_to_cpu. The runner caches the query with
+            # output.clone(), keeping its device, and scoring rejects a
+            # query/document device mismatch -- which a fixed-length query
+            # against variable-length documents would hit routinely. convert
+            # short-circuits a same-device call, so this is free on CPU.
+            item = convert(item, "cpu")
+            trimmed.append(item if item.shape[0] == n else item[:n])
+        return trimmed
 
 
 def prepare_token_head_for_spyre(
@@ -295,8 +423,17 @@ def patch_embedding_heads_for_spyre(pooler: nn.Module) -> int:
     return num_patched
 
 
-def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
-    """Install Spyre CLS, LAST, MEAN, and token AllPool. Returns ``(n_patched, unsupported)``."""
+def patch_pooler_for_spyre(
+    pooler: nn.Module, len_ladder: list[int] | None = None
+) -> tuple[int, list[str]]:
+    """Install Spyre CLS, LAST, MEAN, and token AllPool. Returns ``(n_patched, unsupported)``.
+
+    A pooler class this does not recognise is reported as unsupported rather than
+    ignored: returning ``(0, [])`` for it made it invisible to both of
+    ``configure_pooling_for_spyre``'s gates, so a DispatchPooler with one patched
+    sub-pooler and one unrecognised one passed, and the SpyreDispatchPooler swap
+    then handed the unrecognised one padded ``hidden_states``.
+    """
     num_patched = 0
     unsupported: list[str] = []
 
@@ -320,33 +457,49 @@ def patch_pooler_for_spyre(pooler: nn.Module) -> tuple[int, list[str]]:
         if isinstance(pooling, SpyreAllPool):
             num_patched += 1
         elif type(pooling) is AllPool:
-            pooler.pooling = SpyreAllPool(pooling.enable_chunked_prefill)
+            pooler.pooling = SpyreAllPool(pooling.enable_chunked_prefill, len_ladder=len_ladder)
             num_patched += 1
         else:
             unsupported.append(type(pooling).__name__)
+        # Bucketing the gather is only safe when something trims afterwards, so
+        # the two are switched on together and never independently.
+        if isinstance(pooler.pooling, SpyreAllPool) and type(pooler) is TokenPooler:
+            pooler.__class__ = SpyreTokenPooler
+            pooler.pooling.defer_trim = True
     elif isinstance(pooler, DispatchPooler):
         for sub in pooler.poolers_by_task.values():
-            sub_patched, sub_unsupported = patch_pooler_for_spyre(sub)
+            sub_patched, sub_unsupported = patch_pooler_for_spyre(sub, len_ladder)
             num_patched += sub_patched
             unsupported.extend(sub_unsupported)
+    else:
+        unsupported.append(type(pooler).__name__)
 
     return num_patched, unsupported
 
 
-def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) -> bool:
+def configure_pooling_for_spyre(
+    model: nn.Module, spyre_device: torch.device, max_model_len: int | None = None
+) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
     is garbage (torch-spyre#2971). False if the method is unknown or the
     head is an FP32 linear.
+
+    ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
+    It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
+    the pooler because only the caller is guaranteed to run inside a
+    ``set_current_vllm_config`` context; token pooling degrades to plain stick
+    alignment without it.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
         return False
 
-    num_patched, unsupported = patch_pooler_for_spyre(pooler)
+    len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
+    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__
         logger.info(
@@ -359,6 +512,12 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
     if token_level:
+        if not len_ladder:
+            logger.warning(
+                "Pooling: token pooling has no length ladder (max_model_len was "
+                "not passed); gathers round to every 64-multiple instead of the "
+                "power-of-two buckets, so more shapes compile than necessary"
+            )
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 
     # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
@@ -377,6 +536,9 @@ def configure_pooling_for_spyre(model: nn.Module, spyre_device: torch.device) ->
 
     num_norm = patch_normalize_for_spyre(pooler)
     num_heads = patch_embedding_heads_for_spyre(pooler)
+    # Keep hidden_states bucketed through the dispatcher; see SpyreDispatchPooler.
+    if type(pooler) is DispatchPooler:
+        pooler.__class__ = SpyreDispatchPooler
     staying = ["hidden states"]
     if classifier is not None:
         staying.append("classifier")

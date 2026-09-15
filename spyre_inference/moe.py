@@ -334,7 +334,7 @@ def _reset_named_dims() -> None:
     reset()
 
 
-def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
+def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...], role: str) -> torch.Tensor:
     """Move one expert stack to the device in the gather-friendly MoE layout.
 
     ``dma_moe_expert_weight_to_spyre`` only takes an ``[E, C, F]`` stack whose free dim
@@ -344,8 +344,18 @@ def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch
 
     if any(pad):
         weight = F.pad(weight, pad)
+    from torch_spyre._C import get_elem_in_stick
+
+    stick = get_elem_in_stick(weight.dtype)
+    if weight.shape[-1] % stick:
+        raise ValueError(
+            f"Spyre MoE {role} expert-stack free dim {weight.shape[-1]} is not a "
+            f"multiple of the {stick}-element stick."
+        )
     moved = dma_moe_expert_weight_to_spyre(weight)
-    return moved if moved is not None else weight.contiguous().to("spyre")
+    if moved is None:
+        raise RuntimeError(f"Spyre MoE {role} expert-stack layout is unavailable.")
+    return moved
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -369,15 +379,22 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
     # is inert: the added lanes activate to zero, against zero rows of ``down``.
     stick = get_elem_in_stick(w13.dtype)
+    if hidden % stick:
+        raise ValueError(
+            f"Spyre MoE down expert-stack free dim {hidden} is not a multiple of "
+            f"the {stick}-element stick; hidden_size must be stick-aligned."
+        )
     pad = -inter % stick
-    layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
-    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))
+    layer.spyre_moe_gate = _to_spyre_expert_weight(
+        w13[:, :inter, :].transpose(1, 2), (0, pad), "gate"
+    )
+    layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad), "up")
     del layer.w13_weight, w13
     w2 = layer.get_parameter("w2_weight").data
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad), "down")
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype

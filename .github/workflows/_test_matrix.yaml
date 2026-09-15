@@ -574,6 +574,10 @@ jobs:
       # Force cache-only: fork PRs have no HF_TOKEN, so Hub revalidation
       # against a gated repo 401s even when the model is on the PVC.
       HF_HUB_OFFLINE: '1'
+      # EXPERIMENT: share the Spyre kernel compile cache across all matrix jobs
+      # on the PVC to test concurrent-read/write safety and reuse. Each run gets
+      # its own directory so runs do not interfere with each other.
+      SPYRE_SHARED_KERNEL_CACHE_DIR: /storage-1/spyre-inference/.cache/torchinductor-shared-test-${{ github.run_id }}
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -894,6 +898,22 @@ jobs:
           name: test-durations
           path: test-durations.json
           retention-days: 30
+
+  # EXPERIMENT: Clean up the shared Spyre kernel cache directory after the
+  # matrix finishes, succeeds or fails. Runs on a self-hosted runner because
+  # /storage-1 is only mounted there.
+  cleanup-shared-cache:
+    name: Clean up shared kernel cache experiment directory
+    needs: test_result
+    if: always()
+    runs-on: [x86_64, spyre_pf_x1, linux, image_torch_spyre]
+    steps:
+      - name: Remove shared cache directory
+        shell: bash
+        run: |
+          dir="/storage-1/spyre-inference/.cache/torchinductor-shared-test-${{ github.run_id }}"
+          echo "Removing $dir"
+          rm -rf "$dir"
 
   # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the

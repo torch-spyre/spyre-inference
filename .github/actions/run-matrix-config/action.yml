@@ -153,9 +153,19 @@ runs:
       run: uv run .github/cache_config/manage_cache.py --public
 
     # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.
+    # EXPERIMENT: when SPYRE_SHARED_KERNEL_CACHE_DIR is set, all matrix jobs
+    # share the same directory to test concurrent-cache safety on /storage-1.
     - name: Use a job-scoped torch inductor compile cache dir
       shell: bash
-      run: echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+      run: |
+        if [ -n "${SPYRE_SHARED_KERNEL_CACHE_DIR:-}" ]; then
+          echo "TORCHINDUCTOR_CACHE_DIR=${SPYRE_SHARED_KERNEL_CACHE_DIR}" >> "$GITHUB_ENV"
+          echo "SPYRE_KERNEL_CACHE=1" >> "$GITHUB_ENV"
+          echo "SPYRE_KERNEL_CACHE_SHARED=1" >> "$GITHUB_ENV"
+          echo "Using shared kernel cache dir: ${SPYRE_SHARED_KERNEL_CACHE_DIR}"
+        else
+          echo "TORCHINDUCTOR_CACHE_DIR=${RUNNER_TEMP}/inductor-cache-${{ inputs.job_slot }}-${{ github.run_id }}" >> "$GITHUB_ENV"
+        fi
 
     # All shard jobs of a suite must weight the partition from the SAME durations
     # file or they'd compute different partitions and drop/double-run tests, so

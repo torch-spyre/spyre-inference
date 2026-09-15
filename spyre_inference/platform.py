@@ -560,8 +560,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
         # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid
-        # KV-cache manager gives every layer its own buffer; SWA is still computed
-        # in the model runner. No-op for non-hybrid models.
+        # KV-cache manager gives every layer its own buffer; SWA is still computed, per
+        # layer, via `_split_attn_groups_by_layer_window`. No-op for non-hybrid models.
         scheduler_config.disable_hybrid_kv_cache_manager = True
 
         # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
@@ -583,7 +583,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # Pin the on-device KV cache to what's needed to fill the batch area:
         # max_num_seqs × ceil(max_model_len / block_size) blocks. Holds for hybrid
         # decoders too: `disable_hybrid_kv_cache_manager` above collapses every layer into
-        # one `UniformTypeKVCacheSpecs` group drawing from the single global BlockPool.
+        # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:

@@ -280,7 +280,7 @@ class TestRecordGraphs:
         metadata for unbucketed kv_lens and dispatches on the block counts
         ``build()`` actually produced for them.
         """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         # The builder's own bucketer, derived from the live config, since
         # _padded_mask_metadata builds its metadata from that same config.
@@ -308,7 +308,7 @@ class TestRecordGraphs:
 
     def test_mixed_batch_dispatch_compiles_nothing(self, impl, kv_cache, builder):
         """A mixed batch dispatches two query widths; both must be recorded."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         _record(impl, kv_cache, builder)
 
@@ -342,7 +342,7 @@ class TestRecordGraphs:
         three query buckets, and only bites when a chunk is wider than another
         sequence's padded KV, so the other recorder tests never reach it.
         """
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         cfg = get_current_vllm_config()
         monkeypatch.setattr(cfg.scheduler_config, "max_num_batched_tokens", 2048)
@@ -380,7 +380,7 @@ class TestRecordGraphs:
 
     def test_mixed_batch_row_tables_keep_their_own_width(self, impl, kv_cache):
         """The recorded key is not enough: the row table's width is a guard too."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from test_spyre_attn import _padded_mask_metadata
 
         metadata = _padded_mask_metadata(
             [(32, 300), (1, 200), (1, 65)],
@@ -401,6 +401,13 @@ class TestRecordGraphs:
             "sequences dispatch to an unrecorded graph"
         )
 
+    def test_mixed_batch_real_row_tables_compile_nothing(self, impl, kv_cache):
+        """The acceptance criterion, dispatched on the row tables the builder makes.
+
+        The other mixed-batch tests reach the kernel through ``_record_one``, which
+        rebuilds the row table itself and so cannot see a dispatcher/recorder drift.
+        """
+        from test_spyre_attn import _padded_mask_metadata
     def test_a_real_step_through_forward_compiles_nothing(self, impl, kv_cache, builder):
         """Record, then run a real step: a runtime batch — its own block table, mask
         tiles and row tables, none synthesized — must reuse the recorded graphs."""

@@ -199,7 +199,7 @@ test-smoke-shard-%:
 	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 # Carved out of smoke: every case compiles a product model, up to the 31B decoders.
-test-model-quality: ## Run the product-model output-quality gates against the cached HF references. Unsharded (local full run).
+test-model-quality: ## Run the product-model output-quality gates against live CPU HF. Unsharded (local full run).
 	$(MAKE) run-one MARK_OVERRIDE='model_quality and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
 # CI fans the gate out across parallel shard jobs like smoke/attention; the plugin's

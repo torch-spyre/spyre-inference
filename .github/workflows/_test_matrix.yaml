@@ -597,7 +597,6 @@ jobs:
             spyre-rpms.lock
             tests/**/*.py
             tests/**/*.yaml
-            tests/data/**
             spyre_inference/**/*.py
             spyre_inference/**/*.yaml
 

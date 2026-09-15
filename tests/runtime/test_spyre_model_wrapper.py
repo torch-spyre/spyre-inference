@@ -67,3 +67,44 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
     assert seen == [torch.int64, torch.int64]
     assert out["input_ids"].dtype == torch.int64
     assert out["positions"].dtype == torch.int64
+
+
+def test_wrapper_recursively_converts_integer_inputs(monkeypatch):
+    """Nested tensor inputs share the same boundary conversion as direct inputs."""
+    seen: list[torch.dtype | None] = []
+
+    def fake_convert(t, device=None, dtype=None):
+        seen.append(dtype)
+        return t if dtype is None else t.to(dtype)
+
+    monkeypatch.setattr(mr, "convert", fake_convert)
+
+    class _Capture(nn.Module):
+        def forward(self, nested):
+            return nested
+
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("cpu"), keep_outputs_on_device=True)
+    out = wrapper(nested={"positions": [torch.tensor([1], dtype=torch.int32)]})
+
+    assert seen == [torch.int64]
+    assert out["positions"][0].dtype == torch.int64
+
+
+def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
+    """The same tree conversion serves model outputs and multimodal inputs."""
+    seen: list[object] = []
+
+    def fake_convert(t, device=None, dtype=None):
+        seen.append(device)
+        return t
+
+    monkeypatch.setattr(mr, "convert", fake_convert)
+
+    class _Capture(nn.Module):
+        def forward(self, input_ids):
+            return {"nested": [input_ids]}
+
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("spyre"))
+    wrapper(input_ids=torch.tensor([1], dtype=torch.int64))
+
+    assert seen == [torch.device("spyre"), "cpu"]

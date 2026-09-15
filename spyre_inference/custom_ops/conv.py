@@ -27,6 +27,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
+from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -103,14 +104,12 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             groups=self.groups,
         )
 
-    def _weight_on_device(self) -> torch.Tensor:
-        """Place the conv weight into its tiled layout once, then cache."""
-        if self._w_dev is None:
-            w_cpu = self.weight.detach().to("cpu")
-            self._w_dev = w_cpu.to(  # ty: ignore[no-matching-overload]
-                "spyre", device_layout=_weight_layout(w_cpu)
-            )
-        return self._w_dev
+    def process_weights_after_loading(self) -> None:
+        """Place the patch-conv weight into its tiled layout once after model load."""
+        if self._w_dev is not None or self.weight.device.type != "spyre":
+            return
+        w_cpu = convert(self.weight.detach(), device="cpu")
+        self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -132,8 +131,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.
-        x_cpu = x.to("cpu")
-        x_dev = x_cpu.to(  # ty: ignore[no-matching-overload]
-            "spyre", device_layout=_input_layout(x_cpu)
-        )
-        return self._conv_native(x_dev, self._weight_on_device(), self.bias)
+        x_cpu = convert(x, device="cpu")
+        x_dev = convert(x_cpu, device="spyre", device_layout=_input_layout(x_cpu))
+        assert self._w_dev is not None, "Conv weights must be prepared after model loading."
+        return self._conv_native(x_dev, self._w_dev, self.bias)

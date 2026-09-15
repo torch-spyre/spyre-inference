@@ -277,7 +277,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in _page_attn_kernel, but with a 0-dim
+    Mirrors the page gather in page_attn_kernel, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -378,7 +378,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     """`k_pages[idx]` for the page gather: works compiled, fails eager.
 
-    This asymmetry is why _page_attn_kernel gathers with index_select,
+    This asymmetry is why page_attn_kernel gathers with index_select,
     which works in both modes.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32

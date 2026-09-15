@@ -19,8 +19,8 @@ tests that run them, and the relayout test, need the card: the shapes are scaled
 every dim the device sees stays stick-aligned, because the layouts in those regions depend
 on it. The intermediate dim reaches that alignment the way a TP shard does — zero-widened
 when it lands mid-stick — so the forms are exercised at both a native and a widened width.
-Routing semantics, configuration and dispatch are host-side. The promoted softmax lowering
-has a targeted Spyre test.
+Routing semantics, configuration and dispatch are host-side; only the promoted softmax's
+lowering needs the card.
 """
 
 import warnings
@@ -123,7 +123,6 @@ def test_routing_recipes_agree_under_renormalization():
 
 
 def test_routing_promotes_only_across_whole_float32_sticks(monkeypatch):
-    """The gate is the backend's fp32 stick, and the fp16 reduction it falls back to is logged."""
     from torch_spyre._C import get_elem_in_stick
 
     from spyre_inference import moe as moe_module
@@ -149,9 +148,8 @@ def test_probs_reduce_in_the_given_dtype_and_return_the_transport_dtype():
 
 
 def test_promoted_routing_softmax_lowers_on_spyre():
-    """The promoted reduction, in the region and under the config ``apply_monolithic`` uses.
-
-    A fallback that only manifests under ``frontend_pool_allocation`` would otherwise escape.
+    """``frontend_pool_allocation`` is the config ``apply_monolithic`` runs the region under;
+    a fallback that only manifests there would otherwise escape.
     """
     from spyre_testing_plugin.pytest_plugin import spyre_available
     from torch_spyre._inductor import config as spyre_config

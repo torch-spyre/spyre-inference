@@ -145,13 +145,7 @@ def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _route_reduce_dtype(experts: int, dtype: torch.dtype) -> torch.dtype:
-    """The dtype a full-softmax reduction over ``experts`` router logits runs in.
-
-    Upstream routes in fp32. Spyre keeps the logits themselves in the transport dtype
-    because it cannot restickify fp32 (see ``custom_ops.gate_linear``), and reduces over
-    them in fp32 where the backend lowers it: only across whole fp32 sticks, never over a
-    padded dim.
-    """
+    # An fp32 reduction over the experts only lowers across whole fp32 sticks.
     from torch_spyre._C import get_elem_in_stick
 
     stick = get_elem_in_stick(torch.float32)
@@ -168,7 +162,6 @@ def _route_reduce_dtype(experts: int, dtype: torch.dtype) -> torch.dtype:
 
 
 def _probs(router_logits: torch.Tensor, reduce_dtype: torch.dtype) -> torch.Tensor:
-    """Routing probabilities: a softmax over the experts, reduced in ``reduce_dtype``."""
     return torch.softmax(router_logits.to(reduce_dtype), dim=-1).to(router_logits.dtype)
 
 

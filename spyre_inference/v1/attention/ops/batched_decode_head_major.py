@@ -47,8 +47,8 @@ def batched_decode_head_major_kernel(
     k/v_pages: [num_pages_total, KV, block_size, D] (the raw page cache).
     chunk_page_ids: one [entries, 1] int32 tensor per chunk, entry (s, j) holding
     sequence s's (c * blocks_per_chunk + j)-th page. mask_by_chunk:
-    [num_chunks, entries * KV, 1, block_size], pre-broadcast across KV heads by
-    the builder. rep_row_ids: [entries] int32, each query row repeated
+    [num_chunks, entries, 1, block_size], broadcast across KV heads in the
+    kernel. rep_row_ids: [entries] int32, each query row repeated
     blocks_per_chunk times. ``out`` None returns the result instead of storing it.
     """
     num_heads = num_kv_heads * num_queries_per_kv
@@ -69,20 +69,17 @@ def batched_decode_head_major_kernel(
         # Already head-major: only the gather's singleton axis needs dropping.
         k_page = k_pages[page_idx].squeeze(1)
         v_page = v_pages[page_idx].squeeze(1)
-        # Builder already broadcast across KV heads; split them back out.
-        mask_tile = mask_by_chunk[c].reshape(entries, num_kv_heads, 1, block_size)
-
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        scores = scores + mask_tile
         # Leading-axis split only: merging a permuted axis pair is what
         # torch-spyre rejects.
         sc = scores.reshape(
             num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
         )
+        sc = sc + mask_by_chunk[c].reshape(num_seqs, blocks_per_chunk, 1, 1, block_size)
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
 
         # The running max drives exp(), not the chunk's own: a chunk wholly past

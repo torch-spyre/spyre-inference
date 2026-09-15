@@ -1491,13 +1491,43 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
         f"expected {num_distinct} transfers for {len(seq_tiles)} blocks, got {len(calls)}"
     )
 
-    # Blocks that shared a CPU tile must share the mirrored device tensor.
+    # Kernel arguments must not alias, or Dynamo records identity guards that
+    # vary with the batch's full/boundary tile pattern.
     for i, tile_i in enumerate(seq_tiles):
         for j, tile_j in enumerate(seq_tiles):
-            if tile_i is tile_j:
-                assert tiles_device[0][i] is tiles_device[0][j]
-            else:
+            if i != j:
                 assert tiles_device[0][i] is not tiles_device[0][j]
+
+
+def test_full_decode_masks_share_canonical_tiles(default_vllm_config, monkeypatch):
+    torch.set_default_device("cpu")
+    block_size = 64
+    kv_lens = [64, 65, 129, 193]
+    metadata = _padded_mask_metadata(
+        [(1, kv_len) for kv_len in kv_lens],
+        block_size=block_size,
+        max_num_blocks=_num_blocks_buckets(block_size)[-1],
+    )
+
+    tiles_cpu = metadata.attention_mask_tiles
+    assert tiles_cpu is not None
+    for seq_idx, kv_len in enumerate(kv_lens):
+        mask = torch.cat(tiles_cpu[seq_idx], dim=-1)
+        expected = torch.arange(mask.shape[-1]) < kv_len
+        assert torch.equal(mask[0] == 0, expected)
+
+    distinct = {id(tile) for seq_tiles in tiles_cpu for tile in seq_tiles}
+    calls = []
+
+    def counting_convert(tensor, device=None, dtype=None):
+        calls.append(tensor)
+        return tensor.clone()
+
+    monkeypatch.setattr(spyre_attn, "convert", counting_convert)
+    _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
+
+    # Shared zero and fully-masked tiles, plus boundaries with 1 valid lane.
+    assert len(distinct) == len(calls) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1860,9 +1890,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
         block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
         for c in range(num_chunks)
     ]
-    mask_by_chunk = torch.zeros(
-        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
-    )
+    mask_by_chunk = torch.zeros(num_chunks, entries, 1, block_size, dtype=torch.float32)
 
     def run(cap: float):
         return batched_decode_kernel(
@@ -2067,9 +2095,7 @@ def test_batched_decode_matches_fp32_reference(
     mask_by_chunk = (
         mask.reshape(b_seqs, num_chunks, bpc, block_size)
         .permute(1, 0, 2, 3)
-        .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .reshape(num_chunks, entries, 1, block_size)
         .contiguous()
     )
 

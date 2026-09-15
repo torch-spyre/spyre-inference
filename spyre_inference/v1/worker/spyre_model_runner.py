@@ -21,8 +21,8 @@ Data flow in the current WIP version:
 - self.device = CPU. Buffers and scatter ops stay on CPU.
 - _SpyreModelWrapper converts input_ids/positions to Spyre int64 at the
   model call boundary.
-- Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
-  pooler D2Hs only the final pooled vectors in ``_pool``.
+- Generative: D2H only the sampled rows (full copy when a mode needs more). Pooling:
+  keep on Spyre; pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
 - Hidden states flow on Spyre between decoder layers.
 - There are few exceptions where a CPU fallback is currently needed:
@@ -294,10 +294,8 @@ class _SpyreModelWrapper:
         Convert them to int64 and provide them to the model.
 
     Output conversion (Spyre → CPU):
-        The model's final hidden_states come out on Spyre. Downstream
-        operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
+        The model's final hidden_states come out on Spyre. Generation D2Hs only the
+        rows selected by logits_indices; modes needing more copy the whole output.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -318,6 +316,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_sample_rows", None)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -348,19 +347,46 @@ class _SpyreModelWrapper:
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
-        # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-
-            def _to_cpu(x):
-                return convert(x, device="cpu")
-
-            result = tree_map(_to_cpu, result)
+            result = self._outputs_to_cpu(result)
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    def _outputs_to_cpu(self, result):
+        sample_rows = self._sample_rows
+        object.__setattr__(self, "_sample_rows", None)
+        if (
+            sample_rows is not None
+            and isinstance(result, torch.Tensor)
+            and result.dim() == 2
+            and result.device.type == self._spyre_device.type
+        ):
+            trimmed = self._d2h_sampled_rows(result, sample_rows)
+            if trimmed is not None:
+                return trimmed
+        return tree_map(lambda x: convert(x, device="cpu"), result)
+
+    def _d2h_sampled_rows(self, hidden_states: torch.Tensor, rows: torch.Tensor):
+        """D2H only ``rows``, gathered on Spyre at a warmed width; None if not narrower."""
+        num_tokens = hidden_states.shape[0]
+        rows = rows.to(device="cpu", dtype=torch.int64)
+        num_rows = rows.numel()
+        idx = bisect.bisect_left(self._logits_row_buckets, num_rows)
+        padded_rows = (
+            self._logits_row_buckets[idx] if idx < len(self._logits_row_buckets) else num_rows
+        )
+        if padded_rows >= num_tokens:
+            return None
+
+        gather_rows = rows
+        if padded_rows != num_rows:
+            gather_rows = F.pad(rows, (0, padded_rows - num_rows), value=int(rows[-1]))
+
+        return convert(select_rows(hidden_states, gather_rows), device="cpu")[:num_rows]
 
     def embed_multimodal(self, **kwargs):
         """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
@@ -444,14 +470,7 @@ class _SpyreModelWrapper:
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
 
-        gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
-        `select_rows`), so the tensor handed to compute_logits is on CPU;
-        move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        Logits come back on CPU: SpyreLogitsProcessor converts right after the TP gather.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
@@ -599,7 +618,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Initialize bucket dispatcher for shape bucketing at runtime.
         self.spyre_shape_bucketer = self._create_shape_bucketer()
 
-        # Generative: D2H model outputs. Pooling: keep hidden_states on Spyre.
         bucketer = self.spyre_shape_bucketer
         self.model = _SpyreModelWrapper(
             self.model,
@@ -753,10 +771,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def warming_up_model(self) -> None:
         """Warm kernels / compile.
 
-        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then a dummy
-        logits/sampler run at each *sampled-row* width so the lm_head compiles here
-        rather than mid-request. The two bucket sets differ: body buckets are packed
-        token counts, rows are at most ``max_num_reqs``.
+        Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then warm the
+        output gather and logits/sampler at each *sampled-row* width. The two bucket
+        sets differ: body buckets are packed token counts, rows are at most
+        ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
         attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
@@ -822,6 +840,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+                self._warmup_output_row_gather(widest_hidden_states, row_widths)
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -829,6 +848,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    def _warmup_output_row_gather(self, hidden_states: torch.Tensor, row_widths: list[int]) -> None:
+        wrapper = getattr(self, "model", None)
+        if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
+            return
+        size = hidden_states.shape[0]
+        for num_rows in sorted((rows for rows in row_widths if rows < size), reverse=True):
+            rows = torch.arange(num_rows, dtype=torch.int64)
+            wrapper._d2h_sampled_rows(hidden_states, rows)
 
     @torch.inference_mode()
     def _record_encoder_pack_graphs(self) -> None:
@@ -963,6 +991,36 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         )
                     )
             self.attn_groups[kv_cache_group_id] = split_groups
+
+    def _can_trim_output_d2h(self) -> bool:
+        """Return whether sampled rows are the only consumers of model output."""
+        return (
+            not self.is_pooling_model
+            and not self.num_prompt_logprobs
+            and not self.use_aux_hidden_state_outputs
+            and self.speculative_config is None
+            and not self.cache_config.kv_sharing_fast_prefill
+        )
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        """Last hook before the model call that is handed ``logits_indices``."""
+        wrapper = self.model
+        rows = kwargs.get("logits_indices")
+        metadata = super()._build_attention_metadata(*args, **kwargs)
+        bucketer = self.spyre_shape_bucketer
+        if (
+            isinstance(wrapper, _SpyreModelWrapper)
+            and bucketer is not None
+            and bucketer.find_bucket(kwargs["num_tokens"]) is not None
+            and self._can_trim_output_d2h()
+            and rows is not None
+            and rows.numel() > 0
+        ):
+            # Preserve body offsets for the device gather, then make upstream's later
+            # hidden_states[logits_indices] an identity over the compact CPU result.
+            object.__setattr__(wrapper, "_sample_rows", rows.clone())
+            rows.copy_(torch.arange(rows.numel(), dtype=rows.dtype, device=rows.device))
+        return metadata
 
     def _determine_batch_execution_and_padding(
         self,

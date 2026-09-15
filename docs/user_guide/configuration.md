@@ -30,11 +30,15 @@ See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page 
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
-dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
-it needs the same treatment: it projects one row per *sampled* request, a width that
-would otherwise take every value in `1..--max-num-seqs` as requests finish. Those rows
-pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
-no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
+dummies every bucket. The output gather and lm_head sit outside every body graph and
+compile their own. Both use sampled-row buckets clipped to `--max-num-seqs`: the gather
+selects the required final hidden-state rows on Spyre before D2H, and the lm_head projects
+those rows after they return to Spyre. Warmup covers each reachable row width, and padding
+is removed before upstream processing.
+
+The reduced output transfer is used when sampled rows are the only output consumer.
+Prompt logprobs, auxiliary hidden-state outputs, speculative decoding, KV-sharing fast
+prefill, pooling, eager execution, and unbucketed shapes retain the full-output path.
 
 ## Encoder / pooling compile buckets
 

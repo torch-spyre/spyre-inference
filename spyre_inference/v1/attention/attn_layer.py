@@ -35,7 +35,8 @@ logger = init_logger(__name__)
 
 # vLLM reserves block 0 as `BlockPool.null_block`, so no sequence is ever given its
 # slots. `index_copy_` has no skip index, so they absorb writes with nowhere to go.
-_NULL_SLOT = 0
+# Padded block columns gather this block, so `_clear_masked_kv_slots` re-zeroes the slot.
+NULL_SLOT = 0
 
 
 class SlotMapping:
@@ -69,14 +70,14 @@ class SlotMapping:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = self._write_index(slot_mapping.clamp(min=_NULL_SLOT), device)
+        self.slots = self._write_index(slot_mapping.clamp(min=NULL_SLOT), device)
 
     def publish_null(self, num_tokens: int) -> None:
         device = self._resolve_device()
         if device is None:
             return
         self.slots = self._write_index(
-            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device
+            torch.full((num_tokens,), NULL_SLOT, dtype=torch.int64), device
         )
 
 

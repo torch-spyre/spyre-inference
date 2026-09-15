@@ -17,16 +17,22 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+from vllm.config import CompilationMode
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4SelfDecoderLayers,
+)
 
+from spyre_inference.custom_ops.lazy_compile import compile_when_outermost
+from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
 
     from torch import nn
     from vllm.config import VllmConfig
@@ -122,6 +128,25 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
+def reject_masked_per_layer_vocab(decoder: nn.Module) -> None:
+    """Reject a PLE checkpoint whose per-layer vocab is narrower than the full one.
+
+    Upstream then masks ``input_ids`` down to the per-layer vocab, and that mask is a
+    ``torch.bool`` result over an int operand, which torch-spyre lowers in neither mode:
+    its eager dispatch goes through the same Inductor backend, so there is no eager path
+    to fall back to. Raised at construction, before weights load, not mid-forward.
+    """
+    if decoder.embed_tokens_per_layer is None:
+        return
+    self_decoder = cast("Any", decoder)
+    per_layer, full = self_decoder.vocab_size_per_layer_input, self_decoder.config.vocab_size
+    if per_layer < full:
+        raise NotImplementedError(
+            f"Gemma-4 per-layer embeddings on Spyre require vocab_size_per_layer_input "
+            f">= vocab_size (got {per_layer} < {full})."
+        )
+
+
 def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Fold Gemma's output scale into the source down-projection stack."""
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
@@ -148,19 +173,80 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
 
 
-class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
+class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
+    """Self-decoder adapting the two PLE operations Spyre cannot lower."""
 
-    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
-    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
-    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
-    CPU tensor into Inductor, which has no notion of a live CPU graph input.
-    Re-registering the aliases restores the parent's stated intent (move with the
-    model, interact with torch.compile) and needs no change to the embedding math:
-    a device-side 0-d scalar lowers fine.
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
+
+    @compile_when_outermost
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Materialize every PLE row at offset zero in one compiled operation."""
+        return tuple(
+            ple[:, layer_idx, :].clone() for layer_idx in range(self.config.num_hidden_layers)
+        )
+
+    def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        """Upstream's, minus the mask ``reject_masked_per_layer_vocab`` makes a no-op.
+
+        That mask is a torch.bool result over an int operand, which Spyre cannot lower.
+        """
+        if self.embed_tokens_per_layer is None:
+            return None
+        per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
+        return per_layer_embeds.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def project_per_layer_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Use upstream's projection and materialize the rows its model loop slices."""
+        ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if ple is None:
+            return None
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple)
+        return rows
+
+
+class _PerLayerRows(torch.Tensor):
+    """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
+
+    Upstream's backbone loop cuts each block's row with exactly that index, and a
+    compiled block reads that nonzero-offset view from offset 0 (torch-spyre#3770).
     """
+
+    # No subclass propagation: only the instance the projection hands back carries rows.
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
+class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
+    """Gemma-4 adapted for the Spyre compile path, with Spyre MoE expert dispatch."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
+        reject_masked_per_layer_vocab(decoder)
+        decoder.spyre_compile_enabled = (
+            vllm_config.compilation_config.mode is not CompilationMode.NONE
+        )
+        decoder.spyre_compiled_kernel = None
         register_aliased_scalars(self.model.self_decoder)
         configure_gemma4_moe_layers(self.model.layers)

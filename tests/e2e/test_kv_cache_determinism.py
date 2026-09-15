@@ -22,7 +22,7 @@ to later requests. Masked slots must not reach the output; on Spyre they do
 So: run a short request, dirty its blocks with a longer one, run the short request again,
 and require the two logprob traces to be bit-identical.
 ``SpyreAttentionImpl._clear_new_kv_block_tails`` is what makes that hold. When
-``tests/probes/test_masked_kv_slot_probe.py`` flips to XPASS the backend no longer needs
+``tests/probes/test_fp16_exp_underflow_probe.py`` flips to XPASS the backend no longer needs
 the workaround, and this test guards its removal.
 """
 

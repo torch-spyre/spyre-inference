@@ -33,6 +33,15 @@ on:
         required: false
         type: boolean
         default: false
+      use_prebaked_image:
+        description: >
+          When true, skip the "Install Spyre RPMs" step. That step pins the
+          spyre-rpms.lock baseline and overrides the runner image's Spyre
+          stack, so a prebaked (spyre-test) run must skip it to test the baked
+          stack as-is. Matches _test_matrix.yaml.
+        required: false
+        type: boolean
+        default: false
       clickhouse_env:
         description: >
           ClickHouse instance to ingest into: "prod" (the CLICKHOUSE_* secret
@@ -116,6 +125,7 @@ jobs:
 
       - name: Install Spyre RPMs
         id: spyre-rpms
+        if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
+    SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
@@ -68,6 +69,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 4 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
+    # Which KV cache layout the decoder attention backend uses, within a page:
+    #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size] (default)
+    #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
+    #    the per-page permute the kernels do before the matmuls
+    "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
     # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.

@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
-    SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -74,10 +74,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
     #    the per-page permute the kernels do before the matmuls
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
-    # When "1", enables the batched multi-sequence decode kernel. Off by default
-    # pending performance characterisation at small batch sizes (num_seqs <= 4).
-    # Re-enable to measure the path or to restore it after calibration.
-    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1" (default), enables the batched multi-sequence decode kernel for
+    # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
+    # per-seq loop either way. "0" forces the loop for all batch sizes.
+    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

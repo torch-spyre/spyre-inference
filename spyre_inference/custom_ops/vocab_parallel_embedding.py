@@ -51,6 +51,10 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # A tied embedding is identified as the LM head only at first logits use,
+        # when the vLLM config context is no longer active. Sample its compile
+        # policy now so promotion does not construct a compile-aware method later.
+        self._spyre_lm_head_method = SpyreUnquantizedLMHeadMethod()
 
         if self.tp_size > 1:
             reindex_table, keep_table = self._build_reindex_and_keep_tables()
@@ -138,7 +142,7 @@ def promote_tied_lm_head(head: torch.nn.Module) -> None:
     if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
         return
 
-    method = SpyreUnquantizedLMHeadMethod()
+    method = head._spyre_lm_head_method
     # Pad and transpose on the host: this runs after the device move, and relaying
     # out a vocab-sized table on device costs far more than the round trip.
     weight = cast(torch.Tensor, head.weight)

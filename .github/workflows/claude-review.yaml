@@ -1,22 +1,18 @@
 name: Claude PR Review (on-hardware)
-run-name: Claude review of PR #${{ github.event.issue.number }}
+run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
 
 # ---------------------------------------------------------------------------
-# On-demand Claude Code review that runs on the Spyre self-hosted runner so
-# the agent can exercise the accelerator
+# On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner;
+# /claude-review-static uses a GitHub-hosted CPU runner.
 # ---------------------------------------------------------------------------
 on:
   issue_comment:
     types: [created]
 
 concurrency:
-  # Spyre is single-accelerator: the group key serializes a PR's reviews so
-  # two never hold the device at once. cancel-in-progress stays FALSE on
-  # purpose: a mid-compile run that gets SIGKILLed can leave a half-written
-  # torch-spyre compile cache under /storage-1 (CLAUDE.md: interrupted Spyre
-  # runs "corrupt device state, or corrupt the compile cache"). A newer trigger
-  # queues behind the in-flight review instead of killing it.
-  group: claude-review-${{ github.event.issue.number }}
+  # Static and hardware reviews must not block each other. Hardware reviews are
+  # still serialized per PR so a cancelled run cannot corrupt the Spyre cache.
+  group: claude-review-${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}-${{ github.event.issue.number }}
   cancel-in-progress: false
 
 permissions:
@@ -34,23 +30,23 @@ permissions:
 
 jobs:
   review:
-    # A comment on a PR (not a plain issue), starting with the trigger command,
+    # A comment on a PR (not a plain issue), starting with a trigger command,
     # from a commenter that clears a cheap author_association pre-filter.
     # author_association is NOT proof of write access -- COLLABORATOR also covers
     # read/triage collaborators -- so it only avoids spinning the runner for
     # obvious non-members here; the authoritative write-access check is the
     # "Verify commenter has write access" step below, which asks the API.
+    #
+    # No trailing delimiter after the command: a comment with notes on later
+    # lines has CRLF (not a space) after it, and GHA literals can't encode it.
     if: >-
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/claude-review') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-    runs-on:
-      - x86_64
-      - spyre_pf_x2
-      - linux
-      - image_torch_spyre
+    runs-on: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'ubuntu-latest' || fromJSON('["x86_64","spyre_pf_x2","linux","image_torch_spyre"]') }}
     timeout-minutes: 60
     env:
+      REVIEW_MODE: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}
       # Mirror the test runners
       CI: ''
       STORAGE_1_DIR: /storage-1/spyre-inference
@@ -99,9 +95,11 @@ jobs:
           fetch-depth: 0
 
       - name: Install Spyre RPMs
+        if: env.REVIEW_MODE == 'hardware'
         uses: ./.github/actions/spyre-rpm-install
 
       - name: Set up uv
+        if: env.REVIEW_MODE == 'hardware'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           enable-cache: true
@@ -110,6 +108,7 @@ jobs:
             spyre-rpms.lock
 
       - name: Install spyre-inference
+        if: env.REVIEW_MODE == 'hardware'
         run: |
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
@@ -161,11 +160,12 @@ jobs:
           SPYRE_KB_MCP_URL: ${{ secrets.SPYRE_KB_MCP_URL }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: |
-          # Device env, so the agent's own Bash can reach the accelerator for
-          # on-hardware verification (this shell does not inherit it otherwise).
-          # Source it from the real home before switching HOME below.
-          source "$HOME/.bashrc"
-          source /etc/profile.d/ibm-aiu-setup.sh
+          # Device env is only needed for the hardware review. Source it from
+          # the real home before switching HOME below.
+          if [ "$REVIEW_MODE" = "hardware" ]; then
+            source "$HOME/.bashrc"
+            source /etc/profile.d/ibm-aiu-setup.sh
+          fi
 
           # claude was installed under this HOME (the image's ~/.local is
           # read-only for this uid); set it so the CLI is found and can write
@@ -178,8 +178,13 @@ jobs:
           mcp_config="{\"mcpServers\":{\"spyre-knowledgebase\":{\"type\":\"http\",\"url\":\"${SPYRE_KB_MCP_URL}\"}}}"
 
           # CANNED prompt from a committed file -- NOT the comment body. Any
-          # text a maintainer types after /claude-review is ignored.
-          prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/" .github/claude-review-prompt.txt)"
+          # text a maintainer types after either trigger is ignored.
+          if [ "$REVIEW_MODE" = "static" ]; then
+            prompt_file=.github/claude-review-static-prompt.txt
+          else
+            prompt_file=.github/claude-review-prompt.txt
+          fi
+          prompt="$(sed "s/__PR_NUMBER__/${PR_NUMBER}/" "$prompt_file")"
 
           # This CLI build does NOT provide a github_inline_comment MCP server,
           # so /code-review --comment posts through the gh CLI fallback.

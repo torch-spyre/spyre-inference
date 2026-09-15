@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import types
+
 import torch
 import torch.nn as nn
 from vllm.v1.kv_cache_interface import (
@@ -95,6 +97,12 @@ def test_kv_sharing_attention_lookup_preserves_physical_specs(monkeypatch):
     )
     runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
     runner.shared_kv_cache_layers = {sharing: owner}
+    # `initialize_attn_backend` also splits groups by per-layer window after super();
+    # no groups here makes that a no-op, leaving the spec resolution under test.
+    runner.attn_groups = []
+    runner.vllm_config = types.SimpleNamespace(
+        compilation_config=types.SimpleNamespace(static_forward_context={})
+    )
     seen = []
 
     def capture(_self, attn_config, is_profiling=False):

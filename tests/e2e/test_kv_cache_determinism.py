@@ -29,6 +29,10 @@ The second test covers the other masked-slot kind: padded block columns sit at z
 they gather the null slot. That needs a block count off the bucket lattice, which the
 test above cannot express -- at ``_MAX_MODEL_LEN = 256`` the lattice is ``[1, 2]``, so
 padded == real at every prompt length.
+
+The third runs a whole batch, which is what the batched decode kernel needs: both of the
+above decode one sequence at a time, and that kernel reads the batch through a block table
+and a padded-row scheme of its own.
 """
 
 from __future__ import annotations
@@ -176,4 +180,97 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
             f"real={real} padded={padded} blocks: the {padded - real} padded block(s) "
             f"are gathering a slot that is not held at zero.\n"
             f"  pass1={traces[0][diverged]}\n  pass{i}={trace[diverged]}"
+        )
+
+
+# The batched decode kernel serves batches of at least `_MIN_BATCHED_SEQS` sequences, so
+# four concurrent requests are the smallest batch that reaches it. Prefills are serialised
+# (SPYRE_MAX_NUM_PARTIAL_PREFILLS defaults to 1), so the batch only fills up once every
+# prompt has prefilled -- hence more tokens than the solo tests, to leave steps where all
+# four decode together.
+_BATCH_NUM_SEQS = 4
+_BATCH_MAX_TOKENS = 8
+# Short, for the same reason as `_PROBE_PROMPT`, and distinct so a leak between slots
+# carries a neighbour's KV rather than a copy of this slot's own.
+_BATCH_PROBE_PROMPTS = [
+    "What are IBMs main businesses?",
+    "Name three rivers in Europe.",
+    "Why is the sky blue?",
+    "Who wrote the Odyssey?",
+]
+
+
+def _batch_logprobs(engine, prompts: list[str]) -> list[list[dict[int, float]]]:
+    """One per-step logprob trace per prompt, for a batch in a single `generate` call."""
+    from vllm import SamplingParams
+
+    outputs = engine.generate(
+        prompts,
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=_BATCH_MAX_TOKENS,
+            logprobs=_NUM_LOGPROBS,
+            ignore_eos=True,
+        ),
+        use_tqdm=False,
+    )
+    assert len(outputs) == len(prompts)
+    traces = []
+    for output in outputs:
+        steps = output.outputs[0].logprobs
+        assert steps is not None
+        traces.append([{tid: lp.logprob for tid, lp in step.items()} for step in steps])
+    return traces
+
+
+def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same batch twice, with other requests in between, while decode is batched.
+
+    Batched decode reads the whole batch through one padded gather, off a block table of
+    its own (`chunk_page_ids_cpu`, not the per-seq `page_index_tables_cpu`), with the block
+    axis padded up to a whole chunk and the row axis up to the num_seqs lattice. Which
+    masked slots a row reaches is therefore not the per-seq loop's answer.
+
+    The batch is identical in both passes, so the schedule repeats and with it the chunked
+    reduction order (which is not comparable across batch sizes -- see
+    test_spyre_attn_batched_decode_correctness); only the physical blocks differ. Prompts
+    stay under one block, so nothing is prefix-cacheable and every pass really re-prefills.
+    """
+    from vllm import LLM
+
+    assert len(_BATCH_PROBE_PROMPTS) == _BATCH_NUM_SEQS
+
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    # Pinned on, so a default flip cannot silently move this test onto the per-seq loop.
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+
+    engine = LLM(
+        model=_MODEL,
+        enforce_eager=False,
+        max_model_len=_MAX_MODEL_LEN,
+        max_num_seqs=_BATCH_NUM_SEQS,
+        max_num_batched_tokens=_PREFILL_BUCKET,
+        # Every reachable body token count: a prefill step, a full decode batch, and one
+        # sequence decoding alone. Shorter batches pad up onto `_BATCH_NUM_SEQS`.
+        compilation_config={"compile_sizes": [_PREFILL_BUCKET, _BATCH_NUM_SEQS, 1]},
+    )
+
+    first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
+    # Hands the probe batch's blocks to other tenants, whose KV then sits in the slots the
+    # probe requests' last blocks leave past their end. Identical prompts are enough: the
+    # comparison is pass-to-pass, and in the first pass those blocks held something else.
+    _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS)
+    second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
+
+    for slot, (before, after) in enumerate(zip(first, second)):
+        diverged = next(
+            (i for i, (a, b) in enumerate(zip(before, after)) if a != b),
+            None,
+        )
+        assert diverged is None, (
+            f"batch slot {slot} diverged at step {diverged} after an unrelated batch ran "
+            f"in between: a stale KV tail is leaking into batched decode.\n"
+            f"  first={before[diverged]}\n  second={after[diverged]}"
         )

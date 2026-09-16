@@ -298,10 +298,9 @@ def _run_head_major_attn_test(
 
 
 def test_head_major_kv_cache_shape():
-    """The backend advertises head-major, and vLLM can still find the block dim."""
+    """The backend advertises the head-major shape with num_blocks outermost."""
     shape = SpyreHeadMajorAttentionBackend.get_kv_cache_shape(16, 128, 8, 64)
     assert shape == (16, 8, 128, 64)
-    assert SpyreHeadMajorAttentionBackend.get_kv_cache_block_dim(128, 8, 64) == 0
 
 
 def test_head_major_write_index(default_vllm_config):
@@ -809,7 +808,12 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layers.0.self_attn"])
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks,
+                layers=["layers.0.self_attn"],
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
         ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
     )

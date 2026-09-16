@@ -27,7 +27,6 @@ from . import (
     linear,
     logits_processor,  # noqa: F401
     parallel_lm_head,
-    rms_norm,
     rotary_embedding,
     utils,
     vocab_parallel_embedding,  # noqa: F401

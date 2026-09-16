@@ -88,14 +88,23 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
+        # One page past vLLM's block count is the padding sink; see the token-major
+        # `allocate_pages`.
+        pages = num_blocks + 1
         layout = head_major_kv_layout(
-            num_blocks * spec.num_kv_heads * spec.block_size, spec.head_size, torch.float16
+            pages * spec.num_kv_heads * spec.block_size, spec.head_size, torch.float16
         )
-        shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
+        shape = (pages, spec.num_kv_heads, spec.block_size, spec.head_size)
         return SpyrePagedKVCache(
             k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
             v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
+
+    @classmethod
+    def padding_sink_slot(cls, kv_cache: SpyrePagedKVCache) -> int:
+        """As token-major, but ``block_size`` is dim 2 in this layout."""
+        pages, block_size = kv_cache[0].shape[0], kv_cache[0].shape[2]
+        return (pages - 1) * block_size
 
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device

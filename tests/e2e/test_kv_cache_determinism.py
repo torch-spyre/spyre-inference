@@ -25,10 +25,11 @@ and require the two logprob traces to be bit-identical.
 ``tests/probes/test_fp16_exp_underflow_probe.py`` flips to XPASS the backend no longer needs
 the workaround, and this test guards its removal.
 
-The second test covers the other masked-slot kind: padded block columns sit at zero, so
-they gather the null slot. That needs a block count off the bucket lattice, which the
-test above cannot express -- at ``_MAX_MODEL_LEN = 256`` the lattice is ``[1, 2]``, so
-padded == real at every prompt length.
+The second test covers the padded block columns: ``build()`` rounds a sequence's block
+count onto the recorder's buckets and gathers the padded columns too. That needs a block
+count off the bucket lattice, which the test above cannot express -- at
+``_MAX_MODEL_LEN = 256`` the lattice is ``[1, 2]``, so padded == real at every prompt
+length.
 """
 
 from __future__ import annotations
@@ -107,7 +108,7 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
 
 # 1024, not 512: the leak is always present, but its value only changes often enough to
 # surface as pass-to-pass divergence at the larger prefill bucket. The deterministic
-# detector is test_spyre_attn.py::test_padded_blocks_do_not_read_the_null_slot.
+# detector is test_spyre_attn.py::test_padded_blocks_do_not_read_a_stale_page.
 _PAD_MAX_MODEL_LEN = 1024
 _BLOCK_SIZE = 128
 # 3 blocks, not a bucket, so build() pads to 4; stays 3 for every generated token too.

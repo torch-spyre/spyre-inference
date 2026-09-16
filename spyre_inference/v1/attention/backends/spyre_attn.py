@@ -443,12 +443,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_lens_list: list[int],
         block_table: torch.Tensor,
     ) -> list[tuple[int, int]]:
-        """Slot ranges the kernel gathers under the mask but no real token wrote.
+        """Tail ranges the kernel gathers under the mask but no real token wrote.
 
-        The null slot every step; a partial block's tail only on the step that first
-        writes that block, since later decode steps retain the zero tail.
+        Only on the step that first writes a partial block, since later decode steps
+        retain the zero tail. Padding tokens need no entry: `attn_layer` sends them to a
+        page nothing gathers, so block 0 stays at its allocated zero.
         """
-        ranges = [(attn_layer.NULL_SLOT, attn_layer.NULL_SLOT + 1)]
+        ranges: list[tuple[int, int]] = []
         for seq in range(num_seqs):
             kv_len = int(seq_lens_list[seq])
             if kv_len <= 0:
@@ -1228,12 +1229,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _clear_masked_kv_slots(
         self, kv_cache: SpyrePagedKVCache, attn_metadata: "SpyreAttentionMetadata"
     ) -> None:
-        """Zero the slots build() flagged as gathered under the mask but never written.
+        """Zero the block tails build() flagged as gathered under the mask but never written.
 
         torch-spyre#4517: fp16 ``exp()`` floors at ``2**-24``, so masked positions keep a
-        softmax weight and their V reaches the output. Takes ``kv_cache`` rather than
-        reading ``self._kv_slots`` so layers ``attn_layer`` declines to split -- whose
-        KV write upstream owns -- are covered too.
+        softmax weight and their V reaches the output. Usually a no-op -- a tail is cleared
+        only on the step that first enters its block. Takes ``kv_cache`` so layers
+        ``attn_layer`` declines to split are covered too.
         """
         k_slots, v_slots = self.kv_slot_views(kv_cache)
         for start, end in attn_metadata.masked_kv_slot_ranges:
@@ -1576,16 +1577,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
-        """Allocate the paged K/V tensors in the layout this impl's kernels read."""
+        """Allocate the paged K/V tensors in the layout this impl's kernels read.
+
+        One page past vLLM's block count is the padding sink: no block table names it, so
+        the padding tokens `attn_layer` funnels there are never gathered. That keeps
+        block 0 -- which every padded block column gathers -- at its allocated zero.
+        """
+        pages = num_blocks + 1
         # Host-allocated then transferred: only .to() takes a device_layout.
         layout = slot_major_kv_layout(
-            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            pages * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
         )
-        shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+        shape = (pages, spec.block_size, spec.num_kv_heads, spec.head_size)
         return SpyrePagedKVCache(
             k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
             v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
+
+    @classmethod
+    def padding_sink_slot(cls, kv_cache: SpyrePagedKVCache) -> int:
+        """First slot of the page ``allocate_pages`` reserved past vLLM's blocks."""
+        pages, block_size = kv_cache[0].shape[0], kv_cache[0].shape[1]
+        return (pages - 1) * block_size
 
     def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
         """Mirror a host slot mapping to the index ``do_kv_cache_update`` takes.

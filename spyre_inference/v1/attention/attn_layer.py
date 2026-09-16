@@ -33,11 +33,6 @@ from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
 
-# vLLM reserves block 0 as `BlockPool.null_block`, so no sequence is ever given its
-# slots. `index_copy_` has no skip index, so they absorb writes with nowhere to go.
-# Padded block columns gather this block, so `_clear_masked_kv_slots` re-zeroes the slot.
-NULL_SLOT = 0
-
 
 class SlotMapping:
     """This step's slot mapping on device, shared by every split layer."""
@@ -45,6 +40,7 @@ class SlotMapping:
     def __init__(self, layers: list[Attention]) -> None:
         self._layers = layers
         self._device: torch.device | None = None
+        self._sink_slot: int | None = None
         # One tensor, or one per KV head: whatever the impl's KV store indexes by.
         self.slots: torch.Tensor | list[torch.Tensor] | None = None
 
@@ -59,6 +55,14 @@ class SlotMapping:
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._layers:
                 layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
+            sinks = {
+                layer.impl.padding_sink_slot(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
+                for layer in self._layers
+            }
+            # One slot mapping addresses every layer in the group, so the reserved sink
+            # has to be the same index in all of them.
+            assert len(sinks) == 1, f"layers sharing a slot mapping differ in size: {sinks}"
+            self._sink_slot = sinks.pop()
         return self._device
 
     def _write_index(self, slot_mapping: torch.Tensor, device: torch.device):
@@ -70,14 +74,19 @@ class SlotMapping:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = self._write_index(slot_mapping.clamp(min=NULL_SLOT), device)
+        # Padding tokens carry -1. torch-spyre#4517 keeps a softmax weight on masked
+        # positions, so they must not land in a slot any block table names -- they go to
+        # the sink page `allocate_pages` reserves, which nothing gathers. Once per step.
+        self.slots = self._write_index(
+            torch.where(slot_mapping < 0, self._sink_slot, slot_mapping), device
+        )
 
     def publish_null(self, num_tokens: int) -> None:
         device = self._resolve_device()
         if device is None:
             return
         self.slots = self._write_index(
-            torch.full((num_tokens,), NULL_SLOT, dtype=torch.int64), device
+            torch.full((num_tokens,), self._sink_slot, dtype=torch.int64), device
         )
 
 

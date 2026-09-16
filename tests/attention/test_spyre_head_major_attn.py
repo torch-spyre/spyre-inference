@@ -38,6 +38,10 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major import (
+    page_attn_head_major_decode_kernel,
+    page_attn_head_major_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
@@ -49,13 +53,6 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 pytestmark = pytest.mark.attention
 
 DTYPE = torch.float16
-
-
-@pytest.fixture()
-def enable_batched_decode(monkeypatch):
-    """See the identically-named fixture in test_spyre_attn.py: the batched decode
-    path ships gated off, so a test of it would otherwise pass testing nothing."""
-    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
 
 # Per-module in this directory, as in test_spyre_attn.py and test_spyre_encoder_attn.py.
@@ -129,7 +126,6 @@ def _run_head_major_attn_test(
     sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
-    use_alibi: bool = False,
     soft_cap: float | None = None,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
@@ -144,7 +140,6 @@ def _run_head_major_attn_test(
         pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
 
     from tests.attention.test_spyre_attn import (
-        _alibi_slopes,
         _build_metadata,
         _fused_qkv_kv_views,
         assert_close_outliers,
@@ -155,7 +150,8 @@ def _run_head_major_attn_test(
     torch.set_default_device("cpu")
     set_random_seed(0)
 
-    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
+    # This layout does not carry ALiBi; the impl rejects slopes at construction.
+    alibi_slopes = None
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -495,22 +491,18 @@ _SHAPES = [
 ]
 
 
+# Spyre and compiled only: the kernel's page gather lowers to aten.index, which fails
+# eager, so the impl always compiles attention. Residency itself is a property of the
+# layout plan rather than a result, and is measured by
+# scripts/probes/lx_head_major_residency.py.
 @pytest.mark.parametrize("seq_lens", _SHAPES)
 @pytest.mark.parametrize(
     "configure_compilation",
-    [
-        pytest.param("NONE", id="eager"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compiled"),
-    ],
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
 )
 @pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_attn_core(
     default_vllm_config, seq_lens, configure_compilation, configure_device
@@ -570,28 +562,6 @@ def test_head_major_attn_sliding_window(
 
 
 @pytest.mark.parametrize("seq_lens", [pytest.param([(1, 300), (64, 200)], id="mixed_batch")])
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_head_major_attn_alibi(
-    default_vllm_config, seq_lens, configure_compilation, configure_device
-):
-    _run_head_major_attn_test(
-        seq_lens=seq_lens,
-        block_size=64,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
-        use_alibi=True,
-    )
-
-
-@pytest.mark.parametrize("seq_lens", [pytest.param([(1, 300), (64, 200)], id="mixed_batch")])
 @pytest.mark.parametrize("soft_cap", [30.0])
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -637,27 +607,6 @@ def test_head_major_attn_head_configs(
         configure_device=configure_device,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
-    )
-
-
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
-)
-def test_head_major_batched_decode(
-    default_vllm_config, enable_batched_decode, configure_compilation, configure_device
-):
-    """The batched decode kernel reads the page too, so it needs its own head-major copy."""
-    _run_head_major_attn_test(
-        seq_lens=[(1, 256), (1, 192), (1, 256), (1, 128)],
-        block_size=64,
-        sliding_window=None,
-        configure_compilation=configure_compilation,
-        configure_device=configure_device,
     )
 
 
@@ -761,9 +710,9 @@ def test_head_major_matches_token_major(
         _write(impl, kv_cache, key_src, value_src, slot_mapping_t, cache_device)
 
         output = torch.full_like(query, float("nan")).to(cache_device)
-        # Each impl mirrors its own device tables onto the metadata; clear the
-        # first one's so the second is not handed the wrong shapes.
-        attn_metadata.page_index_tables = None
+        # Each impl builds its own device tables onto the metadata; clear the first one's
+        # so the second is not handed the wrong shapes.
+        attn_metadata.kernel_index_tables = None
         attn_metadata.attention_mask_tiles_device = None
         attn_metadata.query_row_tables = None
         impl.forward(
@@ -835,11 +784,56 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     assert k_pages.shape == expected == (num_blocks, num_kv_heads, block_size, head_size)
     assert v_pages.shape == expected
 
-    # The store indexes one flat row axis, so it has to stay whole at device position 0
-    # (torch-spyre#3705), exactly as the token-major slot axis does.
-    num_rows = num_blocks * num_kv_heads * block_size
+    # The kernel gathers a (page, kv_head) row, which has to stay whole at device
+    # position 0 (torch-spyre#3705) or the gather costs the whole cache, not one page.
     for pages in (k_pages, v_pages):
-        assert pages.device_tensor_layout().device_size[0] == num_rows
+        device_size = pages.device_tensor_layout().device_size
+        assert device_size[0] == num_blocks * num_kv_heads
+        assert device_size[1] == block_size
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+def test_decode_fold_matches_unrolled():
+    """The folded decode kernel is the unrolled one rebatched, so it must agree exactly."""
+    set_random_seed(0)
+    kv, qpk, d, block, blocks = 8, 4, 128, 64, 5
+    heads = kv * qpk
+    k = torch.randn(blocks * kv, block, d)
+    v = torch.randn(blocks * kv, block, d)
+    query = torch.randn(3, heads, d)
+    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+    kv_tables = [
+        torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
+    ]
+    head_tables = [
+        torch.tensor([h * qpk + g for h in range(kv)], dtype=torch.int32) for g in range(qpk)
+    ]
+    masks = [torch.zeros(1, block) for _ in range(blocks)]
+    masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
+
+    for soft_cap in (0.0, 30.0):
+        args = (
+            query,
+            rows,
+            k,
+            v,
+            kv_tables,
+            head_tables,
+            masks,
+            d**-0.5,
+            blocks,
+            1,
+            heads,
+            kv,
+            d,
+            block,
+            soft_cap,
+            None,
+        )
+        unrolled = page_attn_head_major_kernel(*args)
+        # The folded kernel needs no head gather, so it takes no head index tables.
+        folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
+        assert folded.shape == unrolled.shape
+        torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)

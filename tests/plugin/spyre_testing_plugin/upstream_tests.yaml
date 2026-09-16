@@ -130,6 +130,23 @@ tests:
           mode: skip # model_info0 (Qwen3-0.6B): RAS::VFIO::MapDMAFailed; model_info1 (Qwen3-0.6B-FP8): KeyError PlatformEnum.OOT - FP8 quant not supported on Spyre; model_info2 (Qwen3.5-0.8B): Qwen3_5ForConditionalGeneration not in vLLM registry
           tags: [model, generation, upstream, uses_subprocess]
 
+    # Server-based GSM8K eval: launches `vllm serve` (RemoteOpenAIServer) and hits
+    # the OpenAI completions endpoint. Runs compiled (server_args omit --enforce-eager)
+    # and batched (max_concurrency matches the server's batch area) to reflect
+    # real-world serving. The upstream `config_filename` fixture is steered to the
+    # Spyre configs (one per model) via `config_list`; thresholds are measured
+    # on-device baselines.
+    # Egress note: upstream's gsm8k_eval.py fetches the dataset (train/test.jsonl) over
+    # HTTP from VLLM_S3_BUCKET_URL (vllm-public-assets S3, *not* HF Hub, so HF_HUB_OFFLINE
+    # does not gate it) into tempfile.gettempdir(). The runners therefore need S3 egress;
+    # the temp dir is not durable, so each shard re-downloads (the two files are small).
+    - rel_path: tests/evals/gsm8k/test_gsm8k_correctness.py
+      config_list: gsm8k_configs/models-spyre.txt
+      allow_list:
+        - test: "test_gsm8k_correctness"
+          mode: mandatory_pass
+          tags: [gsm8k, upstream, uses_subprocess]
+
     - rel_path: tests/models/language/pooling/test_embedding.py
       allow_list:
         - test: "test_models"

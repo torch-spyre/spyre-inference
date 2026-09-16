@@ -292,12 +292,16 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Gather indices for the paged attention loop, one row per active block:
     # [num_seqs, max_active_blocks, INT32_ELEMS_PER_STICK] int32 with the page
     # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
-    # which is why block_table cannot serve as the index. The device mirror is
-    # filled by the first forward(), since the builder's device is CPU.
+    # which is why block_table cannot serve as the index.
     # One table per sequence at its own active-block count, materialized once per
     # step: a batch-max width would put max(num_active) into the kernel's guards.
     page_index_tables_cpu: list[torch.Tensor] | None = None
-    page_index_tables: list[torch.Tensor] | None = None
+
+    # Per sequence, the device index table each kernel gathers pages with, built from
+    # page_index_tables_cpu on the step's first layer since the builder's device is CPU.
+    # Its shape is the kernel's business, so a caller driving two impls over one step's
+    # metadata has to clear this between them.
+    kernel_index_tables: list | None = None
 
     # Absolute query rows per sequence: gather sources in `query`, and store
     # destinations in `output`. One offset-0 tensor each, as above. Rows past
@@ -1285,14 +1289,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
 
-        # Only the first layer of a step pays for the device mirror.
-        if attn_metadata.page_index_tables is None:
-            tables_cpu = attn_metadata.page_index_tables_cpu
-            assert tables_cpu is not None
-            # Fresh offset-0 allocations (torch-spyre#3770).
-            attn_metadata.page_index_tables = [
-                convert(table, device=_target_device) for table in tables_cpu
-            ]
         if attn_metadata.attention_mask_tiles_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
@@ -1705,6 +1701,55 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
 
+    def build_index_tables(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> list:
+        """Per sequence, the device index table this impl's kernel gathers pages with."""
+        tables_cpu = attn_metadata.page_index_tables_cpu
+        assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
+        # Fresh offset-0 allocations (torch-spyre#3770).
+        return [convert(table, device=device) for table in tables_cpu]
+
+    def index_tables(self, attn_metadata: "SpyreAttentionMetadata", device: torch.device) -> list:
+        """`build_index_tables`, memoized so only the step's first layer pays for it."""
+        if attn_metadata.kernel_index_tables is None:
+            attn_metadata.kernel_index_tables = self.build_index_tables(attn_metadata, device)
+        return attn_metadata.kernel_index_tables
+
+    def _run_page_attn(
+        self,
+        query: torch.Tensor,
+        row_table: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        index_table,
+        mask_tiles: list[torch.Tensor],
+        num_blocks: int,
+        padded_query_len: int,
+        alibi_bias_tiles: list[torch.Tensor] | None,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run one sequence's page attention. The point where a subclass swaps kernels."""
+        return _call_kernel(
+            "page attention",
+            self._attn_fn,
+            query,
+            row_table,
+            k_pages,
+            v_pages,
+            index_table,
+            mask_tiles,
+            self.scale,
+            num_blocks,
+            padded_query_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_size,
+            self.logits_soft_cap,
+            alibi_bias_tiles,
+            out,
+        )
+
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
@@ -1739,13 +1784,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        page_index_tables = attn_metadata.page_index_tables
+        index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
-        assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
         # Must follow the scatter, which `kv_cache_dummy_dep` orders ahead of this op:
         # the padding tokens it clamps into the null slot are what needs undoing. The
@@ -1811,7 +1855,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
             # cache key misses. Narrowing belongs before the convert, not here.
-            page_index_table = page_index_tables[seq_idx]
+            index_table = index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
@@ -1855,22 +1899,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device
-            result = _call_kernel(
-                "page attention",
-                self._attn_fn,
+            result = self._run_page_attn(
                 q_staging,
                 row_table,
                 k_pages,
                 v_pages,
-                page_index_table,
+                index_table,
                 mask_tiles,
-                self.scale,
                 len(active_bs),
                 aligned_query_lens[seq_idx],
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_size,
-                self.logits_soft_cap,
                 alibi_bias_tiles,
                 out_staging if store_out else None,
             )

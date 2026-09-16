@@ -12,12 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre FP8 linear: keep checkpoint FP8 weights, run compiled ``aten._scaled_mm``.
+"""Spyre FP8 linear: keep checkpoint FP8 weights, run compiled FP8 GEMM.
 
-Forward (same graph as torch-spyre ``test_fp8_scaled_mm_cpu``):
+Forward (torch-spyre ``test_fp8_scaled_mm_cpu``, scales folded to one epilogue):
 
     scale_a = amax(x) / 448                         # eager, outside compile
-    y = _scaled_mm(qfp8ch(x), qfp8wt(W), scale_a, scale_b)   # FP16 out
+    y = spyre.scaled_mm(qfp8ch(x), qfp8wt(W)) * (scale_a * scale_b) [+ bias]
+
+``aten._scaled_mm`` requires both scale tensors and decomposes to three ``[M, N]``
+pointwise kernels (``*scale_a``, ``*scale_b``, ``+bias``). Fold ``scale_a * scale_b``
+first — scalar, ``[M,1]``, or ``[1,N]`` — then one epilogue. Granite 8B decode
+drops two of those passes (~80 µs / step).
 
 Granite 4096-wide SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128}, so we
 tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
@@ -105,14 +110,16 @@ def _compiled_fp8_scaled_mm(
         weight,  # ty: ignore[invalid-argument-type]
         weight_scale,  # ty: ignore[invalid-argument-type]
     )
-    return torch.ops.aten._scaled_mm(
+    # ATen _scaled_mm always emits result*scale_a then result*scale_b. Fold
+    # first (matches torch-spyre's CPU ref: (q_a @ q_b) * (scale_a * scale_b)).
+    combined_scale = scale_a * weight_scale
+    result = torch.ops.spyre.scaled_mm(
         x_fp8,  # ty: ignore[invalid-argument-type]
         w_fp8,  # ty: ignore[invalid-argument-type]
-        scale_a=scale_a,  # ty: ignore[invalid-argument-type]
-        scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
-        bias=bias,  # ty: ignore[invalid-argument-type]
         out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
     )
+    result = result * combined_scale
+    return result if bias is None else result + bias
 
 
 def _fp8_mm(
@@ -207,7 +214,7 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         return splits
 
     # Not an untraceable op. The GEMM is already Dynamo/Inductor:
-    # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
+    # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + spyre.scaled_mm).
     # ``recursive=False`` keeps that nested compile. This wrapper stays
     # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
     # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
@@ -297,5 +304,5 @@ def register_spyre_fp8_linear_kernel() -> bool:
         return True
     register_linear_kernel(SpyreFp8LinearKernel, PlatformEnum.OOT, kernel_type="fp8")
     _REGISTERED = True
-    logger.info("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)")
+    logger.info("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (spyre.scaled_mm)")
     return True

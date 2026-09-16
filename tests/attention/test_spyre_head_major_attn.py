@@ -516,6 +516,49 @@ def test_head_major_attn_core(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_dispatches_by_query_width(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
+    wide query to the unrolled kernel pays for residency the query width already amortises."""
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    called = []
+
+    def spy(name, fn):
+        def wrapper(*args, **kwargs):
+            called.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    # Patched before the impl is built: __init__ reads these globals into the impl.
+    monkeypatch.setattr(
+        hm, "_page_attn_decode_compiled", spy("decode", hm._page_attn_decode_compiled)
+    )
+    monkeypatch.setattr(
+        hm, "_page_attn_prefill_compiled", spy("prefill", hm._page_attn_prefill_compiled)
+    )
+
+    _run_head_major_attn_test(
+        seq_lens=[(1, 300), (64, 200)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert sorted(called) == ["decode", "prefill"], called
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",

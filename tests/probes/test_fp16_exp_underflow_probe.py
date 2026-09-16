@@ -49,8 +49,11 @@ def _require_spyre() -> None:
 def test_fp16_exp_underflows_to_zero(exponent: float) -> None:
     """In fp16 ``exp(x)`` is exactly zero below about -17.33."""
     got = torch.full((32, 64), exponent, dtype=_DTYPE).to("spyre").exp().to("cpu")
-    bits = int(got.view(torch.int16)[0, 0]) & 0xFFFF
-    assert bits == 0x0000, f"spyre exp({exponent:g}) = {float(got[0, 0]):g} (bits 0x{bits:04x})"
+    # Every lane, so a partially correct lowering cannot pass on element 0.
+    nonzero = int((got != 0).sum())
+    assert nonzero == 0, (
+        f"spyre exp({exponent:g}) = {float(got.abs().max()):g} in {nonzero}/{got.numel()} lanes"
+    )
 
 
 @pytest.mark.xfail(strict=True, reason=_REASON)

@@ -34,7 +34,7 @@ pytestmark = pytest.mark.uses_subprocess
 # what the dirtying request left in the masked slots. The probe is the strict signal.
 _XFAIL_REASON = (
     "torch-spyre#4517: masked KV slots reach the attention output, so a request's logprobs "
-    "depend on the requests before it. Fixed in the backend; see "
+    "depend on the requests before it. The fix belongs in the backend; see "
     "tests/probes/test_fp16_exp_underflow_probe.py."
 )
 
@@ -53,22 +53,46 @@ _MAX_MODEL_LEN = 256
 _PREFILL_BUCKET = 128
 
 
-def _logprobs(engine, prompt) -> list[dict[int, float]]:
-    """Per-step ``{token id: logprob}`` for a greedy continuation."""
+def _batch_logprobs(
+    engine, prompts: list, max_tokens: int = _MAX_TOKENS
+) -> list[list[dict[int, float]]]:
+    """One per-step ``{token id: logprob}`` trace per prompt, from a single `generate`."""
     from vllm import SamplingParams
 
-    output = engine.generate(
-        prompt,
+    outputs = engine.generate(
+        prompts,
         SamplingParams(
             temperature=0.0,
-            max_tokens=_MAX_TOKENS,
+            max_tokens=max_tokens,
             logprobs=_NUM_LOGPROBS,
             ignore_eos=True,  # fixed-length trace, so the comparison covers every step
         ),
         use_tqdm=False,
-    )[0].outputs[0]
-    assert output.logprobs is not None
-    return [{tid: lp.logprob for tid, lp in step.items()} for step in output.logprobs]
+    )
+    assert len(outputs) == len(prompts)
+    traces = []
+    for output in outputs:
+        steps = output.outputs[0].logprobs
+        assert steps is not None
+        traces.append([{tid: lp.logprob for tid, lp in step.items()} for step in steps])
+    return traces
+
+
+def _logprobs(engine, prompt) -> list[dict[int, float]]:
+    """`_batch_logprobs` for one prompt."""
+    return _batch_logprobs(engine, [prompt])[0]
+
+
+def _assert_fits_prefill(prompts: list[str]) -> None:
+    """Past _PREFILL_BUCKET a prompt chunks, which is not what these tests measure."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(_MODEL)
+    for prompt in prompts:
+        num_tokens = len(tokenizer(prompt).input_ids)
+        assert num_tokens <= _PREFILL_BUCKET, (
+            f"prompt is {num_tokens} tokens, over _PREFILL_BUCKET={_PREFILL_BUCKET}: {prompt!r}"
+        )
 
 
 @pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
@@ -76,6 +100,7 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
     """The same greedy request twice, with a different request in between."""
     from vllm import LLM
 
+    _assert_fits_prefill([_PROBE_PROMPT, _DIRTY_PROMPT])
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     engine = LLM(
@@ -85,6 +110,8 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
         max_num_seqs=1,
         max_num_batched_tokens=_PREFILL_BUCKET,
         compilation_config={"compile_sizes": [_PREFILL_BUCKET, 1]},
+        # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
+        enable_prefix_caching=False,
     )
 
     first = _logprobs(engine, _PROBE_PROMPT)
@@ -112,19 +139,20 @@ _PAD_PROMPT_LEN = 300
 
 
 def _block_counts() -> tuple[int, int]:
-    """``(real, padded)`` block counts for ``_PAD_PROMPT_LEN``."""
-    import bisect
+    """``(real, padded)`` block counts for ``_PAD_PROMPT_LEN``, from the bucketer itself."""
+    from unittest.mock import MagicMock
 
-    from spyre_inference.v1.attention.spyre_attn_bucketer import _powers_of_two_up_to
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
-    buckets = sorted(
-        {
-            (kv + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-            for kv in _powers_of_two_up_to(_PAD_MAX_MODEL_LEN, start=_BLOCK_SIZE)
-        }
-    )
+    config = MagicMock()
+    config.cache_config.block_size = _BLOCK_SIZE
+    config.model_config.max_model_len = _PAD_MAX_MODEL_LEN
+    config.scheduler_config.max_num_batched_tokens = _PAD_MAX_MODEL_LEN
+    config.scheduler_config.max_num_seqs = 1
     real = (_PAD_PROMPT_LEN + _BLOCK_SIZE - 1) // _BLOCK_SIZE
-    return real, buckets[bisect.bisect_left(buckets, real)]
+    padded = SpyreAttnBucketer(config).find_blocks_bucket(real)
+    assert padded is not None, f"real={real} blocks is above every bucket"
+    return real, padded
 
 
 @pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
@@ -135,7 +163,7 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
 
     real, padded = _block_counts()
     assert padded > real, (
-        f"_PAD_PROMPT_LEN={_PAD_PROMPT_LEN} gives real=={padded}==padded blocks, so this "
+        f"_PAD_PROMPT_LEN={_PAD_PROMPT_LEN} gives real=={real}==padded blocks, so this "
         f"test no longer exercises a padded block; pick a length off the bucket lattice."
     )
 
@@ -148,6 +176,8 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
         max_num_seqs=1,
         max_num_batched_tokens=_PAD_MAX_MODEL_LEN,
         compilation_config={"compile_sizes": [_PAD_MAX_MODEL_LEN, 1]},
+        # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
+        enable_prefix_caching=False,
     )
 
     # Exact token ids: a tokenizer would not let the test pin the block count.
@@ -190,29 +220,6 @@ _BATCH_PROBE_PROMPTS = [
 ]
 
 
-def _batch_logprobs(engine, prompts: list[str]) -> list[list[dict[int, float]]]:
-    """One `_logprobs` trace per prompt, for a batch in a single `generate` call."""
-    from vllm import SamplingParams
-
-    outputs = engine.generate(
-        prompts,
-        SamplingParams(
-            temperature=0.0,
-            max_tokens=_BATCH_MAX_TOKENS,
-            logprobs=_NUM_LOGPROBS,
-            ignore_eos=True,
-        ),
-        use_tqdm=False,
-    )
-    assert len(outputs) == len(prompts)
-    traces = []
-    for output in outputs:
-        steps = output.outputs[0].logprobs
-        assert steps is not None
-        traces.append([{tid: lp.logprob for tid, lp in step.items()} for step in steps])
-    return traces
-
-
 @pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     monkeypatch: pytest.MonkeyPatch,
@@ -220,7 +227,12 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     """The same batch twice, with other requests in between, while decode is batched."""
     from vllm import LLM
 
+    from spyre_inference.v1.attention.spyre_attn_bucketer import _MIN_BATCHED_SEQS
+
     assert len(_BATCH_PROBE_PROMPTS) == _BATCH_NUM_SEQS
+    # Below the threshold the batch takes the per-seq loop, and this tests nothing batched.
+    assert _BATCH_NUM_SEQS >= _MIN_BATCHED_SEQS
+    _assert_fits_prefill([*_BATCH_PROBE_PROMPTS, _DIRTY_PROMPT])
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     # Pinned on, so a default flip cannot silently move this test onto the per-seq loop.
@@ -234,13 +246,15 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
         max_num_batched_tokens=_PREFILL_BUCKET,
         # A prefill step, a full decode batch, and one sequence decoding alone.
         compilation_config={"compile_sizes": [_PREFILL_BUCKET, _BATCH_NUM_SEQS, 1]},
+        # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
+        enable_prefix_caching=False,
     )
 
-    first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
+    first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
     # Discarded: it rehomes the probe batch's blocks onto other tenants. Same batch size in
     # both passes, since the chunked reduction order is not comparable across sizes.
-    _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS)
-    second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
+    _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS, _BATCH_MAX_TOKENS)
+    second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
 
     for slot, (before, after) in enumerate(zip(first, second)):
         diverged = next(

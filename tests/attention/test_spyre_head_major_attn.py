@@ -330,6 +330,38 @@ def test_head_major_write_index(default_vllm_config):
     assert stacked.unique().numel() == stacked.numel()
 
 
+def test_head_major_clear_masked_kv_slots_zeroes_every_head_of_the_slot(default_vllm_config):
+    """A logical slot range must reach all KV heads of its own block, and only those.
+
+    The base class's flat row slice would land on a lower block here (a slot's heads sit
+    ``block_size`` rows apart), zeroing live KV and leaving the masked tail dirty.
+    """
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention.attn_layer import NULL_SLOT
+
+    block_size, num_kv_heads, head_size = 64, 2, 64
+    get_current_vllm_config().cache_config.block_size = block_size
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=4, head_size=head_size, scale=0.125, num_kv_heads=num_kv_heads
+    )
+    shape = (3, num_kv_heads, block_size, head_size)
+    cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
+    # The null slot, plus block 1's tail from offset 6 on: the ranges build() emits.
+    metadata = Mock(
+        masked_kv_slot_ranges=[(NULL_SLOT, NULL_SLOT + 1), (block_size + 6, 2 * block_size)]
+    )
+
+    impl._clear_masked_kv_slots(cache, metadata)
+
+    for pages in cache:
+        assert torch.all(pages[0, :, NULL_SLOT] == 0), "the null slot kept a value"
+        assert torch.all(pages[0, :, NULL_SLOT + 1 :] == -7)
+        assert torch.count_nonzero(pages[1, :, 6:]) == 0
+        assert torch.all(pages[1, :, :6] == -7)
+        assert torch.all(pages[2] == -7)
+
+
 def test_token_major_write_index_is_the_slot_mapping(default_vllm_config):
     """The shared publish path must leave the token-major index untouched."""
     impl = SpyreAttentionImpl(num_heads=8, head_size=64, scale=1.0, num_kv_heads=4)

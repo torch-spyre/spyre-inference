@@ -33,6 +33,7 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
@@ -121,6 +122,27 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             shape = (-1, k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
+
+    def _clear_masked_kv_slots(
+        self, kv_cache: SpyrePagedKVCache, attn_metadata: SpyreAttentionMetadata
+    ) -> None:
+        """The base's slot ranges, over the rows this layout puts those slots in.
+
+        A slot's heads are ``block_size`` rows apart here, not one row covering all of
+        them, so the base's flat slice would zero a lower block's live KV and leave the
+        tail dirty. Each range stays inside one block, hence one run per KV head.
+        """
+        k_rows, v_rows = self.kv_slot_views(kv_cache)
+        for start, end in attn_metadata.masked_kv_slot_ranges:
+            block, offset = divmod(start, self.block_size)
+            assert end <= (block + 1) * self.block_size, (
+                f"masked slot range ({start}, {end}) straddles a block boundary"
+            )
+            width = end - start
+            for head in range(self.num_kv_heads):
+                row = (block * self.num_kv_heads + head) * self.block_size + offset
+                k_rows[row : row + width] = 0.0
+                v_rows[row : row + width] = 0.0
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
     # `kv_write_index` publishes; ty cannot see that the pair co-evolves.

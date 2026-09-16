@@ -31,10 +31,8 @@ def reference_gelu_new(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize("num_tokens", [1, 5, 16])
 @pytest.mark.parametrize("d", [64, 256, 3072])
 def test_newgelu_on_spyre_matches_reference(num_tokens, d):
-    """SpyreNewGELU on a Spyre input matches the float32 reference."""
+    """NewGELU on a Spyre input matches the float32 reference."""
     from vllm.model_executor.layers.activation import NewGELU
-
-    import spyre_inference.custom_ops.activation  # noqa: F401
 
     torch.manual_seed(42)
     # Scaled to the range a GPT-2 c_fc output actually spans.
@@ -50,23 +48,19 @@ def test_newgelu_gates_negative_inputs():
     """gelu_new must gate negative inputs towards zero, not return them unchanged."""
     from vllm.model_executor.layers.activation import NewGELU
 
-    import spyre_inference.custom_ops.activation  # noqa: F401
-
     x = torch.full((1, 64), -6.0, dtype=torch.float16)
     out = NewGELU().forward_oot(x.to("spyre")).cpu().float()
 
     assert out.abs().max().item() < 1e-2, f"expected ~0, got {out.flatten()[0]}"
 
 
-def test_newgelu_oot_dispatch():
-    """Verify NewGELU OOT registration: class swap."""
+def test_newgelu_has_no_spyre_replacement():
+    """Dispatch reaches vLLM's own gelu_new, with no OOT class in between."""
     from vllm.model_executor.layers.activation import NewGELU
-
-    from spyre_inference.custom_ops.activation import SpyreNewGELU
 
     layer = NewGELU()
 
-    assert isinstance(layer, SpyreNewGELU)
+    assert type(layer) is NewGELU
     assert layer._forward_method == layer.forward_oot
 
 

@@ -337,15 +337,16 @@ def _reset_named_dims() -> None:
 def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
     """Move one expert stack to the device in the gather-friendly MoE layout.
 
-    ``dma_moe_expert_weight_to_spyre`` only takes an ``[E, C, F]`` stack whose free dim
-    spans whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
+    ``dma_moe_expert_weight_to_spyre`` takes an ``[E, C, F]`` stack whose free dim spans
+    whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
     """
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
     if any(pad):
         weight = F.pad(weight, pad)
     moved = dma_moe_expert_weight_to_spyre(weight)
-    return moved if moved is not None else weight.contiguous().to("spyre")
+    assert moved is not None
+    return moved
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -369,6 +370,11 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     # TP divides ``inter`` by the rank count, so it need not span whole sticks. Widening
     # is inert: the added lanes activate to zero, against zero rows of ``down``.
     stick = get_elem_in_stick(w13.dtype)
+    if hidden % stick:
+        raise ValueError(
+            f"Spyre MoE down expert-stack free dim {hidden} is not a multiple of "
+            f"the {stick}-element stick; hidden_size must be stick-aligned."
+        )
     pad = -inter % stick
     layer.spyre_moe_gate = _to_spyre_expert_weight(w13[:, :inter, :].transpose(1, 2), (0, pad))
     layer.spyre_moe_up = _to_spyre_expert_weight(w13[:, inter:, :].transpose(1, 2), (0, pad))

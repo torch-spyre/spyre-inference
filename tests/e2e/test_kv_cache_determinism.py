@@ -24,7 +24,13 @@ See ``tests/probes/test_fp16_exp_underflow_probe.py``.
 
 from __future__ import annotations
 
+import contextlib
+import gc
+import os
+from collections.abc import Iterator
+
 import pytest
+from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
 # enforce_eager=False spawns an EngineCore subprocess, which cannot claim the Spyre card if
 # an in-process test already has.
@@ -51,6 +57,29 @@ _MAX_TOKENS = 4
 _NUM_LOGPROBS = 20
 _MAX_MODEL_LEN = 256
 _PREFILL_BUCKET = 128
+
+
+@contextlib.contextmanager
+def _engine(**kwargs) -> Iterator:
+    """An `LLM` that is shut down before the test's assertion leaves this frame.
+
+    These tests are expected to fail, and a raised assertion keeps its frame -- and so the
+    `LLM` in it -- alive past teardown, where the plugin SIGKILLs the worker still holding
+    the card. That kill leaves the VFIO release in flight, and the next in-process card test
+    fails with ``DeviceOpenFail ... "Device or resource busy"``. Shutting down in `finally`
+    runs before the assertion propagates, so the worker exits on its own and there is
+    nothing to reap.
+    """
+    from vllm import LLM
+
+    engine = LLM(**kwargs)
+    try:
+        yield engine
+    finally:
+        engine.llm_engine.engine_core.shutdown(timeout=60)
+        del engine
+        gc.collect()
+        wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
 
 
 def _batch_logprobs(
@@ -98,12 +127,10 @@ def _assert_fits_prefill(prompts: list[str]) -> None:
 @pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """The same greedy request twice, with a different request in between."""
-    from vllm import LLM
-
     _assert_fits_prefill([_PROBE_PROMPT, _DIRTY_PROMPT])
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
-    engine = LLM(
+    with _engine(
         model=_MODEL,
         enforce_eager=False,
         max_model_len=_MAX_MODEL_LEN,
@@ -112,13 +139,12 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
         compilation_config={"compile_sizes": [_PREFILL_BUCKET, 1]},
         # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
         enable_prefix_caching=False,
-    )
-
-    first = _logprobs(engine, _PROBE_PROMPT)
-    # Discarded: it exists to leave another tenant's KV in the slots the probe request's
-    # last block keeps past its end.
-    _logprobs(engine, _DIRTY_PROMPT)
-    second = _logprobs(engine, _PROBE_PROMPT)
+    ) as engine:
+        first = _logprobs(engine, _PROBE_PROMPT)
+        # Discarded: it exists to leave another tenant's KV in the slots the probe request's
+        # last block keeps past its end.
+        _logprobs(engine, _DIRTY_PROMPT)
+        second = _logprobs(engine, _PROBE_PROMPT)
 
     diverged = next(
         (i for i, (a, b) in enumerate(zip(first, second)) if a != b),
@@ -158,7 +184,6 @@ def _block_counts() -> tuple[int, int]:
 @pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request whose block count is padded up must still answer identically."""
-    from vllm import LLM
     from vllm.inputs import TokensPrompt
 
     real, padded = _block_counts()
@@ -169,17 +194,6 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
-    engine = LLM(
-        model=_MODEL,
-        enforce_eager=False,
-        max_model_len=_PAD_MAX_MODEL_LEN,
-        max_num_seqs=1,
-        max_num_batched_tokens=_PAD_MAX_MODEL_LEN,
-        compilation_config={"compile_sizes": [_PAD_MAX_MODEL_LEN, 1]},
-        # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
-        enable_prefix_caching=False,
-    )
-
     # Exact token ids: a tokenizer would not let the test pin the block count.
     def ids(n: int, seed: int) -> list[int]:
         return [1000 + ((i + 1) * (7919 + 13 * seed)) % 3000 for i in range(n)]
@@ -188,10 +202,20 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
     # Fills every block the probe's padded count reaches.
     dirty = TokensPrompt(prompt_token_ids=ids(_PAD_MAX_MODEL_LEN - _MAX_TOKENS, 2))
 
-    traces = []
-    for _ in range(5):
-        _logprobs(engine, dirty)
-        traces.append(_logprobs(engine, probe))
+    with _engine(
+        model=_MODEL,
+        enforce_eager=False,
+        max_model_len=_PAD_MAX_MODEL_LEN,
+        max_num_seqs=1,
+        max_num_batched_tokens=_PAD_MAX_MODEL_LEN,
+        compilation_config={"compile_sizes": [_PAD_MAX_MODEL_LEN, 1]},
+        # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
+        enable_prefix_caching=False,
+    ) as engine:
+        traces = []
+        for _ in range(5):
+            _logprobs(engine, dirty)
+            traces.append(_logprobs(engine, probe))
 
     for i, trace in enumerate(traces[1:], start=2):
         diverged = next(
@@ -225,8 +249,6 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The same batch twice, with other requests in between, while decode is batched."""
-    from vllm import LLM
-
     from spyre_inference.v1.attention.spyre_attn_bucketer import _MIN_BATCHED_SEQS
 
     assert len(_BATCH_PROBE_PROMPTS) == _BATCH_NUM_SEQS
@@ -238,7 +260,7 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     # Pinned on, so a default flip cannot silently move this test onto the per-seq loop.
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
 
-    engine = LLM(
+    with _engine(
         model=_MODEL,
         enforce_eager=False,
         max_model_len=_MAX_MODEL_LEN,
@@ -248,13 +270,12 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
         compilation_config={"compile_sizes": [_PREFILL_BUCKET, _BATCH_NUM_SEQS, 1]},
         # Off: a prefix-cache hit would reuse the probe's own KV instead of recomputing it.
         enable_prefix_caching=False,
-    )
-
-    first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
-    # Discarded: it rehomes the probe batch's blocks onto other tenants. Same batch size in
-    # both passes, since the chunked reduction order is not comparable across sizes.
-    _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS, _BATCH_MAX_TOKENS)
-    second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
+    ) as engine:
+        first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
+        # Discarded: it rehomes the probe batch's blocks onto other tenants. Same batch size
+        # in both passes, since the chunked reduction order is not comparable across sizes.
+        _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS, _BATCH_MAX_TOKENS)
+        second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS, _BATCH_MAX_TOKENS)
 
     for slot, (before, after) in enumerate(zip(first, second)):
         diverged = next(

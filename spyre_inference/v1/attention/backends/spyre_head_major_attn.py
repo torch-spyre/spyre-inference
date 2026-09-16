@@ -142,21 +142,31 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
-        pages = num_blocks + 1  # padding sink; see the token-major `allocate_pages`
         layout = head_major_kv_layout(
-            pages * spec.num_kv_heads, spec.block_size, spec.head_size, torch.float16
+            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, torch.float16
         )
-        shape = (pages, spec.num_kv_heads, spec.block_size, spec.head_size)
+        shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
         return SpyrePagedKVCache(
             k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
             v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
 
-    @classmethod
-    def padding_sink_slot(cls, kv_cache: SpyrePagedKVCache) -> int:
-        """As token-major, but ``block_size`` is dim 2 in this layout."""
-        pages, block_size = kv_cache[0].shape[0], kv_cache[0].shape[2]
-        return (pages - 1) * block_size
+    def _clear_masked_kv_slots(
+        self, kv_cache: SpyrePagedKVCache, attn_metadata: "SpyreAttentionMetadata"
+    ) -> None:
+        """As the base, but a token-major slot range is `num_kv_heads` rows here.
+
+        `build()` reports ranges in slot numbers; this layout splits a block's tokens
+        across one row run per KV head, so each range clears once per head.
+        """
+        k_rows, v_rows = self.kv_slot_views(kv_cache)
+        for start, end in attn_metadata.masked_kv_slot_ranges:
+            block, offset = divmod(start, self.block_size)
+            count = end - start
+            for head in range(self.num_kv_heads):
+                base = (block * self.num_kv_heads + head) * self.block_size + offset
+                k_rows[base : base + count] = 0.0
+                v_rows[base : base + count] = 0.0
 
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device

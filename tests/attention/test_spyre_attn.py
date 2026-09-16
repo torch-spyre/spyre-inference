@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.attn_layer import NULL_SLOT
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     _MIN_BATCHED_SEQS,
@@ -401,7 +402,7 @@ def _run_spyre_attn_test(
     # table is, so build()'s padding isn't suppressed by an exactly-sized table.
     # The extra entries point at garbage pages on purpose: padded blocks are fully
     # masked and must not affect the result. The tolerances below are far looser than a
-    # masked slot's 2**-24 leak; `test_padded_blocks_do_not_read_a_stale_page` is tight.
+    # masked slot's 2**-24 leak; `test_padded_blocks_do_not_read_the_null_slot` is tight.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
     from vllm.config import get_current_vllm_config
 
@@ -1515,8 +1516,8 @@ def test_masked_kv_slot_ranges_covers_tail_only_when_step_enters_block():
         query_lens_list=[10, 1],
         block_table=torch.tensor([[0, 1], [0, 2]], dtype=torch.int32),
     )
-    # Block 1's tail (slots 70..128). Seq 1 entered its last block earlier, so nothing.
-    assert ranges == [(70, 128)]
+    # Null slot always; then block 1's tail (slots 70..128). Seq 1 contributes nothing.
+    assert ranges == [(NULL_SLOT, NULL_SLOT + 1), (70, 128)]
 
 
 def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
@@ -1527,7 +1528,7 @@ def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
         query_lens_list=[1],
         block_table=torch.tensor([[1, 2]], dtype=torch.int32),
     )
-    assert ranges == []
+    assert ranges == [(NULL_SLOT, NULL_SLOT + 1)]
 
 
 @pytest.mark.parametrize(
@@ -1536,12 +1537,13 @@ def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
     [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
-def test_padded_blocks_do_not_read_a_stale_page(default_vllm_config, configure_device: str):
-    """The same attention twice, changing only the stale page the padded columns name.
+def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_device: str):
+    """The same attention twice, changing only what the padded blocks can see.
 
-    A reused vLLM row leaves a previous tenant's page ids past the new width, and
-    torch-spyre#4517 keeps a weight on the masked positions that gather them. The poison
-    is huge because 2**-24 is otherwise below fp16 resolution.
+    Two things a padded block column can name: a previous tenant's page (a reused vLLM
+    row leaves stale ids past the new width) and the null slot (every padding token's K/V
+    is clamped there). Poisoning either must not move the output. The poison is huge
+    because one slot at 2**-24 is otherwise below fp16 resolution.
     """
     block_size, num_q_heads, num_kv_heads, head_size = 128, 4, 2, 64
     num_blocks, kv_len = 64, 300
@@ -1600,6 +1602,7 @@ def test_padded_blocks_do_not_read_a_stale_page(default_vllm_config, configure_d
         k_pages = k_pages_cpu.to(cache_device)
         v_pages = v_pages_cpu.clone()
         v_pages[stale_page] = poison
+        v_pages[NULL_SLOT // block_size, NULL_SLOT % block_size] = poison
         v_pages = v_pages.to(cache_device)
 
         impl = SpyreAttentionImpl(
@@ -1634,9 +1637,9 @@ def test_padded_blocks_do_not_read_a_stale_page(default_vllm_config, configure_d
     assert not clean.isnan().any(), "attention wrote no output"
     delta = (clean - poisoned).abs().max()
     assert torch.equal(clean, poisoned), (
-        f"a padded block reached a stale page: real={real_blocks} padded={padded_blocks} "
+        f"a padded block reached masked KV: real={real_blocks} padded={padded_blocks} "
         f"blocks, max|delta|={float(delta):g}. build() must point the padded columns at "
-        f"block 0."
+        f"the null block, and _clear_masked_kv_slots must hold slot {NULL_SLOT} at zero."
     )
 
 
@@ -1645,52 +1648,16 @@ def test_clear_masked_kv_slots_zeroes_exactly_the_given_ranges(default_vllm_conf
     impl = SpyreAttentionImpl(num_heads=2, head_size=64, scale=0.125, num_kv_heads=2)
     shape = (3, 64, 2, 64)
     cache = SpyrePagedKVCache(torch.full(shape, -7.0), torch.full(shape, -7.0))
-    metadata = Mock(masked_kv_slot_ranges=[(70, 128)])
+    metadata = Mock(masked_kv_slot_ranges=[(NULL_SLOT, NULL_SLOT + 1), (70, 128)])
 
     impl._clear_masked_kv_slots(cache, metadata)
 
     for pages in cache:
+        assert torch.all(pages[0, NULL_SLOT] == 0), "the null slot kept a value"
+        assert torch.all(pages[0, NULL_SLOT + 1 :] == -7)
         assert torch.count_nonzero(pages[1, 6:]) == 0
         assert torch.all(pages[1, :6] == -7)
-        assert torch.all(pages[0] == -7) and torch.all(pages[2] == -7)
-
-
-def test_publish_routes_padding_tokens_to_the_sink(default_vllm_config):
-    """A -1 slot must not land in block 0 -- every padded block column gathers it."""
-    from spyre_inference.v1.attention import attn_layer
-
-    num_blocks, block_size, kv_heads, head_size = 3, 64, 2, 64
-    impl = SpyreAttentionImpl(num_heads=2, head_size=head_size, scale=0.125, num_kv_heads=kv_heads)
-    shape = (num_blocks + 1, block_size, kv_heads, head_size)
-    cache = SpyrePagedKVCache(torch.zeros(shape), torch.zeros(shape))
-    holder = attn_layer.SlotMapping([Mock(kv_cache=cache, impl=impl)])
-
-    holder.publish(torch.tensor([-1, 5, -1, 130], dtype=torch.int64))
-
-    sink = num_blocks * block_size
-    assert holder.slots is not None
-    assert holder.slots.tolist() == [sink, 5, sink, 130], (
-        "padding tokens must go to the reserved sink slot, and real slots stay put"
-    )
-
-
-def test_padding_sink_slot_is_the_reserved_page():
-    """`allocate_pages` reserves one page past vLLM's blocks; the sink is its first slot."""
-    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
-        SpyreHeadMajorAttentionImpl,
-    )
-
-    num_blocks, block_size, kv_heads, head_size = 5, 64, 2, 64
-    token_major = SpyrePagedKVCache(
-        torch.zeros(num_blocks + 1, block_size, kv_heads, head_size),
-        torch.zeros(num_blocks + 1, block_size, kv_heads, head_size),
-    )
-    head_major = SpyrePagedKVCache(
-        torch.zeros(num_blocks + 1, kv_heads, block_size, head_size),
-        torch.zeros(num_blocks + 1, kv_heads, block_size, head_size),
-    )
-    assert SpyreAttentionImpl.padding_sink_slot(token_major) == num_blocks * block_size
-    assert SpyreHeadMajorAttentionImpl.padding_sink_slot(head_major) == num_blocks * block_size
+        assert torch.all(pages[2] == -7)
 
 
 # (label, block_indices, block_offsets)

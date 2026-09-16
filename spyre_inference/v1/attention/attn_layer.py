@@ -33,34 +33,33 @@ from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
 
+# vLLM reserves block 0 as `BlockPool.null_block`, so no sequence is ever given its
+# slots. `index_copy_` has no skip index, so they absorb writes with nowhere to go.
+# Padded block columns gather this block, so `_clear_masked_kv_slots` re-zeroes the slot.
+NULL_SLOT = 0
+
 
 class SlotMapping:
     """This step's slot mapping on device, shared by every split layer."""
 
     def __init__(self, layers: list[Attention]) -> None:
         self._layers = layers
-        # Device and padding-sink slot resolve together, once the caches are bound.
-        self._resolved: tuple[torch.device, int] | None = None
+        self._device: torch.device | None = None
         # One tensor, or one per KV head: whatever the impl's KV store indexes by.
         self.slots: torch.Tensor | list[torch.Tensor] | None = None
 
-    def _resolve(self) -> tuple[torch.device, int] | None:
-        if self._resolved is None:
+    def _resolve_device(self) -> torch.device | None:
+        if self._device is None:
             # `install` runs before bind_kv_cache, so a layer whose cache never arrives
             # still has the empty default and indexing it would raise.
             self._layers = [layer for layer in self._layers if len(layer.kv_cache) > 0]
             if not self._layers:
                 return None
+            self._device = self._layers[0].kv_cache[0].device
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._layers:
                 layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
-            sinks = {
-                layer.impl.padding_sink_slot(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
-                for layer in self._layers
-            }
-            assert len(sinks) == 1, f"layers sharing a slot mapping differ in size: {sinks}"
-            self._resolved = (self._layers[0].kv_cache[0].device, sinks.pop())
-        return self._resolved
+        return self._device
 
     def _write_index(self, slot_mapping: torch.Tensor, device: torch.device):
         """The device-side KV store index in this group's cache layout."""
@@ -68,20 +67,18 @@ class SlotMapping:
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
-        resolved = self._resolve()
-        if resolved is None:
+        device = self._resolve_device()
+        if device is None:
             return
-        device, sink = resolved
-        # torch-spyre#4517 keeps a softmax weight on masked positions, so the -1 padding
-        # tokens must go to the sink page rather than a slot a block table names.
-        self.slots = self._write_index(torch.where(slot_mapping < 0, sink, slot_mapping), device)
+        self.slots = self._write_index(slot_mapping.clamp(min=NULL_SLOT), device)
 
     def publish_null(self, num_tokens: int) -> None:
-        resolved = self._resolve()
-        if resolved is None:
+        device = self._resolve_device()
+        if device is None:
             return
-        device, sink = resolved
-        self.slots = self._write_index(torch.full((num_tokens,), sink, dtype=torch.int64), device)
+        self.slots = self._write_index(
+            torch.full((num_tokens,), NULL_SLOT, dtype=torch.int64), device
+        )
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()

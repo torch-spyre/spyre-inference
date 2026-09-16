@@ -14,54 +14,34 @@
 
 """A greedy request must answer the same way however the KV cache was used before it.
 
-The paged kernel gathers whole KV pages, so a sequence whose length is not a multiple of
-``block_size`` also reads the unused slots of its last block, and vLLM hands those blocks
-to later requests. Masked slots must not reach the output; on Spyre they do
-(torch-spyre#4517: fp16 ``exp()`` saturates at ``2**-24`` instead of underflowing to zero,
-so an additively masked position keeps a softmax weight), which makes one request's
-logprobs depend on the requests before it.
-
-So: run a short request, dirty its blocks with a longer one, run the short request again,
-and require the two logprob traces to be bit-identical.
-
-Every test here therefore xfails today, and the fix belongs in the backend rather than in
-a plugin-side workaround. ``tests/probes/test_fp16_exp_underflow_probe.py`` is the
-strict-xfail signal for the arithmetic itself; when it XPASSes, drop the xfails here.
-
-The second test covers the other masked-slot kind: a padded block column names whatever
-page its block-table row last held, and the whole column is masked. That needs a block
-count off the bucket lattice, which the test above cannot express -- at
-``_MAX_MODEL_LEN = 256`` the lattice is ``[1, 2]``, so padded == real at every prompt
-length.
-
-The third runs a whole batch, which is what the batched decode kernel needs: both of the
-above decode one sequence at a time, and that kernel reads the batch through a block table
-and a padded-row scheme of its own.
+The paged kernel gathers whole KV pages, so a sequence also reads the unused slots of its
+last block, and vLLM hands those blocks to later requests. On Spyre fp16 ``exp()``
+saturates at ``2**-24`` instead of underflowing to zero, so those masked slots keep a
+softmax weight and reach the output (torch-spyre#4517). Each test therefore runs a request,
+dirties its blocks with another, and reruns it -- and xfails until the backend is fixed.
+See ``tests/probes/test_fp16_exp_underflow_probe.py``.
 """
 
 from __future__ import annotations
 
 import pytest
 
-# enforce_eager=False builds a subprocess EngineCore, so uses_subprocess runs this before
-# any in-process test claims the Spyre device.
+# enforce_eager=False spawns an EngineCore subprocess, which cannot claim the Spyre card if
+# an in-process test already has.
 pytestmark = pytest.mark.uses_subprocess
 
-# Not strict: the leak is always present, but whether it moves a logprob depends on what
-# the dirtying request happened to leave in the masked slots, so an individual case can
-# pass without the backend being fixed. The strict signal is the probe.
+# Not strict: the leak is always present, but whether it moves a given logprob depends on
+# what the dirtying request left in the masked slots. The probe is the strict signal.
 _XFAIL_REASON = (
-    "torch-spyre#4517: the device's fp16 exp() saturates at 2**-24 instead of underflowing "
-    "to zero, so masked KV slots reach the attention output and a request's logprobs depend "
-    "on the requests before it. Fix is in the backend; see "
+    "torch-spyre#4517: masked KV slots reach the attention output, so a request's logprobs "
+    "depend on the requests before it. Fixed in the backend; see "
     "tests/probes/test_fp16_exp_underflow_probe.py."
 )
 
 _MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 # Short, so most of its single 128-slot KV block stays masked.
 _PROBE_PROMPT = "What are IBMs main businesses?"
-# Long, so its KV lands on the slots the probe request leaves masked. Both prompts have to
-# fit the one prefill bucket below.
+# Long, so its KV lands on the slots the probe leaves masked; both must fit _PREFILL_BUCKET.
 _DIRTY_PROMPT = (
     "Describe in as much detail as you can manage the history of the city of Zurich, "
     "its two rivers, its universities and museums, the industries based there, and the "
@@ -74,7 +54,7 @@ _PREFILL_BUCKET = 128
 
 
 def _logprobs(engine, prompt) -> list[dict[int, float]]:
-    """Per-step ``{token id: logprob}`` for a greedy continuation of a str or TokensPrompt."""
+    """Per-step ``{token id: logprob}`` for a greedy continuation."""
     from vllm import SamplingParams
 
     output = engine.generate(
@@ -83,7 +63,7 @@ def _logprobs(engine, prompt) -> list[dict[int, float]]:
             temperature=0.0,
             max_tokens=_MAX_TOKENS,
             logprobs=_NUM_LOGPROBS,
-            ignore_eos=True,  # a fixed-length trace, so the comparison covers every step
+            ignore_eos=True,  # fixed-length trace, so the comparison covers every step
         ),
         use_tqdm=False,
     )[0].outputs[0]
@@ -108,8 +88,8 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
     )
 
     first = _logprobs(engine, _PROBE_PROMPT)
-    # Hands the probe request's blocks to a different tenant, whose KV then sits in the
-    # slots the probe request's last block leaves past its end.
+    # Discarded: it exists to leave another tenant's KV in the slots the probe request's
+    # last block keeps past its end.
     _logprobs(engine, _DIRTY_PROMPT)
     second = _logprobs(engine, _PROBE_PROMPT)
 
@@ -124,11 +104,10 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
     )
 
 
-# 1024, not 512: the leak is always present, but its value only changes often enough to
-# surface as pass-to-pass divergence at the larger prefill bucket.
+# 1024, not 512: the masked value changes often enough to surface as pass-to-pass
+# divergence only at the larger bucket.
 _PAD_MAX_MODEL_LEN = 1024
 _BLOCK_SIZE = 128
-# 3 blocks, not a bucket, so build() pads to 4; stays 3 for every generated token too.
 _PAD_PROMPT_LEN = 300
 
 
@@ -155,7 +134,6 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
     from vllm.inputs import TokensPrompt
 
     real, padded = _block_counts()
-    # Without this the test would pass while covering nothing if the lattice changed.
     assert padded > real, (
         f"_PAD_PROMPT_LEN={_PAD_PROMPT_LEN} gives real=={padded}==padded blocks, so this "
         f"test no longer exercises a padded block; pick a length off the bucket lattice."
@@ -198,15 +176,12 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
         )
 
 
-# The batched decode kernel serves batches of at least `_MIN_BATCHED_SEQS` sequences, so
-# four concurrent requests are the smallest batch that reaches it. Prefills are serialised
-# (SPYRE_MAX_NUM_PARTIAL_PREFILLS defaults to 1), so the batch only fills up once every
-# prompt has prefilled -- hence more tokens than the solo tests, to leave steps where all
-# four decode together.
+# _MIN_BATCHED_SEQS is 4, and prefills serialise (SPYRE_MAX_NUM_PARTIAL_PREFILLS defaults to
+# 1), so the batch only fills up once every prompt has prefilled -- hence more tokens here.
 _BATCH_NUM_SEQS = 4
 _BATCH_MAX_TOKENS = 8
-# Short, for the same reason as `_PROBE_PROMPT`, and distinct so a leak between slots
-# carries a neighbour's KV rather than a copy of this slot's own.
+# Short like `_PROBE_PROMPT`, and distinct so a leak carries a neighbour's KV rather than a
+# copy of the slot's own.
 _BATCH_PROBE_PROMPTS = [
     "What are IBMs main businesses?",
     "Name three rivers in Europe.",
@@ -216,7 +191,7 @@ _BATCH_PROBE_PROMPTS = [
 
 
 def _batch_logprobs(engine, prompts: list[str]) -> list[list[dict[int, float]]]:
-    """One per-step logprob trace per prompt, for a batch in a single `generate` call."""
+    """One `_logprobs` trace per prompt, for a batch in a single `generate` call."""
     from vllm import SamplingParams
 
     outputs = engine.generate(
@@ -242,18 +217,7 @@ def _batch_logprobs(engine, prompts: list[str]) -> list[list[dict[int, float]]]:
 def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same batch twice, with other requests in between, while decode is batched.
-
-    Batched decode reads the whole batch through one padded gather, off a block table of
-    its own (`chunk_page_ids_cpu`, not the per-seq `page_index_tables_cpu`), with the block
-    axis padded up to a whole chunk and the row axis up to the num_seqs lattice. Which
-    masked slots a row reaches is therefore not the per-seq loop's answer.
-
-    The batch is identical in both passes, so the schedule repeats and with it the chunked
-    reduction order (which is not comparable across batch sizes -- see
-    test_spyre_attn_batched_decode_correctness); only the physical blocks differ. Prompts
-    stay under one block, so nothing is prefix-cacheable and every pass really re-prefills.
-    """
+    """The same batch twice, with other requests in between, while decode is batched."""
     from vllm import LLM
 
     assert len(_BATCH_PROBE_PROMPTS) == _BATCH_NUM_SEQS
@@ -268,15 +232,13 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
         max_model_len=_MAX_MODEL_LEN,
         max_num_seqs=_BATCH_NUM_SEQS,
         max_num_batched_tokens=_PREFILL_BUCKET,
-        # Every reachable body token count: a prefill step, a full decode batch, and one
-        # sequence decoding alone. Shorter batches pad up onto `_BATCH_NUM_SEQS`.
+        # A prefill step, a full decode batch, and one sequence decoding alone.
         compilation_config={"compile_sizes": [_PREFILL_BUCKET, _BATCH_NUM_SEQS, 1]},
     )
 
     first = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
-    # Hands the probe batch's blocks to other tenants, whose KV then sits in the slots the
-    # probe requests' last blocks leave past their end. Identical prompts are enough: the
-    # comparison is pass-to-pass, and in the first pass those blocks held something else.
+    # Discarded: it rehomes the probe batch's blocks onto other tenants. Same batch size in
+    # both passes, since the chunked reduction order is not comparable across sizes.
     _batch_logprobs(engine, [_DIRTY_PROMPT] * _BATCH_NUM_SEQS)
     second = _batch_logprobs(engine, _BATCH_PROBE_PROMPTS)
 

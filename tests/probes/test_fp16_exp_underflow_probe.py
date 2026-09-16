@@ -14,19 +14,12 @@
 
 """Strict-xfail probe for torch-spyre#4517: fp16 ``exp()`` floors instead of underflowing.
 
-On the device, ``exp()`` of a large negative fp16 never returns zero -- it saturates at
-``2**-24``, the smallest fp16 subnormal. So softmax keeps a weight on every additively
-masked position and that position's V reaches the attention output, including the unused
-tail slots of a partially-filled KV block that vLLM later hands to another request.
+``exp()`` of a large negative fp16 saturates at ``2**-24`` on the device instead of
+returning zero, so softmax keeps a weight on every additively masked position and that
+position's V reaches the attention output. ``tests/e2e/test_kv_cache_determinism.py``
+measures the consequence and xfails for the same reason.
 
-The consequence one level up is that a greedy request's logprobs depend on the requests
-that ran before it; ``tests/e2e/test_kv_cache_determinism.py`` measures that, and xfails
-for the same reason as this probe. Fixing it belongs in the backend, not here: when this
-probe XPASSes, drop the xfails there and this file.
-
-Follows tdoublep's minimal reproducer (torch-spyre#4517, comment 5669447964): eager ops
-only, no paged attention and no model, so the probe tracks the arithmetic that is wrong
-rather than one kernel's use of it.
+Minimal reproducer from torch-spyre#4517 (comment 5669447964).
 """
 
 import pytest
@@ -39,9 +32,9 @@ _DTYPE = torch.float16
 _MASK = torch.finfo(_DTYPE).min
 _REASON = (
     "torch-spyre#4517: the device's fp16 exp() saturates at 2**-24 instead of underflowing "
-    "to zero, so additively masked positions keep a softmax weight and leak their V into the "
-    "attention output. When this passes, drop the xfails in "
-    "tests/e2e/test_kv_cache_determinism.py and delete this probe."
+    "to zero, so additively masked positions leak their V into the attention output. When "
+    "this passes, drop the xfails in tests/e2e/test_kv_cache_determinism.py and delete this "
+    "probe."
 )
 
 
@@ -54,7 +47,7 @@ def _require_spyre() -> None:
 @pytest.mark.xfail(strict=True, reason=_REASON)
 @pytest.mark.parametrize("exponent", [-18.0, -1000.0, _MASK])
 def test_fp16_exp_underflows_to_zero(exponent: float) -> None:
-    """In fp16 ``exp(x)`` is exactly zero below about -17.33; the device returns 2**-24."""
+    """In fp16 ``exp(x)`` is exactly zero below about -17.33."""
     got = torch.full((32, 64), exponent, dtype=_DTYPE).to("spyre").exp().to("cpu")
     bits = int(got.view(torch.int16)[0, 0]) & 0xFFFF
     assert bits == 0x0000, f"spyre exp({exponent:g}) = {float(got[0, 0]):g} (bits 0x{bits:04x})"

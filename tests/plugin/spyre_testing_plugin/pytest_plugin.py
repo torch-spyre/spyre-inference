@@ -1076,6 +1076,19 @@ def register_ministral_14b(request, monkeypatch):
 
 
 @pytest.fixture()
+def register_granite_models(request, monkeypatch):
+    """Add our injected granite models to test_granite's MODELS dict.
+
+    0.29 turned test_granite's MODELS into a dict (model -> min transformers version)
+    and the test does MODELS[model]; models we inject via param override aren't keys,
+    so add them as unconstrained (None).
+    """
+    models = request.node.module.MODELS
+    for model in ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", "ibm-granite/granite-4.1-3b"):
+        monkeypatch.setitem(models, model, None)
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 

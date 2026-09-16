@@ -292,3 +292,46 @@ def test_same_rpms_give_torch_spyre_a_stable_cache_key(tmp_path, monkeypatch):
         keys.append(_cache_key_for(case / "out" / "components.txt", monkeypatch))
 
     assert keys[0] == keys[1], "identical RPM sets produced different cache keys"
+
+
+@requires_kernel_cache
+def test_merge_changes_torch_spyre_cache_key(tmp_path, monkeypatch):
+    """An override merge must move the torch-spyre cache key.
+
+    This mirrors the CI override path: baseline RPMs are installed, then a
+    subset is overlaid with --merge. The resulting components.txt must differ
+    from the baseline in a way that changes _get_dxp_version(), otherwise a
+    cache built against the old library would be reused after the override.
+    """
+    base_proc, _ = _run(tmp_path, _rpms())
+    assert base_proc.returncode == 0, base_proc.stderr
+    baseline_key = _cache_key_for(tmp_path / "out" / "components.txt", monkeypatch)
+
+    new_flex = "3.1.0-0.main.7+9999.abcdef1_777.el10"
+    override = tmp_path / "override"
+    override.mkdir()
+    (override / f"ibm-flex-{new_flex}.x86_64.rpm").touch()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--rpm-dir",
+            str(override),
+            "--arch",
+            "x86_64",
+            "--output",
+            str(tmp_path / "out" / "components.txt"),
+            "--lock",
+            str(tmp_path / "spyre-rpms.lock"),
+            "--merge",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    merged_key = _cache_key_for(tmp_path / "out" / "components.txt", monkeypatch)
+
+    assert merged_key != baseline_key, (
+        "override merge did not change the kernel cache key; a stale kernel "
+        "could be reused across library versions"
+    )

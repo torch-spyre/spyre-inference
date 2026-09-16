@@ -46,6 +46,8 @@ def _meta(rows: int, k: int | None = None, p: float | None = None) -> SamplingMe
     )
 
 
+# Compares two upstream functions (full sort vs the sort-free top-k), never
+# touching SpyreTopKTopPSampler: it pins the upstream invariant this PR relies on.
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("vocab", [4096, 32000])
 def test_topk_filter_matches_full_sort(rows: int, vocab: int) -> None:
@@ -59,11 +61,10 @@ def test_topk_filter_matches_full_sort(rows: int, vocab: int) -> None:
     assert torch.equal(sort_path[kept_sort], topk_path[kept_topk])
 
 
-# Top-k-only is the sort-free path this PR adds; top-p-only and top-k+top-p still
-# sort and must be token-for-token identical to the stock sampler.
-@pytest.mark.parametrize(
-    "k,p", [(50, None), (None, 0.8), (50, 0.8)], ids=["topk", "topp", "topk_topp"]
-)
+# The override applies top-k up front and delegates the rest upstream, so it must
+# stay token-for-token identical to the stock joint sort. Both cases exercise the
+# override's top-k pre-filter (top-p-only would delegate to super unchanged).
+@pytest.mark.parametrize("k,p", [(50, None), (50, 0.8)], ids=["topk", "topk_topp"])
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("vocab", [4096, 32000])
 def test_swapped_sampler_matches_stock_tokens(
@@ -82,29 +83,6 @@ def test_swapped_sampler_matches_stock_tokens(
     out_swap = swapped(logits=logits.clone(), sampling_metadata=meta).sampled_token_ids
 
     assert torch.equal(out_stock, out_swap)
-
-
-# forward_native is hand-copied from upstream and re-pasted on every vLLM bump, so
-# guard the processed_logits / processed_logprobs branches it also carries.
-@pytest.mark.parametrize("logprobs_mode", ["processed_logits", "processed_logprobs"])
-def test_swapped_forward_native_matches_stock_logprobs(logprobs_mode: str) -> None:
-    from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
-
-    rows, vocab = 8, 4096
-    logits = torch.randn(rows, vocab, dtype=torch.float16)
-    k = torch.full((rows,), 50, dtype=torch.long)
-
-    stock = TopKTopPSampler(logprobs_mode)
-    torch.manual_seed(1234)
-    tok_stock, lp_stock = stock.forward_native(logits.clone(), {}, k, None)
-
-    swapped = SpyreTopKTopPSampler(logprobs_mode)
-    torch.manual_seed(1234)
-    tok_swap, lp_swap = swapped.forward_native(logits.clone(), {}, k, None)
-
-    assert torch.equal(tok_stock, tok_swap)
-    assert lp_stock is not None and lp_swap is not None
-    assert torch.equal(lp_stock, lp_swap)
 
 
 def test_runner_installs_spyre_topk_sampler() -> None:

@@ -33,8 +33,9 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.28.0), changing
-        # only allow_cpu_sync=True. Re-sync with upstream on a vLLM bump.
+        # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.28.0), with two
+        # changes: it calls apply_top_k_top_p_pytorch directly (upstream dispatches
+        # via apply_top_k_top_p) with allow_cpu_sync=True. Re-sync on a vLLM bump.
         logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":

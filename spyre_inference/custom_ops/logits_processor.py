@@ -47,9 +47,6 @@ class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
         return tensor_model_parallel_all_gather(logits)
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """All-gather the TP-sharded logits (compiled to `spyre::all_gather_async`), then D2H."""
-        if self.use_all_gather:
-            gathered = self._all_gather_logits(logits)
-        else:
-            gathered = super()._gather_logits(logits)
-        return convert(gathered, device="cpu")
+        # `Platform.use_all_gather()` is constant-True on Spyre, so the gather is always the
+        # all-gather form; compiled it lowers to `spyre::all_gather_async`, then D2H for sampling.
+        return convert(self._all_gather_logits(logits), device="cpu")

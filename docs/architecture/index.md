@@ -405,19 +405,21 @@ now implements `barrier`, `broadcast`, `send`/`recv`, list-form `allgather`, `ga
 and `allreduce`; only `reduce` remains a throw-stub, and torch-spyre's spyreccl
 backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't work).
 
-`SpyreCommunicator` therefore only overrides:
+`SpyreCommunicator` therefore overrides:
 
-- **`all_gather`** — routes CPU tensors through the gloo half of the multi-backend
-  `cpu:gloo,spyre:spyreccl` group, and uses native list-form `dist.all_gather` for Spyre
-  tensors (the base class's `dist.all_gather_into_tensor` path is blocked by the
-  `_allgather_base` stub).
+- **`all_reduce`** — uses the functional `_c10d_functional.all_reduce`, which torch-spyre
+  lowers to `spyre::all_reduce_async` inside a compiled graph and which runs eagerly via
+  `libspyre_comms` outside one, so one code path serves both modes.
+- **`all_gather`** — inside a compiled graph the functional collective lowers to
+  `spyre::all_gather_async` and stays on device; eager keeps native list-form
+  `dist.all_gather`, because the functional entry point (`allgather_into_tensor_coalesced`)
+  is rejected outside a graph. CPU tensors route through the gloo half of the multi-backend
+  `cpu:gloo,spyre:spyreccl` group.
 - **`reduce_scatter`** — raises; it is not on the TP forward path.
 
-`all_reduce` and `gather` are no longer overridden — they now work natively via
-`libspyre_comms`. Each remaining fallback is
-tagged `REPLACE-WITH-NATIVE`; the `tests/probes/test_spyre_comms_native_probes.py` xfail-strict
-suite is the canonical signal: when a probe flips green, delete the corresponding
-override.
+`gather` is not overridden — it works natively via `libspyre_comms`. The
+`tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
+signal: when a probe flips green, delete the corresponding override or workaround.
 
 The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM

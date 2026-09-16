@@ -125,7 +125,16 @@ class SpyreCommunicator(DeviceCommunicatorBase):
     def _all_gather_compiled(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
         # `spyre::all_gather_async` narrows the output at a `rank * per_rank_numel` offset
         # that `copy_from_d2d` requires to be 64-aligned; the vocab-parallel layers pad each
-        # shard to a 64 multiple, so per_rank_numel is aligned for the only gather on the TP path.
+        # shard to a 64 multiple, so per_rank_numel is aligned for the only gather on the TP
+        # path. Fail loudly for a future unaligned caller -- unaligned faults the card.
+        if input_.numel() % self._GATHER_ALIGN:
+            raise ValueError(
+                f"compiled all_gather needs a shard numel divisible by {self._GATHER_ALIGN} "
+                f"(got {input_.numel()}); pad the vocab-parallel layer to a 64 multiple."
+            )
+        # No `.contiguous()` unlike the eager path: inductor owns the graph input, and
+        # torch-spyre's all_gather kernel asserts contiguity -- a loud failure, not the
+        # silent corruption a non-contiguous eager input risks.
         dim = dim % input_.dim()
         input_size = input_.shape
         out = torch.ops._c10d_functional.all_gather_into_tensor(

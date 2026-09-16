@@ -14,6 +14,10 @@ gated_models:
   - google/gemma-2-2b-it
 
 public_models:
+  # GSM8K accuracy-gate models (tests/plugin/spyre_testing_plugin/gsm8k_configs/); the
+  # matrix prefetches these offline before the HF_HUB_OFFLINE test steps. granite-4.1-3b
+  # is listed below. (Unpinned, matching its gsm8k siblings.)
+  - Qwen/Qwen2.5-0.5B-Instruct
   - mistralai/Mistral-7B-Instruct-v0.3
   - mistralai/Ministral-3-14B-Instruct-2512-BF16
   - BAAI/bge-base-en-v1.5

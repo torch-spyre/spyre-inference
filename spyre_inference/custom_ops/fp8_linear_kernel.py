@@ -19,9 +19,17 @@ Forward (same graph as torch-spyre ``test_fp8_scaled_mm_cpu``):
     scale_a = amax(x) / 448                         # eager, outside compile
     y = _scaled_mm(qfp8ch(x), qfp8wt(W), scale_a, scale_b)   # FP16 out
 
-Granite 4096-wide SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128}, so we
-tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
-(``.contiguous()`` is a no-op on a row-view and SuperDSC ignores storage_offset).
+**Decode (M=1)** — the FP8 ops are inlined directly into the model's compiled
+graph via ``_apply_decode``, eliminating the graph break and HostCallback
+overhead between the model graph and a separate FP8 compiled graph.  This is
+possible because torch-spyre's GEMV fix (ef8b274b) allows M=1 ``_scaled_mm``
+to compile through SuperDSC.
+
+**Prefill (M>1)** — ``_apply_tiled`` tiles rows (M) and splits fused
+QKV/gate_up columns (N) into SuperDSC-legal widths ``{4096, 1024, 128}``.
+This path retains ``@torch._dynamo.disable(recursive=False)`` because
+inlining the full tiling loop would fuse Granite-sized shapes that SuperDSC
+cannot yet handle as a single graph.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
 )
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.platforms import PlatformEnum
 
 logger = init_logger(__name__)
@@ -106,8 +115,8 @@ def _compiled_fp8_scaled_mm(
         weight_scale,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,  # ty: ignore[invalid-argument-type]
-        w_fp8,  # ty: ignore[invalid-argument-type]
+        x_fp8,
+        w_fp8,
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
@@ -123,6 +132,35 @@ def _fp8_mm(
     per_token: bool,
 ) -> torch.Tensor:
     return _compiled_fp8_scaled_mm(x, _activation_scale(x, per_token), weight, weight_scale, bias)
+
+
+def _inline_fp8_scaled_mm(
+    x_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    scale_a: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Traceable FP8 matmul for the model's outer compiled graph.
+
+    Unlike ``_compiled_fp8_scaled_mm`` this has no ``@torch.compile``:
+    the enclosing model compile captures these ops directly so the
+    ``qfp8wt`` layout is assigned by Inductor on the model graph.
+    Activation ``x_fp8`` is pre-quantized by the caller so it is
+    computed once and reused across N-tiles.
+    """
+    w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(
+        weight,
+        weight_scale,
+    )
+    return torch.ops.aten._scaled_mm(
+        x_fp8,
+        w_fp8,
+        scale_a=scale_a,
+        scale_b=weight_scale,
+        bias=bias,
+        out_dtype=torch.float16,
+    )
 
 
 def _fp16_weight_for_qfp8wt(
@@ -206,18 +244,56 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
             layer._fp8_n_weight_splits = splits
         return splits
 
-    # Not an untraceable op. The GEMM is already Dynamo/Inductor:
-    # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
-    # ``recursive=False`` keeps that nested compile. This wrapper stays
-    # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
-    # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
-    # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
-    # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
-    # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
-    # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
-    # Drop this when those shapes compile as one graph.
-    @torch._dynamo.disable(recursive=False)
     def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | QuantizedActivation,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Dispatch to inline decode or tiled prefill path.
+
+        Decode (M=1): ``_apply_decode`` — FP8 ops traced by the outer model
+        compile; no graph break, no HostCallback overhead.  Requires cached
+        weight splits from a prior forward (set up during warmup).
+        """
+        if not isinstance(x, torch.Tensor):
+            raise NotImplementedError(
+                "SpyreFp8LinearKernel expects unquantized activations; "
+                "in-graph qfp8ch handles quantization."
+            )
+        orig_shape = x.shape
+        x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+
+        if x2d.shape[0] == 1 and hasattr(layer, "_fp8_n_weight_splits"):
+            out = self._apply_decode(layer, x2d, bias)
+            if x.dim() > 2:
+                out = out.reshape(*orig_shape[:-1], out.shape[-1])
+            return out
+
+        return self._apply_tiled(layer, x, bias)
+
+    def _apply_decode(
+        self,
+        layer: torch.nn.Module,
+        x2d: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """M=1 path: no row clone / pad; still the isolated ``_compiled_fp8_scaled_mm``."""
+        splits = cast(list[tuple[torch.Tensor, torch.Tensor]], layer._fp8_n_weight_splits)
+        if len(splits) == 1:
+            wj, sj = splits[0]
+            return _fp8_mm(x2d, wj, sj, bias, self._per_token_act)
+
+        col_outs: list[torch.Tensor] = []
+        col = 0
+        for wj, sj in splits:
+            ns = int(wj.shape[1])
+            bj = None if bias is None else bias[col : col + ns]
+            col_outs.append(_fp8_mm(x2d, wj, sj, bj, self._per_token_act))
+            col += ns
+        return torch.cat(col_outs, dim=-1)
+
+    def _apply_tiled(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,

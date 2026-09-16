@@ -305,6 +305,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.head_size,
                     self.block_size,
                     self.logits_soft_cap,
+                    self._page_group_for_query(padded_query_len),
                     out,
                 )
 

@@ -44,6 +44,9 @@ from spyre_inference.v1.attention.ops.batched_decode_head_major import (
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
@@ -837,6 +840,51 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+@pytest.mark.parametrize("page_group", [2, 3, 4, 8])
+def test_prefill_page_group_matches_single_page(page_group):
+    """Grouping pages reassociates the online softmax, so the result must not move.
+
+    5 blocks against groups of 2/3/4 covers a short tail group, and group 8 a group wider
+    than the whole context.
+    """
+    set_random_seed(0)
+    kv, qpk, d, block, blocks = 2, 2, 16, 8, 5
+    heads, query_len = kv * qpk, 7
+    pages = [6, 1, 7, 3, 2]
+
+    k = torch.randn(8, kv, block, d)
+    v = torch.randn(8, kv, block, d)
+    query = torch.randn(query_len + 1, heads, d)
+    rows = torch.arange(query_len, dtype=torch.int32)
+    # Non-contiguous page ids: a grouped gather must follow the tables, not a range.
+    page_tables = [torch.tensor([p], dtype=torch.int32) for p in pages]
+    masks = [torch.zeros(query_len, block) for _ in range(blocks)]
+    masks[-1][:, block // 2 :] = torch.finfo(torch.float32).min
+
+    for soft_cap in (0.0, 30.0):
+        head = (
+            query,
+            rows,
+            k,
+            v,
+            page_tables,
+            masks,
+            d**-0.5,
+            blocks,
+            query_len,
+            heads,
+            kv,
+            d,
+            block,
+            soft_cap,
+        )
+        expected = page_attn_head_major_prefill_kernel(*head, 1, None)
+        actual = page_attn_head_major_prefill_kernel(*head, page_group, None)
+
+        assert actual.shape == expected.shape == (query_len, heads, d)
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
 def test_page_attn_head_major_matches_fp32_reference():

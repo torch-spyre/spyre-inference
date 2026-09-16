@@ -214,7 +214,7 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
 variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length
 buckets below — so a served request always lands on an already-compiled kernel. When the
-batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, off by default) warmup also
+batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup also
 records its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
@@ -237,13 +237,44 @@ duplicated rather than parameterised: the advertised shape, the allocation
 (`head_major_kv_layout`), and the three kernels that touch a page. The worker follows the
 layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
 
+#### LX-resident pages
+
+The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
+gather to its last use instead of round-tripping through HBM. Two shape choices get it
+there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
+gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
+behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
+groups are unrolled, so each matmul carries a single batch dim: the batched GQA form
+leaves the page with two batch dims and Inductor clones it out to a query-group axis it
+does not have (torch-spyre#4123). The fold itself is free — `[num_blocks, KV, block_size,
+D]` reshapes to `[num_blocks * KV, block_size, D]` — but the cache is allocated with that
+folded axis at device dim 0, which is where an indexed axis has to sit for the gather to
+cost one page rather than the whole tensor.
+
+Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+`aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
+attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
+of the model still runs eager. Because the bmm's output axes
+(`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
+mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries neither ALiBi
+(which needs a bias tile per query group) nor batched decode (whose kernel gathers whole
+pages from the unfolded cache) — both are available on the token-major layout.
+
+Residency is a property of the layout plan, not of a result, so it is measured off the
+planner's own verdicts by `scripts/probes/lx_head_major_residency.py`. K's residency
+needs torch-spyre#4153: `q @ Kᵀ` lowers the transpose to a restickify, whose cross-frame
+barrier bars an LX-resident input without that PR's local-read proof. V is read directly
+by `probs @ V` and stays resident either way.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre)
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
-- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`):
+- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
+  default; not on the head-major layout):
   powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)

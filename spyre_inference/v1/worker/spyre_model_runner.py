@@ -1366,20 +1366,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # nullcontext (Spyre pages live on-device, not in a host cumem pool), so
         # entering it is a no-op — honour it anyway to match the base contract.
         with kv_cache_allocation_context or nullcontext():
+            # A 0.29 KVCacheTensor packs every layer it lists into one allocation
+            # (num_blocks is per-layer). Each layer gets its own on-device pages: one
+            # shared buffer aliases every layer onto the same block, so a later layer's
+            # write clobbers an earlier layer's KV.
+            num_blocks = kv_cache_config.num_blocks
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                # All layers sharing this tensor use the same spec by construction.
-                spec = spec_by_layer[kv_cache_tensor.layers[0]]
-                num_blocks = kv_cache_tensor.size // spec.page_size_bytes
-
-                # The layout belongs to the backend; a layer without an impl (fixture
-                # stubs) gets the token-major default.
-                impl = getattr(static_ctx.get(kv_cache_tensor.layers[0]), "impl", None)
-                impl_cls = (
-                    type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-                )
-                page_cache = impl_cls.allocate_pages(num_blocks, spec, self._spyre_device)
                 for layer_name in kv_cache_tensor.layers:
-                    kv_caches[layer_name] = page_cache
+                    spec = spec_by_layer[layer_name]
+                    # The layout belongs to the backend; a layer without an impl (fixture
+                    # stubs) gets the token-major default.
+                    impl = getattr(static_ctx.get(layer_name), "impl", None)
+                    impl_cls = (
+                        type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+                    )
+                    kv_caches[layer_name] = impl_cls.allocate_pages(
+                        num_blocks, spec, self._spyre_device
+                    )
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]

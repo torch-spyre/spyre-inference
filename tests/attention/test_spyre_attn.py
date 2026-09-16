@@ -1537,13 +1537,35 @@ def test_masked_kv_slot_ranges_skips_a_block_aligned_length():
     [pytest.param("spyre", id="device_spyre")],
     indirect=True,
 )
-def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_device: str):
+@pytest.mark.parametrize(
+    ("num_seqs", "configure_compilation"),
+    [
+        pytest.param(1, "NONE", id="per_seq_loop"),
+        # One sequence under the num_seqs bucket, so the batch carries padded rows as
+        # well as padded blocks. Compiled because the batched kernel's 2-D page index
+        # lowers to aten.index, which fails eager (see _batched_decode_supported).
+        pytest.param(_MIN_BATCHED_SEQS + 1, "STOCK_TORCH_COMPILE", id="batched_decode"),
+    ],
+    indirect=["configure_compilation"],
+)
+def test_padded_blocks_do_not_read_the_null_slot(
+    default_vllm_config,
+    enable_batched_decode,
+    num_seqs: int,
+    configure_compilation: str,
+    configure_device: str,
+):
     """The same attention twice, changing only what the padded blocks can see.
 
     Two things a padded block column can name: a previous tenant's page (a reused vLLM
     row leaves stale ids past the new width) and the null slot (every padding token's K/V
     is clamped there). Poisoning either must not move the output. The poison is huge
     because one slot at 2**-24 is otherwise below fp16 resolution.
+
+    Both dispatches read padded columns, off block tables built separately: the per-seq
+    loop from `page_index_tables_cpu`, batched decode from its own `chunk_page_ids_cpu`,
+    whose block axis pads up to a whole chunk and whose row axis pads up to the num_seqs
+    bucket. Each sequence holds its own pages, so a row reading past its own is visible.
     """
     block_size, num_q_heads, num_kv_heads, head_size = 128, 4, 2, 64
     num_blocks, kv_len = 64, 300
@@ -1564,26 +1586,33 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
         )
 
     scale = head_size**-0.5
-    query = torch.randn(1, num_q_heads, head_size, dtype=dtype)
-    key = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
-    value = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
+    query = torch.randn(num_seqs, num_q_heads, head_size, dtype=dtype)
+    key = torch.randn(num_seqs, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(num_seqs, num_kv_heads, head_size, dtype=dtype)
 
     # A reused row leaves a previous tenant's ids past the new width: add_row rewrites
     # only that width, and clear_row/move_row zero only their own.
-    stale_page = real_blocks + 1
-    block_table = torch.full((1, padded_blocks), stale_page, dtype=torch.int32)
-    block_table[0, :real_blocks] = torch.arange(1, real_blocks + 1, dtype=torch.int32)
+    stale_page = 1 + num_seqs * real_blocks
+    assert stale_page < num_blocks
+    block_table = torch.full((num_seqs, padded_blocks), stale_page, dtype=torch.int32)
+    for seq in range(num_seqs):
+        first = 1 + seq * real_blocks
+        block_table[seq, :real_blocks] = torch.arange(first, first + real_blocks, dtype=torch.int32)
 
     k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
     v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
-    for pos in range(kv_len - 1):
-        page = int(block_table[0, pos // block_size])
-        k_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
-        v_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+    for seq in range(num_seqs):
+        for pos in range(kv_len - 1):
+            page = int(block_table[seq, pos // block_size])
+            k_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+            v_pages_cpu[page, pos % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
 
     last = kv_len - 1
     slot_mapping = torch.tensor(
-        [int(block_table[0, last // block_size]) * block_size + last % block_size],
+        [
+            int(block_table[seq, last // block_size]) * block_size + last % block_size
+            for seq in range(num_seqs)
+        ],
         dtype=torch.int64,
     )
     attn_metadata = _build_metadata(
@@ -1591,11 +1620,22 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
         num_kv_heads=num_kv_heads,
         head_size=head_size,
         block_size=block_size,
-        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
+        query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
         block_table=block_table,
         slot_mapping=slot_mapping,
     )
+
+    expect_batched = num_seqs >= _MIN_BATCHED_SEQS
+    if expect_batched:
+        # Without both of these the batched case would cover no padding at all.
+        assert attn_metadata.padded_num_seqs is not None
+        assert attn_metadata.padded_num_seqs > num_seqs, (
+            f"num_seqs={num_seqs} is itself a bucket, so the batch has no padded rows; "
+            f"pick a count off the num_seqs lattice."
+        )
+        assert attn_metadata.padded_batch_blocks is not None
+        assert attn_metadata.padded_batch_blocks > real_blocks
 
     def run(poison: float) -> torch.Tensor:
         cache_device = torch.device(configure_device)
@@ -1611,6 +1651,12 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
             scale=scale,
             num_kv_heads=num_kv_heads,
             kv_cache_dtype="auto",
+        )
+        # Otherwise a declined batch would silently repeat the per-seq case.
+        assert impl._batched_decode_preconditions_met(attn_metadata) == expect_batched, (
+            f"num_seqs={num_seqs} took the "
+            f"{'per-seq loop' if expect_batched else 'batched kernel'}, not the "
+            f"{'batched kernel' if expect_batched else 'per-seq loop'}"
         )
         kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
         key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
@@ -1637,9 +1683,10 @@ def test_padded_blocks_do_not_read_the_null_slot(default_vllm_config, configure_
     assert not clean.isnan().any(), "attention wrote no output"
     delta = (clean - poisoned).abs().max()
     assert torch.equal(clean, poisoned), (
-        f"a padded block reached masked KV: real={real_blocks} padded={padded_blocks} "
-        f"blocks, max|delta|={float(delta):g}. build() must point the padded columns at "
-        f"the null block, and _clear_masked_kv_slots must hold slot {NULL_SLOT} at zero."
+        f"a padded block reached masked KV: num_seqs={num_seqs}, real={real_blocks} "
+        f"padded={padded_blocks} blocks, max|delta|={float(delta):g}. build() must point "
+        f"the padded columns at the null block, and _clear_masked_kv_slots must hold slot "
+        f"{NULL_SLOT} at zero."
     )
 
 

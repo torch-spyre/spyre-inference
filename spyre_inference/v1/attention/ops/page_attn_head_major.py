@@ -124,3 +124,76 @@ def page_attn_head_major_kernel(
         out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
         return out
     return attn
+
+
+def page_attn_head_major_decode_kernel(
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    kv_index_tables,
+    mask_tiles,
+    scale,
+    num_blocks,
+    padded_query_len,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_size,
+    logits_soft_cap=0.0,
+    out=None,
+):
+    """Decode (Q=1) attention with the query groups folded into the row axis.
+
+    Heads are kv-major, so the fold is a reshape: the page keeps a single batch dim, where
+    the batched GQA form gives it a group axis Inductor clones it out to
+    (torch-spyre#4123). The fold needs no head gather, so this takes no head index tables:
+    passing them costs argument marshalling per call for tensors the graph never reads.
+    """
+    assert padded_query_len == 1, "decode kernel is specialized for a single query row"
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    row = query_row_index[:1]
+    q = query.index_select(0, row).reshape(num_kv_heads, num_queries_per_kv, head_size)
+
+    tile_max = None
+    tile_sum = None
+    tile_out = None
+
+    for i in range(num_blocks):
+        kv_rows = kv_index_tables[i]
+        k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+        v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+
+        scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        if logits_soft_cap > 0.0:
+            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+        # At one query row the mask is head-independent, so its [1, block_size] tile
+        # broadcasts across the folded group axis.
+        scores = scores + mask_tiles[i]
+        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+        if i == 0:
+            probs = torch.exp(scores - scores_max)
+            tile_max = scores_max
+            tile_out = torch.matmul(probs, v_page)
+            tile_sum = probs.sum(dim=-1, keepdim=True)
+        else:
+            assert tile_max is not None
+            assert tile_sum is not None
+            assert tile_out is not None
+            new_max = torch.maximum(tile_max, scores_max)
+            rescale = torch.exp(tile_max - new_max)
+            tile_out = tile_out * rescale
+            tile_sum = tile_sum * rescale
+            probs = torch.exp(scores - new_max)
+            tile_out = tile_out + torch.matmul(probs, v_page)
+            tile_sum = tile_sum + probs.sum(dim=-1, keepdim=True)
+            tile_max = new_max
+
+    assert tile_out is not None and tile_sum is not None
+    attn = (tile_out / tile_sum).reshape(1, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, row, attn)
+        return out
+    return attn

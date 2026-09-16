@@ -38,6 +38,10 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major import (
+    page_attn_head_major_decode_kernel,
+    page_attn_head_major_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
@@ -512,6 +516,49 @@ def test_head_major_attn_core(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_dispatches_by_query_width(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
+    wide query to the unrolled kernel pays for residency the query width already amortises."""
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    called = []
+
+    def spy(name, fn):
+        def wrapper(*args, **kwargs):
+            called.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    # Patched before the impl is built: __init__ reads these globals into the impl.
+    monkeypatch.setattr(
+        hm, "_page_attn_decode_compiled", spy("decode", hm._page_attn_decode_compiled)
+    )
+    monkeypatch.setattr(
+        hm, "_page_attn_prefill_compiled", spy("prefill", hm._page_attn_prefill_compiled)
+    )
+
+    _run_head_major_attn_test(
+        seq_lens=[(1, 300), (64, 200)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert sorted(called) == ["decode", "prefill"], called
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -789,3 +836,47 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+def test_decode_fold_matches_unrolled():
+    """The folded decode kernel is the unrolled one rebatched, so it must agree exactly."""
+    set_random_seed(0)
+    kv, qpk, d, block, blocks = 8, 4, 128, 64, 5
+    heads = kv * qpk
+    k = torch.randn(blocks * kv, block, d)
+    v = torch.randn(blocks * kv, block, d)
+    query = torch.randn(3, heads, d)
+    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+    kv_tables = [
+        torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
+    ]
+    head_tables = [
+        torch.tensor([h * qpk + g for h in range(kv)], dtype=torch.int32) for g in range(qpk)
+    ]
+    masks = [torch.zeros(1, block) for _ in range(blocks)]
+    masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
+
+    for soft_cap in (0.0, 30.0):
+        args = (
+            query,
+            rows,
+            k,
+            v,
+            kv_tables,
+            head_tables,
+            masks,
+            d**-0.5,
+            blocks,
+            1,
+            heads,
+            kv,
+            d,
+            block,
+            soft_cap,
+            None,
+        )
+        unrolled = page_attn_head_major_kernel(*args)
+        # The folded kernel needs no head gather, so it takes no head index tables.
+        folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
+        assert folded.shape == unrolled.shape
+        torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)

@@ -58,6 +58,7 @@ from torch_spyre._inductor import config as ts_config  # noqa: E402
 
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout  # noqa: E402
 from spyre_inference.v1.attention.ops.page_attn_head_major import (  # noqa: E402
+    page_attn_head_major_decode_kernel,
     page_attn_head_major_kernel,
 )
 
@@ -78,9 +79,12 @@ NUM_PAGES = _int("NUM_PAGES", max(NUM_BLOCKS, 8))
 CTX = SEQ_LEN - Q_LEN
 SCALE = D**-0.5
 FP16_MIN = torch.finfo(torch.float16).min
-# Mirrors _lx_max_cores: cap the attention compile when the bmm's output axes cannot
-# fill the cores on their own.
-MAX_CORES = _int("MAX_CORES", 8 if KV * Q_LEN < 32 else 0)
+# Mirrors the backend's dispatch; FOLD=0 runs the unrolled kernel at Q=1 instead.
+FOLD = Q_LEN == 1 and _int("FOLD", 1) == 1
+KERNEL = page_attn_head_major_decode_kernel if FOLD else page_attn_head_major_kernel
+# Mirrors _lx_max_cores over the dispatched kernel's output units.
+OUTPUT_UNITS = (NUM_HEADS if FOLD else KV) * Q_LEN
+MAX_CORES = _int("MAX_CORES", 8 if OUTPUT_UNITS < 32 else 0)
 
 print(
     f"config: Q_LEN={Q_LEN} SEQ_LEN={SEQ_LEN} CTX={CTX} "
@@ -90,7 +94,8 @@ print(
     f"solver={ts_config.layout_solver} lx_planning={ts_config.lx_planning} "
     f"co_opt={ts_config.co_optimizing_lx_planning} "
     f"relayout={getattr(ts_config, 'lx_planner_relayout', 'MISSING')} "
-    f"max_cores={MAX_CORES or 'uncapped'}"
+    f"max_cores={MAX_CORES or 'uncapped'} "
+    f"kernel={KERNEL.__name__} output_units={OUTPUT_UNITS}"
 )
 
 fails = []
@@ -151,12 +156,14 @@ args = (
     D,
     B,
 )
+# The folded kernel needs no head gather, so it takes no head index tables.
+kernel_args = args[:5] + args[6:] if FOLD else args
 
 prev_cores = ts_config.sencores
 if MAX_CORES:
     ts_config.sencores = MAX_CORES
 try:
-    got = torch.compile(page_attn_head_major_kernel, dynamic=False)(*args).cpu()[:Q_LEN]
+    got = torch.compile(KERNEL, dynamic=False)(*kernel_args).cpu()[:Q_LEN]
 finally:
     ts_config.sencores = prev_cores
 

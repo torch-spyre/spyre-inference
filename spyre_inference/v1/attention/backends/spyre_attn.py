@@ -443,12 +443,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         query_lens_list: list[int],
         block_table: torch.Tensor,
     ) -> list[tuple[int, int]]:
-        """Tail ranges the kernel gathers under the mask but no real token wrote.
-
-        Only on the step that first writes a partial block, since later decode steps
-        retain the zero tail. Padding tokens need no entry: `attn_layer` sends them to a
-        page nothing gathers, so block 0 stays at its allocated zero.
-        """
+        """Tails gathered under the mask, only for a block this step is the first to write."""
         ranges: list[tuple[int, int]] = []
         for seq in range(num_seqs):
             kv_len = int(seq_lens_list[seq])
@@ -1229,12 +1224,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _clear_masked_kv_slots(
         self, kv_cache: SpyrePagedKVCache, attn_metadata: "SpyreAttentionMetadata"
     ) -> None:
-        """Zero the block tails build() flagged as gathered under the mask but never written.
+        """Zero the tails build() flagged: torch-spyre#4517 leaks masked V into the output.
 
-        torch-spyre#4517: fp16 ``exp()`` floors at ``2**-24``, so masked positions keep a
-        softmax weight and their V reaches the output. Usually a no-op -- a tail is cleared
-        only on the step that first enters its block. Takes ``kv_cache`` so layers
-        ``attn_layer`` declines to split are covered too.
+        Takes ``kv_cache`` so layers ``attn_layer`` declines to split are covered too.
         """
         k_slots, v_slots = self.kv_slot_views(kv_cache)
         for start, end in attn_metadata.masked_kv_slot_ranges:
@@ -1580,8 +1572,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Allocate the paged K/V tensors in the layout this impl's kernels read.
 
         One page past vLLM's block count is the padding sink: no block table names it, so
-        the padding tokens `attn_layer` funnels there are never gathered. That keeps
-        block 0 -- which every padded block column gathers -- at its allocated zero.
+        what `attn_layer` funnels there is never gathered.
         """
         pages = num_blocks + 1
         # Host-allocated then transferred: only .to() takes a device_layout.

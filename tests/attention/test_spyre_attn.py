@@ -1540,8 +1540,8 @@ def test_padded_blocks_do_not_read_a_stale_page(default_vllm_config, configure_d
     """The same attention twice, changing only the stale page the padded columns name.
 
     A reused vLLM row leaves a previous tenant's page ids past the new width, and
-    torch-spyre#4517 keeps a softmax weight on the masked positions that gather them.
-    The poison is huge because 2**-24 is otherwise below fp16 resolution.
+    torch-spyre#4517 keeps a weight on the masked positions that gather them. The poison
+    is huge because 2**-24 is otherwise below fp16 resolution.
     """
     block_size, num_q_heads, num_kv_heads, head_size = 128, 4, 2, 64
     num_blocks, kv_len = 64, 300
@@ -1689,7 +1689,6 @@ def test_padding_sink_slot_is_the_reserved_page():
         torch.zeros(num_blocks + 1, kv_heads, block_size, head_size),
         torch.zeros(num_blocks + 1, kv_heads, block_size, head_size),
     )
-    # Past every slot vLLM can name, and identical in both layouts.
     assert SpyreAttentionImpl.padding_sink_slot(token_major) == num_blocks * block_size
     assert SpyreHeadMajorAttentionImpl.padding_sink_slot(head_major) == num_blocks * block_size
 

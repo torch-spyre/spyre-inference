@@ -88,9 +88,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
-        # One page past vLLM's block count is the padding sink; see the token-major
-        # `allocate_pages`.
-        pages = num_blocks + 1
+        pages = num_blocks + 1  # padding sink; see the token-major `allocate_pages`
         layout = head_major_kv_layout(
             pages * spec.num_kv_heads * spec.block_size, spec.head_size, torch.float16
         )

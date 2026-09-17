@@ -366,7 +366,7 @@ class TestRecorderBuilders:
         self, monkeypatch, default_vllm_config
     ):
         """The regression this guards: ``build()`` and warmup must agree."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

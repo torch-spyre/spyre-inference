@@ -292,29 +292,6 @@ class TestSpyreFp8LinearKernel:
         assert isinstance(layer.quant_method.fp8_linear, SpyreFp8LinearKernel)
 
 
-class TestFp8TileHelpers:
-    """SuperDSC-legal M/N splits from the Granite torch-spyre probe."""
-
-    def test_m_tiles_4096_wide(self):
-        from spyre_inference.custom_ops.fp8_linear_kernel import _m_tiles
-
-        assert _m_tiles(1, 4096, 4096) == [1]
-        assert _m_tiles(4, 4096, 4096) == [4]
-        assert _m_tiles(16, 4096, 4096) == [4, 4, 4, 4]
-        assert _m_tiles(3, 4096, 4096) == [4]
-        assert _m_tiles(6, 4096, 4096) == [4, 4]
-        assert _m_tiles(128, 128, 128) == [128]
-
-    def test_n_tiles_granite(self):
-        from spyre_inference.custom_ops.fp8_linear_kernel import _n_tiles
-
-        assert _n_tiles(4096) == [4096]
-        assert _n_tiles(1024) == [1024]
-        assert _n_tiles(6144) == [4096, 1024, 1024]
-        assert _n_tiles(25600) == [4096] * 6 + [1024]
-        assert _n_tiles(12800) == [4096, 4096, 4096, 128, 128, 128, 128]
-
-
 class TestDetectFp8ForCompile:
     """``_compile_for_spyre`` must use fullgraph=False for Granite FP8."""
 

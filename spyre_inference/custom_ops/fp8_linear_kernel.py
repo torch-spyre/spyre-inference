@@ -21,10 +21,10 @@ Forward:
 
 Per-tensor activations still compute ``scale_a = amax(x) / FP8_E4M3FN_MAX``
 eagerly because ``quantscalepertokenfp8`` always reduces over the hidden dim.
+Keep scale and ``_scaled_mm`` as separate compiles: fusing them fails SuperDSC.
 
-Granite 4096-wide SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128}, so we
-tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
-(``.contiguous()`` is a no-op on a row-view and SuperDSC ignores storage_offset).
+Granite fused N (QKV 6144, gate_up 25600) and wide M compile as one GEMM
+once torch-spyre includes the #4179 fix (PR #4235). Host M/N tiling is gone.
 """
 
 from __future__ import annotations
@@ -51,40 +51,6 @@ except ImportError:
     FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 _REGISTERED = False
-
-_WIDE = 4096
-_WIDE_N = (4096, 1024, 128)
-_SMALL_M = frozenset({1, 2, 3, 4})
-_M_ALIGN = 128
-
-
-def _m_tiles(m: int, k: int, n: int) -> list[int]:
-    """Wide GEMMs: decode M=1, otherwise tiles of 4 (pad up). Narrow: one tile."""
-    if max(k, n) < _WIDE:
-        return [m]
-    if m == 1:
-        return [1]
-    pad_m = m if m % 4 == 0 else ((m + 3) // 4) * 4
-    return [4] * (pad_m // 4)
-
-
-def _n_tiles(n: int) -> list[int]:
-    """Split fused N (QKV 6144, gate_up 25600) into SuperDSC-legal widths."""
-    if n in _WIDE_N:
-        return [n]
-    tiles: list[int] = []
-    left = n
-    for size in _WIDE_N:
-        count, left = divmod(left, size)
-        tiles.extend([size] * count)
-    if left:
-        raise RuntimeError(f"SpyreFp8LinearKernel: N={n} remainder {left} is not in {_WIDE_N}")
-    return tiles
-
-
-def _join(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
-    """Cat tiles into a new buffer so RMSNorm/SiLU/attention see offset 0."""
-    return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)).clone()
 
 
 def _per_tensor_activation_scale(x: torch.Tensor) -> torch.Tensor:
@@ -165,29 +131,6 @@ def _normalize_weight_scale(weight: torch.Tensor, weight_scale: torch.Tensor) ->
     return scale.reshape(1, n_out)
 
 
-def _n_weight_splits(
-    w_fp16: torch.Tensor, weight_scale: torch.Tensor, n_parts: list[int]
-) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    if len(n_parts) == 1:
-        return [(w_fp16, weight_scale)]
-    parts: list[tuple[torch.Tensor, torch.Tensor]] = []
-    j = 0
-    for ns in n_parts:
-        wj = w_fp16[:, j : j + ns].clone()
-        sj = weight_scale if weight_scale.numel() == 1 else weight_scale[:, j : j + ns].clone()
-        parts.append((wj, sj))
-        j += ns
-    return parts
-
-
-def _pad_m(x: torch.Tensor, need_m: int) -> torch.Tensor:
-    extra = need_m - x.shape[0]
-    if extra <= 0:
-        return x
-    pad = torch.zeros(extra, x.shape[-1], dtype=x.dtype, device=x.device)
-    return torch.cat([x, pad], dim=0)
-
-
 class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
     @classmethod
     def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
@@ -212,26 +155,12 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(scale, requires_grad=False)
 
-    def _weight_splits(
-        self, layer: torch.nn.Module, w: torch.Tensor
-    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        n_parts = _n_tiles(int(w.shape[1]))
-        splits = getattr(layer, "_fp8_n_weight_splits", None)
-        if splits is None or len(splits) != len(n_parts):
-            splits = _n_weight_splits(w, cast(torch.Tensor, layer.weight_scale), n_parts)
-            layer._fp8_n_weight_splits = splits
-        return splits
-
     # Not an untraceable op. The GEMM is already Dynamo/Inductor:
     # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
     # ``recursive=False`` keeps that nested compile. This wrapper stays
-    # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
-    # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
-    # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
-    # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
-    # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
-    # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
-    # Drop this when those shapes compile as one graph.
+    # eager because first-forward CPU float8→fp16 for qfp8wt is not
+    # Spyre-graphable (torch-spyre #3506). Drop disable when checkpoint
+    # float8 loads as qfp8wt.
     @torch._dynamo.disable(recursive=False)
     def apply_weights(
         self,
@@ -241,7 +170,6 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
     ) -> torch.Tensor:
         orig_shape = x.shape
         x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
-        orig_m = x2d.shape[0]
 
         w = getattr(layer, "_fp16_for_qfp8wt", None)
         if w is None or w.device != x2d.device:
@@ -252,35 +180,10 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
             )
             layer._fp16_for_qfp8wt = w
 
-        k, n = int(w.shape[0]), int(w.shape[1])
-        splits = self._weight_splits(layer, w)
-        wide = max(k, n) >= _WIDE or len(splits) > 1
-        if wide:
-            m_parts = _m_tiles(orig_m, k, n)
-            x2d = _pad_m(x2d, sum(m_parts))
-        else:
-            # 128-wide: pad M to a torch-spyre-tested size (1–4 or 128).
-            if orig_m not in _SMALL_M and orig_m % _M_ALIGN:
-                x2d = _pad_m(x2d, ((orig_m + _M_ALIGN - 1) // _M_ALIGN) * _M_ALIGN)
-            m_parts = [x2d.shape[0]]
-
-        row_outs = []
-        i = 0
-        for mt in m_parts:
-            xi = x2d[i : i + mt].clone()
-            i += mt
-            col_outs = []
-            col = 0
-            for wj, sj in splits:
-                ns = wj.shape[1]
-                bj = None if bias is None else bias[col : col + ns].clone()
-                col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
-                col += ns
-            row_outs.append(_join(col_outs, dim=-1))
-        out = _join(row_outs, dim=0)[:orig_m]
+        out = _fp8_mm(x2d, w, cast(torch.Tensor, layer.weight_scale), bias, self._per_token_act)
         if x.dim() > 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out.clone()
+        return out
 
     def apply_scaled_mm(
         self,
@@ -296,11 +199,11 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         # Required: FP8ScaledMMLinearKernel marks this abstract. Unused on Spyre.
         # Upstream Torch only overrides this hook because parent apply_weights
         # quantizes then calls it with already-FP8 A/B. We replace apply_weights
-        # (tiling + in-graph qfp8ch/qfp8wt), so this is never entered. Do not
-        # wrap _fp8_mm here: that helper expects FP16 x/W, not pre-quantized A/B.
+        # (in-graph qfp8ch/qfp8wt), so this is never entered. Do not wrap
+        # _fp8_mm here: that helper expects FP16 x/W, not pre-quantized A/B.
         raise RuntimeError(
             "SpyreFp8LinearKernel runs only through apply_weights "
-            "(tiled qfp8ch/qfp8wt graph). apply_scaled_mm is unused."
+            "(qfp8ch/qfp8wt graph). apply_scaled_mm is unused."
         )
 
 

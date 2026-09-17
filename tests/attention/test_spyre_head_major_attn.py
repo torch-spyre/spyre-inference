@@ -797,7 +797,7 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
         cache_config=CacheConfig(block_size=block_size),
         compilation_config=CompilationConfig(custom_ops=["all"]),
     )
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
     spec = AttentionSpec(
         block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
     )

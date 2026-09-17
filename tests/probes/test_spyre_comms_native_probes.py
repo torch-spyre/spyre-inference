@@ -68,18 +68,13 @@ def test_all_reduce_vision_flattened_is_exact(run_tp_probe) -> None:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "F.pad + all_reduce + index_select inside a compiled graph returns garbage "
-        "(32/32 blocks wrong, uninitialised-looking values) while the same ops in "
-        "eager are bit-exact. Plain [1, 5120] and [2, 5120] compile and reduce "
-        "correctly, which is why all_reduce no longer pads. Keep this as the record "
-        "of why; when it passes, padding inside a compiled collective is safe again."
-    ),
-)
 def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
-    """Padding a collective inside a compiled graph, alongside unpadded controls."""
+    """Padding a collective inside a compiled graph, alongside unpadded controls.
+
+    Was xfail(strict=True) for returning garbage while eager was bit-exact; fixed in the
+    torch-spyre f4f0bcc..9f975a3 range. The host-side pad in `embed_input_ids` still stays
+    for bucketing -- this only unlocks moving it inside the compiled region.
+    """
     run_tp_probe("compiled_all_reduce_padded", world_size=2)
 
 

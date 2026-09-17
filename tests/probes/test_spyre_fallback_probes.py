@@ -263,17 +263,6 @@ def test_spyre_fancy_index_tensor(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A ZERO-DIM scalar device index silently produces wrong results: "
-        "k_pages[torch.tensor(2)] fed through transpose into torch.matmul "
-        "diverges from CPU. A ONE-ELEMENT index tensor works and is what the "
-        "attention backend uses -- see "
-        "test_spyre_indirect_page_gather_one_element_index below. Only this "
-        "0-dim form remains broken."
-    ),
-)
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
@@ -283,6 +272,12 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
       scores = torch.matmul(q, k_page)
 
     Pages here are head-major, so no permute: only the index form is under test.
+
+    Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
+    f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
+    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
+    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
+    (torch-spyre#3770).
     """
     num_kv_heads = 2
     block_size = 64
@@ -322,10 +317,10 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
     table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
-    provides. Two nearby index forms do NOT work and are deliberately not used:
-      - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
-      - a slice of a plain 1-D index tensor, or of a shared table row, which
-        fails to compile rather than returning wrong values.
+    provides. One nearby index form does NOT work and is deliberately not used: a slice
+    of a plain 1-D index tensor, or of a shared table row, which fails to compile rather
+    than returning wrong values. (A 0-dim scalar index works too now, but is not used --
+    see test_spyre_indirect_matmul_tensor_index.)
 
     index_select works in both modes, so it guards the shape of the gather here.
     The subscript form the kernel uses when compiled is covered by

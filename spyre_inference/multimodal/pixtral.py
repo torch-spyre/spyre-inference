@@ -64,6 +64,29 @@ def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
 # Attribute under which a source mask carries its padded counterpart `(key, padded)`.
 _MASK_ATTR = "_spyre_padded_mask"
 
+# Attribute under which a `cu_seqlens` tensor carries its block-diagonal mask.
+_CU_MASK_ATTR = "_spyre_block_diag_mask"
+
+
+def _block_diagonal_mask(cu_seqlens: torch.Tensor, seq: int) -> torch.Tensor:
+    """Bool `[seq, seq]` mask, `True` where two tokens share an image.
+
+    0.29 dropped the precomputed vision mask for `cu_seqlens` block boundaries
+    (`[0, len0, len0+len1, ...]`), and stock SDPA runs each image independently —
+    i.e. block-diagonal attention. The tower reuses one `cu_seqlens` across every
+    layer, so the mask is built once (on CPU, like `_padded_attn_mask`) and cached
+    on it; the same object then hits the padded-mask cache in each layer.
+    """
+    cached = getattr(cu_seqlens, _CU_MASK_ATTR, None)
+    if cached is not None and cached[0] == seq:
+        return cached[1]
+    bounds = convert(cu_seqlens, "cpu").to(torch.int64).tolist()
+    m = torch.zeros(seq, seq, dtype=torch.bool)
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        m[start:end, start:end] = True
+    setattr(cu_seqlens, _CU_MASK_ATTR, (seq, m))
+    return m
+
 
 def _padded_attn_mask(
     mask: torch.Tensor,
@@ -151,8 +174,10 @@ def patch_vision_attention() -> None:
 
     At a patch count coprime with the 64 stick, stock SDPA either fails to restickify
     a batch-matmul operand or returns silently wrong values, so the padding is a
-    correctness requirement. The body is upstream's non-xformers branch with only the
-    SDPA call swapped; `patch_vision_rope_vit` must run first because
+    correctness requirement. 0.29 replaced the precomputed `mask` argument with
+    `cu_seqlens` (stock delegates to `MMEncoderAttention`, which runs each image
+    independently); we rebuild the equivalent block-diagonal mask from it and feed
+    it to the padded SDPA. `patch_vision_rope_vit` must run first because
     `apply_rotary_emb_vit` is resolved by name at call time.
     """
     try:
@@ -164,7 +189,7 @@ def patch_vision_attention() -> None:
     if attn_cls is None or getattr(attn_cls.forward, "_spyre_patched", False):
         return
 
-    def _forward(self, x, mask, freqs_cis):
+    def _forward(self, x, freqs_cis, cu_seqlens, max_seqlen=None, sequence_lengths=None):
         batch, patches, _ = x.shape
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -176,7 +201,7 @@ def patch_vision_attention() -> None:
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = padded_sdpa(q, k, v, mask)
+        out = padded_sdpa(q, k, v, _block_diagonal_mask(cu_seqlens, patches))
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
         return out

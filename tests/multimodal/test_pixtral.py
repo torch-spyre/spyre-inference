@@ -380,10 +380,12 @@ def test_flat_index_gather_matches_2d_index():
         67,  # coprime with the 64 stick — the case the stock lowering rejects
     ],
 )
-@pytest.mark.parametrize("mask_kind", ["bool", "additive"])
-def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind):
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_padded_vision_attention_matches_stock(tp_group, num_patches, num_images):
     """The pad-to-64 + `-inf` mask + crop SDPA must equal upstream's forward: padded
-    keys contribute nothing and padded queries are cropped."""
+    keys contribute nothing, padded queries are cropped, and the `cu_seqlens`-derived
+    block-diagonal mask blocks cross-image attention (0.29 replaced the precomputed
+    mask argument with `cu_seqlens`)."""
 
     args = _vision_args()
     layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
@@ -401,18 +403,35 @@ def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind)
         theta=ROPE_THETA,
     ).reshape(-1, HEAD_DIM // 2)[:num_patches]
 
-    if mask_kind == "bool":
-        mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
-    else:
-        mask = torch.zeros(num_patches, num_patches, dtype=torch.float16)
-        mask[:, num_patches // 2 :] = torch.finfo(torch.float16).min
+    # 0.29 passes per-image `cu_seqlens` instead of a mask; split the patches into
+    # `num_images` contiguous images so both attention cores see the same geometry.
+    lens = [num_patches] if num_images == 1 else [num_patches // 2, num_patches - num_patches // 2]
+    cu_seqlens = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32)
+
+    # Reference: stock 0.29 runs one plain SDPA per image (`torch_sdpa_wrapper` splits
+    # on `cu_seqlens`). Reproduce that here — the wrapper is a custom op that is not
+    # registered for CPU tensors, so `layer.forward` can't run card-less — sharing the
+    # layer's qkv/rope/o_proj so the comparison isolates the padded attention core.
+    qkv, _ = layer.qkv_proj(x)
+    q, k, v = qkv.chunk(3, dim=-1)
+    q = q.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    k = k.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    v = v.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    per_image = [
+        torch.nn.functional.scaled_dot_product_attention(
+            q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], scale=layer.head_dim**-0.5
+        )
+        for a, b in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+    ]
+    core = torch.cat(per_image, dim=2).transpose(1, 2).reshape(1, num_patches, HIDDEN_SIZE)
+    expected, _ = layer.o_proj(core)
 
     from spyre_inference.multimodal.pixtral import patch_vision_attention
 
-    expected = layer.forward(x, mask, freqs_cis)
-
     patch_vision_attention()
-    actual = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    actual = pixtral.Attention.forward(layer, x, freqs_cis, cu_seqlens)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
@@ -600,14 +619,16 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
 
     torch.manual_seed(37)
     x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
-    # Kept on CPU: the padded mask is assembled host-side and Spyre has no bool.
-    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+    # 0.29 drives attention with per-image `cu_seqlens`, not a mask; split into two
+    # images to exercise the block-diagonal path (kept on CPU — the derived mask is
+    # assembled host-side and Spyre has no bool).
+    cu_seqlens = torch.tensor([0, num_patches // 2, num_patches], dtype=torch.int32)
 
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    expected = pixtral.Attention.forward(layer, x, freqs_cis, cu_seqlens)
 
     device = torch.device("spyre")
     layer = layer.to(device)
-    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+    actual = pixtral.Attention.forward(layer, x.to(device), freqs_cis.to(device), cu_seqlens)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

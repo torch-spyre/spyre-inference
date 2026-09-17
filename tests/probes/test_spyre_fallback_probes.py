@@ -263,17 +263,6 @@ def test_spyre_fancy_index_tensor(spyre_device):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A ZERO-DIM scalar device index silently produces wrong results: "
-        "k_pages[torch.tensor(2)] fed through transpose into torch.matmul "
-        "diverges from CPU. A ONE-ELEMENT index tensor works and is what the "
-        "attention backend uses -- see "
-        "test_spyre_indirect_page_gather_one_element_index below. Only this "
-        "0-dim form remains broken."
-    ),
-)
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
@@ -283,6 +272,12 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
       scores = torch.matmul(q, k_page)
 
     Pages here are head-major, so no permute: only the index form is under test.
+
+    Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
+    f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
+    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
+    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
+    (torch-spyre#3770).
     """
     num_kv_heads = 2
     block_size = 64
@@ -322,10 +317,10 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
     table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
-    provides. Two nearby index forms do NOT work and are deliberately not used:
-      - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
-      - a slice of a plain 1-D index tensor, or of a shared table row, which
-        fails to compile rather than returning wrong values.
+    provides. One nearby index form does NOT work and is deliberately not used: a slice
+    of a plain 1-D index tensor, or of a shared table row, which fails to compile rather
+    than returning wrong values. (A 0-dim scalar index works too now, but is not used --
+    see test_spyre_indirect_matmul_tensor_index.)
 
     index_select works in both modes, so it guards the shape of the gather here.
     The subscript form the kernel uses when compiled is covered by
@@ -926,3 +921,96 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Compiled Pixtral vision attention (coarse-tile hint split)
+# ---------------------------------------------------------------------------
+
+
+_VISION_ATTN_COMPILE_REASON = (
+    "torch.compile of Pixtral vision Attention (RoPE + padded SDPA) dies in "
+    "coarse-tile: `hint_id=N appears in both group 0 and group 1` — ops from "
+    "the same spyre_hint were split across two loop nests. That is why "
+    "`_is_decoder_attention_like` refuses vision towers. When this XPASS-es, "
+    "vision blocks can compile and the decoder-only restriction can be dropped."
+)
+
+
+@pytest.mark.xfail(strict=True, reason=_VISION_ATTN_COMPILE_REASON)
+def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_group, monkeypatch):
+    """A compiled vision-attention block must match the eager patched forward.
+
+    `_compile_blocks` wraps each TransformerBlock the same way. First
+    ``embed_multimodal`` then traces that graph and coarse-tile raises.
+    """
+    pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from spyre_inference.multimodal.pixtral import (
+        patch_vision_attention,
+        patch_vision_rope_vit,
+    )
+
+    monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
+    monkeypatch.setattr(
+        pixtral.VisionTransformer,
+        "freqs_cis",
+        pixtral.VisionTransformer.__dict__["freqs_cis"],
+    )
+    monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
+
+    hidden, heads, num_patches, max_side = 256, 4, 64, 16
+    args = pixtral.VisionEncoderArgs(
+        hidden_size=hidden,
+        num_channels=3,
+        image_size=128,
+        patch_size=16,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=heads,
+        rope_theta=10000.0,
+        image_token_id=10,
+        spatial_merge_size=1,
+    )
+
+    class _FreqsStub:
+        def __init__(self):
+            self.args = args
+            self.max_patches_per_side = max_side
+            self._freqs_cis = None
+            self.device = torch.device("cpu")
+
+    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
+    torch.manual_seed(31)
+    for param in layer.parameters():
+        param.data.normal_(std=0.02)
+    for module in layer.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+
+    patch_vision_rope_vit()
+    patch_vision_attention()
+
+    torch.manual_seed(7)
+    positions = torch.stack(
+        [
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+        ],
+        dim=-1,
+    )
+    freqs_cis = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())[
+        (positions[:, 0], positions[:, 1])
+    ]
+    torch.manual_seed(37)
+    x = torch.randn(1, num_patches, hidden, dtype=torch.float16)
+    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+
+    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+
+    layer = layer.to(spyre_device)
+    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
+
+    torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

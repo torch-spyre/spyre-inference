@@ -392,7 +392,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        # From the spec, like block_size and head_size above: gemma-4 resolves KV heads
+        # per layer, so this group's count need not be the model-level one.
+        self.num_kv_heads = kv_cache_spec.num_kv_heads
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
         # `torch.float16` upstream so it's always a real torch.dtype here.

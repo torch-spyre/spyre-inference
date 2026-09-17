@@ -83,8 +83,8 @@ def _n_tiles(n: int) -> list[int]:
 
 
 def _join(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
-    """Cat tiles into a new buffer so RMSNorm/SiLU/attention see offset 0."""
-    return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)).clone()
+    """Concatenate tiles; both ``_fp8_mm`` and ``cat`` already return fresh buffers."""
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
 
 
 def _per_tensor_activation_scale(x: torch.Tensor) -> torch.Tensor:
@@ -119,8 +119,8 @@ def _compiled_fp8_scaled_mm(
         weight_scale,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,  # ty: ignore[invalid-argument-type]
-        w_fp8,  # ty: ignore[invalid-argument-type]
+        x_fp8,
+        w_fp8,
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
@@ -277,10 +277,16 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
                 col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
                 col += ns
             row_outs.append(_join(col_outs, dim=-1))
-        out = _join(row_outs, dim=0)[:orig_m]
+        out = _join(row_outs, dim=0)
+        if out.shape[0] > orig_m:
+            # The slice is already contiguous at offset 0; clone() compacts the
+            # storage so the subsequent reshape (3-D inputs) sees the correct
+            # element count. Without it, the padding rows corrupt the trailing
+            # dimensions.
+            out = out[:orig_m].clone()
         if x.dim() > 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out.clone()
+        return out
 
     def apply_scaled_mm(
         self,

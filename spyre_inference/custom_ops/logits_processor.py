@@ -13,14 +13,16 @@
 # limitations under the License.
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
 from .utils import convert
 from .vocab_parallel_embedding import promote_tied_lm_head
 
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
-class SpyreLogitsProcessor(LogitsProcessor):
+class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
         """Project through the lm_head, then D2H the logits on the single-card path.
 
@@ -40,6 +42,11 @@ class SpyreLogitsProcessor(LogitsProcessor):
             logits = convert(logits, device="cpu")
         return logits
 
+    @compile_when_outermost
+    def _all_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return tensor_model_parallel_all_gather(logits)
+
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded logits on Spyre, then move the result to CPU."""
-        return convert(super()._gather_logits(logits), device="cpu")
+        # `Platform.use_all_gather()` is constant-True on Spyre, so the gather is always the
+        # all-gather form; compiled it lowers to `spyre::all_gather_async`, then D2H for sampling.
+        return convert(self._all_gather_logits(logits), device="cpu")

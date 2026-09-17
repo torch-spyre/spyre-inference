@@ -914,6 +914,46 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
+  # Test-report fan-in: every leg's JUnit XML into one aggregate report on the run
+  # Summary page -- totals plus a single flat, ctrl+f-searchable row per test case
+  # across all shards (no per-shard rollup, no per-file headings) -- replacing the
+  # per-shard dorny checks the matrix used to publish. Rendered directly from the
+  # JUnit XML by aggregate_junit_summary.py (mirrors the coverage/durations fan-
+  # ins): no dorny, so no check-run to 403 on a fork PR's read-only token, and no
+  # coupling to any external tool's markdown. always()/continue-on-error like the
+  # other fan-ins; no-op when no leg produced a JUnit file.
+  # ---------------------------------------------------------------------------
+  test-report:
+    name: Aggregate test report
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Write aggregate summary
+        run: |
+          shopt -s nullglob
+          files=(junit/*.xml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No JUnit XML to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
+
+  # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the
   # pytest matrix (`make tests TEST_TYPE=perf` -> perf-tests target). It is NOT
   # one of the matrix configs above: perf runs benchmarks, not pytest markers,

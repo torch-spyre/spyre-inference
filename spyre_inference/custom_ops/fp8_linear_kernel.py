@@ -265,7 +265,7 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         if out.shape[0] > orig_m:
             # The slice is already contiguous at offset 0; clone() compacts the
             # storage so the subsequent reshape (3-D inputs) sees the correct
-            # element count without it the padding rows corrupt the trailing
+            # element count. Without it, the padding rows corrupt the trailing
             # dimensions.
             out = out[:orig_m].clone()
         if x.dim() > 2:

@@ -267,21 +267,56 @@ def _block_sharing_defeated_by() -> str | None:
     return None
 
 
+## TODO: Remove this function when upgrading to vLLM 0.30.0
+def _is_decoder_attention_like(module: nn.Module) -> bool:
+    """Return whether a module participates in decoder KV-cache attention.
+
+    Native vLLM models own an ``Attention`` directly. The Transformers backend
+    instead retains an HF dispatcher with a ``layer_idx`` and the text config's
+    ``_attn_implementation`` set to ``vllm``. Those are the interface
+    contract, unlike the module's class name, and do not match vision encoders.
+    """
+    if isinstance(module, Attention):
+        return True
+    # Vision encoders retain their HF attention implementation (for example,
+    # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
+    # vLLM's KV-cache attention implementation. Transformers may prefix the
+    # implementation with ``paged|`` when it enables its paged-cache wrapper.
+    # TODO: Drop the decoder-only restriction when
+    # test_spyre_compiled_pixtral_vision_attention_coarse_tile XPASSes.
+    implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
+    return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
+        "|"
+    )
+
+
+_VISION_TOWER_NAME_PARTS = frozenset(("vision_encoder", "vision_tower", "vision_model", "visual"))
+
+
+def _is_vision_tower_path(qualname: str) -> bool:
+    """True for ``vision_encoder.transformer.layers`` and the HF / Qwen-VL spellings."""
+    return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
+
+
 def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     block_lists = []
-    for module in model.modules():
+    for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
+            continue
+        # Encoder-only towers stay eager even if a block's class name looks like
+        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
             continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
-        if any(isinstance(b, Attention) for b in blocks):
+        if any(_is_decoder_attention_like(b) for b in blocks):
             continue
         # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
         # each class shares a forward code object, so compiles scale per class, not depth.
-        if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
+        if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
             block_lists.append(module)
     return block_lists
 

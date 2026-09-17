@@ -40,6 +40,25 @@ logger = init_logger(__name__)
 # both align to this so Inductor never enters insert_bmm_padding.
 ENCODER_SEQ_ALIGNMENT = 64
 
+# How far an encoder attention cell may exceed the scheduler's token budget.
+#
+# The scheduler admits by token *sum*, encoder attention pays for ``B * L_bucket``, and
+# those agree only at uniform prompt lengths. Five 400-token prompts inside the pooling
+# default of 2048 have no covering in-budget cell at all: ``(5, 512) = 2560``. So warming
+# only in-budget cells and never compiling while serving are mutually exclusive.
+#
+# The slack goes to the *exact* widths the dispatcher would fall back to, not the next
+# power of two: warming ``(8, 512)`` instead wins the 5-sequence step and burns 4096
+# slots where 2560 would do. 2x stops the band -- going wider removed no serving-path
+# compile in simulation, since a step wide enough to need it already dropped a length
+# bucket.
+ENCODER_CELL_BUDGET_SLACK = 2
+
+
+def encoder_cell_budget(max_num_batched_tokens: int) -> int:
+    """Largest ``B * L`` a cell may occupy; see ``ENCODER_CELL_BUDGET_SLACK``."""
+    return max(1, int(max_num_batched_tokens)) * ENCODER_CELL_BUDGET_SLACK
+
 
 def default_encoder_len_buckets(max_model_len: int) -> list[int]:
     """Stick-aligned prompt-length buckets from 64 up to ``max_model_len``.
@@ -92,11 +111,8 @@ def len_buckets(
 
 
 def batch_buckets(max_num_seqs: int) -> list[int]:
-    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself.
-
-    Same buckets as decoder attention (``_powers_of_two_up_to``): clip with
-    ``--max-num-seqs``, no extra env var.
-    """
+    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself."""
+    # TODO need to concile with the batching bucketting in spyre_attn_bucketer.py
     cap = max(1, max_num_seqs)
     out: list[int] = []
     size = 1
@@ -134,7 +150,7 @@ def pick_encoder_attention_shape(
         and length >= max_query_len
         and batch <= max_num_seqs
         and length <= max_model_len
-        and batch * length <= max_num_batched_tokens
+        and batch * length <= encoder_cell_budget(max_num_batched_tokens)
     ]
     if not candidates:
         return None
@@ -154,16 +170,50 @@ def pooling_warmup_shapes(
     max_num_batched_tokens: int,
     len_bucket: Sequence[int] | None = None,
 ) -> list[tuple[int, int]]:
-    """``(batch_size, prompt_len)`` pairs to dummy at serve start."""
-    shapes: list[tuple[int, int]] = []
-    for batch_size in batch_buckets(max_num_seqs):
-        for prompt_len in len_buckets(max_model_len, len_bucket):
-            if prompt_len > max_model_len:
-                continue
-            if batch_size * prompt_len > max_num_batched_tokens:
-                continue
-            shapes.append((batch_size, prompt_len))
-    return shapes
+    """``(batch_size, prompt_len)`` pairs to dummy at serve start.
+
+    Three groups: the power-of-two ``B`` ladder within the token budget, the *exact*
+    widths just above it at the longest length (see ``ENCODER_CELL_BUDGET_SLACK``), and
+    a rescue cell for any batch bucket that no length fits within the budget (#775).
+
+    The last two groups can exceed ``max_num_batched_tokens``, which upstream
+    ``_dummy_run`` asserts against, so they need the runner's skewed-batch warmup
+    rather than a uniform ``B * L`` fill; see ``_warmup_pooling_bucket_shapes``.
+    """
+    budget = max(1, int(max_num_batched_tokens))
+    cell_budget = encoder_cell_budget(max_num_batched_tokens)
+    lengths = [
+        prompt_len
+        for prompt_len in len_buckets(max_model_len, len_bucket)
+        if prompt_len <= max_model_len
+    ]
+    batches = batch_buckets(max_num_seqs)
+
+    shapes: set[tuple[int, int]] = {
+        (batch_size, prompt_len)
+        for batch_size in batches
+        for prompt_len in lengths
+        if batch_size * prompt_len <= budget
+    }
+
+    if lengths:
+        longest = lengths[-1]
+        overflow_widths = range(
+            budget // longest + 1, min(max_num_seqs, cell_budget // longest) + 1
+        )
+        shapes.update((batch_size, longest) for batch_size in overflow_widths)
+
+    for batch_size in batches:
+        if any(batch_size * prompt_len <= budget for prompt_len in lengths):
+            continue
+        rescue = next(
+            (prompt_len for prompt_len in lengths if batch_size * prompt_len <= cell_budget),
+            None,
+        )
+        if rescue is not None:
+            shapes.add((batch_size, rescue))
+
+    return sorted(shapes)
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:

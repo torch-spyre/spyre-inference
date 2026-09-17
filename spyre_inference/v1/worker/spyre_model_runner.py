@@ -87,19 +87,25 @@ from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
+    SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
     mark_warmup_complete,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    SpyreEncoderAttentionImpl,
+)
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
+    default_encoder_len_buckets,
     logits_row_buckets,
+    next_bucket,
     pooling_warmup_shapes,
 )
 
@@ -505,6 +511,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
 
+        # Sort-free top-k path (see SpyreTopKTopPSampler).
+        self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
+            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
+        )
+
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False
         self.cascade_attn_enabled = False
@@ -577,7 +588,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
-            self._pooling_on_spyre = configure_pooling_for_spyre(self.model, self._spyre_device)
+            self._pooling_on_spyre = configure_pooling_for_spyre(
+                self.model, self._spyre_device, self.model_config.max_model_len
+            )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
@@ -768,8 +781,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._dummy_run(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
+                self._record_encoder_pack_graphs()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
+            # Pooling never reaches _record_attention_graphs (encoder layers have
+            # no KV cache to record against), so claim coverage here instead --
+            # otherwise _call_kernel stays silent for the encoder kernels.
+            mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -816,11 +834,35 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
-        self._record_attention_graphs(bucket_sizes)
+        self._record_attention_graphs()
 
     @torch.inference_mode()
-    def _record_attention_graphs(self, token_counts: list[int]) -> None:
-        """Pre-compile the attention.
+    def _record_encoder_pack_graphs(self) -> None:
+        """Trace the encoder pack kernel on every reachable shape.
+
+        The dummy runs above cannot: the kernel keys on the cell *and* the body token
+        bucket, and one run visits a single pair.
+        """
+        if not envs.SPYRE_ATTN_RECORD:
+            logger.info("Encoder pack graph recording disabled (SPYRE_ATTN_RECORD=0)")
+            return
+        static_ctx = self.compilation_config.static_forward_context
+        t0 = time.time()
+        total = 0
+        # Layers with the same head config share a graph; only the first pays a compile.
+        for layer in static_ctx.values():
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, SpyreEncoderAttentionImpl):
+                total += impl.record_pack_graphs(self._spyre_device)
+        logger.info(
+            "Encoder pack graph recording complete: %d graphs in %.3fs.",
+            total,
+            time.time() - t0,
+        )
+
+    @torch.inference_mode()
+    def _record_attention_graphs(self) -> None:
+        """Pre-compile the attention kernels, per-sequence and batched decode.
 
         The model-level warmup above cannot cover these: ``_dummy_run`` delegates
         upstream, which passes ``attn_metadata=None``, so ``forward`` returns
@@ -844,18 +886,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
         static_ctx = self.compilation_config.static_forward_context
         t0 = time.time()
         total = 0
-        # The metadata builders' own bucketer, not a second one built here, so
-        # every bucket recorded is one build() can actually produce.
-        bucketer = self._resolve_builder_attn_bucketer()
-        assert bucketer is not None, "No attention metadata builder exposes a bucketer"
+        builders = self._attn_metadata_builders()
         with _set_spyre_compilation_settings(self.vllm_config):
             for layer_name, kv_cache in self._spyre_kv_caches.items():
                 layer = static_ctx.get(layer_name)
                 impl = getattr(layer, "impl", None)
                 if not isinstance(impl, SpyreAttentionImpl):
                     continue
+                builder = builders.get(layer_name)
+                # A KV-cache layer on this impl is always in an attention group whose
+                # backend builds SpyreAttentionMetadataBuilder, so a miss is a wiring or
+                # ordering bug (recording before initialize_attn_backend), not a config.
+                assert builder is not None, (
+                    f"Layer {layer_name} has a Spyre attention impl and a KV cache but no "
+                    "Spyre metadata builder; initialize_attn_backend() must run first."
+                )
                 logger.info("Recording attention graphs for layer %s...", layer_name)
-                total += impl.record_graphs(self._spyre_device, bucketer, kv_cache)
+                total += impl.record_graphs(layer, kv_cache, builder)
         logger.info(
             "Attention graph recording complete: %d graphs in %.3fs.",
             total,
@@ -864,40 +911,64 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Past the early returns: with recording off, first-use compiles are intended.
         mark_warmup_complete()
 
-    def _resolve_builder_attn_bucketer(self) -> SpyreAttnBucketer | None:
-        """The attention bucketer the metadata builders dispatch against.
-
-        Returned rather than constructed here, so the recorder compiles exactly
-        the buckets ``build()`` rounds onto -- a second, independently built
-        instance could drift and make every request pad to an unrecorded block
-        count. A model can have several attention groups and, under ubatching,
-        several builders per group; the assert below guards against a future
-        spec-dependent bucket, since today all builders derive buckets from
-        ``cache_config``/``model_config`` alone and so agree by construction.
-        Returns None when no builder exposes a bucketer.
-        """
-        first: SpyreAttnBucketer | None = None
+    def _attn_metadata_builders(self) -> dict[str, SpyreAttentionMetadataBuilder]:
+        """Each layer's metadata builder: attention groups' specs (block size, sliding
+        window) need not agree, and a group's ubatch builders differ only in internal
+        buffers, so the first stands for all."""
+        builders: dict[str, SpyreAttentionMetadataBuilder] = {}
         for group in self._attn_group_iterator():
-            for builder in group.metadata_builders:
-                bucketer = getattr(builder, "_attn_bucketer", None)
-                if bucketer is None:
+            builder = group.metadata_builders[0] if group.metadata_builders else None
+            if not isinstance(builder, SpyreAttentionMetadataBuilder):
+                continue
+            for layer_name in group.layer_names:
+                builders[layer_name] = builder
+        return builders
+
+    def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+        self._split_attn_groups_by_layer_window()
+
+    def _split_attn_groups_by_layer_window(self) -> None:
+        """Give each distinct per-layer sliding window its own attention group."""
+        # `FullAttentionSpec.merge` collapses a hybrid decoder onto the one window it finds,
+        # clamping its full-attention layers too (gemma-3-1b-it: 512 on all 26). Spyre masks
+        # per group, not per layer as upstream does, so the group is what has to split.
+        from dataclasses import replace
+
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        from vllm.v1.worker.utils import AttentionGroup
+
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        for kv_cache_group_id, groups in enumerate(self.attn_groups):
+            split_groups: list[AttentionGroup] = []
+            for group in groups:
+                spec = group.kv_cache_spec
+                windows: dict[int | None, list[str]] = {}
+                for layer_name in group.layer_names:
+                    window = getattr(layers.get(layer_name), "sliding_window", None)
+                    windows.setdefault(window, []).append(layer_name)
+                # SlidingWindowSpec is single-window by construction; UniformTypeKVCacheSpecs
+                # is already unwrapped per layer upstream.
+                if not isinstance(spec, FullAttentionSpec) or len(windows) <= 1:
+                    split_groups.append(group)
                     continue
-                if first is None:
-                    first = bucketer
-                    continue
-                assert (bucketer.block_size, bucketer.num_blocks_buckets) == (
-                    first.block_size,
-                    first.num_blocks_buckets,
-                ), (
-                    "Attention bucketer buckets diverge between metadata builders: "
-                    f"{type(builder).__name__} has block_size={bucketer.block_size} "
-                    f"num_blocks={bucketer.num_blocks_buckets}, expected "
-                    f"block_size={first.block_size} "
-                    f"num_blocks={first.num_blocks_buckets}. Only one set can be "
-                    "recorded, so a mismatch means some builder pads onto block "
-                    "counts no kernel was compiled for."
+                logger.info(
+                    "Split %d attention layers into %d groups by sliding window %s.",
+                    len(group.layer_names),
+                    len(windows),
+                    {w: len(n) for w, n in windows.items()},
                 )
-        return first
+                for window, layer_names in windows.items():
+                    split_groups.append(
+                        AttentionGroup(
+                            group.backend,
+                            layer_names,
+                            replace(spec, sliding_window=window),
+                            kv_cache_group_id,
+                        )
+                    )
+            self.attn_groups[kv_cache_group_id] = split_groups
 
     def _determine_batch_execution_and_padding(
         self,
@@ -986,20 +1057,64 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             return
 
+        budget = self.scheduler_config.max_num_batched_tokens
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
         try:
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
-                num_tokens = batch_size * prompt_len
+                # A cell may sit above the token budget (ENCODER_CELL_BUDGET_SLACK) while
+                # _dummy_run asserts num_tokens <= budget, so a uniform B*L fill cannot
+                # warm it. One full-length sequence plus B-1 single-token ones carries the
+                # same num_seqs and max_query_len, all the cell keys on. That fill can
+                # overrun the budget too (L == budget suffices), so clamp it.
+                skewed = batch_size * prompt_len > budget
+                num_tokens = (
+                    min(prompt_len + batch_size - 1, budget) if skewed else batch_size * prompt_len
+                )
+                if skewed:
+                    # create_mixed_batch takes min(B-1, num_tokens//2) single-token rows
+                    # and gives the rest to one prefill row, so the traced cell is
+                    # (rows, bucket(prefill_len)) -- the requested one only if both match.
+                    # Skip rather than mislabel; serving snaps such a batch onto the ladder.
+                    decode_rows = min(batch_size - 1, num_tokens // 2)
+                    prefill_len = num_tokens - decode_rows
+                    lengths = default_encoder_len_buckets(self.model_config.max_model_len)
+                    if (
+                        decode_rows != batch_size - 1
+                        or next_bucket(prefill_len, lengths) != prompt_len
+                    ):
+                        logger.warning(
+                            "Pooling attention warmup: skipping cell batch_size=%d "
+                            "prompt_len=%d -- no skewed batch within the token budget "
+                            "carries it.",
+                            batch_size,
+                            prompt_len,
+                        )
+                        continue
                 logger.info(
-                    "Pooling attention warmup: exact bucket "
-                    "batch_size=%d prompt_len=%d (%d tokens)",
+                    "Pooling attention warmup: %s bucket batch_size=%d prompt_len=%d (%d tokens)",
+                    "skewed" if skewed else "exact",
                     batch_size,
                     prompt_len,
                     num_tokens,
                 )
-                hidden_states, _ = self._dummy_run(num_tokens, force_attention=True)
+                hidden_states, _ = self._dummy_run(
+                    num_tokens, force_attention=True, create_mixed_batch=skewed
+                )
                 self._dummy_pooler_run(hidden_states)
+                if batch_size == 1:
+                    # An exact fill satisfies _is_b1_fused_sdpa, so the run above
+                    # traces only the fused kernel. One token short takes the
+                    # packed QK/P.V kernels instead, which is what serving hits
+                    # for every prompt whose length is not already a bucket.
+                    logger.info(
+                        "Pooling attention warmup: partial bucket "
+                        "batch_size=1 prompt_len=%d (bucket %d)",
+                        prompt_len - 1,
+                        prompt_len,
+                    )
+                    hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
+                    self._dummy_pooler_run(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
 
@@ -1185,20 +1300,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
-        Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each
-        is a single tensor of shape [num_blocks, block_size, num_kv_heads,
-        head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
-        advertises. The attention kernel selects a page by indexing with a
-        one-element device tensor, so the page read is a real indirect access.
+        Each layer gets its own SpyrePagedKVCache(k_pages, v_pages), in the shape and
+        device layout its attention impl's `allocate_pages` chooses. The attention kernel
+        selects a page by indexing with a one-element device tensor, so the page read is
+        a real indirect access.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
-        from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+        static_ctx = self.compilation_config.static_forward_context
 
-        # One spec per layer. disable_hybrid_kv_cache_manager (set in the
-        # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
-        # group; unwrap it to the real per-layer specs so each layer keeps its own
-        # num_kv_heads/head_size. Non-hybrid groups expose the spec directly.
+        # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
+        # collapses hybrid models into a single group; when the layers' head shapes differ
+        # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
+        # so each layer keeps its own num_kv_heads/head_size. A merged spec is direct.
         spec_by_layer = {}
         for group in kv_cache_config.kv_cache_groups:
             per_layer = getattr(group.kv_cache_spec, "kv_cache_specs", None)
@@ -1217,27 +1331,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
-
-            k_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-
-            page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+            # The layout belongs to the backend; a layer without an impl (fixture
+            # stubs) gets the token-major default.
+            impl = getattr(static_ctx.get(kv_cache_tensor.shared_by[0]), "impl", None)
+            impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+            page_cache = impl_cls.allocate_pages(num_blocks, spec, self._spyre_device)
             for layer_name in kv_cache_tensor.shared_by:
                 kv_caches[layer_name] = page_cache
 
@@ -1246,7 +1344,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         bind_kv_cache(
             kv_caches,  # ty: ignore[invalid-argument-type]
-            self.compilation_config.static_forward_context,
+            static_ctx,
             self.kv_caches,
         )
         self._spyre_kv_caches = dict(kv_caches)

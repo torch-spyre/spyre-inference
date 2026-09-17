@@ -277,7 +277,7 @@ def test_spyre_fancy_index_tensor(spyre_device):
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
-    Mirrors the page gather in _page_attn_kernel, but with a 0-dim
+    Mirrors the page gather in page_attn_kernel, but with a 0-dim
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
@@ -378,7 +378,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     """`k_pages[idx]` for the page gather: works compiled, fails eager.
 
-    This asymmetry is why _page_attn_kernel gathers with index_select,
+    This asymmetry is why page_attn_kernel gathers with index_select,
     which works in both modes.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
@@ -742,18 +742,13 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
 # ---------------------------------------------------------------------------
 # 9. Scalar pow
 # ---------------------------------------------------------------------------
+#
+# torch-spyre#4479 decomposes pow.Tensor_Scalar into a mul chain, so exponent 3
+# is exact. Dispatch is on the exponent's value, and gelu_new passes the float.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
-        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
-        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
-        "torch-spyre#4009."
-    ),
-)
-def test_spyre_scalar_pow_cube(spyre_device):
+@pytest.mark.parametrize("exponent", [3, 3.0])
+def test_spyre_scalar_pow_cube(spyre_device, exponent):
     """torch.pow with exponent 3 on a device-produced tensor."""
     # x has to come from an on-device op: a host-copied tensor of unaligned width
     # is re-tiled and the comparison stops being meaningful.
@@ -762,7 +757,7 @@ def test_spyre_scalar_pow_cube(spyre_device):
     x = a @ b
 
     expected = x.cpu().float() ** 3
-    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(torch.pow(x, exponent).cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------

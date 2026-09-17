@@ -455,24 +455,45 @@ def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
     assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
 
 
+class _RoutedExperts(torch.nn.Module):
+    """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
+
+    def __init__(self, w13, w2):
+        super().__init__()
+        self.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
+        self.w2_weight = torch.nn.Parameter(w2, requires_grad=False)
+
+
+def test_prepare_layer_rejects_an_unaligned_hidden_size_before_relayout():
+    from torch_spyre._C import get_elem_in_stick
+
+    from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
+
+    stick = get_elem_in_stick(torch.float16)
+    hidden = HIDDEN - 1
+    w13 = torch.empty(EXPERTS, 2 * INTER, hidden, dtype=torch.float16)
+    w2 = torch.empty(EXPERTS, hidden, INTER, dtype=torch.float16)
+    layer = _RoutedExperts(w13, w2)
+    layer.spyre_moe_recipe = SpyreMoERecipe("gelu_tanh", "full_softmax")
+
+    match = rf"down expert-stack free dim {hidden}.*{stick}-element stick.*hidden_size"
+    with pytest.raises(ValueError, match=match):
+        _prepare_layer(layer)
+
+    assert hasattr(layer, "w13_weight")
+    assert hasattr(layer, "w2_weight")
+    assert not hasattr(layer, "spyre_moe_gate")
+
+
 # A whole number of sticks, and a TP shard that lands mid-stick (704 // 2 = 352 for
 # gemma-4-26B-A4B, scaled down here).
 @pytest.mark.parametrize("inter", [INTER, INTER - 32])
 def test_relayout_splits_and_transposes_the_generic_expert_stacks(inter):
     """A model recipe may prepare down weights before generic relayout."""
 
-    import torch.nn as nn
     from torch_spyre._C import get_elem_in_stick
 
     from spyre_inference.moe import SpyreMoERecipe, _prepare_layer
-
-    class _RoutedExperts(nn.Module):
-        """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
-
-        def __init__(self, w13, w2):
-            super().__init__()
-            self.w13_weight = nn.Parameter(w13, requires_grad=False)
-            self.w2_weight = nn.Parameter(w2, requires_grad=False)
 
     torch.manual_seed(0)
     w13 = torch.randn(EXPERTS, 2 * inter, HIDDEN, dtype=torch.float16) * 0.05

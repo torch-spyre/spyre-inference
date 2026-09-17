@@ -76,6 +76,20 @@ def _make_kernel(*, granite_channel: bool = False):
     )
 
 
+# Non-strict: this shape still compiles on some deeptools/dxp_standalone builds,
+# and an xpass is the signal that the backend fix landed.
+_XFAIL_M1 = pytest.param(
+    1,
+    marks=pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "dxp_standalone fails to compile the fused activation-quantize + "
+            "_scaled_mm graph for the M=1 decode shape"
+        ),
+    ),
+)
+
+
 @pytest.mark.fp8
 class TestSpyreFp8LinearKernel:
     def test_register(self):
@@ -204,7 +218,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre."""
         if not spyre_available():
@@ -228,7 +242,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.dtype == torch.float16
         assert actual.shape == (num_tokens, out_features)
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 128])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
         if not spyre_available():

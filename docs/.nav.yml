@@ -13,6 +13,7 @@ nav:
       - Kineto Profiling: user_guide/kineto_profiling.md
     - Developer Guide:
       - Contributing: contributing/README.md
+      - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md
 
   - Getting Started:
     - Installation: getting_started/installation.md
@@ -22,6 +23,8 @@ nav:
     - Offline Inference: examples/offline_inference
   - User Guide:
     - Configuration: user_guide/configuration.md
+    - Environment Variables: user_guide/env_vars.md
     - Kineto Profiling: user_guide/kineto_profiling.md
   - Developer Guide:
     - Contributing: contributing/README.md
+    - vLLM Upgrade Procedure: contributing/vllm-upgrade-procedure.md

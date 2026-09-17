@@ -317,6 +317,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     rep_row_ids_cpu: torch.Tensor | None = None  # [entries] int32
     rep_row_ids_dev: torch.Tensor | None = None
     chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
+    # Built by build_chunk_index_tables, so the shape is the kernel's (as above).
     chunk_page_ids_dev: list[torch.Tensor] | None = None
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
@@ -1266,9 +1267,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.rep_row_ids_dev = convert(
                 attn_metadata.rep_row_ids_cpu, device=_target_device
             )
-            attn_metadata.chunk_page_ids_dev = [
-                convert(t, device=_target_device) for t in attn_metadata.chunk_page_ids_cpu
-            ]
+            attn_metadata.chunk_page_ids_dev = self.build_chunk_index_tables(
+                attn_metadata, _target_device
+            )
             attn_metadata.mask_by_chunk_dev = convert(
                 attn_metadata.mask_by_chunk_cpu, device=_target_device
             )
@@ -1611,23 +1612,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             and output.storage_offset() == 0
             and output.is_contiguous()
         )
-        result = _call_kernel(
-            "batched decode attention",
-            self._decode_fn,
+        result = self._run_batched_decode(
             query_dev,
             attn_metadata.rep_row_ids_dev,
             k_pages,
             v_pages,
             attn_metadata.chunk_page_ids_dev,
             attn_metadata.mask_by_chunk_dev,
-            self.scale,
             b_seqs,
             blocks_per_chunk,
-            self.num_kv_heads,
-            self.num_queries_per_kv,
             block_size,
-            self.head_size,
-            self.logits_soft_cap,
             output if store_out else None,
         )
         if store_out:
@@ -1641,6 +1635,49 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
+
+    def _run_batched_decode(
+        self,
+        query_dev: torch.Tensor,
+        rep_row_ids: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        chunk_index_tables: list[torch.Tensor],
+        mask_by_chunk: torch.Tensor,
+        b_seqs: int,
+        blocks_per_chunk: int,
+        block_size: int,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run the batch's decode attention. The point where a subclass swaps kernels."""
+        return _call_kernel(
+            "batched decode attention",
+            self._decode_fn,
+            query_dev,
+            rep_row_ids,
+            k_pages,
+            v_pages,
+            chunk_index_tables,
+            mask_by_chunk,
+            self.scale,
+            b_seqs,
+            blocks_per_chunk,
+            self.num_kv_heads,
+            self.num_queries_per_kv,
+            block_size,
+            self.head_size,
+            self.logits_soft_cap,
+            out,
+        )
+
+    def build_chunk_index_tables(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> list[torch.Tensor]:
+        """Per chunk, the device index table the batched kernel gathers pages with."""
+        tables_cpu = attn_metadata.chunk_page_ids_cpu
+        assert tables_cpu is not None, "chunk_page_ids_cpu must come from the builder"
+        # Fresh offset-0 allocations (torch-spyre#3770).
+        return [convert(table, device=device) for table in tables_cpu]
 
     def build_index_tables(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device

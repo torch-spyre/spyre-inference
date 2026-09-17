@@ -742,18 +742,13 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
 # ---------------------------------------------------------------------------
 # 9. Scalar pow
 # ---------------------------------------------------------------------------
+#
+# torch-spyre#4479 decomposes pow.Tensor_Scalar into a mul chain, so exponent 3
+# is exact. Dispatch is on the exponent's value, and gelu_new passes the float.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
-        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
-        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
-        "torch-spyre#4009."
-    ),
-)
-def test_spyre_scalar_pow_cube(spyre_device):
+@pytest.mark.parametrize("exponent", [3, 3.0])
+def test_spyre_scalar_pow_cube(spyre_device, exponent):
     """torch.pow with exponent 3 on a device-produced tensor."""
     # x has to come from an on-device op: a host-copied tensor of unaligned width
     # is re-tiled and the comparison stops being meaningful.
@@ -762,7 +757,7 @@ def test_spyre_scalar_pow_cube(spyre_device):
     x = a @ b
 
     expected = x.cpu().float() ** 3
-    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(torch.pow(x, exponent).cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------

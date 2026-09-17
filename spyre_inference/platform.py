@@ -540,8 +540,8 @@ class TorchSpyrePlatform(CpuPlatform):
             # Pad attention head_dim up to a stick-aligned size on the native path.
             cls._maybe_pad_head_dim(vllm_config)
 
-        # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
-        cls._maybe_pad_intermediate_size(vllm_config)
+            # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
+            cls._maybe_pad_intermediate_size(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 

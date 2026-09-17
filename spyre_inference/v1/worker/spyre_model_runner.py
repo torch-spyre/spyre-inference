@@ -100,6 +100,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     default_encoder_len_buckets,
@@ -509,6 +510,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int64 at the model boundary.
         # _make_buffer (overridden below) places float .gpu tensors on Spyre
         # regardless of self.device.
+
+        # Sort-free top-k path (see SpyreTopKTopPSampler).
+        self.sampler.topk_topp_sampler = SpyreTopKTopPSampler(
+            self.sampler.logprobs_mode, self.sampler.use_fp64_gumbel
+        )
 
         # Disable GPU-specific features (same as CPUModelRunner)
         self.use_cuda_graph = False

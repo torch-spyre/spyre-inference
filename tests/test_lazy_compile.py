@@ -181,6 +181,7 @@ def test_each_instance_compiles_its_own_kernel(compile_calls, mode) -> None:
 def test_the_real_layers_opt_in() -> None:
     """Guards against the decorator or mixin being dropped from a layer."""
     from spyre_inference.custom_ops.gemma_rms_norm import SpyreGemmaRMSNorm
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm, SpyreTPAwareRMSNorm
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
@@ -193,6 +194,7 @@ def test_the_real_layers_opt_in() -> None:
         (SpyreTPAwareRMSNorm, "forward_oot"),
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
+        (SpyreLogitsProcessor, "_all_gather_logits"),
     ):
         assert issubclass(cls, CompileOutermost), cls.__name__
         wrapped = getattr(cls, method)

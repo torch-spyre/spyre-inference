@@ -81,8 +81,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1" (default), enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
-    # per-seq loop either way. "0" forces the loop for all batch sizes. Not
-    # available on the head-major KV layout, which has no batched kernel.
+    # per-seq loop either way. "0" forces the loop for all batch sizes.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache

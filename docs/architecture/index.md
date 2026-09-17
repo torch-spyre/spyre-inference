@@ -59,7 +59,7 @@ compiled graph (see below).
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (TP tables built on CPU at load) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, the per-vocab reindex/keep tables are built once on CPU at load and registered as device buffers; `forward` derives `masked_input`/`keep` from them on-device (`index_select`/`F.embedding`), applies the keep mask, and `all_reduce`s — no per-step CPU round-trip |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | — (not replaced) | Spyre | No OOT class: vLLM's own `SiluAndMul` is traced into the compiled graph, so `silu(gate)·up` runs on Spyre and slices the fused `[..., 2*d]` on-device. The Spyre-specific piece is `mlp_pad.py`, which zero-pads `intermediate_size` to the 64-element stick at load time so that slice lands at a lowerable offset (inert since `silu(0) = 0`) |
-| `NewGELU` | `SpyreNewGELU` | Spyre | `forward_native` cubes by multiplication instead of `torch.pow(x, 3)`, which returns `abs(x) ** 4` on Spyre (torch-spyre#4009) |
+| `NewGELU` | — (not replaced) | Spyre | No OOT class: vLLM's own `gelu_new` is traced into the compiled graph, cube term included — torch-spyre decomposes its `torch.pow(x, 3.0)` into a chain of `mul` ops (torch-spyre#4479) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
@@ -405,19 +405,21 @@ now implements `barrier`, `broadcast`, `send`/`recv`, list-form `allgather`, `ga
 and `allreduce`; only `reduce` remains a throw-stub, and torch-spyre's spyreccl
 backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't work).
 
-`SpyreCommunicator` therefore only overrides:
+`SpyreCommunicator` therefore overrides:
 
-- **`all_gather`** — routes CPU tensors through the gloo half of the multi-backend
-  `cpu:gloo,spyre:spyreccl` group, and uses native list-form `dist.all_gather` for Spyre
-  tensors (the base class's `dist.all_gather_into_tensor` path is blocked by the
-  `_allgather_base` stub).
+- **`all_reduce`** — uses the functional `_c10d_functional.all_reduce`, which torch-spyre
+  lowers to `spyre::all_reduce_async` inside a compiled graph and which runs eagerly via
+  `libspyre_comms` outside one, so one code path serves both modes.
+- **`all_gather`** — inside a compiled graph the functional collective lowers to
+  `spyre::all_gather_async` and stays on device; eager keeps native list-form
+  `dist.all_gather`, because the functional entry point (`allgather_into_tensor_coalesced`)
+  is rejected outside a graph. CPU tensors route through the gloo half of the multi-backend
+  `cpu:gloo,spyre:spyreccl` group.
 - **`reduce_scatter`** — raises; it is not on the TP forward path.
 
-`all_reduce` and `gather` are no longer overridden — they now work natively via
-`libspyre_comms`. Each remaining fallback is
-tagged `REPLACE-WITH-NATIVE`; the `tests/probes/test_spyre_comms_native_probes.py` xfail-strict
-suite is the canonical signal: when a probe flips green, delete the corresponding
-override.
+`gather` is not overridden — it works natively via `libspyre_comms`. The
+`tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
+signal: when a probe flips green, delete the corresponding override or workaround.
 
 The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM

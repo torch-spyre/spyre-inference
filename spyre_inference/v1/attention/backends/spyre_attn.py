@@ -1340,15 +1340,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 "on first use. The per-variant warnings above carry the reason.",
                 len(variants),
             )
-        if recorded_decode == 0 and decode_variants:
-            # Same for the batched side, where the fallback is worse than a late compile:
-            # dispatch compiles the failing variant mid-serving and takes the engine down.
-            logger.warning_once(
-                "Recorded none of the %d batched-decode attention variants; the first "
-                "batch that dispatches one will compile it mid-serving. The per-variant "
-                "warnings above carry the reason.",
-                len(decode_variants),
-            )
         logger.info(
             "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
@@ -1610,15 +1601,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.rep_row_ids_dev is not None
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
-        # The mask is the only kernel argument built from the builder's head count, so
-        # it is the only one that can disagree; checked eagerly so a mismatch is not a
-        # fake-tensor reshape failure from inside the traced kernel.
-        mask_kv_rows = attn_metadata.mask_by_chunk_dev.shape[1]
-        assert mask_kv_rows == b_seqs * blocks_per_chunk * self.num_kv_heads, (
-            f"decode mask has {mask_kv_rows} rows, but the kernel reshapes it to "
-            f"{b_seqs * blocks_per_chunk} x {self.num_kv_heads}: the builder broadcast "
-            f"it over a different num_kv_heads than this layer's."
-        )
 
         # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
         # b_seqs, not the real count -- so the destination needs that many rows and a

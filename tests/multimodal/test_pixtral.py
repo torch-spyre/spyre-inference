@@ -198,6 +198,40 @@ def test_patch_merger_patch_is_applied_and_idempotent():
 
 
 @pytest.mark.pixtral
+def test_pre_transformer_norm_patch_is_applied_and_idempotent():
+    from spyre_inference.multimodal.pixtral import (
+        _DefaultLayoutNorm,
+        patch_pre_transformer_norm,
+    )
+
+    model = torch.nn.Module()
+    model.vision_encoder = torch.nn.Module()
+    model.vision_encoder.ln_pre = torch.nn.RMSNorm(HIDDEN_SIZE)
+
+    patch_pre_transformer_norm(model)
+    patched = model.vision_encoder.ln_pre
+    assert isinstance(patched, _DefaultLayoutNorm)
+
+    patch_pre_transformer_norm(model)
+    assert model.vision_encoder.ln_pre is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_pre_transformer_norm_patch_is_transparent_on_cpu():
+    from spyre_inference.multimodal.pixtral import patch_pre_transformer_norm
+
+    model = torch.nn.Module()
+    model.vision_encoder = torch.nn.Module()
+    model.vision_encoder.ln_pre = torch.nn.RMSNorm(HIDDEN_SIZE)
+    x = torch.randn(1, 49, HIDDEN_SIZE)
+    expected = model.vision_encoder.ln_pre(x)
+
+    patch_pre_transformer_norm(model)
+
+    torch.testing.assert_close(model.vision_encoder.ln_pre(x), expected)
+
+
+@pytest.mark.pixtral
 def test_block_attention_mask_patch_is_applied_and_idempotent():
     from transformers.models.pixtral import modeling_pixtral
 
@@ -537,8 +571,8 @@ CORRUPTING_PATCHES = 121
 def test_rope_rotate_matmul_matches_cpu_on_spyre(num_patches):
     """The rope rotation on-card must equal the same rotation on CPU.
 
-    `torch.matmul(x, m)` here is 4-D @ 2-D, the shape family that torch-spyre#4155
-    computes wrongly for 3-D operands (confident garbage, no warning). Nothing
+    `torch.matmul(x, m)` here is 4-D @ 2-D, the same shape family as torch-spyre#4155
+    (a 3-D operand came back as confident garbage, no warning; since fixed). Nothing
     else covers the 4-D case, so this is the only guard against a silently wrong
     vision rope.
     """

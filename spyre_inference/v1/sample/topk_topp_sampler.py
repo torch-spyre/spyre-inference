@@ -21,10 +21,15 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 
 
 class SpyreTopKTopPSampler(TopKTopPSampler):
-    """Force the sort-free top-k path. Upstream only takes it under
-    ``allow_cpu_sync`` (CPU platform only); Spyre D2Hs logits before sampling, so
-    that host-device sync is free and the full-vocab sort it otherwise runs is
-    pure waste. Top-p still sorts (unaffected)."""
+    """Sort-free top-k plus a log-space Gumbel draw for random sampling.
+
+    Upstream only takes the sort-free top-k path under ``allow_cpu_sync`` (CPU
+    platform only); Spyre D2Hs logits before sampling, so that host-device sync
+    is free and the full-vocab sort it otherwise runs is pure waste. We also
+    draw in log space -- ``argmax(softmax(x)/q) == argmax(x - log q)`` for
+    ``q ~ Exp(1)`` -- which skips the softmax on the hot path. That draw is why
+    ``forward_native`` reimplements upstream's tail rather than delegating to
+    ``super()`` (which would softmax + ``random_sample``). Top-p still sorts."""
 
     def forward_native(
         self,
@@ -42,13 +47,10 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        # argmax(softmax(x)/q) == argmax(x - log q) for q~Exp(1): the softmax's
-        # per-row normalization is a constant the argmax ignores, so skip it.
         # Noise generation mirrors upstream random_sample.
         q = empty_exponential_noise_like(logits, self.use_fp64_gumbel)
         if len(generators) != logits.shape[0]:
             q.exponential_()
         for i, generator in generators.items():
             q[i].exponential_(generator=generator)
-        sampled = (logits - q.log_()).argmax(dim=-1).view(-1)
-        return sampled, logits_to_return
+        return (logits - q.log_()).argmax(dim=-1).view(-1), logits_to_return

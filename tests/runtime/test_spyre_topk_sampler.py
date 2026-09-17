@@ -24,14 +24,14 @@ from vllm.v1.sample.sampler import Sampler
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 
-def _meta(rows: int, k: int) -> SamplingMetadata:
+def _meta(rows: int, k: int | None = None, p: float | None = None) -> SamplingMetadata:
     z = torch.zeros(rows)
     return SamplingMetadata(
         temperature=torch.full((rows,), 0.8),
         all_greedy=False,
         all_random=True,
-        top_p=None,
-        top_k=torch.full((rows,), k, dtype=torch.long),
+        top_p=None if p is None else torch.full((rows,), p),
+        top_k=None if k is None else torch.full((rows,), k, dtype=torch.long),
         generators={},
         max_num_logprobs=None,
         no_penalties=True,
@@ -46,6 +46,8 @@ def _meta(rows: int, k: int) -> SamplingMetadata:
     )
 
 
+# Compares two upstream functions (full sort vs the sort-free top-k), never
+# touching SpyreTopKTopPSampler: it pins the upstream invariant this PR relies on.
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("vocab", [4096, 32000])
 def test_topk_filter_matches_full_sort(rows: int, vocab: int) -> None:
@@ -59,10 +61,16 @@ def test_topk_filter_matches_full_sort(rows: int, vocab: int) -> None:
     assert torch.equal(sort_path[kept_sort], topk_path[kept_topk])
 
 
+# The override applies top-k up front and delegates the rest upstream, so it must
+# stay token-for-token identical to the stock joint sort. Both cases exercise the
+# override's top-k pre-filter (top-p-only would delegate to super unchanged).
+@pytest.mark.parametrize("k,p", [(50, None), (50, 0.8)], ids=["topk", "topk_topp"])
 @pytest.mark.parametrize("rows", [1, 8])
 @pytest.mark.parametrize("vocab", [4096, 32000])
-def test_swapped_sampler_matches_stock_tokens(rows: int, vocab: int) -> None:
-    meta = _meta(rows, k=50)
+def test_swapped_sampler_matches_stock_tokens(
+    rows: int, vocab: int, k: int | None, p: float | None
+) -> None:
+    meta = _meta(rows, k=k, p=p)
     logits = torch.randn(rows, vocab, dtype=torch.float16)
 
     stock = Sampler()

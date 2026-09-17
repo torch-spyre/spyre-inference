@@ -31,6 +31,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     len_buckets,
     logits_row_buckets,
     next_bucket,
+    pick_encoder_attention_shape,
     pooling_warmup_shapes,
 )
 
@@ -166,12 +167,13 @@ class TestEncoderDispatch:
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
 
     def test_for_pooling_none_when_no_shapes(self):
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
+        # 16 * ENCODER_CELL_BUDGET_SLACK < 64, so not even (1, 64) survives.
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=16)
         cfg.compilation_config.compile_sizes = []
         assert SpyreShapeBucketer.for_pooling(cfg) is None
 
     def test_for_pooling_1d_only_when_no_attention_shapes(self):
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=32)
+        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=16)
         cfg.compilation_config.compile_sizes = [256]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
@@ -234,7 +236,8 @@ class TestEncoderDispatch:
         assert desc is not None
         assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
 
-    def test_dispatch_encoder_none_when_over_token_budget(self):
+    def test_dispatch_encoder_none_when_over_cell_budget(self):
+        # 4 * 64 = 256 exceeds 100 * ENCODER_CELL_BUDGET_SLACK = 200.
         config = MagicMock()
         config.compilation_config.compile_sizes = []
         b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
@@ -244,7 +247,7 @@ class TestEncoderDispatch:
                 max_query_len=30,
                 max_num_seqs=4,
                 max_model_len=2048,
-                max_num_batched_tokens=200,
+                max_num_batched_tokens=100,
             )
             is None
         )
@@ -333,14 +336,96 @@ class TestEncoderBuckets:
             max_num_batched_tokens=512,
         ) == [(1, 64)]
 
-    def test_warmup_shapes_skip_over_token_budget(self):
-        # 4*256 = 1024 and 2*256 = 512 both exceed 300; 4*64 = 256 still fits.
+    def test_warmup_shapes_skip_over_cell_budget(self):
+        # The limit is the cell budget, 300 * ENCODER_CELL_BUDGET_SLACK = 600, not
+        # the token budget: 2*256 = 512 is kept, 4*256 = 1024 is dropped.
         assert pooling_warmup_shapes(
             max_num_seqs=4,
             max_model_len=2048,
             max_num_batched_tokens=300,
             len_bucket=[64, 256],
-        ) == [(1, 64), (1, 256), (2, 64), (4, 64)]
+        ) == [(1, 64), (1, 256), (2, 64), (2, 256), (4, 64)]
+
+    def test_warmup_shapes_batch_bucket_can_lose_every_cell(self):
+        """A batch bucket whose minimum row already exceeds the cell budget
+        is dropped entirely, not just narrowed (spyre-inference#775).
+
+        32 * 64 = 2048 > 1024, and 64 is the smallest possible row, so batch
+        bucket 32 has no surviving cell at any prompt length — unlike bucket 16
+        (16*64=1024, exactly at the cell budget), which keeps one. Such a batch
+        falls back to an unwarmed exact-num_seqs shape at request time
+        (``_ladder_encoder_shape``), one bounded compile per distinct shape.
+        """
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=32,
+            max_model_len=512,
+            max_num_batched_tokens=512,
+        )
+        covered_batches = {batch for batch, _length in shapes}
+        assert covered_batches == {1, 2, 4, 8, 16}
+        assert 32 not in covered_batches
+
+    def test_slack_rescues_the_bucket_the_raw_budget_would_lose(self):
+        """ENCODER_CELL_BUDGET_SLACK narrows #775's starvation by one bucket.
+
+        16 * 64 = 1024 busts a 512 token budget, yet sixteen 32-token prompts are
+        admitted by token sum, so the cell budget keeps bucket 16.
+        """
+        covered = {
+            batch
+            for batch, _length in pooling_warmup_shapes(
+                max_num_seqs=16,
+                max_model_len=512,
+                max_num_batched_tokens=512,
+            )
+        }
+        assert covered == {1, 2, 4, 8, 16}
+
+    def test_warmup_shapes_add_exact_widths_above_the_budget(self):
+        """The overflow band is exact widths at the longest length, not powers of two.
+
+        See ``ENCODER_CELL_BUDGET_SLACK``. The wide low-``L`` cells a power-of-two band
+        would add are deliberately absent: a step wide enough to need them has a shorter
+        max length, so it lands a bucket down.
+        """
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=64,
+            max_model_len=512,
+            max_num_batched_tokens=2048,
+        )
+        assert {(5, 512), (6, 512), (7, 512), (8, 512)} <= set(shapes)
+        assert (16, 256) not in shapes
+        assert (32, 128) not in shapes
+
+    def test_exact_overflow_width_wins_over_the_next_power_of_two(self):
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=64,
+            max_model_len=512,
+            max_num_batched_tokens=2048,
+        )
+        assert pick_encoder_attention_shape(
+            num_seqs=5,
+            max_query_len=512,
+            encoder_shapes=shapes,
+            max_num_seqs=64,
+            max_model_len=512,
+            max_num_batched_tokens=2048,
+        ) == (5, 512)
+
+    def test_warmup_shapes_cover_every_batch_bucket_within_budget(self):
+        """Once max_num_seqs * ENCODER_SEQ_ALIGNMENT <= max_num_batched_tokens,
+        every batch bucket keeps at least one warmed cell.
+        """
+        max_num_batched_tokens = 512
+        max_num_seqs = max_num_batched_tokens // 64  # == 8
+
+        shapes = pooling_warmup_shapes(
+            max_num_seqs=max_num_seqs,
+            max_model_len=512,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        covered_batches = {batch for batch, _length in shapes}
+        assert covered_batches == set(batch_buckets(max_num_seqs))
 
     def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
         padded_ids, padded_pos = expand_packed_to_encoder_bucket(

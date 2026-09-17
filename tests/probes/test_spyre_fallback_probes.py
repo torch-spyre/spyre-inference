@@ -742,18 +742,13 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
 # ---------------------------------------------------------------------------
 # 9. Scalar pow
 # ---------------------------------------------------------------------------
+#
+# torch-spyre#4479 decomposes pow.Tensor_Scalar into a mul chain, so exponent 3
+# is exact. Dispatch is on the exponent's value, and gelu_new passes the float.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
-        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
-        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
-        "torch-spyre#4009."
-    ),
-)
-def test_spyre_scalar_pow_cube(spyre_device):
+@pytest.mark.parametrize("exponent", [3, 3.0])
+def test_spyre_scalar_pow_cube(spyre_device, exponent):
     """torch.pow with exponent 3 on a device-produced tensor."""
     # x has to come from an on-device op: a host-copied tensor of unaligned width
     # is re-tiled and the comparison stops being meaningful.
@@ -762,7 +757,7 @@ def test_spyre_scalar_pow_cube(spyre_device):
     x = a @ b
 
     expected = x.cpu().float() ** 3
-    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(torch.pow(x, exponent).cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -931,3 +926,96 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Compiled Pixtral vision attention (coarse-tile hint split)
+# ---------------------------------------------------------------------------
+
+
+_VISION_ATTN_COMPILE_REASON = (
+    "torch.compile of Pixtral vision Attention (RoPE + padded SDPA) dies in "
+    "coarse-tile: `hint_id=N appears in both group 0 and group 1` — ops from "
+    "the same spyre_hint were split across two loop nests. That is why "
+    "`_is_decoder_attention_like` refuses vision towers. When this XPASS-es, "
+    "vision blocks can compile and the decoder-only restriction can be dropped."
+)
+
+
+@pytest.mark.xfail(strict=True, reason=_VISION_ATTN_COMPILE_REASON)
+def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_group, monkeypatch):
+    """A compiled vision-attention block must match the eager patched forward.
+
+    `_compile_blocks` wraps each TransformerBlock the same way. First
+    ``embed_multimodal`` then traces that graph and coarse-tile raises.
+    """
+    pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from spyre_inference.multimodal.pixtral import (
+        patch_vision_attention,
+        patch_vision_rope_vit,
+    )
+
+    monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
+    monkeypatch.setattr(
+        pixtral.VisionTransformer,
+        "freqs_cis",
+        pixtral.VisionTransformer.__dict__["freqs_cis"],
+    )
+    monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
+
+    hidden, heads, num_patches, max_side = 256, 4, 64, 16
+    args = pixtral.VisionEncoderArgs(
+        hidden_size=hidden,
+        num_channels=3,
+        image_size=128,
+        patch_size=16,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=heads,
+        rope_theta=10000.0,
+        image_token_id=10,
+        spatial_merge_size=1,
+    )
+
+    class _FreqsStub:
+        def __init__(self):
+            self.args = args
+            self.max_patches_per_side = max_side
+            self._freqs_cis = None
+            self.device = torch.device("cpu")
+
+    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
+    torch.manual_seed(31)
+    for param in layer.parameters():
+        param.data.normal_(std=0.02)
+    for module in layer.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+
+    patch_vision_rope_vit()
+    patch_vision_attention()
+
+    torch.manual_seed(7)
+    positions = torch.stack(
+        [
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+        ],
+        dim=-1,
+    )
+    freqs_cis = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())[
+        (positions[:, 0], positions[:, 1])
+    ]
+    torch.manual_seed(37)
+    x = torch.randn(1, num_patches, hidden, dtype=torch.float16)
+    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+
+    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+
+    layer = layer.to(spyre_device)
+    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
+
+    torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

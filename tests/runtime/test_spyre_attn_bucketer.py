@@ -211,6 +211,19 @@ class TestVariants:
         assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [4, 8]
         assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [4, 6]
 
+    @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
+    def test_num_seqs_buckets_empty_below_min_batched(self, max_num_seqs, monkeypatch):
+        """Clamping down to max_num_seqs would enumerate a variant build() declines,
+        so the axis stays empty -- an explicit override included."""
+        b = SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs))
+        assert b.num_seqs_buckets == []
+        assert b.batched_decode_variants() == []
+        assert b.find_sequence_bucket(max_num_seqs) is None
+
+        monkeypatch.setenv("SPYRE_ATTN_NUM_SEQS_BUCKETS", str(max_num_seqs))
+        envs.clear_env_cache()
+        assert SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs)).num_seqs_buckets == []
+
     def test_num_blocks_buckets_follow_the_kv_buckets(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
         envs.clear_env_cache()
@@ -353,7 +366,7 @@ class TestRecorderBuilders:
         self, monkeypatch, default_vllm_config
     ):
         """The regression this guards: ``build()`` and warmup must agree."""
-        from tests.attention.test_spyre_attn import _padded_mask_metadata
+        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
 
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
         monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")

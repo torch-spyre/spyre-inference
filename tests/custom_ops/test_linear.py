@@ -19,10 +19,10 @@ is a pure host-side weight mutation. The generic `LinearBase` path (gate_up_proj
 down_proj, ...) is covered here; QKV and the LM head have their own tests
 (test_mlp.py, test_parallel_lm_head.py).
 
-`spyre_linear_t` is *not* device-agnostic, despite being a plain `torch.matmul`:
-torch-spyre computes a 3-D @ 2-D matmul incorrectly, so a CPU-only test of it
-proves nothing about a batched input. That case needs a card and lives in the
-on-card section at the bottom.
+A CPU-only test of `spyre_linear_t` proves nothing about how the card lowers its
+matmul, and a 3-D @ 2-D matmul under torch.compile once came back wrong on Spyre
+(torch-spyre#4155, since fixed). The batched case is checked in the on-card section
+at the bottom.
 """
 
 import pytest
@@ -238,12 +238,15 @@ def test_large_weights_not_padded(tp_group, monkeypatch):
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_transposed_linear_3d_matches_reference_on_spyre(tp_group, batch, seq, use_bias):
+@pytest.mark.parametrize("mode", ["compile", "eager"])
+def test_transposed_linear_3d_matches_reference_on_spyre(tp_group, batch, seq, use_bias, mode):
     """A 3-D `[B, T, hidden]` input through the layer on-card matches `F.linear`.
 
-    Regression guard for the 3-D fold in `spyre_linear_t` (torch-spyre#4155): without
-    it this returns confident garbage. Every other test here passes 2-D, as the
-    decoder does; the Pixtral vision tower is the only 3-D caller.
+    Regression guard for torch-spyre#4155: a compiled 3-D @ 2-D matmul returned the
+    right shape with uncorrelated values. It is fixed, so `spyre_linear_t` no longer
+    folds to 2-D. The bug was compile-only, so the compile case is the one that
+    guards it. Every other test here passes 2-D, as the decoder does; the Pixtral
+    vision tower is the only 3-D caller.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -267,7 +270,15 @@ def test_transposed_linear_3d_matches_reference_on_spyre(tp_group, batch, seq, u
 
     layer.quant_method.process_weights_after_loading(layer)
     layer = layer.to("spyre")
-    actual = _forward(layer, x.to("spyre"))
+
+    def fn(x):
+        return _forward(layer, x)
+
+    if mode == "compile":
+        torch._dynamo.reset()
+        fn = torch.compile(fn, dynamic=False, backend="inductor")
+
+    actual = fn(x.to("spyre"))
 
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-2, rtol=1e-2)

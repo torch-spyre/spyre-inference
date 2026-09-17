@@ -20,9 +20,9 @@ ibm-deeptools         = { version = "2.0.0-0.main.1+2457.d868b05_349" }
 ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2457.d868b05_349" }
 ibm-flex              = { version = "2.0.0-0.main.1+570.c11584a_408" }
 ibm-flex-devel        = { version = "2.0.0-0.main.1+570.c11584a_408" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+275.7b07aaf_267" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+275.7b07aaf_267" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+275.7b07aaf_267" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+275.7b07aaf_268" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+275.7b07aaf_268" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+275.7b07aaf_268" }
 ibm-spyre-comms       = { version = "1.0.0-0.main.1+154.ce55e90_197" }
 ibm-spyre-comms-devel = { version = "1.0.0-0.main.1+154.ce55e90_197" }
 ibm-libaiupti         = { version = "2.0.0-0.main.1+30.ef4e622_23" }

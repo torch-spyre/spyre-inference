@@ -38,6 +38,9 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
 )
+from spyre_inference.v1.attention.ops.batched_decode_head_major import (
+    batched_decode_head_major_kernel,
+)
 from spyre_inference.v1.attention.ops.page_attn_head_major import (
     page_attn_head_major_decode_kernel,
     page_attn_head_major_kernel,
@@ -139,7 +142,7 @@ def _run_head_major_attn_test(
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "cpu":
         pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
 
-    from tests.attention.test_spyre_attn import (
+    from spyre_testing_plugin.attn_helpers import (
         _build_metadata,
         _fused_qkv_kv_views,
         assert_close_outliers,
@@ -384,10 +387,9 @@ def test_head_major_scatter(
     """
     import warnings
 
+    from spyre_testing_plugin.attn_helpers import _fused_qkv_kv_views
     from torch_spyre.ops.fallbacks import FallbackWarning
     from vllm.config import get_current_vllm_config
-
-    from tests.attention.test_spyre_attn import _fused_qkv_kv_views
 
     set_random_seed(0)
     num_tokens = len(block_indices)
@@ -516,6 +518,49 @@ def test_head_major_attn_core(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_dispatches_by_query_width(
+    default_vllm_config, monkeypatch, configure_compilation, configure_device
+):
+    """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
+    wide query to the unrolled kernel pays for residency the query width already amortises."""
+    from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    called = []
+
+    def spy(name, fn):
+        def wrapper(*args, **kwargs):
+            called.append(name)
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    # Patched before the impl is built: __init__ reads these globals into the impl.
+    monkeypatch.setattr(
+        hm, "_page_attn_decode_compiled", spy("decode", hm._page_attn_decode_compiled)
+    )
+    monkeypatch.setattr(
+        hm, "_page_attn_prefill_compiled", spy("prefill", hm._page_attn_prefill_compiled)
+    )
+
+    _run_head_major_attn_test(
+        seq_lens=[(1, 300), (64, 200)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+    assert sorted(called) == ["decode", "prefill"], called
+
+
 @pytest.mark.parametrize("block_size", [64, 128])
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -624,7 +669,7 @@ def test_head_major_matches_token_major(
 ):
     """Both backends over the same logical KV must agree far more tightly than
     either agrees with the fp16 CPU reference: the layout is the only difference."""
-    from tests.attention.test_spyre_attn import _build_metadata, _fused_qkv_kv_views
+    from spyre_testing_plugin.attn_helpers import _build_metadata, _fused_qkv_kv_views
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -837,3 +882,301 @@ def test_decode_fold_matches_unrolled():
         folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
         assert folded.shape == unrolled.shape
         torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged",
+    [
+        pytest.param(4, 4, 8, 8, 2, 1, False, id="one_chunk"),
+        pytest.param(4, 4, 8, 2, 2, 1, False, id="four_chunks"),
+        pytest.param(4, 4, 8, 1, 2, 1, False, id="bpc_1"),
+        pytest.param(3, 4, 8, 4, 2, 1, False, id="padded_batch_rows"),
+        pytest.param(4, 4, 8, 2, 2, 4, True, id="gqa_ragged"),
+        pytest.param(5, 8, 12, 4, 1, 2, True, id="uneven_buckets_ragged"),
+        pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
+    ],
+)
+def test_head_major_batched_decode_matches_fp32_reference(
+    num_seqs: int,
+    b_seqs: int,
+    num_blocks: int,
+    bpc: int,
+    num_kv_heads: int,
+    qpk: int,
+    ragged: bool,
+) -> None:
+    """The head-major page read feeds the same reduction the token-major kernel gets.
+
+    Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
+    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
+    """
+    from tests.attention.test_spyre_attn import _decode_reference_fp32
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    block_size, head_size = 16, 8
+    num_heads = num_kv_heads * qpk
+    padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
+    num_chunks = padded_blocks // bpc
+    entries = b_seqs * bpc
+    scale = 0.5
+
+    n_pages = padded_blocks * b_seqs + 1
+    query = torch.randn(num_seqs, num_heads * head_size, dtype=torch.float32)
+    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
+
+    # Page 0 is the padding page, exactly as the builder leaves it.
+    page_ids = torch.zeros(b_seqs, padded_blocks, dtype=torch.int64)
+    mask = torch.full((b_seqs, padded_blocks, block_size), float("-inf"), dtype=torch.float32)
+    for s in range(num_seqs):
+        n_use = max(1, num_blocks - s) if ragged else num_blocks
+        tail = (block_size // 2) if ragged else block_size
+        kv_len = (n_use - 1) * block_size + tail
+        for b in range(n_use):
+            page_ids[s, b] = 1 + s * padded_blocks + b
+            mask[s, b, : min(block_size, kv_len - b * block_size)] = 0.0
+    mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+
+    rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
+    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
+    # One index row per page, in int64 for eager CPU indexing.
+    chunk_page_ids = [
+        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = (
+        mask.reshape(b_seqs, num_chunks, bpc, block_size)
+        .permute(1, 0, 2, 3)
+        .unsqueeze(3)
+        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
+        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .contiguous()
+    )
+
+    query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
+    query_padded[:num_seqs] = query
+
+    # The cache as this layout stores it: [pages, KV, block, D].
+    k_hm = k_pages.permute(0, 2, 1, 3).contiguous()
+    v_hm = v_pages.permute(0, 2, 1, 3).contiguous()
+    actual = batched_decode_head_major_kernel(
+        query_padded,
+        rep_row_ids,
+        k_hm,
+        v_hm,
+        chunk_page_ids,
+        mask_by_chunk,
+        scale,
+        b_seqs,
+        bpc,
+        num_kv_heads,
+        qpk,
+        block_size,
+        head_size,
+    )
+    expected = _decode_reference_fp32(
+        query_padded,
+        k_pages,
+        v_pages,
+        page_ids,
+        mask,
+        scale,
+        num_kv_heads,
+        qpk,
+        head_size,
+    )
+
+    assert torch.isfinite(actual[:num_seqs]).all()
+    torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
+    """The batched kernel gathers whole pages, so its index is the builder's page ids.
+
+    Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
+    with num_kv_heads times the gather entries, which measured ~2x the kernel time.
+    """
+    from tests.attention.test_spyre_attn import _build_metadata
+
+    torch.set_default_device("cpu")
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 4, 64, 64
+    num_seqs, blocks_per_seq = 8, 4
+
+    query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+    block_table = 1 + torch.arange(num_seqs * blocks_per_seq, dtype=torch.int32).reshape(
+        num_seqs, blocks_per_seq
+    )
+    attn_metadata = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.full((num_seqs,), blocks_per_seq * block_size, dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        block_table=block_table,
+        slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+    )
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+
+    assert impl._batched_decode_supported()
+    assert impl._batched_decode_preconditions_met(attn_metadata), (
+        "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
+    )
+    assert attn_metadata.chunk_page_ids_cpu is not None
+    assert attn_metadata.padded_num_seqs is not None
+    assert attn_metadata.blocks_per_chunk is not None
+    entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
+
+    tables = impl.build_chunk_index_tables(attn_metadata, torch.device("cpu"))
+    assert len(tables) == len(attn_metadata.chunk_page_ids_cpu)
+    for pages, table in zip(attn_metadata.chunk_page_ids_cpu, tables, strict=True):
+        assert table.shape == (entries, 1)
+        torch.testing.assert_close(table, pages)
+
+
+@pytest.fixture()
+def batched_decode_calls(monkeypatch):
+    """Pin ``SPYRE_BATCHED_DECODE`` on and count the batched dispatches.
+
+    A fall back to the per-seq loop still matches the reference, so without the count the
+    tests below would pass while testing nothing.
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    calls: list[bool] = []
+    original = SpyreHeadMajorAttentionImpl._run_batched_decode
+
+    def counting(self, *args, **kwargs):
+        calls.append(True)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SpyreHeadMajorAttentionImpl, "_run_batched_decode", counting)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "seq_lens,soft_cap",
+    [
+        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)] * 2, None, id="bucket_exact(N=8)"),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)], None, id="bucket_pad(N=5_bucket=8)"
+        ),
+        # Leading decode prefix batched, trailing prefill through the per-seq loop.
+        pytest.param([(1, 256)] * 4 + [(64, 256)], None, id="mixed_decode_prefix(N=4+1)"),
+        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, id="soft_cap(N=4)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_batched_decode_correctness(
+    default_vllm_config,
+    batched_decode_calls,
+    seq_lens,
+    soft_cap,
+    configure_compilation,
+    configure_device,
+):
+    """The batched decode kernel over folded pages, against the CPU reference.
+
+    Not bit-exact with the per-seq kernel and cannot be: the chunked reduction sums in a
+    different order under one shared max.
+    """
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
+    )
+    assert batched_decode_calls, "the batch fell back to the per-seq loop"
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_warmup_records_a_batched_decode_variant(
+    default_vllm_config, batched_decode_calls, configure_compilation, configure_device
+):
+    """Warmup can trace this layout's batched kernel, so serving does not compile it.
+
+    One bucket, not the whole enumeration: what matters is that the recorder reaches the
+    folded gather through builder-produced metadata.
+    """
+    import sys
+    from unittest.mock import MagicMock
+
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention.backends.spyre_attn import (
+        SpyreAttentionMetadataBuilder,
+    )
+    from spyre_inference.v1.attention.spyre_attn_bucketer import (
+        SpyreAttnBatchedDecodeBucket,
+        batched_decode_chunking,
+    )
+
+    torch.set_default_device("cpu")
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
+    num_seqs, num_blocks, num_pages = 4, 4, 64
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    vllm_config.cache_config.block_size = block_size
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
+    )
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+    assert impl._batched_decode_supported()
+
+    device = torch.device(configure_device)
+    kv_cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_pages, spec, device)
+    blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+    bucket = SpyreAttnBatchedDecodeBucket(
+        num_seqs=num_seqs,
+        num_blocks=num_blocks,
+        blocks_per_chunk=blocks_per_chunk,
+        num_chunks=num_chunks,
+    )
+
+    realized = impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
+
+    assert realized == (num_seqs, blocks_per_chunk, num_chunks)
+    assert batched_decode_calls, "the recorder traced the per-seq loop, not the batched kernel"
+
+    del kv_cache
+    gc.collect()

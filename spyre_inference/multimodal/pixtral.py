@@ -24,6 +24,7 @@ from __future__ import annotations
 from functools import cache
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
@@ -124,12 +125,6 @@ def padded_sdpa(
         q = F.pad(q, pad)
         k = F.pad(k, pad)
         v = F.pad(v, pad)
-    else:
-        # Offset operands read as offset 0 (torch-spyre#3770), so SDPA is silently
-        # wrong here; the padded branch escapes it only because F.pad materializes.
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
 
     out = F.scaled_dot_product_attention(
         q,
@@ -322,6 +317,35 @@ def patch_patch_merger() -> None:
     )
 
 
+class _DefaultLayoutNorm(nn.Module):
+    """Materialize a default-layout input before Pixtral's pre-transformer norm."""
+
+    def __init__(self, norm: nn.Module) -> None:
+        super().__init__()
+        self.norm = norm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type == "spyre":
+            device = x.device
+            x = convert(convert(x, device="cpu").contiguous(), device=device)
+        return self.norm(x)
+
+
+def patch_pre_transformer_norm(model: nn.Module) -> None:
+    """Reset the patch-conv layout before RMSNorm's fp32 accumulation.
+
+    Flattening the channel-tiled convolution output preserves a device layout whose
+    patch-grid dimension can contain an odd number of fp32 sticks. That layout cannot
+    be rescaled for RMSNorm's fp32-to-fp16 conversion. A CPU round trip after flattening
+    materializes the logical ``[batch, patches, hidden]`` tensor in its default layout.
+    """
+    tower = getattr(model, "vision_encoder", None) or getattr(model, "vision_tower", None)
+    if tower is None or isinstance(tower.ln_pre, _DefaultLayoutNorm):
+        return
+    tower.ln_pre = _DefaultLayoutNorm(tower.ln_pre)
+    logger.info("Spyre: Pixtral pre-transformer norm input uses the default device layout.")
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Pixtral vision-tower workaround, in dependency order.
 
@@ -349,3 +373,4 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     patch_vision_attention()
     patch_block_attention_mask()
     patch_patch_merger()
+    patch_pre_transformer_norm(model)

@@ -107,8 +107,9 @@ The default KV buckets are geometric (powers of two) precisely because the recor
 is a product. If your context never exceeds 2048, dropping the higher powers removes
 variants from warmup at no serving cost.
 
-If you enable the batched-decode kernel (`SPYRE_BATCHED_DECODE=1`, off by default), warmup
-also records it over the KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; the
+head-major layout has no batched kernel and ignores it), warmup also records it over the
+KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
 (default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
 keep-it-short advice applies.
 

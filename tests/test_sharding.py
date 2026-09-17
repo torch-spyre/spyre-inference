@@ -28,7 +28,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from spyre_testing_plugin.sharding import _apply_shard
+import spyre_testing_plugin.sharding as sharding
+from spyre_testing_plugin.sharding import _apply_quality_shard, _apply_shard, _apply_upstream_shard
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -452,6 +453,114 @@ def test_partition_runs_after_marker_deselection(tmp_path):
     )
 
 
+class _ShardConfig(_FakeConfig):
+    """Config for the real suite appliers: they read shard options and (via
+    _load_durations) a durations file that _apply_suite makes sure is absent."""
+
+    def __init__(self, options: dict, rootpath: Path):
+        self._options = options
+        self._rootpath = rootpath
+
+    @property
+    def rootpath(self) -> Path:
+        return self._rootpath
+
+    def getoption(self, name: str):
+        return self._options[name]
+
+
+def _apply_suite(
+    applier, master, *, shards_opt, id_opt, num_shards, shard_id, tmp_path, monkeypatch
+):
+    # Pin _load_durations to the static heuristic: no env override, empty rootpath.
+    monkeypatch.delenv("SPYRE_TEST_DURATIONS", raising=False)
+    sharding._DURATIONS_LOADED = False
+    sharding._DURATIONS_CACHE = None
+    items = list(master)
+    applier(_ShardConfig({shards_opt: num_shards, id_opt: shard_id}, tmp_path), items)
+    return {it.nodeid for it in items}
+
+
+def test_quality_shard_selects_and_partitions_gsm8k(tmp_path, monkeypatch):
+    """_apply_quality_shard folds the gsm8k evals in with model_quality and partitions
+    both; an upstream-tagged model_quality item is excluded, mirroring the Makefile combo."""
+    gsm8k = [
+        _FakeItem(
+            f"upstream/tests/evals/gsm8k/test_gsm8k_correctness.py::test_gsm8k_correctness[{m}]",
+            marks=[pytest.mark.gsm8k, pytest.mark.upstream],
+        )
+        for m in ("qwen", "granite", "mistral")
+    ]
+    mq = [
+        _FakeItem(
+            f"tests/e2e/test_model_quality.py::test_q[{i}]", marks=[pytest.mark.model_quality]
+        )
+        for i in range(3)
+    ]
+    mq_upstream = _FakeItem(
+        "upstream/tests/models/test_x.py::test_q[0]",
+        marks=[pytest.mark.model_quality, pytest.mark.upstream],
+    )
+    plain = [_FakeItem(f"tests/custom_ops/test_linear.py::test_p[{i}]") for i in range(4)]
+    master = gsm8k + mq + [mq_upstream] + plain
+
+    selected = {it.nodeid for it in gsm8k + mq}
+    excluded = {it.nodeid for it in [mq_upstream] + plain}
+    shards = [
+        _apply_suite(
+            _apply_quality_shard,
+            master,
+            shards_opt="--quality-shards",
+            id_opt="--quality-shard-id",
+            num_shards=2,
+            shard_id=i,
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        for i in range(2)
+    ]
+    # Selected items are partitioned once across the shards; excluded items are left in
+    # every shard. Both collapse into: the intersection is exactly the excluded set.
+    assert shards[0] | shards[1] == selected | excluded
+    assert shards[0] & shards[1] == excluded
+    # Spell the gsm8k direction out: each eval is selected, so it lands in exactly one shard.
+    for g in (it.nodeid for it in gsm8k):
+        assert sum(g in s for s in shards) == 1, f"{g} not partitioned (excluded or duplicated)"
+
+
+def test_upstream_shard_excludes_gsm8k(tmp_path, monkeypatch):
+    """_apply_upstream_shard keeps gsm8k out of its partition (the evals belong to the
+    quality suite); the remaining upstream items partition normally."""
+    gsm8k = _FakeItem(
+        "upstream/tests/evals/gsm8k/test_gsm8k_correctness.py::test_gsm8k_correctness[qwen]",
+        marks=[pytest.mark.gsm8k, pytest.mark.upstream],
+    )
+    others = [
+        _FakeItem(f"upstream/tests/models/test_x.py::test_m[{i}]", marks=[pytest.mark.upstream])
+        for i in range(4)
+    ]
+    master = [gsm8k] + others
+    other_ids = {it.nodeid for it in others}
+
+    shards = [
+        _apply_suite(
+            _apply_upstream_shard,
+            master,
+            shards_opt="--upstream-shards",
+            id_opt="--upstream-shard-id",
+            num_shards=2,
+            shard_id=i,
+            tmp_path=tmp_path,
+            monkeypatch=monkeypatch,
+        )
+        for i in range(2)
+    ]
+    # gsm8k is unselected here, so _apply_shard leaves it in every shard; the genuine
+    # upstream items are partitioned (disjoint). Intersection == just the gsm8k eval.
+    assert shards[0] & shards[1] == {gsm8k.nodeid}
+    assert shards[0] | shards[1] == other_ids | {gsm8k.nodeid}
+
+
 def _makefile_shard_counts() -> dict[str, int]:
     text = (_REPO_ROOT / "Makefile").read_text()
     counts = {}
@@ -461,7 +570,7 @@ def _makefile_shard_counts() -> dict[str, int]:
         ("upstream", "UPSTREAM_SHARDS"),
         ("distributed", "DIST_SHARDS"),
         ("probes", "PROBE_SHARDS"),
-        ("model-quality", "QUALITY_SHARDS"),
+        ("quality", "QUALITY_SHARDS"),
     ):
         m = re.search(rf"^{var}\s*\?=\s*(\d+)", text, re.MULTILINE)
         assert m, f"{var} not found in Makefile"
@@ -473,7 +582,14 @@ def _matrix_shard_ids() -> dict[str, list[int]]:
     text = (_REPO_ROOT / ".github/workflows/_test_matrix.yaml").read_text()
     return {
         suite: sorted({int(n) for n in re.findall(rf"test-{suite}-shard-(\d+)\b", text)})
-        for suite in ("smoke", "attention", "upstream", "distributed", "probes", "model-quality")
+        for suite in (
+            "smoke",
+            "attention",
+            "upstream",
+            "distributed",
+            "probes",
+            "quality",
+        )
     }
 
 

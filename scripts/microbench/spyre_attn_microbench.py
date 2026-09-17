@@ -217,6 +217,24 @@ def _fused_qkv_kv_views(query, key, value, device):
     )
 
 
+def _head_major_pages(k_cpu, v_cpu, device):
+    """The zeroed pages the worker allocates, in the head-major device layout."""
+    from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
+
+    nb, bsz, kv, d = k_cpu.shape
+    if device.type != "spyre":
+        return (
+            k_cpu.permute(0, 2, 1, 3).contiguous().to(device),
+            v_cpu.permute(0, 2, 1, 3).contiguous().to(device),
+        )
+    layout = head_major_kv_layout(nb * kv, bsz, d, k_cpu.dtype)
+    shape = (nb, kv, bsz, d)
+    return (
+        torch.zeros(shape, dtype=k_cpu.dtype).to(device, device_layout=layout),
+        torch.zeros(shape, dtype=v_cpu.dtype).to(device, device_layout=layout),
+    )
+
+
 def build_inputs_from_requests(
     query_lens,
     seq_lens,
@@ -228,6 +246,7 @@ def build_inputs_from_requests(
     device,
     seed=0,
     kv_layout="slot_major_devfill",
+    attn_kv_layout="token_major",
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
@@ -334,16 +353,22 @@ def build_inputs_from_requests(
             return cache.to(cache_device, device_layout=layout)
         return torch.zeros_like(cache).to(cache_device, device_layout=layout)
 
-    k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
+    if attn_kv_layout == "head_major":
+        # kv_layout is a token-major device-layout knob and does not apply here.
+        k_pages, v_pages = _head_major_pages(k_pages_cpu, v_pages_cpu, cache_device)
+    else:
+        k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
 
-    if kv_layout == "slot_major_devfill" and cache_device.type == "spyre" and hist_slots:
-        # Same index_copy_ the kernel uses, on the same [-1, H, D] view.
-        slots_dev = torch.tensor(hist_slots, dtype=torch.int64).to(cache_device)
-        hk_dev = convert(torch.cat(hist_k), cache_device)
-        hv_dev = convert(torch.cat(hist_v), cache_device)
-        view = (-1, num_kv_heads, head_size)
-        k_pages.view(view).index_copy_(0, slots_dev, hk_dev)
-        v_pages.view(view).index_copy_(0, slots_dev, hv_dev)
+    # Eager index_copy_ takes an int64 index, which falls back to CPU and lands the rows in
+    # the wrong place, so make_forward writes the history through the impl's compiled store.
+    devfill = cache_device.type == "spyre" and bool(hist_slots)
+    hist_seed = None
+    if devfill and (attn_kv_layout == "head_major" or kv_layout == "slot_major_devfill"):
+        hist_seed = {
+            "key": convert(torch.cat(hist_k), cache_device),
+            "value": convert(torch.cat(hist_v), cache_device),
+            "slots_cpu": torch.tensor(hist_slots, dtype=torch.int64),
+        }
     key_dev, value_dev = _fused_qkv_kv_views(query, key, value, cache_device)
 
     return {
@@ -351,6 +376,8 @@ def build_inputs_from_requests(
         "key_dev": key_dev,
         "value_dev": value_dev,
         "slots_dev": convert(slot_mapping, cache_device),
+        "slot_mapping_cpu": slot_mapping,
+        "hist_seed": hist_seed,
         "k_pages": k_pages,
         "v_pages": v_pages,
         "k_pages_cpu": k_pages_cpu,
@@ -441,6 +468,7 @@ def span_device_times(prof, span=SPANS["layer"]):
     windows = [tr for n, tr in spans if n == span]
     total = mem = 0.0
     n_compute = 0
+    by_op: dict[str, list[float]] = {}
 
     def credit(e, dev):
         nonlocal total, mem, n_compute
@@ -449,6 +477,9 @@ def span_device_times(prof, span=SPANS["layer"]):
             mem += dev
         else:
             n_compute += 1
+        slot = by_op.setdefault(e.name, [0.0, 0])
+        slot[0] += dev
+        slot[1] += 1
 
     for e in events:
         dev = getattr(e, "self_device_time_total", 0.0) or 0.0
@@ -465,7 +496,7 @@ def span_device_times(prof, span=SPANS["layer"]):
         if owner != span:
             continue
         credit(e, dev)
-    return total, mem, n_compute
+    return total, mem, n_compute, by_op
 
 
 def span_cpu_time_us(prof, span=SPANS["layer"]):
@@ -475,7 +506,14 @@ def span_cpu_time_us(prof, span=SPANS["layer"]):
     return float("nan")
 
 
-def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=False):
+def make_forward(
+    inputs,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+    kv_write=False,
+    attn_kv_layout="token_major",
+):
     """One emulated attention layer, in the order ``attn_layer`` runs it.
 
     The query is staged here because ``attn_layer`` stages it in the block graph,
@@ -489,7 +527,15 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
         SpyrePagedKVCache,
     )
 
-    impl = SpyreAttentionImpl(
+    impl_cls = SpyreAttentionImpl
+    if attn_kv_layout == "head_major":
+        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+            SpyreHeadMajorAttentionImpl,
+        )
+
+        impl_cls = SpyreHeadMajorAttentionImpl
+
+    impl = impl_cls(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=inputs["scale"],
@@ -503,7 +549,17 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
     q_staging, out_staging = impl.staging_buffers(device)
     rows = inputs["total_query_tokens"]
-    slots_dev = inputs["slots_dev"]
+    slots_dev = impl.kv_write_index(inputs["slot_mapping_cpu"], device)
+
+    seed = inputs.get("hist_seed")
+    if seed is not None:
+        impl.do_kv_cache_update(
+            None,
+            seed["key"],
+            seed["value"],
+            kv_cache,
+            impl.kv_write_index(seed["slots_cpu"], device),
+        )
 
     @torch.inference_mode()
     def run():
@@ -539,16 +595,19 @@ def measure(run, iterations, span=SPANS["layer"]):
     The AIUPTI backend has a fixed trace-buffer pool and stops capturing once
     full (kineto_profiling.md §4.5), so one long window truncates the timeline.
     """
-    dev_us, mem_us, cpu_us, n_kernels = [], [], [], []
+    dev_us, mem_us, cpu_us, n_kernels, per_op = [], [], [], [], []
     for _ in range(iterations):
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
             run()
-        total, mem, n_compute = span_device_times(prof, span)
+        total, mem, n_compute, by_op = span_device_times(prof, span)
         dev_us.append(total)
         mem_us.append(mem)
         n_kernels.append(n_compute)
+        per_op.append(by_op)
         cpu_us.append(span_cpu_time_us(prof, span))
-    return dev_us, mem_us, cpu_us, n_kernels
+    # The window whose total is the reported median, so the breakdown adds up to `ms`.
+    median_at = int(np.argsort(dev_us)[len(dev_us) // 2]) if dev_us else 0
+    return dev_us, mem_us, cpu_us, n_kernels, per_op[median_at] if per_op else {}
 
 
 def unreachable_reason(query_lens) -> str:
@@ -609,12 +668,17 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
+    Head-major's unrolled kernel emits its store as a second kernel per call, where
+    token-major and head-major's batched-GQA prefill kernel both fuse it into the
+    attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
     if row["attn_path"].startswith("batched"):
         attn = 1 + (num_seqs - num_decode)
     else:
         attn = num_seqs
+    if row.get("attn_kv_layout") == "head_major" and row["padded_query_len"] == 1:
+        attn *= 2
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
         return write
@@ -635,6 +699,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     max_kv = max(seq_lens)
     num_blocks = max(cfg["num_blocks"], (max_kv + block_size - 1) // block_size)
 
+    attn_kv_layout = cfg.get("attn_kv_layout", "token_major")
     span = SPANS[cfg.get("span", "layer")]
     print(
         f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
@@ -656,6 +721,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "block_size": block_size,
         "num_blocks": num_blocks,
         "kv_layout": cfg.get("kv_layout", "slot_major_devfill"),
+        "attn_kv_layout": attn_kv_layout,
         "num_kv_blocks_iterated": -1,
         "padded_query_len": -1,
         "dtype": str(DTYPE),
@@ -672,6 +738,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "cpu_time_ms": float("nan"),
         "allclose_pass": False,
         "max_abs_diff": float("nan"),
+        "ref_abs_max": float("nan"),
         "num_outliers": -1,
         "fallback_clean": True,
         "attn_path": "",
@@ -707,6 +774,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             cfg.get("device", "spyre"),
             seed=cfg.get("seed", 0),
             kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
+            attn_kv_layout=attn_kv_layout,
         )
         if inputs is None:
             from vllm.config import get_current_vllm_config
@@ -720,7 +788,14 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
 
         record_padding(row, inputs["attn_metadata"], query_lens, seq_lens, block_size)
 
-        run, output, impl = make_forward(inputs, num_q, num_kv, head_size, kv_write=row["kv_write"])
+        run, output, impl = make_forward(
+            inputs,
+            num_q,
+            num_kv,
+            head_size,
+            kv_write=row["kv_write"],
+            attn_kv_layout=attn_kv_layout,
+        )
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -736,10 +811,13 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
+        k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
+        if attn_kv_layout == "head_major":
+            k_ref, v_ref = k_ref.permute(0, 2, 1, 3), v_ref.permute(0, 2, 1, 3)
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            k_ref,
+            v_ref,
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -749,6 +827,13 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         diff = (got - ref).abs()
         n_outliers = int((diff > atol + rtol * ref.abs()).sum().item())
         row["max_abs_diff"] = diff.max().item()
+        row["ref_abs_max"] = ref.abs().max().item()
+        if row["ref_abs_max"] == 0.0:
+            print(
+                "    -> WARNING: reference is all zeros, so this comparison is vacuous "
+                "(the cache the kernel read holds no data)",
+                flush=True,
+            )
         row["num_outliers"] = n_outliers
         row["allclose_pass"] = n_outliers <= max_outliers
         if not row["allclose_pass"]:
@@ -765,7 +850,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         from torch._dynamo.utils import counters
 
         graphs_before = counters["stats"]["unique_graphs"]
-        dev_us, mem_us, cpu_us, n_kernels = measure(run, cfg.get("iterations", 10), span)
+        dev_us, mem_us, cpu_us, n_kernels, by_op = measure(run, cfg.get("iterations", 10), span)
         row["late_compile"] = counters["stats"]["unique_graphs"] != graphs_before
         if row["late_compile"]:
             print("    -> WARNING: a kernel compiled inside a measured window", flush=True)
@@ -790,9 +875,36 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                 f"    -> {row['ms'] * 1000:.1f}us device "
                 f"(min={row['min_ms'] * 1000:.1f}, max={row['max_ms'] * 1000:.1f}) "
                 f"mem={row['memory_share_pct']:.1f}%  cpu={row['cpu_time_ms']:.2f}ms  "
-                f"max_diff={row['max_abs_diff']:.3g}",
+                f"max_diff={row['max_abs_diff']:.3g} ref_max={row['ref_abs_max']:.3g}",
                 flush=True,
             )
+            if cfg.get("top_ops"):
+                ops = sorted(by_op.items(), key=lambda kv: -kv[1][0])
+                print(f"    -- top device ops in '{span}' (median window):", flush=True)
+                for op_name, (op_us, op_n) in ops[: cfg["top_ops"]]:
+                    print(
+                        f"       {op_us:9.1f}us  n={op_n:<4} "
+                        f"{100.0 * op_us / max(row['ms'] * 1000, 1e-9):5.1f}%  {op_name}",
+                        flush=True,
+                    )
+                if csv_path is not None:
+                    pd.DataFrame(
+                        [
+                            {
+                                "capture_name": name,
+                                "attn_kv_layout": attn_kv_layout,
+                                "max_seq_len": max_kv,
+                                "op": op_name,
+                                "device_us": op_us,
+                                "count": op_n,
+                            }
+                            for op_name, (op_us, op_n) in ops
+                        ]
+                    ).to_csv(
+                        Path(csv_path).with_name(f"ops_{attn_kv_layout}_{name}_{max_kv}.tsv"),
+                        sep="\t",
+                        index=False,
+                    )
         else:
             row["error"] = "no device time attributed to span"
             print("    -> no device time attributed", flush=True)
@@ -917,6 +1029,7 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         num_blocks,
         cfg["device"],
         kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
+        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
     )
     probe_run, _, _ = make_forward(
         probe_inputs,
@@ -924,6 +1037,7 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         cfg["num_kv_heads"],
         cfg["head_size"],
         kv_write=bool(cfg.get("kv_write", False)),
+        attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
     )
     probe_run()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
@@ -931,7 +1045,7 @@ def run_startup_guard(cfg, entries, block_size, span, args):
     assert_span_present(prof, span)
     if not args.allow_empty_device_profile:
         assert_device_profiler_active(prof)
-    total, _, _ = span_device_times(prof, span)
+    total, _, _, _ = span_device_times(prof, span)
     print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
     del probe_inputs, probe_run
     gc.collect()
@@ -956,6 +1070,14 @@ def main():
         "index_select layout/SDSC probe.",
     )
     ap.add_argument(
+        "--attn-kv-layout",
+        choices=["token_major", "head_major"],
+        default=None,
+        help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
+        "'head_major' stores a page as [KV, block_size, head_size] and selects the "
+        "head-major backend, which has no batched decode kernel.",
+    )
+    ap.add_argument(
         "--span",
         choices=sorted(SPANS),
         default=None,
@@ -968,6 +1090,13 @@ def main():
         action="store_true",
         help="also scatter K/V into the cache each iteration, as attn_layer does, "
         "so the reshape_and_cache and layer spans have something to measure",
+    )
+    ap.add_argument(
+        "--top-ops",
+        type=int,
+        default=0,
+        help="print the N device ops holding the most time in the measured span, and "
+        "write the full per-op breakdown of that window beside the CSV",
     )
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
@@ -982,6 +1111,7 @@ def main():
         ("device", args.device),
         ("span", args.span),
         ("kv_layout", args.kv_layout),
+        ("attn_kv_layout", args.attn_kv_layout),
         ("kv_write", args.kv_write or None),
     ):
         if val is not None:
@@ -1008,6 +1138,7 @@ def main():
     if args.variants:
         cfg["variants"] = args.variants
     cfg["stop_on_failure"] = args.stop_on_failure
+    cfg["top_ops"] = args.top_ops
     cfg.setdefault("device", "spyre")
 
     variants = [v for v in cfg["variants"] if VARIANT_REGISTRY[v]["available"]()]
@@ -1030,6 +1161,14 @@ def main():
             "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
+    # Selects the backend via the platform, and is cached on first envs read like the rest.
+    attn_kv_layout = cfg.setdefault("attn_kv_layout", "token_major")
+    os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
+    if attn_kv_layout == "head_major" and next(iter(batched_modes)):
+        raise SystemExit(
+            "the head-major KV layout has no batched decode kernel; run the batched "
+            "variant on token_major."
+        )
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries)
@@ -1052,6 +1191,7 @@ def main():
         f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
     )
     print(f"  span       : {sel_span}")
+    print(f"  kv layout  : {attn_kv_layout}")
     print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")

@@ -187,11 +187,15 @@ class SpyreAttnBucketer:
         # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
         # batch sizes the batched decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = _resolve_buckets(
-            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-            max_num_seqs,
-            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+        self._num_seqs_buckets: list[int] = (
+            _resolve_buckets(
+                envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+                max_num_seqs,
+                "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+            )
+            if max_num_seqs >= _MIN_BATCHED_SEQS
+            else []
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by

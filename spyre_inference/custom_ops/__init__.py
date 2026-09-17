@@ -21,14 +21,12 @@ from vllm.logger import init_logger
 from spyre_inference import moe  # noqa: F401
 
 from . import (
-    activation,  # noqa: F401
     conv,  # noqa: F401
     gate_linear,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
     parallel_lm_head,
-    rms_norm,
     rotary_embedding,
     utils,
     vocab_parallel_embedding,  # noqa: F401

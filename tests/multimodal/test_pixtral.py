@@ -198,6 +198,40 @@ def test_patch_merger_patch_is_applied_and_idempotent():
 
 
 @pytest.mark.pixtral
+def test_pre_transformer_norm_patch_is_applied_and_idempotent():
+    from spyre_inference.multimodal.pixtral import (
+        _DefaultLayoutNorm,
+        patch_pre_transformer_norm,
+    )
+
+    model = torch.nn.Module()
+    model.vision_encoder = torch.nn.Module()
+    model.vision_encoder.ln_pre = torch.nn.RMSNorm(HIDDEN_SIZE)
+
+    patch_pre_transformer_norm(model)
+    patched = model.vision_encoder.ln_pre
+    assert isinstance(patched, _DefaultLayoutNorm)
+
+    patch_pre_transformer_norm(model)
+    assert model.vision_encoder.ln_pre is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_pre_transformer_norm_patch_is_transparent_on_cpu():
+    from spyre_inference.multimodal.pixtral import patch_pre_transformer_norm
+
+    model = torch.nn.Module()
+    model.vision_encoder = torch.nn.Module()
+    model.vision_encoder.ln_pre = torch.nn.RMSNorm(HIDDEN_SIZE)
+    x = torch.randn(1, 49, HIDDEN_SIZE)
+    expected = model.vision_encoder.ln_pre(x)
+
+    patch_pre_transformer_norm(model)
+
+    torch.testing.assert_close(model.vision_encoder.ln_pre(x), expected)
+
+
+@pytest.mark.pixtral
 def test_block_attention_mask_patch_is_applied_and_idempotent():
     from transformers.models.pixtral import modeling_pixtral
 

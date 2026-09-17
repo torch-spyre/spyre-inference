@@ -98,7 +98,7 @@ worker: "n == TP size worker procs" {
     style.stroke: "#263238"
     style.font-color: "#ffffff"
   }
-  SpyreComm: "SpyreCommunicator\n(list-form all_gather;\nallreduce/gather native)" {
+  SpyreComm: "SpyreCommunicator\n(allreduce/allgather lower\nin-graph; eager fallback)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"

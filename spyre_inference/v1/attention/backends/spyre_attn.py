@@ -392,7 +392,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         model_config = vllm_config.model_config
         self.num_heads = model_config.get_num_attention_heads(vllm_config.parallel_config)
-        self.num_kv_heads = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        # From the spec, like block_size and head_size above: gemma-4 resolves KV heads
+        # per layer, so this group's count need not be the model-level one.
+        self.num_kv_heads = kv_cache_spec.num_kv_heads
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
         # `torch.float16` upstream so it's always a real torch.dtype here.
@@ -1338,6 +1340,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 "on first use. The per-variant warnings above carry the reason.",
                 len(variants),
             )
+        if recorded_decode == 0 and decode_variants:
+            # Same for the batched side, where the fallback is worse than a late compile:
+            # dispatch compiles the failing variant mid-serving and takes the engine down.
+            logger.warning_once(
+                "Recorded none of the %d batched-decode attention variants; the first "
+                "batch that dispatches one will compile it mid-serving. The per-variant "
+                "warnings above carry the reason.",
+                len(decode_variants),
+            )
         logger.info(
             "Recorded %d/%d per-seq and %d/%d batched-decode attention variants in %.2fs.",
             recorded,
@@ -1599,6 +1610,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.rep_row_ids_dev is not None
         assert attn_metadata.chunk_page_ids_dev is not None
         assert attn_metadata.mask_by_chunk_dev is not None
+        # The mask is the only kernel argument built from the builder's head count, so
+        # it is the only one that can disagree; checked eagerly so a mismatch is not a
+        # fake-tensor reshape failure from inside the traced kernel.
+        mask_kv_rows = attn_metadata.mask_by_chunk_dev.shape[1]
+        assert mask_kv_rows == b_seqs * blocks_per_chunk * self.num_kv_heads, (
+            f"decode mask has {mask_kv_rows} rows, but the kernel reshapes it to "
+            f"{b_seqs * blocks_per_chunk} x {self.num_kv_heads}: the builder broadcast "
+            f"it over a different num_kv_heads than this layer's."
+        )
 
         # The kernel's store writes out[:b_seqs] -- its num_seqs parameter receives
         # b_seqs, not the real count -- so the destination needs that many rows and a

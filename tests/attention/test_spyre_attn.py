@@ -975,7 +975,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     ), f"Unexpected KV cache shape: {shape}"
 
     # The runner must allocate exactly the shape it advertises.
-    runner = TorchSpyreModelRunner(vllm_config, torch.device("cpu"))
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
     spec = AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,

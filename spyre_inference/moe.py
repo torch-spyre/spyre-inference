@@ -145,15 +145,15 @@ def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def _route_reduce_dtype(experts: int, dtype: torch.dtype) -> torch.dtype:
-    # An fp32 reduction over the experts only lowers across whole fp32 sticks.
+    # An fp32 rescale needs whole sticks in the source dtype ("cannot rescale device layout").
     from torch_spyre._C import get_elem_in_stick
 
-    stick = get_elem_in_stick(torch.float32)
+    stick = get_elem_in_stick(dtype)
     if experts % stick == 0:
         return torch.float32
     logger.warning_once(
         "Spyre: reducing the routing softmax over %d experts in %s; an fp32 reduction "
-        "requires a multiple of %d experts.",
+        "requires the expert count to be a multiple of %d.",
         experts,
         dtype,
         stick,

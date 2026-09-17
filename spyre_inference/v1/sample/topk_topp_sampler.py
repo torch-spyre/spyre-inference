@@ -16,7 +16,6 @@ import torch
 from vllm.v1.sample.ops.topk_topp_sampler import (
     TopKTopPSampler,
     apply_top_k_top_p_pytorch,
-    empty_exponential_noise_like,
 )
 
 
@@ -29,7 +28,10 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
     draw in log space -- ``argmax(softmax(x)/q) == argmax(x - log q)`` for
     ``q ~ Exp(1)`` -- which skips the softmax on the hot path. That draw is why
     ``forward_native`` reimplements upstream's tail rather than delegating to
-    ``super()`` (which would softmax + ``random_sample``). Top-p still sorts."""
+    ``super()`` (which would softmax + ``random_sample``). Top-p still sorts.
+
+    The two draws are equal in exact arithmetic; in fp32 they can select a
+    different token only on rare near-ties."""
 
     def forward_native(
         self,
@@ -47,8 +49,11 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        # Noise generation mirrors upstream random_sample.
-        q = empty_exponential_noise_like(logits, self.use_fp64_gumbel)
+        # Exp(1) noise, generated like upstream random_sample but pinned to fp32
+        # (fp64 under use_fp64_gumbel) independent of the logits dtype, so the
+        # log never runs in fp16 (where small q underflows to 0 -> log = -inf).
+        noise_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
+        q = torch.empty(logits.shape, dtype=noise_dtype, device=logits.device)
         if len(generators) != logits.shape[0]:
             q.exponential_()
         for i, generator in generators.items():

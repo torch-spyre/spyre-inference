@@ -34,6 +34,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
@@ -310,6 +312,36 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
     )
 
 
+def _gathered_tokens(
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    region = _region(layer, "gathered", _gathered)
+    tokens = x.shape[0]
+    if tokens == 1:
+        return region(layer, x, router_logits)
+    # Under ``frontend_pool_allocation`` two calls of one graph can share an output address, so a
+    # region result is only valid until the next call: hence the copy and the per-row concatenate.
+    packed = _gathered_row(region, layer, x, router_logits, 0).clone()
+    for token in range(1, tokens):
+        packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token)])
+    return packed
+
+
+def _rows_start_on_sticks(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
+    # Copying row ``t`` bakes its storage offset ``t * width`` into the kernel coordinate, and the
+    # backend can only express an offset that is a whole number of sticks.
+    return x.shape[-1] % stick == 0 and router_logits.shape[-1] % stick == 0
+
+
+def _gathered_row(
+    region: Any, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, token: int
+) -> torch.Tensor:
+    # A compiled region reads its inputs from storage offset 0 whatever the view's offset
+    # (torch-spyre#3770), so the slices must be cloned or every row would read row 0.
+    row = slice(token, token + 1)
+    return region(layer, x[row].clone(), router_logits[row].clone())
+
+
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
     """Materialize canonical vLLM top-k weights in dense expert order."""
     topk_weights, topk_ids = _routing_weights(
@@ -455,9 +487,15 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
         moe_scope, persistent_scope = _compiler_scopes()
+        tokens = x.shape[0]
         with moe_scope:
-            if x.shape[0] == 1:
-                return _region(layer, "gathered", _gathered)(layer, x, router_logits)
+            # The gathered region lowers at exactly one token and the all-expert region has no
+            # single-row form, so a small batch drives gathered per token; the bound is tuning.
+            if tokens == 1 or (
+                tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+                and _rows_start_on_sticks(x, router_logits, layer.spyre_moe_stick)
+            ):
+                return _gathered_tokens(layer, x, router_logits)
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)

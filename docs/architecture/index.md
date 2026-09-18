@@ -125,8 +125,11 @@ Two adaptations worth knowing:
   for an out-of-tree platform (it selects `UnquantizedMoeBackend.OOT` — no kernel — and
   leaves `process_weights_after_loading` to the plugin). A `CustomOp.register_oot`
   replacement for `UnquantizedFusedMoEMethod` computes the experts in two Spyre forms —
-  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
-  in the post-load hook, rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
+  gathered, which reads only a token's routed experts but lowers one token at a time, and
+  all-expert persistent, which has no single-token form. A decode step drives the gathered
+  form once per packed token up to `SPYRE_MOE_GATHERED_MAX_TOKENS`; a prefill chunk, and any
+  batch above that bound, takes the all-expert form. In the post-load hook it also rebuilds
+  each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into the
   `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing
   further: upstream shards each expert's intermediate dim, so the forms just see a

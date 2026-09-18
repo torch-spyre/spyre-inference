@@ -258,6 +258,37 @@ def test_spyre_fancy_index_tensor(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Boolean-mask index_put_ (aten::_index_put_impl_) has no Spyre kernel at "
+        "all -- a hard NotImplementedError, not a CPU FallbackWarning. "
+        "spyre_inference.custom_ops.multimodal_embeddings works around this by "
+        "monkeypatching vllm's _merge_multimodal_embeddings to scatter on CPU and "
+        "torch.where the result back in. When this probe passes, revisit that "
+        "workaround."
+    ),
+)
+def test_spyre_bool_mask_index_put(spyre_device):
+    """Boolean-mask scatter ``t[mask] = values`` (aten::_index_put_impl_).
+
+    Mirrors vllm.model_executor.models.utils._merge_multimodal_embeddings'
+    ``inputs_embeds[is_multimodal] = mm_embeds_flat``.
+    """
+    num_tokens, hidden = 8, 64
+    t = torch.zeros(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+    mask = torch.tensor(
+        [True, False, False, True, True, False, False, True],
+        device=spyre_device,
+    )
+    values = torch.randn(4, hidden, dtype=torch.float16, device=spyre_device)
+    t[mask] = values
+
+    expected = torch.zeros(num_tokens, hidden, dtype=torch.float16)
+    expected[mask.cpu()] = values.cpu()
+    torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------

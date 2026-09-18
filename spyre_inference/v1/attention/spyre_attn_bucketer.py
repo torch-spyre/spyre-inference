@@ -173,6 +173,14 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
+        # A pooling request's query_len is its own context_len, so it can't
+        # exceed max_model_len even when max_num_batched_tokens is larger (unlike
+        # a decoder's chunked-prefill step). Without this cap, warmup could record
+        # a query bucket with no matching num_blocks bucket, crashing with
+        # "num_blocks=N exceeds the largest recorded bucket".
+        if vllm_config.model_config.runner_type == "pooling":
+            max_batched = min(max_batched, max_model_len)
+
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform

@@ -1346,7 +1346,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 decode_variants, layer, kv_cache, builder, num_pages
             )
         finally:
-            torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
+            torch._dynamo.config.accumulated_recompile_limit = prev_limit
 
         if recorded == 0 and variants:
             # Recording nothing is a broken pass, not a degenerate bucket set: the

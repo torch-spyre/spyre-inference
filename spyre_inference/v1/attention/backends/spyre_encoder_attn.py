@@ -33,7 +33,6 @@ per step.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -224,7 +223,7 @@ def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
         return kernel
     compiled = _compiled_kernels.get(kernel)
     if compiled is None:
-        compiled = cast(_CompiledFn, torch.compile(kernel, dynamic=False))
+        compiled = torch.compile(kernel, dynamic=False)
         _compiled_kernels[kernel] = compiled
     return compiled
 

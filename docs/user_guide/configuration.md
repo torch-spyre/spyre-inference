@@ -33,12 +33,18 @@ The body pads the packed token count to the next `compile_sizes` bucket, and war
 dummies every bucket. The output gather and lm_head sit outside every body graph and
 compile their own. Both use sampled-row buckets clipped to `--max-num-seqs`: the gather
 selects the required final hidden-state rows on Spyre before D2H, and the lm_head projects
-those rows after they return to Spyre. Warmup covers each reachable row width, and padding
-is removed before upstream processing.
+those rows, reusing the gathered device tensor rather than sending them back. The gather
+kernel specializes on the body width as well as the row width, so warmup covers every
+reachable `(bucket, row width)` pair; padding is removed before upstream processing.
 
 The reduced output transfer is used when sampled rows are the only output consumer.
 Prompt logprobs, auxiliary hidden-state outputs, speculative decoding, KV-sharing fast
-prefill, pooling, eager execution, and unbucketed shapes retain the full-output path.
+prefill, pooling, eager execution, and unbucketed shapes retain the full-output path. It
+is also skipped when the rows it would drop are too few to cover the gather: the gather
+is a near-fixed cost while the copy it removes scales with the body, so trimming only
+pays once enough hidden states would be left behind. All of these conditions are
+evaluated in one place before the step runs, because arming the trim rewrites the
+sampled-row indices and that rewrite cannot be undone later.
 
 ## Encoder / pooling compile buckets
 

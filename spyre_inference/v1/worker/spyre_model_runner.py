@@ -285,6 +285,27 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     return block_lists
 
 
+# Body bytes below which gathering the sampled rows on Spyre costs more than the
+# full-body D2H it replaces. The gather is a near-fixed cost while the D2H scales
+# with the body, so the crossover is a byte count, not a row count: it lands at
+# the same byte figure across hidden sizes 1024/2048/4096, which are three
+# different row counts. Trimming below this is a measured net loss.
+_OUTPUT_TRIM_MIN_BYTES = 256 * 1024
+
+
+def _worth_trimming(body_rows: int, padded_rows: int, hidden_size: int, itemsize: int = 2) -> bool:
+    """Whether an on-device row gather beats copying the whole body output.
+
+    Requires the gather to actually narrow the copy, and the copy it removes to be
+    large enough to pay for the gather kernel. Takes ``hidden_size`` rather than a
+    tensor so the runner can evaluate it before the body has run -- the trim
+    decision must be final before ``logits_indices`` is rewritten.
+    """
+    if padded_rows >= body_rows:
+        return False
+    return (body_rows - padded_rows) * hidden_size * itemsize >= _OUTPUT_TRIM_MIN_BYTES
+
+
 class _SpyreModelWrapper:
     """Transparent wrapper that converts model inputs/outputs at the boundary.
 
@@ -359,34 +380,56 @@ class _SpyreModelWrapper:
     def _outputs_to_cpu(self, result):
         sample_rows = self._sample_rows
         object.__setattr__(self, "_sample_rows", None)
-        if (
-            sample_rows is not None
-            and isinstance(result, torch.Tensor)
-            and result.dim() == 2
-            and result.device.type == self._spyre_device.type
-        ):
-            trimmed = self._d2h_sampled_rows(result, sample_rows)
-            if trimmed is not None:
-                return trimmed
+        if sample_rows is not None:
+            # The runner committed to the trim and rewrote logits_indices, so the
+            # output must be the 2-D Spyre tensor the gather expects. Falling back
+            # silently here would make upstream index the full body with identity
+            # indices and sample the wrong rows; fail loudly instead.
+            if not (
+                isinstance(result, torch.Tensor)
+                and result.dim() == 2
+                and result.device.type == self._spyre_device.type
+            ):
+                raise RuntimeError(
+                    "output row trim was armed, but the model output is not a 2-D "
+                    f"{self._spyre_device.type} tensor "
+                    f"(got {type(result).__name__}"
+                    + (
+                        f" dim={result.dim()} device={result.device.type}"
+                        if isinstance(result, torch.Tensor)
+                        else ""
+                    )
+                    + "). logits_indices has already been rewritten, so the sampled "
+                    "rows cannot be recovered here."
+                )
+            return self._d2h_sampled_rows(result, sample_rows)
         return tree_map(lambda x: convert(x, device="cpu"), result)
 
+    def _padded_row_width(self, num_rows: int) -> int:
+        """Smallest warmed row bucket >= ``num_rows`` (``num_rows`` if none fits)."""
+        buckets = self._logits_row_buckets
+        idx = bisect.bisect_left(buckets, num_rows)
+        return buckets[idx] if idx < len(buckets) else num_rows
+
     def _d2h_sampled_rows(self, hidden_states: torch.Tensor, rows: torch.Tensor):
-        """D2H only ``rows``, gathered on Spyre at a warmed width; None if not narrower."""
-        num_tokens = hidden_states.shape[0]
+        """D2H only ``rows``, gathered on Spyre at a warmed width.
+
+        Unconditional: the runner already decided the trim is worthwhile and
+        rewrote ``logits_indices`` accordingly, so declining here would leave
+        upstream indexing the full body with identity indices and sampling the
+        wrong rows. Any new reason to skip the trim belongs in
+        ``_build_attention_metadata``, before the rewrite.
+        """
         rows = rows.to(device="cpu", dtype=torch.int64)
         num_rows = rows.numel()
-        idx = bisect.bisect_left(self._logits_row_buckets, num_rows)
-        padded_rows = (
-            self._logits_row_buckets[idx] if idx < len(self._logits_row_buckets) else num_rows
-        )
-        if padded_rows >= num_tokens:
-            return None
+        padded_rows = self._padded_row_width(num_rows)
 
         gather_rows = rows
         if padded_rows != num_rows:
             gather_rows = F.pad(rows, (0, padded_rows - num_rows), value=int(rows[-1]))
 
-        return convert(select_rows(hidden_states, gather_rows), device="cpu")[:num_rows]
+        gathered = select_rows(hidden_states, gather_rows)
+        return convert(gathered, device="cpu")[:num_rows]
 
     def embed_multimodal(self, **kwargs):
         """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
@@ -468,7 +511,7 @@ class _SpyreModelWrapper:
         return convert(merged, device=self._spyre_device)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
-        """Move hidden_states onto Spyre for the lm_head custom op.
+        """Project the sampled rows through the lm_head on Spyre.
 
         Logits come back on CPU: SpyreLogitsProcessor converts right after the TP gather.
 
@@ -476,13 +519,12 @@ class _SpyreModelWrapper:
         row buckets keeps the projection on shapes warmup compiled.
         """
         num_rows = hidden_states.shape[0]
-        buckets = self._logits_row_buckets
-        idx = bisect.bisect_left(buckets, num_rows)
-        padded_rows = buckets[idx] if idx < len(buckets) else num_rows
+        padded_rows = self._padded_row_width(num_rows)
+
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
-
         hidden_states = convert(hidden_states, device=self._spyre_device)
+
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -840,7 +882,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
-                self._warmup_output_row_gather(widest_hidden_states, row_widths)
+                self._warmup_output_row_gather(bucket_sizes, row_widths)
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -849,14 +891,54 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
 
-    def _warmup_output_row_gather(self, hidden_states: torch.Tensor, row_widths: list[int]) -> None:
+    def _warmup_output_row_gather(
+        self,
+        bucket_sizes: list[int],
+        row_widths: list[int],
+    ) -> None:
+        """Compile the output row gather on every reachable (body, rows) shape.
+
+        ``select_rows`` lands on eager ``index_select``, whose torch-spyre kernel
+        specializes on both operand shapes, so a warmed ``(widest_body, rows)`` does
+        not cover a narrower body: an unwarmed pair costs ~0.5-1.5s of compile
+        mid-request. Walk the same pairs ``_d2h_sampled_rows`` can select at runtime,
+        which is why the ``_worth_trimming`` filter is applied here too -- warming a
+        pair the runtime will never choose only burns warmup time. Its inputs must
+        match the ones ``_build_attention_metadata`` passes, ``itemsize`` included:
+        a filter here that is stricter than the runtime's leaves a pair the runtime
+        will arm unwarmed, which is the compile this method exists to remove.
+
+        Uses the same model-config hidden size and dtype as the runtime guard, then
+        allocates each body on ``self._spyre_device``. The ``_dummy_run`` output
+        cannot provide those inputs: it is upstream's ``hidden_states[logit_indices]``,
+        already reduced to the sampled rows (at most ``max_num_reqs``) and left on
+        CPU for generative warmup.
+        """
         wrapper = getattr(self, "model", None)
         if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
             return
-        size = hidden_states.shape[0]
-        for num_rows in sorted((rows for rows in row_widths if rows < size), reverse=True):
-            rows = torch.arange(num_rows, dtype=torch.int64)
-            wrapper._d2h_sampled_rows(hidden_states, rows)
+        hidden_size = self.model_config.get_hidden_size()
+        dtype = self.model_config.dtype
+        pairs = {
+            (body, wrapper._padded_row_width(rows)) for body in bucket_sizes for rows in row_widths
+        }
+        reachable = sorted(
+            (
+                (body, padded)
+                for body, padded in pairs
+                if _worth_trimming(body, padded, hidden_size, dtype.itemsize)
+            ),
+            reverse=True,
+        )
+        if not reachable:
+            return
+        # Both operands specialize, so this is a cross product: roughly 0.65s of
+        # compile each. Log it so the startup cost is attributable.
+        logger.info("Warming output row gather on %d (bucket, rows) pairs...", len(reachable))
+        for body, padded in reachable:
+            dummy = torch.zeros(body, hidden_size, dtype=dtype, device=self._spyre_device)
+            rows = torch.arange(padded, dtype=torch.int64)
+            wrapper._d2h_sampled_rows(dummy, rows)
 
     @torch.inference_mode()
     def _record_encoder_pack_graphs(self) -> None:
@@ -1003,23 +1085,42 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def _build_attention_metadata(self, *args, **kwargs):
-        """Last hook before the model call that is handed ``logits_indices``."""
+        """Last hook before the model call that is handed ``logits_indices``.
+
+        The rewrite below is destructive, so the trim decision has to be final
+        here: if the wrapper later declined, the real offsets would already be
+        gone and upstream's ``hidden_states[logits_indices]`` would silently
+        select the first ``num_rows`` rows instead of the sampled ones. The
+        wrapper therefore only executes the decision this method records.
+        """
         wrapper = self.model
         rows = kwargs.get("logits_indices")
         metadata = super()._build_attention_metadata(*args, **kwargs)
         bucketer = self.spyre_shape_bucketer
+        # ``num_tokens`` is upstream's first parameter and may be passed positionally.
+        num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if (
-            isinstance(wrapper, _SpyreModelWrapper)
-            and bucketer is not None
-            and bucketer.find_bucket(kwargs["num_tokens"]) is not None
-            and self._can_trim_output_d2h()
-            and rows is not None
-            and rows.numel() > 0
+            not isinstance(wrapper, _SpyreModelWrapper)
+            or bucketer is None
+            or num_tokens is None
+            or not self._can_trim_output_d2h()
+            or rows is None
+            or rows.numel() == 0
         ):
-            # Preserve body offsets for the device gather, then make upstream's later
-            # hidden_states[logits_indices] an identity over the compact CPU result.
-            object.__setattr__(wrapper, "_sample_rows", rows.clone())
-            rows.copy_(torch.arange(rows.numel(), dtype=rows.dtype, device=rows.device))
+            return metadata
+        body_rows = bucketer.find_bucket(num_tokens)
+        if body_rows is None or not _worth_trimming(
+            body_rows,
+            wrapper._padded_row_width(rows.numel()),
+            self.model_config.get_hidden_size(),
+            self.model_config.dtype.itemsize,
+        ):
+            return metadata
+
+        # Preserve body offsets for the device gather, then make upstream's later
+        # hidden_states[logits_indices] an identity over the compact CPU result.
+        object.__setattr__(wrapper, "_sample_rows", rows.clone())
+        rows.copy_(torch.arange(rows.numel(), dtype=rows.dtype, device=rows.device))
         return metadata
 
     def _determine_batch_execution_and_padding(

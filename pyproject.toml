@@ -83,6 +83,8 @@ override-dependencies = [
     # stale 0.2.0 wheel back in on Power/Z.
     "torchvision; platform_machine not in 's390x, ppc64le'",
 
+    "torchcodec; platform_machine == 'never'",
+
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
 

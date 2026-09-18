@@ -661,8 +661,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
         Granite ``compressed-tensors`` stores it on the scheme
         (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
-        Checkpoint FP8 weights are the fallback: ``process_weights_after_loading``
-        keeps ``float8_e4m3fn``.
+        Checkpoint FP8 is dequanted to CPU fp16 in
+        ``process_weights_after_loading``; first Spyre forward caches ``qfp8wt``.
         """
         from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
 

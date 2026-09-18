@@ -328,6 +328,30 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     logger.info("Reset attention scale to 1/sqrt(%d) on %d head_dim-derived layers.", orig, n)
 
 
+def fix_padded_qk_norm_eps(model, hf_config) -> None:
+    """Scale QK-norm epsilon to compensate for the wider padded reduction."""
+    if not head_padding_active(hf_config):
+        return
+    orig = getattr(hf_config, _ORIG_ATTR)
+    padded = hf_config.head_dim
+    n = 0
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if (
+            not name.endswith(("q_norm", "k_norm"))
+            or not hasattr(module, "variance_epsilon")
+            or weight is None
+            or weight.numel() != padded
+        ):
+            continue
+        if getattr(module, "_spyre_padded_qk_norm_eps", False):
+            continue
+        module.variance_epsilon *= orig / padded
+        module._spyre_padded_qk_norm_eps = True
+        n += 1
+    logger.info("Scaled QK-norm epsilon by %d/%d on %d layers.", orig, padded, n)
+
+
 def fix_padded_rope(model, hf_config) -> None:
     """Inject the original-frequency cos/sin cache into each padded RoPE.
 

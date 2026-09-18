@@ -289,6 +289,7 @@ markers = [
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
 ]
 # --8<-- [end:test-markers-definition]
 

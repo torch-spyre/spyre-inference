@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from spyre_inference.custom_ops.head_pad import (
     _pad_weight,
     fix_padded_attention_scale,
+    fix_padded_qk_norm_eps,
     install_padded_head_dim,
     verify_padded_head_dim,
 )
@@ -219,7 +220,7 @@ def test_pad_weight_qk_norm_reproduces_the_original_rmsnorm():
     # q and its norm weight are padded exactly as the loader pads q_proj / q_norm.
     q_padded = _pad_weight("q_proj.weight", q.view(_ORIG, 1), 1, 1, _ORIG, _PADDED).view(_PADDED)
     w_padded = _pad_weight("q_norm.weight", w, 1, 1, _ORIG, _PADDED)
-    out = F.rms_norm(q_padded, (_PADDED,), w_padded, eps=1e-6)
+    out = F.rms_norm(q_padded, (_PADDED,), w_padded, eps=1e-6 * _ORIG / _PADDED)
 
     half, padded_half = _ORIG // 2, _PADDED // 2
     assert torch.allclose(out[:half], ref[:half], atol=1e-5)
@@ -227,6 +228,23 @@ def test_pad_weight_qk_norm_reproduces_the_original_rmsnorm():
     # Padded dims stay zero, so they never reach the QK dot product or RoPE.
     assert not out[half:padded_half].any()
     assert not out[padded_half + half :].any()
+
+
+def test_fix_padded_qk_norm_eps_scales_only_qk_norms():
+    q_norm = torch.nn.Module()
+    q_norm.variance_epsilon = 1e-6
+    q_norm.weight = torch.nn.Parameter(torch.ones(_PADDED))
+    other_q_norm = torch.nn.Module()
+    other_q_norm.variance_epsilon = 1e-6
+    other_q_norm.weight = torch.nn.Parameter(torch.ones(_ORIG * 7))
+    model = torch.nn.Module()
+    model.q_norm = q_norm
+    model.other_q_norm = other_q_norm
+
+    fix_padded_qk_norm_eps(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
+
+    assert q_norm.variance_epsilon == pytest.approx(1e-6 * _ORIG / _PADDED)
+    assert other_q_norm.variance_epsilon == pytest.approx(1e-6)
 
 
 def test_pad_weight_leaves_a_norm_of_another_width_alone():

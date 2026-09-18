@@ -41,8 +41,10 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 
+from spyre_inference.custom_ops.linear import _STICK
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
+    SpyreClassifierLinear,
     SpyreCLSPool,
     SpyreCpuClassifier,
     SpyreDispatchPooler,
@@ -129,8 +131,12 @@ def test_configure_pooling_fp32_classifier_downcasts_to_fp16():
     model.classifier = classifier
     assert configure_pooling_for_spyre(model, _SPYRE) is True
     assert isinstance(model.pooler.pooling, SpyreCLSPool)
-    assert classifier.weight.dtype == torch.float16
-    assert classifier.bias.dtype == torch.float16
+    assert isinstance(model.classifier, SpyreClassifierLinear)
+    assert model.classifier is model.pooler.head.classifier
+    assert model.classifier.weight.dtype == torch.float16
+    assert model.classifier.bias is not None
+    assert tuple(model.classifier.bias.shape) == (1, _STICK)
+    assert model.classifier.weight.shape[0] == 8
     assert model.pooler.head.head_dtype == torch.float16
 
 
@@ -149,9 +155,73 @@ def test_configure_pooling_roberta_head_dense_and_out_proj_downcast():
     model = _model_with_pooler(pooler)
     model.classifier = head
     assert configure_pooling_for_spyre(model, _SPYRE) is True
+    assert isinstance(head.dense, SpyreClassifierLinear)
+    assert isinstance(head.out_proj, SpyreClassifierLinear)
+    assert head.dense is model.pooler.head.classifier.dense
     assert head.dense.weight.dtype == torch.float16
     assert head.out_proj.weight.dtype == torch.float16
+    assert head.dense.bias is not None
+    assert tuple(head.dense.bias.shape) == (1, _STICK)
     assert model.pooler.head.head_dtype == torch.float16
+
+
+def test_spyre_classifier_linear_matches_nn_linear_on_cpu():
+    """Short-row CLS (B=1) and unaligned out_proj (N=1) must match F.linear."""
+    torch.manual_seed(0)
+    dense = nn.Linear(8, 8)
+    x = torch.randn(1, 8)
+    dense_ref = dense(x).detach()
+    x_batch = torch.randn(3, 8)
+    dense_batch_ref = dense(x_batch).detach()
+    wrapped_dense = SpyreClassifierLinear.convert(dense)
+    assert wrapped_dense is dense
+    assert wrapped_dense.weight.shape[0] == 8
+    assert tuple(wrapped_dense.bias.shape) == (1, _STICK)
+    torch.testing.assert_close(wrapped_dense(x), dense_ref, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(wrapped_dense(x_batch), dense_batch_ref, atol=1e-5, rtol=1e-5)
+
+    out_proj = nn.Linear(8, 1)
+    out_ref = out_proj(x).detach()
+    wrapped_out = SpyreClassifierLinear.convert(out_proj)
+    torch.testing.assert_close(wrapped_out(x), out_ref, atol=1e-5, rtol=1e-5)
+
+    # bert-base-NER dummy_run: packed tokens [16, 768] -> [16, 9], not CLS [1, H].
+    ner = nn.Linear(768, 9)
+    x_ner = torch.randn(16, 768)
+    ner_ref = ner(x_ner).detach()
+    wrapped_ner = SpyreClassifierLinear.convert(ner)
+    assert wrapped_ner.weight.shape == (768, _STICK)
+    torch.testing.assert_close(wrapped_ner(x_ner), ner_ref, atol=1e-5, rtol=1e-5)
+
+
+def test_spyre_classifier_linear_cls_warmup_shape_compiles_on_spyre():
+    """B=1, H=1024 + bias is the bge-reranker dense that mixed-EA'd isolated F.linear."""
+    if not spyre_available():
+        pytest.skip("needs Spyre: mixed-EA bias add is a device compile failure")
+
+    torch.manual_seed(0)
+    src = nn.Linear(1024, 1024, dtype=torch.float16)
+    x_cpu = torch.randn(1, 1024, dtype=torch.float16)
+    ref = src(x_cpu).detach()
+    wrapped = SpyreClassifierLinear.convert(src).to("spyre")
+    x = x_cpu.to("spyre")
+    out = wrapped(x)
+    assert out.shape == (1, 1024)
+    torch.testing.assert_close(out.cpu().float(), ref.float(), atol=2e-2, rtol=2e-2)
+
+    out_proj_src = nn.Linear(1024, 1, dtype=torch.float16)
+    out_proj = SpyreClassifierLinear.convert(out_proj_src).to("spyre")
+    logits = out_proj(out)
+    assert logits.shape == (1, 1)
+
+    # Token-classify packed tokens: K stays 768 (no bias-fold extra stick).
+    ner_src = nn.Linear(768, 9, dtype=torch.float16)
+    x_ner_cpu = torch.randn(16, 768, dtype=torch.float16)
+    ner_ref = ner_src(x_ner_cpu).detach()
+    ner = SpyreClassifierLinear.convert(ner_src).to("spyre")
+    ner_out = ner(x_ner_cpu.to("spyre"))
+    assert ner_out.shape == (16, 9)
+    torch.testing.assert_close(ner_out.cpu().float(), ner_ref.float(), atol=2e-2, rtol=2e-2)
 
 
 def test_configure_pooling_fp32_embed_projector_falls_back_to_cpu():

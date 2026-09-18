@@ -60,7 +60,9 @@ RERANKER_MODELS = [
 ]
 
 # Token classification applies its own classifier after a head_dtype cast.
-# prepare_fp32_head_for_spyre downcasts that head to fp16 (#868).
+# prepare_fp32_head_for_spyre downcasts that head to fp16 and wraps nn.Linear
+# as SpyreClassifierLinear (fp16 GEMM, 2-D bias) so isolated F.linear does not
+# hit mixed-EA bias add (#868).
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",

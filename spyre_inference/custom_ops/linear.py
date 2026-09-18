@@ -42,6 +42,8 @@ logger = init_logger(__name__)
 # full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
+# fp16 stick is 64 elements. Classifier out_proj is often Linear(H, 1).
+_STICK = 64
 
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
@@ -53,6 +55,34 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
+    return out
+
+
+def spyre_classifier_linear(
+    x: torch.Tensor,
+    weight_t: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    out_features: int | None = None,
+) -> torch.Tensor:
+    """Pooling-head GEMM: pre-transposed ``x @ Wᵀ``, bias as ``[1, N]``.
+
+    Isolated ``F.linear`` of CLS ``[B, H] @ W.T + [H]`` dies in torch-spyre's mixed-EA
+    gate: the matmul output is staggered and a STANDARD 1-D ``[H]`` bias has stick
+    size 1. A 2-D ``[1, N]`` bias keeps the stick on the feature dim (conv2d's trick).
+
+    Do not fold bias into K: ``1024+64=1088`` is not a native Spyre GEMM K, so
+    inductor lowers ``matmul`` as an fp32 reduction (bge-reranker-large dense).
+    Short batches pad to ``_PAD_ROWS`` (torch-spyre#4032).
+    """
+    rows = x.shape[0] if x.dim() == 2 else 0
+    if 0 < rows < _PAD_ROWS:
+        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    out = spyre_linear_t(x, weight_t, bias)
+    if 0 < rows < _PAD_ROWS:
+        out = out[:rows]
+    if out_features is not None and out.shape[-1] != out_features:
+        out = out[..., :out_features]
     return out
 
 

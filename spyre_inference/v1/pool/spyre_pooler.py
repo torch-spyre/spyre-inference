@@ -33,6 +33,7 @@ from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
+from spyre_inference.custom_ops.linear import _STICK, spyre_classifier_linear
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
@@ -353,6 +354,121 @@ def prepare_fp32_head_for_spyre(
         model.head_dtype = torch.float16
 
 
+class SpyreClassifierLinear(nn.Linear):
+    """In-place ``nn.Linear`` for pooling classifiers: ``x @ Wᵀ`` plus ``[1, N]`` bias.
+
+    Vanilla ``F.linear`` on a CLS vector compiles as its own graph and dies on
+    mixed-EA bias add (STANDARD 1-D ``[H]`` vs staggered matmul). ``enforce_eager``
+    does not help: torch-spyre still ``compile_once``s ``aten.linear``. Convert
+    the existing ``nn.Linear`` in place so every alias (``model.classifier.dense``,
+    ``pooler.head.classifier.dense``) stops calling ``F.linear``.
+
+    Bias stays a separate ``[1, N]`` add (stick on N). Folding it into K made
+    ``1024+64=1088``, which inductor lowered as an fp32 reduction instead of the
+    native fp16 GEMM.
+    """
+
+    spyre_out_features: int
+    spyre_compiled_kernel: object
+    spyre_compile_enabled: bool
+
+    @classmethod
+    def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
+        if type(linear) is cls:
+            return linear
+        orig_device = linear.weight.device
+        w = linear.weight.data
+        bias = linear.bias.data if linear.bias is not None else None
+        if orig_device.type == "spyre":
+            w = convert(w, "cpu")
+            if bias is not None:
+                bias = convert(bias, "cpu")
+        out_features = linear.out_features
+        pad_out = (-w.shape[0]) % _STICK
+        if pad_out:
+            w = nn.functional.pad(w, (0, 0, 0, pad_out))
+            if bias is not None:
+                bias = nn.functional.pad(bias, (0, pad_out))
+        weight_t = w.t().contiguous()
+        if bias is not None:
+            bias = bias.view(1, -1).contiguous()
+        if orig_device.type == "spyre":
+            weight_t = convert(weight_t, orig_device)
+            if bias is not None:
+                bias = convert(bias, orig_device)
+        else:
+            weight_t = weight_t.to(device=orig_device)
+            if bias is not None:
+                bias = bias.to(device=orig_device)
+
+        linear.__class__ = cls
+        linear.weight = nn.Parameter(weight_t, requires_grad=False)
+        linear.bias = None if bias is None else nn.Parameter(bias, requires_grad=False)
+        linear.spyre_out_features = out_features
+        linear.spyre_compiled_kernel = None
+        # Always compile on Spyre: enforce_eager only skips block graphs.
+        linear.spyre_compile_enabled = True
+        return linear
+
+    def _linear(self, x: torch.Tensor) -> torch.Tensor:
+        return spyre_classifier_linear(
+            x,
+            self.weight,
+            self.bias,
+            out_features=self.spyre_out_features,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type != "spyre" or torch.compiler.is_compiling():
+            return self._linear(x)
+        if self.spyre_compiled_kernel is None:
+            from vllm.platforms import current_platform
+
+            logger.info_once(
+                "Compiling SpyreClassifierLinear as its own graph: isolated "
+                "F.linear hits mixed-EA bias add on Spyre."
+            )
+            self.spyre_compiled_kernel = torch.compile(
+                self._linear,
+                backend=current_platform.simple_compile_backend,
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self.spyre_compiled_kernel(x)
+
+
+def _classifier_roots(model: nn.Module, pooler: nn.Module) -> list[nn.Module]:
+    """Classifier modules even when not registered in ``_modules``."""
+    roots: list[nn.Module] = []
+    seen: set[int] = set()
+
+    def add(module: object) -> None:
+        if not isinstance(module, nn.Module):
+            return
+        key = id(module)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(module)
+
+    add(getattr(model, "classifier", None))
+    for parent in (*model.modules(), *pooler.modules()):
+        add(getattr(parent, "classifier", None))
+    return roots
+
+
+def patch_classifier_linears_for_spyre(model: nn.Module, pooler: nn.Module) -> int:
+    """Convert every ``nn.Linear`` under a classifier, in place."""
+    n = 0
+    for root in _classifier_roots(model, pooler):
+        candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
+        for child in candidates:
+            if type(child) is nn.Linear:
+                SpyreClassifierLinear.convert(child)
+                n += 1
+    return n
+
+
 class SpyreCpuClassifier(nn.Module):
     """D2H wrapper for a classifier the model applies in its own forward.
 
@@ -525,8 +641,16 @@ def configure_pooling_for_spyre(
             "not passed); gathers round to every 64-multiple instead of the "
             "power-of-two buckets, so more shapes compile than necessary"
         )
+    n_classifier_gemms = 0
     if token_level or _has_classifier(model, pooler):
         prepare_fp32_head_for_spyre(model, pooler, spyre_device)
+        n_classifier_gemms = patch_classifier_linears_for_spyre(model, pooler)
+        if n_classifier_gemms:
+            logger.info(
+                "Pooling: converted %d classifier Linear(s) in place "
+                "(fp16 GEMM, 2-D bias, no F.linear)",
+                n_classifier_gemms,
+            )
 
     # Leftover fp32 (embed projector, no classifier) still has no Spyre matmul.
     fp32_head = _module_has_float32_params(pooler) or (
@@ -546,11 +670,13 @@ def configure_pooling_for_spyre(
     if classifier is not None:
         staying.append("classifier")
     logger.info(
-        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads)",
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, "
+        "%d classifier GEMMs)",
         ", ".join(staying),
         spyre_device,
         num_patched,
         num_norm,
         num_heads,
+        n_classifier_gemms,
     )
     return True

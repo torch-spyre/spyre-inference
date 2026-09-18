@@ -349,6 +349,10 @@ def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
     if region is None:
         region = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
         layer.spyre_moe_regions[name] = region
+        # Deferred import: spyre_inference.v1.worker imports this module's package.
+        from spyre_inference.v1.worker import compile_guard
+
+        compile_guard.watch(fn, f"MoE region {name!r}")
     return region
 
 

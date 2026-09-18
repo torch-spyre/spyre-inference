@@ -57,6 +57,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     batched_decode_chunking,
 )
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
@@ -176,6 +177,10 @@ def _build_query_row_tables(
 # hold the per-sequence Python loop around these.
 _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
+
+compile_guard.watch(page_attn_kernel, "page attention kernel")
+compile_guard.watch(batched_decode_kernel, "batched decode kernel")
+compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 _warmup_complete = False
 

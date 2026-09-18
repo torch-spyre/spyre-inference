@@ -33,6 +33,7 @@ from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
+from spyre_inference.custom_ops.linear import _STICK, spyre_classifier_linear
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
@@ -320,30 +321,163 @@ class SpyreTokenPooler(TokenPooler):
         return trimmed
 
 
-def prepare_token_head_for_spyre(
+def _has_classifier(model: nn.Module, pooler: nn.Module) -> bool:
+    if getattr(model, "classifier", None) is not None:
+        return True
+    return any(getattr(m, "classifier", None) is not None for m in pooler.modules())
+
+
+def _downcast_module_to_fp16(module: nn.Module, spyre_device: torch.device) -> None:
+    """On-device fp32→fp16 is staggered garbage (torch-spyre#2971); go via host."""
+    for child in module.modules():
+        if getattr(child, "head_dtype", None) is not None:
+            child.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
+    for param in module.parameters(recurse=True):
+        if param.dtype != torch.float32:
+            continue
+        # convert() detours via host; CPU unit tests have no spyre_convert.
+        if param.device.type == "spyre" or spyre_device.type == "spyre":
+            param.data = convert(param.data, spyre_device, torch.float16)
+        else:
+            param.data = param.data.to(device=spyre_device, dtype=torch.float16)
+
+
+def prepare_fp32_head_for_spyre(
     model: nn.Module, pooler: nn.Module, spyre_device: torch.device
 ) -> None:
-    """Keep the token-level tail in fp16 so it can run on Spyre.
-
-    Heads cast per chunk to a float32 ``head_dtype`` and the model casts before
-    its own classifier; both are wrong on device, and Spyre has no fp32 matmul.
-    """
-    # Scope to the token sub-poolers: a DispatchPooler can also hold a sequence
-    # pooler whose fp32 head is handled by SpyreEmbeddingPoolerHead instead.
-    targets = [m for m in pooler.modules() if isinstance(m, TokenPooler)]
+    """Downcast classifier weights to fp16; Spyre has no fp32 matmul (torch-spyre#1794)."""
+    _downcast_module_to_fp16(pooler, spyre_device)
     classifier = getattr(model, "classifier", None)
     if classifier is not None:
-        targets.append(classifier)
+        _downcast_module_to_fp16(classifier, spyre_device)
     if getattr(model, "head_dtype", None) is not None:
         model.head_dtype = torch.float16
-    for target in targets:
-        for module in target.modules():
-            if getattr(module, "head_dtype", None) is not None:
-                module.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
-        # A dtype cast on device returns wrong data; convert() detours via host.
-        for param in target.parameters(recurse=True):
-            if param.dtype == torch.float32:
-                param.data = convert(param.data, spyre_device, torch.float16)
+
+
+class SpyreClassifierLinear(nn.Linear):
+    """In-place ``nn.Linear`` for pooling classifiers: folded-bias ``x @ Wᵀ``.
+
+    Vanilla ``F.linear`` on a CLS vector compiles as its own graph and dies on
+    mixed-EA bias add (STANDARD ``[H]`` vs staggered matmul). ``enforce_eager``
+    does not help: torch-spyre still ``compile_once``s ``aten.linear``. Convert
+    the existing ``nn.Linear`` in place so every alias (``model.classifier.dense``,
+    ``pooler.head.classifier.dense``) stops calling ``F.linear``.
+
+    Extra K is one fp16 stick (64): a width-1 ones column concat is a stick
+    scatter, which is how bert-base-NER warmup died.
+    """
+
+    spyre_out_features: int
+    spyre_bias_folded: bool
+    spyre_bias_stick: nn.Parameter | None
+    spyre_compiled_kernel: object
+    spyre_compile_enabled: bool
+
+    @classmethod
+    def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
+        if type(linear) is cls:
+            return linear
+        orig_device = linear.weight.device
+        w = linear.weight.data
+        bias = linear.bias.data if linear.bias is not None else None
+        if orig_device.type == "spyre":
+            w = convert(w, "cpu")
+            if bias is not None:
+                bias = convert(bias, "cpu")
+        out_features = linear.out_features
+        pad_out = (-w.shape[0]) % _STICK
+        if pad_out:
+            w = nn.functional.pad(w, (0, 0, 0, pad_out))
+        weight_t = w.t().contiguous()
+        bias_folded = bias is not None
+        bias_stick = None
+        if bias_folded:
+            if pad_out:
+                bias = nn.functional.pad(bias, (0, pad_out))
+            extra_w = weight_t.new_zeros(_STICK, weight_t.shape[1])
+            extra_w[0] = bias
+            weight_t = torch.cat([weight_t, extra_w], dim=0)
+            bias_stick = weight_t.new_zeros(1, _STICK)
+            bias_stick[0, 0] = 1
+        if orig_device.type == "spyre":
+            weight_t = convert(weight_t, orig_device)
+            if bias_stick is not None:
+                bias_stick = convert(bias_stick, orig_device)
+        else:
+            weight_t = weight_t.to(device=orig_device)
+            if bias_stick is not None:
+                bias_stick = bias_stick.to(device=orig_device)
+
+        linear.__class__ = cls
+        linear.weight = nn.Parameter(weight_t, requires_grad=False)
+        linear.bias = None
+        linear.spyre_out_features = out_features
+        linear.spyre_bias_folded = bias_folded
+        linear.spyre_bias_stick = (
+            nn.Parameter(bias_stick, requires_grad=False) if bias_stick is not None else None
+        )
+        linear.spyre_compiled_kernel = None
+        # Always compile on Spyre: enforce_eager only skips block graphs.
+        linear.spyre_compile_enabled = True
+        return linear
+
+    def _linear(self, x: torch.Tensor) -> torch.Tensor:
+        return spyre_classifier_linear(
+            x,
+            self.weight,
+            out_features=self.spyre_out_features,
+            bias_stick=self.spyre_bias_stick,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type != "spyre" or torch.compiler.is_compiling():
+            return self._linear(x)
+        if self.spyre_compiled_kernel is None:
+            from vllm.platforms import current_platform
+
+            logger.info_once(
+                "Compiling SpyreClassifierLinear as its own graph: isolated "
+                "F.linear hits mixed-EA bias add on Spyre."
+            )
+            self.spyre_compiled_kernel = torch.compile(
+                self._linear,
+                backend=current_platform.simple_compile_backend,
+                fullgraph=True,
+                dynamic=False,
+            )
+        return self.spyre_compiled_kernel(x)
+
+
+def _classifier_roots(model: nn.Module, pooler: nn.Module) -> list[nn.Module]:
+    """Classifier modules even when not registered in ``_modules``."""
+    roots: list[nn.Module] = []
+    seen: set[int] = set()
+
+    def add(module: object) -> None:
+        if not isinstance(module, nn.Module):
+            return
+        key = id(module)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(module)
+
+    add(getattr(model, "classifier", None))
+    for parent in (*model.modules(), *pooler.modules()):
+        add(getattr(parent, "classifier", None))
+    return roots
+
+
+def patch_classifier_linears_for_spyre(model: nn.Module, pooler: nn.Module) -> int:
+    """Convert every ``nn.Linear`` under a classifier, in place."""
+    n = 0
+    for root in _classifier_roots(model, pooler):
+        candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
+        for child in candidates:
+            if type(child) is nn.Linear:
+                SpyreClassifierLinear.convert(child)
+                n += 1
+    return n
 
 
 class SpyreCpuClassifier(nn.Module):
@@ -484,8 +618,9 @@ def configure_pooling_for_spyre(
 
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
-    is garbage (torch-spyre#2971). False if the method is unknown or the
-    head is an FP32 linear.
+    is garbage (torch-spyre#2971). Classifier / reranker heads are downcast
+    to fp16 (no native fp32 matmul, torch-spyre#1794). False if the pooling
+    method is unknown.
 
     ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
     It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
@@ -511,27 +646,30 @@ def configure_pooling_for_spyre(
 
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
-    if token_level:
-        if not len_ladder:
-            logger.warning(
-                "Pooling: token pooling has no length ladder (max_model_len was "
-                "not passed); gathers round to every 64-multiple instead of the "
-                "power-of-two buckets, so more shapes compile than necessary"
+    if token_level and not len_ladder:
+        logger.warning(
+            "Pooling: token pooling has no length ladder (max_model_len was "
+            "not passed); gathers round to every 64-multiple instead of the "
+            "power-of-two buckets, so more shapes compile than necessary"
+        )
+    n_classifier_gemms = 0
+    if token_level or _has_classifier(model, pooler):
+        prepare_fp32_head_for_spyre(model, pooler, spyre_device)
+        n_classifier_gemms = patch_classifier_linears_for_spyre(model, pooler)
+        if n_classifier_gemms:
+            logger.info(
+                "Pooling: converted %d classifier Linear(s) in place "
+                "(stick-padded folded-bias GEMM, no F.linear)",
+                n_classifier_gemms,
             )
-        prepare_token_head_for_spyre(model, pooler, spyre_device)
 
-    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
-    # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
-    # stay on CPU.
+    # Leftover fp32 (embed projector, no classifier) still has no Spyre matmul.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
     if fp32_head:
         run_pooling_tail_on_cpu(model, pooler)
-        logger.info(
-            "Pooling: FP32 classifier/head unsupported on Spyre "
-            "(no FP32 batchmatmul); running pooler on CPU"
-        )
+        logger.info("Pooling: leftover FP32 weights have no Spyre matmul; running pooler on CPU")
         return False
 
     num_norm = patch_normalize_for_spyre(pooler)
@@ -543,11 +681,13 @@ def configure_pooling_for_spyre(
     if classifier is not None:
         staying.append("classifier")
     logger.info(
-        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads)",
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, "
+        "%d classifier GEMMs)",
         ", ".join(staying),
         spyre_device,
         num_patched,
         num_norm,
         num_heads,
+        n_classifier_gemms,
     )
     return True

@@ -59,9 +59,10 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
-# Token classification: the model applies its own classifier after casting to
-# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
-# runs on Spyre instead of detouring through SpyreCpuClassifier.
+# Token classification applies its own classifier after a head_dtype cast.
+# prepare_fp32_head_for_spyre downcasts that head to fp16 and wraps nn.Linear
+# as SpyreClassifierLinear (stick-padded folded-bias GEMM) so isolated F.linear
+# does not hit mixed-EA bias add (#868).
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",
@@ -259,8 +260,7 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
-    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
+    """Classifier GEMM runs on Spyre in fp16 (no fp32 matmul, torch-spyre#1794)."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")

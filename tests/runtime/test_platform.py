@@ -577,3 +577,40 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
         configure_threading(worker_count=1)
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("cpu:gloo,spyre:spyreccl", "cpu:gloo,spyre:spyreccl"),
+        ("cpu:gloo,cuda:nccl", "cpu:gloo"),
+        ("cpu:gloo,cuda:gloo,spyre:spyreccl", "cpu:gloo,spyre:spyreccl"),
+        ("nccl", "gloo"),
+        ("cuda:gloo", "gloo"),
+    ],
+)
+def test_without_cuda_dist_backend(requested, expected):
+    from spyre_inference.platform import without_cuda_dist_backend
+
+    assert without_cuda_dist_backend(requested) == expected
+
+
+def test_strip_cuda_process_group_backends_rewrites_init(monkeypatch):
+    import torch.distributed as dist
+
+    from spyre_inference.platform import _strip_cuda_process_group_backends
+
+    seen: list[object] = []
+
+    def fake_init(*args, **kwargs):
+        seen.append(kwargs.get("backend", args[0] if args else None))
+
+    def fake_new(*args, **kwargs):
+        seen.append(kwargs.get("backend"))
+
+    monkeypatch.setattr(dist, "init_process_group", fake_init)
+    monkeypatch.setattr(dist, "new_group", fake_new)
+    _strip_cuda_process_group_backends()
+    dist.init_process_group(backend="cpu:gloo,cuda:nccl")
+    dist.new_group(backend="cuda:gloo")
+    assert seen == ["cpu:gloo", "gloo"]

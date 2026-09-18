@@ -38,7 +38,11 @@ from vllm.v1.worker.worker_base import CompilationTimes
 from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
-from spyre_inference.platform import _raise_dynamo_recompile_limits
+from spyre_inference.platform import (
+    _raise_dynamo_recompile_limits,
+    _strip_cuda_process_group_backends,
+    without_cuda_dist_backend,
+)
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -138,12 +142,13 @@ class TorchSpyreWorker(Worker):
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
 
+        _strip_cuda_process_group_backends()
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
             self.distributed_init_method,
             self.local_rank,
-            current_platform.dist_backend,
+            without_cuda_dist_backend(current_platform.dist_backend),
         )
 
         # Set random seed.

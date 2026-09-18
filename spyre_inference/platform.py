@@ -19,7 +19,7 @@ import multiprocessing
 import os
 import sys
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -67,6 +67,48 @@ def _disable_torch_accelerator() -> None:
 _disable_torch_accelerator()
 
 
+def without_cuda_dist_backend(backend: str) -> str:
+    """Drop CUDA / NCCL maps from a PyTorch backend string. Keep cpu:gloo and spyre."""
+    kept = [
+        part
+        for part in (p.strip() for p in backend.split(","))
+        if part and not part.lower().startswith("cuda:") and part.lower() not in {"nccl", "cuda"}
+    ]
+    return ",".join(kept) if kept else "gloo"
+
+
+def _strip_cuda_process_group_backends() -> None:
+    """vLLM concatenates ``cuda:gloo`` / ``cuda:nccl`` onto the default PG."""
+    import torch.distributed as dist
+
+    orig_init: Any = getattr(dist, "init_process_group", None)
+    orig_new: Any = getattr(dist, "new_group", None)
+    if orig_init is None or orig_new is None:
+        return
+    if getattr(orig_init, "_spyre_no_cuda", False):
+        return
+
+    def init_process_group(*args: Any, **kwargs: Any) -> Any:
+        if args and isinstance(args[0], str):
+            args = (without_cuda_dist_backend(args[0]), *args[1:])
+        backend = kwargs.get("backend")
+        if isinstance(backend, str):
+            kwargs["backend"] = without_cuda_dist_backend(backend)
+        return orig_init(*args, **kwargs)
+
+    def new_group(*args: Any, **kwargs: Any) -> Any:
+        backend = kwargs.get("backend")
+        if isinstance(backend, str):
+            kwargs["backend"] = without_cuda_dist_backend(backend)
+        elif len(args) >= 3 and isinstance(args[2], str):
+            args = (*args[:2], without_cuda_dist_backend(args[2]), *args[3:])
+        return orig_new(*args, **kwargs)
+
+    init_process_group._spyre_no_cuda = True
+    dist.init_process_group = init_process_group
+    dist.new_group = new_group
+
+
 def _raise_dynamo_recompile_limits() -> None:
     # torch-spyre runs every aten op on the spyre device as its own
     # torch.compile(op, dynamic=False), and all of them funnel through a single
@@ -104,6 +146,8 @@ class TorchSpyrePlatform(CpuPlatform):
     # and any host-side coordination); `spyreccl` handles Spyre tensors
     # for the device_group. See `torch_spyre._autoload` (registers
     # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
+    # vLLM may still concatenate `cuda:gloo` / `cuda:nccl`; strip those
+    # in the worker — Spyre nodes have no GPU process group.
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
     # Cap applied to `max_model_len` only when the user didn't pass one —

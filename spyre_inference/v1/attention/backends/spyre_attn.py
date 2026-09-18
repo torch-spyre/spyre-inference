@@ -333,6 +333,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     encoder_pack_batch: int | None = None
     encoder_pack_len: int | None = None
     encoder_fused_sdpa: bool = False
+    # Packed ``[B, H, L, D]`` with every sequence filling ``L`` and no dummy
+    # seqs: ``F.sdpa`` without a mask (same as B=1 fused). Live pad still uses
+    # packed QK / P·V because compiled SDPA drops ``attn_mask`` on this pin.
+    encoder_unmasked_sdpa: bool = False
     # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
     # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
     # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only

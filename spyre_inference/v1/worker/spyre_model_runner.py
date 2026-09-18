@@ -918,7 +918,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
             return
         hidden_size = self.model_config.get_hidden_size()
-        dtype = self.model_config.dtype
+        dtype = cast(torch.dtype, self.model_config.dtype)
         pairs = {
             (body, wrapper._padded_row_width(rows)) for body in bucket_sizes for rows in row_widths
         }
@@ -1113,7 +1113,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             body_rows,
             wrapper._padded_row_width(rows.numel()),
             self.model_config.get_hidden_size(),
-            self.model_config.dtype.itemsize,
+            cast(torch.dtype, self.model_config.dtype).itemsize,
         ):
             return metadata
 

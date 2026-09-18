@@ -596,18 +596,29 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
-        "when passed into a compiled region; hence the per-sequence page_index_tables."
-    ),
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        pytest.param(
+            torch.int32,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
+                    "read from offset 0 when passed into a compiled region. Index tensors "
+                    "are int32, hence the per-sequence page_index_tables."
+                ),
+            ),
+        ),
+    ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
+    Every offset here is a whole number of sticks, so a pass does not speak for a
+    row-misaligned view.
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)

@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_FP8_PREQUANT_FORCE: bool = True
 
 _cache: dict[str, Any] = {}
 
@@ -99,6 +100,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # When False (set via ``SPYRE_FP8_PREQUANT_FORCE=0``), run qfp8wt inside the
+    # compiled graph every forward instead of pre-quantizing once at load time.
+    "SPYRE_FP8_PREQUANT_FORCE": lambda: os.getenv("SPYRE_FP8_PREQUANT_FORCE", "") != "0",
 }
 # --8<-- [end:env-vars-definition]
 

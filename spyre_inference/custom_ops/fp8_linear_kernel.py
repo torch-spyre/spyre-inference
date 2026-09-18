@@ -14,10 +14,21 @@
 
 """Spyre FP8 linear: keep checkpoint FP8 weights, run compiled ``aten._scaled_mm``.
 
-Forward:
+Forward (prequant path, default):
 
     scale_a = quantscalepertokenfp8(x)              # in-graph, per-token
-    y = _scaled_mm(qfp8ch(x), qfp8wt(W), scale_a, scale_b)   # FP16 out
+    y = _scaled_mm(qfp8ch(x), qfp8wt_W, scale_a, scale_b)   # FP16 out; qfp8wt_W pre-cached
+
+Weights are pre-quantized to qfp8wt layout once on the first forward after the
+model moves to Spyre (requires torch-spyre with eager
+``quantize_weight_fp8_with_scale``):
+
+    [first forward, once]  qfp8wt_W = quantize_weight_fp8_with_scale(W_fp16, scale_b)
+    [every forward]        y = _scaled_mm(qfp8ch(x), qfp8wt_W, scale_a, scale_b)
+
+Set ``SPYRE_FP8_PREQUANT_FORCE=0`` to disable pre-quantization and fall back to
+running qfp8wt inside the compiled graph on every forward (useful for testing /
+numerical comparison).
 
 Per-tensor activations still compute ``scale_a = amax(x) / FP8_E4M3FN_MAX``
 eagerly because ``quantscalepertokenfp8`` always reduces over the hidden dim.
@@ -92,6 +103,16 @@ def _per_tensor_activation_scale(x: torch.Tensor) -> torch.Tensor:
     return (amax / FP8_E4M3FN_MAX).to(dtype=torch.float16).reshape(1)
 
 
+def _activation_scale(x: torch.Tensor, per_token: bool) -> torch.Tensor:
+    return _compiled_fp8_scale(x) if per_token else _per_tensor_activation_scale(x)
+
+
+# Two compiled GEMM variants:
+#   _compiled_fp8_scaled_mm_prequant — weight is already qfp8wt; only qfp8ch runs in-graph (default)
+#   _compiled_fp8_scaled_mm          — weight is fp16; qfp8wt runs inside the graph
+#                                      (fallback: SPYRE_FP8_PREQUANT_FORCE=0)
+
+
 @torch.compile(backend="inductor", dynamic=False)
 def _compiled_fp8_scale(x: torch.Tensor) -> torch.Tensor:
     # quantscalepertokenfp8 computes amax, scale, and clip inside the graph.
@@ -128,23 +149,54 @@ def _compiled_fp8_scaled_mm(
     )
 
 
+@torch.compile(backend="inductor", dynamic=False)
+def _compiled_fp8_scaled_mm_prequant(
+    x: torch.Tensor,
+    scale_a: torch.Tensor,
+    weight_qfp8wt: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    # weight_qfp8wt is already in qfp8wt layout — skip quantize_weight_fp8_with_scale.
+    x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
+        x,  # ty: ignore[invalid-argument-type]
+        scale_a,  # ty: ignore[invalid-argument-type]
+    )
+    return torch.ops.aten._scaled_mm(
+        x_fp8,
+        weight_qfp8wt,  # ty: ignore[invalid-argument-type]
+        scale_a=scale_a,  # ty: ignore[invalid-argument-type]
+        scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
+        bias=bias,  # ty: ignore[invalid-argument-type]
+        out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
+    )
+
+
 def _fp8_mm(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     per_token: bool,
+    prequant: bool = False,
 ) -> torch.Tensor:
-    if per_token:
-        scale_a = _compiled_fp8_scale(x)
-        return _compiled_fp8_scaled_mm(x, scale_a, weight, weight_scale, bias)
-    return _compiled_fp8_scaled_mm(x, _per_tensor_activation_scale(x), weight, weight_scale, bias)
+    sa = _activation_scale(x, per_token)
+    if prequant:
+        return _compiled_fp8_scaled_mm_prequant(x, sa, weight, weight_scale, bias)
+    return _compiled_fp8_scaled_mm(x, sa, weight, weight_scale, bias)
+
+
+def _use_prequant() -> bool:
+    """Return True unless explicitly disabled via ``SPYRE_FP8_PREQUANT_FORCE=0``."""
+    from spyre_inference import envs
+
+    return envs.SPYRE_FP8_PREQUANT_FORCE
 
 
 def _fp16_weight_for_qfp8wt(
     weight: torch.Tensor, weight_scale: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
-    """CPU float8 is not qfp8wt. Dequant once; the compiled graph re-quantizes."""
+    """Dequantize checkpoint float8 weights on CPU and move them to ``device``."""
     if weight.dtype != torch.float8_e4m3fn:
         return weight
     w = weight.detach().cpu().to(torch.float16)
@@ -176,6 +228,29 @@ def _n_weight_splits(
         wj = w_fp16[:, j : j + ns].clone()
         sj = weight_scale if weight_scale.numel() == 1 else weight_scale[:, j : j + ns].clone()
         parts.append((wj, sj))
+        j += ns
+    return parts
+
+
+def _precompute_qfp8wt_splits(
+    w_fp16: torch.Tensor, weight_scale: torch.Tensor
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Pre-quantize fp16 weight tiles to qfp8wt layout eagerly.
+
+    Each tile is quantized independently and stored as ``(qfp8wt_tensor, scale)``.
+    Normally called once on the first forward after the model moves to Spyre.
+    """
+    n_parts = _n_tiles(int(w_fp16.shape[1]))
+    if len(n_parts) == 1:
+        wq = torch.ops.spyre.quantize_weight_fp8_with_scale(w_fp16, weight_scale)  # ty: ignore[invalid-argument-type]
+        return [(wq, weight_scale)]
+    parts: list[tuple[torch.Tensor, torch.Tensor]] = []
+    j = 0
+    for ns in n_parts:
+        wj = w_fp16[:, j : j + ns].clone()
+        sj = weight_scale if weight_scale.numel() == 1 else weight_scale[:, j : j + ns].clone()
+        wq = torch.ops.spyre.quantize_weight_fp8_with_scale(wj, sj)  # ty: ignore[invalid-argument-type]
+        parts.append((wq, sj))
         j += ns
     return parts
 
@@ -212,6 +287,9 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         layer.weight = Parameter(weight.contiguous(), requires_grad=False)
         layer.weight_scale = Parameter(scale, requires_grad=False)
 
+        # _qfp8wt_for_mm is built lazily on first forward (after model.to(device)),
+        # because quantize_weight_fp8_with_scale is a Spyre-only op.
+
     def _weight_splits(
         self, layer: torch.nn.Module, w: torch.Tensor
     ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -223,15 +301,14 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         return splits
 
     # Not an untraceable op. The GEMM is already Dynamo/Inductor:
-    # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
+    # ``_compiled_fp8_scaled_mm`` / ``_compiled_fp8_scaled_mm_prequant``
+    # (qfp8ch + [optional qfp8wt] + aten._scaled_mm).
     # ``recursive=False`` keeps that nested compile. This wrapper stays
-    # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
+    # eager because (1) this implementation uses M∈{1,4} and N∈{4096,1024,128},
     # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
-    # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
-    # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
+    # views (storage_offset is ignored); (2) inlining this into the outer
     # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
     # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
-    # Drop this when those shapes compile as one graph.
     @torch._dynamo.disable(recursive=False)
     def apply_weights(
         self,
@@ -243,17 +320,31 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
         x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
         orig_m = x2d.shape[0]
 
-        w = getattr(layer, "_fp16_for_qfp8wt", None)
-        if w is None or w.device != x2d.device:
-            w = _fp16_weight_for_qfp8wt(
-                cast(torch.Tensor, layer.weight),
-                cast(torch.Tensor, layer.weight_scale),
-                x2d.device,
-            )
-            layer._fp16_for_qfp8wt = w
+        prequant = _use_prequant()
+        if prequant:
+            # qfp8wt tensors are computed on the first forward; rebuild if the device changes.
+            splits = getattr(layer, "_qfp8wt_for_mm", None)
+            if splits is None or splits[0][0].device != x2d.device:
+                w_fp16 = _fp16_weight_for_qfp8wt(
+                    cast(torch.Tensor, layer.weight),
+                    cast(torch.Tensor, layer.weight_scale),
+                    x2d.device,
+                )
+                splits = _precompute_qfp8wt_splits(w_fp16, cast(torch.Tensor, layer.weight_scale))
+                layer._qfp8wt_for_mm = splits
+        else:
+            w = getattr(layer, "_fp16_for_qfp8wt", None)
+            if w is None or w.device != x2d.device:
+                w = _fp16_weight_for_qfp8wt(
+                    cast(torch.Tensor, layer.weight),
+                    cast(torch.Tensor, layer.weight_scale),
+                    x2d.device,
+                )
+                layer._fp16_for_qfp8wt = w
+            splits = self._weight_splits(layer, w)
 
-        k, n = int(w.shape[0]), int(w.shape[1])
-        splits = self._weight_splits(layer, w)
+        w_ref = splits[0][0]
+        k, n = int(w_ref.shape[0]), sum(int(wj.shape[1]) for wj, _ in splits)
         wide = max(k, n) >= _WIDE or len(splits) > 1
         if wide:
             m_parts = _m_tiles(orig_m, k, n)
@@ -274,7 +365,7 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
             for wj, sj in splits:
                 ns = wj.shape[1]
                 bj = None if bias is None else bias[col : col + ns].clone()
-                col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
+                col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act, prequant=prequant))
                 col += ns
             row_outs.append(_join(col_outs, dim=-1))
         out = _join(row_outs, dim=0)

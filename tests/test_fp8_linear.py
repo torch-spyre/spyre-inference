@@ -23,6 +23,7 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 from spyre_inference.custom_ops.fp8_linear_kernel import (
     FP8_E4M3FN_MAX,
     SpyreFp8LinearKernel,
+    _use_prequant,
     register_spyre_fp8_linear_kernel,
 )
 
@@ -74,20 +75,6 @@ def _make_kernel(*, granite_channel: bool = False):
         out_dtype=torch.float16,
         module_name="TestSpyreFp8",
     )
-
-
-# Non-strict: this shape still compiles on some deeptools/dxp_standalone builds,
-# and an xpass is the signal that the backend fix landed.
-_XFAIL_M1 = pytest.param(
-    1,
-    marks=pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "dxp_standalone fails to compile the fused activation-quantize + "
-            "_scaled_mm graph for the M=1 decode shape"
-        ),
-    ),
-)
 
 
 @pytest.mark.fp8
@@ -218,7 +205,7 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre.
 
@@ -289,7 +276,7 @@ class TestSpyreFp8LinearKernel:
         assert out3d.shape == (batch, seq_len, out_features)
         torch.testing.assert_close(out3d.reshape_as(out2d), out2d, atol=0.0, rtol=0.0)
 
-    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
+    @pytest.mark.parametrize("num_tokens", [1, 4, 5, 128, 130])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
         if not spyre_available():
@@ -337,6 +324,26 @@ class TestSpyreFp8LinearKernel:
             prefix="test.qkv_proj",
         )
         assert isinstance(layer.quant_method.fp8_linear, SpyreFp8LinearKernel)
+
+
+class TestUsePrequant:
+    """_use_prequant() env-var override."""
+
+    def test_default_is_true(self, monkeypatch):
+        monkeypatch.delenv("SPYRE_FP8_PREQUANT_FORCE", raising=False)
+        assert _use_prequant() is True
+
+    def test_force_0_disables(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "0")
+        assert _use_prequant() is False
+
+    def test_force_1_enables(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "1")
+        assert _use_prequant() is True
+
+    def test_arbitrary_value_enables(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "yes")
+        assert _use_prequant() is True
 
 
 class TestFp8TileHelpers:
@@ -398,3 +405,283 @@ class TestDetectFp8ForCompile:
 
         model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
         assert not TorchSpyreModelRunner._model_has_spyre_fp8(model)
+
+
+@pytest.mark.fp8
+class TestSpyreFp8PrequantPath:
+    """Tests for the prequant path: weight pre-quantized to qfp8wt at load time.
+
+    Prequant is the default path. Set SPYRE_FP8_PREQUANT_FORCE=0 to test the
+    fallback (qfp8wt inside the compiled graph every forward).
+    """
+
+    @staticmethod
+    def _prepare_prequant_layer(layer, kernel, weight_kn, *, per_channel: bool):
+        """Prepare a layer with fp16 weight on Spyre (simulates model.to('spyre'))."""
+        if per_channel:
+            _wfp8, ws = _quantize_weight_fp8_per_channel(weight_kn)
+            ws = ws.reshape(-1, 1)
+        else:
+            _wfp8, ws = _quantize_weight_fp8(weight_kn)
+            ws = ws.reshape(1)
+
+        layer.weight = torch.nn.Parameter(_wfp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(ws, requires_grad=False)
+        kernel.process_weights_after_loading(layer)
+        # Move FP16 dequant of weight to Spyre (simulates model.to("spyre"))
+        from spyre_inference.custom_ops.fp8_linear_kernel import _fp16_weight_for_qfp8wt
+
+        w_fp16 = _fp16_weight_for_qfp8wt(
+            layer.weight.data, layer.weight_scale.data, torch.device("spyre")
+        )
+        layer.weight = torch.nn.Parameter(w_fp16, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(
+            layer.weight_scale.data.to("spyre"), requires_grad=False
+        )
+        return layer
+
+    def test_prequant_populates_qfp8wt_cache(self):
+        """After first apply_weights, _qfp8wt_for_mm is set on the layer."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(7)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = torch.nn.Module()
+        self._prepare_prequant_layer(layer, kernel, weight_kn, per_channel=False)
+
+        assert getattr(layer, "_qfp8wt_for_mm", None) is None, (
+            "_qfp8wt_for_mm should not exist before first forward"
+        )
+
+        x = torch.randn(1, in_features, dtype=torch.float16, device="spyre")
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            _ = kernel.apply_weights(layer, x)
+
+        splits = getattr(layer, "_qfp8wt_for_mm", None)
+        assert splits is not None, "_qfp8wt_for_mm should be set after first forward"
+        assert len(splits) >= 1
+        wq, _s = splits[0]
+        # qfp8wt tensors are float8_e4m3fn on Spyre.
+        assert wq.dtype == torch.float8_e4m3fn, f"Expected float8_e4m3fn, got {wq.dtype}"
+        assert wq.device.type == "spyre", f"Expected spyre device, got {wq.device}"
+
+    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    def test_prequant_result_matches_fallback(self, num_tokens, monkeypatch):
+        """Prequant path (default) produces numerically close output to FORCE=0 fallback."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(13)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        x = torch.randn(num_tokens, in_features, dtype=torch.float16)
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        # --- fallback path (SPYRE_FP8_PREQUANT_FORCE=0) ---
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "0")
+        layer_base = torch.nn.Module()
+        _wfp8, ws = _quantize_weight_fp8(weight_kn)
+        layer_base.weight = torch.nn.Parameter(_wfp8, requires_grad=False)
+        layer_base.weight_scale = torch.nn.Parameter(ws.reshape(1), requires_grad=False)
+        kernel.process_weights_after_loading(layer_base)
+        layer_base.weight = torch.nn.Parameter(
+            weight_kn.contiguous().to("spyre"), requires_grad=False
+        )
+        layer_base.weight_scale = torch.nn.Parameter(
+            layer_base.weight_scale.data.to("spyre"), requires_grad=False
+        )
+        x_spyre = x.to("spyre")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_base = kernel.apply_weights(layer_base, x_spyre).cpu()
+
+        # --- prequant path (default, no env var) ---
+        monkeypatch.delenv("SPYRE_FP8_PREQUANT_FORCE", raising=False)
+        layer_pre = torch.nn.Module()
+        self._prepare_prequant_layer(layer_pre, kernel, weight_kn, per_channel=False)
+        x_spyre2 = x.to("spyre")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_pre = kernel.apply_weights(layer_pre, x_spyre2).cpu()
+
+        assert out_base.shape == out_pre.shape
+        # The two paths quantize weights independently (one eager, one compiled), so
+        # fp8-rounding can introduce a small difference.  One FP8 ULP dequanted to fp16
+        # is ~scale * 2/448 ≈ 0.05*2/448 ≈ 2e-4; we allow a generous 0.1 to cover
+        # any accumulation across 128 inner-product terms.
+        max_diff = (out_base.float() - out_pre.float()).abs().max().item()
+        assert max_diff < 0.1, (
+            f"Prequant and fallback outputs differ too much: max_diff={max_diff:.6f} "
+            f"(num_tokens={num_tokens})"
+        )
+
+    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    def test_prequant_per_channel_result_matches_fallback(self, num_tokens, monkeypatch):
+        """Prequant path with per-channel scales produces close output to fallback."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=True)
+        except ImportError:
+            pytest.skip("vLLM FP8 channel QuantKey unavailable")
+
+        torch.manual_seed(21)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        x = torch.randn(num_tokens, in_features, dtype=torch.float16)
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        # --- fallback path ---
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "0")
+        layer_base = torch.nn.Module()
+        _wfp8, ws = _quantize_weight_fp8_per_channel(weight_kn)
+        layer_base.weight = torch.nn.Parameter(_wfp8, requires_grad=False)
+        layer_base.weight_scale = torch.nn.Parameter(ws.reshape(-1, 1), requires_grad=False)
+        kernel.process_weights_after_loading(layer_base)
+        layer_base.weight = torch.nn.Parameter(
+            weight_kn.contiguous().to("spyre"), requires_grad=False
+        )
+        layer_base.weight_scale = torch.nn.Parameter(
+            layer_base.weight_scale.data.to("spyre"), requires_grad=False
+        )
+        x_spyre = x.to("spyre")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_base = kernel.apply_weights(layer_base, x_spyre).cpu()
+
+        # --- prequant path ---
+        monkeypatch.delenv("SPYRE_FP8_PREQUANT_FORCE", raising=False)
+        layer_pre = torch.nn.Module()
+        self._prepare_prequant_layer(layer_pre, kernel, weight_kn, per_channel=True)
+        x_spyre2 = x.to("spyre")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_pre = kernel.apply_weights(layer_pre, x_spyre2).cpu()
+
+        assert out_base.shape == out_pre.shape
+        max_diff = (out_base.float() - out_pre.float()).abs().max().item()
+        assert max_diff < 0.1, (
+            f"Prequant per-channel and fallback outputs differ too much: max_diff={max_diff:.6f} "
+            f"(num_tokens={num_tokens})"
+        )
+
+    def test_prequant_cache_reused_on_second_forward(self):
+        """_qfp8wt_for_mm is computed once and reused (identity check) on second forward."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(3)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = torch.nn.Module()
+        self._prepare_prequant_layer(layer, kernel, weight_kn, per_channel=False)
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        x = torch.randn(1, in_features, dtype=torch.float16, device="spyre")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            _ = kernel.apply_weights(layer, x)
+
+        splits_after_first = layer._qfp8wt_for_mm
+        id_first = id(splits_after_first[0][0])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            _ = kernel.apply_weights(layer, x)
+
+        splits_after_second = layer._qfp8wt_for_mm
+        id_second = id(splits_after_second[0][0])
+
+        assert id_first == id_second, (
+            "_qfp8wt_for_mm tensor was rebuilt on second forward — expected cache reuse"
+        )
+
+    @pytest.mark.parametrize("out_features", [6144, 25600])
+    def test_prequant_wide_multitile_matches_fallback(self, out_features, monkeypatch):
+        """Wide fused projections (QKV N=6144, gate_up N=25600) are N-split into
+        SuperDSC tiles; prequant output matches the fallback path."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        torch.manual_seed(42)
+        in_features = 4096
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        x = torch.randn(1, in_features, dtype=torch.float16)
+
+        # --- fallback path ---
+        monkeypatch.setenv("SPYRE_FP8_PREQUANT_FORCE", "0")
+        layer_base = torch.nn.Module()
+        _wfp8, ws = _quantize_weight_fp8(weight_kn)
+        layer_base.weight = torch.nn.Parameter(_wfp8, requires_grad=False)
+        layer_base.weight_scale = torch.nn.Parameter(ws.reshape(1), requires_grad=False)
+        kernel.process_weights_after_loading(layer_base)
+        layer_base.weight = torch.nn.Parameter(
+            weight_kn.contiguous().to("spyre"), requires_grad=False
+        )
+        layer_base.weight_scale = torch.nn.Parameter(
+            layer_base.weight_scale.data.to("spyre"), requires_grad=False
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_base = kernel.apply_weights(layer_base, x.to("spyre")).cpu()
+
+        # --- prequant path ---
+        monkeypatch.delenv("SPYRE_FP8_PREQUANT_FORCE", raising=False)
+        layer_pre = torch.nn.Module()
+        self._prepare_prequant_layer(layer_pre, kernel, weight_kn, per_channel=False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            out_pre = kernel.apply_weights(layer_pre, x.to("spyre")).cpu()
+
+        assert out_base.shape == out_pre.shape
+        max_diff = (out_base.float() - out_pre.float()).abs().max().item()
+        assert max_diff < 0.2, (
+            f"Wide multi-tile prequant and fallback differ: max_diff={max_diff:.6f} "
+            f"(out_features={out_features})"
+        )

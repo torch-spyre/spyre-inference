@@ -63,6 +63,45 @@ compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
+| FP8 linear (`Fp8LinearMethod`, compressed-tensors) | `SpyreFp8LinearKernel` | Spyre | Registered via `register_spyre_fp8_linear_kernel()` for `PlatformEnum.OOT`. Keeps checkpoint `float8_e4m3fn` weights as-is through `process_weights_after_loading`. On first forward, dequantizes fp8→fp16 on CPU and moves to Spyre; from there, two paths are possible — see [FP8 weight lifecycle](#fp8-weight-lifecycle) below. `apply_weights` is `@torch._dynamo.disable(recursive=False)` so the outer block compile uses `fullgraph=False` for FP8 models. Prequant path requires [torch-spyre#3172](https://github.com/torch-spyre/torch-spyre/pull/3172) |
+
+### FP8 weight lifecycle
+
+FP8 checkpoint weights (e.g. Granite-3.3-FP8, Granite-4.1-FP8) follow a two-step
+lifecycle. The prequant or fallback path is selected by the
+`SPYRE_FP8_PREQUANT_FORCE` environment variable:
+
+```text
+[load]   process_weights_after_loading  →  layer.weight stays float8_e4m3fn on CPU
+[to device]  model.to("spyre")          →  weight moves as fp8 to Spyre
+
+[first forward, prequant path]
+  w_fp16  = dequant(fp8_weight) on CPU → .to("spyre")
+  qfp8wt  = quantize_weight_fp8_with_scale(w_fp16, scale)   ← eager, once
+  layer._qfp8wt_for_mm = [(qfp8wt, scale), ...]             ← cached until device changes
+[every forward]
+  qfp8ch  = quantize_fp8_with_scale(x, scale_a)             ← in compiled graph
+  out     = aten._scaled_mm(qfp8ch, qfp8wt, ...)            ← in compiled graph
+
+[first forward, fallback path (SPYRE_FP8_PREQUANT_FORCE=0)]
+  w_fp16  = dequant(fp8_weight) on CPU → .to("spyre")
+  layer._fp16_for_qfp8wt = w_fp16                           ← cached until device changes
+[every forward]
+  qfp8ch  = quantize_fp8_with_scale(x, scale_a)             ← in compiled graph
+  qfp8wt  = quantize_weight_fp8_with_scale(w_fp16, scale_b) ← in compiled graph (re-run each time)
+  out     = aten._scaled_mm(qfp8ch, qfp8wt, ...)            ← in compiled graph
+```
+
+The **prequant path** is the default. Set `SPYRE_FP8_PREQUANT_FORCE=0` to use the
+fallback path, which performs the `qfp8wt` conversion inside the compiled graph
+on every forward. Pre-quantization is performed lazily on the first forward after
+the model has moved to Spyre and the resulting qfp8wt tensors are cached.
+
+Fused projections with N > 4096 (QKV: N=6144, gate_up: N=25600) are N-split into
+SuperDSC-legal tile widths (`[4096, 1024, 128]`) and each tile is pre-quantized
+independently. Wide GEMMs (K or N ≥ 4096) also tile the M dimension into groups of 4
+(decode M=1 stays unsplit). See `_n_tiles` / `_m_tiles` in
+`spyre_inference/custom_ops/fp8_linear_kernel.py`.
 
 ### Transposed linear weights
 

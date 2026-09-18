@@ -186,6 +186,27 @@ class TestRecordGraphs:
 
         assert recorded == len(_recordable(bucketer)) > 0
 
+    def test_recorder_uses_single_page_decode_and_grouped_prefill(
+        self, impl, kv_cache, builder, monkeypatch
+    ):
+        """Recording must trace the same page_group dispatch picks, or every prefill
+        compiles on first use."""
+        monkeypatch.setattr(impl, "_page_group", 8)
+        builder._attn_bucketer = make_bucketer()
+        groups = []
+        real = impl._attn_fn
+
+        def capture(*args):
+            # (padded_query_len, page_group) in page_attn_kernel's argument order.
+            groups.append((args[8], args[13]))
+            return real(*args)
+
+        monkeypatch.setattr(impl, "_attn_fn", capture)
+        _record(impl, kv_cache, builder)
+
+        assert groups
+        assert all(group == (1 if query_len == 1 else 8) for query_len, group in groups)
+
     def test_dispatch_after_recording_compiles_nothing(self, impl, kv_cache, builder):
         """The acceptance criterion: no request compiles a new variant.
 

@@ -1120,6 +1120,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
+        if self._page_group < 1:
+            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}")
+        if sliding_window is not None and self._page_group != 1:
+            # A window leaves the block count unpadded (see _record_one), so the tail
+            # group takes an arbitrary width and Dynamo specializes on each one --
+            # every prefill would risk an unrecorded compile.
+            raise ValueError(
+                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with sliding-window "
+                "attention; use SPYRE_ATTN_PAGE_GROUP=1"
+            )
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
@@ -1200,6 +1212,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"padded_query_len={padded_query_len} needs a query buffer wider than "
             "itself; a gather selecting its whole source faults the device"
         )
+
+    def _page_group_for_query(self, query_len: int) -> int:
+        """Group pages only for multi-token prefill/chunked-prefill sequences.
+
+        At one query row the page transfer, not the online-softmax bookkeeping, is the
+        cost, so grouping buys nothing there and would fragment the decode variants the
+        recorder covers.
+        """
+        return self._page_group if query_len > 1 else 1
 
     def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
@@ -1729,6 +1750,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
+            self._page_group_for_query(padded_query_len),
             alibi_bias_tiles,
             out,
         )

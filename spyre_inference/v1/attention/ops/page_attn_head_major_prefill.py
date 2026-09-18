@@ -38,12 +38,17 @@ def page_attn_head_major_prefill_kernel(
     head_size,
     block_size,
     logits_soft_cap=0.0,
+    page_group=1,
     out=None,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
     Shapes are ``page_attn_head_major``'s, except ``page_index_tables``: one [1] int32 device
     tensor per active block, indexing ``[num_blocks, num_kv_heads, block_size, head_size]``.
+
+    ``page_group`` folds that many adjacent pages into one online-softmax update, widening its
+    score matmul to ``page_group * block_size`` keys. 1 keeps one page per update; the final
+    group may be shorter.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
@@ -60,13 +65,36 @@ def page_attn_head_major_prefill_kernel(
     tile_sum = None
     tile_output = None
 
-    for i in range(num_blocks):
-        # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
-        # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
-        page_idx = page_index_tables[i]
-        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        mask_tile = mask_tiles[i]
+    for group_start in range(0, num_blocks, page_group):
+        group_end = min(group_start + page_group, num_blocks)
+        width = group_end - group_start
+
+        if width == 1:
+            # One row of the unfolded cache: the folded per-kv-head gather exists to split for
+            # LX residency. index_select, not subscripting, which lowers to aten.index and
+            # fails eager.
+            page_idx = page_index_tables[group_start]
+            k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            mask_tile = mask_tiles[group_start]
+        else:
+            # The group's pages in one gather, joined along the token axis. The cat runs inside
+            # the traced region, so it yields a real offset-0 tensor rather than a view whose
+            # offset is dropped crossing the argument boundary (torch-spyre#3770).
+            page_idx = torch.cat(page_index_tables[group_start:group_end])
+            k_page = (
+                k_pages.index_select(0, page_idx)
+                .permute(1, 0, 2, 3)
+                .reshape(num_kv_heads, width * block_size, head_size)
+                .unsqueeze(1)
+            )
+            v_page = (
+                v_pages.index_select(0, page_idx)
+                .permute(1, 0, 2, 3)
+                .reshape(num_kv_heads, width * block_size, head_size)
+                .unsqueeze(1)
+            )
+            mask_tile = torch.cat(mask_tiles[group_start:group_end], dim=-1)
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
@@ -76,7 +104,7 @@ def page_attn_head_major_prefill_kernel(
         scores = scores + mask_tile
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
+        if group_start == 0:
             tile_max = scores_max
             tile_probs = torch.exp(scores - tile_max)
             tile_output = torch.matmul(tile_probs, v_page)

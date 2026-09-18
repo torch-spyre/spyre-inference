@@ -60,7 +60,7 @@ RERANKER_MODELS = [
 ]
 
 # Token classification applies its own classifier after a head_dtype cast.
-# prepare_fp32_head_for_spyre downcasts that head to fp16 (#868).
+# Same path as sequence-classify: downcast to fp16, GEMM on Spyre, bias on CPU.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",
@@ -149,14 +149,14 @@ def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
 
     for prompt, out, ref_emb in zip(prompts, outputs, ref["embeddings"]):
         emb = out.outputs.embedding
-        assert len(emb) == len(ref_emb), (
-            f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
-        )
+        assert len(emb) == len(
+            ref_emb
+        ), f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
         assert all(math.isfinite(x) for x in emb)
         sim = _cosine(emb, ref_emb)
-        assert sim >= COSINE_MIN, (
-            f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
-        )
+        assert (
+            sim >= COSINE_MIN
+        ), f"{model}: cosine {sim:.4f} < {COSINE_MIN} vs cached HF reference for prompt {prompt!r}"
 
 
 @pytest.mark.uses_subprocess
@@ -186,9 +186,9 @@ def test_encoder_embed_mean_multi_seq(model: str) -> None:
 
     for prompt, out, ref_emb in zip(prompts, outputs, ref["embeddings"]):
         emb = out.outputs.embedding
-        assert len(emb) == len(ref_emb), (
-            f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
-        )
+        assert len(emb) == len(
+            ref_emb
+        ), f"{model}: dim mismatch {len(emb)} vs cached {len(ref_emb)}"
         assert all(math.isfinite(x) for x in emb)
         sim = _cosine(emb, ref_emb)
         assert sim >= COSINE_MIN, (
@@ -231,9 +231,9 @@ def test_encoder_embed_last_pooling() -> None:
 
     for prompt, out, ref_emb in zip(prompts, outputs, ref_embs):
         emb = out.outputs.embedding
-        assert len(emb) == len(ref_emb), (
-            f"LAST {LAST_POOLING_MODEL}: dim mismatch {len(emb)} vs HF {len(ref_emb)}"
-        )
+        assert len(emb) == len(
+            ref_emb
+        ), f"LAST {LAST_POOLING_MODEL}: dim mismatch {len(emb)} vs HF {len(ref_emb)}"
         assert all(math.isfinite(x) for x in emb)
         sim = _cosine(emb, ref_emb)
         assert sim >= COSINE_MIN, (
@@ -324,7 +324,7 @@ def test_encoder_token_classify() -> None:
     for prompt, out, ref in zip(TOKEN_CLASSIFY_PROMPTS, outputs, refs):
         got = torch.as_tensor(out.outputs.data).float()
         assert got.shape == ref.shape, f"{prompt!r}: {tuple(got.shape)} vs {tuple(ref.shape)}"
-        assert torch.equal(got.argmax(-1), ref.argmax(-1)), (
-            f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
-        )
+        assert torch.equal(
+            got.argmax(-1), ref.argmax(-1)
+        ), f"{prompt!r}: labels {got.argmax(-1).tolist()} vs HF {ref.argmax(-1).tolist()}"
         assert (got - ref).abs().max().item() < 1e-2, f"{prompt!r}: scores drifted from HF"

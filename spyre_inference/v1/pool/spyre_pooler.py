@@ -353,6 +353,75 @@ def prepare_fp32_head_for_spyre(
         model.head_dtype = torch.float16
 
 
+class SpyreClassifierLinear(nn.Linear):
+    """Same ``nn.Linear``; GEMM on Spyre, bias add on CPU.
+
+    Downcast (token-classify already did this) is enough for dtype: Spyre has no
+    fp32 matmul. Isolated ``F.linear(x, W, bias)`` still mixed-EA's because
+    torch-spyre compiles that op as its own graph; decoder linears survive
+    because they sit in a block graph. Drop bias from the GEMM, add it on the
+    host. ``@torch.compiler.disable`` keeps compiled warmup from inlining the add.
+    """
+
+    @classmethod
+    def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
+        if type(linear) is not cls:
+            linear.__class__ = cls
+        return linear
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device != self.weight.device:
+            x = (
+                convert(x, self.weight.device)
+                if self.weight.device.type == "spyre"
+                else x.to(device=self.weight.device)
+            )
+        return self._add_bias(nn.functional.linear(x, self.weight, None))
+
+    @torch.compiler.disable
+    def _add_bias(self, out: torch.Tensor) -> torch.Tensor:
+        if self.bias is None:
+            return out
+        if out.device.type == "spyre":
+            out = convert(out, "cpu")
+        bias = self.bias
+        if bias.device.type == "spyre":
+            bias = convert(bias, "cpu")
+        return out + bias.to(device=out.device, dtype=out.dtype)
+
+
+def _classifier_roots(model: nn.Module, pooler: nn.Module) -> list[nn.Module]:
+    """Classifier modules even when not registered in ``_modules``."""
+    roots: list[nn.Module] = []
+    seen: set[int] = set()
+
+    def add(module: object) -> None:
+        if not isinstance(module, nn.Module):
+            return
+        key = id(module)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(module)
+
+    add(getattr(model, "classifier", None))
+    for parent in (*model.modules(), *pooler.modules()):
+        add(getattr(parent, "classifier", None))
+    return roots
+
+
+def patch_classifier_linears_for_spyre(model: nn.Module, pooler: nn.Module) -> int:
+    """Convert every ``nn.Linear`` under a classifier, in place."""
+    n = 0
+    for root in _classifier_roots(model, pooler):
+        candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
+        for child in candidates:
+            if type(child) is nn.Linear:
+                SpyreClassifierLinear.convert(child)
+                n += 1
+    return n
+
+
 class SpyreCpuClassifier(nn.Module):
     """D2H wrapper for a classifier the model applies in its own forward.
 
@@ -525,8 +594,15 @@ def configure_pooling_for_spyre(
             "not passed); gathers round to every 64-multiple instead of the "
             "power-of-two buckets, so more shapes compile than necessary"
         )
+    n_classifier_gemms = 0
     if token_level or _has_classifier(model, pooler):
         prepare_fp32_head_for_spyre(model, pooler, spyre_device)
+        n_classifier_gemms = patch_classifier_linears_for_spyre(model, pooler)
+        if n_classifier_gemms:
+            logger.info(
+                "Pooling: downcast %d classifier Linear(s) to fp16 (GEMM on Spyre, bias on CPU)",
+                n_classifier_gemms,
+            )
 
     # Leftover fp32 (embed projector, no classifier) still has no Spyre matmul.
     fp32_head = _module_has_float32_params(pooler) or (
@@ -546,11 +622,13 @@ def configure_pooling_for_spyre(
     if classifier is not None:
         staying.append("classifier")
     logger.info(
-        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads)",
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, "
+        "%d classifier GEMMs)",
         ", ".join(staying),
         spyre_device,
         num_patched,
         num_norm,
         num_heads,
+        n_classifier_gemms,
     )
     return True

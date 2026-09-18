@@ -15,6 +15,114 @@
     num-iters-warmup: 1
     num-iters: 2
     max-model-len: 128
+- test_name: latency_granite-embedding-125m-english_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-embedding-125m-english
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_granite-embedding-278m-multilingual_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: ibm-granite/granite-embedding-278m-multilingual
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_multilingual-e5-large_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: intfloat/multilingual-e5-large
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_all-roberta-large-v1_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: sentence-transformers/all-roberta-large-v1
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_bge-reranker-v2-m3_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: BAAI/bge-reranker-v2-m3
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
+- test_name: latency_bge-reranker-large_tp1_in64
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  parameters:
+    model: BAAI/bge-reranker-large
+    runner: pooling
+    tensor_parallel_size: 1
+    dtype: float16
+    load_format: auto
+    input-len: 64
+    output-len: 0
+    batch-size: 4
+    num-iters-warmup: 2
+    num-iters: 10
+    max-model-len: 128
 - test_name: latency_granite33-8b_tp1_in64_out64
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64

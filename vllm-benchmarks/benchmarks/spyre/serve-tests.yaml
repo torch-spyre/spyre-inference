@@ -24,6 +24,168 @@
     # Match max-num-seqs and burst so the batch fills without queueing.
     max-concurrency: 4
     request-rate: inf
+- test_name: serve_granite-embedding-125m-english_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: ibm-granite/granite-embedding-125m-english
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: ibm-granite/granite-embedding-125m-english
+    backend: openai-embeddings
+    endpoint: /v1/embeddings
+    dataset-name: random
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
+- test_name: serve_granite-embedding-278m-multilingual_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: ibm-granite/granite-embedding-278m-multilingual
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: ibm-granite/granite-embedding-278m-multilingual
+    backend: openai-embeddings
+    endpoint: /v1/embeddings
+    dataset-name: random
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
+- test_name: serve_multilingual-e5-large_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: intfloat/multilingual-e5-large
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: intfloat/multilingual-e5-large
+    backend: openai-embeddings
+    endpoint: /v1/embeddings
+    dataset-name: random
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
+- test_name: serve_all-roberta-large-v1_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: sentence-transformers/all-roberta-large-v1
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: sentence-transformers/all-roberta-large-v1
+    backend: openai-embeddings
+    endpoint: /v1/embeddings
+    dataset-name: random
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
+- test_name: serve_bge-reranker-v2-m3_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: BAAI/bge-reranker-v2-m3
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: BAAI/bge-reranker-v2-m3
+    backend: vllm-rerank
+    endpoint: /rerank
+    dataset-name: random-rerank
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
+- test_name: serve_bge-reranker-large_tp1_in64
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+    SPYRE_DEVICES: '0'
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  server_parameters:
+    model: BAAI/bge-reranker-large
+    runner: pooling
+    dtype: float16
+    load-format: auto
+    max-num-seqs: 4
+    max-model-len: 128
+    port: 8000
+    host: 127.0.0.1
+  parameters:
+    model: BAAI/bge-reranker-large
+    backend: vllm-rerank
+    endpoint: /rerank
+    dataset-name: random-rerank
+    random-input-len: 64
+    random-batch-size: 1
+    num-prompts: 16
+    num-warmups: 8
+    max-concurrency: 4
+    request-rate: inf
 - test_name: serve_granite33-8b_tp1_in64_out64
   server_health_timeout: 1800
   environment_variables:

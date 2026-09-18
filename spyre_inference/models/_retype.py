@@ -14,12 +14,9 @@
 
 """Retyping an upstream-built submodule to its Spyre subclass.
 
-Shared machinery rather than one architecture's adaptation, hence the private name.
-
-A vLLM model that hardcodes the class of a submodule it builds offers no
-``embedding_class``-style hook to pass a subclass through, so the Spyre adaptation
-lets ``super().__init__()`` build the tree and then swaps the class of the one
-submodule it needs to change.
+A vLLM model that hardcodes a submodule's class offers no ``embedding_class``-style hook
+to pass a subclass through, so ``super().__init__()`` builds the tree and this swaps the
+class afterwards.
 """
 
 from __future__ import annotations
@@ -35,9 +32,8 @@ _ModuleT = TypeVar("_ModuleT", bound="nn.Module")
 def retype(module: object, spyre: type[_ModuleT]) -> _ModuleT:
     """Retype ``module`` to the Spyre subclass ``spyre``, and hand it back.
 
-    ``spyre`` must name its mixins before the upstream class it adapts
-    (``class SpyreX(SomeMixin, UpstreamX)``): its last base is the class ``module``
-    is required to be an exact instance of.
+    ``spyre`` must name its mixins first (``class SpyreX(SomeMixin, UpstreamX)``): its last
+    base is the class ``module`` must be an exact instance of.
     """
     upstream = spyre.__bases__[-1]
     if type(module) is not upstream:

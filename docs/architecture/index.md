@@ -228,6 +228,18 @@ path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
 the host-side orchestration that calls them.
 
+### Cross-layer KV sharing
+
+Gemma-4's per-layer-embedding checkpoints (E2B, E4B) are the first models here to
+share a KV cache across layers (`num_kv_shared_layers`), so the runner's aliasing in
+`initialize_kv_cache_tensors` — which points a sharing layer's cache at its target's —
+went from dead code to load-bearing. One gap sits above it: vLLM adds a sharing layer to
+its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
+per-layer spec lookup in `initialize_attn_backend` cannot find it. The runner resolves
+those specs into a throwaway copy of the config before delegating upward, and skips the
+whole step for a model without KV sharing. `kv_sharing_fast_prefill` is rejected outright
+for per-layer-embedding models (see Model Adaptations).
+
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
 variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length

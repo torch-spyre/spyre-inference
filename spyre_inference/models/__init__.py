@@ -102,11 +102,7 @@ def register_models() -> None:
 
 
 def has_per_layer_embeddings(text_config) -> bool:
-    """Whether the config declares gemma-4-style per-layer embeddings (PLE).
-
-    ``Gemma4Model`` builds ``embed_tokens_per_layer`` exactly when this is positive, so
-    the config answers before weights load what a module walk answers after.
-    """
+    """``Gemma4Model`` builds ``embed_tokens_per_layer`` exactly when this is positive."""
     return (getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
 
 

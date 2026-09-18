@@ -445,6 +445,18 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
     assert all(block._compiled_call_impl is None for block in model.model.layers)
 
 
+def test_model_granularity_is_rejected_for_per_layer_embeddings(monkeypatch) -> None:
+    """A PLE model's per-layer row cut has to stay outside the compiled region."""
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
+    runner = _runner(_Model(num_layers=2))
+    runner.vllm_config.model_config.hf_text_config = types.SimpleNamespace(
+        hidden_size_per_layer_input=256
+    )
+
+    with pytest.raises(NotImplementedError, match="SPYRE_COMPILE_GRANULARITY=model"):
+        runner._compile_for_spyre()
+
+
 def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:
     """The path every MLA and vision-tower model takes."""
     compiled: list[nn.Module] = []

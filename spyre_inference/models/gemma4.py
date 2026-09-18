@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -127,18 +127,15 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
         decoder.register_buffer(name, scalar, persistent=False)
 
 
-def reject_masked_per_layer_vocab(decoder: nn.Module) -> None:
+def reject_masked_per_layer_vocab(decoder: SpyreGemma4SelfDecoderLayers) -> None:
     """Reject a PLE checkpoint whose per-layer vocab is narrower than the full one.
 
-    Upstream then masks ``input_ids`` down to the per-layer vocab, and that mask is a
-    ``torch.bool`` result over an int operand, which torch-spyre lowers in neither mode:
-    its eager dispatch goes through the same Inductor backend, so there is no eager path
-    to fall back to. Raised at construction, before weights load, not mid-forward.
+    Upstream masks ``input_ids`` down to it, a ``torch.bool`` result over an int operand
+    that torch-spyre lowers in neither mode: eager dispatches through Inductor too.
     """
     if decoder.embed_tokens_per_layer is None:
         return
-    self_decoder = cast("Any", decoder)
-    per_layer, full = self_decoder.vocab_size_per_layer_input, self_decoder.config.vocab_size
+    per_layer, full = decoder.vocab_size_per_layer_input, decoder.config.vocab_size
     if per_layer < full:
         raise NotImplementedError(
             f"Gemma-4 per-layer embeddings on Spyre require vocab_size_per_layer_input "
@@ -172,6 +169,28 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
 
 
+class _PerLayerRows(torch.Tensor):
+    """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
+
+    A compiled block reads that nonzero-offset view from offset 0 (torch-spyre#3770).
+    """
+
+    # No subclass propagation: only the instance the projection hands back carries rows.
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
     """Self-decoder adapting the two PLE operations Spyre cannot lower."""
 
@@ -183,10 +202,7 @@ class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
         )
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        """Upstream's, minus the mask ``reject_masked_per_layer_vocab`` makes a no-op.
-
-        That mask is a torch.bool result over an int operand, which Spyre cannot lower.
-        """
+        """Upstream's, minus the mask ``reject_masked_per_layer_vocab`` makes a no-op."""
         if self.embed_tokens_per_layer is None:
             return None
         per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
@@ -210,29 +226,6 @@ class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
         return rows
 
 
-class _PerLayerRows(torch.Tensor):
-    """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
-
-    Upstream's backbone loop cuts each block's row with exactly that index, and a
-    compiled block reads that nonzero-offset view from offset 0 (torch-spyre#3770).
-    """
-
-    # No subclass propagation: only the instance the projection hands back carries rows.
-    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
-
-    spyre_rows: tuple[torch.Tensor, ...]
-
-    def __getitem__(self, index: Any) -> torch.Tensor:
-        if (
-            isinstance(index, tuple)
-            and len(index) == 3
-            and index[0] == index[2] == slice(None)
-            and isinstance(index[1], int)
-        ):
-            return self.spyre_rows[index[1]]
-        return torch.Tensor.__getitem__(self, index)
-
-
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 adapted for the Spyre compile path, with Spyre MoE expert dispatch."""
 
@@ -241,5 +234,5 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
         reject_masked_per_layer_vocab(decoder)
         decoder.init_spyre_compile()
-        register_aliased_scalars(self.model.self_decoder)
+        register_aliased_scalars(decoder)
         configure_gemma4_moe_layers(self.model.layers)

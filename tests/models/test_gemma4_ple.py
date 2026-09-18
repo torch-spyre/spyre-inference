@@ -55,10 +55,8 @@ def _backbone(layers: list[nn.Module], rows: _PerLayerRows) -> upstream.Gemma4Mo
 
 
 def test_upstream_backbone_loop_uses_precomputed_per_layer_rows(monkeypatch):
-    """The only PLE cut Spyre reaches is ``Gemma4Model.forward``'s inline
-    ``per_layer_inputs[:, layer_idx, :]``: upstream's other one, in ``_run_decoder_layers``,
-    is reachable only through ``fast_prefill_forward``, which the platform rejects for
-    per-layer-embedding models.
+    """The only PLE cut Spyre reaches: upstream's other one, in ``_run_decoder_layers``,
+    needs ``fast_prefill_forward``, which the platform rejects for PLE models.
     """
     monkeypatch.setattr(
         upstream,
@@ -93,8 +91,7 @@ def _decoder_with_masked_ple() -> SpyreGemma4SelfDecoderLayers:
 
 
 def test_masked_per_layer_vocab_is_rejected():
-    """Unconditional: torch-spyre's eager dispatch lowers through Inductor too, so
-    enforce_eager is not a way around the mask."""
+    """Unconditional: eager dispatches through Inductor too, so enforce_eager cannot help."""
     with pytest.raises(NotImplementedError, match="vocab_size_per_layer_input"):
         reject_masked_per_layer_vocab(_decoder_with_masked_ple())
 
@@ -111,3 +108,21 @@ def test_checkpoint_without_per_layer_embeddings_is_accepted():
     decoder.embed_tokens_per_layer = None
 
     reject_masked_per_layer_vocab(decoder)
+
+
+@pytest.mark.parametrize(
+    ("attr", "expected"),
+    [({"hidden_size_per_layer_input": 256}, True), ({"hidden_size_per_layer_input": 0}, False)],
+)
+def test_has_per_layer_embeddings_reads_the_config(attr, expected):
+    from spyre_inference.models import has_per_layer_embeddings
+
+    assert has_per_layer_embeddings(SimpleNamespace(**attr)) is expected
+
+
+def test_has_per_layer_embeddings_defaults_to_false_without_the_attribute():
+    """Every non-gemma-4 config: the guards must not reject them."""
+    from spyre_inference.models import has_per_layer_embeddings
+
+    assert has_per_layer_embeddings(SimpleNamespace()) is False
+    assert has_per_layer_embeddings(SimpleNamespace(hidden_size_per_layer_input=None)) is False

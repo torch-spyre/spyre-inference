@@ -656,13 +656,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linears.
+        """True if the model has Spyre FP8 linear layers in its blocks.
 
         ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
         Granite ``compressed-tensors`` stores it on the scheme
         (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
         Checkpoint FP8 weights are the fallback: ``process_weights_after_loading``
         keeps ``float8_e4m3fn``.
+
+        Note: the FP8 LM head (``SpyreFp8LMHeadMethod``) is deliberately
+        excluded — it compiles separately via ``compile_when_outermost`` /
+        ``@dynamo.disable`` and is not part of the per-block graph whose
+        ``fullgraph`` flag this method governs.
         """
         from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
 

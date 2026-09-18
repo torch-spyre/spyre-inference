@@ -307,8 +307,8 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
-        # Divides both widths ``_apply`` builds, so these tests exercise the token bound and not
-        # the row-addressability guard; the guard has its own test, which widens this.
+        # Divides both widths ``_apply`` builds, so these tests hit the token bound, not the
+        # row-addressability guard, which has its own test.
         spyre_moe_stick=16,
         top_k=TOP_K,
     )
@@ -340,11 +340,7 @@ def test_a_small_batch_drives_the_gathered_form_once_per_token(monkeypatch):
 
 
 def test_a_batch_whose_rows_are_not_stick_addressable_takes_the_all_expert_form(monkeypatch):
-    """Copying row ``t`` out bakes offset ``t * width``, which must span whole sticks.
-
-    An expert count narrower than a stick leaves every row but the first unaddressable, so the
-    batch has to go to the all-expert region even below the bound.
-    """
+    """An expert count narrower than a stick leaves rows unaddressable, so gathered is skipped."""
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch)
     layer = _dispatch_layer("full_softmax")
@@ -424,10 +420,8 @@ def test_gathered_matches_dense_reference(moe_weights):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# One row of the packed batch is copied out per token, and the backend can only bake a storage
-# offset that is a whole number of sticks. Row t of the router logits starts at t * num_experts,
-# so the loop needs an expert count that spans whole sticks; EXPERTS above does not, on purpose,
-# so the dispatch's fallback is exercised too.
+# Row ``t`` of the router logits starts at ``t * num_experts``, which must span whole sticks to be
+# addressable. ``EXPERTS`` above deliberately does not, so the dispatch fallback is covered too.
 STICK_EXPERTS = 64
 
 
@@ -456,12 +450,8 @@ def stick_aligned_moe_weights():
 def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
     """The per-token driver over a packed batch, against the same dense reference.
 
-    Beyond re-checking the arithmetic, this pins the buffer lifetime the driver depends on. The
-    MoE regions compile under ``frontend_pool_allocation``, which permits two calls of one graph
-    to be handed the same output address, and the driver is the only caller that holds a region
-    result across another call of that region. If a pin ever does reuse the buffer, rows take
-    another token's expert output with no error raised — an O(1) error, far outside the tolerance
-    here, and invisible without a comparison like this one.
+    Also pins the buffer lifetime: a reused region output silently gives a row another token's
+    experts, which nothing but a value comparison would catch.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config

@@ -289,19 +289,12 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 def _gathered_tokens(
     layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 ) -> torch.Tensor:
-    """Serve a packed batch from the gathered region, which lowers one token at a time.
-
-    The region reads only each token's routed experts, so driving it per token adds a
-    host launch per token and no extra expert bytes.
-    """
     region = _region(layer, "gathered", _gathered)
     tokens = x.shape[0]
     if tokens == 1:
         return region(layer, x, router_logits)
-    # The MoE regions compile under ``frontend_pool_allocation``, which lets two calls of one
-    # graph share an output address, so a region result is only guaranteed valid until the next
-    # call. Growing the batch a row at a time holds exactly one of them: the accumulator starts
-    # as a copy, and every later accumulator is a fresh concatenate rather than a region result.
+    # Under ``frontend_pool_allocation`` two calls of one graph can share an output address, so a
+    # region result is only valid until the next call: hence the copy and the per-row concatenate.
     packed = _gathered_row(region, layer, x, router_logits, 0).clone()
     for token in range(1, tokens):
         packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token)])
@@ -309,25 +302,16 @@ def _gathered_tokens(
 
 
 def _rows_start_on_sticks(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
-    """Whether one row of each input can be copied out of a packed batch.
-
-    Copying a row bakes its storage offset into the kernel coordinate, and the backend can
-    only express an offset that is a whole number of sticks. Row ``t`` begins at ``t * width``,
-    so the widths alone decide it: an expert count or hidden size below one stick, or astride
-    one, leaves every row but the first unaddressable.
-    """
+    # Copying row ``t`` bakes its storage offset ``t * width`` into the kernel coordinate, and the
+    # backend can only express an offset that is a whole number of sticks.
     return x.shape[-1] % stick == 0 and router_logits.shape[-1] % stick == 0
 
 
 def _gathered_row(
     region: Any, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, token: int
 ) -> torch.Tensor:
-    """One token through the gathered region — the same call a batch of one makes.
-
-    The inputs are cloned because a compiled region reads them from storage offset 0 whatever
-    the view's offset (torch-spyre#3770), so a bare ``x[token : token + 1]`` would make every
-    row read row 0. ``clone()`` rather than ``contiguous()``: a one-row slice already is.
-    """
+    # A compiled region reads its inputs from storage offset 0 whatever the view's offset
+    # (torch-spyre#3770), so the slices must be cloned or every row would read row 0.
     row = slice(token, token + 1)
     return region(layer, x[row].clone(), router_logits[row].clone())
 
@@ -476,15 +460,8 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
         with moe_scope:
-            # Neither form covers both token regimes, so the bound is not a design
-            # choice. The gathered region reads only the routed experts but lowers at
-            # exactly one token; the all-expert region has no single-row form at all.
-            # A small packed batch therefore drives the gathered region once per token.
-            # Where that stops paying is a tuning decision the env var carries: the
-            # all-expert region reads every expert whatever the token count, so its cost
-            # per token falls with the batch while the per-token loop's stays flat.
-            # A single token needs no bound: it is the only count the gathered region lowers
-            # at, and the all-expert region has no single-row form to fall back to.
+            # The gathered region lowers at exactly one token and the all-expert region has no
+            # single-row form, so a small batch drives gathered per token; the bound is tuning.
             if tokens == 1 or (
                 tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
                 and _rows_start_on_sticks(x, router_logits, layer.spyre_moe_stick)

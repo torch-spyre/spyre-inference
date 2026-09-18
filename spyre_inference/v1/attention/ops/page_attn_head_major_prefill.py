@@ -28,7 +28,7 @@ def page_attn_head_major_prefill_kernel(
     query_row_index,
     k_pages,
     v_pages,
-    page_index_tables,
+    kv_index_tables,
     mask_tiles,
     scale,
     num_blocks,
@@ -42,8 +42,9 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    Shapes are ``page_attn_head_major``'s, except ``page_index_tables``: one [1] int32 device
-    tensor per active block, indexing ``[num_blocks, num_kv_heads, block_size, head_size]``.
+    Shapes are ``page_attn_head_major``'s: ``kv_index_tables`` is one [num_kv_heads, 1] int32
+    device tensor per active block, indexing the cache folded to
+    ``[num_pages * num_kv_heads, block_size, head_size]``.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
@@ -61,11 +62,11 @@ def page_attn_head_major_prefill_kernel(
     tile_output = None
 
     for i in range(num_blocks):
-        # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
-        # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
-        page_idx = page_index_tables[i]
-        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        # Subscripting a [num_kv_heads, 1] index, not index_select on a [1] page id: a gather
+        # splits only on its index-entry axis, and one page id is one entry to split across.
+        kv_rows = kv_index_tables[i]
+        k_page = k_pages[kv_rows].reshape(num_kv_heads, 1, block_size, head_size)
+        v_page = v_pages[kv_rows].reshape(num_kv_heads, 1, block_size, head_size)
         mask_tile = mask_tiles[i]
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale

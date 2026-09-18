@@ -191,13 +191,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._folded
 
-    # The base publishes one table per sequence; this layout needs two, so the pair travels
-    # together and `_run_page_attn` picks the one its kernel reads.
-    def build_index_tables(  # ty: ignore[invalid-method-override]
+    def build_index_tables(
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
-    ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
-        """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
-        paired with the page id alone for the wide-query kernel.
+    ) -> list[list[torch.Tensor]]:
+        """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows.
 
         One [KV, 1] tensor per block, not rows of one table: an index tensor reaches the
         hardware as a tensor argument, so a slice's nonzero storage offset is dropped and
@@ -206,23 +203,12 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
         heads = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(self.num_kv_heads, 1)
-        query_lens = attn_metadata.aligned_query_lens
         return [
-            (
-                [
-                    convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
-                    for b in range(pages.shape[0])
-                ],
-                # Only a wide query reads these, and building them for a decode step would
-                # add an H2D transfer per page to the path this layout exists to speed up.
-                [
-                    convert(torch.tensor([int(pages[b, 0])], dtype=torch.int32), device=device)
-                    for b in range(pages.shape[0])
-                ]
-                if query_lens[s] > 1
-                else [],
-            )
-            for s, pages in enumerate(tables_cpu)
+            [
+                convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
+                for b in range(pages.shape[0])
+            ]
+            for pages in tables_cpu
         ]
 
     def _run_batched_decode(
@@ -273,7 +259,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
-        kv_row_table, page_table = index_table
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
@@ -283,9 +268,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     _page_attn_prefill_compiled,
                     query,
                     row_table,
-                    k_pages,
-                    v_pages,
-                    page_table,
+                    k_folded,
+                    v_folded,
+                    index_table,
                     mask_tiles,
                     self.scale,
                     num_blocks,
@@ -308,7 +293,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 row_table,
                 k_folded,
                 v_folded,
-                kv_row_table,
+                index_table,
                 mask_tiles,
                 self.scale,
                 num_blocks,

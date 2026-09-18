@@ -1199,7 +1199,7 @@ def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs
 def test_encoder_build_skips_kv_cache_fields(default_vllm_config) -> None:
     meta = _profile_metadata(EncoderOnlyAttentionSpec, max_model_len=512, prompt_len=64, num_seqs=2)
     assert meta.padded_num_blocks is None
-    assert not meta.attention_mask_tiles
+    assert not meta.attention_mask_stacks
     assert meta.page_index_tables_cpu is None
     assert meta.active_block_indices is None
     # Everything SpyreEncoderAttentionImpl.forward actually reads.

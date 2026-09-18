@@ -28,8 +28,8 @@ def page_attn_head_major_prefill_kernel(
     query_row_index,
     k_pages,
     v_pages,
-    page_index_tables,
-    mask_tiles,
+    page_index_table,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -42,13 +42,14 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    Shapes are ``page_attn_head_major``'s, except ``page_index_tables``: one [1] int32 device
-    tensor per active block, indexing ``[num_blocks, num_kv_heads, block_size, head_size]``.
+    Shapes are ``page_attn_head_major``'s, except ``page_index_table``: one [num_blocks, 1]
+    int32 tensor of page ids into ``[num_blocks, num_kv_heads, block_size, head_size]``,
+    sliced per block in-graph.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
-    # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
-    # strides (torch-spyre#3770).
+    # Gathered, not sliced outside: a view's storage_offset is a Dynamo graph guard
+    # (torch-spyre#4449) and q_start varies, so a slice compiles one kernel per batch layout.
     q_rows = query.index_select(0, query_row_index[:padded_query_len])
     q = (
         q_rows.unsqueeze(0)
@@ -63,10 +64,10 @@ def page_attn_head_major_prefill_kernel(
     for i in range(num_blocks):
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
-        page_idx = page_index_tables[i]
+        page_idx = page_index_table[i]
         k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        mask_tile = mask_tiles[i]
+        mask_tile = mask_stack[i]
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:

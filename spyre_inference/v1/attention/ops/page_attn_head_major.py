@@ -32,7 +32,7 @@ def page_attn_head_major_kernel(
     v_pages,
     kv_index_tables,
     head_index_tables,
-    mask_tiles,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -55,19 +55,20 @@ def page_attn_head_major_kernel(
         k_pages / v_pages: [num_pages_total * num_kv_heads, block_size, head_size]
         kv_index_tables: per active block, a [num_kv_heads, 1] int32 device tensor of that
             block's ``page * num_kv_heads + kv`` rows. One real tensor per block, not a
-            slice of a table: an index tensor reaches the hardware as a tensor argument,
-            so a slice's nonzero storage offset is dropped (torch-spyre#3770).
+            slice of a table: an int32 argument's nonzero storage offset is dropped
+            (torch-spyre#3770), and an in-graph slice of a stacked one silently gathers the
+            wrong rows at this shape.
         head_index_tables: per query group, a [num_kv_heads] int32 device tensor of that
             group's head ids (``kv * num_queries_per_kv + g``).
-        mask_tiles: [num_blocks], each [padded_query_len, block_size]
+        mask_stack: [num_blocks, padded_query_len, block_size], sliced per block in-graph.
         out: buffer to store into, or None to return the result instead.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
-    # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
-    # strides (torch-spyre#3770).
+    # Gathered, not sliced outside: a view's storage_offset is a Dynamo graph guard
+    # (torch-spyre#4449) and q_start varies, so a slice compiles one kernel per batch layout.
     q_rows = query.index_select(0, query_row_index[:padded_query_len])
     # Rows before heads: selecting heads first keeps every staging row, so each group
     # would build a full-height intermediate and gather one row back out of it.
@@ -88,7 +89,7 @@ def page_attn_head_major_kernel(
         k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
         v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
         k_t = k_page.permute(0, 2, 1)
-        mask_tile = mask_tiles[i]
+        mask_tile = mask_stack[i]
 
         for g in range(num_queries_per_kv):
             scores = torch.matmul(q_groups[g], k_t) * scale
@@ -132,7 +133,7 @@ def page_attn_head_major_decode_kernel(
     k_pages,
     v_pages,
     kv_index_tables,
-    mask_tiles,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -170,7 +171,7 @@ def page_attn_head_major_decode_kernel(
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # At one query row the mask is head-independent, so its [1, block_size] tile
         # broadcasts across the folded group axis.
-        scores = scores + mask_tiles[i]
+        scores = scores + mask_stack[i]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
         if i == 0:

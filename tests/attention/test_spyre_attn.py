@@ -37,7 +37,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _mirror_mask_tiles,
+    _mirror_mask_stacks,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -1168,8 +1168,8 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     )
 
     # Compare masks - they should be identical when window doesn't bind
-    mask_none = metadata_none.attention_mask_tiles[0][0]
-    mask_swa = metadata_swa.attention_mask_tiles[0][0]
+    mask_none = metadata_none.attention_mask_stacks[0][0]
+    mask_swa = metadata_swa.attention_mask_stacks[0][0]
 
     assert torch.equal(mask_none, mask_swa), (
         "Masks differ when sliding_window >= seq_len. "
@@ -1217,7 +1217,7 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     )
 
     # Query at position 3 (absolute) should attend to [0, 1, 2, 3] - all 4 tokens
-    mask_eq = metadata_eq.attention_mask_tiles[0][0]
+    mask_eq = metadata_eq.attention_mask_stacks[0][0]
     attended_eq = (mask_eq[0] == 0).nonzero().flatten().tolist()
     assert attended_eq == [0, 1, 2, 3], f"Expected [0,1,2,3], got {attended_eq}"
 
@@ -1244,7 +1244,7 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     )
 
     # Query at position 4 (absolute) should attend to [1, 2, 3, 4] - 4 tokens
-    mask_gt = metadata_gt.attention_mask_tiles[0][0]
+    mask_gt = metadata_gt.attention_mask_stacks[0][0]
     attended_gt = (mask_gt[0] == 0).nonzero().flatten().tolist()
     assert attended_gt == [1, 2, 3, 4], f"Expected [1,2,3,4], got {attended_gt}"
 
@@ -1279,22 +1279,21 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     )
 
     # Seq 0 (kv_len=4): query at position 3, attends to [0, 1, 2, 3]
-    mask_mixed_0 = metadata_mixed.attention_mask_tiles[0][0]
+    mask_mixed_0 = metadata_mixed.attention_mask_stacks[0][0]
     attended_mixed_0 = (mask_mixed_0[0] == 0).nonzero().flatten().tolist()
     assert attended_mixed_0 == [0, 1, 2, 3], f"Seq 0: expected [0,1,2,3], got {attended_mixed_0}"
 
     # Seq 1 (kv_len=9): query at position 8, attends to [5, 6, 7, 8]
-    mask_mixed_1 = metadata_mixed.attention_mask_tiles[1][0]
+    mask_mixed_1 = metadata_mixed.attention_mask_stacks[1][0]
     attended_mixed_1 = (mask_mixed_1[0] == 0).nonzero().flatten().tolist()
     assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"
 
 
-def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, monkeypatch):
-    """Interior blocks sharing the zero tile must cost a single H2D transfer.
+def test_mirror_mask_stacks_one_transfer_per_sequence(default_vllm_config, monkeypatch):
+    """One H2D transfer per sequence, not per block.
 
-    Guards against a regression back to one transfer per block, which is
-    invisible in outputs: the mirrored tiles compare equal either way, so only
-    the transfer count and the device-side object identity distinguish them.
+    Invisible in outputs -- the mirrored mask compares equal either way -- so only the
+    transfer count distinguishes them.
     """
     torch.set_default_device("cpu")
 
@@ -1314,18 +1313,10 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
         sliding_window=sliding_window,
     )
 
-    tiles_cpu = metadata.attention_mask_tiles
-    assert tiles_cpu is not None
-    seq_tiles = tiles_cpu[0]
-    num_distinct = len({id(t) for t in seq_tiles})
-    assert num_distinct < len(seq_tiles), (
-        "builder no longer shares one CPU tile across interior blocks, so this "
-        "test cannot observe the memoization"
-    )
+    stacks_cpu = metadata.attention_mask_stacks
+    assert stacks_cpu is not None
+    assert stacks_cpu[0].shape[0] > 1, "need more than one active block to be meaningful"
 
-    # `convert` short-circuits same-device/same-dtype, so a real CPU->CPU call
-    # would hand back the input and make identity checks vacuous. Count the
-    # calls and return a distinct tensor from each instead.
     calls: list[torch.Tensor] = []
 
     def counting_convert(tensor, device=None, dtype=None):
@@ -1333,19 +1324,12 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
         return tensor.clone()
 
     monkeypatch.setattr(spyre_attn, "convert", counting_convert)
-    tiles_device = _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
+    stacks_device = _mirror_mask_stacks(stacks_cpu, torch.device("cpu"))
 
-    assert len(calls) == num_distinct, (
-        f"expected {num_distinct} transfers for {len(seq_tiles)} blocks, got {len(calls)}"
+    assert len(calls) == len(stacks_cpu), (
+        f"expected one transfer per sequence, got {len(calls)} for {len(stacks_cpu)}"
     )
-
-    # Blocks that shared a CPU tile must share the mirrored device tensor.
-    for i, tile_i in enumerate(seq_tiles):
-        for j, tile_j in enumerate(seq_tiles):
-            if tile_i is tile_j:
-                assert tiles_device[0][i] is tiles_device[0][j]
-            else:
-                assert tiles_device[0][i] is not tiles_device[0][j]
+    assert torch.equal(stacks_device[0], stacks_cpu[0])
 
 
 # ---------------------------------------------------------------------------
@@ -2214,7 +2198,7 @@ def test_spyre_attn_mixed_batch_batched_decode(
 
 def _seq_mask(metadata, seq_idx: int) -> torch.Tensor:
     """Concatenate a sequence's per-block mask tiles into [aligned_q, num_blocks*block]."""
-    return torch.cat(metadata.attention_mask_tiles[seq_idx], dim=-1)
+    return torch.cat(list(metadata.attention_mask_stacks[seq_idx]), dim=-1)
 
 
 @pytest.mark.parametrize(
@@ -2397,7 +2381,7 @@ def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expect
     metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])
 
     assert metadata.padded_num_blocks == [expected]
-    assert len(metadata.attention_mask_tiles[0]) == expected
+    assert metadata.attention_mask_stacks[0].shape[0] == expected
     # One table per sequence, sized to that sequence's own active-block count.
     assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]
 
@@ -2420,7 +2404,7 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config)
 
     mask_min = torch.finfo(torch.float16).min
     for b in range(real_blocks, narrow.padded_num_blocks[0]):
-        tile = narrow.attention_mask_tiles[0][b]
+        tile = narrow.attention_mask_stacks[0][b]
         assert torch.equal(tile, torch.full_like(tile, mask_min)), f"block {b} is not finfo.min"
 
     # The real prefix must be bit-identical regardless of extra table
@@ -2430,7 +2414,7 @@ def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config)
     )
     assert wide.padded_num_blocks == narrow.padded_num_blocks
     for b in range(real_blocks):
-        assert torch.equal(narrow.attention_mask_tiles[0][b], wide.attention_mask_tiles[0][b]), (
+        assert torch.equal(narrow.attention_mask_stacks[0][b], wide.attention_mask_stacks[0][b]), (
             f"real block {b} changed"
         )
 
@@ -2441,7 +2425,7 @@ def test_zero_kv_len_stays_at_zero_blocks(default_vllm_config):
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=_num_blocks_buckets()[-1])
 
     assert metadata.padded_num_blocks[0] == 0
-    assert metadata.attention_mask_tiles[0] == []
+    assert metadata.attention_mask_stacks[0].shape[0] == 0
     assert metadata.padded_num_blocks[1] == 2
 
 

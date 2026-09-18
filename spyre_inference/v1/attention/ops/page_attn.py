@@ -23,7 +23,7 @@ def page_attn_kernel(
     k_pages,
     v_pages,
     page_index_table,
-    mask_tiles,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -48,7 +48,7 @@ def page_attn_kernel(
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
             column 0.
-        mask_tiles: [num_blocks]
+        mask_stack: [num_blocks, padded_query_len, block_size], sliced per block in-graph.
         alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants — see the derivation at the bias-tile
@@ -59,8 +59,8 @@ def page_attn_kernel(
     kernel stored the result itself.
     """
     num_queries_per_kv = num_heads // num_kv_heads
-    # A compiled region reads a view from offset 0, ignoring storage_offset
-    # (torch-spyre#3770), so the rows are gathered here rather than sliced outside.
+    # Gathered, not sliced outside: a view's storage_offset is a Dynamo graph guard
+    # (torch-spyre#4449) and q_start varies, so a slice compiles one kernel per batch layout.
     q_rows = query.index_select(0, query_row_index[:padded_query_len])
     q = (
         q_rows.unsqueeze(0)
@@ -82,7 +82,7 @@ def page_attn_kernel(
         k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
         v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
-        mask_tile = mask_tiles[i]
+        mask_tile = mask_stack[i]
 
         scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:

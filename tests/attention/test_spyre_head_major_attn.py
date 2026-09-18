@@ -758,7 +758,7 @@ def test_head_major_matches_token_major(
         # Each impl builds its own device tables onto the metadata; clear the first one's
         # so the second is not handed the wrong shapes.
         attn_metadata.kernel_index_tables = None
-        attn_metadata.attention_mask_tiles_device = None
+        attn_metadata.attention_mask_stacks_device = None
         attn_metadata.query_row_tables = None
         impl.forward(
             layer=None,
@@ -855,8 +855,8 @@ def test_decode_fold_matches_unrolled():
     head_tables = [
         torch.tensor([h * qpk + g for h in range(kv)], dtype=torch.int32) for g in range(qpk)
     ]
-    masks = [torch.zeros(1, block) for _ in range(blocks)]
-    masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
+    masks = torch.zeros(blocks, 1, block)
+    masks[-1, 0, block // 2 :] = torch.finfo(torch.float32).min
 
     for soft_cap in (0.0, 30.0):
         args = (

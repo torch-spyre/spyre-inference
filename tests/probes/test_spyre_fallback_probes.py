@@ -712,6 +712,138 @@ def test_spyre_compile_input_honors_last_dim_window(spyre_device, start):
 
 
 # ---------------------------------------------------------------------------
+# 8c. storage_offset is a graph guard, so a varying one is a recompile axis
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_compile_input_offset_specialises_the_graph(spyre_device):
+    """One compiled variant per distinct storage_offset.
+
+    torch-spyre#4449 fixed the silent offset-0 read of torch-spyre#3770 with a Dynamo
+    guard on the offset (``_monkey_patch.py``), not a runtime read, so a caller whose
+    offset varies recompiles. This is what keeps the paged-attention query rows gathered.
+    """
+    rows, width = 4, 64
+    base = torch.stack([torch.full((rows, width), float(s)) for s in range(3)])
+    base = base.to(torch.float16).to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    code = fn._torchdynamo_orig_callable.__code__  # ty: ignore[unresolved-attribute]
+    for s in range(3):
+        fn(base[s])
+    entries = torch._dynamo.eval_frame._debug_get_cache_entry_list(code)
+    assert len(entries) == 3, (
+        f"expected one compiled variant per storage offset, got {len(entries)}; if this "
+        "is now 1, torch-spyre reads the offset at runtime and a slice is free to "
+        "replace a gather"
+    )
+    offsets = {
+        line.split("storage_offset ==")[1].strip()
+        for entry in entries
+        for line in str(entry.guard_manager).splitlines()
+        if "storage_offset ==" in line
+    }
+    assert offsets == {"0", str(rows * width), str(2 * rows * width)}, offsets
+
+
+# ---------------------------------------------------------------------------
+# 8d. Slicing a stacked input INSIDE the graph, the other way to avoid offsets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("query_len", [1, 64])
+def test_spyre_in_graph_slice_of_stacked_fp16_input(spyre_device, query_len):
+    """One stacked mask sliced per block in-graph, the form the mask mirror uses.
+
+    No offset reaches a guard, unlike a sliced graph input.
+    """
+    blocks, block_size = 8, 128
+    stack_cpu = torch.stack(
+        [torch.full((query_len, block_size), float(b)) for b in range(blocks)]
+    ).to(torch.float16)
+    stack = stack_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(s):
+        acc = s[0] * 2.0
+        for i in range(1, blocks):
+            acc = acc + s[i] * 2.0
+        return acc
+
+    expected = sum(stack_cpu[b] * 2.0 for b in range(blocks))
+    torch.testing.assert_close(fn(stack).cpu(), expected, atol=0, rtol=0)
+
+
+def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
+    pages_cpu = (torch.arange(blocks * entries * block_size * head_size) % 97).reshape(
+        blocks * entries, block_size, head_size
+    )
+    pages_cpu = pages_cpu.to(torch.float16)
+    return pages_cpu, pages_cpu.to(spyre_device)
+
+
+def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
+    """One stacked [num_blocks, 1] int32 table, sliced in-graph, feeding index_select.
+
+    An int32 argument's offset is dropped
+    (test_spyre_compile_input_honors_storage_offset[dtype1]); an in-graph slice of a
+    stacked table is a different mechanism and holds at this shape, which is what
+    ``page_attn_head_major_prefill`` reads.
+    """
+    blocks, block_size, head_size = 4, 64, 64
+    pages_cpu, pages = _stacked_index_pages(blocks, 1, block_size, head_size, spyre_device)
+    table_cpu = torch.arange(blocks, dtype=torch.int32).reshape(blocks, 1)
+    table = table_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(p, t):
+        acc = p.index_select(0, t[0])
+        for i in range(1, blocks):
+            acc = acc + p.index_select(0, t[i])
+        return acc
+
+    expected = sum(pages_cpu.index_select(0, table_cpu[b].to(torch.int64)) for b in range(blocks))
+    torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "An in-graph row slice of a stacked [num_blocks, KV, 1] int32 table gathers the "
+        "wrong rows -- silently, with no compile error. The [num_blocks, 1] form above "
+        "works, so the head-major kv_index_tables cannot be collapsed into one transfer "
+        "the way its page indices can."
+    ),
+)
+def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
+    """The same idea at the [KV, 1] entry shape ``page_attn_head_major`` gathers with.
+
+    A 2-D entry cannot go through index_select, hence the subscript.
+    """
+    blocks, kv, block_size, head_size = 4, 8, 64, 64
+    pages_cpu, pages = _stacked_index_pages(blocks, kv, block_size, head_size, spyre_device)
+    rows = torch.arange(kv, dtype=torch.int32).reshape(kv, 1)
+    table_cpu = torch.stack([b * kv + rows for b in range(blocks)])
+    table = table_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(p, t):
+        acc = p[t[0]].reshape(kv, block_size, head_size)
+        for i in range(1, blocks):
+            acc = acc + p[t[i]].reshape(kv, block_size, head_size)
+        return acc
+
+    expected = sum(
+        pages_cpu[table_cpu[b].to(torch.int64)].reshape(kv, block_size, head_size)
+        for b in range(blocks)
+    )
+    torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
 # 9. Slot-major KV cache: the indirect scatter write
 # ---------------------------------------------------------------------------
 

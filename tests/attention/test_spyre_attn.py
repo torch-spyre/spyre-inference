@@ -924,8 +924,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     (1) the backend's advertised shape, (2) TorchSpyreModelRunner's allocation,
     and (3) the attention kernels. This regression test ensures they stay in
     sync. If get_kv_cache_shape drifts, vLLM code that allocates from the
-    contract (KV transfer, future tests, Mamba zeroing via
-    get_kv_cache_block_dim) will allocate a transposed cache.
+    contract (KV transfer, future tests) will allocate a transposed cache.
     """
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
@@ -963,9 +962,9 @@ def test_kv_cache_shape_matches_runner_allocation():
         num_blocks, block_size, num_kv_heads, head_size
     )
 
-    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples.
-    # The base-class get_kv_cache_block_dim does shape.index(_S), which fails
-    # if shape is a list. Spyre stores K and V as separate NamedTuple fields.
+    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples:
+    # vLLM callers index into it directly. Spyre stores K and V as separate
+    # NamedTuple fields.
     assert isinstance(shape, tuple), f"get_kv_cache_shape must return a tuple, got {type(shape)}"
     assert shape == (
         num_blocks,
@@ -982,9 +981,13 @@ def test_kv_cache_shape_matches_runner_allocation():
         head_size=head_size,
         dtype=torch.float16,
     )
+    # layer_stride/block_stride are required by the 0.29 KVCacheTensor dataclass but
+    # unused by our runner (it reads only size + layers); pass the layer-outer values.
     kv_cache_tensor = KVCacheTensor(
         size=spec.page_size_bytes * num_blocks,
-        shared_by=["layers.0.self_attn"],
+        layers=["layers.0.self_attn"],
+        layer_stride=spec.page_size_bytes * num_blocks,
+        block_stride=spec.page_size_bytes,
     )
     kv_cache_group = KVCacheGroupSpec(
         layer_names=["layers.0.self_attn"],

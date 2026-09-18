@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import bisect
 import time
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import cast
 
 import numpy as np
@@ -170,17 +170,53 @@ def _compute_slot_mapping_impl(
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
 
-class _FuncWrapper:
-    """Mimics Triton's grid-launch syntax: kernel[(grid,)](...) → kernel(...)."""
+class _SlotMappingKernelShim:
+    """Drop-in for vLLM's ComputeSlotMappingKernel on Spyre.
 
-    def __init__(self, func):
-        self.func = func
+    0.29 moved slot-mapping into a Triton VllmJitKernel, launched directly as
+    ``KERNEL(num_reqs, num_tokens, max_num_tokens, ...)``. Triton is unavailable
+    with VLLM_TARGET_DEVICE=empty, so we route the call to the pure-PyTorch impl
+    and no-op the warmup registration (there is no JIT kernel to compile).
+    """
 
-    def __getitem__(self, grid):
-        return self.func
+    def __call__(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        max_num_tokens: int,
+        query_start_loc: torch.Tensor,
+        positions: torch.Tensor,
+        block_table: torch.Tensor,
+        block_table_stride: int,
+        block_size: int,
+        slot_mapping: torch.Tensor,
+        KV_CACHE_BLOCK_SIZE: int | None = None,
+        BLOCKS_PER_KV_BLOCK: int = 1,
+        TOTAL_CP_WORLD_SIZE: int = 1,
+        TOTAL_CP_RANK: int = 0,
+        CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
+    ) -> None:
+        _compute_slot_mapping_impl(
+            num_tokens,
+            max_num_tokens,
+            query_start_loc,
+            positions,
+            block_table,
+            block_table_stride,
+            block_size,
+            slot_mapping,
+            KV_CACHE_BLOCK_SIZE=KV_CACHE_BLOCK_SIZE,
+            BLOCKS_PER_KV_BLOCK=BLOCKS_PER_KV_BLOCK,
+            TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
+            TOTAL_CP_RANK=TOTAL_CP_RANK,
+            CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
+        )
+
+    def register_warmup(self, *args, **kwargs) -> None:
+        pass
 
 
-_compute_slot_mapping_kernel = _FuncWrapper(_compute_slot_mapping_impl)
+_compute_slot_mapping_kernel = _SlotMappingKernelShim()
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -568,9 +604,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
         from vllm.v1.worker import block_table
 
-        # Deliberately swap the Triton JITFunction for the grid-launch-compatible
-        # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        # Swap the whole ComputeSlotMappingKernel instance for our shim, before any
+        # BlockTable is built: its constructor calls register_warmup() on this
+        # module attribute, which our shim no-ops so warmup never tries to compile.
+        block_table._COMPUTE_SLOT_MAPPING_KERNEL = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -1332,7 +1369,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
-    def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
+    def initialize_kv_cache_tensors(
+        self,
+        kv_cache_config,
+        kernel_block_sizes,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages), in the shape and
@@ -1361,18 +1403,27 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            # All layers in `shared_by` use the same spec by construction.
-            spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
-            num_blocks = kv_cache_tensor.size // spec.page_size_bytes
-
-            # The layout belongs to the backend; a layer without an impl (fixture
-            # stubs) gets the token-major default.
-            impl = getattr(static_ctx.get(kv_cache_tensor.shared_by[0]), "impl", None)
-            impl_cls = type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
-            page_cache = impl_cls.allocate_pages(num_blocks, spec, self._spyre_device)
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_caches[layer_name] = page_cache
+        # Upstream threads a memory-pool context here; TorchSpyreWorker supplies a
+        # nullcontext (Spyre pages live on-device, not in a host cumem pool), so
+        # entering it is a no-op — honour it anyway to match the base contract.
+        with kv_cache_allocation_context or nullcontext():
+            # A 0.29 KVCacheTensor packs every layer it lists into one allocation
+            # (num_blocks is per-layer). Each layer gets its own on-device pages: one
+            # shared buffer aliases every layer onto the same block, so a later layer's
+            # write clobbers an earlier layer's KV.
+            num_blocks = kv_cache_config.num_blocks
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                for layer_name in kv_cache_tensor.layers:
+                    spec = spec_by_layer[layer_name]
+                    # The layout belongs to the backend; a layer without an impl (fixture
+                    # stubs) gets the token-major default.
+                    impl = getattr(static_ctx.get(layer_name), "impl", None)
+                    impl_cls = (
+                        type(impl) if isinstance(impl, SpyreAttentionImpl) else SpyreAttentionImpl
+                    )
+                    kv_caches[layer_name] = impl_cls.allocate_pages(
+                        num_blocks, spec, self._spyre_device
+                    )
 
         for layer_name, target in self.shared_kv_cache_layers.items():
             kv_caches[layer_name] = kv_caches[target]

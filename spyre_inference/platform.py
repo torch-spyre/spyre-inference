@@ -577,6 +577,16 @@ class TorchSpyrePlatform(CpuPlatform):
 
         configure_threading(parallel_config.world_size)
 
+        # Pin the V1 model runner: 0.29 defaults to V2, which needs Triton (absent on
+        # Spyre), and TorchSpyreWorker builds the V1 GPUModelRunner subclass directly.
+        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") not in (None, "", "0"):
+            logger.warning(
+                "Spyre only supports the V1 model runner; overriding "
+                "VLLM_USE_V2_MODEL_RUNNER=%s to 0.",
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"],
+            )
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"

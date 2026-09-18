@@ -127,12 +127,10 @@ def _mirror_mask_tiles(
 ) -> list[list[torch.Tensor]]:
     """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
+    Keying on `id()` collapses shared CPU tiles to a single H2D transfer.
+    Repeated uses get device clones so compiled kernel arguments do not alias.
+    `tiles_cpu` keeps strong references for the whole call, so no id can be
+    recycled mid-flight.
     """
     mirrored: dict[int, torch.Tensor] = {}
     tiles_device: list[list[torch.Tensor]] = []
@@ -143,6 +141,8 @@ def _mirror_mask_tiles(
             if dev_tile is None:
                 dev_tile = convert(tile, device=device)
                 mirrored[id(tile)] = dev_tile
+            else:
+                dev_tile = dev_tile.clone()
             row.append(dev_tile)
         tiles_device.append(row)
     return tiles_device
@@ -319,7 +319,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
     # Built by build_chunk_index_tables, so the shape is the kernel's (as above).
     chunk_page_ids_dev: list[torch.Tensor] | None = None
-    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
+    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
     # Encoder scatter dest ``[T]`` (int32 on Spyre) and gather unpack.
@@ -751,11 +751,29 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 real_num_blocks.append(n)
             padded_num_blocks = [self._pad_num_blocks(n) for n in real_num_blocks]
 
-            # Padded tiles need no special construction — kv_valid = kv_pos <
-            # seq_lens already emits finfo.min past the true length.
             attention_mask_tiles = [[] for _ in range(num_seqs)]
             for aligned_query_len in sorted(set(aligned_query_lens)):
                 group = [s for s in range(num_seqs) if aligned_query_lens[s] == aligned_query_len]
+                if aligned_query_len == 1:
+                    mask_min = torch.finfo(self.model_dtype).min
+                    zero_tile = torch.zeros(1, block_size, dtype=self.model_dtype)
+                    masked_tile = torch.full_like(zero_tile, mask_min)
+                    partial_tiles: dict[int, torch.Tensor] = {}
+                    for s in group:
+                        real_blocks = real_num_blocks[s]
+                        padded_blocks = padded_num_blocks[s]
+                        valid_tail = int(seq_lens[s].item()) % block_size
+                        tiles = [zero_tile] * real_blocks
+                        if real_blocks and valid_tail:
+                            boundary = partial_tiles.get(valid_tail)
+                            if boundary is None:
+                                boundary = masked_tile.clone()
+                                boundary[:, :valid_tail] = 0
+                                partial_tiles[valid_tail] = boundary
+                            tiles[-1] = boundary
+                        tiles.extend([masked_tile] * (padded_blocks - real_blocks))
+                        attention_mask_tiles[s] = tiles
+                    continue
                 mask_cpu = self._build_attention_mask(
                     seq_lens[group],
                     query_lens[group],
@@ -767,19 +785,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     max(padded_num_blocks[s] for s in group) * block_size,
                     torch.device("cpu"),
                 )
-                if aligned_query_len == 1:
-                    # One unbind beats a __getitem__ per tile at decode tile counts; the
-                    # clones stay, for storage offset 0 (torch-spyre#3770).
-                    # Width 1 only: wider needs a permute that copies the whole mask.
-                    tiles_by_block = mask_cpu.reshape(
-                        len(group), mask_cpu.shape[-1] // block_size, 1, block_size
-                    )
-                    for row, s in enumerate(group):
-                        attention_mask_tiles[s] = [
-                            tile.clone(memory_format=torch.contiguous_format)
-                            for tile in tiles_by_block[row].unbind(0)[: padded_num_blocks[s]]
-                        ]
-                    continue
                 for row, s in enumerate(group):
                     # `.contiguous()` is a no-op on a [1, N] slice, leaving
                     # stride(0) == the mask width and a nonzero storage offset
@@ -903,8 +908,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 ]
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions. Broadcast to KV heads and reshape to the
-                # kernel input shape [num_chunks, entries * KV, 1, block_size].
+                # valid positions. The kernel broadcasts the mask to KV heads.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
@@ -926,9 +930,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 mask_by_chunk_cpu = (
                     mask_bs_bb.reshape(b_seqs, num_chunks, blocks_per_chunk, block_size)
                     .permute(1, 0, 2, 3)
-                    .unsqueeze(3)
-                    .expand(num_chunks, b_seqs, blocks_per_chunk, self.num_kv_heads, block_size)
-                    .reshape(num_chunks, entries * self.num_kv_heads, 1, block_size)
+                    .reshape(num_chunks, entries, 1, block_size)
                     .contiguous()
                 )
 

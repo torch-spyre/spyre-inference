@@ -908,7 +908,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     """The head-major page read feeds the same reduction the token-major kernel gets.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
-    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
+    page-row mask broadcast, not the fp16 tolerances.
     """
     from tests.attention.test_spyre_attn import _decode_reference_fp32
 
@@ -949,9 +949,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     mask_by_chunk = (
         mask.reshape(b_seqs, num_chunks, bpc, block_size)
         .permute(1, 0, 2, 3)
-        .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .reshape(num_chunks, entries, 1, block_size)
         .contiguous()
     )
 

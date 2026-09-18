@@ -104,6 +104,9 @@ def register_models() -> None:
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
     builds the ModelConfig (e.g. text-only backbone selection)."""
-    from spyre_inference.models import gemma4
+    from spyre_inference.models import gemma4, param
 
     gemma4.force_text_backbone(engine_args)
+    # Param has no entry in _ADAPTED_ARCHS: its own architecture never reaches the
+    # registry, because this rewrites the config to LlamaForCausalLM first.
+    param.force_llama_architecture(engine_args)

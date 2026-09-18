@@ -353,9 +353,14 @@ The weight transposes happen before that, in each layer's
 call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
-- **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling)
-- **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
+- **Output**: for normal compiled generation, gather the rows selected by
+  `logits_indices` on Spyre and move only those rows to CPU. Modes that need additional
+  hidden states retain the full-output copy, as do bodies too small for the gather to
+  pay for itself
+- **`compute_logits`**: reuses the Spyre-resident gather from the output step, so the
+  sampled rows are not sent back H2D; a step that took the full-output path pads the
+  CPU rows and moves them onto Spyre instead. Logits return to CPU after projection and
+  TP gathering
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the

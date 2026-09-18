@@ -288,7 +288,12 @@ markers = [
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
+    "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
+    "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
+    "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
+    "mm_encoder_attention: SpyreMMEncoderAttention and SDPA-helper tests (tests/custom_ops/test_mm_encoder_attention.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
 ]
 # --8<-- [end:test-markers-definition]
 

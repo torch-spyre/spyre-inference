@@ -21,7 +21,12 @@ implementations by layer class.
 
 import torch
 
-from . import pixtral
+from . import (
+    blip2,
+    granite4_vision,
+    pixtral,
+    siglip,
+)
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -30,9 +35,20 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     A no-op for text-only models. Call after weights are on the device but before
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
-    # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
-    # Mistral3 `vision_tower`. Ungated, the patches rewrite vLLM's shared module.
-    if not any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
+    # Check if the model is a multimodal model (e.g. has vision_tower, vision_encoder,
+    # vision_model, etc.)
+    mm_attrs = (
+        "vision_encoder",
+        "vision_tower",
+        "vision_model",
+        "image_encoder",
+        "visual",
+        "multi_modal_projector",
+    )
+    if not any(hasattr(model, attr) for attr in mm_attrs):
         return
 
     pixtral.apply(model, device)
+    siglip.apply(model, device)
+    granite4_vision.apply(model, device)
+    blip2.apply(model, device)

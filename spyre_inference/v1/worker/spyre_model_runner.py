@@ -421,15 +421,83 @@ class _SpyreModelWrapper:
         multimodal_embeddings=None,
         *,
         is_multimodal=None,
+        **kwargs,
     ):
         """Text-token embedding + multimodal merge, Spyre-aware.
 
-        Like ``embed_multimodal``, this is reached through ``__getattr__`` with
-        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
-        images are present the merge is done on CPU, because upstream scatters image
-        rows with a dim-0 boolean mask that Spyre cannot do.
+        Two paths:
+        - Model has its own embed_input_ids that handles multimodal merging
+          (e.g. Granite4Vision with packed deepstack tensors): pass everything
+          through directly after converting input_ids to Spyre int64.
+          The model's own index-put (target[is_multimodal] = ...) runs on CPU
+          because Spyre cannot do boolean-mask scatter in place.
+        - Generic models that rely on _merge_multimodal_embeddings: run the
+          text embedding on Spyre, then do the merge on CPU. The text lookup
+          runs on-card; when images are present the merge is done on CPU,
+          because upstream scatters image rows with a dim-0 boolean mask that
+          Spyre cannot do.
         """
         has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+
+        # Check whether the underlying model's embed_input_ids accepts
+        # multimodal_embeddings itself (i.e. handles the merge internally).
+        import inspect
+
+        model_embed_sig = inspect.signature(self._model.embed_input_ids)
+        model_owns_merge = "multimodal_embeddings" in model_embed_sig.parameters
+
+        if model_owns_merge:
+            # Delegate fully to the model's own embed_input_ids.
+            # The model body uses boolean-mask index-put ops
+            # (e.g. text_embeds[is_multimodal] = 0.0, target[is_multimodal] = ...)
+            # that Spyre does not support.  Only the token embedding lookup
+            # (language_model.model.embed_tokens) needs weights on CPU; moving
+            # the whole model would be prohibitively expensive.
+            input_ids_cpu = convert(input_ids, dtype=torch.int64, device="cpu")
+            mm_embeds_cpu = (
+                tree_map(
+                    lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
+                    multimodal_embeddings,
+                )
+                if has_mm
+                else multimodal_embeddings
+            )
+            is_multimodal_cpu = (
+                is_multimodal.to("cpu")
+                if isinstance(is_multimodal, torch.Tensor)
+                else is_multimodal
+            )
+            # Move only the token embedding table to CPU; restore after.
+            embed_tokens = getattr(
+                getattr(getattr(self._model, "language_model", None), "model", None),
+                "embed_tokens",
+                None,
+            )
+            if embed_tokens is not None:
+                embed_tokens.to("cpu")
+            try:
+                result = self._model.embed_input_ids(
+                    input_ids_cpu,
+                    multimodal_embeddings=mm_embeds_cpu,
+                    is_multimodal=is_multimodal_cpu,
+                    **kwargs,
+                )
+            finally:
+                if embed_tokens is not None:
+                    embed_tokens.to(self._spyre_device)
+                # _ds_buffers auto-migrate to inputs_embeds.device inside
+                # embed_input_ids (granite4_vision.py line ~854).  Since we
+                # ran on CPU they are now on CPU; move them back to Spyre so
+                # GraniteModel.forward can add them to Spyre hidden_states.
+                ds_buffers = getattr(self._model, "_ds_buffers", None)
+                if ds_buffers is not None:
+                    self._model._ds_buffers = [
+                        convert(b, dtype=torch.float16, device=self._spyre_device)
+                        for b in ds_buffers
+                    ]
+            return convert(result, device=self._spyre_device)
+
+        # Generic path: model.embed_input_ids only does text embedding.
         if has_mm and is_multimodal is None:
             raise ValueError(
                 "embed_input_ids got multimodal_embeddings without is_multimodal; the "
@@ -456,7 +524,7 @@ class _SpyreModelWrapper:
             padded_tokens = None
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        inputs_embeds = self._model.embed_input_ids(input_ids)
+        inputs_embeds = self._model.embed_input_ids(input_ids, **kwargs)
         if padded_tokens is not None:
             inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
 
@@ -473,7 +541,9 @@ class _SpyreModelWrapper:
         merged = _merge_multimodal_embeddings(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=mm_embeds_cpu,
-            is_multimodal=is_multimodal.to("cpu"),
+            is_multimodal=is_multimodal.to("cpu")
+            if isinstance(is_multimodal, torch.Tensor)
+            else is_multimodal,
         )
         return convert(merged, device=self._spyre_device)
 
@@ -619,6 +689,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
 
+        # Patches instances/classes, so it runs after load and before compile wraps modules
+        # in OptimizedModule and breaks traversal.
+        apply_multimodal_patches(self.model, self._spyre_device)
+
+        # Move plain tensor buffers (e.g. Granite4Vision _ds_buffers) to Spyre device.
+        if hasattr(self.model, "_ds_buffers"):
+            self.model._ds_buffers = [
+                convert(b, dtype=self.dtype, device=self._spyre_device)
+                for b in self.model._ds_buffers
+            ]
+
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.
         self._pooling_on_spyre = False
@@ -632,7 +713,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Patches instances, so it runs after load and before compile wraps modules
         # in OptimizedModule and breaks traversal.
-        apply_multimodal_patches(self.model, self._spyre_device)
+        # apply_multimodal_patches(self.model, self._spyre_device)
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()

@@ -404,22 +404,31 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        num_heads = getattr(hf_config, "num_attention_heads", None)
-        hidden_size = getattr(hf_config, "hidden_size", None)
+        target_cfg = getattr(hf_config, "text_config", None) or hf_config
+        num_heads = getattr(target_cfg, "num_attention_heads", None)
+        hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
             return
 
         # transformers 5.x unifies all RoPE config under `rope_parameters`
-        cfgs = (hf_config, model_config.hf_text_config)
+        cfgs = tuple(
+            c
+            for c in (
+                hf_config,
+                getattr(hf_config, "text_config", None),
+                model_config.hf_text_config,
+            )
+            if c is not None
+        )
         if not any(getattr(c, "rope_parameters", None) for c in cfgs):
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
+        orig = getattr(target_cfg, "head_dim", None) or hidden_size // num_heads
         if orig % 128 == 0:
             return
 
         padded = ((orig + 127) // 128) * 128
-        for cfg in (hf_config, model_config.hf_text_config):
+        for cfg in cfgs:
             reason = reduced_rotary_dim_reason(cfg)
             if reason is not None:
                 raise NotImplementedError(
@@ -427,7 +436,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"alignment, but this model reduces the rotary dimension below "
                     f"head_dim ({reason})."
                 )
-        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+        for cfg in {id(c): c for c in cfgs}.values():
             cfg._spyre_orig_head_dim = orig
             cfg.head_dim = padded
         # ModelConfig snapshots head_size into model_arch_config in __post_init__,

@@ -37,6 +37,8 @@ DECODER_MODELS = [
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
     "google/gemma-4-26B-A4B",
+    "google/gemma-4-E2B",
+    "google/gemma-4-E4B",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 

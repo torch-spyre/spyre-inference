@@ -36,6 +36,8 @@ DECODER_MODELS = [
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
     "google/gemma-4-26B-A4B",
+    "google/gemma-4-E2B",
+    "google/gemma-4-E4B",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
@@ -44,6 +46,8 @@ MODEL_REVISIONS = {
     "ibm-granite/granite-4.1-8b": "1504002f650e656a0a3789d99574df12e3e94ed0",
     "google/gemma-4-31B": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",
     "google/gemma-4-26B-A4B": "24548b62aa021d562695c04aaf7758a1ea47990b",
+    "google/gemma-4-E2B": "d29ff6b45f081a49ee2733a859c9c9c2d95d1a6f",
+    "google/gemma-4-E4B": "411aa17b749aa952df1359d2dcea73917a544d9a",
     "meta-llama/Llama-3.1-8B-Instruct": "0e9e39f249a16976918f6564b8830bc894c89659",
 }
 
@@ -68,6 +72,8 @@ _GEMMA4_PROMPTS = [
 MODEL_PROMPTS = {
     "google/gemma-4-31B": _GEMMA4_PROMPTS,
     "google/gemma-4-26B-A4B": _GEMMA4_PROMPTS,
+    "google/gemma-4-E2B": _GEMMA4_PROMPTS,
+    "google/gemma-4-E4B": _GEMMA4_PROMPTS,
 }
 
 MAX_TOKENS = 16

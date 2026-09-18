@@ -101,6 +101,15 @@ def register_models() -> None:
         ModelRegistry.register_model(arch, model_cls)
 
 
+def has_per_layer_embeddings(text_config) -> bool:
+    """Whether the config declares gemma-4-style per-layer embeddings (PLE).
+
+    ``Gemma4Model`` builds ``embed_tokens_per_layer`` exactly when this is positive, so
+    the config answers before weights load what a module walk answers after.
+    """
+    return (getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
+
+
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
     builds the ModelConfig (e.g. text-only backbone selection)."""

@@ -20,19 +20,18 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from vllm.config import CompilationMode
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import (
     Gemma4ForCausalLM,
     Gemma4SelfDecoderLayers,
 )
 
-from spyre_inference.custom_ops.lazy_compile import compile_when_outermost
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, compile_when_outermost
 from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Iterable
 
     from torch import nn
     from vllm.config import VllmConfig
@@ -173,11 +172,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
 
 
-class SpyreGemma4SelfDecoderLayers(Gemma4SelfDecoderLayers):
+class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
     """Self-decoder adapting the two PLE operations Spyre cannot lower."""
-
-    spyre_compile_enabled: bool
-    spyre_compiled_kernel: Callable | None
 
     @compile_when_outermost
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
@@ -244,9 +240,6 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
         reject_masked_per_layer_vocab(decoder)
-        decoder.spyre_compile_enabled = (
-            vllm_config.compilation_config.mode is not CompilationMode.NONE
-        )
-        decoder.spyre_compiled_kernel = None
+        decoder.init_spyre_compile()
         register_aliased_scalars(self.model.self_decoder)
         configure_gemma4_moe_layers(self.model.layers)

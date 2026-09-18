@@ -635,6 +635,83 @@ def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
 
 
 # ---------------------------------------------------------------------------
+# 8b. storage_offset: the float16 view shapes the workarounds carry
+# ---------------------------------------------------------------------------
+
+# float16 elements in a 128-byte stick, i.e. get_elem_in_stick(torch.float16).
+_FP16_ELEMS_PER_STICK = 64
+
+
+def _fn_doubling():
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    return fn
+
+
+def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
+    """A row view whose width is not a whole number of sticks.
+
+    test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
+    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
+    gates the per-token row clones on exactly that property, so the off-stick width is the
+    case that decides whether the gate can go.
+    """
+    rows, width = 2, 40
+    assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"
+    base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    for s in range(3):
+        view = base[s]
+        assert view.is_contiguous() and view.storage_offset() == s * rows * width
+        torch.testing.assert_close(fn(view).cpu(), base_cpu[s] + base_cpu[s], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        _FP16_ELEMS_PER_STICK,
+        pytest.param(
+            _FP16_ELEMS_PER_STICK // 2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "An innermost offset short of a whole stick has no lowering: the view "
+                    "reaches the op as h_coords=[d0, d1 + 32] and it raises 'no mechanism to "
+                    "resolve stick incompatibility'. A compile error, not the silent offset-0 "
+                    "read of torch-spyre#3770."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_compile_input_honors_last_dim_window(spyre_device, start):
+    """A last-dim window, which leaves stride(0) at the full row width.
+
+    The shape the attention mask tiles carry: ``mask[row, :, b * block : (b + 1) * block]``
+    is not contiguous, so ``.contiguous()`` is not a no-op on it and the clone it forces is a
+    real copy. Non-contiguity is not what decides it -- the stick-aligned start works; only
+    the offset within the stick does.
+    """
+    rows, window = 4, _FP16_ELEMS_PER_STICK
+    blocks = 3
+    base_cpu = torch.cat([torch.full((rows, window), float(b)) for b in range(blocks)], dim=1).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    view, view_cpu = base[:, start : start + window], base_cpu[:, start : start + window]
+    assert not view.is_contiguous() and view.storage_offset() == start
+    torch.testing.assert_close(fn(view).cpu(), view_cpu + view_cpu, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
 # 9. Slot-major KV cache: the indirect scatter write
 # ---------------------------------------------------------------------------
 

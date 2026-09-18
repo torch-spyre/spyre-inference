@@ -37,8 +37,9 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
-    # apply_prelaunch_overrides rewrites it to this text-only backbone first.
+    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM's
+    # own multimodal wrapper builds its nested decoder via init_vllm_registered_model,
+    # which resolves this entry.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",

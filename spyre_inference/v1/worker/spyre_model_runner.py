@@ -347,6 +347,8 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        *,
+        model_dtype: torch.dtype,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -354,6 +356,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_model_dtype", model_dtype)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -408,12 +411,18 @@ class _SpyreModelWrapper:
 
         def _to_spyre_float(t):
             if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
+                return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        out = self._model.embed_multimodal(**kwargs)
-        return out
+        # Vision towers run eager, so each Spyre op with a decomposition reaches it
+        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
+        # without fullgraph. Decompositions built on for_each_tile (SDPA since
+        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
+        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
+        # trace dies with DataDependentOutputException.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._model.embed_multimodal(**kwargs)
 
     def embed_input_ids(
         self,
@@ -510,7 +519,12 @@ class _SpyreModelWrapper:
         return getattr(self._model, name)
 
     def __setattr__(self, name, value):
-        setattr(self._model, name, value)
+        # `__init__` fills our `__dict__` via `object.__setattr__`, so a name in it is
+        # ours, not the model's.
+        if name in self.__dict__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._model, name, value)
 
 
 class TorchSpyreModelRunner(GPUModelRunner):
@@ -652,6 +666,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     @staticmethod
@@ -1332,6 +1347,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def _model_dtype(self) -> torch.dtype:
+        """The activation dtype the platform settled on (float16 unless bfloat16 was
+        asked for explicitly)."""
+        dtype = self.model_config.dtype
+        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
@@ -1420,14 +1441,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> SpyreCpuGpuBuffer:
         """Create a SpyreCpuGpuBuffer with float tensors on Spyre.
 
-        - Float dtypes: .cpu on CPU, .gpu on Spyre as float16
+        - Float dtypes: .cpu on CPU, .gpu on Spyre at the model dtype
         - Int/bool dtypes: .gpu aliased to .cpu (stays on CPU)
         """
         if dtype.is_floating_point:
             return SpyreCpuGpuBuffer(
                 *size,
                 cpu_dtype=dtype,
-                gpu_dtype=torch.float16,
+                gpu_dtype=self._model_dtype(),
                 device=self._spyre_device,
                 pin_memory=False,
                 with_numpy=numpy,

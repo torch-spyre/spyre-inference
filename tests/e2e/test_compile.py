@@ -54,6 +54,12 @@ _COSINE_MIN = 0.99
             "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
         ),
     ],
+    ids=[
+        "micro-g3.3-8b",
+        "gemma-3-1b-it",
+        "gemma-4-31B",
+        "gemma-4-26B-A4B",
+    ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.

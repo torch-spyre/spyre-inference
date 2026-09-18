@@ -544,6 +544,16 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"but was specified to be {vllm_config.model_config.dtype}"
                 )
 
+            from spyre_inference.models import has_per_layer_embeddings
+
+            if vllm_config.cache_config.kv_sharing_fast_prefill and has_per_layer_embeddings(
+                vllm_config.model_config.hf_text_config
+            ):
+                raise NotImplementedError(
+                    "Spyre does not support kv_sharing_fast_prefill for models with "
+                    "per-layer embeddings."
+                )
+
             # Pad attention head_dim up to a stick-aligned size on the native path.
             cls._maybe_pad_head_dim(vllm_config)
 

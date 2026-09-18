@@ -41,6 +41,8 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import contextmanager
+from copy import copy
+from dataclasses import replace
 from typing import cast
 
 import numpy as np
@@ -734,6 +736,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
+        from spyre_inference.models import has_per_layer_embeddings
+
+        if granularity == "model" and has_per_layer_embeddings(
+            getattr(self.vllm_config.model_config, "hf_text_config", None)
+        ):
+            raise NotImplementedError(
+                "SPYRE_COMPILE_GRANULARITY=model is not supported for models with "
+                "per-layer embeddings; use SPYRE_COMPILE_GRANULARITY=block."
+            )
+
         # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
         # stays isolated. fullgraph=True cannot graph-break.
         uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
@@ -960,7 +972,35 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return builders
 
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
-        super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
+        """Resolve KV-sharing specs, then split groups by per-layer sliding window."""
+        # A KV-sharing layer carries no spec of its own; give it its target's before
+        # super() builds the groups. Adding them inflates the group's page_size_bytes (a
+        # sum over kv_cache_specs), which is safe: super() unwraps the spec per layer.
+        attn_config = kv_cache_config
+        if self.shared_kv_cache_layers:
+            from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+            attn_config = copy(kv_cache_config)
+            attn_config.kv_cache_groups = []
+            for group in kv_cache_config.kv_cache_groups:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    per_layer = dict(spec.kv_cache_specs)
+                    for layer_name in group.layer_names:
+                        if layer_name in per_layer:
+                            continue
+                        target = self.shared_kv_cache_layers.get(layer_name)
+                        if target is None:
+                            raise RuntimeError(
+                                f"{layer_name} is in a KV cache group with neither its "
+                                "own spec nor a KV-sharing target."
+                            )
+                        per_layer[layer_name] = per_layer[target]
+                    spec = replace(spec, kv_cache_specs=per_layer)
+                attn_config.kv_cache_groups.append(replace(group, kv_cache_spec=spec))
+
+        super().initialize_attn_backend(attn_config, is_profiling=is_profiling)
+        # Post-super: operates on the attention groups super() just built.
         self._split_attn_groups_by_layer_window()
 
     def _split_attn_groups_by_layer_window(self) -> None:

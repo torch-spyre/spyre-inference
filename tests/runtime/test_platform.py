@@ -155,6 +155,24 @@ def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
     assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
 
 
+def test_rejects_kv_sharing_fast_prefill_for_per_layer_embeddings():
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=128,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    model_config.hf_text_config.hidden_size_per_layer_input = 256
+    cache_config = CacheConfig(block_size=64, kv_sharing_fast_prefill=True)
+
+    with pytest.raises(NotImplementedError, match="kv_sharing_fast_prefill"):
+        VllmConfig(
+            model_config=model_config,
+            cache_config=cache_config,
+            compilation_config=CompilationConfig(custom_ops=["all"]),
+        )
+
+
 def test_num_gpu_blocks_override_skipped_for_pooling():
     """Encoder/pooling models have no KV cache — do not invent a block count."""
     from spyre_inference.platform import TorchSpyrePlatform

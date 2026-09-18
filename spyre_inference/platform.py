@@ -275,8 +275,9 @@ class TorchSpyrePlatform(CpuPlatform):
 
             # Body: 1D compile_sizes (packed token counts). Attention (B, L)
             # is independent — see SpyreEncoderAttentionImpl gather-pack.
-            # Honor a user-set list (#638); otherwise generate defaults.
-            if vllm_config.compilation_config.compile_sizes:
+            # Honor a user-set list (#638), including an empty one to opt out
+            # of bucketing; otherwise generate defaults.
+            if vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
@@ -325,13 +326,14 @@ class TorchSpyrePlatform(CpuPlatform):
                     compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
-            max_capture_size = max(int(s) for s in compile_sizes)
-            # Scheduler must not send more tokens than the largest body bucket.
-            vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-            logger.warning(
-                "Capping max_num_batched_tokens to %d ",
-                max_capture_size,
-            )
+            if compile_sizes:
+                max_capture_size = max(int(s) for s in compile_sizes)
+                # Scheduler must not send more tokens than the largest body bucket.
+                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+                logger.warning(
+                    "Capping max_num_batched_tokens to %d ",
+                    max_capture_size,
+                )
 
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
+    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 6
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -92,6 +93,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of topping itself up with a short chunk of the next. Any non-positive
     # value removes the cap, as does a pooling runner, which never decodes.
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
+    # Largest packed-token count the MoE backend serves by driving the gathered
+    # region once per token, instead of the all-expert region once. The gathered
+    # region reads only each token's routed experts but lowers at exactly one token;
+    # the all-expert region reads every expert whatever the token count, so above
+    # this bound it is cheaper per token. Only a decode batch is ever small enough
+    # to reach it: a prefill chunk takes the all-expert region either way. Set to 1
+    # for a single-token-only gathered dispatch.
+    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "6")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

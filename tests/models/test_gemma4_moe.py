@@ -307,6 +307,9 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
+        # Divides both widths ``_apply`` builds, so these tests exercise the token bound and not
+        # the row-addressability guard; the guard has its own test, which widens this.
+        spyre_moe_stick=16,
         top_k=TOP_K,
     )
 
@@ -324,6 +327,40 @@ def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
     _apply(_dispatch_layer("full_softmax"), tokens=1)
     assert calls == [("gathered", "_gathered")]
     assert resets == [], "the gathered form declares no persistent dims to reset"
+
+
+def test_a_small_batch_drives_the_gathered_form_once_per_token(monkeypatch):
+    """Below the bound each token gets its own gathered call, since it lowers at one."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    calls, resets = _dispatch_recorder(monkeypatch)
+    out = _apply(_dispatch_layer("full_softmax"), tokens=3)
+    assert calls == [("gathered", "_gathered")] * 3
+    assert out.shape[0] == 3, "the per-token results must be reassembled into one batch"
+    assert resets == [], "the gathered form declares no persistent dims to reset"
+
+
+def test_a_batch_whose_rows_are_not_stick_addressable_takes_the_all_expert_form(monkeypatch):
+    """Copying row ``t`` out bakes offset ``t * width``, which must span whole sticks.
+
+    An expert count narrower than a stick leaves every row but the first unaddressable, so the
+    batch has to go to the all-expert region even below the bound.
+    """
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    calls, resets = _dispatch_recorder(monkeypatch)
+    layer = _dispatch_layer("full_softmax")
+    layer.spyre_moe_stick = 64
+    _apply(layer, tokens=2)
+    assert calls == [("probs", "_probs"), ("route", "_route"), ("experts", "_experts")]
+    assert resets == [1]
+
+
+def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatch):
+    """The bound is the seam: one token past it the whole batch goes all-expert."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "2")
+    calls, resets = _dispatch_recorder(monkeypatch)
+    _apply(_dispatch_layer("full_softmax"), tokens=3)
+    assert calls == [("probs", "_probs"), ("route", "_route"), ("experts", "_experts")]
+    assert resets == [1]
 
 
 @pytest.mark.parametrize(
@@ -384,6 +421,80 @@ def test_gathered_matches_dense_reference(moe_weights):
         host["scale"],
         TOP_K,
     )
+    torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
+
+
+# One row of the packed batch is copied out per token, and the backend can only bake a storage
+# offset that is a whole number of sticks. Row t of the router logits starts at t * num_experts,
+# so the loop needs an expert count that spans whole sticks; EXPERTS above does not, on purpose,
+# so the dispatch's fallback is exercised too.
+STICK_EXPERTS = 64
+
+
+@pytest.fixture(scope="module")
+def stick_aligned_moe_weights():
+    """Expert stacks whose count spans whole sticks, so a row slice is addressable."""
+    from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
+
+    torch.manual_seed(0)
+    host = {
+        "gate": torch.randn(STICK_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "up": torch.randn(STICK_EXPERTS, HIDDEN, INTER, dtype=torch.float16) * 0.05,
+        "down": torch.randn(STICK_EXPERTS, INTER, HIDDEN, dtype=torch.float16) * 0.05,
+    }
+    host["scale"] = torch.ones(STICK_EXPERTS, dtype=torch.float16)
+    device = {
+        "gate": dma_moe_expert_weight_to_spyre(host["gate"]),
+        "up": dma_moe_expert_weight_to_spyre(host["up"]),
+        "down": dma_moe_expert_weight_to_spyre(host["down"]),
+    }
+    assert all(v is not None for v in device.values()), "expert stacks must take the MoE layout"
+    return host, device
+
+
+@pytest.mark.parametrize("num_tokens", [2, 4])
+def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
+    """The per-token driver over a packed batch, against the same dense reference.
+
+    Beyond re-checking the arithmetic, this pins the buffer lifetime the driver depends on. The
+    MoE regions compile under ``frontend_pool_allocation``, which permits two calls of one graph
+    to be handed the same output address, and the driver is the only caller that holds a region
+    result across another call of that region. If a pin ever does reuse the buffer, rows take
+    another token's expert output with no error raised — an O(1) error, far outside the tolerance
+    here, and invisible without a comparison like this one.
+    """
+    from torch_spyre._C import get_elem_in_stick
+    from torch_spyre._inductor import config as spyre_config
+
+    from spyre_inference.moe import SpyreMoERecipe, _gathered_tokens
+
+    host, device = stick_aligned_moe_weights
+    gen = torch.Generator().manual_seed(num_tokens)
+    x = torch.randn(num_tokens, HIDDEN, dtype=torch.float16, generator=gen) * 0.5
+    logits = torch.randn(num_tokens, STICK_EXPERTS, dtype=torch.float16, generator=gen)
+    layer = SimpleNamespace(
+        spyre_moe_recipe=SpyreMoERecipe("gelu_tanh", "full_softmax"),
+        spyre_moe_gate=device["gate"],
+        spyre_moe_up=device["up"],
+        spyre_moe_down=device["down"],
+        spyre_moe_stick=get_elem_in_stick(torch.float16),
+        spyre_moe_regions={},
+        top_k=TOP_K,
+    )
+
+    with spyre_config.patch({"frontend_pool_allocation": True}):
+        actual = _gathered_tokens(layer, x.to("spyre"), logits.to("spyre"))
+
+    expected = _dense_reference(
+        x,
+        torch.softmax(logits, dim=-1),
+        host["gate"],
+        host["up"],
+        host["down"],
+        host["scale"],
+        TOP_K,
+    )
+    assert actual.shape == x.shape
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 

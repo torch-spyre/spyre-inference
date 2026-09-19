@@ -1118,10 +1118,11 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
-    # layout underneath is token-major, which upstream expresses separately via
-    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view; the physical layout underneath is token-major, which 0.29
+    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
+    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
+    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
+    # physical layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(

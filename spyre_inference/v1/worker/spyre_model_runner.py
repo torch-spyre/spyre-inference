@@ -218,6 +218,43 @@ class _SlotMappingKernelShim:
 
 _compute_slot_mapping_kernel = _SlotMappingKernelShim()
 
+# The module attribute in vllm.v1.worker.block_table that both launches the
+# slot-mapping kernel and receives its warmup registration.
+_SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
+
+
+def _patch_compute_slot_mapping() -> None:
+    """Route vLLM's slot-mapping launch through ``_compute_slot_mapping_impl``.
+
+    Swap the whole ``ComputeSlotMappingKernel`` instance for our shim, before any
+    ``BlockTable`` is built: its constructor calls ``register_warmup()`` on this
+    module attribute, which our shim no-ops so warmup never tries to compile.
+
+    The attribute is checked before it is written, because a plain assignment is
+    the wrong shape of patch here: vLLM has already moved this kernel twice (a
+    module-level ``@triton.jit`` function named ``_compute_slot_mapping_kernel``,
+    then the ``VllmJitKernel`` wrapper named ``_COMPUTE_SLOT_MAPPING_KERNEL``),
+    and assigning a name nothing reads any more would bind a fresh module
+    attribute and leave the real launch site untouched. Because ``HAS_TRITON`` is
+    always False on Spyre, that launch site then runs the Triton placeholder —
+    the bare undecorated function — and the grid subscript raises ``TypeError:
+    'function' object is not subscriptable`` at the *first decode step*, long
+    after startup. Fail at import-time patching instead.
+    """
+    from vllm.v1.worker import block_table
+
+    if not hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
+        raise RuntimeError(
+            f"Cannot find vLLM's slot-mapping kernel to patch: "
+            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} does not exist (nor the older "
+            f"block_table._compute_slot_mapping_kernel). vLLM has moved it again; "
+            f"update _SlotMappingKernelShim and _patch_compute_slot_mapping for the "
+            f"new launch site. Leaving the patch unapplied would defer the failure to "
+            f"the first decode step."
+        )
+
+    setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
+
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
     """Spyre-specific CpuGpuBuffer with Spyre-safe copies and split dtypes.
@@ -602,12 +639,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
         # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
-        from vllm.v1.worker import block_table
-
-        # Swap the whole ComputeSlotMappingKernel instance for our shim, before any
-        # BlockTable is built: its constructor calls register_warmup() on this
-        # module attribute, which our shim no-ops so warmup never tries to compile.
-        block_table._COMPUTE_SLOT_MAPPING_KERNEL = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        _patch_compute_slot_mapping()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -1381,6 +1413,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         device layout its attention impl's `allocate_pages` chooses. The attention kernel
         selects a page by indexing with a one-element device tensor, so the page read is
         a real indirect access.
+
+        ``kernel_block_sizes`` is ignored. It lets a backend view one KV-manager block as
+        several smaller kernel blocks; Spyre never needs that split, because
+        ``SpyreAttentionBackend.get_supported_kernel_block_sizes`` advertises
+        ``MultipleOf(64)`` and the platform forces ``block_size`` to a 64-multiple, so
+        upstream's ``prepare_kernel_block_sizes`` hands back the manager block size
+        unchanged.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
@@ -1449,8 +1488,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Spyre tensors. torch.spyre is registered by torch-spyre autoload.
         torch.spyre.synchronize(self._spyre_device)
 
-    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
-        return 0, None
+    # No get_dp_padding override: vLLM removed that hook in "[Core] Simplify the DP
+    # padding/should-ubatch coordination logic" (vllm-project/vllm#25768) and nothing
+    # calls it any more. DP > 1 is rejected in TorchSpyrePlatform.check_and_update_config,
+    # so there is no DP padding to neutralise on Spyre either way.
 
     def get_model(self) -> nn.Module:
         # Return the unwrapped model for isinstance checks

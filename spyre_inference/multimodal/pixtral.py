@@ -97,7 +97,7 @@ def _padded_attn_mask(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`.
+    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`, from a bool `mask`.
 
     The tensor is O(L²) and the tower hands the same mask to every layer, so it is
     cached on the mask itself: one upload per image, released with its source.
@@ -111,13 +111,16 @@ def _padded_attn_mask(
     neg_inf = torch.finfo(dtype).min
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, seq:] = neg_inf  # padded keys never attended
+    # Bool only. The additive float mask upstream used to precompute is gone in 0.29;
+    # the sole caller is `padded_sdpa`, fed from `_block_diagonal_mask`, which always
+    # returns a bool "these two tokens share an image" mask. Assert rather than convert:
+    # silently treating a float mask as keep/drop would invert it.
     mc = convert(mask, "cpu")
-    if mc.dtype == torch.bool:
-        m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
-            ~mc.reshape(seq, seq), neg_inf
-        )
-    else:
-        m[:, :, :seq, :seq] = mc.to(dtype).reshape(seq, seq)
+    if mc.dtype != torch.bool:
+        raise TypeError(f"_padded_attn_mask expects a bool keep-mask, got {mc.dtype}")
+    m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
+        ~mc.reshape(seq, seq), neg_inf
+    )
 
     m = convert(m, device)
     setattr(mask, _MASK_ATTR, (key, m))
@@ -283,35 +286,11 @@ def patch_vision_rope_vit() -> None:
     )
 
 
-def patch_block_attention_mask() -> None:
-    """Build Pixtral's block-diagonal vision mask on CPU.
-
-    Upstream zeroes one `[start:end, start:end]` sub-block per image on
-    `patch_embeds.device`; with N images those are strided sub-block writes, which are
-    not stick-safe. `_padded_attn_mask` pulls the mask to CPU anyway.
-    """
-    try:
-        from transformers.models.pixtral import modeling_pixtral
-    except ImportError:
-        return
-
-    orig = getattr(modeling_pixtral, "generate_block_attention_mask", None)
-    if orig is None or getattr(orig, "_spyre_patched", False):
-        return
-
-    def _cpu_mask(patch_embeds_list, tensor):
-        if tensor.device.type != "spyre":
-            return orig(patch_embeds_list, tensor)
-        # Only `dtype` and the two leading dims are read off `tensor`, so a CPU stand-in
-        # gives an identical mask without a D2H of patch_embeds.
-        stand_in = torch.empty((tensor.shape[0], tensor.shape[1]), dtype=tensor.dtype)
-        return orig(patch_embeds_list, stand_in)
-
-    _cpu_mask._spyre_patched = True
-    # vLLM imports this symbol inside the function body, so patching the module
-    # attribute is picked up at call time.
-    modeling_pixtral.generate_block_attention_mask = _cpu_mask  # ty: ignore[invalid-assignment]
-    logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
+# No patch_block_attention_mask: 0.29 stopped precomputing the vision mask. vLLM no
+# longer calls transformers' generate_block_attention_mask anywhere -- the tower passes
+# `cu_seqlens` down to MMEncoderAttention instead -- so patching that symbol would only
+# log a false success. `_block_diagonal_mask` rebuilds the equivalent mask on CPU from
+# `cu_seqlens`, which is where the stick-safety argument now lives.
 
 
 def patch_patch_merger() -> None:
@@ -396,6 +375,5 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
-    patch_block_attention_mask()
     patch_patch_merger()
     patch_pre_transformer_norm(model)

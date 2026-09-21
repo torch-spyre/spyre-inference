@@ -1,40 +1,18 @@
-# ---------------------------------------------------------------------------
-# Serve benchmarks for Spyre devices using agentic dataset traces
+# Serve benchmarks for Spyre devices, replaying agentic dataset traces.
 #
-# `defaults` holds the settings every test shares; each entry under `tests`
-# is merged over it, so a test only spells out what makes it different.
-# A test can override any default by setting the same key.
+# Each entry under `tests` is merged over `defaults` and can override any key.
+# run_vllm_benchmarks.py derives SPYRE_DEVICES / AIU_WORLD_SIZE from
+# tensor-parallel-size, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from
+# server_health_timeout, and the bench-side model from server_parameters; it
+# also always passes --skip-chat-template, since the trace prompts carry their
+# own template.
 #
-# --custom-output-len -1 keeps each record's own `output_tokens`; --ignore-eos
-# makes generation run to that length so decode cost is comparable run to run.
-# --disable-shuffle replays the trace in its recorded order, which is what makes
-# the prefix-cache hit rate reproducible.
+# dataset-path is an env var so each host can point at its own copy of the
+# trace: ${SPYRE_AIOPS_DATASET} (_4k entries) and ${SPYRE_CICS_DATASET} (_8k).
+# Entries whose file is absent are skipped with a warning.
 #
-# --skip-chat-template is not listed here: the trace prompts already carry their
-# chat template, and re-applying it would change token counts and the
-# prefix-cache hit rate. run_vllm_benchmarks.py always passes it.
-#
-# SPYRE_DEVICES and AIU_WORLD_SIZE are derived from tensor-parallel-size, and
-# VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from server_health_timeout, by
-# run_vllm_benchmarks.py. Set any of them explicitly here only to override.
-#
-# The bench side takes its model from server_parameters, so each test names
-# its model once.
-#
-# dataset-path is an environment variable so each host can point it at its own
-# copy of the trace: ${SPYRE_AIOPS_DATASET} for the AIOps trace (_4k entries)
-# and ${SPYRE_CICS_DATASET} for the CICS trace (_8k entries), whose first 100
-# requests need the larger context. run_vllm_benchmarks.py expands them, falling
-# back to the paths on the Spyre benchmark hosts, and skips entries with a
-# warning where the file is not present.
-#
-# max-model-len matches the _4k/_8k suffix: the requests of the trace a test
-# replays stay under that many tokens (prompt + output), and longer requests are
+# The _4k/_8k suffix is the max-model-len the trace needs: longer requests are
 # rejected.
-#
-# num-prompts defaults to 100; the larger models override it downwards to keep
-# run time bounded.
-# ---------------------------------------------------------------------------
 
 defaults:
   environment_variables:
@@ -69,7 +47,6 @@ tests:
       max-model-len: 8192
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
-      num-prompts: 100
 
   - test_name: serve_granite33-8b_tp4_8k
     server_health_timeout: 3600
@@ -79,7 +56,6 @@ tests:
       max-model-len: 8192
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
-      num-prompts: 100
 
   - test_name: serve_granite41-8b_tp1_8k
     server_health_timeout: 1800
@@ -89,7 +65,6 @@ tests:
       max-model-len: 8192
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
-      num-prompts: 100
 
   - test_name: serve_granite41-8b_tp4_8k
     server_health_timeout: 3600
@@ -99,7 +74,6 @@ tests:
       max-model-len: 8192
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
-      num-prompts: 100
 
   - test_name: serve_granite33-8b-fp8_tp4_4k
     server_health_timeout: 3600

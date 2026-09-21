@@ -26,10 +26,9 @@ import yaml
 
 logging.basicConfig(level=logging.INFO)
 
-# Sections a config can carry its parameters in. Tried in order, and the first
-# one that actually names a model wins -- a serve config carries its model in
-# `server_parameters` and has no `parameters.model`, so an existing-but-modelless
-# section must not stop the search.
+# Tried in order; the first section that actually names a model wins. A serve
+# config has `server_parameters.model` and no `parameters.model`, so an
+# existing-but-modelless section must not stop the search.
 VLLM_BENCHMARK_CONFIGS_PARAMETER = (
     "parameters",
     "server_parameters",
@@ -102,16 +101,11 @@ def generate_benchmark_matrix(benchmark_configs_dir: str, models: list[str]) -> 
                 warning("Failed to load %s: %s", file, e)
                 continue
 
-        # A config file is either a bare list of tests or a `defaults`/`tests`
-        # mapping. Only the per-test `model` matters here, so `defaults` is not
-        # merged in.
+        # Only the per-test `model` matters here, so `defaults` is not merged in.
         if isinstance(configs, dict):
             configs = configs.get("tests") or []
 
         for config in configs:
-            # A serve config names its model in `server_parameters` only, so
-            # take the first section that carries one rather than the first
-            # section that exists.
             model = None
             for key in VLLM_BENCHMARK_CONFIGS_PARAMETER:
                 candidate = config.get(key, {}).get("model")

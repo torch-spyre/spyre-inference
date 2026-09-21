@@ -43,9 +43,8 @@ log = logging.getLogger(__name__)
 # Valid environment variable name pattern
 ENV_VAR_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*$")
 
-# Dataset paths in the benchmark configs are written as environment variable
-# references so each host can point them at its own mount. Unset variables fall
-# back to the layout on the Spyre benchmark hosts.
+# Fallbacks for the dataset env vars the configs reference, matching the layout
+# on the Spyre benchmark hosts.
 DATASET_PATH_DEFAULTS = {
     "SPYRE_AIOPS_DATASET": (
         "/models/online_benchmarking_data_reordered/"
@@ -57,10 +56,8 @@ DATASET_PATH_DEFAULTS = {
     ),
 }
 
-# Environment defaults shared by every benchmark: thread-count caps for the
-# CPU-side math libraries, plus the Spyre layout solver. Applied only when the
-# host has not set them, so a host can tune its own values. A test that needs a
-# different value sets it in its config's `environment_variables`.
+# Applied only where the host has not set them, so a host or a config's
+# `environment_variables` can override any of these.
 ENV_DEFAULTS = {
     "OMP_NUM_THREADS": "8",
     "OPENBLAS_NUM_THREADS": "8",
@@ -131,12 +128,10 @@ def _config_model(config: dict) -> str | None:
 
 
 def _config_tp(config: dict) -> int | None:
-    """Tensor-parallel size for a benchmark config.
+    """Tensor-parallel size for a benchmark config, or None if it sets none.
 
-    The serve configs spell the key `tensor-parallel-size` and the
-    latency/throughput ones `tensor_parallel_size`, matching the CLI each
-    passes it to. Every config must set one of them; a config with neither is
-    a config error, not a TP-1 default.
+    Both spellings are accepted: serve passes `tensor-parallel-size` to the
+    server CLI, latency/throughput `tensor_parallel_size`.
     """
     for key in ("parameters", "server_parameters"):
         parameters = config.get(key, {})
@@ -147,11 +142,7 @@ def _config_tp(config: dict) -> int | None:
 
 
 def _resolve_dataset_path(config: dict) -> None:
-    """Expand environment variables in a config's `dataset-path`, in place.
-
-    Applies DATASET_PATH_DEFAULTS for variables the host has not set, so an
-    unexpanded `${...}` never reaches the benchmark CLI.
-    """
+    """Expand environment variables in a config's `dataset-path`, in place."""
     parameters = config.get("parameters")
     if not parameters:
         return
@@ -171,9 +162,8 @@ def _missing_dataset(config: dict) -> str | None:
 
 
 def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
-    """Keep configs whose model and tensor-parallel size are selected (an empty
-    `models` / `tps` selects all) and whose dataset, if any, exists on this
-    host."""
+    """Keep configs whose model and TP are selected (empty selects all) and
+    whose dataset, if any, exists on this host."""
     selected = []
     for config in configs:
         model = _config_model(config)
@@ -203,8 +193,7 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
     return selected
 
 
-# Devices a config gets for its tensor-parallel size. Spyre devices are handed
-# out from 0, so TP n takes the first n.
+# Spyre devices are handed out from 0, so TP n takes the first n.
 def _spyre_devices_for_tp(tp: int) -> str:
     return ",".join(str(i) for i in range(tp))
 
@@ -212,9 +201,8 @@ def _spyre_devices_for_tp(tp: int) -> str:
 def _merge_defaults(defaults: dict, config: dict) -> dict:
     """Merge one test config over the file's `defaults`.
 
-    Merges one level into the three parameter sections, so a test overrides
-    individual keys rather than replacing a whole section. Keys outside those
-    sections (`test_name`, `server_health_timeout`) come from the test.
+    The parameter sections merge one level deep, so a test overrides individual
+    keys instead of replacing a whole section.
     """
     merged = {**defaults, **config}
     for section in ("environment_variables", "server_parameters", "parameters"):
@@ -228,17 +216,10 @@ def _merge_defaults(defaults: dict, config: dict) -> dict:
 def _derive_config(config: dict) -> None:
     """Fill in the config values that follow from others, in place.
 
-    Each is derived rather than spelled out per test, but a config that sets one
-    explicitly keeps its own value:
-
-    - `SPYRE_DEVICES` and `AIU_WORLD_SIZE` from tensor-parallel-size. Both must
-      agree with it: the devices say which cards the run gets, and the world
-      size is what the platform falls back to for its card count in
-      subprocesses that re-import before torch_spyre is loaded.
-    - `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` from `server_health_timeout`, so the
-      model-execute timeout never trips before the server is called unhealthy.
-    - the bench side's `model` from `server_parameters`, which the serve configs
-      name once.
+    A config that sets one of them explicitly keeps its own value.
+    `AIU_WORLD_SIZE` must agree with the device list: it is what the platform
+    falls back to for its card count in subprocesses that re-import before
+    torch_spyre is loaded.
     """
     env_config = config.setdefault("environment_variables", {})
 
@@ -257,12 +238,8 @@ def _derive_config(config: dict) -> None:
 
 
 def _load_configs(config_file: Path) -> list | None:
-    """Read a benchmark config file into a list of merged test configs.
-
-    Accepts either a bare list of tests or a `defaults` / `tests` mapping, in
-    which case every test is merged over `defaults`. Returns None on a
-    malformed file.
-    """
+    """Read a config file -- a bare list of tests, or a `defaults`/`tests`
+    mapping whose tests are merged over `defaults`. None if malformed."""
     with open(config_file) as f:
         raw = yaml.safe_load(f)
 
@@ -313,8 +290,7 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
 def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
     """Render a command as a copy-pasteable shell line, prefixed by its env vars.
 
-    Only the variables the config sets are shown; the inherited environment is
-    left out, so the line stays short enough to rerun by hand.
+    Only the config's own variables are shown, not the inherited environment.
     """
     prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(env_vars.items()))
     line = shlex.join(cmd)
@@ -322,23 +298,21 @@ def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
 
 
 def record_command(cmd: list[str], env_vars: dict[str, str], cmd_file: Path) -> str:
-    """Write a command line to `cmd_file` and return it.
-
-    The same line goes to the head of the run's log, so a log and its `.cmd`
-    file each say on their own how the run was invoked.
-    """
+    """Write a command line to `cmd_file` and return it."""
     line = format_command(cmd, env_vars)
     try:
         cmd_file.write_text(line + "\n")
     except OSError as e:
-        # The command itself still runs; losing the record is not a test failure.
+        # Losing the record is not a test failure.
         log.warning("Could not write %s: %s", cmd_file.name, e)
     return line
 
 
-# Equivalent to the `vllm` console script, but run through sys.executable so the
-# CLI always uses this interpreter's environment instead of whatever `vllm` PATH
-# resolves to.
+# Invoke the vLLM CLI directly: the dynamo recompile-limit raise the benchmarks
+# need is applied by the platform plugin at import (see
+# spyre_inference/platform.py::_raise_dynamo_recompile_limits, torch-spyre #444).
+# Via sys.executable rather than the `vllm` console script, so the CLI always
+# runs in this interpreter's environment.
 VLLM_CLI = [sys.executable, "-m", "vllm.entrypoints.cli.main"]
 
 
@@ -356,10 +330,8 @@ def run_benchmark(
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
 
-    # Build environment. The --spyre-devices / --aiu-world-size values are only
-    # a base: _derive_config has already put the per-test values in env_config,
-    # which is applied last and so wins for every config that carries a
-    # tensor-parallel size.
+    # The CLI device values are only a base: env_config carries the per-test
+    # values from _derive_config and is applied last, so it wins.
     env = os.environ.copy()
     for key, value in ENV_DEFAULTS.items():
         env.setdefault(key, value)
@@ -443,8 +415,8 @@ def run_serve_benchmark(
     health_timeout: int = 180,
 ) -> bool:
     """Start vllm serve, wait for health, run bench serve, cleanup."""
-    # As in run_benchmark: the CLI device values are a base that the per-test
-    # env_config, applied last, overrides.
+    # As in run_benchmark: env_config is applied last and overrides the CLI
+    # device values.
     env = os.environ.copy()
     for key, value in ENV_DEFAULTS.items():
         env.setdefault(key, value)
@@ -492,9 +464,8 @@ def run_serve_benchmark(
             start_new_session=True,
         )
 
-        # Wait for server health. Time it from just before the spawn: for large
-        # models most of this is the one-time warmup compile, which is the part
-        # worth comparing run to run.
+        # Timed from before the spawn: for large models this is mostly the
+        # one-time warmup compile, which is worth comparing run to run.
         health_url = f"http://{host}:{port}/health"
         server_startup_sec = None
         deadline = server_start_ts + health_timeout
@@ -524,9 +495,9 @@ def run_serve_benchmark(
         bench_cmd.extend(build_command_args(bench_parameters))
         bench_cmd.extend(
             [
-                # The trace prompts already carry their chat template; letting
-                # the bench re-apply it would change token counts and the
-                # prefix-cache hit rate, so this is not configurable.
+                # The trace prompts already carry their chat template;
+                # re-applying it would change token counts and the
+                # prefix-cache hit rate.
                 "--skip-chat-template",
                 "--save-result",
                 "--result-dir",
@@ -560,15 +531,14 @@ def run_serve_benchmark(
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
 
-    # `vllm bench serve` only measures the request phase, so add the startup
-    # time to its result file.
+    # `vllm bench serve` only measures the request phase.
     result_file = results_dir / f"{test_name}.json"
     try:
         data = json.loads(result_file.read_text())
         data["server_startup_sec"] = server_startup_sec
         result_file.write_text(json.dumps(data, indent=2))
     except (OSError, ValueError) as e:
-        # The benchmark itself succeeded; don't fail the test over this.
+        # The benchmark itself succeeded.
         log.warning("Could not add server_startup_sec to %s: %s", result_file.name, e)
 
     log.info("Serve test %s passed (server startup %.1fs)", test_name, server_startup_sec)

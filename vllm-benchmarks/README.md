@@ -9,9 +9,9 @@ test entries; one entry per `(model, shape)`:
 - `serve-tests.yaml` → `vllm bench serve` (starts a server, waits for health,
   then benchmarks against it)
 
-Serve entries replay a recorded agentic trace: real router prompts, each request keeping the output length it actually produced, replayed in recorded order so prefix-cache behaviour is reproducible. The `*_4k` and `*_8k` suffixes give the context the trace needs, served with `max-model-len: 4096` and `8192` respectively. A trace rather than a fixed prompt shape is what makes prefill chunking, prefix reuse, and KV-block pressure visible.
+Serve entries replay a recorded agentic trace: real router prompts, each request keeping the output length it actually produced, in recorded order. A trace rather than a fixed prompt shape is what makes prefill chunking, prefix reuse, and KV-block pressure visible. The `*_4k` / `*_8k` suffix is the `max-model-len` the trace needs.
 
-Trace paths are environment variables, so each host can point them at its own copy: `SPYRE_AIOPS_DATASET` for the AIOps trace (`*_4k`) and `SPYRE_CICS_DATASET` for the CICS trace (`*_8k`). Unset, each falls back to its location on the Spyre benchmark hosts. Where a file is not present, the runner skips the entries using it with a warning instead of failing.
+Trace paths come from `SPYRE_AIOPS_DATASET` (`*_4k`) and `SPYRE_CICS_DATASET` (`*_8k`), so each host can point at its own copy; unset, each falls back to its location on the Spyre benchmark hosts. Entries whose file is absent are skipped with a warning rather than failing.
 
 ## Running locally
 

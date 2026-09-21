@@ -32,11 +32,16 @@ BLOCK_SIZE = 64
 
 
 def make_config(
-    max_model_len=2048, max_num_batched_tokens=512, block_size=BLOCK_SIZE, max_num_seqs=8
+    max_model_len=2048,
+    max_num_batched_tokens=512,
+    block_size=BLOCK_SIZE,
+    max_num_seqs=8,
+    runner_type="generate",
 ):
     config = MagicMock()
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
+    config.model_config.runner_type = runner_type
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
     return config
@@ -110,6 +115,35 @@ class TestBuckets:
             b = SpyreAttnBucketer(make_config(max_model_len=limit, max_num_batched_tokens=limit))
             assert b.kv_buckets == sorted(set(b.kv_buckets))
             assert b.query_buckets == sorted(set(b.query_buckets))
+
+
+class TestPoolingQueryBucketCap:
+    """Pooling's query_len can't exceed max_model_len; without this cap, warmup
+    could record a query bucket with no matching num_blocks bucket, crashing
+    with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
+    max_model_len=77, max_num_batched_tokens much larger)."""
+
+    def test_pooling_caps_query_buckets_at_max_model_len(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
+        )
+        assert b.query_buckets[-1] == 77
+        # The largest recorded query bucket must round onto a real num_blocks
+        # bucket -- this is what crashed for CLIP.
+        largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
+        assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_generate_is_unaffected(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="generate")
+        )
+        assert b.query_buckets[-1] == 2048
+
+    def test_pooling_is_a_noop_when_max_batched_is_already_smaller(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.query_buckets[-1] == 512
 
 
 class TestFindBucket:

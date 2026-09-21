@@ -85,7 +85,12 @@ jobs:
       - name: Install Python dependencies
         run: |
           source .venv/bin/activate
-          uv pip install clickhouse-connect regex
+          # The parse/ingest logic is shared with torch-spyre and hf-adapters via
+          # spyre-clickhouse-ingest; the scripts above are the CLI around it. Tracking @main is
+          # deliberate: the point of the library is that ONE definition runs everywhere, and a
+          # consumer pinned to an older ref is a second definition again.
+          uv pip install clickhouse-connect regex \
+            "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
 
       - name: Install gh CLI
         env:

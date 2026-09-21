@@ -24,11 +24,14 @@ from . import (
     conv,  # noqa: F401
     gate_linear,  # noqa: F401
     gemma_rms_norm,  # noqa: F401
+    layer_norm,  # noqa: F401
     linear,
     logits_processor,  # noqa: F401
+    multimodal_embeddings,
     parallel_lm_head,
     rotary_embedding,
     utils,
+    vit_attn,
     vocab_parallel_embedding,  # noqa: F401
 )
 from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
@@ -41,3 +44,5 @@ def register_all():
     logger.info("Registering custom ops for spyre_inference")
     register_spyre_fp8_linear_kernel()
     utils.register()
+    multimodal_embeddings.register()
+    vit_attn.register()

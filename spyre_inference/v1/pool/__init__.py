@@ -16,6 +16,8 @@
 
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
+    SpyreDispatchPooler,
+    SpyreTokenPooler,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
@@ -23,6 +25,8 @@ from spyre_inference.v1.pool.spyre_pooler import (
 
 __all__ = [
     "SpyreAllPool",
+    "SpyreDispatchPooler",
+    "SpyreTokenPooler",
     "configure_pooling_for_spyre",
     "copy_pooler_output_to_cpu",
     "select_rows",

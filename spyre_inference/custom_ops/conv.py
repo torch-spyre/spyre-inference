@@ -87,6 +87,10 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
     if a workload uses many resolutions.
     """
 
+    # Per-(H, W) recompiles are this layer's contract, so the compile guard must not
+    # report them; warmup cannot enumerate every image resolution.
+    allow_inference_recompiles = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._w_dev: torch.Tensor | None = None

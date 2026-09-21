@@ -20,8 +20,12 @@ path. This module enumerates the pairs a run can reach so warmup can record them
 all up front.
 
 Separate from ``SpyreShapeBucketer``, which dispatches a single ``num_tokens``
-int for the model graph; an attention variant is 2-D (kv_len and query_len
-buckets).
+int for the model graph; a per-sequence attention variant is 2-D (kv_len and
+query_len buckets).
+
+The batched decode kernel specializes on its own key,
+``(num_seqs, blocks_per_chunk, num_chunks)``, hence a second bucket type and
+enumerator.
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
@@ -51,10 +55,25 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # starts here -- smaller batches never dispatch to a batched variant.
 _MIN_BATCHED_SEQS = 4
 
+# Cores available to split a gather's entry axis across.
+_SPYRE_CORE_COUNT = 32
+
+
+def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+    """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
+
+    ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
+    them, more than one stick's worth hits a backend axis-merge limit. The block
+    axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
+    """
+    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+    return blocks_per_chunk, num_chunks
+
 
 @dataclass(frozen=True)
 class SpyreAttnBucket:
-    """One recordable attention kernel variant.
+    """One recordable per-sequence attention kernel variant.
 
     Fields are the values the kernel specializes on, so a recorded bucket and a
     runtime dispatch reach the same Dynamo entry.
@@ -62,6 +81,22 @@ class SpyreAttnBucket:
 
     num_blocks: int
     padded_query_len: int
+
+
+@dataclass(frozen=True)
+class SpyreAttnBatchedDecodeBucket:
+    """One recordable batched decode kernel variant.
+
+    The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
+    ``num_chunks`` (the per-chunk index list it unrolls at trace time).
+    ``num_blocks`` is the bucket they were derived from, kept so the recorder can
+    skip a bucket that outruns the KV allocation.
+    """
+
+    num_seqs: int
+    num_blocks: int
+    blocks_per_chunk: int
+    num_chunks: int
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -138,6 +173,14 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
+        # A pooling request's query_len is its own context_len, so it can't
+        # exceed max_model_len even when max_num_batched_tokens is larger (unlike
+        # a decoder's chunked-prefill step). Without this cap, warmup could record
+        # a query bucket with no matching num_blocks bucket, crashing with
+        # "num_blocks=N exceeds the largest recorded bucket".
+        if vllm_config.model_config.runner_type == "pooling":
+            max_batched = min(max_batched, max_model_len)
+
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform
@@ -152,11 +195,15 @@ class SpyreAttnBucketer:
         # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
         # batch sizes the batched decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = _resolve_buckets(
-            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-            max_num_seqs,
-            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+        self._num_seqs_buckets: list[int] = (
+            _resolve_buckets(
+                envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+                max_num_seqs,
+                "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+            )
+            if max_num_seqs >= _MIN_BATCHED_SEQS
+            else []
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
@@ -258,5 +305,29 @@ class SpyreAttnBucketer:
                     continue
                 out.append(
                     SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len)
+                )
+        return out
+
+    def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
+        """Every batched decode variant worth recording, largest first.
+
+        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
+        ``variants()`` there is no inter-axis bound to exploit, since a decode
+        batch of any size can sit at any context length. Both axes are geometric,
+        so the grid stays small.
+        """
+        if not envs.SPYRE_BATCHED_DECODE:
+            return []
+        out: list[SpyreAttnBatchedDecodeBucket] = []
+        for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+            for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
+                blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+                out.append(
+                    SpyreAttnBatchedDecodeBucket(
+                        num_seqs=num_seqs,
+                        num_blocks=num_blocks,
+                        blocks_per_chunk=blocks_per_chunk,
+                        num_chunks=num_chunks,
+                    )
                 )
         return out

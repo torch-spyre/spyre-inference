@@ -27,6 +27,26 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Gemma-4: text-only use of a vision checkpoint
+
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
+`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
+tower — weights to load and graphs to warm up that a text-only workload never runs.
+
+To use one of those repositories for text only, pin its decoder architecture:
+
+```python
+llm = LLM(
+    model="google/gemma-4-26B-A4B",
+    hf_overrides={"architectures": ["Gemma4ForCausalLM"]},
+    tensor_parallel_size=2,
+)
+```
+
+That is also the configuration the tensor-parallel and compile e2e tests run these
+checkpoints under. A repository with no vision tower gets the override by default, so
+this is only needed for the multimodal ones.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
@@ -64,6 +84,54 @@ Example:
 vllm serve ibm-granite/granite-embedding-125m-english \
   --runner pooling --max-num-seqs 4 --max-model-len 512
 ```
+
+## Tuning buckets for padding
+
+Bucketing trades warmup time for per-request padding. A request is padded up to the next
+bucket on each axis and the padding is masked out, so buckets far above your real shapes
+waste compute, while buckets that hug your workload cut that waste but add graphs to
+compile at warmup. Attention is recorded as the **product** of its KV-length and
+query-length buckets (and, when the batched-decode kernel is enabled, a second KV-length ×
+num-sequences product), so extra attention buckets cost multiplicatively — keep those
+lists short.
+
+**Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
+platform clamps `--max-num-batched-tokens` to the largest entry. A decode-heavy run at
+`--max-num-seqs 8` rarely needs the full power-of-two ladder:
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+    max_num_seqs=8,
+    max_model_len=2048,
+    compilation_config={"compile_sizes": [1, 8, 512]},
+)
+```
+
+`1` and `8` cover decode steps (one token per running sequence, up to 8); `512` is the
+prefill bucket.
+
+**Attention (KV length × query length).** Set the buckets directly as comma-separated
+lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
+`--max-num-batched-tokens` (query) are dropped, and the limit is appended if missing, so
+every schedulable length keeps a bucket.
+
+```bash
+export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size
+export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
+```
+
+The default KV buckets are geometric (powers of two) precisely because the recorded set
+is a product. If your context never exceeds 2048, dropping the higher powers removes
+variants from warmup at no serving cost.
+
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; the
+head-major layout has no batched kernel and ignores it), warmup also records it over the
+KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
+(default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
+keep-it-short advice applies.
 
 ## pyproject.toml Reference
 

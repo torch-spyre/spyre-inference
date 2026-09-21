@@ -16,6 +16,7 @@ import pytest
 from spyre_testing_plugin.tags import result_tags
 
 from spyre_inference import envs
+from spyre_inference.v1.worker import compile_guard
 
 
 @pytest.fixture(autouse=True)
@@ -25,6 +26,25 @@ def _clear_env_cache():
     envs.clear_env_cache()
     yield
     envs.clear_env_cache()
+
+
+@pytest.fixture(autouse=True)
+def _disarm_compile_guard():
+    """The compile guard installs a process-wide Dynamo callback, so an armed guard
+    leaking out of a test would raise inside an unrelated one.
+
+    Only the arming is undone, never the registry: `watch` runs at import for the
+    attention kernels and once per memoized kernel elsewhere (`_compiled_kernels`,
+    `layer.spyre_moe_regions`, `self.spyre_compiled_kernel`), and those memos outlive
+    the test, so a registration dropped here never comes back and a later
+    warmup-coverage test would pass with its kernel silently unwatched. Clearing the
+    reported-once set is enough for isolation: it is what makes one violation log
+    once, so leaving it would mute an expected report in the next test.
+    """
+    compile_guard.disarm()
+    yield
+    compile_guard.disarm()
+    compile_guard.clear_reported()
 
 
 @pytest.fixture(autouse=True)

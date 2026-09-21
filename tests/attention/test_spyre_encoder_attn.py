@@ -19,7 +19,7 @@ import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 from spyre_inference.v1.attention.backends import spyre_encoder_attn as encoder_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -30,9 +30,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     _content_query_lens,
     build_attention_mask,
+    build_key_pad_mask,
     dummy_pack_row,
     gather_pack,
     gather_unpack,
+    host_key_pad_mask,
     host_pack_indices,
     host_scatter_pack_dest,
     scatter_pack,
@@ -98,6 +100,7 @@ def _build_metadata(
     query_start_loc: torch.Tensor,
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
+    spec_cls: type[AttentionSpec] = EncoderOnlyAttentionSpec,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
     from vllm.config import get_current_vllm_config
@@ -111,7 +114,10 @@ def _build_metadata(
     # cache_config one, so a test block_size has to be set in both places.
     vllm_config.cache_config.block_size = block_size
 
-    kv_cache_spec = AttentionSpec(
+    # Defaults to the spec upstream hands an ENCODER_ONLY group, not a plain
+    # AttentionSpec: build() branches on it to skip the KV-cache fields, so a plain
+    # one would exercise a path production never takes.
+    kv_cache_spec = spec_cls(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -309,6 +315,44 @@ def test_build_attention_mask_matches_loop(
         torch.testing.assert_close(got, ref, atol=0, rtol=0)
         return
     assert bool((got[~attend] < -1e4).all()), "pad slots must stay a large negative"
+
+
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,aligned_len,num_kv_heads",
+    [
+        pytest.param([32], [32], 64, 12, id="single_32"),
+        pytest.param([9, 70, 5], [9, 70, 5], 128, 12, id="batch_unaligned"),
+        pytest.param([16, 8], [8, 8], 64, 4, id="kv_shorter_than_q"),
+        pytest.param([5, 0], [5, 0], 64, 1, id="dummy_seq"),
+        pytest.param([0], [0], 64, 8, id="all_dummy"),
+    ],
+)
+@torch.inference_mode()
+def test_build_key_pad_mask_matches_sliced_square(
+    query_lens: list[int],
+    kv_lens: list[int],
+    aligned_len: int,
+    num_kv_heads: int,
+) -> None:
+    """Direct ``[B*KV, 1, 1, L]`` row must match slicing query-row 0 of the square."""
+    dtype = torch.float16
+    square = build_attention_mask(
+        len(query_lens),
+        aligned_len,
+        query_lens,
+        kv_lens,
+        dtype=dtype,
+    )
+    sliced = host_key_pad_mask(square, num_kv_heads)
+    got = build_key_pad_mask(
+        len(query_lens),
+        aligned_len,
+        [min(q, k) for q, k in zip(query_lens, kv_lens)],
+        num_kv_heads,
+        dtype=dtype,
+    )
+    assert got.shape == (len(query_lens) * num_kv_heads, 1, 1, aligned_len)
+    torch.testing.assert_close(got, sliced, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -621,7 +665,7 @@ def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -
 
 @torch.inference_mode()
 def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
-    """Fused B=1 path does not H2D dest, unpack, or a [B, 1, L, L] mask."""
+    """Fused B=1 path does not H2D dest, unpack, or build a key-pad mask."""
     idx_calls = {"n": 0}
     real_idx = encoder_attn._indices_for_device
 
@@ -646,11 +690,20 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
         return real_mask(*args, **kwargs)
 
     monkeypatch.setattr(encoder_attn, "build_attention_mask", count_mask)
+    row_calls = {"n": 0}
+    real_row = encoder_attn.build_key_pad_mask
+
+    def count_row(*args, **kwargs):
+        row_calls["n"] += 1
+        return real_row(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
     impl, fwd, query, meta = _b1_dense_forward_setup()
     impl.forward(**fwd, output=torch.empty_like(query))
     assert idx_calls["n"] == 0
     assert pad_calls["n"] == 0
     assert mask_calls["n"] == 0
+    assert row_calls["n"] == 0
     assert meta.encoder_fused_sdpa
     assert meta.encoder_pack_batch == 1
     assert meta.encoder_pack_len == 64
@@ -664,6 +717,44 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
     impl.forward(**fwd, output=torch.empty_like(query))
     assert idx_calls["n"] == 0
     assert mask_calls["n"] == 0
+    assert row_calls["n"] == 0
+
+
+@torch.inference_mode()
+def test_packed_path_builds_key_pad_row_not_square(monkeypatch, default_vllm_config) -> None:
+    """Serve must not allocate ``[B, 1, L, L]`` just to throw away all but row 0."""
+    square = {"n": 0}
+    slice_row = {"n": 0}
+    row = {"n": 0}
+    real_square = encoder_attn.build_attention_mask
+    real_slice = encoder_attn.host_key_pad_mask
+    real_row = encoder_attn.build_key_pad_mask
+
+    def count_square(*args, **kwargs):
+        square["n"] += 1
+        return real_square(*args, **kwargs)
+
+    def count_slice(*args, **kwargs):
+        slice_row["n"] += 1
+        return real_slice(*args, **kwargs)
+
+    def count_row(*args, **kwargs):
+        row["n"] += 1
+        return real_row(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "build_attention_mask", count_square)
+    monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_slice)
+    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
+    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
+    meta.seq_lens = torch.tensor([5], dtype=torch.int32)
+    meta.num_actual_tokens = 5
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert square["n"] == 0
+    assert slice_row["n"] == 0
+    assert row["n"] == 1
+    _assert_pad_mask(meta, 5)
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert row["n"] == 1
 
 
 def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: int):
@@ -737,7 +828,11 @@ def _assert_pad_mask(meta, real_len: int) -> None:
     key_pad = meta.encoder_key_pad_mask
     assert key_pad is not None
     key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
-    assert key_cpu.shape[-2] == key_cpu.shape[-1]
+    # Query axis stays 1: the same key-pad row applies to every query row and the
+    # compiled add in _packed_pv broadcasts it. A dense [.., L, L] here would be
+    # 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
+    assert key_cpu.shape[-2] == 1
+    assert key_cpu.shape[-1] == meta.encoder_pack_len
     assert key_cpu[0, 0, 0, 0].item() == 0.0
     assert key_cpu[0, 0, 0, real_len].item() < -1.0e3
 
@@ -1076,3 +1171,95 @@ def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
     assert calls["n"] == 0
     expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
     assert torch.equal(out, expected)
+
+
+def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs: int):
+    """Metadata for warmup's profiling batch: every sequence at the full body size.
+
+    Upstream ``_dummy_run`` sets ``seq_lens = num_tokens`` for every request
+    regardless of how it split the token budget, so this is what the builder sees
+    when the pooling warmup loop runs its largest body bucket.
+    """
+    from vllm.config import get_current_vllm_config
+
+    get_current_vllm_config().model_config.max_model_len = max_model_len
+    return _build_metadata(
+        num_query_heads=4,
+        num_kv_heads=4,
+        head_size=64,
+        block_size=128,
+        seq_lens=torch.full((num_seqs,), prompt_len, dtype=torch.int32),
+        query_start_loc=torch.arange(0, (num_seqs + 1) * prompt_len, prompt_len).to(torch.int32),
+        block_table=torch.zeros((num_seqs, 8), dtype=torch.int32),
+        slot_mapping=torch.zeros(num_seqs * prompt_len, dtype=torch.int64),
+        spec_cls=spec_cls,
+    )
+
+
+def test_encoder_build_skips_kv_cache_fields(default_vllm_config) -> None:
+    meta = _profile_metadata(EncoderOnlyAttentionSpec, max_model_len=512, prompt_len=64, num_seqs=2)
+    assert meta.padded_num_blocks is None
+    assert not meta.attention_mask_tiles
+    assert meta.page_index_tables_cpu is None
+    assert meta.active_block_indices is None
+    # Everything SpyreEncoderAttentionImpl.forward actually reads.
+    assert meta.num_seqs == 2
+    assert meta.num_actual_tokens == 128
+    assert meta.seq_lens.tolist() == [64, 64]
+    assert meta.query_start_loc.tolist() == [0, 64, 128]
+
+
+def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_config) -> None:
+    """A pooling model whose max_model_len is under the top body bucket still builds.
+
+    The two ladders are keyed on different quantities: the num_blocks buckets come
+    from max_model_len, while the body buckets a pooling model warms come from
+    max_num_batched_tokens. all-MiniLM-L6-v2 and all-roberta-large-v1 derive
+    max_model_len=256 and get a 512-token top body bucket, so warmup profiled 4
+    blocks against a 2-block ladder and the engine died at init.
+    """
+    meta = _profile_metadata(
+        EncoderOnlyAttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1
+    )
+    assert meta.padded_num_blocks is None
+
+    # Same input on the paged builder still raises: the guard is what makes the
+    # encoder case work, not a widened ladder.
+    with pytest.raises(AssertionError, match="exceeds the largest recorded bucket"):
+        _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)
+
+
+def test_eager_config_has_no_body_ladder_to_cache(monkeypatch) -> None:
+    """``--enforce-eager`` leaves ``compile_sizes`` unset, and init must tolerate it.
+
+    ``apply_config_platform_defaults`` returns at ``CompilationMode.NONE`` before it
+    builds the body ladder, so every eager pooling engine died in this constructor.
+    """
+    from vllm.config import (
+        CompilationMode,
+        DeviceConfig,
+        ModelConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
+    from vllm.platforms import PlatformEnum, current_platform
+
+    monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        model_config=ModelConfig(dtype=torch.float16, enforce_eager=True),
+    )
+    assert config.compilation_config.mode == CompilationMode.NONE
+    assert config.compilation_config.compile_sizes is None, "the hook now builds a ladder here"
+    with set_current_vllm_config(config):
+        impl = SpyreEncoderAttentionImpl(
+            num_heads=16,
+            head_size=64,
+            scale=64**-0.5,
+            num_kv_heads=4,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            logits_soft_cap=None,
+        )
+    assert impl._cached_body_buckets == []

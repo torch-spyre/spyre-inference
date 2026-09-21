@@ -15,7 +15,7 @@
 """Spyre OOT ``GateLinear``: MoE router logits stay in the weight dtype.
 
 Spyre cannot restickify fp32 (``spyre::ReStickifyOpHBM`` is unsupported for
-IEEE_FP32), so the routing softmax over upstream's fp32 logits fails to lower.
+IEEE_FP32); the routing reduction over them is promoted in ``moe`` instead.
 """
 
 from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear

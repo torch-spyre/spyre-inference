@@ -76,6 +76,20 @@ def _make_kernel(*, granite_channel: bool = False):
     )
 
 
+# Non-strict: this shape still compiles on some deeptools/dxp_standalone builds,
+# and an xpass is the signal that the backend fix landed.
+_XFAIL_M1 = pytest.param(
+    1,
+    marks=pytest.mark.xfail(
+        strict=False,
+        reason=(
+            "dxp_standalone fails to compile the fused activation-quantize + "
+            "_scaled_mm graph for the M=1 decode shape"
+        ),
+    ),
+)
+
+
 @pytest.mark.fp8
 class TestSpyreFp8LinearKernel:
     def test_register(self):
@@ -204,9 +218,13 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
     def test_scaled_mm_apply(self, num_tokens):
-        """apply_weights runs aten._scaled_mm on Spyre."""
+        """apply_weights runs aten._scaled_mm on Spyre.
+
+        num_tokens=5 and 130 exercise M-padding (not in _SMALL_M, not aligned
+        to _M_ALIGN=128), verifying the trim-before-reshape path.
+        """
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -228,7 +246,50 @@ class TestSpyreFp8LinearKernel:
         assert actual.dtype == torch.float16
         assert actual.shape == (num_tokens, out_features)
 
-    @pytest.mark.parametrize("num_tokens", [1, 4, 128])
+    @pytest.mark.parametrize(
+        "batch, seq_len",
+        [
+            (1, 5),  # M=5: not in _SMALL_M, pads to 128
+            (5, 1),  # M=5: same total, different reshape
+            (13, 10),  # M=130: not aligned to _M_ALIGN=128, pads to 256
+            (10, 13),  # M=130: same total, different reshape
+        ],
+    )
+    def test_scaled_mm_3d_matches_2d(self, batch, seq_len):
+        """3-D input ``(B, S, K)`` must produce the same values as 2-D ``(B*S, K)``.
+
+        The trim-before-reshape path (``out[:orig_m].clone()``) is critical here:
+        without the clone, the reshape reads padding rows from the over-sized
+        storage, corrupting trailing dimensions.  On main this gives
+        ``max|out3d − out2d| ≈ 3``; with the fix the outputs are bitwise identical.
+        """
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(42)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=False)
+
+        x2d = torch.randn(batch * seq_len, in_features, dtype=torch.float16, device="spyre")
+        x3d = x2d.reshape(batch, seq_len, in_features)
+
+        out2d = self._run_spyre_apply(kernel, layer, x2d)
+        out3d = self._run_spyre_apply(kernel, layer, x3d)
+
+        assert out2d.shape == (batch * seq_len, out_features)
+        assert out3d.shape == (batch, seq_len, out_features)
+        torch.testing.assert_close(out3d.reshape_as(out2d), out2d, atol=0.0, rtol=0.0)
+
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
     def test_scaled_mm_apply_per_channel(self, num_tokens):
         """apply_weights with Granite per-channel weight scales + per-token acts."""
         if not spyre_available():

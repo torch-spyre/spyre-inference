@@ -17,9 +17,11 @@ Reports device time for the whole emulated attention layer. `--span` narrows tha
 to one scope; see below.
 
 `granite33_8b_e2e_ref.json` reproduces the shapes of one specific end-to-end run,
-as a reference point for checking the harness against it. It is not a description
-of how every deployment is configured — in particular the KV bucket pin is that
-run's, not a default. The run it mirrors:
+as a reference point for checking the harness against it. It declares the shapes
+that run's kernels actually got, not the request lengths it was given: the
+`SPYRE_ATTN_KV_BUCKETS=2048` pin made every step a 16-page kernel, so its four
+prefill chunks — kv 512/1024/1536/1984, query 512/512/512/448 — were all the one
+`q=512, kv=2048` shape, and appear here as a single capture. The run it mirrors:
 
 ```bash
 LAYOUT_SOLVER=greedy SPYRE_NUM_CPUS=8 SPYRE_ATTN_KV_BUCKETS=2048 \
@@ -80,29 +82,34 @@ RoPE kernel, so production has no standalone reshape_and_cache kernel. What
 pair *in isolation*; it cannot be subtracted from, or compared against, the fused
 kernel. Treat it as a bound, not as production's KV-write cost.
 
-## Shapes are declared, but padded
+## Shapes are exact
 
-A config declares `(query_lens, seq_lens)`; the kernel does not run those lengths.
-The real `SpyreAttentionMetadataBuilder` pads each sequence onto the bucket
-lattice, and the kernel specialises on `(num_blocks, padded_query_len)`. The same
-declared shape lands on different kernels under different ladders — a `q=512,
-kv=512` chunk pads to 4 pages under the default geometric ladder and to 16 under
-`SPYRE_ATTN_KV_BUCKETS=2048`.
+A config declares `(query_lens, seq_lens)` and the kernel runs those lengths. The
+bucket lattice is not a second knob: `derive_lattice` builds it from the shape list
+so that every declared length is its own bucket and the real
+`SpyreAttentionMetadataBuilder`'s round-up is the identity. `max_model_len` and
+`max_num_seqs` are the tops of those ladders, so they are derived too.
+`max_num_batched_tokens` is pinned to the platform's 512 cap instead: `staging_rows`
+is it plus one, and those buffers are the kernel's query and output arguments, so
+deriving it from a decode-only shape list would narrow the gather the kernel runs.
+A config that sets any of the three, or the old `attn_*_buckets` keys, is rejected.
 
-So the lattice belongs in the config, not inherited from whatever model
-`ModelConfig()` happens to resolve:
+Padding has not gone away — it is now something you ask for. The kernel specialises
+on `(num_blocks, padded_query_len)`, so **to measure what a deployment's coarser
+ladder does to a length, declare the padded length**: a `q=512, kv=512` chunk under
+`SPYRE_ATTN_KV_BUCKETS=2048` is a 16-page kernel, so declare `kv=2048`. The mask
+differs (fewer valid positions) but the shape, and so the cost, is the one
+production runs.
 
-```json
-"max_model_len": 2048,
-"max_num_batched_tokens": 512,
-"max_num_seqs": 4,
-"attn_kv_buckets": "2048"
-```
+Either way the realized shape is recorded per row, read back from the built metadata
+rather than assumed: `num_kv_blocks_iterated` and `padded_query_len` are what the
+kernel got, and a disagreement with the declared shape sets `error` instead of
+quietly retitling the measurement.
 
-`attn_kv_buckets` / `attn_query_buckets` / `attn_num_seqs_buckets` set the
-matching `SPYRE_ATTN_*` env vars. `block_size` reaches `cache_config`, which the
-builder asserts its `kv_cache_spec` against, so a `block_sizes` sweep runs one
-config context per block size.
+`block_size` reaches `cache_config`, which the builder asserts its `kv_cache_spec`
+against, so a `block_sizes` sweep runs one config context per block size. The
+lattice itself is in tokens and sequences, so it is shared across that sweep —
+which it has to be, since `spyre_inference.envs` caches on first read.
 
 ### Prefill is always chunked
 
@@ -110,8 +117,9 @@ config context per block size.
 `min(max_num_batched_tokens, 512)` for decoder models, so a query longer than
 that is unschedulable at **any** `max_model_len`: production chunks its prefills.
 A prefill capture is therefore `query_len <= 512` against a growing `seq_len`, not
-`query_len == seq_len`. Shapes the engine cannot schedule are reported as a row
-with `error` set rather than an assertion mid-sweep.
+`query_len == seq_len`. The cap is checked against the declared batch, since the
+derived limits come from the shapes and so can never rule one out; a batch over it
+is reported as a row with `error` set rather than an assertion mid-sweep.
 
 ### Batched decode
 
@@ -120,10 +128,9 @@ The batched decode kernel needs the `batched_decode_compiled` variant, which set
 variant in one run). It also needs `num_decode_seqs >= 4`, a compiled build, and a
 resolvable sequence/blocks bucket pair.
 
-The batch axis is bucketed onto powers of two from 4 up to `max_num_seqs`, so
-setting `max_num_seqs` sets the top of the ladder and the largest batch worth
-capturing: `granite33_8b_batched_decode.json` uses 32 and sweeps 4/8/16/32.
-`num_blocks` then has to hold every sequence's pages at that batch size.
+The batch axis is bucketed like the other two — one bucket per captured batch size,
+so each of `granite33_8b_batched_decode.json`'s 4/8/16/32 captures dispatches to its
+own kernel. `num_blocks` has to hold every sequence's pages at the largest of them.
 
 When the gate declines, the impl silently falls back to the per-seq loop. The
 `attn_path` column records which path actually ran, and a declined gate sets
@@ -184,7 +191,8 @@ wall-clock numbers. Spyre-specific columns: `device_time_memory_us` and
 `memory_share_pct` (memcpy/memset/restickify/d2d-copy share), `cpu_time_ms`,
 `fallback_clean`, `num_outliers`, `span`, `kv_layout`, `kv_write`,
 `attn_path`, `num_decode_seqs`, `padded_num_seqs`, `decode_uniformity`,
-`blocks_per_chunk`, `kernels_attributed`, `kernels_expected`, `late_compile`.
+`blocks_per_chunk`, `kernels_attributed`, `kernels_expected`, `late_compile`,
+`num_kv_blocks_iterated`, `padded_query_len`.
 
 One forward per profile window: the AIUPTI backend has a fixed pool of trace
 buffers (`docs/user_guide/kineto_profiling.md` §4.5) and stops capturing once
@@ -194,7 +202,9 @@ full, so a single long window truncates the timeline. An end-to-end
 reason this harness exists.
 
 Normalize by `num_kv_blocks_iterated` before concluding anything about scaling —
-raw µs can suggest a knee that vanishes once divided by pages iterated.
+raw µs can suggest a knee that vanishes once divided by pages iterated. It is the
+count the kernel iterated, not one derived from `max_seq_len`, so it stays right
+when a row is padded.
 
 ## Device memory
 

@@ -9,5 +9,9 @@ self-hosted-runner:
     - image_torch_spyre_pinned
     - image_torch_spyre_pinned_shadow
     - image_spyre_inference
+    # merge-queue runner sets
+    - image_torch_spyre_mq
+    - image_torch_spyre_pinned_mq
+    - image_spyre_inference_mq
     # cardless ClickHouse-ingest set (spyre-frameworks #1235/#1236)
     - image_ingest

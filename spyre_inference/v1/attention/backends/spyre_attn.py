@@ -221,21 +221,15 @@ def _sliding_tile_plan(
     block_size: int,
     apply_causal_mask: bool,
 ) -> tuple[list[int], tuple[bool, ...]]:
-    """``(active_block_indices, needs_real_tile_per_block)`` for a sliding-window sequence.
-
-    A block flagged False is interior: inside every query's window, full of valid KV, and
-    (for prefill) below the earliest query's causal limit, so it shares one all-zero tile.
-    The kernel unrolls its page loop over the tiles and Dynamo guards which are the same
-    object, so the flags are part of its key and the warmup recorder enumerates over them.
-    """
-    first_active, _ = _sliding_active_span(kv_len, context_len, sliding_window, block_size)
+    """``(active_block_indices, needs_real_tile_per_block)`` for a sliding-window sequence."""
     num_blocks = (kv_len + block_size - 1) // block_size
-    # Every block up to the one holding the latest query's window start
-    # (max(0, kv_len - W)) can have a per-query cutoff falling inside it.
+    # Bound by the EARLIEST query's window, not the latest (``kv_len - W``): early queries
+    # in a prefill batch have earlier windows, and the latest would drop blocks they need.
+    first_active = max(0, context_len - sliding_window + 1) // block_size
+    # Blocks up to the latest query's window start can hold a per-query cutoff.
     last_lower_boundary = max(0, kv_len - sliding_window) // block_size
-    # A block is fully below the earliest query's causal limit (abs_pos = context_len)
-    # iff (b + 1) * block_size - 1 <= context_len. Decode applies no causal mask, so
-    # every block satisfies it trivially.
+    # Fully below the earliest query's causal limit iff
+    # (b + 1) * block_size - 1 <= context_len. Decode applies no causal mask.
     last_causal_interior = (
         (context_len + 1) // block_size - 1 if apply_causal_mask else num_blocks - 1
     )
@@ -248,23 +242,6 @@ def _sliding_tile_plan(
         is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
         needs_real_tile.append(is_lower_boundary or is_upper_boundary or is_causal_boundary)
     return active, tuple(needs_real_tile)
-
-
-def _sliding_active_span(
-    kv_len: int, context_len: int, sliding_window: int, block_size: int
-) -> tuple[int, int]:
-    """``(first_active_block, active_block_count)`` for one sliding-window sequence.
-
-    A block is fully outside every query's window when its highest KV position is
-    below the earliest query's window start, ``max(0, context_len - W + 1)``. The
-    bound is the EARLIEST query's window and not the latest (``kv_len - W``): in a
-    prefill batch with ``query_len > 1`` the early queries have earlier windows, and
-    bounding by the latest would drop blocks they still attend to. For decode
-    (``query_len == 1``) the two coincide.
-    """
-    num_blocks = (kv_len + block_size - 1) // block_size
-    first_active = max(0, context_len - sliding_window + 1) // block_size
-    return first_active, max(0, num_blocks - first_active)
 
 
 @dataclass
@@ -662,8 +639,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert self.sliding_window is not None
         block_size = self.block_size
 
-        # Shared with the warmup recorder's shape enumeration, so the tiles it records
-        # are the tiles this builds.
         active_bs, needs_real_tile = _sliding_tile_plan(
             kv_len, query_len, context_len, self.sliding_window, block_size, apply_causal_mask
         )
@@ -824,9 +799,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # Sliding window: arithmetic block-skip. Blocks entirely outside
             # every query's window are dropped; interior blocks share a
             # zero mask tile; only boundary blocks get real per-query cutoffs.
-            # Left unpadded (padded_num_blocks stays None): len(active_bs) is a
-            # window-width quantity, already near-constant across decode steps.
-            # TODO: give this its own window-width buckets if it ever needs recording.
+            # Left unpadded (padded_num_blocks stays None): the window bounds the count,
+            # and sliding_variant_shapes() records every plan it can take.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()
@@ -1021,28 +995,18 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         )
 
     def sliding_variant_shapes(self) -> list[tuple[int, int]]:
-        """One ``(kv_len, query_len)`` per distinct sliding-window kernel shape.
-
-        The sliding-window branch dispatches on its window-derived active-block count,
-        which the num_blocks ladder cannot enumerate: for a block-aligned ``kv_len`` the
-        window boundary lands on a block edge, so every bucket at or above the window
-        realizes the same count and the counts real sequences reach go unrecorded. The
-        reachable counts are found by scanning instead, up to one window plus the widest
-        query and two further blocks, above which the count repeats with period
-        ``block_size``.
-
-        Both ends of every query bucket are scanned. The count spans from the earliest
-        query's window, so it grows with the *real* query length while the kernel keys on
-        the *padded* one: the widest query in a bucket reaches counts its narrowest never
-        does, and both round onto the same recorded variant.
-        """
+        """One ``(kv_len, query_len)`` per distinct sliding-window kernel shape."""
         assert self.sliding_window is not None
         bucketer = self._attn_bucketer
         block_size = self.block_size
+        # Not the num_blocks ladder: a block-aligned ``kv_len`` puts the window boundary on
+        # a block edge, so the ladder never reaches the counts real sequences do.
         limit = min(
             self._max_model_len,
             self.sliding_window + bucketer.query_buckets[-1] + 2 * block_size,
         )
+        # Every width, not one per bucket: the count grows with the real query length
+        # while the kernel keys on the padded one.
         shapes: dict[tuple[int, tuple[bool, ...]], tuple[int, int]] = {}
         for query_len in range(1, min(bucketer.query_buckets[-1], limit) + 1):
             aligned = 1 if query_len <= 1 else bucketer.find_query_bucket(query_len)
@@ -1401,8 +1365,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if self._batched_decode_supported()
             else []
         )
-        # A sliding window dispatches on its active-block count rather than on a
-        # num_blocks bucket, so its shapes are scanned and the ladder is not consulted.
+        # A sliding window dispatches on its active-block count, not a num_blocks bucket.
         sliding_shapes = (
             builder.sliding_variant_shapes() if builder.sliding_window is not None else None
         )
@@ -1530,17 +1493,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         builder: "SpyreAttentionMetadataBuilder",
         num_pages: int,
     ) -> int:
-        """Record one kernel per distinct shape ``(kv_len, query_len)`` realizes.
-
-        Several shapes can realize onto one kernel, so the count returned is of distinct
-        kernels traced. A failing shape is logged and skipped, not raised, so it cannot
-        take down engine startup; dispatch then compiles it on first use.
-        """
+        """Record one kernel per distinct shape ``(kv_len, query_len)`` realizes."""
         recorded: set[tuple[SpyreAttnBucket, tuple[int, ...]]] = set()
         for i, (kv_len, query_len) in enumerate(shapes, start=1):
             if (kv_len + builder.block_size - 1) // builder.block_size > num_pages:
-                # The scan is bounded by max_model_len; a memory-constrained cache
-                # allocates fewer pages than that many distinct blocks to gather.
+                # A memory-constrained cache holds fewer pages than max_model_len blocks.
                 continue
             t0 = time.time()
             try:
@@ -1551,17 +1508,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     num_blocks=len(tiles),
                     padded_query_len=attn_metadata.aligned_query_lens[0],
                 )
-                # The kernel unrolls its page loop over these tiles and Dynamo guards
-                # which of them are the same object, so two shapes agreeing on block
-                # count and query width can still need separate kernels. Canonical form:
-                # each tile maps to the index of its first occurrence.
+                # Dynamo guards which of these tiles are the same object, so two shapes
+                # agreeing on block count and query width can still need separate kernels.
                 first_seen: dict[int, int] = {}
                 aliasing = tuple(first_seen.setdefault(id(tile), i) for i, tile in enumerate(tiles))
                 if (realized, aliasing) in recorded:
                     continue
-                # The staging buffers take the same pre-staged path attn_layer takes, so
-                # no extra copies get traced. key/value are unused: attn_layer does the
-                # KV write.
+                # key/value are unused: attn_layer does the KV write.
                 q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
                 self.forward(
                     layer, q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging

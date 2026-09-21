@@ -25,19 +25,12 @@ from functools import cache
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.multimodal.utils import padded_sdpa
 
 logger = init_logger(__name__)
-
-# Matmul reduction dims must land on the Spyre stick: 64 fp16 elements.
-SEQ_ALIGNMENT = 64
-
-
-def _align_up(n: int, align: int = SEQ_ALIGNMENT) -> int:
-    return (n + align - 1) // align * align
 
 
 @cache
@@ -62,9 +55,6 @@ def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
     return x * cos + torch.matmul(x, m) * sin
 
 
-# Attribute under which a source mask carries its padded counterpart `(key, padded)`.
-_MASK_ATTR = "_spyre_padded_mask"
-
 # Attribute under which a `cu_seqlens` tensor carries its block-diagonal mask.
 _CU_MASK_ATTR = "_spyre_block_diag_mask"
 
@@ -87,84 +77,6 @@ def _block_diagonal_mask(cu_seqlens: torch.Tensor, seq: int) -> torch.Tensor:
         m[start:end, start:end] = True
     setattr(cu_seqlens, _CU_MASK_ATTR, (seq, m))
     return m
-
-
-def _padded_attn_mask(
-    mask: torch.Tensor,
-    b: int,
-    seq: int,
-    seq_pad: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> torch.Tensor:
-    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`, from a bool `mask`.
-
-    The tensor is O(L²) and the tower hands the same mask to every layer, so it is
-    cached on the mask itself: one upload per image, released with its source.
-    """
-    key = (b, seq, seq_pad, dtype, str(device))
-    cached = getattr(mask, _MASK_ATTR, None)
-    if cached is not None and cached[0] == key:
-        return cached[1]
-
-    # Assembled on CPU: strided slice-assign is not stick-safe on Spyre.
-    neg_inf = torch.finfo(dtype).min
-    m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
-    m[:, :, :, seq:] = neg_inf  # padded keys never attended
-    # Bool only. The additive float mask upstream used to precompute is gone in 0.29;
-    # the sole caller is `padded_sdpa`, fed from `_block_diagonal_mask`, which always
-    # returns a bool "these two tokens share an image" mask. Assert rather than convert:
-    # silently treating a float mask as keep/drop would invert it.
-    mc = convert(mask, "cpu")
-    if mc.dtype != torch.bool:
-        raise TypeError(f"_padded_attn_mask expects a bool keep-mask, got {mc.dtype}")
-    m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
-        ~mc.reshape(seq, seq), neg_inf
-    )
-
-    m = convert(m, device)
-    setattr(mask, _MASK_ATTR, (key, m))
-    return m
-
-
-def padded_sdpa(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    """SDPA over `[B, H, L, D]` with L and D padded to the 64 stick, then cropped.
-
-    Padded keys are masked to `-inf` and padded queries cropped off. `scale` comes
-    from the unpadded head dim, so the padding cannot change it.
-    """
-    b, _, seq, d = q.shape
-    scale = d**-0.5
-    seq_pad = _align_up(seq)
-    d_pad = _align_up(d)
-    device = q.device
-    padded = (seq_pad, d_pad) != (seq, d)
-
-    if padded:
-        # F.pad's tuple runs from the last dim backwards: (D left, D right, L left, L right).
-        pad = (0, d_pad - d, 0, seq_pad - seq)
-        q = F.pad(q, pad)
-        k = F.pad(k, pad)
-        v = F.pad(v, pad)
-
-    out = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
-        scale=scale,
-    )
-
-    if padded:
-        # Offset-0 prefix slice, so torch-spyre#3770 cannot bite. Left as a view: the
-        # caller's transpose+reshape materializes it anyway.
-        out = out[:, :, :seq, :d]
-    return out
 
 
 def patch_vision_attention() -> None:

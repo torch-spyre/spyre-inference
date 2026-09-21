@@ -15,11 +15,10 @@
 """A greedy request must answer the same way however the KV cache was used before it.
 
 The paged kernel gathers whole KV pages, so a sequence also reads the unused slots of its
-last block, and vLLM hands those blocks to later requests. On Spyre fp16 ``exp()``
-saturates at ``2**-24`` instead of underflowing to zero, so those masked slots keep a
-softmax weight and reach the output (torch-spyre#4517). Each test therefore runs a request,
-dirties its blocks with another, and reruns it -- and xfails until the backend is fixed.
-See ``tests/probes/test_fp16_exp_underflow_probe.py``.
+last block, and vLLM hands those blocks to later requests. Those slots are masked
+additively, so they must carry no softmax weight and must not reach the attention output.
+Each test therefore runs a request, dirties its blocks with another, and reruns it,
+asserting the logprobs are unchanged.
 """
 
 from __future__ import annotations
@@ -35,14 +34,6 @@ from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 # enforce_eager=False spawns an EngineCore subprocess, which cannot claim the Spyre card if
 # an in-process test already has.
 pytestmark = pytest.mark.uses_subprocess
-
-# Not strict: the leak is always present, but whether it moves a given logprob depends on
-# what the dirtying request left in the masked slots. The probe is the strict signal.
-_XFAIL_REASON = (
-    "torch-spyre#4517: masked KV slots reach the attention output, so a request's logprobs "
-    "depend on the requests before it. The fix belongs in the backend; see "
-    "tests/probes/test_fp16_exp_underflow_probe.py."
-)
 
 _MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
 # Short, so most of its single 128-slot KV block stays masked.
@@ -124,7 +115,6 @@ def _assert_fits_prefill(prompts: list[str]) -> None:
         )
 
 
-@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """The same greedy request twice, with a different request in between."""
     _assert_fits_prefill([_PROBE_PROMPT, _DIRTY_PROMPT])
@@ -181,7 +171,6 @@ def _block_counts() -> tuple[int, int]:
     return real, padded
 
 
-@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
     """A request whose block count is padded up must still answer identically."""
     from vllm.inputs import TokensPrompt
@@ -244,7 +233,6 @@ _BATCH_PROBE_PROMPTS = [
 ]
 
 
-@pytest.mark.xfail(strict=False, reason=_XFAIL_REASON)
 def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

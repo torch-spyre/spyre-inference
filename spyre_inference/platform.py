@@ -47,6 +47,11 @@ else:
 
 logger = init_logger(__name__)
 
+# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
+# accepted only when asked for explicitly. Both are 2 bytes wide, so every
+# stick-alignment constant in this plugin holds for either.
+_SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
+
 
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
@@ -62,6 +67,22 @@ def _disable_torch_accelerator() -> None:
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
     if hasattr(torch.accelerator, "empty_host_cache"):
         torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
+
+    # get_memory_info() has a real caller rather than a shutdown one: vLLM sizes its
+    # vision-encoder chunking budget with it. Host RAM is the right answer, since the
+    # transients that budget guards run on the host.
+    native_memory_info = torch.accelerator.get_memory_info
+
+    def _memory_info(*args, **kwargs) -> tuple[int, int]:
+        try:
+            return native_memory_info(*args, **kwargs)
+        except NotImplementedError:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            return (vm.available, vm.total)
+
+    torch.accelerator.get_memory_info = _memory_info  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -333,7 +354,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_capture_size,
             )
 
-        # In check_and_update_config we assert this must be float16 for spyre.
+        # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
@@ -536,12 +557,28 @@ class TorchSpyrePlatform(CpuPlatform):
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
-            # Check if the model dtype is different from float16,
-            # which is only currently supported in torch-spyre
-            if vllm_config.model_config.dtype != torch.float16:
+            # From here, not from `hf_overrides`, so a user-supplied override does not skip
+            # it; no-op for every other model. Runs again for the nested text config a
+            # multimodal model builds its decoder from.
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            repair_head_dim_access(vllm_config.model_config.hf_config)
+
+            if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
+                supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
-                    f"The model dtype needs to be torch.float16 for spyre, "
-                    f"but was specified to be {vllm_config.model_config.dtype}"
+                    f"The model dtype needs to be one of {supported} for spyre, but "
+                    f"was specified to be {vllm_config.model_config.dtype}"
+                )
+
+            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
+            # weights included.
+            quantization = getattr(vllm_config.model_config, "quantization", None)
+            if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
+                raise ValueError(
+                    f"Spyre does not support quantization ({quantization}) with "
+                    f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
+                    "the run was asked for in bfloat16. Run the unquantized checkpoint."
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
@@ -569,6 +606,21 @@ class TorchSpyrePlatform(CpuPlatform):
             raise ValueError(
                 f"Spyre does not support pipeline_parallel_size > 1 "
                 f"(got {parallel_config.pipeline_parallel_size})."
+            )
+
+        # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
+        # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
+        # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
+        if (
+            parallel_config.tensor_parallel_size > 1
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.dtype == torch.bfloat16
+        ):
+            raise ValueError(
+                f"Spyre does not support tensor_parallel_size > 1 with "
+                f"{torch.bfloat16} (got tensor_parallel_size="
+                f"{parallel_config.tensor_parallel_size}): torch-spyre's all_reduce is "
+                f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
         # Clamp CPU threading env vars before workers fork so they inherit the

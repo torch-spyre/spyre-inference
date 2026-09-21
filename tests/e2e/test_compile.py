@@ -24,6 +24,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
+
 # enforce_eager=False builds a subprocess EngineCore, so uses_subprocess runs these
 # before any in-process test initializes the Spyre device (a subprocess cannot open
 # the VFIO device once the main pytest process holds it).
@@ -40,20 +42,29 @@ _COSINE_MIN = 0.99
         (
             "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
             "\n\nIBMs main businesses are the companies that provide the services of the",
+            None,
         ),
         (
             "google/gemma-3-1b-it",
             "\n\nIBM's main businesses are:\n\n*   **Consulting:** Providing",
+            None,
         ),
+        # Both gemma-4 checkpoints carry a vision_config, so an unpinned run resolves
+        # Gemma4ForConditionalGeneration and builds the tower. This test is about the
+        # compiled decoder -- pin the backbone rather than pay for the tower; the vision
+        # path is covered by tests/multimodal/test_gemma4_vision.py.
         (
             "google/gemma-4-31B",
             "\n\nWhat are the main businesses of IBM?\n\nWhat are the main businesses of",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
         (
             "google/gemma-4-26B-A4B",
             "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
     ],
+    ids=["micro-g3.3", "gemma-3-1b-it", "gemma-4-31B-text", "gemma-4-26B-A4B-text"],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
@@ -61,8 +72,8 @@ def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) 
     No compilation_config is passed: the platform defaults a non-eager run to
     STOCK_TORCH_COMPILE (one transformer block at a time + attention kernel).
     """
-    model, ref_output = model_ref_output
-    _assert_compiled_output(model, ref_output, monkeypatch)
+    model, ref_output, hf_overrides = model_ref_output
+    _assert_compiled_output(model, ref_output, monkeypatch, hf_overrides=hf_overrides)
 
 
 def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,6 +139,7 @@ def _assert_compiled_output(
     ref_output: str,
     monkeypatch: pytest.MonkeyPatch,
     *,
+    hf_overrides=None,
     model_impl: str | None = None,
 ) -> None:
     from vllm import LLM, SamplingParams
@@ -144,6 +156,7 @@ def _assert_compiled_output(
         max_num_seqs=2,
         max_num_batched_tokens=8,
         compilation_config=CompilationConfig(compile_sizes=[1, 8]),
+        **({"hf_overrides": hf_overrides} if hf_overrides is not None else {}),
     )
     if model_impl is not None:
         kwargs["model_impl"] = model_impl

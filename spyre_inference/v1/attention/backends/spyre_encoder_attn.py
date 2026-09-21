@@ -285,6 +285,34 @@ def host_key_pad_mask(mask: torch.Tensor, num_kv_heads: int) -> torch.Tensor:
     )
 
 
+def build_key_pad_mask(
+    num_seqs: int,
+    aligned_len: int,
+    kv_lens: list[int],
+    num_kv_heads: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Host key-pad ``[B*KV, 1, 1, L]``.
+
+    Serve's only mask builder; ``build_attention_mask`` and
+    ``host_key_pad_mask`` are test-only.
+    """
+    if num_seqs != len(kv_lens):
+        raise ValueError(f"num_seqs={num_seqs} != len(kv_lens)={len(kv_lens)}")
+    kv_len = torch.tensor(kv_lens, dtype=torch.int32)
+    kv_pos = torch.arange(aligned_len, dtype=torch.int32)
+    zeros = torch.zeros((), dtype=dtype)
+    neg_inf = torch.tensor(torch.finfo(dtype).min, dtype=dtype)
+    # Length 0 (dummy seq) is all-inf, matching square-mask query row 0.
+    row = torch.where(kv_pos.unsqueeze(0) < kv_len.unsqueeze(1), zeros, neg_inf)
+    return (
+        row.view(num_seqs, 1, 1, aligned_len)
+        .expand(num_seqs, num_kv_heads, 1, aligned_len)
+        .reshape(num_seqs * num_kv_heads, 1, 1, aligned_len)
+        .contiguous()
+    )
+
+
 def _packed_qk_matmul(query: torch.Tensor, key: torch.Tensor, scale: float) -> torch.Tensor:
     """``[B, H, L, D]`` → scores ``[B*Hkv, G, L, L]``. Mask stays out of this graph."""
     batch, hq, length, dim = query.shape
@@ -680,17 +708,13 @@ def _ensure_encoder_pack(
     q_dest = host_scatter_pack_dest(q_starts, query_lens, aligned_len, padded_tokens, dummy_row)
     kv_dest = host_scatter_pack_dest(q_starts, kv_pack_lens, aligned_len, padded_tokens, dummy_row)
     unpack_idx = host_unpack_indices(orig_q_starts, orig_query_lens, aligned_len, padded_tokens)
-    mask_cpu = build_attention_mask(
+    key_pad = build_key_pad_mask(
         batch_bucket,
         aligned_len,
-        query_lens,
-        kv_lens,
+        kv_pack_lens,
+        num_kv_heads,
         dtype=query.dtype,
-        device=torch.device("cpu"),
     )
-    key_pad = host_key_pad_mask(mask_cpu, num_kv_heads)
-    # Do not H2D ``mask_cpu`` ([B, 1, L, L]). Forward only needs (B, L) plus
-    # this key-pad; at B=8, L=512 the unused copy is ~4 MB fp16 per step.
     if target_device.type == "spyre":
         key_pad = convert(key_pad, target_device)
     else:

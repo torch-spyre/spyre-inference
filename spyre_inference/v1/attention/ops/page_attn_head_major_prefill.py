@@ -49,7 +49,7 @@ def page_attn_head_major_prefill_kernel(
 
     # Gathered, not sliced: a compiled region reads a view from offset 0 and ignores its
     # strides (torch-spyre#3770).
-    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    q_rows = query.index_select(0, query_row_index)
     q = (
         q_rows.unsqueeze(0)
         .transpose(1, 2)
@@ -101,6 +101,6 @@ def page_attn_head_major_prefill_kernel(
     if out is not None:
         # Storing the full padded extent keeps this sequence's real query_len out of the
         # arguments, so it is not specialized on.
-        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        out.index_copy_(0, query_row_index, attn)
         return out
     return attn

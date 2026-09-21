@@ -25,6 +25,15 @@ from typing import Any
 # library can't load before init_device runs.
 os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 
+# Shorten torch-spyre's per-solve CP-SAT budget. Co-optimizing LX planning became
+# the default in torch-spyre #4455, which prices layouts with CP-SAT once per
+# recorded attention graph, and at the stock budget warmup runs long enough to
+# exhaust the per-test timeout on larger `compile_sizes` ladders. Solves that hit
+# the budget return their incumbent, so this trades layout search depth for
+# warmup time. `torch_spyre._inductor.config` reads this at import time, so it
+# has to be set before autoload triggers.
+os.environ.setdefault("CPSAT_TIME_LIMIT_SECONDS", "5")
+
 __version__ = importlib.metadata.version("spyre_inference")
 
 

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         spyre_moe_recipe: SpyreMoERecipe
         spyre_moe_regions: dict[str, Any]
         spyre_moe_stick: int
+        spyre_moe_route_dtype: torch.dtype
         spyre_moe_gate: torch.Tensor
         spyre_moe_up: torch.Tensor
         spyre_moe_down: torch.Tensor
@@ -143,15 +144,38 @@ def _topk(values: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]
     return weights[:tokens], indices[:tokens]
 
 
+def _route_reduce_dtype(experts: int, dtype: torch.dtype) -> torch.dtype:
+    # An fp32 rescale needs whole sticks in the source dtype ("cannot rescale device layout").
+    from torch_spyre._C import get_elem_in_stick
+
+    stick = get_elem_in_stick(dtype)
+    if experts % stick == 0:
+        return torch.float32
+    logger.warning_once(
+        "Spyre: reducing the routing softmax over %d experts in %s; an fp32 reduction "
+        "requires the expert count to be a multiple of %d.",
+        experts,
+        dtype,
+        stick,
+    )
+    return dtype
+
+
+def _probs(router_logits: torch.Tensor, reduce_dtype: torch.dtype) -> torch.Tensor:
+    return torch.softmax(router_logits.to(reduce_dtype), dim=-1).to(router_logits.dtype)
+
+
 def _routing_weights(
     router_logits: torch.Tensor,
     top_k: int,
     routing: str,
+    reduce_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if routing == "full_softmax":
-        selected_values, indices = _topk(torch.softmax(router_logits, dim=-1), top_k)
+        selected_values, indices = _topk(_probs(router_logits, reduce_dtype), top_k)
         weights = selected_values / selected_values.sum(-1, keepdim=True)
     else:
+        # ``reduce_dtype`` gates the expert dim; this reduces over ``top_k`` instead.
         selected_logits, indices = _topk(router_logits, top_k)
         weights = torch.softmax(selected_logits, dim=-1)
     return weights, indices
@@ -178,11 +202,12 @@ def _moe_gathered(
     down: torch.Tensor,
     top_k: int,
     stick: int,
+    reduce_dtype: torch.dtype,
     routing: str,
     activation: str,
 ) -> torch.Tensor:
     tokens, hidden = x.shape
-    weights, indices = _routing_weights(router_logits, top_k, routing)
+    weights, indices = _routing_weights(router_logits, top_k, routing, reduce_dtype)
     indices = _gather_indices(indices, top_k, stick)
     rows, inter = tokens * top_k, gate.shape[-1]
     inputs = x[:, None, :].expand(tokens, top_k, hidden).contiguous().reshape(rows, 1, hidden)
@@ -279,18 +304,17 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_down,
         layer.top_k,
         layer.spyre_moe_stick,
+        layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
     )
 
 
-def _probs(router_logits: torch.Tensor) -> torch.Tensor:
-    return torch.softmax(router_logits, dim=-1)
-
-
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
     """Materialize canonical vLLM top-k weights in dense expert order."""
-    topk_weights, topk_ids = _routing_weights(router_logits, top_k, "topk_softmax")
+    topk_weights, topk_ids = _routing_weights(
+        router_logits, top_k, "topk_softmax", router_logits.dtype
+    )
     return torch.zeros_like(router_logits).scatter(-1, topk_ids, topk_weights)
 
 
@@ -325,6 +349,10 @@ def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
     if region is None:
         region = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
         layer.spyre_moe_regions[name] = region
+        # Deferred import: spyre_inference.v1.worker imports this module's package.
+        from spyre_inference.v1.worker import compile_guard
+
+        compile_guard.watch(fn, f"MoE region {name!r}")
     return region
 
 
@@ -388,6 +416,11 @@ def _prepare_layer(layer: RoutedExperts) -> None:
 
     dtype = layer.spyre_moe_gate.dtype
     layer.spyre_moe_stick = stick
+    layer.spyre_moe_route_dtype = (
+        _route_reduce_dtype(experts, dtype)
+        if layer.spyre_moe_recipe.routing == "full_softmax"
+        else dtype
+    )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
@@ -431,7 +464,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 return _region(layer, "gathered", _gathered)(layer, x, router_logits)
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
-                probs = _region(layer, "probs", _probs)(router_logits)
+                probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)
                 route = _region(layer, "route", _route)(layer, probs)
             else:
                 topk_probs = _region(layer, "topk_probs", _topk_probs)(router_logits, layer.top_k)

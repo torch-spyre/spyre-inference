@@ -39,6 +39,7 @@ from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
@@ -83,6 +84,10 @@ class TorchSpyreWorker(Worker):
     construction are handled here.
     """
 
+    # Resolved in init_device, before the weights load, so an invalid
+    # SPYRE_COMPILE_GUARD fails there rather than after warmup.
+    _compile_guard_level = compile_guard.CompileGuardLevel.OFF
+
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         # Worker.load_model wraps weight loading in a memory pool context
         # that calls get_mem_allocator_instance(). That only short-circuits
@@ -126,6 +131,11 @@ class TorchSpyreWorker(Worker):
             os.environ.get("SPYRE_DEVICES"),
             _get_spyre_pcie_address(self.local_rank),
         )
+
+        # Parsed here rather than at the arm() call below: a typo raises, and after
+        # warmup that costs the minutes the model just spent compiling. init_device
+        # runs before the weights load, so an invalid value fails in seconds.
+        self._compile_guard_level = compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD)
 
         # Register all the custom ops and Spyre model architectures here when a
         # worker is created. This has to happen before the model is loaded, so
@@ -182,6 +192,8 @@ class TorchSpyreWorker(Worker):
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
+        # Arm right after warm-up, at the level init_device already validated.
+        compile_guard.arm(self._compile_guard_level)
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
@@ -208,7 +220,7 @@ class TorchSpyreWorker(Worker):
                 self.profiler_config,
                 worker_name=trace_name,
                 local_rank=self.local_rank,
-                activities=["CPU", "PrivateUse1"],  # ty: ignore[invalid-argument-type]
+                activities=["CPU", "PrivateUse1"],
             )
             logger.debug("Starting torch profiler with trace name: %s", trace_name)
 

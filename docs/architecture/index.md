@@ -62,7 +62,7 @@ compiled graph (see below).
 | `NewGELU` | — (not replaced) | Spyre | No OOT class: vLLM's own `gelu_new` is traced into the compiled graph, cube term included — torch-spyre decomposes its `torch.pow(x, 3.0)` into a chain of `mul` ops (torch-spyre#4479) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
-| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
 
 ### Transposed linear weights
 
@@ -274,12 +274,13 @@ gather to its last use instead of round-tripping through HBM. Two shape choices 
 there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
-groups are unrolled, so each matmul carries a single batch dim: the batched GQA form
-leaves the page with two batch dims and Inductor clones it out to a query-group axis it
-does not have (torch-spyre#4123). The fold itself is free — `[num_blocks, KV, block_size,
-D]` reshapes to `[num_blocks * KV, block_size, D]` — but the cache is allocated with that
-folded axis at device dim 0, which is where an indexed axis has to sit for the gather to
-cost one page rather than the whole tensor.
+groups fold into the query's row axis — a reshape, since heads are KV-major — so each
+matmul carries a single batch dim: the batched GQA form leaves the page with two batch dims
+and Inductor clones it out to a query-group axis it does not have (torch-spyre#4123). The
+cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
+`[num_blocks * KV, block_size, D]` — but the cache is allocated with that folded axis at
+device dim 0, which is where an indexed axis has to sit for the gather to cost one page
+rather than the whole tensor.
 
 Three things follow from those choices. The gather is a 2-D subscript, which lowers to
 `aten.index` and fails eager by upcasting its int32 index, so this backend always compiles

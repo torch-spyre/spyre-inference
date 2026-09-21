@@ -57,6 +57,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     batched_decode_chunking,
 )
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
@@ -176,6 +177,10 @@ def _build_query_row_tables(
 # hold the per-sequence Python loop around these.
 _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
+
+compile_guard.watch(page_attn_kernel, "page attention kernel")
+compile_guard.watch(batched_decode_kernel, "batched decode kernel")
+compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 _warmup_complete = False
 
@@ -397,7 +402,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.num_kv_heads = kv_cache_spec.num_kv_heads
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
-        # `torch.float16` upstream so it's always a real torch.dtype here.
+        # `torch.float16`/`torch.bfloat16` upstream, so it's always a real
+        # torch.dtype here.
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
@@ -908,7 +914,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
-                    dtype=torch.float16,
+                    dtype=self.model_dtype,
                 )
                 for s in range(num_decode_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
@@ -920,7 +926,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.
                 # Holds under a window too: first_active <= num_blocks - 1.
-                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(torch.float16).min
+                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
                 # 4-D, not 5-D: the kernel slices dim 0 per chunk, and a dim-0
                 # slice of a 5-D base fails torch-spyre layout propagation.
                 mask_by_chunk_cpu = (
@@ -1030,10 +1036,14 @@ class SpyreAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
+        # Only reachable through an explicit `--dtype bfloat16`; the platform's own
+        # default is float16 for every model.
+        torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
+        "bfloat16",
     ]
 
     @staticmethod
@@ -1120,12 +1130,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        # Resolved before the ALiBi slopes below, which are built at this dtype.
+        # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
+        _dtype = get_current_vllm_config().model_config.dtype
+        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
+
+        # The kernels read a page at model dtype and Spyre has no cast on the way in, so
+        # the two 2-byte dtypes are not interchangeable per-cache.
+        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+            raise ValueError(
+                f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
+                f"{self.model_dtype} on Spyre; use 'auto'."
+            )
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
         # cleanly against the score-tile shape.
         if alibi_slopes is not None:
-            slopes_t = torch.tensor(alibi_slopes, dtype=torch.float16)
+            slopes_t = torch.tensor(alibi_slopes, dtype=self.model_dtype)
             if slopes_t.numel() != num_heads:
                 raise ValueError(
                     f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
@@ -1140,11 +1163,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # can bake it as a closure constant. logits_soft_cap == 0.0 disables
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
-
-        # The recorder needs the model's dtype to fabricate dummy args.
-        # TorchSpyrePlatform.check_and_update_config enforces float16 upstream.
-        _dtype = get_current_vllm_config().model_config.dtype
-        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
@@ -1179,12 +1197,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kernel reads its arguments from storage offset 0 (torch-spyre#3770), so a
         slice past row 0 reads the wrong storage. Allocated whole (hence at offset
         0) and reused, at one size for the whole run.
+
+        Row-outermost: the kernels gather from and scatter into the row axis, which the
+        default tiled layout would relayout whole per call.
         """
         if self._staging is None:
             shape = (self.staging_rows, self.num_heads, self.head_size)
             self._staging = (
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
+                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
+                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
             )
         return self._staging
 
@@ -1330,7 +1351,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 decode_variants, layer, kv_cache, builder, num_pages
             )
         finally:
-            torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
+            torch._dynamo.config.accumulated_recompile_limit = prev_limit
 
         if recorded == 0 and variants:
             # Recording nothing is a broken pass, not a degenerate bucket set: the
@@ -1522,13 +1543,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
         # Host-allocated then transferred: only .to() takes a device_layout.
+        dtype = spec.dtype
         layout = slot_major_kv_layout(
-            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, dtype
         )
         shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
         return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
-            v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            k_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
 
     def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
@@ -1861,7 +1883,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     kv_pos = torch.arange(
                         b * block_size,
                         (b + 1) * block_size,
-                        dtype=torch.float16,
+                        dtype=self.model_dtype,
                     )
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
                     bias = self.alibi_slopes * rel

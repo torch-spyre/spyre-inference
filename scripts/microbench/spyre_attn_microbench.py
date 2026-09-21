@@ -668,7 +668,7 @@ def expected_kernels(row, span):
 
     The loop runs one kernel per sequence; the batched path collapses the decode
     prefix's into one. Staging copies count as memory ops, so they are excluded.
-    Head-major's unrolled kernel emits its store as a second kernel per call, where
+    Head-major's decode kernel emits its store as a second kernel per call, where
     token-major and head-major's batched-GQA prefill kernel both fuse it into the
     attention one.
     """

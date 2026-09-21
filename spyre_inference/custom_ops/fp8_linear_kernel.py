@@ -43,6 +43,8 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
 )
 from vllm.platforms import PlatformEnum
 
+from spyre_inference.v1.worker import compile_guard
+
 logger = init_logger(__name__)
 
 try:
@@ -124,8 +126,18 @@ def _compiled_fp8_scaled_mm(
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
+        # A bfloat16 model cannot use this kernel; `check_and_update_config` rejects
+        # that pairing rather than let float16 output reach a bfloat16 graph.
         out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
     )
+
+
+# Both compile per distinct tile shape, and `apply_weights` tiles M onto {1, 4} (or a
+# 128-multiple) and N onto `_WIDE_N`, so warmup's shapes cover every tile a request can
+# produce. A compile here mid-serving is therefore a warmup-coverage gap like any other,
+# and unwatched it would land in the guard's never-fatal UNKNOWN class.
+compile_guard.watch(_compiled_fp8_scale, "fp8 per-token activation scale")
+compile_guard.watch(_compiled_fp8_scaled_mm, "fp8 scaled_mm")
 
 
 def _fp8_mm(

@@ -14,9 +14,9 @@
 # chat template, and re-applying it would change token counts and the
 # prefix-cache hit rate. run_vllm_benchmarks.py always passes it.
 #
-# SPYRE_DEVICES is derived from tensor-parallel-size, and
+# SPYRE_DEVICES and AIU_WORLD_SIZE are derived from tensor-parallel-size, and
 # VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from server_health_timeout, by
-# run_vllm_benchmarks.py. Set either explicitly here only to override.
+# run_vllm_benchmarks.py. Set any of them explicitly here only to override.
 #
 # The bench side takes its model from server_parameters, so each test names
 # its model once.
@@ -56,7 +56,8 @@ defaults:
     endpoint: /v1/completions
     percentile-metrics: ttft,tpot,itl,e2el
     metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
+    # Match max-num-seqs: the client keeps exactly one batch in flight, so the
+    # server never queues and the measured latency is the batch's own.
     max-concurrency: 4
 
 tests:

@@ -87,13 +87,16 @@ def parse_args():
         "--spyre-devices",
         type=str,
         default=os.environ.get("SPYRE_DEVICES", "0"),
-        help="SPYRE_DEVICES value (default: from env or '0')",
+        help="fallback SPYRE_DEVICES value for a config that sets no "
+        "tensor-parallel size (default: from env or '0'); a config that sets "
+        "one derives its own devices and ignores this",
     )
     parser.add_argument(
         "--aiu-world-size",
         type=str,
         default=os.environ.get("AIU_WORLD_SIZE", "1"),
-        help="AIU_WORLD_SIZE value (default: from env or '1')",
+        help="fallback AIU_WORLD_SIZE value, overridden the same way as "
+        "--spyre-devices (default: from env or '1')",
     )
     parser.add_argument(
         "--models",
@@ -228,7 +231,10 @@ def _derive_config(config: dict) -> None:
     Each is derived rather than spelled out per test, but a config that sets one
     explicitly keeps its own value:
 
-    - `SPYRE_DEVICES` from tensor-parallel-size.
+    - `SPYRE_DEVICES` and `AIU_WORLD_SIZE` from tensor-parallel-size. Both must
+      agree with it: the devices say which cards the run gets, and the world
+      size is what the platform falls back to for its card count in
+      subprocesses that re-import before torch_spyre is loaded.
     - `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` from `server_health_timeout`, so the
       model-execute timeout never trips before the server is called unhealthy.
     - the bench side's `model` from `server_parameters`, which the serve configs
@@ -239,6 +245,7 @@ def _derive_config(config: dict) -> None:
     tp = _config_tp(config)
     if tp is not None:
         env_config.setdefault("SPYRE_DEVICES", _spyre_devices_for_tp(tp))
+        env_config.setdefault("AIU_WORLD_SIZE", str(tp))
 
     health_timeout = config.get("server_health_timeout")
     if health_timeout is not None:
@@ -349,7 +356,10 @@ def run_benchmark(
     cmd.extend(build_command_args(parameters))
     cmd.extend(["--output-json", str(results_dir / f"{test_name}.json")])
 
-    # Build environment
+    # Build environment. The --spyre-devices / --aiu-world-size values are only
+    # a base: _derive_config has already put the per-test values in env_config,
+    # which is applied last and so wins for every config that carries a
+    # tensor-parallel size.
     env = os.environ.copy()
     for key, value in ENV_DEFAULTS.items():
         env.setdefault(key, value)
@@ -433,6 +443,8 @@ def run_serve_benchmark(
     health_timeout: int = 180,
 ) -> bool:
     """Start vllm serve, wait for health, run bench serve, cleanup."""
+    # As in run_benchmark: the CLI device values are a base that the per-test
+    # env_config, applied last, overrides.
     env = os.environ.copy()
     for key, value in ENV_DEFAULTS.items():
         env.setdefault(key, value)

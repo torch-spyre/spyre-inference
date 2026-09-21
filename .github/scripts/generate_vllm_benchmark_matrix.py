@@ -26,9 +26,10 @@ import yaml
 
 logging.basicConfig(level=logging.INFO)
 
-# All the different names vLLM uses to refer to their benchmark configs
-# Sections a config can carry its parameters in, most specific first: a serve
-# config names its model in `server_parameters` only.
+# Sections a config can carry its parameters in. Tried in order, and the first
+# one that actually names a model wins -- a serve config carries its model in
+# `server_parameters` and has no `parameters.model`, so an existing-but-modelless
+# section must not stop the search.
 VLLM_BENCHMARK_CONFIGS_PARAMETER = (
     "parameters",
     "server_parameters",

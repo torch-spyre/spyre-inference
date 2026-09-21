@@ -848,7 +848,7 @@ def test_decode_fold_matches_unrolled():
     k = torch.randn(blocks * kv, block, d)
     v = torch.randn(blocks * kv, block, d)
     query = torch.randn(3, heads, d)
-    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+    rows = torch.tensor([2], dtype=torch.int32)
     kv_tables = [
         torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
     ]

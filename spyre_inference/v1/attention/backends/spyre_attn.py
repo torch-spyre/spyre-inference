@@ -1729,6 +1729,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one sequence's page attention. The point where a subclass swaps kernels."""
+        # The kernels index `row_table` whole rather than slicing it to padded_query_len,
+        # so a wrong width is a shape mismatch at trace time — a surprise compile in the
+        # serving path. Checked here, where every kernel variant converges.
+        assert row_table.shape == (padded_query_len,), (
+            f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
+        )
         return _call_kernel(
             "page attention",
             self._attn_fn,

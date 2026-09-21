@@ -28,9 +28,12 @@
 # back to the paths on the Spyre benchmark hosts, and skips entries with a
 # warning where the file is not present.
 #
-# max-model-len matches the _4k/_8k suffix: the first 100 requests of the trace
-# a test replays stay under that many tokens (prompt + output), and longer
-# requests are rejected.
+# max-model-len matches the _4k/_8k suffix: the requests of the trace a test
+# replays stay under that many tokens (prompt + output), and longer requests are
+# rejected.
+#
+# num-prompts defaults to 100; the larger models override it downwards to keep
+# run time bounded.
 # ---------------------------------------------------------------------------
 
 defaults:
@@ -57,141 +60,6 @@ defaults:
     max-concurrency: 4
 
 tests:
-  - test_name: serve_granite33-8b_tp1_4k
-    server_health_timeout: 1800
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct
-      tensor-parallel-size: 1
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite33-8b_tp2_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct
-      tensor-parallel-size: 2
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite33-8b_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b_tp1_4k
-    server_health_timeout: 1800
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b
-      tensor-parallel-size: 1
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b_tp1_8k
-    server_health_timeout: 1800
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b
-      tensor-parallel-size: 1
-      max-model-len: 8192
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-
-  - test_name: serve_granite41-8b_tp2_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b
-      tensor-parallel-size: 2
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite33-8b-fp8_tp1_4k
-    server_health_timeout: 1800
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct-FP8
-      tensor-parallel-size: 1
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite33-8b-fp8_tp2_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct-FP8
-      tensor-parallel-size: 2
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite33-8b-fp8_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-3.3-8b-instruct-FP8
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b-fp8_tp1_4k
-    server_health_timeout: 1800
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b-fp8
-      tensor-parallel-size: 1
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b-fp8_tp2_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b-fp8
-      tensor-parallel-size: 2
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_granite41-8b-fp8_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: ibm-granite/granite-4.1-8b-fp8
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_gemma4-31b_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: google/gemma-4-31B
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
-  - test_name: serve_gemma4-26b-a4b_tp4_4k
-    server_health_timeout: 3600
-    server_parameters:
-      model: google/gemma-4-26B-A4B
-      tensor-parallel-size: 4
-      max-model-len: 4096
-    parameters:
-      dataset-path: ${SPYRE_AIOPS_DATASET}
-
   - test_name: serve_granite33-8b_tp1_8k
     server_health_timeout: 1800
     server_parameters:
@@ -219,6 +87,15 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
+  - test_name: serve_granite41-8b_tp1_8k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
   - test_name: serve_granite41-8b_tp2_8k
     server_health_timeout: 3600
     server_parameters:
@@ -237,68 +114,65 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
-  - test_name: serve_granite33-8b-fp8_tp1_8k
+  - test_name: serve_granite33-8b-fp8_tp1_4k
     server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct-FP8
       tensor-parallel-size: 1
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
-  - test_name: serve_granite33-8b-fp8_tp2_8k
+  - test_name: serve_granite33-8b-fp8_tp2_4k
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct-FP8
       tensor-parallel-size: 2
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
-  - test_name: serve_granite33-8b-fp8_tp4_8k
+  - test_name: serve_granite33-8b-fp8_tp4_4k
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct-FP8
       tensor-parallel-size: 4
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
-  - test_name: serve_granite41-8b-fp8_tp1_8k
+  - test_name: serve_granite41-8b-fp8_tp1_4k
     server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-4.1-8b-fp8
       tensor-parallel-size: 1
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
-  - test_name: serve_granite41-8b-fp8_tp2_8k
+  - test_name: serve_granite41-8b-fp8_tp2_4k
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b-fp8
       tensor-parallel-size: 2
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
-  - test_name: serve_granite41-8b-fp8_tp4_8k
+  - test_name: serve_granite41-8b-fp8_tp4_4k
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b-fp8
       tensor-parallel-size: 4
-      max-model-len: 8192
+      max-model-len: 4096
     parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
-
-  - test_name: serve_gemma4-31b_tp4_8k
-    server_health_timeout: 3600
-    server_parameters:
-      model: google/gemma-4-31B
-      tensor-parallel-size: 4
-      max-model-len: 8192
-    parameters:
-      dataset-path: ${SPYRE_CICS_DATASET}
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 60
 
   - test_name: serve_gemma4-26b-a4b_tp4_8k
     server_health_timeout: 3600
@@ -308,3 +182,22 @@ tests:
       max-model-len: 8192
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
+      num-prompts: 60
+
+  - test_name: serve_gemma4-31b_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-31B
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+
+  - test_name: serve_gemma3-1b-it_tp1_4k
+    server_health_timeout: 1800
+    server_parameters:
+      model: google/gemma-3-1b-it
+      tensor-parallel-size: 1
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}

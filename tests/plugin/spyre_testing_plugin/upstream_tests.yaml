@@ -65,11 +65,21 @@ tests:
         - test: "test_distributed"
           mode: mandatory_pass
           tags: [model, upstream, uses_subprocess, distributed]
+        - test: "test_pooling"
+          mode: mandatory_pass
+          tags: [transformers, upstream, uses_subprocess]
+          params:
+            override:
+              use_v2_model_runner:
+                - false
+        - test: "test_embed_loading"
+          # max_model_len=1024 is hardcoded in the test body and cannot be overridden
+          # via YAML. Our Spyre-compatible encoder models have max_position_embeddings=512.
+          mode: skip
+          tags: [transformers, upstream, uses_subprocess]
       block_list:
         - test: "test_quantization"
-        - test: "test_embed_loading"
         - test: "test_hybrid_attention"
-        - test: "test_pooling"
         - test: "test_mla"
 
     - rel_path: tests/v1/attention/test_attention_backends.py

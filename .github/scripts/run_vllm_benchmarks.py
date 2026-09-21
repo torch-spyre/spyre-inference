@@ -20,9 +20,11 @@ and executes them.
 """
 
 import contextlib
+import json
 import logging
 import os
 import re
+import shlex
 import signal
 import string
 import subprocess
@@ -52,6 +54,17 @@ DATASET_PATH_DEFAULTS = {
         "/models/online_benchmarking_data_reordered/"
         "cics_results_2025.11.03_e2ee1b0_correct_order.jsonl"
     ),
+}
+
+# Environment defaults shared by every benchmark: thread-count caps for the
+# CPU-side math libraries, plus the Spyre layout solver. Applied only when the
+# host has not set them, so a host can tune its own values. A test that needs a
+# different value sets it in its config's `environment_variables`.
+ENV_DEFAULTS = {
+    "OMP_NUM_THREADS": "8",
+    "OPENBLAS_NUM_THREADS": "8",
+    "MKL_NUM_THREADS": "8",
+    "LAYOUT_SOLVER": "greedy",
 }
 
 
@@ -89,6 +102,13 @@ def parse_args():
         "case-insensitively against each config's model",
     )
     parser.add_argument(
+        "--tps",
+        type=str,
+        default="",
+        help="comma-separated tensor-parallel sizes to run (empty = all); "
+        "matched against each config's tensor-parallel-size",
+    )
+    parser.add_argument(
         "--bench-types",
         type=str,
         default="",
@@ -103,6 +123,22 @@ def _config_model(config: dict) -> str | None:
         model = config.get(key, {}).get("model")
         if model:
             return model
+    return None
+
+
+def _config_tp(config: dict) -> int | None:
+    """Tensor-parallel size for a benchmark config.
+
+    The serve configs spell the key `tensor-parallel-size` and the
+    latency/throughput ones `tensor_parallel_size`, matching the CLI each
+    passes it to. Every config must set one of them; a config with neither is
+    a config error, not a TP-1 default.
+    """
+    for key in ("parameters", "server_parameters"):
+        parameters = config.get(key, {})
+        for tp_key in ("tensor-parallel-size", "tensor_parallel_size"):
+            if tp_key in parameters:
+                return int(parameters[tp_key])
     return None
 
 
@@ -130,14 +166,25 @@ def _missing_dataset(config: dict) -> str | None:
     return None
 
 
-def _select_configs(configs: list, models: set[str]) -> list:
-    """Keep configs whose model is selected (empty `models` = all) and whose
-    dataset, if any, exists on this host."""
+def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
+    """Keep configs whose model and tensor-parallel size are selected (an empty
+    `models` / `tps` selects all) and whose dataset, if any, exists on this
+    host."""
     selected = []
     for config in configs:
         model = _config_model(config)
         if models and not (model and model.lower() in models):
             log.info("Skipping %s (model %s not selected)", config.get("test_name"), model)
+            continue
+        tp = _config_tp(config)
+        if tp is None:
+            log.error(
+                "Config %s sets no tensor-parallel-size; add one to its parameters",
+                config.get("test_name"),
+            )
+            sys.exit(2)
+        if tps and tp not in tps:
+            log.info("Skipping %s (tp %d not selected)", config.get("test_name"), tp)
             continue
         _resolve_dataset_path(config)
         missing = _missing_dataset(config)
@@ -150,6 +197,83 @@ def _select_configs(configs: list, models: set[str]) -> list:
             continue
         selected.append(config)
     return selected
+
+
+# Devices a config gets for its tensor-parallel size. Spyre devices are handed
+# out from 0, so TP n takes the first n.
+def _spyre_devices_for_tp(tp: int) -> str:
+    return ",".join(str(i) for i in range(tp))
+
+
+def _merge_defaults(defaults: dict, config: dict) -> dict:
+    """Merge one test config over the file's `defaults`.
+
+    Merges one level into the three parameter sections, so a test overrides
+    individual keys rather than replacing a whole section. Keys outside those
+    sections (`test_name`, `server_health_timeout`) come from the test.
+    """
+    merged = {**defaults, **config}
+    for section in ("environment_variables", "server_parameters", "parameters"):
+        section_defaults = defaults.get(section) or {}
+        section_config = config.get(section) or {}
+        if section_defaults or section_config:
+            merged[section] = {**section_defaults, **section_config}
+    return merged
+
+
+def _derive_config(config: dict) -> None:
+    """Fill in the config values that follow from others, in place.
+
+    Each is derived rather than spelled out per test, but a config that sets one
+    explicitly keeps its own value:
+
+    - `SPYRE_DEVICES` from tensor-parallel-size.
+    - `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` from `server_health_timeout`, so the
+      model-execute timeout never trips before the server is called unhealthy.
+    - the bench side's `model` from `server_parameters`, which the serve configs
+      name once.
+    """
+    env_config = config.setdefault("environment_variables", {})
+
+    tp = _config_tp(config)
+    if tp is not None:
+        env_config.setdefault("SPYRE_DEVICES", _spyre_devices_for_tp(tp))
+
+    health_timeout = config.get("server_health_timeout")
+    if health_timeout is not None:
+        env_config.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", str(health_timeout))
+
+    server_model = config.get("server_parameters", {}).get("model")
+    if server_model and "parameters" in config:
+        config["parameters"].setdefault("model", server_model)
+
+
+def _load_configs(config_file: Path) -> list | None:
+    """Read a benchmark config file into a list of merged test configs.
+
+    Accepts either a bare list of tests or a `defaults` / `tests` mapping, in
+    which case every test is merged over `defaults`. Returns None on a
+    malformed file.
+    """
+    with open(config_file) as f:
+        raw = yaml.safe_load(f)
+
+    if isinstance(raw, dict):
+        tests = raw.get("tests")
+        if not isinstance(tests, list):
+            log.error("%s has no `tests` list", config_file)
+            return None
+        defaults = raw.get("defaults") or {}
+        configs = [_merge_defaults(defaults, config) for config in tests]
+    elif isinstance(raw, list):
+        configs = raw
+    else:
+        log.error("%s is not a YAML list or a defaults/tests mapping", config_file)
+        return None
+
+    for config in configs:
+        _derive_config(config)
+    return configs
 
 
 def build_command_args(parameters: dict) -> list[str]:
@@ -178,6 +302,32 @@ def build_env_vars(env_config: dict) -> dict[str, str]:
     return env_vars
 
 
+def format_command(cmd: list[str], env_vars: dict[str, str]) -> str:
+    """Render a command as a copy-pasteable shell line, prefixed by its env vars.
+
+    Only the variables the config sets are shown; the inherited environment is
+    left out, so the line stays short enough to rerun by hand.
+    """
+    prefix = " ".join(f"{key}={shlex.quote(value)}" for key, value in sorted(env_vars.items()))
+    line = shlex.join(cmd)
+    return f"{prefix} {line}" if prefix else line
+
+
+def record_command(cmd: list[str], env_vars: dict[str, str], cmd_file: Path) -> str:
+    """Write a command line to `cmd_file` and return it.
+
+    The same line goes to the head of the run's log, so a log and its `.cmd`
+    file each say on their own how the run was invoked.
+    """
+    line = format_command(cmd, env_vars)
+    try:
+        cmd_file.write_text(line + "\n")
+    except OSError as e:
+        # The command itself still runs; losing the record is not a test failure.
+        log.warning("Could not write %s: %s", cmd_file.name, e)
+    return line
+
+
 # Equivalent to the `vllm` console script, but run through sys.executable so the
 # CLI always uses this interpreter's environment instead of whatever `vllm` PATH
 # resolves to.
@@ -200,15 +350,22 @@ def run_benchmark(
 
     # Build environment
     env = os.environ.copy()
+    for key, value in ENV_DEFAULTS.items():
+        env.setdefault(key, value)
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
-    env.update(build_env_vars(env_config))
+    config_env = build_env_vars(env_config)
+    env.update(config_env)
+
+    cmd_line = record_command(cmd, config_env, results_dir / f"{test_name}.cmd")
 
     log.info("=== Running %s test: %s ===", bench_type, test_name)
-    log.info("Command: %s", " ".join(cmd))
+    log.info("Command: %s", cmd_line)
 
     log_file = results_dir / f"{test_name}.log"
     with open(log_file, "w") as lf:
+        lf.write(f"# {cmd_line}\n")
+        lf.flush()
         result = subprocess.run(cmd, env=env, stdout=lf, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         log.error("Test %s failed with exit code %d", test_name, result.returncode)
@@ -227,20 +384,18 @@ def run_benchmarks_from_file(
     spyre_devices: str,
     aiu_world_size: str,
     models: set[str],
+    tps: set[int],
 ) -> tuple[int, int]:
     """Run all benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
         log.info("No %s config found, skipping", config_file.name)
         return 0, 0
 
-    with open(config_file) as f:
-        configs = yaml.safe_load(f)
-
-    if not isinstance(configs, list):
-        log.error("%s is not a YAML list", config_file)
+    configs = _load_configs(config_file)
+    if configs is None:
         return 0, 1
 
-    configs = _select_configs(configs, models)
+    configs = _select_configs(configs, models, tps)
 
     passed = 0
     failed = 0
@@ -278,9 +433,12 @@ def run_serve_benchmark(
 ) -> bool:
     """Start vllm serve, wait for health, run bench serve, cleanup."""
     env = os.environ.copy()
+    for key, value in ENV_DEFAULTS.items():
+        env.setdefault(key, value)
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
-    env.update(build_env_vars(env_config))
+    config_env = build_env_vars(env_config)
+    env.update(config_env)
 
     # Build server command
     server_params = dict(server_parameters)
@@ -290,8 +448,12 @@ def run_serve_benchmark(
     server_cmd = [*VLLM_CLI, "serve", model]
     server_cmd.extend(build_command_args(server_params))
 
+    server_cmd_line = record_command(
+        server_cmd, config_env, results_dir / f"{test_name}_server.cmd"
+    )
+
     log.info("=== Starting vLLM server for serve test: %s ===", test_name)
-    log.info("Server command: %s", " ".join(server_cmd))
+    log.info("Server command: %s", server_cmd_line)
 
     def _kill_server(proc: subprocess.Popen) -> None:
         """Kill the server and its entire process group."""
@@ -306,6 +468,9 @@ def run_serve_benchmark(
 
     server_log = results_dir / f"{test_name}_server.log"
     with open(server_log, "w") as server_lf:
+        server_lf.write(f"# {server_cmd_line}\n")
+        server_lf.flush()
+        server_start_ts = time.monotonic()
         server_proc = subprocess.Popen(
             server_cmd,
             env=env,
@@ -314,10 +479,13 @@ def run_serve_benchmark(
             start_new_session=True,
         )
 
-        # Wait for server health
+        # Wait for server health. Time it from just before the spawn: for large
+        # models most of this is the one-time warmup compile, which is the part
+        # worth comparing run to run.
         health_url = f"http://{host}:{port}/health"
-        server_ready = False
-        for i in range(1, health_timeout + 1):
+        server_startup_sec = None
+        deadline = server_start_ts + health_timeout
+        while time.monotonic() < deadline:
             if server_proc.poll() is not None:
                 log.error("Server process died with exit code %d", server_proc.returncode)
                 if server_log.exists():
@@ -325,13 +493,13 @@ def run_serve_benchmark(
                 return False
             try:
                 urllib.request.urlopen(health_url, timeout=2)
-                log.info("Server ready after %ds", i)
-                server_ready = True
+                server_startup_sec = round(time.monotonic() - server_start_ts, 1)
+                log.info("Server ready after %.1fs", server_startup_sec)
                 break
             except Exception:
                 time.sleep(1)
 
-        if not server_ready:
+        if server_startup_sec is None:
             log.error("Server did not become healthy within %ds", health_timeout)
             if server_log.exists():
                 log.error("Server log:\n%s", server_log.read_text())
@@ -343,6 +511,10 @@ def run_serve_benchmark(
         bench_cmd.extend(build_command_args(bench_parameters))
         bench_cmd.extend(
             [
+                # The trace prompts already carry their chat template; letting
+                # the bench re-apply it would change token counts and the
+                # prefix-cache hit rate, so this is not configurable.
+                "--skip-chat-template",
                 "--save-result",
                 "--result-dir",
                 str(results_dir),
@@ -351,11 +523,17 @@ def run_serve_benchmark(
             ]
         )
 
+        bench_cmd_line = record_command(
+            bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
+        )
+
         log.info("=== Running serve benchmark: %s ===", test_name)
-        log.info("Bench command: %s", " ".join(bench_cmd))
+        log.info("Bench command: %s", bench_cmd_line)
 
         bench_log = results_dir / f"{test_name}_bench.log"
         with open(bench_log, "w") as blf:
+            blf.write(f"# {bench_cmd_line}\n")
+            blf.flush()
             result = subprocess.run(
                 bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
             )
@@ -368,7 +546,19 @@ def run_serve_benchmark(
             stderr_lines = result.stderr.strip().splitlines()[-50:]
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
-    log.info("Serve test %s passed", test_name)
+
+    # `vllm bench serve` only measures the request phase, so add the startup
+    # time to its result file.
+    result_file = results_dir / f"{test_name}.json"
+    try:
+        data = json.loads(result_file.read_text())
+        data["server_startup_sec"] = server_startup_sec
+        result_file.write_text(json.dumps(data, indent=2))
+    except (OSError, ValueError) as e:
+        # The benchmark itself succeeded; don't fail the test over this.
+        log.warning("Could not add server_startup_sec to %s: %s", result_file.name, e)
+
+    log.info("Serve test %s passed (server startup %.1fs)", test_name, server_startup_sec)
     return True
 
 
@@ -378,20 +568,18 @@ def run_serve_benchmarks_from_file(
     spyre_devices: str,
     aiu_world_size: str,
     models: set[str],
+    tps: set[int],
 ) -> tuple[int, int]:
     """Run all serve benchmarks from a config file. Returns (passed, failed) counts."""
     if not config_file.exists():
         log.info("No %s config found, skipping", config_file.name)
         return 0, 0
 
-    with open(config_file) as f:
-        configs = yaml.safe_load(f)
-
-    if not isinstance(configs, list):
-        log.error("%s is not a YAML list", config_file)
+    configs = _load_configs(config_file)
+    if configs is None:
         return 0, 1
 
-    configs = _select_configs(configs, models)
+    configs = _select_configs(configs, models, tps)
 
     passed = 0
     failed = 0
@@ -432,6 +620,11 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     models = {m.strip().lower() for m in args.models.split(",") if m.strip()}
+    try:
+        tps = {int(t.strip()) for t in args.tps.split(",") if t.strip()}
+    except ValueError:
+        log.error("--tps takes comma-separated integers, got %r", args.tps)
+        sys.exit(2)
     bench_types = {b.strip().lower() for b in args.bench_types.split(",") if b.strip()}
     unknown = bench_types - set(VALID_BENCH_TYPES)
     if unknown:
@@ -452,6 +645,7 @@ def main():
             spyre_devices=args.spyre_devices,
             aiu_world_size=args.aiu_world_size,
             models=models,
+            tps=tps,
         )
         total_passed += passed
         total_failed += failed
@@ -465,6 +659,7 @@ def main():
             spyre_devices=args.spyre_devices,
             aiu_world_size=args.aiu_world_size,
             models=models,
+            tps=tps,
         )
         total_passed += passed
         total_failed += failed
@@ -477,6 +672,7 @@ def main():
             spyre_devices=args.spyre_devices,
             aiu_world_size=args.aiu_world_size,
             models=models,
+            tps=tps,
         )
         total_passed += passed
         total_failed += failed

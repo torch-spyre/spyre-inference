@@ -1,352 +1,25 @@
-# Serve benchmarks for Spyre devices
-- test_name: serve_granite33-8b_tp1_in64_out64
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b_tp2_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b_tp1_in64_out64
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b_tp2_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b-fp8_tp1_in64_out64
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b-fp8_tp2_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b-fp8_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b-fp8_tp1_in64_out64
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b-fp8_tp2_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite41-8b-fp8_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-# Gemma 4 needs the full card set: the dense 31B and the 26B-A4B MoE do not fit
-# one card's weights at these shapes.
-- test_name: serve_gemma4-31b_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: google/gemma-4-31B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: google/gemma-4-31B
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_gemma4-26b-a4b_tp4_in64_out64
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-  server_parameters:
-    model: google/gemma-4-26B-A4B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: google/gemma-4-26B-A4B
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-
 # ---------------------------------------------------------------------------
-# Agentic-dataset serve benchmarks.
+# Serve benchmarks for Spyre devices using agentic dataset traces
 #
-# The entries above drive `vllm bench serve` with random prompts at a fixed
-# in64/out64 shape. These replay a recorded agentic trace instead: real router
-# prompts (~1-3k tokens) with the output length each request actually produced.
-# That exercises prefix caching, chunked prefill and the KV-block budget the
-# way production traffic does, which a uniform 64/64 shape cannot.
+# `defaults` holds the settings every test shares; each entry under `tests`
+# is merged over it, so a test only spells out what makes it different.
+# A test can override any default by setting the same key.
 #
 # --custom-output-len -1 keeps each record's own `output_tokens`; --ignore-eos
 # makes generation run to that length so decode cost is comparable run to run.
 # --disable-shuffle replays the trace in its recorded order, which is what makes
 # the prefix-cache hit rate reproducible.
+#
+# --skip-chat-template is not listed here: the trace prompts already carry their
+# chat template, and re-applying it would change token counts and the
+# prefix-cache hit rate. run_vllm_benchmarks.py always passes it.
+#
+# SPYRE_DEVICES is derived from tensor-parallel-size, and
+# VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from server_health_timeout, by
+# run_vllm_benchmarks.py. Set either explicitly here only to override.
+#
+# The bench side takes its model from server_parameters, so each test names
+# its model once.
 #
 # dataset-path is an environment variable so each host can point it at its own
 # copy of the trace: ${SPYRE_AIOPS_DATASET} for the AIOps trace (_4k entries)
@@ -354,1031 +27,284 @@
 # requests need the larger context. run_vllm_benchmarks.py expands them, falling
 # back to the paths on the Spyre benchmark hosts, and skips entries with a
 # warning where the file is not present.
+#
+# max-model-len matches the _4k/_8k suffix: the first 100 requests of the trace
+# a test replays stay under that many tokens (prompt + output), and longer
+# requests are rejected.
 # ---------------------------------------------------------------------------
 
-- test_name: serve_granite33-8b_tp1_4k
-  server_health_timeout: 1800
+defaults:
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
   server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
     load-format: auto
     max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
     max-num-batched-tokens: 512
     enable-prefix-caching: true
   parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
     dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
     num-prompts: 100
     # Keep each record's own output_tokens rather than forcing a fixed length.
     custom-output-len: -1
     ignore-eos: true
     # Replay the recorded order so prefix-cache behaviour is reproducible.
     disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
     endpoint: /v1/completions
     percentile-metrics: ttft,tpot,itl,e2el
     metric-percentiles: 99,100
     # Match max-num-seqs and burst so the batch fills without queueing.
     max-concurrency: 4
-    request-rate: inf
 
-- test_name: serve_granite33-8b_tp2_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+tests:
+  - test_name: serve_granite33-8b_tp1_4k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 1
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b_tp2_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 2
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b_tp1_4k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b_tp1_8k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp1_4k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b_tp2_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp1_8k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp2_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 2
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp1_4k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp2_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp1_4k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 1
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp2_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 2
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp1_4k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp2_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp1_4k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 1
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp2_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 2
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_gemma4-31b_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: google/gemma-4-31B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: google/gemma-4-31B
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_gemma4-26b-a4b_tp4_4k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: google/gemma-4-26B-A4B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 4096 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 4096
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: google/gemma-4-26B-A4B
-    dataset-name: custom
-    dataset-path: ${SPYRE_AIOPS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b_tp1_8k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_gemma4-31b_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-31B
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b_tp2_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_gemma4-26b-a4b_tp4_4k
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
 
-- test_name: serve_granite33-8b_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b_tp1_8k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b_tp2_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b_tp2_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 2
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp1_8k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp2_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 2
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp2_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite33-8b-fp8_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct-FP8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp1_8k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp1_8k
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp2_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 2
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp2_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 2
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite33-8b-fp8_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_granite41-8b-fp8_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: ibm-granite/granite-4.1-8b-fp8
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp1_8k
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_gemma4-31b_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: google/gemma-4-31B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: google/gemma-4-31B
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp2_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 2
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
 
-- test_name: serve_gemma4-26b-a4b_tp4_8k
-  server_health_timeout: 3600
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: 0,1,2,3
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '3600'
-    SPYRE_BATCHED_DECODE: '1'
-  server_parameters:
-    model: google/gemma-4-26B-A4B
-    dtype: float16
-    load-format: auto
-    tensor-parallel-size: 4
-    max-num-seqs: 4
-    # The first 100 trace requests stay under 8192 tokens (prompt + output); longer requests are rejected.
-    max-model-len: 8192
-    max-num-batched-tokens: 512
-    enable-prefix-caching: true
-  parameters:
-    model: google/gemma-4-26B-A4B
-    dataset-name: custom
-    dataset-path: ${SPYRE_CICS_DATASET}
-    num-prompts: 100
-    # Keep each record's own output_tokens rather than forcing a fixed length.
-    custom-output-len: -1
-    ignore-eos: true
-    # Replay the recorded order so prefix-cache behaviour is reproducible.
-    disable-shuffle: true
-    # Prompts already carry their chat template from the trace.
-    skip-chat-template: true
-    endpoint: /v1/completions
-    percentile-metrics: ttft,tpot,itl,e2el
-    metric-percentiles: 99,100
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+  - test_name: serve_granite41-8b-fp8_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_gemma4-31b_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-31B
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_gemma4-26b-a4b_tp4_8k
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}

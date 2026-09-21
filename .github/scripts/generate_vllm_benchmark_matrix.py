@@ -27,12 +27,12 @@ import yaml
 logging.basicConfig(level=logging.INFO)
 
 # All the different names vLLM uses to refer to their benchmark configs
-VLLM_BENCHMARK_CONFIGS_PARAMETER = set(
-    [
-        "parameters",
-        "server_parameters",
-        "common_parameters",
-    ]
+# Sections a config can carry its parameters in, most specific first: a serve
+# config names its model in `server_parameters` only.
+VLLM_BENCHMARK_CONFIGS_PARAMETER = (
+    "parameters",
+    "server_parameters",
+    "common_parameters",
 )
 
 
@@ -101,23 +101,25 @@ def generate_benchmark_matrix(benchmark_configs_dir: str, models: list[str]) -> 
                 warning("Failed to load %s: %s", file, e)
                 continue
 
+        # A config file is either a bare list of tests or a `defaults`/`tests`
+        # mapping. Only the per-test `model` matters here, so `defaults` is not
+        # merged in.
+        if isinstance(configs, dict):
+            configs = configs.get("tests") or []
+
         for config in configs:
-            param = list(VLLM_BENCHMARK_CONFIGS_PARAMETER & set(config.keys()))
-            if not param:
-                warning("No recognized parameter key in config: %s", config)
+            # A serve config names its model in `server_parameters` only, so
+            # take the first section that carries one rather than the first
+            # section that exists.
+            model = None
+            for key in VLLM_BENCHMARK_CONFIGS_PARAMETER:
+                candidate = config.get(key, {}).get("model")
+                if candidate:
+                    model = candidate.lower()
+                    break
+            if model is None:
+                warning("Model name not set in %s, skipping...", config)
                 continue
-            if len(param) > 1:
-                warning(
-                    "Multiple parameter keys found in config %s: %s; using %s",
-                    config,
-                    param,
-                    param[0],
-                )
-            benchmark_config = config[param[0]]
-            if "model" not in benchmark_config:
-                warning("Model name not set in %s, skipping...", benchmark_config)
-                continue
-            model = benchmark_config["model"].lower()
 
             # Dedup
             if model in selected_models:

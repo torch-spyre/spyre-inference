@@ -150,6 +150,9 @@ class TestPoolingWarmupCoversBothSides:
             scheduler_config=SimpleNamespace(
                 max_num_seqs=MAX_NUM_SEQS, max_num_batched_tokens=budget
             ),
+            # Empty: no decoder-type attention layer, so force_attention stays
+            # True for every cell (this suite is encoder-only pooling coverage).
+            _spyre_kv_caches={},
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
         )
@@ -222,6 +225,60 @@ class TestPoolingWarmupCoversBothSides:
         # or 0 would make that a zero/negative token count.
         assert min(default_encoder_len_buckets(MAX_MODEL_LEN)) >= 2
         assert min(default_encoder_len_buckets(1)) >= 2
+
+
+class TestPoolingWarmupSkipsDecoderAttnBugForMultiRequestCells:
+    """A ``batch_size > 1`` exact cell skips ``force_attention`` when the model has
+    a decoder-type attention layer (KV cache present) -- sidesteps upstream's
+    ``_dummy_run`` seq_lens broadcast bug, which overestimates ``num_blocks`` for
+    such a layer. ``batch_size == 1`` and skewed cells are unaffected either way.
+    """
+
+    @staticmethod
+    def _run_warmup(shapes, budget=TOKEN_BUDGET, has_decoder_attn=True):
+        calls: list[tuple[int, bool, bool]] = []
+
+        def dummy_run(num_tokens, **kwargs):
+            calls.append(
+                (
+                    num_tokens,
+                    bool(kwargs.get("create_mixed_batch")),
+                    bool(kwargs.get("force_attention")),
+                )
+            )
+            return object(), object()
+
+        runner = SimpleNamespace(
+            spyre_shape_bucketer=SimpleNamespace(encoder_shapes=shapes),
+            model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=MAX_NUM_SEQS, max_num_batched_tokens=budget
+            ),
+            _spyre_kv_caches=({"layer0": object()} if has_decoder_attn else {}),
+            _dummy_run=dummy_run,
+            _dummy_pooler_run=lambda hidden: None,
+        )
+        TorchSpyreModelRunner._warmup_pooling_bucket_shapes(cast(TorchSpyreModelRunner, runner))
+        return calls
+
+    def test_batched_exact_cell_skips_force_attention_with_decoder_layer(self):
+        calls = self._run_warmup([(1, 64), (2, 64), (4, 64)], has_decoder_attn=True)
+        assert calls == [
+            (64, False, True),  # batch_size=1 exact -- single request, no bug
+            (63, False, True),  # batch_size=1 partial
+            (128, False, False),  # batch_size=2 exact -- the buggy multi-request path
+            (256, False, False),  # batch_size=4 exact
+        ]
+
+    def test_skewed_cell_still_forces_attention_with_decoder_layer(self):
+        # create_mixed_batch computes seq_lens correctly per-sequence, so the
+        # broadcast bug does not apply and force_attention stays True.
+        calls = self._run_warmup([(4, 512), (8, 512)], budget=2048, has_decoder_attn=True)
+        assert calls == [(2048, False, False), (519, True, True)]
+
+    def test_without_decoder_layer_everything_still_forces_attention(self):
+        calls = self._run_warmup([(1, 64), (2, 64), (4, 64)], has_decoder_attn=False)
+        assert all(force_attention for _tokens, _skewed, force_attention in calls)
 
 
 # (max_num_seqs, max_model_len, token budget)

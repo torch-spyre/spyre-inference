@@ -23,6 +23,8 @@ import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
+from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
+
 
 @pytest.mark.uses_subprocess
 @pytest.mark.distributed
@@ -53,6 +55,7 @@ def _generate(
     tp: int,
     enforce_eager: bool,
     compilation_config: dict | None = None,
+    hf_overrides=None,
 ) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
@@ -64,6 +67,7 @@ def _generate(
         max_model_len=128,
         max_num_seqs=2,
         **({"compilation_config": compilation_config} if compilation_config is not None else {}),
+        **({"hf_overrides": hf_overrides} if hf_overrides is not None else {}),
     )
     try:
         outs = llm.generate(
@@ -123,10 +127,17 @@ def test_tp2_llm_generate_matches_tp1() -> None:
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
 @pytest.mark.parametrize(
-    "model",
-    ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "google/gemma-4-26B-A4B"],
+    "model,hf_overrides",
+    [
+        ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", None),
+        # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
+        # pins the text-only backbone -- the decoder is what TP splits anyway, and the
+        # tower's weights and warmup would be paid for nothing.
+        ("google/gemma-4-26B-A4B", GEMMA4_TEXT_BACKBONE_OVERRIDE),
+    ],
+    ids=["micro-g3.3", "gemma-4-26B-A4B-text"],
 )
-def test_tp2_compiled_llm_generate_matches_tp1(model: str) -> None:
+def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides) -> None:
     """TP=1 vs TP=2 greedy-decode prefix match, compiled: the in-graph reduction.
 
     compile_sizes is pinned to the reachable token counts: 1 (one sequence
@@ -134,6 +145,10 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str) -> None:
     """
     _cc = {"compile_sizes": [1, 2, 16]}
     _assert_matches_tp1(
-        _generate(model, tp=1, enforce_eager=False, compilation_config=_cc),
-        _generate(model, tp=2, enforce_eager=False, compilation_config=_cc),
+        _generate(
+            model, tp=1, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
+        ),
+        _generate(
+            model, tp=2, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
+        ),
     )

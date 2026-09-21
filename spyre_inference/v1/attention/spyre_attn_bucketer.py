@@ -173,6 +173,14 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
+        # A pooling request's query_len is its own context_len, so it can't
+        # exceed max_model_len even when max_num_batched_tokens is larger (unlike
+        # a decoder's chunked-prefill step). Without this cap, warmup could record
+        # a query bucket with no matching num_blocks bucket, crashing with
+        # "num_blocks=N exceeds the largest recorded bucket".
+        if vllm_config.model_config.runner_type == "pooling":
+            max_batched = min(max_batched, max_model_len)
+
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform
@@ -187,11 +195,15 @@ class SpyreAttnBucketer:
         # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
         # batch sizes the batched decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = _resolve_buckets(
-            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-            max_num_seqs,
-            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+        self._num_seqs_buckets: list[int] = (
+            _resolve_buckets(
+                envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+                max_num_seqs,
+                "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+            )
+            if max_num_seqs >= _MIN_BATCHED_SEQS
+            else []
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by

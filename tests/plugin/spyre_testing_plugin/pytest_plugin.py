@@ -58,6 +58,7 @@ XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
 import os
 import re
@@ -67,6 +68,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import traceback
 from pathlib import Path
 
 import pytest
@@ -215,6 +217,7 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                 rel_path=file_entry["rel_path"],
                 allow_list=tuple(allow_list),
                 block_list=tuple(block_list),
+                config_list=file_entry.get("config_list"),
             )
         )
     return UpstreamTestConfig(files=tuple(files))
@@ -772,6 +775,18 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if not fc:
         return
 
+    # Tests parametrized by an upstream `config_filename` fixture (e.g. gsm8k evals)
+    # aren't reachable via param_overrides, which only rewrites the test's own
+    # parametrize markers. Instead, point the upstream conftest's --config-list-file at
+    # a Spyre-owned list; its own (later-running) pytest_generate_tests then parametrizes
+    # config_filename from our configs. tryfirst here guarantees we set it first.
+    # config_list_file is session-global; this is set once and deliberately not restored,
+    # since the only config_filename consumer in the pinned upstream tree is this gsm8k file
+    # (test_gsm8k_offloading parametrizes on its own cfg), so there is nothing else to leak to.
+    if fc.config_list and "config_filename" in metafunc.fixturenames:
+        list_path = (_YAML_PATH.parent / fc.config_list).resolve()
+        metafunc.config.option.config_list_file = str(list_path)
+
     test_name = metafunc.definition.originalname or metafunc.definition.name
     allow_entry = _find_allow_entry(test_name, fc.allow_list)
     if not allow_entry or not allow_entry.param_overrides:
@@ -1220,3 +1235,33 @@ def pytest_runtest_logreport(report) -> None:
 
 def pytest_sessionfinish(session, exitstatus) -> None:
     sharding.write_durations(_log)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Hard-exit a Spyre-host run before interpreter finalization.
+
+    senlib's config singleton is torn down from a libc exit handler after
+    pytest has already reported, and that destructor intermittently aborts
+    ("corrupted double-linked list"), failing an otherwise-green job. os._exit
+    skips it. Remove once senlib no longer aborts at process exit.
+    """
+    outcome = yield
+    if not spyre_hardware_present():
+        return
+    result = outcome.get_result()
+    code = int(result) if result is not None else 0
+    _log(
+        f"Spyre host: hard-exiting (code {code}) past finalization "
+        "to skip the senlib teardown abort"
+    )
+    try:
+        # os._exit skips every atexit handler; run them now so coverage saves,
+        # logging flushes and multiprocessing reaps children. Only the libc
+        # handler where the abort lives is left to be skipped.
+        atexit._run_exitfuncs()
+    except Exception:
+        _log(f"atexit handlers failed before hard-exit:\n{traceback.format_exc()}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

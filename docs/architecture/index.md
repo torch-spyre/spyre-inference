@@ -54,15 +54,15 @@ compiled graph (see below).
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
-| `RMSNorm` | `SpyreRMSNorm` | Spyre | `forward_oot` runs a `torch.compile`d `forward_native` on Spyre since EA propagation (PR #2927) is correct compiled, but broken eager. |
+| `GemmaRMSNorm` | `SpyreGemmaRMSNorm` | Spyre | An fp16 body with no dtype promotion. Plain `RMSNorm` needs no replacement — upstream's fp32 `forward_native` lowers — but Gemma's trailing fp32 `weight` multiply does not: a STANDARD `[hidden]` operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger. |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A device-resident 4D rotation cache (`[max_pos, 2, 2, rotary_dim//2]`) is built from `cos_sin_cache` and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`_rotate_neox_2x2`) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 inner dim `rotary_dim//2` must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (TP tables built on CPU at load) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, the per-vocab reindex/keep tables are built once on CPU at load and registered as device buffers; `forward` derives `masked_input`/`keep` from them on-device (`index_select`/`F.embedding`), applies the keep mask, and `all_reduce`s — no per-step CPU round-trip |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
 | `SiluAndMul` | — (not replaced) | Spyre | No OOT class: vLLM's own `SiluAndMul` is traced into the compiled graph, so `silu(gate)·up` runs on Spyre and slices the fused `[..., 2*d]` on-device. The Spyre-specific piece is `mlp_pad.py`, which zero-pads `intermediate_size` to the 64-element stick at load time so that slice lands at a lowerable offset (inert since `silu(0) = 0`) |
-| `NewGELU` | `SpyreNewGELU` | Spyre | `forward_native` cubes by multiplication instead of `torch.pow(x, 3)`, which returns `abs(x) ** 4` on Spyre (torch-spyre#4009) |
+| `NewGELU` | — (not replaced) | Spyre | No OOT class: vLLM's own `gelu_new` is traced into the compiled graph, cube term included — torch-spyre decomposes its `torch.pow(x, 3.0)` into a chain of `mul` ops (torch-spyre#4479) |
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
-| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype. Models ask for fp32 logits for CUDA's top-k, but Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32) so the routing softmax's reduction over them does not lower |
+| `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
 
 ### Transposed linear weights
 
@@ -214,7 +214,7 @@ Because attention kernels are `dynamic=False` too, they are pre-compiled during 
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
 variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length
 buckets below — so a served request always lands on an already-compiled kernel. When the
-batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, off by default) warmup also
+batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default) warmup also
 records its variants, the product of the KV-length (`num_blocks`) and num-sequences
 buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
@@ -237,13 +237,44 @@ duplicated rather than parameterised: the advertised shape, the allocation
 (`head_major_kv_layout`), and the three kernels that touch a page. The worker follows the
 layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
 
+#### LX-resident pages
+
+The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
+gather to its last use instead of round-tripping through HBM. Two shape choices get it
+there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
+gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
+behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
+groups are unrolled, so each matmul carries a single batch dim: the batched GQA form
+leaves the page with two batch dims and Inductor clones it out to a query-group axis it
+does not have (torch-spyre#4123). The fold itself is free — `[num_blocks, KV, block_size,
+D]` reshapes to `[num_blocks * KV, block_size, D]` — but the cache is allocated with that
+folded axis at device dim 0, which is where an indexed axis has to sit for the gather to
+cost one page rather than the whole tensor.
+
+Three things follow from those choices. The gather is a 2-D subscript, which lowers to
+`aten.index` and fails eager by upcasting its int32 index, so this backend always compiles
+attention even under `--enforce-eager` — attention compiles in its own domain, so the rest
+of the model still runs eager. Because the bmm's output axes
+(`num_kv_heads * padded_query_len`) cannot fill 32 cores at decode, and filling them would
+mean K-splitting a reduction a gather cannot mirror, the attention compile alone is capped
+at 8 cores; `SPYRE_ATTN_MAX_CORES` overrides that. And the layout carries neither ALiBi
+(which needs a bias tile per query group) nor batched decode (whose kernel gathers whole
+pages from the unfolded cache) — both are available on the token-major layout.
+
+Residency is a property of the layout plan, not of a result, so it is measured off the
+planner's own verdicts by `scripts/probes/lx_head_major_residency.py`. K's residency
+needs torch-spyre#4153: `q @ Kᵀ` lowers the transpose to a restickify, whose cross-frame
+barrier bars an LX-resident input without that PR's local-read proof. V is read directly
+by `probs @ V` and stays resident either way.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
   to `max_model_len` (avoids per-step recompilation on Spyre)
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
-- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`):
+- **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
+  default; not on the head-major layout):
   powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
@@ -361,9 +392,12 @@ device before compile, leaving only an `index_select` in the graph — plus a ma
 `head_dim` and the weight passes in `head_pad.py` pad Q/K interleaved, so this backend
 only has to rebuild the rotation cache at the pre-pad frequencies.
 
-Because the fusers key on class names, the OOT registry also covers the fused norms
-(`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`); otherwise they fall back to
-`forward_native` and its fp32 promotion.
+`RMSNorm` registers no OOT op: upstream `forward_native` lowers its fp16→fp32 upcast
+into the compiled graph. `GemmaRMSNorm` still needs one, because its trailing fp32
+`weight` multiply hits a torch-spyre gap — a STANDARD `[hidden]` operand that can
+neither broadcast against nor de-stagger the staggered-EA activation. Because the
+fusers key on class names, the OOT registry covers the fused Gemma norm
+(`SpyreTPAwareGemmaRMSNorm`) too.
 
 ## Distributed (TP)
 
@@ -374,19 +408,21 @@ now implements `barrier`, `broadcast`, `send`/`recv`, list-form `allgather`, `ga
 and `allreduce`; only `reduce` remains a throw-stub, and torch-spyre's spyreccl
 backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't work).
 
-`SpyreCommunicator` therefore only overrides:
+`SpyreCommunicator` therefore overrides:
 
-- **`all_gather`** — routes CPU tensors through the gloo half of the multi-backend
-  `cpu:gloo,spyre:spyreccl` group, and uses native list-form `dist.all_gather` for Spyre
-  tensors (the base class's `dist.all_gather_into_tensor` path is blocked by the
-  `_allgather_base` stub).
+- **`all_reduce`** — uses the functional `_c10d_functional.all_reduce`, which torch-spyre
+  lowers to `spyre::all_reduce_async` inside a compiled graph and which runs eagerly via
+  `libspyre_comms` outside one, so one code path serves both modes.
+- **`all_gather`** — inside a compiled graph the functional collective lowers to
+  `spyre::all_gather_async` and stays on device; eager keeps native list-form
+  `dist.all_gather`, because the functional entry point (`allgather_into_tensor_coalesced`)
+  is rejected outside a graph. CPU tensors route through the gloo half of the multi-backend
+  `cpu:gloo,spyre:spyreccl` group.
 - **`reduce_scatter`** — raises; it is not on the TP forward path.
 
-`all_reduce` and `gather` are no longer overridden — they now work natively via
-`libspyre_comms`. Each remaining fallback is
-tagged `REPLACE-WITH-NATIVE`; the `tests/probes/test_spyre_comms_native_probes.py` xfail-strict
-suite is the canonical signal: when a probe flips green, delete the corresponding
-override.
+`gather` is not overridden — it works natively via `libspyre_comms`. The
+`tests/probes/test_spyre_comms_native_probes.py` xfail-strict suite is the canonical
+signal: when a probe flips green, delete the corresponding override or workaround.
 
 The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM

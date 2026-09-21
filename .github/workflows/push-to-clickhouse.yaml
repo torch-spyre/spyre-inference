@@ -204,6 +204,19 @@ jobs:
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
 
+      # integration-tests.yaml's provenance job uploads this artifact carrying the
+      # orchestrator's threaded run_id (empty for a test_each_commit-triggered run or a
+      # manual re-ingest); it rides through the same "download every artifact" step above.
+      - name: Resolve orchestrator run_id
+        id: resolve-run-id
+        run: |
+          RUN_ID_FILE="xml_artifacts/orchestrator-run-id/run-id.txt"
+          if [[ -f "$RUN_ID_FILE" ]]; then
+            echo "run_id=$(cat "$RUN_ID_FILE")" >> "${GITHUB_OUTPUT}"
+          else
+            echo "run_id=" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Resolve test_type for trigger_type
         id: extract-tier
         run: |
@@ -239,6 +252,7 @@ jobs:
             --branch   "${TRIGGERING_BRANCH}" \
             --sha      "${TRIGGERING_SHA}" \
             --gha-run-id "${TRIGGERING_RUN_ID}" \
+            --run-id   "${{ steps.resolve-run-id.outputs.run_id }}" \
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
             --trigger-type "${{ steps.extract-tier.outputs.tier }}" \

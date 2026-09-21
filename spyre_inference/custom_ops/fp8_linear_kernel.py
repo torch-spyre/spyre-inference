@@ -14,10 +14,13 @@
 
 """Spyre FP8 linear: keep checkpoint FP8 weights, run compiled ``aten._scaled_mm``.
 
-Forward (same graph as torch-spyre ``test_fp8_scaled_mm_cpu``):
+Forward:
 
-    scale_a = amax(x) / 448                         # eager, outside compile
+    scale_a = quantscalepertokenfp8(x)              # in-graph, per-token
     y = _scaled_mm(qfp8ch(x), qfp8wt(W), scale_a, scale_b)   # FP16 out
+
+Per-tensor activations still compute ``scale_a = amax(x) / FP8_E4M3FN_MAX``
+eagerly because ``quantscalepertokenfp8`` always reduces over the hidden dim.
 
 Granite 4096-wide SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128}, so we
 tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
@@ -40,10 +43,16 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
 )
 from vllm.platforms import PlatformEnum
 
+from spyre_inference.v1.worker import compile_guard
+
 logger = init_logger(__name__)
 
+try:
+    from torch_spyre._inductor.constants import FP8_E4M3FN_MAX
+except ImportError:
+    FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
 _REGISTERED = False
-FP8_E4M3FN_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 _WIDE = 4096
 _WIDE_N = (4096, 1024, 128)
@@ -76,16 +85,22 @@ def _n_tiles(n: int) -> list[int]:
 
 
 def _join(parts: list[torch.Tensor], dim: int) -> torch.Tensor:
-    """Cat tiles into a new buffer so RMSNorm/SiLU/attention see offset 0."""
-    return (parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)).clone()
+    """Concatenate tiles; both ``_fp8_mm`` and ``cat`` already return fresh buffers."""
+    return parts[0] if len(parts) == 1 else torch.cat(parts, dim=dim)
 
 
-def _activation_scale(x: torch.Tensor, per_token: bool) -> torch.Tensor:
-    if per_token:
-        amax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-        return (amax / FP8_E4M3FN_MAX).to(dtype=torch.float16)
+def _per_tensor_activation_scale(x: torch.Tensor) -> torch.Tensor:
     amax = x.abs().amax().clamp(min=1e-12)
     return (amax / FP8_E4M3FN_MAX).to(dtype=torch.float16).reshape(1)
+
+
+@torch.compile(backend="inductor", dynamic=False)
+def _compiled_fp8_scale(x: torch.Tensor) -> torch.Tensor:
+    # quantscalepertokenfp8 computes amax, scale, and clip inside the graph.
+    return torch.ops.spyre.quantscalepertokenfp8(
+        x,  # ty: ignore[invalid-argument-type]
+        FP8_E4M3FN_MAX,  # ty: ignore[invalid-argument-type]
+    )
 
 
 @torch.compile(backend="inductor", dynamic=False)
@@ -106,13 +121,23 @@ def _compiled_fp8_scaled_mm(
         weight_scale,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,  # ty: ignore[invalid-argument-type]
-        w_fp8,  # ty: ignore[invalid-argument-type]
+        x_fp8,
+        w_fp8,
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
+        # A bfloat16 model cannot use this kernel; `check_and_update_config` rejects
+        # that pairing rather than let float16 output reach a bfloat16 graph.
         out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
     )
+
+
+# Both compile per distinct tile shape, and `apply_weights` tiles M onto {1, 4} (or a
+# 128-multiple) and N onto `_WIDE_N`, so warmup's shapes cover every tile a request can
+# produce. A compile here mid-serving is therefore a warmup-coverage gap like any other,
+# and unwatched it would land in the guard's never-fatal UNKNOWN class.
+compile_guard.watch(_compiled_fp8_scale, "fp8 per-token activation scale")
+compile_guard.watch(_compiled_fp8_scaled_mm, "fp8 scaled_mm")
 
 
 def _fp8_mm(
@@ -122,7 +147,10 @@ def _fp8_mm(
     bias: torch.Tensor | None,
     per_token: bool,
 ) -> torch.Tensor:
-    return _compiled_fp8_scaled_mm(x, _activation_scale(x, per_token), weight, weight_scale, bias)
+    if per_token:
+        scale_a = _compiled_fp8_scale(x)
+        return _compiled_fp8_scaled_mm(x, scale_a, weight, weight_scale, bias)
+    return _compiled_fp8_scaled_mm(x, _per_tensor_activation_scale(x), weight, weight_scale, bias)
 
 
 def _fp16_weight_for_qfp8wt(
@@ -261,10 +289,16 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
                 col_outs.append(_fp8_mm(xi, wj, sj, bj, self._per_token_act))
                 col += ns
             row_outs.append(_join(col_outs, dim=-1))
-        out = _join(row_outs, dim=0)[:orig_m]
+        out = _join(row_outs, dim=0)
+        if out.shape[0] > orig_m:
+            # The slice is already contiguous at offset 0; clone() compacts the
+            # storage so the subsequent reshape (3-D inputs) sees the correct
+            # element count. Without it, the padding rows corrupt the trailing
+            # dimensions.
+            out = out[:orig_m].clone()
         if x.dim() > 2:
             out = out.reshape(*orig_shape[:-1], out.shape[-1])
-        return out.clone()
+        return out
 
     def apply_scaled_mm(
         self,

@@ -30,9 +30,11 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     SpyreEncoderAttentionImpl,
     _content_query_lens,
     build_attention_mask,
+    build_key_pad_mask,
     dummy_pack_row,
     gather_pack,
     gather_unpack,
+    host_key_pad_mask,
     host_pack_indices,
     host_scatter_pack_dest,
     scatter_pack,
@@ -313,6 +315,44 @@ def test_build_attention_mask_matches_loop(
         torch.testing.assert_close(got, ref, atol=0, rtol=0)
         return
     assert bool((got[~attend] < -1e4).all()), "pad slots must stay a large negative"
+
+
+@pytest.mark.parametrize(
+    "query_lens,kv_lens,aligned_len,num_kv_heads",
+    [
+        pytest.param([32], [32], 64, 12, id="single_32"),
+        pytest.param([9, 70, 5], [9, 70, 5], 128, 12, id="batch_unaligned"),
+        pytest.param([16, 8], [8, 8], 64, 4, id="kv_shorter_than_q"),
+        pytest.param([5, 0], [5, 0], 64, 1, id="dummy_seq"),
+        pytest.param([0], [0], 64, 8, id="all_dummy"),
+    ],
+)
+@torch.inference_mode()
+def test_build_key_pad_mask_matches_sliced_square(
+    query_lens: list[int],
+    kv_lens: list[int],
+    aligned_len: int,
+    num_kv_heads: int,
+) -> None:
+    """Direct ``[B*KV, 1, 1, L]`` row must match slicing query-row 0 of the square."""
+    dtype = torch.float16
+    square = build_attention_mask(
+        len(query_lens),
+        aligned_len,
+        query_lens,
+        kv_lens,
+        dtype=dtype,
+    )
+    sliced = host_key_pad_mask(square, num_kv_heads)
+    got = build_key_pad_mask(
+        len(query_lens),
+        aligned_len,
+        [min(q, k) for q, k in zip(query_lens, kv_lens)],
+        num_kv_heads,
+        dtype=dtype,
+    )
+    assert got.shape == (len(query_lens) * num_kv_heads, 1, 1, aligned_len)
+    torch.testing.assert_close(got, sliced, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -625,7 +665,7 @@ def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -
 
 @torch.inference_mode()
 def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
-    """Fused B=1 path does not H2D dest, unpack, or a [B, 1, L, L] mask."""
+    """Fused B=1 path does not H2D dest, unpack, or build a key-pad mask."""
     idx_calls = {"n": 0}
     real_idx = encoder_attn._indices_for_device
 
@@ -650,11 +690,20 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
         return real_mask(*args, **kwargs)
 
     monkeypatch.setattr(encoder_attn, "build_attention_mask", count_mask)
+    row_calls = {"n": 0}
+    real_row = encoder_attn.build_key_pad_mask
+
+    def count_row(*args, **kwargs):
+        row_calls["n"] += 1
+        return real_row(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
     impl, fwd, query, meta = _b1_dense_forward_setup()
     impl.forward(**fwd, output=torch.empty_like(query))
     assert idx_calls["n"] == 0
     assert pad_calls["n"] == 0
     assert mask_calls["n"] == 0
+    assert row_calls["n"] == 0
     assert meta.encoder_fused_sdpa
     assert meta.encoder_pack_batch == 1
     assert meta.encoder_pack_len == 64
@@ -668,6 +717,44 @@ def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> N
     impl.forward(**fwd, output=torch.empty_like(query))
     assert idx_calls["n"] == 0
     assert mask_calls["n"] == 0
+    assert row_calls["n"] == 0
+
+
+@torch.inference_mode()
+def test_packed_path_builds_key_pad_row_not_square(monkeypatch, default_vllm_config) -> None:
+    """Serve must not allocate ``[B, 1, L, L]`` just to throw away all but row 0."""
+    square = {"n": 0}
+    slice_row = {"n": 0}
+    row = {"n": 0}
+    real_square = encoder_attn.build_attention_mask
+    real_slice = encoder_attn.host_key_pad_mask
+    real_row = encoder_attn.build_key_pad_mask
+
+    def count_square(*args, **kwargs):
+        square["n"] += 1
+        return real_square(*args, **kwargs)
+
+    def count_slice(*args, **kwargs):
+        slice_row["n"] += 1
+        return real_slice(*args, **kwargs)
+
+    def count_row(*args, **kwargs):
+        row["n"] += 1
+        return real_row(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn, "build_attention_mask", count_square)
+    monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_slice)
+    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
+    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
+    meta.seq_lens = torch.tensor([5], dtype=torch.int32)
+    meta.num_actual_tokens = 5
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert square["n"] == 0
+    assert slice_row["n"] == 0
+    assert row["n"] == 1
+    _assert_pad_mask(meta, 5)
+    impl.forward(**fwd, output=torch.empty_like(query))
+    assert row["n"] == 1
 
 
 def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: int):

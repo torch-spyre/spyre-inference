@@ -60,8 +60,6 @@ DATASET_PATH_DEFAULTS = {
 # `environment_variables` can override any of these.
 ENV_DEFAULTS = {
     "OMP_NUM_THREADS": "8",
-    "OPENBLAS_NUM_THREADS": "8",
-    "MKL_NUM_THREADS": "8",
     "LAYOUT_SOLVER": "greedy",
 }
 

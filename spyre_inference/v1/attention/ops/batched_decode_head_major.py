@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Batched decode over a head-major KV cache, behind ``SPYRE_BATCHED_DECODE``.
+"""Batched multi-sequence decode over a head-major KV cache.
 
-A copy of ``batched_decode.py``; the gathered page's shape is the only difference.
+The reduction is ``batched_decode``'s, chunk for chunk; only the page read differs.
+One index row per page, as token-major, but this layout stores the page head-major
+already, so the permute token-major does per chunk disappears.
+
+Not the folded ``(page, kv_head)`` rows the per-sequence kernel gathers: the two move the
+same bytes, but folding costs ``num_kv_heads`` times the index entries, and gather time
+scales with entries rather than bytes -- measured at ~2x the kernel time for 8 kv heads.
 """
 
 import torch
@@ -37,19 +43,12 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
 ):
-    """Batched decode kernel; gathers K/V and the query in-graph.
+    """Shapes as in ``batched_decode_kernel``, except k/v_pages are the unfolded
+    head-major cache, [num_pages_total, num_kv_heads, block_size, head_size].
 
-    Gathers blocks_per_chunk blocks per sequence per step, so the gather's entry
-    axis is entries = num_seqs * blocks_per_chunk. A gather is core-split only on
-    that axis, and behind a 1-D index it is counted in whole 32-entry sticks, so
-    a narrow 1-D gather has no splittable unit and runs on one core.
-
-    k/v_pages: [num_pages_total, KV, block_size, D] (the raw page cache).
-    chunk_page_ids: one [entries, 1] int32 tensor per chunk, entry (s, j) holding
-    sequence s's (c * blocks_per_chunk + j)-th page. mask_by_chunk:
-    [num_chunks, entries * KV, 1, block_size], pre-broadcast across KV heads by
-    the builder. rep_row_ids: [entries] int32, each query row repeated
-    blocks_per_chunk times. ``out`` None returns the result instead of storing it.
+    One index row per page rather than per (page, kv_head): the gather then splits on the
+    axis that stays the matmul's batch dim 0, as token-major's does, and the page still
+    arrives head-major so there is no permute either.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -62,11 +61,8 @@ def batched_decode_head_major_kernel(
     tile_output = None
 
     for c, page_idx in enumerate(chunk_page_ids):
-        # Advanced indexing on a [entries, 1] index, not index_select on a 1-D
-        # one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
-        # so a narrow gather gets one core. It costs the eager path, which
-        # _batched_decode_preconditions_met gives up.
-        # Already head-major: only the gather's singleton axis needs dropping.
+        # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
+        # whole 32-entry sticks. Costs the eager path, which the preconditions decline.
         k_page = k_pages[page_idx].squeeze(1)
         v_page = v_pages[page_idx].squeeze(1)
         # Builder already broadcast across KV heads; split them back out.
@@ -78,16 +74,14 @@ def batched_decode_head_major_kernel(
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         scores = scores + mask_tile
-        # Leading-axis split only: merging a permuted axis pair is what
-        # torch-spyre rejects.
+        # Leading-axis split only: torch-spyre rejects merging a permuted axis pair.
         sc = scores.reshape(
             num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
         )
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
 
-        # The running max drives exp(), not the chunk's own: a chunk wholly past
-        # a sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
-        # Every row has a valid block 0, so the chunk-0 max is finite.
+        # The running max drives exp(), not the chunk's own: a chunk wholly past a
+        # sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
         if c == 0:
             new_max = chunk_max
         else:
@@ -121,8 +115,8 @@ def batched_decode_head_major_kernel(
     assert tile_output is not None and tile_sum is not None
     attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
     if out is not None:
-        # The destination prefix starts at offset 0, so torch-spyre#3770 does not
-        # apply; rows past the batch are don't-care and kept finite by the builder.
+        # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
+        # don't-care and kept finite by the builder.
         out[:num_seqs].copy_(attn)
         return out
     return attn

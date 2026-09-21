@@ -63,7 +63,8 @@ class SpyreGemmaRMSNorm(CompileOutermost, GemmaRMSNorm):
         return x, residual
 
 
-# See the SpyreTPAwareRMSNorm note in rms_norm.py.
+# The norm fuser instantiates TPAwareGemmaRMSNorm and OOT dispatch keys on the concrete
+# class name, so the fused norm needs its own entry.
 @GemmaRMSNorm.register_oot(name="TPAwareGemmaRMSNorm")
 class SpyreTPAwareGemmaRMSNorm(TPAwareGemmaRMSNorm, SpyreGemmaRMSNorm):
     """Spyre GemmaRMSNorm that reconstructs a TP-sharded input before normalizing."""

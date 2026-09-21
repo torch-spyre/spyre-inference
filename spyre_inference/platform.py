@@ -47,6 +47,11 @@ else:
 
 logger = init_logger(__name__)
 
+# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
+# accepted only when asked for explicitly. Both are 2 bytes wide, so every
+# stick-alignment constant in this plugin holds for either.
+_SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
+
 
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
@@ -62,6 +67,22 @@ def _disable_torch_accelerator() -> None:
     torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
     if hasattr(torch.accelerator, "empty_host_cache"):
         torch.accelerator.empty_host_cache = _noop  # ty: ignore[invalid-assignment]
+
+    # get_memory_info() has a real caller rather than a shutdown one: vLLM sizes its
+    # vision-encoder chunking budget with it. Host RAM is the right answer, since the
+    # transients that budget guards run on the host.
+    native_memory_info = torch.accelerator.get_memory_info
+
+    def _memory_info(*args, **kwargs) -> tuple[int, int]:
+        try:
+            return native_memory_info(*args, **kwargs)
+        except NotImplementedError:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            return (vm.available, vm.total)
+
+    torch.accelerator.get_memory_info = _memory_info  # ty: ignore[invalid-assignment]
 
 
 _disable_torch_accelerator()
@@ -119,10 +140,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
     _DEFAULT_BLOCK_SIZE = 128
-
-    # Gated activations whose padded lanes are provably inert: `act(0)` meets an equally
-    # zero up lane, so the lane is zero whatever `act` does.
-    _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
     _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
@@ -200,7 +217,14 @@ class TorchSpyrePlatform(CpuPlatform):
         # CpuPlatform returns 1 (CPU = single device); for TP>1 we need the
         # actual Spyre card count so upstream gates like
         # `@multi_gpu_test(num_gpus=2)` don't skip on multi-card hosts.
-        return torch.spyre.device_count()
+        # torch.spyre is only available once torch_spyre is loaded; in
+        # subprocesses where the extension hasn't been initialised (e.g. the
+        # EngineCore during cloudpickle re-imports) fall back to the
+        # AIU_WORLD_SIZE env var set by the Spyre runtime.
+        try:
+            return torch.spyre.device_count()
+        except AttributeError:
+            return int(os.environ.get("AIU_WORLD_SIZE", "0"))
 
     @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:
@@ -330,7 +354,7 @@ class TorchSpyrePlatform(CpuPlatform):
                 max_capture_size,
             )
 
-        # In check_and_update_config we assert this must be float16 for spyre.
+        # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
@@ -445,16 +469,16 @@ class TorchSpyrePlatform(CpuPlatform):
 
         A gated MLP whose per-rank ``intermediate_size`` is not a multiple of the fp16
         stick fuses gate+up and slices the up half at an unaligned offset, which Spyre
-        inductor cannot lower. Unlike head_dim, ``Qwen2MLP``/``Qwen3``/``Gemma4MLP``
-        read ``config.intermediate_size`` directly, so overriding the config value
-        before the model is built widens the modules with no per-class shim.
+        inductor cannot lower. Supported model MLPs read ``config.intermediate_size``
+        directly, so overriding the config value before the model is built widens the
+        modules with no per-class shim.
 
-        Dense MLPs only: routed experts are widened in ``spyre_inference.moe`` instead,
-        and a MoE that sizes its experts from ``intermediate_size`` is skipped, since the
-        loader cannot reach the stacked expert tensors to pad them. Zero-padding is inert
-        for a gated MLP (see ``custom_ops.mlp_pad``).
+        Supported dense gated MLPs only: routed experts are widened in
+        ``spyre_inference.moe`` instead, and a MoE that sizes its experts from
+        ``intermediate_size`` is skipped, since the loader cannot reach the stacked tensors
+        to pad them. Zero-padding is inert for a gated MLP (see ``custom_ops.mlp_pad``).
         """
-        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE
+        from spyre_inference.custom_ops.mlp_pad import BLOCK_SIZE, supports_intermediate_padding
 
         # The text config is where a multimodal checkpoint keeps the decoder's MLP width.
         text_config = vllm_config.model_config.hf_text_config
@@ -469,18 +493,17 @@ class TorchSpyrePlatform(CpuPlatform):
         align = BLOCK_SIZE * vllm_config.parallel_config.tensor_parallel_size
         if not orig or orig % align == 0:
             return
+        if not supports_intermediate_padding(text_config):
+            return
         moe_attrs = ("num_experts", "num_local_experts", "n_routed_experts")
         is_moe = any(getattr(text_config, a, None) for a in moe_attrs)
         expert_size = getattr(text_config, "moe_intermediate_size", None) or getattr(
             text_config, "expert_intermediate_size", None
         )
-        act = getattr(text_config, "hidden_act", None) or getattr(
-            text_config, "hidden_activation", None
-        )
         # Experts sized from ``intermediate_size``, or from its double-wide ``2x``
         # form (e.g. gemma4), would load truncated: the loader cannot reach the
         # stacked tensors to widen them.
-        if (is_moe and expert_size in (None, orig, 2 * orig)) or act not in cls._GATED_ACTS:
+        if is_moe and expert_size in (None, orig, 2 * orig):
             return
 
         padded = ((orig + align - 1) // align) * align
@@ -534,19 +557,35 @@ class TorchSpyrePlatform(CpuPlatform):
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
-            # Check if the model dtype is different from float16,
-            # which is only currently supported in torch-spyre
-            if vllm_config.model_config.dtype != torch.float16:
+            # From here, not from `hf_overrides`, so a user-supplied override does not skip
+            # it; no-op for every other model. Runs again for the nested text config a
+            # multimodal model builds its decoder from.
+            from spyre_inference.models.gemma4 import repair_head_dim_access
+
+            repair_head_dim_access(vllm_config.model_config.hf_config)
+
+            if vllm_config.model_config.dtype not in _SUPPORTED_DTYPES:
+                supported = sorted(str(d) for d in _SUPPORTED_DTYPES)
                 raise ValueError(
-                    f"The model dtype needs to be torch.float16 for spyre, "
-                    f"but was specified to be {vllm_config.model_config.dtype}"
+                    f"The model dtype needs to be one of {supported} for spyre, but "
+                    f"was specified to be {vllm_config.model_config.dtype}"
+                )
+
+            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
+            # weights included.
+            quantization = getattr(vllm_config.model_config, "quantization", None)
+            if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
+                raise ValueError(
+                    f"Spyre does not support quantization ({quantization}) with "
+                    f"{torch.bfloat16}: the FP8 linear kernel produces float16 only, and "
+                    "the run was asked for in bfloat16. Run the unquantized checkpoint."
                 )
 
             # Pad attention head_dim up to a stick-aligned size on the native path.
             cls._maybe_pad_head_dim(vllm_config)
 
-        # Pad SwiGLU MLP intermediate_size up to a stick-aligned size on the native path.
-        cls._maybe_pad_intermediate_size(vllm_config)
+            # Pad gated MLP intermediate_size up to a stick-aligned size on the native path.
+            cls._maybe_pad_intermediate_size(vllm_config)
 
         parallel_config = vllm_config.parallel_config
 
@@ -567,6 +606,21 @@ class TorchSpyrePlatform(CpuPlatform):
             raise ValueError(
                 f"Spyre does not support pipeline_parallel_size > 1 "
                 f"(got {parallel_config.pipeline_parallel_size})."
+            )
+
+        # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
+        # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
+        # no bfloat16 `add`. Reject here rather than crash minutes into warmup.
+        if (
+            parallel_config.tensor_parallel_size > 1
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.dtype == torch.bfloat16
+        ):
+            raise ValueError(
+                f"Spyre does not support tensor_parallel_size > 1 with "
+                f"{torch.bfloat16} (got tensor_parallel_size="
+                f"{parallel_config.tensor_parallel_size}): torch-spyre's all_reduce is "
+                f"float16-only. Run it at tensor_parallel_size=1 or in float16."
             )
 
         # Clamp CPU threading env vars before workers fork so they inherit the

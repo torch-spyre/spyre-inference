@@ -171,6 +171,7 @@ class TestOutputGatherWarmup:
             torch.nn.Identity(),
             torch.device("cpu"),
             logits_row_buckets=logits_row_buckets(list(bucket_sizes), max_num_reqs),
+            model_dtype=torch.float16,
         )
         runner._can_trim_output_d2h = lambda: True
 
@@ -255,6 +256,7 @@ class TestOutputGatherWarmup:
             torch.nn.Identity(),
             runner._spyre_device,
             logits_row_buckets=logits_row_buckets([1, 2, 4, 512], 4),
+            model_dtype=torch.float16,
         )
         runner._can_trim_output_d2h = lambda: True
         runner.warming_up_model()
@@ -283,6 +285,7 @@ class TestArming:
             torch.nn.Identity(),
             torch.device("cpu"),
             logits_row_buckets=logits_row_buckets(list(bucket_sizes), max_num_reqs),
+            model_dtype=torch.float16,
         )
         runner.model_config = types.SimpleNamespace(
             runner_type="generate", dtype=torch.float16, get_hidden_size=lambda: self.HIDDEN

@@ -52,30 +52,25 @@ tests:
               # input embeddings not yet supported on spyre
               use_prompt_embeds: [true]
 
-    # TODO: The rel_path below is stale — upstream moved these to
-    #       tests/models/transformers/test_backend.py in v0.27.1. Re-enabling also needs
-    #       test_models' HF-CPU reference to be reconcilable with fp16 on Spyre: it
-    #       compares 32 tokens of logprobs via check_logprobs_close. Until then,
-    #       tests/e2e/test_transformers_backend.py covers the same ground against the native
-    #       Spyre path.
-    # - rel_path: tests/models/test_transformers.py
-    #   allow_list:
-    #     - test: "test_models"
-    #       mode: mandatory_pass
-    #       tags: [transformers, upstream, uses_subprocess]
-    #       params:
-    #         override:
-    #           "model,model_impl":
-    #           - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "transformers"]
-    #           - ["meta-llama/Llama-3.2-1B-Instruct", "transformers"]
-    #     - test: "test_distributed"
-    #       mode: mandatory_pass
-    #       tags: [transformers, upstream, uses_subprocess, distributed]
-    #   block_list:
-    #     - test: "test_quantization"
-    #     - test: "test_embed_loading"
-    #     - test: "test_hybrid_attention"
-    #     - test: "test_pooling"
+    - rel_path: tests/models/transformers/test_backend.py
+      allow_list:
+        - test: "test_models"
+          mode: mandatory_pass
+          tags: [model, upstream, uses_subprocess]
+          params:
+            override:
+              "model,model_impl,num_fused":
+                - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "transformers", [1, 1]]
+                - ["meta-llama/Llama-3.2-1B-Instruct", "transformers", [1, 1]]
+        - test: "test_distributed"
+          mode: mandatory_pass
+          tags: [model, upstream, uses_subprocess, distributed]
+      block_list:
+        - test: "test_quantization"
+        - test: "test_embed_loading"
+        - test: "test_hybrid_attention"
+        - test: "test_pooling"
+        - test: "test_mla"
 
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
@@ -129,6 +124,23 @@ tests:
         - test: "test_ppl"
           mode: skip # model_info0 (Qwen3-0.6B): RAS::VFIO::MapDMAFailed; model_info1 (Qwen3-0.6B-FP8): KeyError PlatformEnum.OOT - FP8 quant not supported on Spyre; model_info2 (Qwen3.5-0.8B): Qwen3_5ForConditionalGeneration not in vLLM registry
           tags: [model, generation, upstream, uses_subprocess]
+
+    # Server-based GSM8K eval: launches `vllm serve` (RemoteOpenAIServer) and hits
+    # the OpenAI completions endpoint. Runs compiled (server_args omit --enforce-eager)
+    # and batched (max_concurrency matches the server's batch area) to reflect
+    # real-world serving. The upstream `config_filename` fixture is steered to the
+    # Spyre configs (one per model) via `config_list`; thresholds are measured
+    # on-device baselines.
+    # Egress note: upstream's gsm8k_eval.py fetches the dataset (train/test.jsonl) over
+    # HTTP from VLLM_S3_BUCKET_URL (vllm-public-assets S3, *not* HF Hub, so HF_HUB_OFFLINE
+    # does not gate it) into tempfile.gettempdir(). The runners therefore need S3 egress;
+    # the temp dir is not durable, so each shard re-downloads (the two files are small).
+    - rel_path: tests/evals/gsm8k/test_gsm8k_correctness.py
+      config_list: gsm8k_configs/models-spyre.txt
+      allow_list:
+        - test: "test_gsm8k_correctness"
+          mode: mandatory_pass
+          tags: [gsm8k, upstream, uses_subprocess]
 
     - rel_path: tests/models/language/pooling/test_embedding.py
       allow_list:

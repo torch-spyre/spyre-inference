@@ -49,6 +49,11 @@ on:
         required: false
         type: string
         default: ''
+      run_id:
+        description: UUID the dispatching orchestrator minted for this test run, threaded through so ingest can stamp si_test_runs.run_id with it. Leave empty for a standalone/manual dispatch.
+        required: false
+        type: string
+        default: ''
 
       # ---- refs to test ----------
       ref:
@@ -162,6 +167,17 @@ jobs:
             echo "| RPM names           | ${{ inputs.rpm_names || '(none)' }} |"
             echo "| Test type           | ${{ inputs.test_type || 'integration' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # push-to-clickhouse.yaml (workflow_run-triggered) can't read this run's own inputs, so
+      # it recovers run_id the same way it already recovers XML results: as a downloaded artifact.
+      - name: Record orchestrator run_id for ingest
+        run: echo -n "${{ inputs.run_id || '' }}" > run-id.txt
+      - name: Upload orchestrator run_id
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-run-id
+          path: run-id.txt
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # Run the test matrix via the reusable workflow shared with

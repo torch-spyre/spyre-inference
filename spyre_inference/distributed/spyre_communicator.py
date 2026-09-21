@@ -14,13 +14,14 @@
 
 """DeviceCommunicator override for IBM Spyre devices.
 
-`all_reduce` uses `torch.ops._c10d_functional`, which torch-spyre lowers to
-`spyre::all_reduce_async` inside a compiled graph and which falls through to
-eager spyreccl outside one, so the reduction compiles into the model graph
-without needing a separate eager path.
+`all_reduce` and `all_gather` use `torch.ops._c10d_functional`, which torch-spyre
+lowers to `spyre::{all_reduce,all_gather}_async` inside a compiled graph, so the
+collective compiles into the model graph as a native device op. `all_reduce`'s
+functional form also falls through to eager spyreccl, so it needs no separate
+eager path; `all_gather`'s does not (see the method), so eager keeps a list-form
+path alongside the compiled one.
 
-`all_gather` cannot — see the method. `reduce_scatter` raises; `broadcast`,
-`send` and `recv` are inherited unchanged.
+`reduce_scatter` raises; `broadcast`, `send` and `recv` are inherited unchanged.
 """
 
 from __future__ import annotations
@@ -80,16 +81,16 @@ class SpyreCommunicator(DeviceCommunicatorBase):
     _GATHER_ALIGN = 64
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # Two independent blockers keep this off the functional form `all_reduce`
-        # uses: in eager, `_c10d_functional.all_gather_into_tensor` routes to
-        # `allgather_into_tensor_coalesced`, which spyreccl rejects; compiled, it
-        # lowers to `spyre::all_gather_async`, whose reassembly narrows the output
-        # along dim 0 at a `rank * per_rank_numel` storage offset that
-        # `copy_from_d2d` requires to be 64-aligned.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
+
+        # Compiled, the functional collective lowers to `spyre::all_gather_async`; eager
+        # can't (its entry point hits `allgather_into_tensor_coalesced`, which spyreccl
+        # rejects), so eager keeps the list-form `dist.all_gather` path below.
+        if torch.compiler.is_compiling() and self._group_name is not None:
+            return self._all_gather_compiled(input_, dim)
 
         dim = dim % input_.dim()
         orig_size = input_.shape[dim]
@@ -120,6 +121,34 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         )
         stripped = [convert(o, device="cpu").narrow(dim, 0, orig_size) for o in output_list]
         return convert(torch.cat(stripped, dim=dim), device=input_.device)
+
+    def _all_gather_compiled(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
+        # `spyre::all_gather_async` narrows the output at a `rank * per_rank_numel` offset
+        # that `copy_from_d2d` requires to be 64-aligned; the vocab-parallel layers pad each
+        # shard to a 64 multiple, so per_rank_numel is aligned for the only gather on the TP
+        # path. Fail loudly for a future unaligned caller -- unaligned faults the card.
+        if input_.numel() % self._GATHER_ALIGN:
+            raise ValueError(
+                f"compiled all_gather needs a shard numel divisible by {self._GATHER_ALIGN} "
+                f"(got {input_.numel()}); pad the vocab-parallel layer to a 64 multiple."
+            )
+        # No `.contiguous()` unlike the eager path: inductor owns the graph input, and
+        # torch-spyre's all_gather kernel asserts contiguity -- a loud failure, not the
+        # silent corruption a non-contiguous eager input risks.
+        dim = dim % input_.dim()
+        input_size = input_.shape
+        out = torch.ops._c10d_functional.all_gather_into_tensor(
+            input_,  # ty: ignore[invalid-argument-type]
+            self.world_size,  # ty: ignore[invalid-argument-type]
+            self._group_name,  # ty: ignore[invalid-argument-type]
+        )
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        # all_gather_into_tensor concatenates the ranks on dim 0; fold that axis out to `dim`.
+        out = out.reshape((self.world_size, *input_size))
+        out = out.movedim(0, dim)
+        return out.reshape(
+            (*input_size[:dim], self.world_size * input_size[dim], *input_size[dim + 1 :])
+        )
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.

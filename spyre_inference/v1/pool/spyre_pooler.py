@@ -116,13 +116,9 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
     if device.type != "spyre":
         return torch.index_select(hidden_states, 0, flat_idx.to(device=device, dtype=torch.long))
 
-    if flat_idx.device.type == "spyre":
-        if flat_idx.dtype != torch.int32:
-            flat_idx = convert(flat_idx, dtype=torch.int32)
-        return torch.index_select(hidden_states, 0, flat_idx)
-
-    # convert() H2D is blocking (copy_tensor non_blocking=False).
-    return torch.index_select(hidden_states, 0, convert(flat_idx.to(torch.int32), device))
+    indices = convert(flat_idx.to(torch.int32), device)
+    source = hidden_states.clone() if hidden_states.storage_offset() != 0 else hidden_states
+    return torch.index_select(source, 0, indices)
 
 
 class SpyreCLSPool(CLSPool):

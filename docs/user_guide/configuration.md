@@ -27,6 +27,26 @@ llm = LLM(
 
 See the [Examples](../examples/offline_inference/torch_spyre_inference.md) page for more usage patterns.
 
+## Gemma-4: text-only use of a vision checkpoint
+
+Every Gemma-4 repository carries a `vision_config`, so `google/gemma-4-31B` and
+`google/gemma-4-26B-A4B` load as `Gemma4ForConditionalGeneration` and build a vision
+tower — weights to load and graphs to warm up that a text-only workload never runs.
+
+To use one of those repositories for text only, pin its decoder architecture:
+
+```python
+llm = LLM(
+    model="google/gemma-4-26B-A4B",
+    hf_overrides={"architectures": ["Gemma4ForCausalLM"]},
+    tensor_parallel_size=2,
+)
+```
+
+That is also the configuration the tensor-parallel and compile e2e tests run these
+checkpoints under. A repository with no vision tower gets the override by default, so
+this is only needed for the multimodal ones.
+
 ## Decoder compile buckets
 
 The body pads the packed token count to the next `compile_sizes` bucket, and warmup
@@ -117,8 +137,9 @@ The default KV buckets are geometric (powers of two) precisely because the recor
 is a product. If your context never exceeds 2048, dropping the higher powers removes
 variants from warmup at no serving cost.
 
-If you enable the batched-decode kernel (`SPYRE_BATCHED_DECODE=1`, off by default), warmup
-also records it over the KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; the
+head-major layout has no batched kernel and ignores it), warmup also records it over the
+KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
 (default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
 keep-it-short advice applies.
 

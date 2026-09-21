@@ -2,8 +2,9 @@ name: Claude PR Review (on-hardware)
 run-name: Claude ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'on-hardware' }} review of PR #${{ github.event.issue.number }}
 
 # ---------------------------------------------------------------------------
-# On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner;
-# /claude-review-static uses a GitHub-hosted CPU runner.
+# On-demand Claude Code review. /claude-review uses a Spyre self-hosted runner
+# with an accelerator; /claude-review-static uses a card-less one -- it must run
+# on the self-hosted fleet for model connectivity, but needs no accelerator.
 # ---------------------------------------------------------------------------
 on:
   issue_comment:
@@ -23,7 +24,7 @@ permissions:
   # NB: no id-token grant. We run the `claude` CLI directly instead of
   # claude-code-action, so there is no OIDC->Anthropic app-token exchange
   # (that path also demanded the Claude GitHub App). No model or telemetry
-  # traffic reaches api.anthropic.com: model calls go to the LiteLLM proxy,
+  # traffic reaches api.anthropic.com: model calls go to the configured proxy,
   # non-essential traffic is disabled, and GitHub auth uses the job's own
   # github.token. The one Anthropic contact is CLI bootstrap -- the install
   # step fetches the installer and binary from claude.ai.
@@ -43,7 +44,10 @@ jobs:
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/claude-review') &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
-    runs-on: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'ubuntu-latest' || fromJSON('["x86_64","spyre_pf_x2","linux","image_torch_spyre"]') }}
+    # The static review still runs on the self-hosted fleet (required for model
+    # connectivity) but on the card-less pool (spyre_pf_x0), so it never
+    # contends for an accelerator.
+    runs-on: ${{ fromJSON(startsWith(github.event.comment.body, '/claude-review-static') && '["x86_64","spyre_pf_x0","linux","image_torch_spyre"]' || '["x86_64","spyre_pf_x2","linux","image_torch_spyre"]') }}
     timeout-minutes: 60
     env:
       REVIEW_MODE: ${{ startsWith(github.event.comment.body, '/claude-review-static') && 'static' || 'hardware' }}
@@ -146,7 +150,7 @@ jobs:
       - name: Claude review
         id: claude
         env:
-          # ALL model traffic goes to the enterprise LiteLLM proxy -- never
+          # ALL model traffic goes to the configured proxy -- never
           # api.anthropic.com. AUTH_TOKEN is sent as `Authorization: Bearer`.
           ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
           ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
@@ -200,7 +204,7 @@ jobs:
           # also buys no real containment here: on-hardware verification needs
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
-          # internal-IP firewall (see PR #785), not the tool list.
+          # network controls (see PR #785), not the tool list.
           #
           # The agent posts its own PR-level summary comment (see the prompt);
           # the completion signal is the outcome reaction in the next step.

@@ -42,16 +42,19 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
-def head_major_kv_layout(num_rows: int, head_size: int, dtype: torch.dtype):
-    """Row-axis-outermost layout for the head-major cache, whose store indexes one
-    (block, kv_head, token) row at a time. Same reason as slot_major_kv_layout: the
-    indexed axis has to stay whole at device position 0 (torch-spyre#3705)."""
+def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype: torch.dtype):
+    """Head-major cache with the (page, kv_head) row the kernel gathers at device dim 0.
+
+    ``num_pages`` counts folded rows, num_blocks * num_kv_heads. The indexed axis has to
+    stay whole at device position 0, or the gather costs the whole tensor rather than one
+    page (torch-spyre#3705).
+    """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
     eps = get_elem_in_stick(dtype)
     sticks = (head_size + eps - 1) // eps
     return SpyreTensorLayout(
-        device_size=[num_rows, sticks, eps],
-        stride_map=[sticks * eps, eps, 1],
+        device_size=[num_pages, block_size, sticks, eps],
+        stride_map=[block_size * head_size, head_size, eps, 1],
         device_dtype=get_device_dtype(dtype),
     )

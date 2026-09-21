@@ -53,3 +53,6 @@ docs/examples
 .plans/
 .kilo/
 
+
+# Micro-benchmark run artifacts (scripts/microbench default --output-dir)
+microbench_results/

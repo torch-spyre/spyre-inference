@@ -282,60 +282,78 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-smoke-shard-7
-          # Product-model output-quality gate: its own jobs and not in
-          # `integration`, since every case compiles a product model. Sharded
-          # across parallel 1-card jobs like smoke/attention, bounded by the
-          # slowest single case. The plugin owns the weighted partition;
-          # QUALITY_SHARDS (Makefile default) is the count. Adding/removing a
-          # shard = add/remove an entry here and bump that default.
-          - cfg: Spyre model quality tests (shard 1/6)
+          # Model-output quality gate: the product-model output checks (model_quality)
+          # plus the GSM8K accuracy evals (gsm8k). Its own jobs and not in `integration`,
+          # since every case compiles a product model or starts a vLLM server. Sharded
+          # across parallel 1-card jobs like smoke/attention, bounded by the slowest single
+          # case. The plugin owns the weighted partition; QUALITY_SHARDS (Makefile default)
+          # is the count. Adding/removing a shard = add/remove an entry here and bump that
+          # default. (The gsm8k evals need the upstream vLLM checkout; the combo's marker
+          # expression pulls it in automatically, no --upstream flag.)
+          - cfg: Spyre quality gate (shard 1/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-0
-          - cfg: Spyre model quality tests (shard 2/6)
+            test_target: test-quality-shard-0
+          - cfg: Spyre quality gate (shard 2/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-1
-          - cfg: Spyre model quality tests (shard 3/6)
+            test_target: test-quality-shard-1
+          - cfg: Spyre quality gate (shard 3/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-2
-          - cfg: Spyre model quality tests (shard 4/6)
+            test_target: test-quality-shard-2
+          - cfg: Spyre quality gate (shard 4/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-3
-          - cfg: Spyre model quality tests (shard 5/6)
+            test_target: test-quality-shard-3
+          - cfg: Spyre quality gate (shard 5/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-4
-          - cfg: Spyre model quality tests (shard 6/6)
+            test_target: test-quality-shard-4
+          - cfg: Spyre quality gate (shard 6/8)
             test_types: regression trunk
             runs_on:
               - x86_64
               - spyre_pf_x1
               - linux
             image_label: image_torch_spyre
-            test_target: test-model-quality-shard-5
+            test_target: test-quality-shard-5
+          - cfg: Spyre quality gate (shard 7/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-6
+          - cfg: Spyre quality gate (shard 8/8)
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-quality-shard-7
           # Decoder attention, sharded across parallel jobs. The compiled
           # (STOCK on device) cases dominate runtime and grow HBM within a
           # process, so each shard is its own job on its own card: wall-clock
@@ -894,6 +912,46 @@ jobs:
           name: test-durations
           path: test-durations.json
           retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # Test-report fan-in: every leg's JUnit XML into one aggregate report on the run
+  # Summary page -- totals plus a single flat, ctrl+f-searchable row per test case
+  # across all shards (no per-shard rollup, no per-file headings) -- replacing the
+  # per-shard dorny checks the matrix used to publish. Rendered directly from the
+  # JUnit XML by aggregate_junit_summary.py (mirrors the coverage/durations fan-
+  # ins): no dorny, so no check-run to 403 on a fork PR's read-only token, and no
+  # coupling to any external tool's markdown. always()/continue-on-error like the
+  # other fan-ins; no-op when no leg produced a JUnit file.
+  # ---------------------------------------------------------------------------
+  test-report:
+    name: Aggregate test report
+    needs: [test, test_retry]
+    if: always()
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download JUnit results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: junit-*
+          path: junit
+          merge-multiple: true
+
+      - name: Write aggregate summary
+        run: |
+          shopt -s nullglob
+          files=(junit/*.xml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No JUnit XML to aggregate (all suites skipped or failed early)." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 .github/scripts/aggregate_junit_summary.py junit/*.xml
 
   # ---------------------------------------------------------------------------
   # Perf job: the vLLM benchmark suite, on the SAME make entrypoint as the

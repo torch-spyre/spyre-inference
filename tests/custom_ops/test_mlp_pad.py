@@ -240,7 +240,7 @@ def test_verify_noop_without_padding():
 def test_install_rejects_a_loader_that_cannot_pad_weights():
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 
-    with pytest.raises(NotImplementedError, match="get_all_weights.*object is unsupported"):
+    with pytest.raises(NotImplementedError, match="get_all_weights.*object .*unsupported"):
         install_mlp_pad_weight_loader(object(), hf_config)
 
 
@@ -248,13 +248,16 @@ def test_install_allows_an_unpadded_config_with_any_loader():
     install_mlp_pad_weight_loader(object(), SimpleNamespace(intermediate_size=_ORIG))
 
 
-def test_install_allows_dummy_weights_with_padding():
+def test_install_allows_dummy_load_format_with_padding():
     from vllm.config import LoadConfig
     from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 
-    install_mlp_pad_weight_loader(DummyModelLoader(LoadConfig(load_format="dummy")), hf_config)
+    loader = DummyModelLoader(LoadConfig(load_format="dummy"))
+    assert loader.load_config.load_format == "dummy"
+    assert not hasattr(loader, "get_all_weights")
+    install_mlp_pad_weight_loader(loader, hf_config)
 
 
 def _config_stub(*, tp=1, **fields):
@@ -269,10 +272,38 @@ def _config_stub(*, tp=1, **fields):
     ("tp", "fields", "expected"),
     [
         # Aligned at TP=1, but a TP=2 shard of 2112 lands mid-stick, so 2176 it is.
-        (1, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, None),
-        (2, {"intermediate_size": 2112, "hidden_activation": "gelu_pytorch_tanh"}, 2176),
-        (1, {"intermediate_size": 160, "hidden_act": "silu"}, 192),
-        (2, {"intermediate_size": 160, "hidden_act": "silu"}, 256),
+        (1, {"model_type": "gemma4", "intermediate_size": 2112}, None),
+        (2, {"model_type": "gemma4", "intermediate_size": 2112}, 2176),
+        (1, {"model_type": "qwen2", "intermediate_size": 160}, 192),
+        (2, {"model_type": "qwen3", "intermediate_size": 160}, 256),
+        (1, {"model_type": "llama", "intermediate_size": 160}, 192),
+        (1, {"model_type": "granite", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma2", "intermediate_size": 160}, 192),
+        (1, {"model_type": "gemma3_text", "intermediate_size": 160}, 192),
+        (1, {"model_type": "granitemoehybrid", "intermediate_size": 160}, 192),
+        # micro-g3.3 stays unchanged: 12800 and its TP=2 shard are stick-aligned.
+        (2, {"model_type": "granite", "intermediate_size": 12800}, None),
+        (1, {"model_type": "mistral", "intermediate_size": 160}, 192),
+        (1, {"model_type": "ministral3", "intermediate_size": 160}, 192),
+        (
+            1,
+            {
+                "model_type": "transformer",
+                "architectures": ["MistralForCausalLM"],
+                "intermediate_size": 160,
+            },
+            192,
+        ),
+        (
+            1,
+            {
+                "model_type": "transformer",
+                "architectures": ["UnrelatedForCausalLM"],
+                "intermediate_size": 160,
+            },
+            None,
+        ),
         # A MoE with its own expert width: only the dense MLP is widened here.
         (
             2,
@@ -280,14 +311,15 @@ def _config_stub(*, tp=1, **fields):
                 "intermediate_size": 2112,
                 "moe_intermediate_size": 704,
                 "num_experts": 128,
-                "hidden_activation": "gelu_pytorch_tanh",
+                "model_type": "gemma4",
             },
             2176,
         ),
         # A MoE that sizes its experts from intermediate_size would load them truncated.
-        (2, {"intermediate_size": 2112, "num_experts": 8, "hidden_act": "silu"}, None),
-        # Padding is only provably inert for a gated MLP.
-        (2, {"intermediate_size": 2112, "hidden_act": "relu"}, None),
+        (2, {"model_type": "qwen2", "intermediate_size": 2112, "num_experts": 8}, None),
+        # BERT's MLP is not gated: widened weights match no gate/up/down name, so startup
+        # aborts with no down_proj module.
+        (2, {"model_type": "bert", "intermediate_size": 2112}, None),
     ],
 )
 def test_platform_aligns_intermediate_size_to_the_per_rank_shard(tp, fields, expected):
@@ -307,8 +339,8 @@ def test_platform_rejects_per_layer_intermediate_sizes():
 
     config = _config_stub(
         tp=2,
+        model_type="gemma4",
         intermediate_size=[160, 192],
-        hidden_activation="gelu_pytorch_tanh",
     )
 
     with pytest.raises(NotImplementedError, match="per-layer intermediate_size values"):

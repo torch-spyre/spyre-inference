@@ -53,6 +53,7 @@ def _wrapper(monkeypatch, *, buckets, copied):
         model,
         torch.device("cpu"),
         logits_row_buckets=buckets,
+        model_dtype=torch.float16,
     )
 
 

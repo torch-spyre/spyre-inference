@@ -258,22 +258,42 @@ def test_spyre_fancy_index_tensor(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Boolean-mask index_put_ (aten::_index_put_impl_) has no Spyre kernel at "
+        "all -- a hard NotImplementedError, not a CPU FallbackWarning. "
+        "spyre_inference.custom_ops.multimodal_embeddings works around this by "
+        "monkeypatching vllm's _merge_multimodal_embeddings to scatter on CPU and "
+        "torch.where the result back in. When this probe passes, revisit that "
+        "workaround."
+    ),
+)
+def test_spyre_bool_mask_index_put(spyre_device):
+    """Boolean-mask scatter ``t[mask] = values`` (aten::_index_put_impl_).
+
+    Mirrors vllm.model_executor.models.utils._merge_multimodal_embeddings'
+    ``inputs_embeds[is_multimodal] = mm_embeds_flat``.
+    """
+    num_tokens, hidden = 8, 64
+    t = torch.zeros(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+    mask = torch.tensor(
+        [True, False, False, True, True, False, False, True],
+        device=spyre_device,
+    )
+    values = torch.randn(4, hidden, dtype=torch.float16, device=spyre_device)
+    t[mask] = values
+
+    expected = torch.zeros(num_tokens, hidden, dtype=torch.float16)
+    expected[mask.cpu()] = values.cpu()
+    torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "A ZERO-DIM scalar device index silently produces wrong results: "
-        "k_pages[torch.tensor(2)] fed through transpose into torch.matmul "
-        "diverges from CPU. A ONE-ELEMENT index tensor works and is what the "
-        "attention backend uses -- see "
-        "test_spyre_indirect_page_gather_one_element_index below. Only this "
-        "0-dim form remains broken."
-    ),
-)
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
     """Index a dense tensor by a 0-dim device index before matmul.
 
@@ -283,6 +303,12 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
       scores = torch.matmul(q, k_page)
 
     Pages here are head-major, so no permute: only the index form is under test.
+
+    Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
+    f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
+    reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
+    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
+    (torch-spyre#3770).
     """
     num_kv_heads = 2
     block_size = 64
@@ -322,10 +348,10 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
     table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
-    provides. Two nearby index forms do NOT work and are deliberately not used:
-      - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
-      - a slice of a plain 1-D index tensor, or of a shared table row, which
-        fails to compile rather than returning wrong values.
+    provides. One nearby index form does NOT work and is deliberately not used: a slice
+    of a plain 1-D index tensor, or of a shared table row, which fails to compile rather
+    than returning wrong values. (A 0-dim scalar index works too now, but is not used --
+    see test_spyre_indirect_matmul_tensor_index.)
 
     index_select works in both modes, so it guards the shape of the gather here.
     The subscript form the kernel uses when compiled is covered by
@@ -601,18 +627,29 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
-        "when passed into a compiled region; hence the per-sequence page_index_tables."
-    ),
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        pytest.param(
+            torch.int32,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
+                    "read from offset 0 when passed into a compiled region. Index tensors "
+                    "are int32, hence the per-sequence page_index_tables."
+                ),
+            ),
+        ),
+    ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
+    Every offset here is a whole number of sticks, so a pass does not speak for a
+    row-misaligned view.
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
@@ -626,6 +663,83 @@ def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
         view = base[s]
         assert view.is_contiguous() and view.storage_offset() == s * rows * width
         torch.testing.assert_close(fn(view).cpu(), (base_cpu[s] + base_cpu[s]), atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 8b. storage_offset: the float16 view shapes the workarounds carry
+# ---------------------------------------------------------------------------
+
+# float16 elements in a 128-byte stick, i.e. get_elem_in_stick(torch.float16).
+_FP16_ELEMS_PER_STICK = 64
+
+
+def _fn_doubling():
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    return fn
+
+
+def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
+    """A row view whose width is not a whole number of sticks.
+
+    test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
+    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
+    gates the per-token row clones on exactly that property, so the off-stick width is the
+    case that decides whether the gate can go.
+    """
+    rows, width = 2, 40
+    assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"
+    base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    for s in range(3):
+        view = base[s]
+        assert view.is_contiguous() and view.storage_offset() == s * rows * width
+        torch.testing.assert_close(fn(view).cpu(), base_cpu[s] + base_cpu[s], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        _FP16_ELEMS_PER_STICK,
+        pytest.param(
+            _FP16_ELEMS_PER_STICK // 2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "An innermost offset short of a whole stick has no lowering: the view "
+                    "reaches the op as h_coords=[d0, d1 + 32] and it raises 'no mechanism to "
+                    "resolve stick incompatibility'. A compile error, not the silent offset-0 "
+                    "read of torch-spyre#3770."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_compile_input_honors_last_dim_window(spyre_device, start):
+    """A last-dim window, which leaves stride(0) at the full row width.
+
+    The shape the attention mask tiles carry: ``mask[row, :, b * block : (b + 1) * block]``
+    is not contiguous, so ``.contiguous()`` is not a no-op on it and the clone it forces is a
+    real copy. Non-contiguity is not what decides it -- the stick-aligned start works; only
+    the offset within the stick does.
+    """
+    rows, window = 4, _FP16_ELEMS_PER_STICK
+    blocks = 3
+    base_cpu = torch.cat([torch.full((rows, window), float(b)) for b in range(blocks)], dim=1).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    view, view_cpu = base[:, start : start + window], base_cpu[:, start : start + window]
+    assert not view.is_contiguous() and view.storage_offset() == start
+    torch.testing.assert_close(fn(view).cpu(), view_cpu + view_cpu, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -742,18 +856,13 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
 # ---------------------------------------------------------------------------
 # 9. Scalar pow
 # ---------------------------------------------------------------------------
+#
+# torch-spyre#4479 decomposes pow.Tensor_Scalar into a mul chain, so exponent 3
+# is exact. Dispatch is on the exponent's value, and gelu_new passes the float.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
-        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
-        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
-        "torch-spyre#4009."
-    ),
-)
-def test_spyre_scalar_pow_cube(spyre_device):
+@pytest.mark.parametrize("exponent", [3, 3.0])
+def test_spyre_scalar_pow_cube(spyre_device, exponent):
     """torch.pow with exponent 3 on a device-produced tensor."""
     # x has to come from an on-device op: a host-copied tensor of unaligned width
     # is re-tiled and the comparison stops being meaningful.
@@ -762,7 +871,7 @@ def test_spyre_scalar_pow_cube(spyre_device):
     x = a @ b
 
     expected = x.cpu().float() ** 3
-    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(torch.pow(x, exponent).cpu().float(), expected, atol=1e-1, rtol=5e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -931,3 +1040,96 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
     )
+
+
+# ---------------------------------------------------------------------------
+# 14. Compiled Pixtral vision attention (coarse-tile hint split)
+# ---------------------------------------------------------------------------
+
+
+_VISION_ATTN_COMPILE_REASON = (
+    "torch.compile of Pixtral vision Attention (RoPE + padded SDPA) dies in "
+    "coarse-tile: `hint_id=N appears in both group 0 and group 1` — ops from "
+    "the same spyre_hint were split across two loop nests. That is why "
+    "`_is_decoder_attention_like` refuses vision towers. When this XPASS-es, "
+    "vision blocks can compile and the decoder-only restriction can be dropped."
+)
+
+
+@pytest.mark.xfail(strict=True, reason=_VISION_ATTN_COMPILE_REASON)
+def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_group, monkeypatch):
+    """A compiled vision-attention block must match the eager patched forward.
+
+    `_compile_blocks` wraps each TransformerBlock the same way. First
+    ``embed_multimodal`` then traces that graph and coarse-tile raises.
+    """
+    pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
+    from vllm.model_executor.layers.linear import LinearBase
+
+    from spyre_inference.multimodal.pixtral import (
+        patch_vision_attention,
+        patch_vision_rope_vit,
+    )
+
+    monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
+    monkeypatch.setattr(
+        pixtral.VisionTransformer,
+        "freqs_cis",
+        pixtral.VisionTransformer.__dict__["freqs_cis"],
+    )
+    monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
+
+    hidden, heads, num_patches, max_side = 256, 4, 64, 16
+    args = pixtral.VisionEncoderArgs(
+        hidden_size=hidden,
+        num_channels=3,
+        image_size=128,
+        patch_size=16,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=heads,
+        rope_theta=10000.0,
+        image_token_id=10,
+        spatial_merge_size=1,
+    )
+
+    class _FreqsStub:
+        def __init__(self):
+            self.args = args
+            self.max_patches_per_side = max_side
+            self._freqs_cis = None
+            self.device = torch.device("cpu")
+
+    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
+    torch.manual_seed(31)
+    for param in layer.parameters():
+        param.data.normal_(std=0.02)
+    for module in layer.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+
+    patch_vision_rope_vit()
+    patch_vision_attention()
+
+    torch.manual_seed(7)
+    positions = torch.stack(
+        [
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
+        ],
+        dim=-1,
+    )
+    freqs_cis = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())[
+        (positions[:, 0], positions[:, 1])
+    ]
+    torch.manual_seed(37)
+    x = torch.randn(1, num_patches, hidden, dtype=torch.float16)
+    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+
+    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+
+    layer = layer.to(spyre_device)
+    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
+
+    torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

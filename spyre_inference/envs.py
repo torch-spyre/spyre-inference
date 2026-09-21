@@ -29,12 +29,14 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
+    SPYRE_COMPILE_GUARD: str = "off"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
+    SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -53,6 +55,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "block": compile one transformer block at a time (default)
     #  - "model": compile the whole model as a single graph
     "SPYRE_COMPILE_GRANULARITY": lambda: os.getenv("SPYRE_COMPILE_GRANULARITY") or "block",
+    # What to do when a model block, attention kernel or the lm_head compiles *after*
+    # warmup, which costs a full Inductor compile mid-request:
+    #  - "off": nothing (default)
+    #  - "warn": log each distinct violation
+    #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing,
+    #    bearing in mind it catches most but not all: torch runs its compile-start
+    #    callbacks only when a process-wide pending counter goes 0 -> 1, so a compile
+    #    starting while another is in flight goes unreported.
+    # torch-spyre compiles every eager aten op, so those compiles continue for the
+    # whole run; they are never reported.
+    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "off",
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
@@ -75,6 +88,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
     #    the per-page permute the kernels do before the matmuls
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
+    # Core cap for the attention compile only, leaving the rest of the model on all 32.
+    # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
+    "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1" (default), enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
     # per-seq loop either way. "0" forces the loop for all batch sizes.

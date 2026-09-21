@@ -177,7 +177,7 @@
     dtype: float16
     load-format: auto
     max-num-seqs: 4
-    max-model-len: 128
+    max-model-len: 512
     port: 8000
     host: 127.0.0.1
   parameters:
@@ -185,12 +185,12 @@
     backend: vllm-rerank
     endpoint: /rerank
     dataset-name: random-rerank
-    random-input-len: 64
+    random-input-len: 512
     random-range-ratio: 0.5
     random-batch-size: 1
-    num-prompts: 16
+    num-prompts: 200
     num-warmups: 8
-    max-concurrency: 4
+    max-concurrency: 64
     request-rate: inf
 - test_name: serve_granite33-8b_tp1_in64_out64
   server_health_timeout: 1800

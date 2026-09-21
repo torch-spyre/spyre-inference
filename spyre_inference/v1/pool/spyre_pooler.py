@@ -33,6 +33,7 @@ from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
+from spyre_inference.custom_ops.linear import spyre_classifier_gemm
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
@@ -116,13 +117,9 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
     if device.type != "spyre":
         return torch.index_select(hidden_states, 0, flat_idx.to(device=device, dtype=torch.long))
 
-    if flat_idx.device.type == "spyre":
-        if flat_idx.dtype != torch.int32:
-            flat_idx = convert(flat_idx, dtype=torch.int32)
-        return torch.index_select(hidden_states, 0, flat_idx)
-
-    # convert() H2D is blocking (copy_tensor non_blocking=False).
-    return torch.index_select(hidden_states, 0, convert(flat_idx.to(torch.int32), device))
+    indices = convert(flat_idx.to(torch.int32), device)
+    source = hidden_states.clone() if hidden_states.storage_offset() != 0 else hidden_states
+    return torch.index_select(source, 0, indices)
 
 
 class SpyreCLSPool(CLSPool):
@@ -354,19 +351,29 @@ def prepare_fp32_head_for_spyre(
 
 
 class SpyreClassifierLinear(nn.Linear):
-    """Same ``nn.Linear``; GEMM on Spyre, bias add on CPU.
+    """Classifier Linear: decoder-style ``x @ Wᵀ`` on Spyre, bias add on CPU.
 
-    Downcast (token-classify already did this) is enough for dtype: Spyre has no
-    fp32 matmul. Isolated ``F.linear(x, W, bias)`` still mixed-EA's because
-    torch-spyre compiles that op as its own graph; decoder linears survive
-    because they sit in a block graph. Drop bias from the GEMM, add it on the
-    host. ``@torch.compiler.disable`` keeps compiled warmup from inlining the add.
+    Downcast is enough for dtype. Isolated ``F.linear`` still fails: its
+    ``weight.T @ mm`` of a CLS ``[1, H]`` lowers as fp32 ``batchmatmul``, and a
+    bias add in that graph mixed-EA's. Store ``Wᵀ`` like the decoder, pad short
+    rows, add bias on the host.
     """
 
     @classmethod
     def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
-        if type(linear) is not cls:
-            linear.__class__ = cls
+        if type(linear) is cls:
+            return linear
+        orig_device = linear.weight.device
+        w = linear.weight.data
+        if orig_device.type == "spyre":
+            w = convert(w, "cpu")
+        weight_t = w.t().contiguous()
+        if orig_device.type == "spyre":
+            weight_t = convert(weight_t, orig_device)
+        else:
+            weight_t = weight_t.to(device=orig_device)
+        linear.__class__ = cls
+        linear.weight = nn.Parameter(weight_t, requires_grad=False)
         return linear
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -376,7 +383,7 @@ class SpyreClassifierLinear(nn.Linear):
                 if self.weight.device.type == "spyre"
                 else x.to(device=self.weight.device)
             )
-        return self._add_bias(nn.functional.linear(x, self.weight, None))
+        return self._add_bias(spyre_classifier_gemm(x, self.weight))
 
     @torch.compiler.disable
     def _add_bias(self, out: torch.Tensor) -> torch.Tensor:

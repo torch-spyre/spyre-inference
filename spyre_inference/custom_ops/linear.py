@@ -56,6 +56,22 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     return out
 
 
+def spyre_classifier_gemm(x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
+    """Isolated classifier GEMM: pre-transposed ``x @ Wᵀ``, no bias.
+
+    ``F.linear`` decomposes to ``weight.T`` then ``mm``. In a standalone graph that
+    permute+mm of a CLS row lowers as fp32 ``batchmatmul`` (no native fp16 GEMM).
+    Decoder layers already store ``Wᵀ`` and pad short row blocks to ``_PAD_ROWS``.
+    """
+    rows = x.shape[0] if x.dim() == 2 else 0
+    if 0 < rows < _PAD_ROWS:
+        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    out = torch.matmul(x, weight_t)
+    if 0 < rows < _PAD_ROWS:
+        out = out[:rows]
+    return out
+
+
 class SpyreTransposedWeightMethod:
     """Shared Spyre weight handler: store `Wᵀ` (optionally row-padded) and matmul it.
 

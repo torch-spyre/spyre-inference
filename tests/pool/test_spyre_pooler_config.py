@@ -135,7 +135,7 @@ def test_configure_pooling_fp32_classifier_downcasts_to_fp16():
     assert model.classifier.weight.dtype == torch.float16
     assert model.classifier.bias is not None
     assert tuple(model.classifier.bias.shape) == (2,)
-    assert model.classifier.weight.shape == (2, 8)
+    assert model.classifier.weight.shape == (8, 2)
     assert model.pooler.head.head_dtype == torch.float16
 
 
@@ -188,7 +188,7 @@ def test_spyre_classifier_linear_matches_nn_linear_on_cpu():
     x_ner = torch.randn(16, 768)
     ner_ref = ner(x_ner).detach()
     wrapped_ner = SpyreClassifierLinear.convert(ner)
-    assert wrapped_ner.weight.shape == (9, 768)
+    assert wrapped_ner.weight.shape == (768, 9)
     torch.testing.assert_close(wrapped_ner(x_ner), ner_ref, atol=1e-5, rtol=1e-5)
 
 

@@ -60,7 +60,7 @@ RERANKER_MODELS = [
 ]
 
 # Token classification applies its own classifier after a head_dtype cast.
-# Same path as sequence-classify: downcast to fp16, GEMM on Spyre, bias on CPU.
+# Same path as sequence-classify: fp16 x @ Wᵀ on Spyre, bias on CPU.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",

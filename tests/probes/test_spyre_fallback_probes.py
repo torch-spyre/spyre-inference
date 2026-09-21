@@ -258,6 +258,37 @@ def test_spyre_fancy_index_tensor(spyre_device):
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Boolean-mask index_put_ (aten::_index_put_impl_) has no Spyre kernel at "
+        "all -- a hard NotImplementedError, not a CPU FallbackWarning. "
+        "spyre_inference.custom_ops.multimodal_embeddings works around this by "
+        "monkeypatching vllm's _merge_multimodal_embeddings to scatter on CPU and "
+        "torch.where the result back in. When this probe passes, revisit that "
+        "workaround."
+    ),
+)
+def test_spyre_bool_mask_index_put(spyre_device):
+    """Boolean-mask scatter ``t[mask] = values`` (aten::_index_put_impl_).
+
+    Mirrors vllm.model_executor.models.utils._merge_multimodal_embeddings'
+    ``inputs_embeds[is_multimodal] = mm_embeds_flat``.
+    """
+    num_tokens, hidden = 8, 64
+    t = torch.zeros(num_tokens, hidden, dtype=torch.float16, device=spyre_device)
+    mask = torch.tensor(
+        [True, False, False, True, True, False, False, True],
+        device=spyre_device,
+    )
+    values = torch.randn(4, hidden, dtype=torch.float16, device=spyre_device)
+    t[mask] = values
+
+    expected = torch.zeros(num_tokens, hidden, dtype=torch.float16)
+    expected[mask.cpu()] = values.cpu()
+    torch.testing.assert_close(t.cpu(), expected, atol=1e-3, rtol=1e-3)
+
+
 # ---------------------------------------------------------------------------
 # 4. Indirect tensor access in matmul (attention page gathering)
 # ---------------------------------------------------------------------------
@@ -596,18 +627,29 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
-        "when passed into a compiled region; hence the per-sequence page_index_tables."
-    ),
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float16,
+        pytest.param(
+            torch.int32,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
+                    "read from offset 0 when passed into a compiled region. Index tensors "
+                    "are int32, hence the per-sequence page_index_tables."
+                ),
+            ),
+        ),
+    ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
+    Every offset here is a whole number of sticks, so a pass does not speak for a
+    row-misaligned view.
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
@@ -621,6 +663,83 @@ def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
         view = base[s]
         assert view.is_contiguous() and view.storage_offset() == s * rows * width
         torch.testing.assert_close(fn(view).cpu(), (base_cpu[s] + base_cpu[s]), atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 8b. storage_offset: the float16 view shapes the workarounds carry
+# ---------------------------------------------------------------------------
+
+# float16 elements in a 128-byte stick, i.e. get_elem_in_stick(torch.float16).
+_FP16_ELEMS_PER_STICK = 64
+
+
+def _fn_doubling():
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    return fn
+
+
+def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
+    """A row view whose width is not a whole number of sticks.
+
+    test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
+    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
+    gates the per-token row clones on exactly that property, so the off-stick width is the
+    case that decides whether the gate can go.
+    """
+    rows, width = 2, 40
+    assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"
+    base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    for s in range(3):
+        view = base[s]
+        assert view.is_contiguous() and view.storage_offset() == s * rows * width
+        torch.testing.assert_close(fn(view).cpu(), base_cpu[s] + base_cpu[s], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        _FP16_ELEMS_PER_STICK,
+        pytest.param(
+            _FP16_ELEMS_PER_STICK // 2,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "An innermost offset short of a whole stick has no lowering: the view "
+                    "reaches the op as h_coords=[d0, d1 + 32] and it raises 'no mechanism to "
+                    "resolve stick incompatibility'. A compile error, not the silent offset-0 "
+                    "read of torch-spyre#3770."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_compile_input_honors_last_dim_window(spyre_device, start):
+    """A last-dim window, which leaves stride(0) at the full row width.
+
+    The shape the attention mask tiles carry: ``mask[row, :, b * block : (b + 1) * block]``
+    is not contiguous, so ``.contiguous()`` is not a no-op on it and the clone it forces is a
+    real copy. Non-contiguity is not what decides it -- the stick-aligned start works; only
+    the offset within the stick does.
+    """
+    rows, window = 4, _FP16_ELEMS_PER_STICK
+    blocks = 3
+    base_cpu = torch.cat([torch.full((rows, window), float(b)) for b in range(blocks)], dim=1).to(
+        torch.float16
+    )
+    base = base_cpu.to(spyre_device)
+    fn = _fn_doubling()
+
+    view, view_cpu = base[:, start : start + window], base_cpu[:, start : start + window]
+    assert not view.is_contiguous() and view.storage_offset() == start
+    torch.testing.assert_close(fn(view).cpu(), view_cpu + view_cpu, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------

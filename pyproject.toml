@@ -128,7 +128,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "b7c32231329f299317920b4a0744642685cc7837" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "878a34e3cfb9e0c8d7d4773ae683d86ba125c27f" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

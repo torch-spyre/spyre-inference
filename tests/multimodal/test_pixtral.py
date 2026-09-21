@@ -282,6 +282,24 @@ def test_block_diagonal_mask_is_cached_on_cu_seqlens():
 
 
 @pytest.mark.pixtral
+def test_block_diagonal_mask_cache_keys_on_the_boundaries():
+    """`[0, 16, 32]` (two images) and `[0, 32]` (one) share a token count, so a cache
+    keyed on `seq` alone would hand the second call the first one's mask and leak
+    cross-image attention."""
+    from spyre_inference.multimodal.pixtral import _block_diagonal_mask
+
+    cu_seqlens = torch.tensor([0, 16, 32])
+    two_images = _block_diagonal_mask(cu_seqlens, 32).clone()
+    assert not two_images[0, 16]  # the split is there to begin with
+
+    # Same object, repartitioned -- what a reused `cu_seqlens` would look like.
+    cu_seqlens[:] = torch.tensor([0, 32, 32])
+    one_image = _block_diagonal_mask(cu_seqlens, 32)
+    assert one_image[0, 16], "stale mask returned: the cache ignored the new boundaries"
+    assert one_image.all()
+
+
+@pytest.mark.pixtral
 def test_apply_installs_rope_vit_before_attention():
     """`apply` must install the real rope before the attention patch: the patched
     forward resolves `apply_rotary_emb_vit` by name at call time, so the reverse

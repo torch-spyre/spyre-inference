@@ -68,14 +68,21 @@ def _block_diagonal_mask(cu_seqlens: torch.Tensor, seq: int) -> torch.Tensor:
     layer, so the mask is built once (on CPU, like `_padded_attn_mask`) and cached
     on it; the same object then hits the padded-mask cache in each layer.
     """
+    # Keyed on the boundaries, not just `seq`: `[0, 16, 32]` and `[0, 32]` describe
+    # different partitions of the same 32 tokens, so keying on the total would hand a
+    # reused `cu_seqlens` object the earlier partition's mask and leak cross-image
+    # attention. Reading the bounds costs one device-to-host copy of a
+    # `num_images + 1` tensor per layer; the O(L**2) mask build is what the cache
+    # is here to skip.
+    bounds = tuple(convert(cu_seqlens, "cpu").to(torch.int64).tolist())
+    key = (seq, bounds)
     cached = getattr(cu_seqlens, _CU_MASK_ATTR, None)
-    if cached is not None and cached[0] == seq:
+    if cached is not None and cached[0] == key:
         return cached[1]
-    bounds = convert(cu_seqlens, "cpu").to(torch.int64).tolist()
     m = torch.zeros(seq, seq, dtype=torch.bool)
     for start, end in zip(bounds[:-1], bounds[1:]):
         m[start:end, start:end] = True
-    setattr(cu_seqlens, _CU_MASK_ATTR, (seq, m))
+    setattr(cu_seqlens, _CU_MASK_ATTR, (key, m))
     return m
 
 

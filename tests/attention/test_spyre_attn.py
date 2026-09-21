@@ -1147,6 +1147,22 @@ def test_kv_cache_dtype_that_disagrees_with_the_model_is_rejected(default_vllm_c
         SpyreAttentionImpl(kv_cache_dtype="bfloat16", **kwargs)
 
 
+def test_attention_sinks_are_rejected(default_vllm_config):
+    """0.29 threads sinks (gpt-oss) through the layer, and nothing screens sink models
+    out before this constructor: upstream consults `supports_sink()` only from
+    `AttentionBackendEnum.validate_configuration`, called from the CUDA and ROCm
+    platforms, while `TorchSpyrePlatform.get_attn_backend_cls` registers this backend
+    under `CUSTOM` and never calls it. The raise is the only thing standing between a
+    sink model and silently computing plain attention, so pin it."""
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    kwargs = dict(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8)
+    assert SpyreAttentionImpl(sinks=None, **kwargs) is not None
+
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        SpyreAttentionImpl(sinks=torch.zeros(8, dtype=torch.float16), **kwargs)
+
+
 @pytest.mark.parametrize(
     "configure_device",
     [pytest.param("spyre", id="device_spyre")],

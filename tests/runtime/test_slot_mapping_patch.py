@@ -23,7 +23,9 @@ rather than trusting it to have landed.
 
 from __future__ import annotations
 
+import ast
 import inspect
+import textwrap
 
 import pytest
 import torch
@@ -71,17 +73,36 @@ def test_patch_raises_when_the_kernel_moves(monkeypatch):
         _patch_compute_slot_mapping()
 
 
-def test_shim_matches_vllms_positional_launch_order():
-    """vLLM launches the kernel with 14 positional arguments. The shim names its last
-    five in Triton's constexpr style, so only their *order* keeps them aligned."""
+def test_shim_accepts_vllms_positional_launch():
+    """vLLM launches the kernel with 14 positional arguments and no keywords, so only
+    their *order* keeps them aligned with the shim's parameters.
+
+    Read from the call site, not from `ComputeSlotMappingKernel.__call__`: upstream
+    declares that as `(self, num_reqs, *args)` in some releases and enumerates all 14 in
+    others, while the call site has stayed the same across both. The call is what the
+    shim has to survive."""
     from vllm.v1.worker import block_table
 
-    launched = inspect.signature(block_table.ComputeSlotMappingKernel.__call__).parameters
-    shim = inspect.signature(_compute_slot_mapping_kernel.__call__).parameters
+    src = textwrap.dedent(inspect.getsource(block_table.BlockTable.compute_slot_mapping))
+    calls = [
+        node
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == _SLOT_MAPPING_KERNEL_ATTR
+    ]
+    assert len(calls) == 1, f"expected one {_SLOT_MAPPING_KERNEL_ATTR} launch, got {len(calls)}"
+    (launch,) = calls
 
-    # Compare position by position; the names differ in case by design.
-    assert len(shim) == len(launched) - 1  # `self` is bound on the shim instance
-    assert [name.lower() for name in shim] == [name for name in launched if name != "self"]
+    assert not launch.keywords, "the launch passes keywords; the shim's names would matter"
+    assert not any(isinstance(a, ast.Starred) for a in launch.args), "unpacked launch args"
+
+    sig = inspect.signature(_compute_slot_mapping_kernel.__call__)
+    assert len(sig.parameters) == len(launch.args)  # `self` is bound on the shim instance
+
+    # Not just the same count: the launch as written has to bind. Defaults on the last
+    # five would otherwise hide a dropped argument.
+    sig.bind(*launch.args)
 
 
 def test_shim_computes_the_slot_mapping_through_a_real_block_table():

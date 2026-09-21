@@ -85,6 +85,23 @@ def test_swapped_sampler_matches_stock_tokens(
     assert torch.equal(out_stock, out_swap)
 
 
+@pytest.mark.parametrize("rows", [1, 8])
+def test_log_space_gumbel_matches_softmax_draw(rows: int) -> None:
+    """The log-space draw (logits - log q) matches the stock softmax(logits)/q
+    draw for the same exponential noise q."""
+    sampler = SpyreTopKTopPSampler("raw_logprobs", False)
+    logits = torch.randn(rows, 32000, dtype=torch.float32) * 5.0
+
+    torch.manual_seed(7)
+    sampled, _ = sampler.forward_native(logits.clone(), {}, None, None)
+
+    torch.manual_seed(7)
+    q = torch.empty_like(logits).exponential_()
+    ref = (logits.softmax(dim=-1) / q).argmax(dim=-1).view(-1)
+
+    assert torch.equal(sampled, ref)
+
+
 def test_runner_installs_spyre_topk_sampler() -> None:
     """The runner's __init__ installs SpyreTopKTopPSampler -- guards the swap itself."""
     from vllm.config import CacheConfig, ModelConfig, VllmConfig

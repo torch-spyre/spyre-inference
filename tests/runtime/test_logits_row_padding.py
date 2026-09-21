@@ -42,6 +42,7 @@ def _wrapper(buckets):
         model,
         torch.device("cpu"),
         logits_row_buckets=buckets,
+        model_dtype=torch.float16,
     )
 
 

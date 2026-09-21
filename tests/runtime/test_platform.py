@@ -90,6 +90,31 @@ def test_torch_accelerator_ops_are_noop():
         torch.accelerator.empty_host_cache = saved_empty_host_cache
 
 
+def test_memory_info_falls_back_to_host_ram(monkeypatch):
+    """Spyre registers no accelerator memory-info hook, so the native call raises;
+    vLLM's vision-encoder chunking budget needs a real number back."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    def _unimplemented(*args, **kwargs):
+        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
+    _disable_torch_accelerator()
+
+    free, total = torch.accelerator.get_memory_info()
+    assert free > 0
+    assert total >= free
+
+
+def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *a, **k: (123, 456))
+    _disable_torch_accelerator()
+
+    assert torch.accelerator.get_memory_info() == (123, 456)
+
+
 def test_num_gpu_blocks_override_homogeneous():
     """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
     from spyre_inference.platform import TorchSpyrePlatform
@@ -399,6 +424,43 @@ def test_only_tensor_parallelism_is_accepted(field):
 
     with pytest.raises(ValueError, match="Spyre does not support"):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_bfloat16_is_rejected_under_tensor_parallelism():
+    """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
+    compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather
+    than minutes into warmup.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.parallel_config.tensor_parallel_size = 2
+
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1 with"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_quantization_is_rejected_with_bfloat16():
+    """``SpyreFp8LinearKernel`` emits float16 only, so FP8 + bf16 must fail at startup."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.model_config.quantization = "fp8"
+
+    with pytest.raises(ValueError, match="does not support quantization"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_bfloat16_is_accepted_at_tp1():
+    """The guard above must not reject the single-card bf16 path."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
 def test_raise_dynamo_recompile_limits_survives_a_clobber():

@@ -48,4 +48,6 @@ public_models:
     revision: 5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89
   - repo: google/gemma-4-26B-A4B
     revision: 24548b62aa021d562695c04aaf7758a1ea47990b
+  - repo: google/gemma-4-26B-A4B-it
+    revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
   - qwrt/Swedish0.1M

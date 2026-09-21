@@ -23,6 +23,7 @@ import contextlib
 import json
 import logging
 import os
+import platform
 import re
 import shlex
 import signal
@@ -614,6 +615,12 @@ VALID_BENCH_TYPES = ("latency", "throughput", "serve")
 
 
 def main():
+    # s390x: the protobuf upb C runtime SIGSEGVs (upb_DefPool_Free) in vLLM's
+    # model-inspection child; force pure-Python protobuf. Set on os.environ so
+    # the child, spawned by vLLM not us, inherits it.
+    if platform.machine() == "s390x":
+        os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
     args = parse_args()
     configs_dir = Path(args.configs_dir)
     results_dir = Path(args.results_dir)

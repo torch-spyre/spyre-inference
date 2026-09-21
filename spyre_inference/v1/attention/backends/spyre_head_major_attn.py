@@ -56,6 +56,7 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
+from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
 
@@ -65,6 +66,14 @@ logger = init_logger(__name__)
 _page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
+
+# Warmup's recorder covers these, so a compile afterwards is a coverage gap.
+compile_guard.watch(
+    page_attn_head_major_prefill_kernel, "page attention prefill kernel (head-major)"
+)
+compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel (head-major)")
+compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel (head-major)")
+compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel (head-major)")
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8

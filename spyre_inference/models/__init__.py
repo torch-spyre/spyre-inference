@@ -37,9 +37,8 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM's
-    # own multimodal wrapper builds its nested decoder via init_vllm_registered_model,
-    # which resolves this entry.
+    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
+    # apply_prelaunch_overrides rewrites it to this text-only backbone first.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
@@ -105,6 +104,23 @@ def register_models() -> None:
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
     builds the ModelConfig (e.g. text-only backbone selection)."""
-    from spyre_inference.models import gemma4
+    from spyre_inference.models import clip, gemma4
 
     gemma4.force_text_backbone(engine_args)
+    clip.force_disable_chunked_prefill(engine_args)
+
+
+def install_pooling_model_patches() -> None:
+    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, CLIP LayerNorm, …)."""
+    from spyre_inference.models import bert, clip, roberta
+
+    bert.install_spyre_patches()
+    roberta.install_spyre_patches()
+    clip.install_spyre_patches()
+
+
+def install_decoder_model_patches() -> None:
+    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
+    from spyre_inference.models import gemma4
+
+    gemma4.install_spyre_patches()

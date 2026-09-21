@@ -347,6 +347,8 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        *,
+        model_dtype: torch.dtype,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -354,6 +356,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_model_dtype", model_dtype)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -398,84 +401,11 @@ class _SpyreModelWrapper:
 
         return result
 
-    def embed_multimodal(self, **kwargs):
-        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+    def _to_spyre(self, t):
+        return convert(t, device=self._spyre_device) if isinstance(t, torch.Tensor) else t
 
-        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
-        input conversion, so pixel tensors would otherwise arrive on CPU while the
-        vision weights are on Spyre.
-        """
-
-        def _to_spyre_float(t):
-            if isinstance(t, torch.Tensor) and t.is_floating_point():
-                return convert(t, dtype=torch.float16, device=self._spyre_device)
-            return t
-
-        kwargs = tree_map(_to_spyre_float, kwargs)
-        out = self._model.embed_multimodal(**kwargs)
-        return out
-
-    def embed_input_ids(
-        self,
-        input_ids,
-        multimodal_embeddings=None,
-        *,
-        is_multimodal=None,
-    ):
-        """Text-token embedding + multimodal merge, Spyre-aware.
-
-        Like ``embed_multimodal``, this is reached through ``__getattr__`` with
-        ``input_ids`` still on CPU. The text lookup runs on-card either way; when
-        images are present the merge is done on CPU, because upstream scatters image
-        rows with a dim-0 boolean mask that Spyre cannot do.
-        """
-        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
-        if has_mm and is_multimodal is None:
-            raise ValueError(
-                "embed_input_ids got multimodal_embeddings without is_multimodal; the "
-                "CPU merge below needs the mask."
-            )
-        # The text lookup skips upstream's `masked_fill(is_multimodal, 0)`, so an
-        # out-of-vocab placeholder id would index the embedding table out of range.
-        if is_multimodal is not None and getattr(self._model, "_has_oov_mm_tokens", False):
-            raise NotImplementedError(
-                "SpyreModelWrapper.embed_input_ids does not support models with "
-                "out-of-vocab multimodal tokens; mask them before the text embedding."
-            )
-
-        # Bucket the token count: this runs on the raw scheduled count, so at TP>1 the
-        # vocab-parallel all_reduce is `num_tokens * hidden` for every distinct prompt
-        # length, and some of those collective schedules fail to build. Pad on CPU and
-        # trim after; padding inside a compiled collective corrupts output.
-        num_tokens = input_ids.shape[0]
-        bucketer = self._shape_bucketer
-        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
-        if padded_tokens is not None and padded_tokens != num_tokens:
-            input_ids = torch.nn.functional.pad(input_ids, (0, padded_tokens - num_tokens))
-        else:
-            padded_tokens = None
-
-        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        inputs_embeds = self._model.embed_input_ids(input_ids)
-        if padded_tokens is not None:
-            inputs_embeds = select_rows(inputs_embeds, torch.arange(num_tokens))
-
-        if not has_mm:
-            return inputs_embeds
-
-        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
-
-        inputs_embeds = convert(inputs_embeds, device="cpu")
-        mm_embeds_cpu = tree_map(
-            lambda t: convert(t, device="cpu") if isinstance(t, torch.Tensor) else t,
-            multimodal_embeddings,
-        )
-        merged = _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=mm_embeds_cpu,
-            is_multimodal=is_multimodal.to("cpu"),
-        )
-        return convert(merged, device=self._spyre_device)
+    def _to_cpu(self, t):
+        return convert(t, device="cpu") if isinstance(t, torch.Tensor) else t
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -506,11 +436,90 @@ class _SpyreModelWrapper:
             logits = logits[:num_rows]
         return logits
 
+    def embed_multimodal(self, **kwargs):
+        """Move float multimodal inputs (e.g. ``pixel_values``) onto Spyre.
+
+        The runner reaches this through ``__getattr__``, bypassing ``__call__``'s
+        input conversion, so pixel tensors would otherwise arrive on CPU while the
+        vision weights are on Spyre.
+        """
+
+        def _to_spyre_float(t):
+            if isinstance(t, torch.Tensor) and t.is_floating_point():
+                return convert(t, dtype=self._model_dtype, device=self._spyre_device)
+            return t
+
+        kwargs = tree_map(_to_spyre_float, kwargs)
+        # Vision towers run eager, so each Spyre op with a decomposition reaches it
+        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
+        # without fullgraph. Decompositions built on for_each_tile (SDPA since
+        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
+        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
+        # trace dies with DataDependentOutputException.
+        with torch._dynamo.config.patch(capture_scalar_outputs=True):
+            return self._model.embed_multimodal(**kwargs)
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        """Move input_ids/is_multimodal/multimodal_embeddings onto Spyre.
+
+        gpu_model_runner._preprocess calls this directly on `self.model`,
+        bypassing __call__, so it needs its own CPU <-> Spyre boundary
+        conversion: input_ids and is_multimodal are CPU buffers, while the text
+        embedding table (and the merge with multimodal_embeddings) lives on
+        Spyre.
+
+        Bucket the token count: this runs on the raw scheduled count, so at TP>1
+        the vocab-parallel all_reduce is `num_tokens * hidden` for every distinct
+        prompt length, and some of those collective schedules fail to build. Pad
+        on CPU and trim after; padding inside a compiled collective corrupts
+        output. `is_multimodal` is padded the same way so it still lines up with
+        `input_ids` for the merge; the padded rows are never multimodal.
+
+        Only a merged result comes back on CPU: upstream copies what we return
+        into its persistent inputs_embeds buffer, and the merge's `torch.where`
+        output layout does not survive that d2d `copy_`. With no multimodal
+        embeddings there is no merge, so the text lookup stays on device instead
+        of paying a D2H that upstream's H2D immediately undoes -- which is every
+        decode step and every text-only prompt served by a multimodal model.
+        """
+        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        num_tokens = input_ids.shape[0]
+        bucketer = self._shape_bucketer
+        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if padded_tokens is not None and padded_tokens != num_tokens:
+            input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
+            if is_multimodal is not None:
+                is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
+        else:
+            padded_tokens = None
+
+        input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
+        is_multimodal = self._to_spyre(is_multimodal)
+        multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
+
+        result = self._model.embed_input_ids(
+            input_ids, multimodal_embeddings, is_multimodal=is_multimodal
+        )
+        if padded_tokens is not None:
+            # A plain prefix slice, not select_rows: the padding above always
+            # appends at the end, so the real rows are always 0..num_tokens
+            # contiguously -- no gather needed, and a merged result's torch.where
+            # output layout select_rows's own compiled index_select does not accept.
+            result = tree_map(
+                lambda t: t[:num_tokens] if isinstance(t, torch.Tensor) else t, result
+            )
+        return tree_map(self._to_cpu, result) if has_mm else result
+
     def __getattr__(self, name):
         return getattr(self._model, name)
 
     def __setattr__(self, name, value):
-        setattr(self._model, name, value)
+        # `__init__` fills our `__dict__` via `object.__setattr__`, so a name in it is
+        # ours, not the model's.
+        if name in self.__dict__:
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._model, name, value)
 
 
 class TorchSpyreModelRunner(GPUModelRunner):
@@ -652,6 +661,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            model_dtype=self._model_dtype(),
         )
 
     @staticmethod
@@ -812,16 +822,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
             t0 = time.time()
             with _set_spyre_compilation_settings(self.vllm_config):
                 if self.spyre_shape_bucketer is not None:
+                    max_model_len = self.model_config.max_model_len
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
-                        self._dummy_run(size)
+                        # A pooling query_len can't exceed max_model_len, so no
+                        # query bucket exists above it; forcing attention there
+                        # would crash. _warmup_pooling_bucket_shapes below covers
+                        # attention at the shapes that do respect max_model_len.
+                        self._dummy_run(size, force_attention=size <= max_model_len)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()
+                if self._spyre_kv_caches:
+                    # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
+                    # record its (num_blocks, query_len) variants directly, sidestepping
+                    # the dummy-batch seq_lens bug above. No-op for encoder-only pooling
+                    # models (BERT/RoBERTa), which never get a KV cache.
+                    self._record_attention_graphs()
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
-            # Pooling never reaches _record_attention_graphs (encoder layers have
-            # no KV cache to record against), so claim coverage here instead --
-            # otherwise _call_kernel stays silent for the encoder kernels.
+            # Claim coverage even when _record_attention_graphs above was a no-op
+            # (encoder-only pooling), so _call_kernel doesn't warn.
             mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
@@ -1094,6 +1114,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         budget = self.scheduler_config.max_num_batched_tokens
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
+        # Same condition that guards _record_attention_graphs below: only a
+        # genuine decoder-type layer has a KV cache here.
+        has_decoder_attn = bool(self._spyre_kv_caches)
         try:
             for batch_size, prompt_len in shapes:
                 self.scheduler_config.max_num_seqs = batch_size
@@ -1126,6 +1149,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                             prompt_len,
                         )
                         continue
+                # Upstream's GPUModelRunner._dummy_run broadcasts one aggregate
+                # seq_lens to every request in a uniform multi-request batch, which
+                # overestimates num_blocks for a decoder-type layer's paged KV.
+                # Those variants get recorded directly by _record_attention_graphs
+                # instead (see warming_up_model), so skip forcing attention here.
+                # create_mixed_batch (skewed) batches compute seq_lens correctly and
+                # are unaffected.
+                force_attention = not (batch_size > 1 and not skewed and has_decoder_attn)
                 logger.info(
                     "Pooling attention warmup: %s bucket batch_size=%d prompt_len=%d (%d tokens)",
                     "skewed" if skewed else "exact",
@@ -1134,7 +1165,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     num_tokens,
                 )
                 hidden_states, _ = self._dummy_run(
-                    num_tokens, force_attention=True, create_mixed_batch=skewed
+                    num_tokens, force_attention=force_attention, create_mixed_batch=skewed
                 )
                 self._dummy_pooler_run(hidden_states)
                 if batch_size == 1:
@@ -1332,6 +1363,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def _model_dtype(self) -> torch.dtype:
+        """The activation dtype the platform settled on (float16 unless bfloat16 was
+        asked for explicitly)."""
+        dtype = self.model_config.dtype
+        return dtype if isinstance(dtype, torch.dtype) else torch.float16
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 
@@ -1420,14 +1457,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> SpyreCpuGpuBuffer:
         """Create a SpyreCpuGpuBuffer with float tensors on Spyre.
 
-        - Float dtypes: .cpu on CPU, .gpu on Spyre as float16
+        - Float dtypes: .cpu on CPU, .gpu on Spyre at the model dtype
         - Int/bool dtypes: .gpu aliased to .cpu (stays on CPU)
         """
         if dtype.is_floating_point:
             return SpyreCpuGpuBuffer(
                 *size,
                 cpu_dtype=dtype,
-                gpu_dtype=torch.float16,
+                gpu_dtype=self._model_dtype(),
                 device=self._spyre_device,
                 pin_memory=False,
                 with_numpy=numpy,

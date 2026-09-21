@@ -55,6 +55,7 @@ def _build_metadata(
     slot_mapping: torch.Tensor,
     sliding_window: int | None = None,
     model_num_kv_heads: int | None = None,
+    dtype: torch.dtype = torch.float16,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata.
 
@@ -81,7 +82,7 @@ def _build_metadata(
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             head_size_v=head_size,
-            dtype=torch.float16,
+            dtype=dtype,
             sliding_window=sliding_window,
         )
     else:
@@ -89,7 +90,7 @@ def _build_metadata(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
-            dtype=torch.float16,
+            dtype=dtype,
         )
 
     builder = SpyreAttentionMetadataBuilder(

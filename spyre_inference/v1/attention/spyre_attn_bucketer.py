@@ -55,6 +55,14 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # starts here -- smaller batches never dispatch to a batched variant.
 _MIN_BATCHED_SEQS = 4
 
+# A padded block is a real KV read, so round-up costs decode latency: 4/3 bounds it at
+# a quarter of the next rung, where powers of two cost a half.
+_TOKEN_BUCKET_STEP_NUM, _TOKEN_BUCKET_STEP_DEN = 4, 3
+_TOKEN_BUCKET_ANCHOR = 64
+# Powers of two above the cap: a 4/3 rung just under a power of two rounds up past it,
+# so an uncapped ladder pads worse than pow2 there, and the denser rungs cost warmup.
+_KV_DENSE_LADDER_CAP = 1024
+
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
 
@@ -124,6 +132,21 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _token_buckets_up_to(max_tokens: int, anchor: int = _TOKEN_BUCKET_ANCHOR) -> tuple[int, ...]:
+    """Multiplicative token buckets in [anchor, max_tokens], each a multiple of anchor."""
+    if max_tokens < 1:
+        return ()
+    steps: list[int] = []
+    t = anchor
+    while t < max_tokens:
+        steps.append(t)
+        # max() with t + anchor: at small t the ratio rounds back to t and would stall.
+        grown = -(-t * _TOKEN_BUCKET_STEP_NUM // _TOKEN_BUCKET_STEP_DEN)
+        t = -(-max(t + anchor, grown) // anchor) * anchor
+    steps.append(max_tokens)
+    return tuple(steps)
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -173,17 +196,6 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
-        if block_size & (block_size - 1):
-            # Not fatal: _powers_of_two_up_to rounds the start up to a power of
-            # two, just coarser at the bottom. Reachable because the platform
-            # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
-            logger.warning(
-                "block_size=%d is not a power of two; the smallest KV bucket is the next "
-                "power of two instead, making it larger than one block. Prefer a "
-                "power-of-two block_size.",
-                block_size,
-            )
-
         # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
         # batch sizes the batched decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -209,14 +221,23 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # Default: powers of two from block_size up to max_model_len. Geometric
-        # because the recorded set is a product of both axes; the extra padding
-        # each bucket costs is absorbed by the mask.
+        # Anchored in tokens, not block_size: entries below block_size dedupe away in
+        # _num_blocks_buckets, which is what the kernel specializes on.
+        def _default_kv() -> list[int]:
+            cap = min(max_model_len, _KV_DENSE_LADDER_CAP)
+            dense = list(_token_buckets_up_to(cap))
+            if cap < max_model_len:
+                dense_set = set(dense)
+                dense += [
+                    b for b in _powers_of_two_up_to(max_model_len, start=cap) if b not in dense_set
+                ]
+            return dense
+
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            _default_kv,
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv

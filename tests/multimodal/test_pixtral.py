@@ -60,14 +60,8 @@ def restore_pixtral(monkeypatch):
     )
     monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
     monkeypatch.setattr(pixtral.PatchMerger, "forward", pixtral.PatchMerger.forward)
-    # The block-mask patch lives on transformers, not vllm.
-    from transformers.models.pixtral import modeling_pixtral
-
-    monkeypatch.setattr(
-        modeling_pixtral,
-        "generate_block_attention_mask",
-        modeling_pixtral.generate_block_attention_mask,
-    )
+    # No transformers entry: `apply` no longer patches generate_block_attention_mask,
+    # which 0.29's vLLM does not call.
     yield
 
 
@@ -232,69 +226,77 @@ def test_pre_transformer_norm_patch_is_transparent_on_cpu():
 
 
 @pytest.mark.pixtral
-def test_block_attention_mask_patch_is_applied_and_idempotent():
-    from transformers.models.pixtral import modeling_pixtral
-
-    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
-
-    patch_block_attention_mask()
-    patched = modeling_pixtral.generate_block_attention_mask
-    assert getattr(patched, "_spyre_patched", False) is True
-
-    patch_block_attention_mask()
-    assert modeling_pixtral.generate_block_attention_mask is patched, "second call must be a no-op"
-
-
-@pytest.mark.pixtral
 @pytest.mark.parametrize(
     "patch_embeds_list",
     [
-        [16],  # one image: a single full-range write
-        [16, 16],  # two images: strided sub-block writes, the unsafe case
+        [16],  # one image: the whole mask is one block
+        [16, 16],  # two images
         [9, 16, 25],  # three unequal images
     ],
 )
-def test_cpu_block_mask_matches_upstream(patch_embeds_list):
-    """The CPU stand-in must reproduce upstream's mask exactly. A device tensor cannot
-    be built here; the device path is covered by the two-image e2e test."""
-    from transformers.models.pixtral import modeling_pixtral
+def test_block_diagonal_mask_matches_upstream_blocks(patch_embeds_list):
+    """0.29 hands the tower `cu_seqlens` instead of a precomputed mask, so the
+    block-diagonal structure is rebuilt here. It must match the per-image blocks
+    upstream's `generate_block_attention_mask` used to zero."""
+    from spyre_inference.multimodal.pixtral import _block_diagonal_mask
 
-    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
-
-    patch_block_attention_mask()
     seq = sum(patch_embeds_list)
-    embeds = torch.zeros(1, seq, 8, dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, *torch.tensor(patch_embeds_list).cumsum(0).tolist()])
 
-    # A CPU tensor takes the passthrough branch, which is upstream verbatim.
-    got = modeling_pixtral.generate_block_attention_mask(patch_embeds_list, embeds)
+    got = _block_diagonal_mask(cu_seqlens, seq)
 
-    neg_inf = torch.finfo(torch.float16).min
-    want = torch.full((seq, seq), neg_inf, dtype=torch.float16)
+    want = torch.zeros(seq, seq, dtype=torch.bool)
     start = 0
     for length in patch_embeds_list:
-        want[start : start + length, start : start + length] = 0
+        want[start : start + length, start : start + length] = True
         start += length
 
-    assert got.device.type == "cpu"
-    assert torch.equal(got[0, 0], want)
+    assert got.dtype == torch.bool, "padded_sdpa's mask contract is a bool keep-mask"
+    assert got.device.type == "cpu", "built on CPU: strided sub-block writes are not stick-safe"
+    assert torch.equal(got, want)
 
 
 @pytest.mark.pixtral
-def test_block_mask_blocks_cross_image_attention():
-    """Two images must not attend to each other: the off-diagonal blocks stay -inf."""
-    from transformers.models.pixtral import modeling_pixtral
+def test_block_diagonal_mask_blocks_cross_image_attention():
+    """Two images must not attend to each other: the off-diagonal blocks stay False."""
+    from spyre_inference.multimodal.pixtral import _block_diagonal_mask
 
-    from spyre_inference.multimodal.pixtral import patch_block_attention_mask
+    mask = _block_diagonal_mask(torch.tensor([0, 16, 32]), 32)
 
-    patch_block_attention_mask()
-    embeds = torch.zeros(1, 32, 8, dtype=torch.float16)
-    mask = modeling_pixtral.generate_block_attention_mask([16, 16], embeds)[0, 0]
+    assert mask[:16, :16].all()
+    assert mask[16:, 16:].all()
+    assert not mask[:16, 16:].any()
+    assert not mask[16:, :16].any()
 
-    neg_inf = torch.finfo(torch.float16).min
-    assert torch.equal(mask[:16, :16], torch.zeros(16, 16, dtype=torch.float16))
-    assert torch.equal(mask[16:, 16:], torch.zeros(16, 16, dtype=torch.float16))
-    assert torch.equal(mask[:16, 16:], torch.full((16, 16), neg_inf, dtype=torch.float16))
-    assert torch.equal(mask[16:, :16], torch.full((16, 16), neg_inf, dtype=torch.float16))
+
+@pytest.mark.pixtral
+def test_block_diagonal_mask_is_cached_on_cu_seqlens():
+    """The tower reuses one `cu_seqlens` across every layer; the O(L²) mask must be
+    built once, so that each layer then hits the padded-mask cache too."""
+    from spyre_inference.multimodal.pixtral import _block_diagonal_mask
+
+    cu_seqlens = torch.tensor([0, 16, 32])
+
+    first = _block_diagonal_mask(cu_seqlens, 32)
+    assert all(_block_diagonal_mask(cu_seqlens, 32) is first for _ in range(23))
+
+
+@pytest.mark.pixtral
+def test_block_diagonal_mask_cache_keys_on_the_boundaries():
+    """`[0, 16, 32]` (two images) and `[0, 32]` (one) share a token count, so a cache
+    keyed on `seq` alone would hand the second call the first one's mask and leak
+    cross-image attention."""
+    from spyre_inference.multimodal.pixtral import _block_diagonal_mask
+
+    cu_seqlens = torch.tensor([0, 16, 32])
+    two_images = _block_diagonal_mask(cu_seqlens, 32).clone()
+    assert not two_images[0, 16]  # the split is there to begin with
+
+    # Same object, repartitioned -- what a reused `cu_seqlens` would look like.
+    cu_seqlens[:] = torch.tensor([0, 32, 32])
+    one_image = _block_diagonal_mask(cu_seqlens, 32)
+    assert one_image[0, 16], "stale mask returned: the cache ignored the new boundaries"
+    assert one_image.all()
 
 
 @pytest.mark.pixtral
@@ -414,10 +416,12 @@ def test_flat_index_gather_matches_2d_index():
         67,  # coprime with the 64 stick — the case the stock lowering rejects
     ],
 )
-@pytest.mark.parametrize("mask_kind", ["bool", "additive"])
-def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind):
+@pytest.mark.parametrize("num_images", [1, 2])
+def test_padded_vision_attention_matches_stock(tp_group, num_patches, num_images):
     """The pad-to-64 + `-inf` mask + crop SDPA must equal upstream's forward: padded
-    keys contribute nothing and padded queries are cropped."""
+    keys contribute nothing, padded queries are cropped, and the `cu_seqlens`-derived
+    block-diagonal mask blocks cross-image attention (0.29 replaced the precomputed
+    mask argument with `cu_seqlens`)."""
 
     args = _vision_args()
     layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
@@ -435,18 +439,35 @@ def test_padded_vision_attention_matches_stock(tp_group, num_patches, mask_kind)
         theta=ROPE_THETA,
     ).reshape(-1, HEAD_DIM // 2)[:num_patches]
 
-    if mask_kind == "bool":
-        mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
-    else:
-        mask = torch.zeros(num_patches, num_patches, dtype=torch.float16)
-        mask[:, num_patches // 2 :] = torch.finfo(torch.float16).min
+    # 0.29 passes per-image `cu_seqlens` instead of a mask; split the patches into
+    # `num_images` contiguous images so both attention cores see the same geometry.
+    lens = [num_patches] if num_images == 1 else [num_patches // 2, num_patches - num_patches // 2]
+    cu_seqlens = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32)
+
+    # Reference: stock 0.29 runs one plain SDPA per image (`torch_sdpa_wrapper` splits
+    # on `cu_seqlens`). Reproduce that here — the wrapper is a custom op that is not
+    # registered for CPU tensors, so `layer.forward` can't run card-less — sharing the
+    # layer's qkv/rope/o_proj so the comparison isolates the padded attention core.
+    qkv, _ = layer.qkv_proj(x)
+    q, k, v = qkv.chunk(3, dim=-1)
+    q = q.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    k = k.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    v = v.reshape(1, num_patches, layer.n_heads, layer.head_dim)
+    q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    per_image = [
+        torch.nn.functional.scaled_dot_product_attention(
+            q[:, :, a:b], k[:, :, a:b], v[:, :, a:b], scale=layer.head_dim**-0.5
+        )
+        for a, b in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+    ]
+    core = torch.cat(per_image, dim=2).transpose(1, 2).reshape(1, num_patches, HIDDEN_SIZE)
+    expected, _ = layer.o_proj(core)
 
     from spyre_inference.multimodal.pixtral import patch_vision_attention
 
-    expected = layer.forward(x, mask, freqs_cis)
-
     patch_vision_attention()
-    actual = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    actual = pixtral.Attention.forward(layer, x, freqs_cis, cu_seqlens)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)
@@ -508,16 +529,27 @@ def test_padded_mask_is_released_with_its_source_mask():
 @pytest.mark.parametrize("seq,seq_pad", [(64, 64), (67, 128)])
 def test_padded_keys_are_masked_off(seq, seq_pad):
     """Padded key columns must be `-inf` and real ones must stay unmasked; a
-    full-attention source mask (all-zero) must not add masking of its own."""
+    full-attention source mask (all-True) must not add masking of its own."""
     from spyre_inference.multimodal.utils import _padded_attn_mask
 
-    source = torch.zeros(seq, seq, dtype=torch.float16)
+    source = torch.ones(seq, seq, dtype=torch.bool)
     m = _padded_attn_mask(source, 1, seq, seq_pad, torch.float16, torch.device("cpu"))
 
     assert m.shape == (1, 1, seq_pad, seq_pad)
     neg_inf = torch.finfo(torch.float16).min
     assert (m[:, :, :, seq:] == neg_inf).all(), "padded keys must be masked off"
     assert (m[:, :, :, :seq] == 0).all(), "real keys must be unmasked"
+
+
+@pytest.mark.pixtral
+def test_padded_mask_rejects_a_float_mask():
+    """The keep-mask contract is bool. A float mask means a caller is passing an
+    additive mask, which read as keep/drop would invert the masking."""
+    from spyre_inference.multimodal.utils import _padded_attn_mask
+
+    additive = torch.zeros(64, 64, dtype=torch.float16)
+    with pytest.raises(TypeError, match="bool keep-mask"):
+        _padded_attn_mask(additive, 1, 64, 64, torch.float16, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -634,14 +666,16 @@ def test_padded_vision_attention_matches_cpu_on_spyre(tp_group, num_patches):
 
     torch.manual_seed(37)
     x = torch.randn(1, num_patches, HIDDEN_SIZE, dtype=torch.float16)
-    # Kept on CPU: the padded mask is assembled host-side and Spyre has no bool.
-    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
+    # 0.29 drives attention with per-image `cu_seqlens`, not a mask; split into two
+    # images to exercise the block-diagonal path (kept on CPU — the derived mask is
+    # assembled host-side and Spyre has no bool).
+    cu_seqlens = torch.tensor([0, num_patches // 2, num_patches], dtype=torch.int32)
 
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
+    expected = pixtral.Attention.forward(layer, x, freqs_cis, cu_seqlens)
 
     device = torch.device("spyre")
     layer = layer.to(device)
-    actual = pixtral.Attention.forward(layer, x.to(device), mask, freqs_cis.to(device))
+    actual = pixtral.Attention.forward(layer, x.to(device), freqs_cis.to(device), cu_seqlens)
 
     assert actual.shape == expected.shape == (1, num_patches, HIDDEN_SIZE)
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

@@ -297,10 +297,9 @@ def _run_head_major_attn_test(
 
 
 def test_head_major_kv_cache_shape():
-    """The backend advertises head-major, and vLLM can still find the block dim."""
+    """The backend advertises the head-major shape with num_blocks outermost."""
     shape = SpyreHeadMajorAttentionBackend.get_kv_cache_shape(16, 128, 8, 64)
     assert shape == (16, 8, 128, 64)
-    assert SpyreHeadMajorAttentionBackend.get_kv_cache_block_dim(128, 8, 64) == 0
 
 
 def test_head_major_write_index(default_vllm_config):
@@ -803,7 +802,12 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layers.0.self_attn"])
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks,
+                layers=["layers.0.self_attn"],
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
         ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
     )
@@ -838,6 +842,83 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+def test_mixed_layout_layers_in_one_kv_cache_tensor_each_get_their_own_pages(monkeypatch):
+    """0.29 packs every attention layer into one KVCacheTensor.
+
+    Allocating once per tensor would both alias the layers onto the same blocks and pick
+    a single layout for all of them -- so a head-major layer would read a token-major
+    cache. Each layer must get its own allocation, from its own impl class.
+
+    Card-free: both `allocate_pages` implementations are stubbed with tagged sentinels.
+    """
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
+    layer_names = ["layers.0.self_attn", "layers.1.self_attn"]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
+        ),
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks * len(layer_names),
+                layers=layer_names,
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+    )
+
+    impl_kwargs = dict(
+        num_heads=32, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
+    )
+    with set_current_vllm_config(vllm_config):
+        impls = {
+            "layers.0.self_attn": SpyreHeadMajorAttentionImpl(**impl_kwargs),
+            "layers.1.self_attn": SpyreAttentionImpl(**impl_kwargs),
+        }
+    for layer_name, impl in impls.items():
+        fake_layer = Mock()
+        fake_layer.kv_cache = None
+        fake_layer.impl = impl
+        runner.compilation_config.static_forward_context[layer_name] = fake_layer
+
+    # Tag each sentinel with the class the runner dispatched on, so a single shared
+    # allocation shows up as both a repeated object and the wrong layout.
+    def _stub(cls):
+        def _allocate_pages(inner_cls, blocks, allocate_spec, device):
+            return Mock(name=f"{inner_cls.__name__}-pages-{blocks}", _spyre_impl_cls=inner_cls)
+
+        monkeypatch.setattr(cls, "allocate_pages", classmethod(_allocate_pages))
+
+    _stub(SpyreHeadMajorAttentionImpl)
+    _stub(SpyreAttentionImpl)
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+
+    assert caches["layers.0.self_attn"] is not caches["layers.1.self_attn"], (
+        "layers packed into one KVCacheTensor must not share a page buffer"
+    )
+    assert caches["layers.0.self_attn"]._spyre_impl_cls is SpyreHeadMajorAttentionImpl
+    assert caches["layers.1.self_attn"]._spyre_impl_cls is SpyreAttentionImpl
 
 
 def test_decode_fold_matches_unrolled():

@@ -1073,9 +1073,14 @@ class SpyreAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        # K and V are separate tensors in SpyrePagedKVCache, each with the same
-        # shape. The base vLLM API expects a single tuple here; callers like
-        # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        # K and V are separate tensors in SpyrePagedKVCache, each with this shape.
+        #
+        # No longer an upstream hook: 0.29 replaced the per-backend shape/stride methods
+        # with the KVCacheLayout descriptor (vllm/v1/kv_cache_layout.py) and dropped
+        # get_kv_cache_shape from AttentionBackend. It stays as Spyre's own single source
+        # of truth for the shape TorchSpyreModelRunner.initialize_kv_cache_tensors
+        # allocates and SpyreAttentionImpl.forward indexes, kept honest by
+        # tests/attention/test_spyre_attn.py.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -1115,7 +1120,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
+        # 0.29 threads attention sinks (gpt-oss) through the layer; Spyre doesn't
+        # implement them.
+        #
+        # This raise is the only guard -- do not delete it on the assumption that
+        # supports_sink() screens sink models out first. Upstream only consults
+        # supports_sink() from AttentionBackendEnum.validate_configuration, which is
+        # called from vllm/platforms/cuda.py and rocm.py alone;
+        # TorchSpyrePlatform.get_attn_backend_cls registers this backend under
+        # AttentionBackendEnum.CUSTOM and never calls it. A sink model therefore reaches
+        # __init__ with sinks set and would otherwise silently compute plain attention.
+        if sinks is not None:
+            raise NotImplementedError("Spyre attention does not support attention sinks")
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)

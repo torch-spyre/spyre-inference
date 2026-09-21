@@ -629,6 +629,47 @@ class TorchSpyrePlatform(CpuPlatform):
 
         configure_threading(parallel_config.world_size)
 
+        # Pin the V1 model runner: TorchSpyreWorker builds the V1 GPUModelRunner subclass
+        # directly, so V2 is not merely slower here, it does not run.
+        #
+        # This override is load-bearing even though V2 also requires Triton (absent on
+        # Spyre): VllmConfig.use_v2_model_runner returns an explicitly set
+        # VLLM_USE_V2_MODEL_RUNNER *before* it reaches the HAS_TRITON fallback, so a user
+        # exporting =1 would otherwise select V2 with no Triton behind it.
+        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") not in (None, "", "0"):
+            logger.warning(
+                "Spyre only supports the V1 model runner; overriding "
+                "VLLM_USE_V2_MODEL_RUNNER=%s to 0.",
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"],
+            )
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
+        # Two features outrank that env var inside use_v2_model_runner, so rejecting them
+        # here is what actually keeps the pin true. Left alone, hisparse raises
+        # "HiSparse requires Model Runner V2; remove VLLM_USE_V2_MODEL_RUNNER=0" --
+        # blaming an env var the user never set, since we just set it -- and watermarking
+        # silently returns V2 anyway, landing on the missing Triton much later.
+        if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
+            raise ValueError(
+                "Spyre does not support HiSparse: it requires the V2 model runner, and "
+                "TorchSpyreWorker only builds the V1 runner."
+            )
+        if getattr(vllm_config, "watermark_config", None) is not None:
+            raise ValueError(
+                "Spyre does not support watermarking: it requires the V2 model runner, "
+                "and TorchSpyreWorker only builds the V1 runner."
+            )
+
+        # The pin holds only if the resolved property agrees; anything new that outranks
+        # the env var must fail here rather than at the first V2-only code path. A raise,
+        # not an assert: -O would strip the tripwire and restore the deferred failure.
+        if vllm_config.use_v2_model_runner is not False:
+            raise RuntimeError(
+                "VLLM_USE_V2_MODEL_RUNNER=0 did not take effect: use_v2_model_runner is "
+                "True. A config field now forces the V2 model runner, which Spyre cannot "
+                "use; reject it in TorchSpyrePlatform.check_and_update_config."
+            )
+
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"

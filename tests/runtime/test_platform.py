@@ -426,6 +426,45 @@ def test_only_tensor_parallelism_is_accepted(field):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize("requested", ["1", "true", "0", None])
+def test_v1_model_runner_is_pinned(monkeypatch, requested):
+    """TorchSpyreWorker only builds the V1 runner, so the resolved config must agree
+    whatever the user asked for. An explicit VLLM_USE_V2_MODEL_RUNNER=1 short-circuits
+    upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    if requested is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert vllm_config.use_v2_model_runner is False
+
+
+@pytest.mark.parametrize("feature", ["hisparse", "watermark"])
+def test_v2_only_features_are_rejected(monkeypatch, feature):
+    """Both outrank VLLM_USE_V2_MODEL_RUNNER inside use_v2_model_runner: hisparse raises
+    an error blaming the env var *we* set, and watermarking silently returns V2. Reject
+    them here, where the message can name Spyre."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    if feature == "hisparse":
+        monkeypatch.setattr(
+            vllm_config.attention_config, "hisparse_config", object(), raising=False
+        )
+    else:
+        monkeypatch.setattr(vllm_config, "watermark_config", object(), raising=False)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_rejected_under_tensor_parallelism():
     """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
     compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather

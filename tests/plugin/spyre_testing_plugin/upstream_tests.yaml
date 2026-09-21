@@ -105,6 +105,8 @@ tests:
                 - ibm-granite/granite-4.1-3b
               dtype: [torch.float16]
               max_tokens: [2] # one prefill and one decode
+          fixture_names:
+            - "register_granite_models"
 
     # gemma-3-1b-it is hybrid; test_dummy_loader exercises engine startup + KV
     # cache init (the hybrid block-override path) with dummy weights, isolating

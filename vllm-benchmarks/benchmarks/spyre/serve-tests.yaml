@@ -121,7 +121,7 @@
     dtype: float16
     load-format: auto
     max-num-seqs: 4
-    max-model-len: 128
+    max-model-len: 256
     port: 8000
     host: 127.0.0.1
   parameters:
@@ -129,12 +129,12 @@
     backend: openai-embeddings
     endpoint: /v1/embeddings
     dataset-name: random
-    random-input-len: 64
+    random-input-len: 256
     random-range-ratio: 0.5
     random-batch-size: 1
-    num-prompts: 16
+    num-prompts: 200
     num-warmups: 8
-    max-concurrency: 4
+    max-concurrency: 64
     request-rate: inf
 - test_name: serve_bge-reranker-v2-m3_tp1_in64
   server_health_timeout: 1800

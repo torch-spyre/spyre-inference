@@ -1332,7 +1332,6 @@ def test_mirror_mask_stacks_one_transfer_per_sequence(default_vllm_config, monke
     assert torch.equal(stacks_device[0], stacks_cpu[0])
 
 
-
 # ---------------------------------------------------------------------------
 # KV write-back (reshape_and_cache scatter)
 # ---------------------------------------------------------------------------
@@ -1848,7 +1847,7 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
         f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; expected one row per sequence/block entry"
     )
     # Both token- and head-major kernels broadcast this over KV heads.
-    md.mask_by_chunk_cpu[0].reshape(num_seqs, md.blocks_per_chunk, 1, 1, block_size)
+    md.mask_by_chunk_cpu[0].reshape(md.padded_num_seqs, md.blocks_per_chunk, 1, 1, block_size)
 
 
 def _decode_reference_fp32(

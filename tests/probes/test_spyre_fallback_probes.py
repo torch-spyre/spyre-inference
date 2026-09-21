@@ -777,6 +777,43 @@ def test_spyre_in_graph_slice_of_stacked_fp16_input(spyre_device, query_len):
     torch.testing.assert_close(fn(stack).cpu(), expected, atol=0, rtol=0)
 
 
+# ---------------------------------------------------------------------------
+# 8e. The transfer collapses a host view's offset, which is what 8d relies on
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_transfer_lands_a_host_view_at_offset_zero(spyre_device):
+    """A nonzero-offset host view arrives on device contiguous at offset 0.
+
+    The mask mirror hands over exactly this: the width-1 builder path assigns a row of
+    a per-group tensor, so the host stack starts mid-storage. If the transfer preserved
+    that offset, every consumer that narrows dim 0 in-graph (8d, and a tiled page walk)
+    would instead be slicing a graph input at a varying offset -- one compiled variant
+    per sequence at best (8c), wrong rows for int32 at worst (8).
+    """
+    rows, blocks, block_size = 4, 8, 128
+    # Bounded like `_stacked_index_pages`: the compare is exact, so a value and its double
+    # both have to be representable in fp16. Still unique per (row, block) and varying
+    # inside a tile, so a misread row, block or element each show up.
+    base = (
+        torch.arange(rows).reshape(rows, 1, 1, 1) * 32
+        + torch.arange(blocks).reshape(1, blocks, 1, 1) * 4
+        + torch.arange(block_size).reshape(1, 1, 1, block_size) % 4
+    ).to(torch.float16)
+
+    @torch.compile(dynamic=False)
+    def fn(s, i):
+        return s[i] * 2.0
+
+    for row in range(1, rows):
+        view = base[row][: blocks - 3]
+        assert view.is_contiguous() and view.storage_offset() > 0
+        stack = view.to(spyre_device)
+        assert stack.is_contiguous() and stack.storage_offset() == 0
+        for i in (0, blocks - 4):
+            torch.testing.assert_close(fn(stack, i).cpu(), view[i] * 2.0, atol=0, rtol=0)
+
+
 def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
     pages_cpu = (torch.arange(blocks * entries * block_size * head_size) % 97).reshape(
         blocks * entries, block_size, head_size

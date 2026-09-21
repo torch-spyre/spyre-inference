@@ -125,6 +125,12 @@ class SpyrePagedKVCache(NamedTuple):
 def _mirror_mask_stacks(stacks_cpu: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
     """Mirror each sequence's mask stack onto the device, one transfer per sequence.
 
+    `convert` copies, so the device stack is contiguous at storage offset 0 whatever the
+    builder handed over -- the width-1 group path assigns a row view, whose offset is
+    nonzero. That is what lets a kernel narrow dim 0 in-graph at all. Elements are never
+    None, so no consumer needs a narrowing assert: an empty stack stays a correctly
+    shaped host tensor, and the dispatch skips such a sequence before reading it.
+
     The `numel()` guard leaves empty stacks on the host: a sliding window can leave a
     sequence with no active block at all, and `_online_softmax_attention` writes zeros
     for such a sequence before it reads any stack, so the transfer would be pure waste.
@@ -250,7 +256,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # i-th ACTIVE block -- a position within active_block_indices[seq_idx], not an
     # absolute block index, though the two coincide when sliding_window is None.
     # The stack is the unit of transfer (one H2D per sequence); the tile is what a
-    # kernel adds to one block's scores, sliced back out in-graph as `mask_stack[i]`.
+    # kernel adds to one block's scores, narrowed back out in-graph -- `mask_stack[i]`
+    # under a Python page loop, a dim-0 window under a tiled one. So the block axis
+    # stays dim 0, and the split is per sequence rather than one batch-wide tensor:
+    # aligned_query_lens differs across sequences.
     attention_mask_stacks: list[torch.Tensor] | None = None
 
     # For each sequence: absolute block indices whose mask is not fully
@@ -878,7 +887,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # would silently gather chunk 0's pages. Probed by
                 # test_spyre_compile_input_honors_storage_offset; when that
                 # strict xfail flips, one stacked tensor also collapses the
-                # per-chunk H2D transfers into one.
+                # per-chunk H2D transfers into one. A walk that narrows the block
+                # axis in-graph needs no list either: it reads block_ids_padded
+                # whole, at offset 0.
                 chunk_page_ids_cpu = [
                     block_ids_padded[c * blocks_per_chunk : (c + 1) * blocks_per_chunk]
                     .t()
@@ -903,8 +914,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # block 0, so its padded blocks can stay -inf and contribute zero.
                 # Holds under a window too: first_active <= num_blocks - 1.
                 mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
-                # 4-D, not 5-D: the kernel slices dim 0 per chunk, and a dim-0
-                # slice of a 5-D base fails torch-spyre layout propagation.
+                # 4-D, not 5-D: this walk slices dim 0 per chunk, and a dim-0 slice
+                # of a 5-D base fails torch-spyre layout propagation. The KV axis is
+                # left to the kernel's broadcast; a walk that narrows dim 0 in-graph
+                # instead has to materialize the expand, since a broadcast window's
+                # layout does not propagate through a tiled body.
                 mask_by_chunk_cpu = (
                     mask_bs_bb.reshape(b_seqs, num_chunks, blocks_per_chunk, block_size)
                     .permute(1, 0, 2, 3)

@@ -20,7 +20,10 @@ import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
+from vllm.model_executor.layers.pooler.seqwise.heads import (
+    ClassifierPoolerHead,
+    EmbeddingPoolerHead,
+)
 from vllm.model_executor.layers.pooler.seqwise.methods import (
     CLSPool,
     LastPool,
@@ -29,6 +32,7 @@ from vllm.model_executor.layers.pooler.seqwise.methods import (
 )
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
+from vllm.model_executor.layers.pooler.tokwise.heads import TokenClassifierPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
@@ -43,6 +47,26 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 logger = init_logger(__name__)
 
 
+def _cpu_cast_if_needed(pooled_data, head_dtype):
+    """Host cast when a Spyre tensor's dtype differs. Same-dtype is a no-op.
+
+    On-device fp16↔fp32 is staggered garbage (torch-spyre#2971). Upstream
+    ``.to(head_dtype)`` then sees a CPU tensor and does not cast again.
+    """
+    if head_dtype is None:
+        return pooled_data
+    sample = pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
+    if (
+        isinstance(sample, torch.Tensor)
+        and sample.device.type == "spyre"
+        and sample.dtype != head_dtype
+    ):
+        if isinstance(pooled_data, list):
+            pooled_data = torch.stack(pooled_data)
+        pooled_data = convert(pooled_data, "cpu").to(head_dtype)
+    return pooled_data
+
+
 class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
     """D2H before ``.to(head_dtype)`` when dtype changes; rest is upstream.
 
@@ -51,20 +75,28 @@ class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
     """
 
     def forward(self, pooled_data, pooling_metadata):
-        if self.head_dtype is not None:
-            sample = (
-                pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
-            )
-            if (
-                isinstance(sample, torch.Tensor)
-                and sample.device.type == "spyre"
-                and sample.dtype != self.head_dtype
-            ):
-                if isinstance(pooled_data, list):
-                    pooled_data = torch.stack(pooled_data)
-                # Upstream ``.to(head_dtype)`` is then a no-op on CPU.
-                pooled_data = convert(pooled_data, "cpu").to(self.head_dtype)
-        return super().forward(pooled_data, pooling_metadata)
+        return super().forward(_cpu_cast_if_needed(pooled_data, self.head_dtype), pooling_metadata)
+
+
+class SpyreClassifierPoolerHead(ClassifierPoolerHead):
+    """D2H before ``.to(head_dtype)`` when the CLS row dtype differs.
+
+    ``configure`` sets this head's ``head_dtype`` to fp16, so a fp16 CLS row
+    is not upcast. A real dtype change still goes through the host: an
+    on-device fp32 upcast is what compiled the classifier GEMM as fp32.
+    """
+
+    def forward(self, pooled_data, pooling_metadata):
+        return super().forward(_cpu_cast_if_needed(pooled_data, self.head_dtype), pooling_metadata)
+
+
+class SpyreTokenClassifierPoolerHead(TokenClassifierPoolerHead):
+    """Same host cast as ``SpyreClassifierPoolerHead``, for token classify."""
+
+    def forward_chunk(self, pooled_data, pooling_param):
+        if isinstance(pooled_data, torch.Tensor):
+            pooled_data = _cpu_cast_if_needed(pooled_data, self.head_dtype)
+        return super().forward_chunk(pooled_data, pooling_param)
 
 
 def _pooler_output_on_cpu(raw_pooler_output: PoolerOutput) -> PoolerOutput:
@@ -317,17 +349,35 @@ class SpyreTokenPooler(TokenPooler):
         return trimmed
 
 
+def _iter_modules(module: nn.Module):
+    """``children()`` plus ``DispatchPooler.poolers_by_task``.
+
+    That map is a plain dict, so ``modules()`` never yields the classify head.
+    Its ``head_dtype`` stays the pooling default ``float32``, and
+    ``pooled_data.to(float32)`` then runs on Spyre before the classifier GEMM.
+    """
+    seen: set[int] = set()
+    stack = [module]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, nn.Module) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        stack.extend(current.children())
+        task_poolers = getattr(current, "poolers_by_task", None)
+        if task_poolers is not None:
+            stack.extend(task_poolers.values())
+
+
 def _has_classifier(model: nn.Module, pooler: nn.Module) -> bool:
     if getattr(model, "classifier", None) is not None:
         return True
-    return any(getattr(m, "classifier", None) is not None for m in pooler.modules())
+    return any(getattr(m, "classifier", None) is not None for m in _iter_modules(pooler))
 
 
 def _downcast_module_to_fp16(module: nn.Module, spyre_device: torch.device) -> None:
     """On-device fp32→fp16 is staggered garbage (torch-spyre#2971); go via host."""
-    for child in module.modules():
-        if getattr(child, "head_dtype", None) is not None:
-            child.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
     for param in module.parameters(recurse=True):
         if param.dtype != torch.float32:
             continue
@@ -338,14 +388,26 @@ def _downcast_module_to_fp16(module: nn.Module, spyre_device: torch.device) -> N
             param.data = param.data.to(device=spyre_device, dtype=torch.float16)
 
 
+def _set_classifier_head_dtype(pooler: nn.Module) -> None:
+    """Point classifier heads at fp16. Leave embed heads at their fp32 default."""
+    for child in _iter_modules(pooler):
+        if not isinstance(child, ClassifierPoolerHead | TokenClassifierPoolerHead):
+            continue
+        if child.head_dtype is not None:
+            child.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
+
+
 def prepare_fp32_head_for_spyre(
     model: nn.Module, pooler: nn.Module, spyre_device: torch.device
 ) -> None:
-    """Downcast classifier weights to fp16; Spyre has no fp32 matmul (torch-spyre#1794)."""
-    _downcast_module_to_fp16(pooler, spyre_device)
-    classifier = getattr(model, "classifier", None)
-    if classifier is not None:
-        _downcast_module_to_fp16(classifier, spyre_device)
+    """Downcast classifier weights to fp16; Spyre has no fp32 matmul (torch-spyre#1794).
+
+    Only classifier modules are downcast. An embed projector that shares the
+    ``DispatchPooler`` stays fp32 and keeps the CPU cast in its own head.
+    """
+    _set_classifier_head_dtype(pooler)
+    for root in _classifier_roots(model, pooler):
+        _downcast_module_to_fp16(root, spyre_device)
     if getattr(model, "head_dtype", None) is not None:
         model.head_dtype = torch.float16
 
@@ -353,10 +415,10 @@ def prepare_fp32_head_for_spyre(
 class SpyreClassifierLinear(nn.Linear):
     """Classifier Linear: decoder-style ``x @ Wᵀ`` on Spyre, bias add on CPU.
 
-    Downcast is enough for dtype. Isolated ``F.linear`` still fails: its
-    ``weight.T @ mm`` of a CLS ``[1, H]`` lowers as fp32 ``batchmatmul``, and a
+    Isolated ``F.linear`` of a CLS row lowers as fp32 ``batchmatmul``, and a
     bias add in that graph mixed-EA's. Store ``Wᵀ`` like the decoder, pad short
-    rows, add bias on the host.
+    rows, add bias on the host. Activations must already be fp16; a leftover
+    fp32 row is cast on the host so the matmul itself stays fp16.
     """
 
     @classmethod
@@ -377,13 +439,13 @@ class SpyreClassifierLinear(nn.Linear):
         return linear
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.device != self.weight.device:
-            x = (
-                convert(x, self.weight.device)
-                if self.weight.device.type == "spyre"
-                else x.to(device=self.weight.device)
-            )
-        return self._add_bias(spyre_classifier_gemm(x, self.weight))
+        weight = self.weight
+        if x.device != weight.device or x.dtype != weight.dtype:
+            if weight.device.type == "spyre":
+                x = convert(x, weight.device, weight.dtype)
+            else:
+                x = x.to(device=weight.device, dtype=weight.dtype)
+        return self._add_bias(spyre_classifier_gemm(x, weight))
 
     @torch.compiler.disable
     def _add_bias(self, out: torch.Tensor) -> torch.Tensor:
@@ -412,7 +474,7 @@ def _classifier_roots(model: nn.Module, pooler: nn.Module) -> list[nn.Module]:
         roots.append(module)
 
     add(getattr(model, "classifier", None))
-    for parent in (*model.modules(), *pooler.modules()):
+    for parent in (*_iter_modules(model), *_iter_modules(pooler)):
         add(getattr(parent, "classifier", None))
     return roots
 
@@ -478,6 +540,44 @@ def patch_normalize_for_spyre(pooler: nn.Module) -> int:
         for name, child in list(module.named_children()):
             if isinstance(child, PoolerNormalize) and not isinstance(child, SpyreNormalize):
                 setattr(module, name, SpyreNormalize())
+                num_patched += 1
+    return num_patched
+
+
+def patch_classifier_heads_for_spyre(pooler: nn.Module) -> int:
+    """Swap classifier heads so a dtype change is a host cast.
+
+    ``head_dtype`` is already fp16 when this runs. The swap still matters when
+    the CLS row dtype differs: upstream ``.to`` would otherwise run on Spyre.
+    """
+    num_patched = 0
+    for module in list(_iter_modules(pooler)):
+        for name, child in list(module.named_children()):
+            if type(child) is ClassifierPoolerHead:
+                setattr(
+                    module,
+                    name,
+                    SpyreClassifierPoolerHead(
+                        classifier=child.classifier,
+                        logit_mean=child.logit_mean,
+                        logit_sigma=child.logit_sigma,
+                        head_dtype=child.head_dtype,
+                        activation=child.activation,
+                    ),
+                )
+                num_patched += 1
+            elif type(child) is TokenClassifierPoolerHead:
+                setattr(
+                    module,
+                    name,
+                    SpyreTokenClassifierPoolerHead(
+                        classifier=child.classifier,
+                        logit_mean=child.logit_mean,
+                        logit_sigma=child.logit_sigma,
+                        head_dtype=child.head_dtype,
+                        activation=child.activation,
+                    ),
+                )
                 num_patched += 1
     return num_patched
 
@@ -605,6 +705,7 @@ def configure_pooling_for_spyre(
     if token_level or _has_classifier(model, pooler):
         prepare_fp32_head_for_spyre(model, pooler, spyre_device)
         n_classifier_gemms = patch_classifier_linears_for_spyre(model, pooler)
+        patch_classifier_heads_for_spyre(pooler)
         if n_classifier_gemms:
             logger.info(
                 "Pooling: downcast %d classifier Linear(s) to fp16 (GEMM on Spyre, bias on CPU)",

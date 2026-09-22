@@ -44,6 +44,7 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
     SpyreClassifierLinear,
+    SpyreClassifierPoolerHead,
     SpyreCLSPool,
     SpyreCpuClassifier,
     SpyreDispatchPooler,
@@ -136,7 +137,58 @@ def test_configure_pooling_fp32_classifier_downcasts_to_fp16():
     assert model.classifier.bias is not None
     assert tuple(model.classifier.bias.shape) == (2,)
     assert model.classifier.weight.shape == (8, 2)
+    assert isinstance(model.pooler.head, SpyreClassifierPoolerHead)
     assert model.pooler.head.head_dtype == torch.float16
+
+
+def test_configure_pooling_dispatch_classify_sets_head_dtype():
+    """``poolers_by_task`` is a plain dict; ``modules()`` never sees ``head_dtype``."""
+    classifier = nn.Linear(8, 2)
+    pooler = DispatchPooler(
+        {
+            "classify": SequencePooler(
+                pooling=CLSPool(),
+                head=ClassifierPoolerHead(classifier=classifier, head_dtype=torch.float32),
+            )
+        }
+    )
+    model = _model_with_pooler(pooler)
+    model.classifier = classifier
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    classify = model.pooler.poolers_by_task["classify"]
+    assert isinstance(classify.head, SpyreClassifierPoolerHead)
+    assert classify.head.head_dtype == torch.float16
+    assert isinstance(classify.head.classifier, SpyreClassifierLinear)
+    assert classify.head.classifier.weight.dtype == torch.float16
+
+
+def test_configure_pooling_dispatch_classify_leaves_embed_head_fp32():
+    """Classifier fp16 must not downcast an embed projector in the same dispatcher."""
+    classifier = nn.Linear(8, 2)
+    projector = nn.Linear(8, 8)
+    pooler = DispatchPooler(
+        {
+            "classify": SequencePooler(
+                pooling=CLSPool(),
+                head=ClassifierPoolerHead(classifier=classifier, head_dtype=torch.float32),
+            ),
+            "embed": SequencePooler(
+                pooling=CLSPool(),
+                head=EmbeddingPoolerHead(
+                    projector=projector,
+                    head_dtype=torch.float32,
+                    activation=PoolerNormalize(),
+                ),
+            ),
+        }
+    )
+    model = _model_with_pooler(pooler)
+    model.classifier = classifier
+    assert configure_pooling_for_spyre(model, _SPYRE) is True
+    embed = model.pooler.poolers_by_task["embed"]
+    assert isinstance(embed.head, SpyreEmbeddingPoolerHead)
+    assert embed.head.head_dtype == torch.float32
+    assert projector.weight.dtype == torch.float32
 
 
 def test_configure_pooling_roberta_head_dense_and_out_proj_downcast():
@@ -161,6 +213,7 @@ def test_configure_pooling_roberta_head_dense_and_out_proj_downcast():
     assert head.out_proj.weight.dtype == torch.float16
     assert head.dense.bias is not None
     assert tuple(head.dense.bias.shape) == (8,)
+    assert isinstance(model.pooler.head, SpyreClassifierPoolerHead)
     assert model.pooler.head.head_dtype == torch.float16
 
 

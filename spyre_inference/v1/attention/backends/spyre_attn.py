@@ -129,12 +129,15 @@ def _mirror_mask_tiles(
 ) -> list[list[torch.Tensor]]:
     """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
+    `_get_zero_tile` hands every sequence in the batch the same CPU tensor for a
+    given (query width, position), so keying on `id()` collapses a batch's
+    interior blocks to one H2D transfer per position instead of one per block
+    per sequence. Positions do not share a tile with each other -- that is what
+    keeps the kernel's mask-tile aliasing constant (see `_get_zero_tile`) -- so
+    the transfer count grows with the active block count, not with batch size.
+    `tiles_cpu` keeps strong references for the whole call, so no id can be
+    recycled mid-flight, and sharing one device buffer across sequences is safe
+    because mask tiles are read-only by contract.
     """
     mirrored: dict[int, torch.Tensor] = {}
     tiles_device: list[list[torch.Tensor]] = []

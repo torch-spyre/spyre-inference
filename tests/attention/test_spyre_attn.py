@@ -1289,39 +1289,33 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"
 
 
-def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, monkeypatch):
-    """Interior blocks sharing the zero tile must cost a single H2D transfer.
+def test_mirror_mask_tiles_one_transfer_per_distinct_tile(monkeypatch):
+    """Blocks handed the same CPU tile must cost a single H2D transfer.
 
     Guards against a regression back to one transfer per block, which is
     invisible in outputs: the mirrored tiles compare equal either way, so only
     the transfer count and the device-side object identity distinguish them.
+
+    The tile layout is constructed here rather than taken from the metadata
+    builder. ``_get_zero_tile`` keys interior tiles by (query width, position),
+    so within one sequence no two positions share a tile; the sharing this
+    memoization exists for is across the sequences of a batch at the same
+    position, which is what the two rows below represent.
     """
     torch.set_default_device("cpu")
 
-    block_size = 64
-    sliding_window = 256
-    kv_len = 512  # 8 blocks; blocks 5 and 6 are window interior
-
-    metadata = _build_metadata(
-        num_query_heads=32,
-        num_kv_heads=8,
-        head_size=128,
-        block_size=block_size,
-        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        block_table=torch.arange(kv_len // block_size, dtype=torch.int32).unsqueeze(0),
-        slot_mapping=torch.tensor([kv_len - 1], dtype=torch.int64),
-        sliding_window=sliding_window,
-    )
-
-    tiles_cpu = metadata.attention_mask_tiles
-    assert tiles_cpu is not None
-    seq_tiles = tiles_cpu[0]
-    num_distinct = len({id(t) for t in seq_tiles})
-    assert num_distinct < len(seq_tiles), (
-        "builder no longer shares one CPU tile across interior blocks, so this "
-        "test cannot observe the memoization"
-    )
+    aligned_query_len, block_size = 1, 64
+    # Position 1 is an interior block: both sequences are handed the same tile
+    # object, exactly as _get_zero_tile does for a shared (width, position).
+    shared_interior = torch.zeros((aligned_query_len, block_size), dtype=torch.float16)
+    real_a = torch.full((aligned_query_len, block_size), -1.0, dtype=torch.float16)
+    real_b = torch.full((aligned_query_len, block_size), -2.0, dtype=torch.float16)
+    tiles_cpu = [
+        [real_a, shared_interior, real_b],
+        [real_b, shared_interior, real_a],
+    ]
+    num_distinct = len({id(t) for row in tiles_cpu for t in row})
+    assert num_distinct == 3, "fixture should hold exactly three distinct tile objects"
 
     # `convert` short-circuits same-device/same-dtype, so a real CPU->CPU call
     # would hand back the input and make identity checks vacuous. Count the
@@ -1335,17 +1329,21 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
     monkeypatch.setattr(spyre_attn, "convert", counting_convert)
     tiles_device = _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
 
+    total_blocks = sum(len(row) for row in tiles_cpu)
     assert len(calls) == num_distinct, (
-        f"expected {num_distinct} transfers for {len(seq_tiles)} blocks, got {len(calls)}"
+        f"expected {num_distinct} transfers for {total_blocks} blocks, got {len(calls)}"
     )
 
-    # Blocks that shared a CPU tile must share the mirrored device tensor.
-    for i, tile_i in enumerate(seq_tiles):
-        for j, tile_j in enumerate(seq_tiles):
+    # Blocks that shared a CPU tile must share the mirrored device tensor, and
+    # blocks that did not must not -- across sequences as well as within one.
+    flat_cpu = [t for row in tiles_cpu for t in row]
+    flat_device = [t for row in tiles_device for t in row]
+    for i, tile_i in enumerate(flat_cpu):
+        for j, tile_j in enumerate(flat_cpu):
             if tile_i is tile_j:
-                assert tiles_device[0][i] is tiles_device[0][j]
+                assert flat_device[i] is flat_device[j]
             else:
-                assert tiles_device[0][i] is not tiles_device[0][j]
+                assert flat_device[i] is not flat_device[j]
 
 
 # ---------------------------------------------------------------------------

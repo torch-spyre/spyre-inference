@@ -62,6 +62,15 @@ jobs:
       CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
       CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
       CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+      # The schema-v2 database. Every v2 statement is QUALIFIED with it rather than opening a
+      # second connection, because test_cases exists in both generations with incompatible
+      # shapes and an unqualified name would hit the wrong one. Empty/unset makes the v2
+      # write a no-op, so this stays safe before the v2 migration lands.
+      CLICKHOUSE_DB_V2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+      # Dual-write during the migration window: v1 stays authoritative, v2 accumulates the
+      # same runs so the new schema can be validated against real traffic. No data is ported
+      # (v1 rows cannot produce a v2 run_id), so `both` is how v2 gets any history at all.
+      INGEST_SCHEMA: both
 
       # Metadata about the triggering run
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
@@ -100,7 +109,8 @@ jobs:
       - name: Install Python dependencies
         run: |
           source .venv/bin/activate
-          uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+          uv pip install requests clickhouse-driver clickhouse-connect lxml regex \
+            "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
 
       - name: Install gh CLI
         env:
@@ -244,6 +254,12 @@ jobs:
       # si_test_runs / si_test_cases / si_run_properties.
       # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
+        env:
+          # The arch the SUITE ran on, not this job's: arch is a v2 run_id hash input and this
+          # job is pinned to x86_64, so `uname -m` would stamp x86_64 on every leg it ingests.
+          # All test legs are x86_64 today; this must become a per-leg value (carried like the
+          # run-id artifact) before a non-x86 leg is added.
+          LEG_ARCH: x86_64
         run: |
           source .venv/bin/activate
           python3 .github/scripts/ingest_xml_si.py \
@@ -256,7 +272,8 @@ jobs:
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
             --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
-            --platform "$(uname -m)"
+            --platform "${LEG_ARCH}" \
+            --schema "${INGEST_SCHEMA}"
 
       - name: Summary
         if: always()

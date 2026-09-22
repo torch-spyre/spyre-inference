@@ -730,8 +730,7 @@ def configure_pooling_for_spyre(
     if classifier is not None:
         staying.append("classifier")
     logger.info(
-        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, "
-        "%d classifier GEMMs)",
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, %d classifier GEMMs)",
         ", ".join(staying),
         spyre_device,
         num_patched,

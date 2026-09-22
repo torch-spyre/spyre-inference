@@ -123,20 +123,27 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
-def _mirror_mask_stacks(stacks_cpu: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
-    """Mirror each sequence's mask stack onto the device, one transfer per sequence.
+def _mirror_mask_stack(
+    attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
+) -> torch.Tensor:
+    """Return one sequence's device mask stack, mirroring it at most once per step."""
+    stacks_cpu = attn_metadata.attention_mask_stacks
+    assert stacks_cpu is not None, "attention_mask_stacks must come from the metadata builder"
+    stack_cpu = stacks_cpu[seq_idx]
+    assert stack_cpu.numel(), "an empty mask stack must be skipped before mirroring"
 
-    `convert` copies, so the device stack is contiguous at storage offset 0 whatever the
-    builder handed over -- the width-1 group path assigns a row view, whose offset is
-    nonzero. That is what lets a kernel narrow dim 0 in-graph at all. Elements are never
-    None, so no consumer needs a narrowing assert: an empty stack stays a correctly
-    shaped host tensor, and the dispatch skips such a sequence before reading it.
+    stacks_device = attn_metadata.attention_mask_stacks_device
+    if stacks_device is None:
+        stacks_device = [None] * attn_metadata.num_seqs
+        attn_metadata.attention_mask_stacks_device = stacks_device
 
-    The `numel()` guard leaves empty stacks on the host: a sliding window can leave a
-    sequence with no active block at all, and `_online_softmax_attention` writes zeros
-    for such a sequence before it reads any stack, so the transfer would be pure waste.
-    """
-    return [convert(stack, device=device) if stack.numel() else stack for stack in stacks_cpu]
+    stack_device = stacks_device[seq_idx]
+    if stack_device is None:
+        # `convert` copies, so even a nonzero-offset host view arrives contiguous at
+        # offset 0, ready for an in-graph dim-0 slice.
+        stack_device = convert(stack_cpu, device=device)
+        stacks_device[seq_idx] = stack_device
+    return stack_device
 
 
 def _build_query_row_tables(
@@ -302,8 +309,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # query_len repeat the sequence's last real row; the mask discards them.
     query_row_tables: list[torch.Tensor] | None = None
 
-    # Device mirror of attention_mask_stacks, filled once per step by forward().
-    attention_mask_stacks_device: list[torch.Tensor] | None = None
+    # Device mirror of attention_mask_stacks, filled lazily per sequence by the first
+    # layer whose per-sequence kernel reads it. None entries have not been mirrored yet.
+    attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -1785,16 +1793,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             batched_done = True
 
         # Past the early return, so a step the batched kernel fully served pays nothing.
-        # Still once per step: the first layer to get here fills the cache for the rest.
-        mask_stacks_all = attn_metadata.attention_mask_stacks_device
-        if mask_stacks_all is None:
-            stacks_cpu = attn_metadata.attention_mask_stacks
-            assert stacks_cpu is not None, (
-                "attention_mask_stacks must be precomputed by the metadata builder"
-            )
-            mask_stacks_all = _mirror_mask_stacks(stacks_cpu, _target_device)
-            attn_metadata.attention_mask_stacks_device = mask_stacks_all
-
+        # Entries are filled at their read site below: in a mixed batch, the decode
+        # prefix was already served by the batched kernel and needs no mask transfer.
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.
         q_staging, out_staging = self._staging_buffers(_target_device)
@@ -1847,10 +1847,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
             # cache key misses. Narrowing belongs before the convert, not here.
             index_table = index_tables[seq_idx]
+            mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
             # Indexed by position within active_bs; a prefix keeps storage_offset 0.
-            mask_stack = mask_stacks_all[seq_idx][: len(active_bs)]
+            mask_stack = mask_stack[: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
             assert mask_stack.shape[0] == len(active_bs)
+            assert index_table.shape[0] == len(active_bs)
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #

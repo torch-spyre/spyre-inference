@@ -37,7 +37,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
-    _mirror_mask_stacks,
+    _mirror_mask_stack,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -1289,47 +1289,65 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
     assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"
 
 
-def test_mirror_mask_stacks_one_transfer_per_sequence(default_vllm_config, monkeypatch):
-    """One H2D transfer per sequence, not per block.
-
-    Invisible in outputs -- the mirrored mask compares equal either way -- so only the
-    transfer count distinguishes them.
-    """
+def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monkeypatch):
+    """Full decode, mixed, and later fallback paths transfer only masks they read."""
     torch.set_default_device("cpu")
 
     block_size = 64
-    sliding_window = 256
-    kv_len = 512  # 8 blocks; blocks 5 and 6 are window interior
-
-    metadata = _build_metadata(
-        num_query_heads=32,
-        num_kv_heads=8,
-        head_size=128,
+    metadata = _padded_mask_metadata(
+        [(1, 512), (1, 320), (7, 320), (33, 512)],
         block_size=block_size,
-        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-        block_table=torch.arange(kv_len // block_size, dtype=torch.int32).unsqueeze(0),
-        slot_mapping=torch.tensor([kv_len - 1], dtype=torch.int64),
-        sliding_window=sliding_window,
+        max_num_blocks=_num_blocks_buckets(block_size)[-1],
     )
 
     stacks_cpu = metadata.attention_mask_stacks
     assert stacks_cpu is not None
-    assert stacks_cpu[0].shape[0] > 1, "need more than one active block to be meaningful"
+    assert stacks_cpu[0].shape[0] > 1
+    assert stacks_cpu[1].storage_offset() > 0
+    assert len({stack.shape[1] for stack in stacks_cpu}) > 1
 
     calls: list[torch.Tensor] = []
 
     def counting_convert(tensor, device=None, dtype=None):
         calls.append(tensor)
-        return tensor.clone()
+        return tensor.clone(memory_format=torch.contiguous_format)
 
     monkeypatch.setattr(spyre_attn, "convert", counting_convert)
-    stacks_device = _mirror_mask_stacks(stacks_cpu, torch.device("cpu"))
 
-    assert len(calls) == len(stacks_cpu), (
-        f"expected one transfer per sequence, got {len(calls)} for {len(stacks_cpu)}"
-    )
-    assert torch.equal(stacks_device[0], stacks_cpu[0])
+    # Equivalent to a fully batched decode returning before any per-sequence read.
+    assert calls == []
+    assert metadata.attention_mask_stacks_device is None
+
+    # Equivalent to a mixed batch reading only its per-sequence suffix. A later
+    # layer taking the same path reuses both mirrors.
+    suffix = {
+        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
+    }
+    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    for seq_idx in (2, 3):
+        assert _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) is suffix[seq_idx]
+    assert calls == [stacks_cpu[2], stacks_cpu[3]]
+
+    # A later layer that cannot use batched decode fills only the missing prefix.
+    prefix = {
+        seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (0, 1)
+    }
+    assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
+    assert metadata.attention_mask_stacks_device is not None
+    expected = prefix | suffix
+    for seq_idx, stack_device in expected.items():
+        assert metadata.attention_mask_stacks_device[seq_idx] is stack_device
+        assert torch.equal(stack_device, stacks_cpu[seq_idx])
+        assert stack_device.is_contiguous()
+        assert stack_device.storage_offset() == 0
+
+
+def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):
+    torch.set_default_device("cpu")
+    metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=4)
+
+    with pytest.raises(AssertionError, match="empty mask stack"):
+        _mirror_mask_stack(metadata, 0, torch.device("cpu"))
 
 
 # ---------------------------------------------------------------------------
@@ -2348,6 +2366,51 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     num_blocks = (kv_len + block_size - 1) // block_size
     assert metadata.active_block_indices is not None
     assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
+
+
+def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm_config):
+    """Mask row i and page-table row i describe the same active logical block."""
+    torch.set_default_device("cpu")
+    block_size, window = 64, 128
+    query_len, kv_len = 1, 512
+    num_blocks = kv_len // block_size
+    # Physical pages deliberately run opposite to logical blocks, so accidentally
+    # treating either row number as a page id cannot pass.
+    block_table = torch.arange(100, 100 + num_blocks, dtype=torch.int32).flip(0).unsqueeze(0)
+    metadata = _build_metadata(
+        num_query_heads=8,
+        num_kv_heads=2,
+        head_size=64,
+        block_size=block_size,
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+        block_table=block_table,
+        slot_mapping=torch.tensor(
+            [int(block_table[0, -1]) * block_size + block_size - 1], dtype=torch.int64
+        ),
+        sliding_window=window,
+    )
+
+    active = metadata.active_block_indices
+    stacks = metadata.attention_mask_stacks
+    tables = metadata.page_index_tables_cpu
+    assert active is not None and stacks is not None and tables is not None
+    assert active[0][0] > 0
+    assert stacks[0].shape[0] == tables[0].shape[0] == len(active[0])
+
+    mask_min = torch.finfo(stacks[0].dtype).min
+    for row, logical_block in enumerate(active[0]):
+        assert tables[0][row, 0] == block_table[0, logical_block]
+        open_offsets = (stacks[0][row, 0] > mask_min).nonzero().flatten().tolist()
+        open_positions = [logical_block * block_size + offset for offset in open_offsets]
+        assert all(kv_len - window <= pos < kv_len for pos in open_positions)
+
+    open_positions = [
+        logical_block * block_size + offset
+        for row, logical_block in enumerate(active[0])
+        for offset in (stacks[0][row, 0] > mask_min).nonzero().flatten().tolist()
+    ]
+    assert open_positions == list(range(kv_len - window, kv_len))
 
 
 def _num_blocks_buckets(block_size: int = 64) -> list[int]:

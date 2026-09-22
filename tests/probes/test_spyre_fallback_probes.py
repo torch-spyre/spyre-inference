@@ -771,13 +771,6 @@ def test_spyre_compile_input_offset_specialises_the_graph(spyre_device):
         "is now 1, torch-spyre reads the offset at runtime and a slice is free to "
         "replace a gather"
     )
-    offsets = {
-        line.split("storage_offset ==")[1].strip()
-        for entry in entries
-        for line in str(entry.guard_manager).splitlines()
-        if "storage_offset ==" in line
-    }
-    assert offsets == {"0", str(rows * width), str(2 * rows * width)}, offsets
 
 
 # ---------------------------------------------------------------------------

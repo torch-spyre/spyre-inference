@@ -160,9 +160,13 @@ def _missing_dataset(config: dict) -> str | None:
 
 
 def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
-    """Keep configs whose model and TP are selected (empty selects all) and
-    whose dataset, if any, exists on this host."""
+    """Keep configs whose model and TP are selected (empty selects all).
+
+    A selected config whose dataset is absent is fatal, not skipped: skipping
+    would let a serve-only model job report success while measuring nothing.
+    """
     selected = []
+    missing_datasets = []
     for config in configs:
         model = _config_model(config)
         if models and not (model and model.lower() in models):
@@ -181,13 +185,18 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
         _resolve_dataset_path(config)
         missing = _missing_dataset(config)
         if missing:
-            log.warning(
-                "Skipping %s: dataset %s not present on this host",
-                config.get("test_name"),
-                missing,
-            )
+            missing_datasets.append((config.get("test_name"), missing))
             continue
         selected.append(config)
+
+    if missing_datasets:
+        for test_name, path in missing_datasets:
+            log.error("%s needs dataset %s, which is not present on this host", test_name, path)
+        log.error(
+            "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET at this host's copies "
+            "of the trace files, or mount them at the paths above."
+        )
+        sys.exit(2)
     return selected
 
 
@@ -529,7 +538,9 @@ def run_serve_benchmark(
             log.error("stderr tail:\n%s", "\n".join(stderr_lines))
         return False
 
-    # `vllm bench serve` only measures the request phase.
+    # `vllm bench serve` only measures the request phase. A local artifact:
+    # not in ingest_vllm_benchmarks.py's `_SERVE_METRICS`, so it does not
+    # reach ClickHouse.
     result_file = results_dir / f"{test_name}.json"
     try:
         data = json.loads(result_file.read_text())

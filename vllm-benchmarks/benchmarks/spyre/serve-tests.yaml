@@ -9,7 +9,8 @@
 #
 # dataset-path is an env var so each host can point at its own copy of the
 # trace: ${SPYRE_AIOPS_DATASET} (_4k entries) and ${SPYRE_CICS_DATASET} (_8k).
-# Entries whose file is absent are skipped with a warning.
+# Both fall back to the layout on the Spyre benchmark hosts; a selected entry
+# whose file is absent fails the run rather than being skipped.
 #
 # The _4k/_8k suffix is the max-model-len the trace needs: longer requests are
 # rejected.

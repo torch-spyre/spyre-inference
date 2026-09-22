@@ -290,9 +290,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         )
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         kv_row_table, page_table = index_table
+        assert len(kv_row_table) == num_blocks
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
+            assert page_table is not None and page_table.shape[0] == num_blocks
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",

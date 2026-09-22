@@ -1855,7 +1855,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_stack = mask_stack[: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
             assert mask_stack.shape[0] == len(active_bs)
-            assert index_table.shape[0] == len(active_bs)
+            if isinstance(index_table, torch.Tensor):
+                assert index_table.shape[0] == len(active_bs)
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #

@@ -57,9 +57,8 @@ torch.zeros(1, dtype=torch.float16).to("spyre")
 from torch_spyre._inductor import config as ts_config  # noqa: E402
 
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout  # noqa: E402
-from spyre_inference.v1.attention.ops.page_attn_head_major import (  # noqa: E402
+from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (  # noqa: E402
     page_attn_head_major_decode_kernel,
-    page_attn_head_major_kernel,
 )
 
 
@@ -79,11 +78,9 @@ NUM_PAGES = _int("NUM_PAGES", max(NUM_BLOCKS, 8))
 CTX = SEQ_LEN - Q_LEN
 SCALE = D**-0.5
 FP16_MIN = torch.finfo(torch.float16).min
-# Mirrors the backend's dispatch; FOLD=0 runs the unrolled kernel at Q=1 instead.
-FOLD = Q_LEN == 1 and _int("FOLD", 1) == 1
-KERNEL = page_attn_head_major_decode_kernel if FOLD else page_attn_head_major_kernel
-# Mirrors _lx_max_cores over the dispatched kernel's output units.
-OUTPUT_UNITS = (NUM_HEADS if FOLD else KV) * Q_LEN
+KERNEL = page_attn_head_major_decode_kernel
+# Mirrors _lx_max_cores over the kernel's output units.
+OUTPUT_UNITS = NUM_HEADS * Q_LEN
 MAX_CORES = _int("MAX_CORES", 8 if OUTPUT_UNITS < 32 else 0)
 
 print(
@@ -137,16 +134,12 @@ for i in range(NUM_BLOCKS):
 
 head_ids = torch.arange(KV, dtype=torch.int32).reshape(KV, 1)
 kv_tables = [(int(pages_used[i]) * KV + head_ids).contiguous() for i in range(NUM_BLOCKS)]
-head_tables = [
-    torch.tensor([kv * QPK + g for kv in range(KV)], dtype=torch.int32) for g in range(QPK)
-]
 args = (
     query.to("spyre"),
     row_index.to("spyre"),
     k_dev.view(NUM_PAGES * KV, B, D),
     v_dev.view(NUM_PAGES * KV, B, D),
     [t.to("spyre") for t in kv_tables],
-    [t.to("spyre") for t in head_tables],
     [m.to("spyre") for m in masks],
     SCALE,
     NUM_BLOCKS,
@@ -156,14 +149,12 @@ args = (
     D,
     B,
 )
-# The folded kernel needs no head gather, so it takes no head index tables.
-kernel_args = args[:5] + args[6:] if FOLD else args
 
 prev_cores = ts_config.sencores
 if MAX_CORES:
     ts_config.sencores = MAX_CORES
 try:
-    got = torch.compile(KERNEL, dynamic=False)(*kernel_args).cpu()[:Q_LEN]
+    got = torch.compile(KERNEL, dynamic=False)(*args).cpu()[:Q_LEN]
 finally:
     ts_config.sencores = prev_cores
 
@@ -180,12 +171,12 @@ check("attention vs SDPA", got, want, 2e-2)
 text = PLANNER_LOG.read_text(errors="replace") if PLANNER_LOG.is_file() else ""
 verdicts = re.findall(r"lx_pinning: (\S+) \(([^)]+)\) . ([^\n]+)", text)
 
-# The K/V page gathers are 2 per block; the rest are query-side (one query-row gather,
-# then one per query group), tiny and not what this probe is about.
+# The K/V page gathers are 2 per block; the rest is the query-row gather, tiny and not
+# what this probe is about.
 gathers = [(op, kind, why.strip()) for op, kind, why in verdicts if kind == "index"]
 pinned = [op for op, _, why in gathers if why == "lx"]
 page_gathers = 2 * NUM_BLOCKS
-query_gathers = 1 + (NUM_HEADS // KV)
+query_gathers = 1
 print(f"\ngathers: {len(gathers)} ops, {len(pinned)} pinned LX")
 print(f"  K/V page gathers expected: {page_gathers} (K and V per block)")
 print(f"  query-side gathers expected: {query_gathers} (not page residency)")
@@ -208,7 +199,7 @@ print(f"\ntotal ops: {len(verdicts)}, spilled to HBM: {len(spilled)}")
 print(f"restickify cross-frame barrier hits: {text.count('read by restickify')}")
 print(f"mutation relayout copies: {text.count('mutation relayout copy')}")
 
-# A page broadcast over the query-group axis is materialised as a clone; the unrolled
+# A page broadcast over the query-group axis is materialised as a clone; the folded
 # form has no such axis, so any clone here is a page copy that should not exist.
 clones = sum(n for kind, c in by_kind.items() if kind == "clone" for n in c.values())
 print(f"clone ops (page materialisation): {clones}")

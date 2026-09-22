@@ -244,12 +244,13 @@ gather to its last use instead of round-tripping through HBM. Two shape choices 
 there. The page is gathered on (page, kv_head) with a `[num_kv_heads, 1]` index, so the
 gather's split lands per KV head — an output axis of `probs @ V` the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
-groups are unrolled, so each matmul carries a single batch dim: the batched GQA form
-leaves the page with two batch dims and Inductor clones it out to a query-group axis it
-does not have (torch-spyre#4123). The fold itself is free — `[num_blocks, KV, block_size,
-D]` reshapes to `[num_blocks * KV, block_size, D]` — but the cache is allocated with that
-folded axis at device dim 0, which is where an indexed axis has to sit for the gather to
-cost one page rather than the whole tensor.
+groups fold into the query's row axis — a reshape, since heads are KV-major — so each
+matmul carries a single batch dim: the batched GQA form leaves the page with two batch dims
+and Inductor clones it out to a query-group axis it does not have (torch-spyre#4123). The
+cache fold is free too — `[num_blocks, KV, block_size, D]` reshapes to
+`[num_blocks * KV, block_size, D]` — but the cache is allocated with that folded axis at
+device dim 0, which is where an indexed axis has to sit for the gather to cost one page
+rather than the whole tensor.
 
 Three things follow from those choices. The gather is a 2-D subscript, which lowers to
 `aten.index` and fails eager by upcasting its int32 index, so this backend always compiles

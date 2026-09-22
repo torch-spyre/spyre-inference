@@ -14,9 +14,9 @@
 
 """Paged attention over a head-major KV cache for a query wider than one token.
 
-``page_attn_head_major`` buys LX page residency with an unrolled matmul per query group and
-a ``stack`` epilogue that cannot fuse. Past one query token the page transfer that buys is
-amortised over every query row, so this kernel spends it instead: batched GQA over
+``page_attn_head_major_decode`` buys LX page residency by shaping the gather and the query
+around the folded cache. Past one query token the page transfer that buys is amortised over
+every query row, so this kernel spends it instead: batched GQA over
 ``[kv_head, group, query, D]``, one accumulator, store fuses.
 """
 
@@ -42,7 +42,7 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    Shapes are ``page_attn_head_major``'s, except ``page_index_tables``: one [1] int32 device
+    Shapes are ``page_attn_head_major_decode``'s, except ``page_index_tables``: one [1] int32 device
     tensor per active block, indexing ``[num_blocks, num_kv_heads, block_size, head_size]``.
     """
     num_queries_per_kv = num_heads // num_kv_heads

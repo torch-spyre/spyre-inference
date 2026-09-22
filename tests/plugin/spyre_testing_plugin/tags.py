@@ -43,11 +43,24 @@ def model_from_params(params):
     return None
 
 
-def test_tier():
-    """Suite tier from SPYRE_TEST_TIER (exported by CI's run-matrix-config; empty
-    on a local run). Read live rather than at import so tests that monkeypatch the
-    env still see it."""
+def invoked_tier():
+    """The tier this run was invoked as, from SPYRE_TEST_TIER. Read live so tests that
+    monkeypatch the env still see it."""
     return os.environ.get("SPYRE_TEST_TIER", "")
+
+
+def declared_tiers():
+    """Every tier this leg's tests belong to, from SPYRE_TEST_TIERS (whitespace-separated,
+    declared as `test_types` per matrix entry).
+
+    A declared SET, never inferred from a tier ladder: legs here declare `unit regression
+    trunk` without `integration`, so a ladder would claim coverage that never ran.
+    """
+    raw = os.environ.get("SPYRE_TEST_TIERS", "")
+    if not raw.strip():
+        tier = invoked_tier()
+        return [tier] if tier else []
+    return sorted(set(raw.split()))
 
 
 def result_tags(params):
@@ -59,7 +72,6 @@ def result_tags(params):
     model = model_from_params(params)
     if model:
         tags.append(("tag", f"model__{model}"))
-    tier = test_tier()
-    if tier:
+    for tier in declared_tiers():
         tags.append(("tag", f"testtype__{tier}"))
     return tags

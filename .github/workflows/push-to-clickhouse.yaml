@@ -101,6 +101,10 @@ jobs:
         run: |
           source .venv/bin/activate
           uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+          # The v2 schema and write path live in torch-spyre's extensions/ so all three
+          # product repos share ONE definition of run_id and test_case_id.
+          uv pip install \
+            "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
 
       - name: Install gh CLI
         env:
@@ -204,18 +208,26 @@ jobs:
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
 
-      # integration-tests.yaml's provenance job uploads this artifact carrying the
-      # orchestrator's threaded run_id (empty for a test_each_commit-triggered run or a
-      # manual re-ingest); it rides through the same "download every artifact" step above.
+      # The orchestrator's threaded run_id, uploaded as an artifact because this workflow runs on
+      # workflow_run and so cannot read the triggering run's inputs. Empty on a GHA-initiated run
+      # or a manual re-ingest, in which case the ingest derives its own id from the run coordinate.
       - name: Resolve orchestrator run_id
         id: resolve-run-id
         run: |
-          RUN_ID_FILE="xml_artifacts/orchestrator-run-id/run-id.txt"
-          if [[ -f "$RUN_ID_FILE" ]]; then
-            echo "run_id=$(cat "$RUN_ID_FILE")" >> "${GITHUB_OUTPUT}"
-          else
-            echo "run_id=" >> "${GITHUB_OUTPUT}"
-          fi
+          # Two producers upload the same value under different names: integration-tests.yaml
+          # writes "orchestrator-run-id", and _test_matrix.yaml (used by test_each_commit) writes
+          # "run-id". Both ride in via the download-every-artifact step above, so read whichever
+          # is present rather than adding a second API round-trip for one of them.
+          RID=""
+          for f in xml_artifacts/orchestrator-run-id/run-id.txt \
+                   xml_artifacts/run-id/run-id.txt; do
+            if [[ -f "$f" ]]; then
+              RID="$(tr -d '[:space:]' < "$f")"
+              [[ -n "$RID" ]] && break
+            fi
+          done
+          echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
+          echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve test_type for trigger_type
         id: extract-tier
@@ -242,8 +254,17 @@ jobs:
       # Parse each XML file and insert rows into ClickHouse via
       # ingest_xml_si.py (checked out above), into
       # si_test_runs / si_test_cases / si_run_properties.
-      # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
+        env:
+          # Fallback only: each leg uploads its own arch beside its JUnit XML, which the
+          # ingest prefers per file. Used when that sidecar is absent (a re-ingest of an
+          # older run), since arch is hashed into run_id and this job is pinned to x86_64.
+          LEG_ARCH: x86_64
+          # Routed through env rather than interpolated into the script: this job runs on
+          # workflow_run, a privileged trigger, and the value comes from a downloaded artifact.
+          THREADED_RUN_ID: ${{ steps.resolve-run-id.outputs.run_id }}
+          PR_NUMBER: ${{ steps.resolve-pr.outputs.pr_number }}
+          TIER: ${{ steps.extract-tier.outputs.tier }}
         run: |
           source .venv/bin/activate
           python3 .github/scripts/ingest_xml_si.py \
@@ -252,11 +273,140 @@ jobs:
             --branch   "${TRIGGERING_BRANCH}" \
             --sha      "${TRIGGERING_SHA}" \
             --gha-run-id "${TRIGGERING_RUN_ID}" \
-            --run-id   "${{ steps.resolve-run-id.outputs.run_id }}" \
+            --run-id   "${THREADED_RUN_ID}" \
             --triggered-at "${TRIGGERING_AT}" \
-            --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
-            --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
-            --platform "$(uname -m)"
+            --pr-number    "${PR_NUMBER}" \
+            --trigger-type "${TIER}" \
+            --platform "${LEG_ARCH}"
+
+      # Schema-v2 via torch-spyre's reusable action, grouped by leg arch first since arch is a run_id hash input and the matrix dispatches non-x86_64 legs too.
+      - name: Group XML files by leg arch
+        id: group-by-arch
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          from pathlib import Path
+
+          ROOT = Path("xml_artifacts")
+          OUT = Path("xml_by_arch")
+          DEFAULT_ARCH = "x86_64"
+          KNOWN_ARCHES = ("x86_64", "ppc64le", "s390x")
+
+          def canonical(arch: str) -> str:
+              a = arch.strip().lower()
+              return "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
+
+          def leg_arch(xml_path: Path) -> str:
+              # A name-derived sidecar first, then any leg-arch-*.txt beside the XML.
+              sidecar = xml_path.with_name(
+                  xml_path.stem.replace("junit-", "leg-arch-") + ".txt"
+              )
+              for candidate in (sidecar, *sorted(xml_path.parent.glob("leg-arch-*.txt"))):
+                  try:
+                      arch = candidate.read_text().strip()
+                  except OSError:
+                      continue
+                  if arch:
+                      return arch
+              return ""
+
+          groups: dict[str, int] = {}
+          for xml_path in sorted(ROOT.rglob("*.xml")):
+              arch = canonical(leg_arch(xml_path) or DEFAULT_ARCH)
+              dest_dir = OUT / arch
+              dest_dir.mkdir(parents=True, exist_ok=True)
+              # Flattened with the relative path as filename: the action globs non-recursively.
+              rel = xml_path.relative_to(ROOT)
+              dest = dest_dir / str(rel).replace(os.sep, "__")
+              dest.symlink_to(xml_path.resolve())
+              groups[arch] = groups.get(arch, 0) + 1
+
+          print("Grouped XML files by leg arch:")
+          for arch, n in sorted(groups.items()):
+              print(f"  {arch}: {n} file(s)")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              for arch in KNOWN_ARCHES:
+                  present = "true" if groups.get(arch, 0) > 0 else "false"
+                  f.write(f"has_{arch}={present}\n")
+
+          unknown = sorted(set(groups) - set(KNOWN_ARCHES))
+          if unknown:
+              print(
+                  f"::warning::XML grouped under unrecognised arch(es) {unknown}; v2 "
+                  "will not be written for them -- add to KNOWN_ARCHES in "
+                  "push-to-clickhouse.yaml's grouping step."
+              )
+          PYEOF
+
+      - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
+        if: steps.group-by-arch.outputs.has_x86_64 == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/x86_64
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: x86_64
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+
+      - name: Ingest XML into shared v2 ClickHouse tables (ppc64le)
+        if: steps.group-by-arch.outputs.has_ppc64le == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/ppc64le
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: ppc64le
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+
+      - name: Ingest XML into shared v2 ClickHouse tables (s390x)
+        if: steps.group-by-arch.outputs.has_s390x == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/s390x
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: s390x
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       - name: Summary
         if: always()

@@ -41,9 +41,8 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
-from spyre_inference.v1.attention.ops.page_attn_head_major import (
+from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
-    page_attn_head_major_kernel,
 )
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
@@ -530,7 +529,7 @@ def test_head_major_dispatches_by_query_width(
     default_vllm_config, monkeypatch, configure_compilation, configure_device
 ):
     """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
-    wide query to the unrolled kernel pays for residency the query width already amortises."""
+    wide query to the decode kernel pays for residency the query width already amortises."""
     from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
 
     called = []
@@ -840,36 +839,42 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     gc.collect()
 
 
-def test_decode_fold_matches_unrolled():
-    """The folded decode kernel is the unrolled one rebatched, so it must agree exactly."""
+def test_page_attn_head_major_matches_fp32_reference():
+    """The per-sequence decode kernel matches the suite's CPU reference.
+
+    Card-free and fp32, as its batched twin: it pins the group fold and the ragged tail's
+    mask, not the fp16 tolerances.
+    """
+    from spyre_testing_plugin.attn_helpers import ref_attn
+
+    torch.set_default_device("cpu")
     set_random_seed(0)
     kv, qpk, d, block, blocks = 8, 4, 128, 64, 5
-    heads = kv * qpk
+    heads, query_len = kv * qpk, 1
+    # A ragged tail, so the last page is half masked rather than whole.
+    kv_len = (blocks - 1) * block + block // 2
     k = torch.randn(blocks * kv, block, d)
     v = torch.randn(blocks * kv, block, d)
+    # The kernel reads its row out of a wider staging buffer, and not the first one.
     query = torch.randn(3, heads, d)
     rows = torch.tensor([2, 0, 1], dtype=torch.int32)
     kv_tables = [
         torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
     ]
-    head_tables = [
-        torch.tensor([h * qpk + g for h in range(kv)], dtype=torch.int32) for g in range(qpk)
-    ]
     masks = [torch.zeros(1, block) for _ in range(blocks)]
     masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
 
     for soft_cap in (0.0, 30.0):
-        args = (
+        got = page_attn_head_major_decode_kernel(
             query,
             rows,
             k,
             v,
             kv_tables,
-            head_tables,
             masks,
             d**-0.5,
             blocks,
-            1,
+            query_len,
             heads,
             kv,
             d,
@@ -877,11 +882,20 @@ def test_decode_fold_matches_unrolled():
             soft_cap,
             None,
         )
-        unrolled = page_attn_head_major_kernel(*args)
-        # The folded kernel needs no head gather, so it takes no head index tables.
-        folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
-        assert folded.shape == unrolled.shape
-        torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)
+        expected = ref_attn(
+            query=query.index_select(0, rows[:query_len].to(torch.int64)),
+            # ref_attn indexes a page's token axis first.
+            key_cache=k.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
+            value_cache=v.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
+            query_lens=[query_len],
+            kv_lens=[kv_len],
+            block_tables=torch.arange(blocks, dtype=torch.int32).unsqueeze(0),
+            block_size=block,
+            scale=d**-0.5,
+            soft_cap=soft_cap,
+        )
+        assert got.shape == expected.shape
+        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

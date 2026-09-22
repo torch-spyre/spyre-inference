@@ -438,6 +438,10 @@ class SpyreClassifierLinear(nn.Linear):
             weight_t = weight_t.to(device=orig_device)
         linear.__class__ = cls
         linear.weight = nn.Parameter(weight_t, requires_grad=False)
+        # Keep bias on CPU: _add_bias runs outside the compiled graph anyway,
+        # so a device bias just forces a D2H on every forward call.
+        if linear.bias is not None and linear.bias.device.type == "spyre":
+            linear.bias = nn.Parameter(convert(linear.bias.data, "cpu"), requires_grad=False)
         return cast(SpyreClassifierLinear, linear)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -447,17 +451,18 @@ class SpyreClassifierLinear(nn.Linear):
                 input = convert(input, weight.device, weight.dtype)
             else:
                 input = input.to(device=weight.device, dtype=weight.dtype)
-        return self._add_bias(spyre_classifier_gemm(input, weight))
+        out = spyre_classifier_gemm(input, weight)
+        # Skip the graph-break entirely when there is no bias: _add_bias is
+        # @torch.compiler.disable, so calling it even for bias=None forces
+        # a graph break on every forward.
+        return self._add_bias(out) if self.bias is not None else out
 
     @torch.compiler.disable
     def _add_bias(self, out: torch.Tensor) -> torch.Tensor:
-        if self.bias is None:
-            return out
         if out.device.type == "spyre":
             out = convert(out, "cpu")
         bias = self.bias
-        if bias.device.type == "spyre":
-            bias = convert(bias, "cpu")
+        assert bias is not None  # caller guards; keeps type checker happy
         return out + bias.to(device=out.device, dtype=out.dtype)
 
 

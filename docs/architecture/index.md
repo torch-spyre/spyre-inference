@@ -271,7 +271,14 @@ by `probs @ V` and stays resident either way.
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
-  to `max_model_len` (avoids per-step recompilation on Spyre)
+  to `max_model_len` (avoids per-step recompilation on Spyre). A sliding-window layer
+  group's block axis is its *active* count, which the window caps well below
+  `max_model_len / block_size`, so that group's ladder is the power-of-two one truncated
+  at the cap plus one exact rung per query bucket — the count a decode step or a full
+  prefill chunk actually reaches. Exact rungs at the top are what make the rounding free
+  where it matters: gemma-4's 1024-token window is 8 blocks at `block_size` 128 and
+  steady-state decode reaches 9, one past a power of two, so the plain geometric ladder
+  would read 1.8x the KV the window needs
 - **Query length bucketing**: `[1] + multiples of min(512, max_num_batched_tokens)`
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the

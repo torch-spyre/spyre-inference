@@ -56,6 +56,7 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
     batched_decode_chunking,
+    sliding_active_blocks,
 )
 from spyre_inference.v1.worker import compile_guard
 
@@ -128,12 +129,12 @@ def _mirror_mask_tiles(
 ) -> list[list[torch.Tensor]]:
     """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
+    `_get_constant_tile` hands the same CPU tensor to every sequence's block at a
+    given position, so keying on `id()` collapses those to a single H2D transfer
+    instead of one per block. `tiles_cpu` keeps strong references for the whole
+    call, so no id can be recycled mid-flight, and sharing one device buffer
+    across blocks is safe because mask tiles are read-only by contract (see
+    `_get_constant_tile`).
     """
     mirrored: dict[int, torch.Tensor] = {}
     tiles_device: list[list[torch.Tensor]] = []
@@ -407,9 +408,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
-        # Shared zero tiles for interior active blocks, whose mask is all-zeros.
-        # Keyed by query width: a mixed batch pads its sequences to several.
-        self._zero_tiles: dict[int, torch.Tensor] = {}
+        # Mask tiles that carry no per-sequence content: all-zero for interior active
+        # blocks, all-masked for the blocks that pad the count onto a bucket. Keyed by
+        # (query width, position within the active list) -- see _get_constant_tile.
+        self._constant_tiles: dict[tuple[int, int, bool], torch.Tensor] = {}
 
         static_ctx = vllm_config.compilation_config.static_forward_context
         self._slot_mapping = attn_layer.install(
@@ -417,8 +419,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         )
 
         # record_graphs() enumerates this same instance, so the buckets warmup
-        # compiles are exactly the ones build() can round onto.
-        self._attn_bucketer = SpyreAttnBucketer(vllm_config)
+        # compiles are exactly the ones build() can round onto. The window matters: it
+        # caps the block axis, and a windowed group's counts come from window arithmetic
+        # rather than from the kv ladder.
+        self._attn_bucketer = SpyreAttnBucketer(vllm_config, sliding_window=self.sliding_window)
 
         self._init_reorder_batch_threshold(
             reorder_batch_threshold=1 if envs.SPYRE_BATCHED_DECODE else None
@@ -428,26 +432,42 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     def attn_bucketer(self) -> SpyreAttnBucketer:
         return self._attn_bucketer
 
-    def _get_zero_tile(self, aligned_query_len: int) -> torch.Tensor:
-        """Return (or create) the shared all-zero mask tile for interior blocks.
+    def _get_constant_tile(
+        self, aligned_query_len: int, block_pos: int, masked: bool
+    ) -> torch.Tensor:
+        """The content-free mask tile for the active block at ``block_pos``.
 
-        The returned tensor is reused by reference across all interior blocks
-        of every sequence padded to this width. Callers must treat it as
-        read-only: any in-place mutation would corrupt every interior tile
-        simultaneously. This is safe today because attention kernels only read
-        mask tiles.
+        ``masked`` picks all-``finfo.min`` (a block padding the count onto a bucket)
+        over all-zero (an interior block, fully inside every window).
+
+        One tile per (query width, position), not one per width. Dynamo guards *which*
+        of the kernel's mask-tile arguments are the same object, so a tile shared across
+        positions makes the kernel specialize on which blocks are interior -- a third key
+        axis on top of (block count, query width), and one no bucketing can reach, since
+        two sequences agreeing on both still differ in where their boundary blocks fall.
+        Distinct per position, every sequence sharing a bucket reaches one kernel.
+
+        Sequences in a batch still share a tile per position, so ``_mirror_mask_tiles``
+        still collapses the whole batch's content-free blocks to one H2D transfer each.
+
+        Read-only by contract: every block at this position, in every sequence, is handed
+        this same tensor, and attention kernels only read mask tiles.
         """
-        tile = self._zero_tiles.get(aligned_query_len)
+        key = (aligned_query_len, block_pos, masked)
+        tile = self._constant_tiles.get(key)
         if tile is None:
-            tile = torch.zeros((aligned_query_len, self.block_size), dtype=self.model_dtype)
-            self._zero_tiles[aligned_query_len] = tile
+            fill = torch.finfo(self.model_dtype).min if masked else 0.0
+            tile = torch.full((aligned_query_len, self.block_size), fill, dtype=self.model_dtype)
+            self._constant_tiles[key] = tile
         return tile
 
     def _pad_num_blocks(self, num_blocks: int) -> int:
         """Round an active-block count up onto the recorder's num_blocks buckets.
 
         block_table is allocated at width ceil(max_model_len / block_size) for
-        the engine's lifetime, so the padded bucket always fits.
+        the engine's lifetime, so the padded bucket always fits. Under a window the
+        padding blocks read page 0 instead of the table, since the count is an active
+        count and the absolute indices past it need not be allocated.
         """
         if num_blocks == 0:
             # A fully-masked padded tile would divide by a zero softmax
@@ -535,7 +555,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             at least one query), and
           - the upper-boundary block (last block: KV padding, plus causal
             during prefill).
-        Interior blocks reuse the shared zero tile instead.
+        Interior and padding blocks take a content-free tile instead.
         """
         block_size = self.block_size
         mask_min = torch.finfo(self.model_dtype).min
@@ -580,13 +600,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         context_len: int,
         aligned_query_len: int,
         apply_causal_mask: bool,
-    ) -> tuple[list[int], list[torch.Tensor]]:
-        """Return (active_block_indices, mask_tiles) using arithmetic block-skip.
+    ) -> tuple[list[int], list[torch.Tensor], int]:
+        """Return (block_indices, mask_tiles, num_real_blocks) using arithmetic block-skip.
 
-        active_block_indices: absolute block indices whose mask contributes
-        to at least one query's attention (i.e. inside the window of the
-        earliest query).
-        mask_tiles: one tile per active block, in the same order.
+        block_indices: absolute block indices whose mask contributes to at least
+        one query's attention (i.e. inside the window of the earliest query),
+        then padding entries rounding the count onto the recorder's buckets.
+        mask_tiles: one tile per entry, in the same order.
+        num_real_blocks: how many of them are active rather than padding. Only
+        those reach the page-index table; the padding reads page 0 under an
+        all-masked tile, whose scores saturate to finfo.min and contribute
+        nothing to either side of the online softmax.
 
         Block classification:
           - [0, first_active):
@@ -613,21 +637,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         block_size = self.block_size
         num_blocks = (kv_len + block_size - 1) // block_size
 
-        # Earliest query (q_pos=0) has window
-        # [max(0, context_len - W + 1), context_len].
-        # Latest query (q_pos=query_len-1) has window
-        # [max(0, kv_len - W), kv_len - 1].
-        # A block is fully outside every query's window when its highest KV
-        # position is below the earliest query's window start.
-        # NOTE: using the EARLIEST query's window (not the latest, kv_len - W)
-        # is required for prefill correctness. In a prefill batch with
-        # query_len > 1, early queries have earlier windows and their
-        # in-window blocks would otherwise be incorrectly dropped. For decode
-        # (query_len == 1) both formulas coincide.
-        earliest_window_start = max(0, context_len - self.sliding_window + 1)
         latest_window_start = max(0, kv_len - self.sliding_window)
-
-        first_active = earliest_window_start // block_size
         # Every block from first_active up to the block containing the
         # latest window start can have a per-query cutoff falling inside it.
         last_lower_boundary = latest_window_start // block_size
@@ -640,14 +650,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             last_causal_interior = num_blocks - 1
         last_block = num_blocks - 1
 
-        active_bs = list(range(first_active, num_blocks))
+        active_bs = list(
+            sliding_active_blocks(kv_len, context_len, self.sliding_window, block_size)
+        )
         if not active_bs:
-            return [], []
+            return [], [], 0
 
-        zero_tile = self._get_zero_tile(aligned_query_len)
         tiles: list[torch.Tensor] = []
-
-        for b in active_bs:
+        for pos, b in enumerate(active_bs):
             is_lower_boundary = b <= last_lower_boundary
             is_upper_boundary = (b == last_block) and not is_lower_boundary
             is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
@@ -667,9 +677,18 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # entirely filled with valid KV tokens, and (for prefill)
                 # entirely below the earliest query's causal limit.
                 # Mask is all-zero.
-                tiles.append(zero_tile)
+                tiles.append(self._get_constant_tile(aligned_query_len, pos, masked=False))
 
-        return active_bs, tiles
+        # Round the count onto the ladder: it is what the kernel specializes on, and the
+        # counts a window reaches are dense where the ladder is geometric. The ladder
+        # carries the window's own caps, so the common counts land on a rung exactly --
+        # steady-state decode pads by nothing at all.
+        real = len(active_bs)
+        for pos in range(real, self._pad_num_blocks(real)):
+            active_bs.append(active_bs[-1])
+            tiles.append(self._get_constant_tile(aligned_query_len, pos, masked=True))
+
+        return active_bs, tiles, real
 
     def build(
         self,
@@ -799,11 +818,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             # active_block_indices stays None, so forward iterates all blocks.
         else:
             # Sliding window: arithmetic block-skip. Blocks entirely outside
-            # every query's window are dropped; interior blocks share a
-            # zero mask tile; only boundary blocks get real per-query cutoffs.
-            # Left unpadded (padded_num_blocks stays None): len(active_bs) is a
-            # window-width quantity, already near-constant across decode steps.
-            # TODO: give this its own window-width buckets if it ever needs recording.
+            # every query's window are dropped; interior blocks take a
+            # content-free mask tile; only boundary blocks get real per-query cutoffs.
+            # padded_num_blocks stays None because the block-count rounding is already in
+            # active_block_indices, which forward() iterates.
             active_block_indices = []
             query_lens_list = query_lens.tolist()
             seq_lens_list = seq_lens.tolist()
@@ -813,7 +831,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 query_len_s = int(query_lens_list[s])
                 context_len_s = kv_len_s - query_len_s
 
-                active_bs, tiles = self._build_active_tiles_with_skip(
+                active_bs, tiles, real = self._build_active_tiles_with_skip(
                     kv_len_s,
                     query_len_s,
                     context_len_s,
@@ -822,15 +840,24 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 )
                 active_block_indices.append(active_bs)
                 attention_mask_tiles.append(tiles)
+                real_num_blocks.append(real)
 
         # Sized per sequence, each its own allocation: a batch-max width becomes a
         # Dynamo guard the key cannot carry.
         num_active = [len(tiles) for tiles in attention_mask_tiles]
         page_index_tables_cpu = []
         for s, n in enumerate(num_active):
-            blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-            table[:, 0] = block_table[s, blocks_s]
+            if active_block_indices is None:
+                table[:, 0] = block_table[s, :n]
+            else:
+                # Rows past the real active blocks stay 0 -- page 0 is vLLM's null block,
+                # never allocated and never written, so the ladder's padding blocks read
+                # zeros. That matters beyond tidiness: torch-spyre lets the content under a
+                # mask reach the kernel's output, so a padding block aimed at a page holding
+                # real KV would leak it, while zeros leak nothing.
+                real = real_num_blocks[s]
+                table[:real, 0] = block_table[s, active_block_indices[s][:real]]
             page_index_tables_cpu.append(table)
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
@@ -887,9 +914,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     ).unsqueeze(1)
                     block_ids_padded[:w, :num_decode_seqs] = (bt[:, :w] * in_range).t()
                 else:
-                    # Position i is the i-th ACTIVE block, matching the mask tiles.
+                    # Position i is the i-th ACTIVE block, matching the mask tiles. The
+                    # ladder's padding blocks keep page 0, as in the per-seq table above.
                     for s, abs_blocks in enumerate(active_block_indices[:num_decode_seqs]):
-                        n_use = min(len(abs_blocks), b_blocks)
+                        n_use = min(real_num_blocks[s], b_blocks)
                         for b, abs_b in enumerate(abs_blocks[:n_use]):
                             block_ids_padded[b, s] = bt[s, abs_b]
                 # Entry order (s, j), s major, matching rep_row_ids and the mask.
@@ -969,9 +997,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
     def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
         """Metadata for the one-sequence batch that dispatches to ``bucket``."""
-        query_len = self._attn_bucketer.min_real_query_len(bucket.padded_query_len)
-        kv_len = bucket.num_blocks * self.block_size
-        assert query_len <= kv_len, f"{bucket} pairs a query length no sequence can reach"
+        kv_len, query_len = self._attn_bucketer.witness(bucket)
+        num_blocks = (kv_len + self.block_size - 1) // self.block_size
         query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
         # Every block points at page 0, vLLM's null block: nothing real is read.
         return self.build(
@@ -984,7 +1011,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 num_actual_tokens=query_len,
                 max_query_len=query_len,
                 max_seq_len=kv_len,
-                block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
+                block_table_tensor=torch.zeros(1, num_blocks, dtype=torch.int32),
                 slot_mapping=torch.zeros(query_len, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.tensor([query_len > 1]),
@@ -998,10 +1025,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
         ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
-        values and ``decode_uniformity`` is 1.
+        values and ``decode_uniformity`` is 1. The length comes from
+        ``decode_witness_kv_len``, since under a window a block-aligned one rounds onto
+        the wrong block bucket -- see that method.
         """
         num_seqs = bucket.num_seqs
-        kv_len = bucket.num_blocks * self.block_size
+        kv_len = self._attn_bucketer.decode_witness_kv_len(bucket.num_blocks)
+        assert kv_len is not None, (
+            f"{bucket} is in the bucketer's batched-decode list but no decode step pads "
+            "onto its block count"
+        )
+        # Absolute block indices reach the block table, and under a window the witness is
+        # deliberately not block-aligned, so the table spans the witness rather than the
+        # bucket. Wider than the bucket is harmless: only the per-chunk page lists the
+        # kernel receives are bucket-sized.
+        table_blocks = max(bucket.num_blocks, (kv_len + self.block_size - 1) // self.block_size)
         query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
         metadata = self.build(
             common_prefix_len=0,
@@ -1014,7 +1052,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 max_query_len=1,
                 max_seq_len=kv_len,
                 # Every block points at page 0, vLLM's null block: nothing real is read.
-                block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
+                block_table_tensor=torch.zeros(num_seqs, table_blocks, dtype=torch.int32),
                 slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
@@ -1422,15 +1460,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_blocks=len(attn_metadata.attention_mask_tiles[0]),
             padded_query_len=attn_metadata.aligned_query_lens[0],
         )
-        # Several requested buckets realize onto one kernel: a sliding window leaves
-        # the block count unpadded. Without a window build() rounds onto the bucketer's
-        # own buckets, so a mismatch means the two have drifted and dispatch can ask
-        # for a kernel warmup never recorded.
-        if realized != bucket and builder.sliding_window is None:
+        # Every requested bucket must realize itself: build() rounds the block count onto
+        # the bucketer's own ladder on both paths, and the witness under a window is a
+        # sequence chosen to round onto this entry. A mismatch means the two have drifted
+        # and dispatch can ask for a kernel warmup never recorded.
+        if realized != bucket:
             logger.warning(
-                "Attention variant %s realized as %s without a sliding window; the "
-                "bucketer and build() have diverged and some shapes will compile on "
-                "first use.",
+                "Attention variant %s realized as %s; the bucketer and build() have "
+                "diverged and some shapes will compile on first use.",
                 bucket,
                 realized,
             )
@@ -1510,24 +1547,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.blocks_per_chunk,
             len(attn_metadata.chunk_page_ids_cpu),
         )
-        # Several requested buckets realize onto one kernel: a sliding window leaves
-        # the block count unpadded. Without a window build() rounds onto the bucketer's
-        # own buckets, so a mismatch means the two have drifted and dispatch can ask
-        # for a kernel warmup never recorded.
+        # Every requested bucket must realize itself, window or not: build() rounds the
+        # decode block count onto the bucketer's own ladder, and the witness is chosen so
+        # it rounds onto the requested entry. A mismatch means the two have drifted and
+        # dispatch can ask for a kernel warmup never recorded.
         requested = (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks)
-        if realized != requested and builder.sliding_window is None:
+        if realized != requested:
             logger.warning(
-                "Batched decode variant %s realized as %s without a sliding window; the "
-                "bucketer and build() have diverged and some shapes will compile on "
-                "first use.",
+                "Batched decode variant %s realized as %s; the bucketer and build() have "
+                "diverged and some shapes will compile on first use.",
                 requested,
                 realized,
             )
         # The kernel gathers `entries` pages per chunk, not num_blocks of them, and
-        # selecting a whole source faults the device (torch-spyre#4033). A sliding
-        # window leaves the block count unpadded, so this keys on what build()
-        # realized, not the bucket's window-agnostic count, to skip only the
-        # variants dispatch cannot reach either.
+        # selecting a whole source faults the device (torch-spyre#4033). This keys on what
+        # build() realized, to skip only the variants dispatch cannot reach either.
         if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
             return None
         if realized in recorded:

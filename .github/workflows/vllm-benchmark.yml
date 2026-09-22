@@ -211,6 +211,7 @@ jobs:
           CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
           CLICKHOUSE_PASS: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PASS || secrets.CLICKHOUSE_PASS_DEV }}
           CLICKHOUSE_DB: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB || secrets.CLICKHOUSE_DB_DEV }}
+          CLICKHOUSE_DB_V2: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_DB_V2 || secrets.CLICKHOUSE_DB_V2_DEV }}
           BENCHMARK_BRANCH: ${{ github.ref_name }}
           BENCHMARK_SHA: ${{ github.sha }}
           PR_NUMBER: "0"
@@ -230,9 +231,12 @@ jobs:
             --workflow "vLLM Benchmark" \
             --branch "${BENCHMARK_BRANCH}" \
             --sha "${BENCHMARK_SHA}" \
-            --run-id "${{ github.run_id }}" \
+            --gha-run-id "${{ github.run_id }}" \
             --job-id "0" \
-            --pr-number "${PR_NUMBER}"
+            --pr-number "${PR_NUMBER}" \
+            --arch "${BENCHMARK_ARCH:-x86_64}" \
+            --test-type perf \
+            --rpm-lock spyre-rpms.lock
 
       - name: Job Summary
         if: always()

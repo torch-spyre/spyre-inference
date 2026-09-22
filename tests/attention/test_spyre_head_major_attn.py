@@ -757,7 +757,7 @@ def test_head_major_matches_token_major(
         # Each impl builds its own device tables onto the metadata; clear the first one's
         # so the second is not handed the wrong shapes.
         attn_metadata.kernel_index_tables = None
-        attn_metadata.attention_mask_tiles_device = None
+        attn_metadata.attention_mask_stacks_device = None
         attn_metadata.query_row_tables = None
         impl.forward(
             layer=None,
@@ -857,12 +857,12 @@ def test_page_attn_head_major_matches_fp32_reference():
     v = torch.randn(blocks * kv, block, d)
     # The kernel reads its row out of a wider staging buffer, and not the first one.
     query = torch.randn(3, heads, d)
-    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+    rows = torch.tensor([2], dtype=torch.int32)
     kv_tables = [
         torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
     ]
-    masks = [torch.zeros(1, block) for _ in range(blocks)]
-    masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
+    masks = torch.zeros(blocks, 1, block)
+    masks[-1, 0, block // 2 :] = torch.finfo(torch.float32).min
 
     for soft_cap in (0.0, 30.0):
         got = page_attn_head_major_decode_kernel(
@@ -922,7 +922,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     """The head-major page read feeds the same reduction the token-major kernel gets.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
-    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
+    page-row mask broadcast, not the fp16 tolerances.
     """
     from tests.attention.test_spyre_attn import _decode_reference_fp32
 
@@ -963,9 +963,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     mask_by_chunk = (
         mask.reshape(b_seqs, num_chunks, bpc, block_size)
         .permute(1, 0, 2, 3)
-        .unsqueeze(3)
-        .expand(num_chunks, b_seqs, bpc, num_kv_heads, block_size)
-        .reshape(num_chunks, entries * num_kv_heads, 1, block_size)
+        .reshape(num_chunks, entries, 1, block_size)
         .contiguous()
     )
 

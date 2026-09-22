@@ -175,8 +175,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """Head h of the token at ``block * block_size + offset`` lives at row
         ``(block * num_kv_heads + h) * block_size + offset``.
 
-        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: a view's storage
-        offset is dropped on the way to the device (torch-spyre#3770). That corruption is
+        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
+        storage offset is still dropped on the way to the device (torch-spyre#3770 is
+        closed, but its fix covers float16 only -- see build_index_tables). That corruption is
         shape-dependent — correct while a row fits one int32 stick, every head past it
         silently wrong — so a short-token test passes while long prefill corrupts.
         """
@@ -205,13 +206,17 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     # together and `_run_page_attn` picks the one its kernel reads.
     def build_index_tables(  # ty: ignore[invalid-method-override]
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
-    ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
+    ) -> list[tuple[list[torch.Tensor], torch.Tensor | None]]:
         """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
-        paired with the page id alone for the wide-query kernel.
+        paired with the page ids alone for the wide-query kernel.
 
-        One [KV, 1] tensor per block, not rows of one table: an index tensor reaches the
-        hardware as a tensor argument, so a slice's nonzero storage offset is dropped and
-        every block would gather block 0 (torch-spyre#3770).
+        The folded rows are one [KV, 1] tensor per block, not rows of one table: an int32
+        argument's nonzero storage offset is still read as 0, so every block would gather
+        block 0, and an in-graph slice of a stacked table still gathers the wrong rows at
+        this shape. torch-spyre#3770 is closed, but the fix (torch-spyre#4449) landed for
+        float16 only; strict xfails pin both int32 cases on the pinned stack --
+        test_spyre_compile_input_honors_storage_offset (its int32 parametrization) and
+        test_spyre_in_graph_slice_of_stacked_kv_row_index.
         """
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
@@ -223,14 +228,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
                     for b in range(pages.shape[0])
                 ],
-                # Only a wide query reads these, and building them for a decode step would
-                # add an H2D transfer per page to the path this layout exists to speed up.
-                [
-                    convert(torch.tensor([int(pages[b, 0])], dtype=torch.int32), device=device)
-                    for b in range(pages.shape[0])
-                ]
-                if query_lens[s] > 1
-                else [],
+                # Only a wide query reads this, and building it for a decode step would add
+                # an H2D transfer to the path this layout exists to speed up.
+                convert(pages[:, 0:1].contiguous(), device=device) if query_lens[s] > 1 else None,
             )
             for s, pages in enumerate(tables_cpu)
         ]
@@ -276,17 +276,25 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         index_table,
-        mask_tiles: list[torch.Tensor],
+        mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
         alibi_bias_tiles: list[torch.Tensor] | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
+        # at trace time — see the base's `_run_page_attn`, which this replaces rather than
+        # extends.
+        assert row_table.shape == (padded_query_len,), (
+            f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
+        )
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         kv_row_table, page_table = index_table
+        assert len(kv_row_table) == num_blocks
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
+            assert page_table is not None and page_table.shape[0] == num_blocks
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
@@ -296,7 +304,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     k_pages,
                     v_pages,
                     page_table,
-                    mask_tiles,
+                    mask_stack,
                     self.scale,
                     num_blocks,
                     padded_query_len,
@@ -319,7 +327,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 k_folded,
                 v_folded,
                 kv_row_table,
-                mask_tiles,
+                mask_stack,
                 self.scale,
                 num_blocks,
                 padded_query_len,

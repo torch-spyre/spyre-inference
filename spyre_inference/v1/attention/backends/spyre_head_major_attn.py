@@ -17,8 +17,8 @@
 Storing a page as ``[num_kv_heads, block_size, head_size]`` drops the permute the
 token-major kernels do before the matmuls, and pays for it in the KV write, whose
 per-token destinations are one head apart rather than contiguous. The cache is decomposed
-so a gathered page stays LX-resident; see ``page_attn_head_major``. Past one query token
-that residency stops paying, and ``page_attn_head_major_prefill`` runs instead; across
+so a gathered page stays LX-resident; see ``page_attn_head_major_decode``. Past one query
+token that residency stops paying, and ``page_attn_head_major_prefill`` runs instead; across
 sequences at decode, ``batched_decode_head_major`` gathers whole pages for the same reason.
 
 Everything above the cache's memory is shared with ``spyre_attn``; the places that touch
@@ -47,7 +47,7 @@ from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
-from spyre_inference.v1.attention.ops.page_attn_head_major import (
+from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
 from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (

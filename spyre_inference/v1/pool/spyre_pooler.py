@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -394,7 +396,7 @@ def _set_classifier_head_dtype(pooler: nn.Module) -> None:
         if not isinstance(child, ClassifierPoolerHead | TokenClassifierPoolerHead):
             continue
         if child.head_dtype is not None:
-            child.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
+            child.head_dtype = torch.float16
 
 
 def prepare_fp32_head_for_spyre(
@@ -424,7 +426,7 @@ class SpyreClassifierLinear(nn.Linear):
     @classmethod
     def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
         if type(linear) is cls:
-            return linear
+            return cast(SpyreClassifierLinear, linear)
         orig_device = linear.weight.device
         w = linear.weight.data
         if orig_device.type == "spyre":
@@ -436,16 +438,16 @@ class SpyreClassifierLinear(nn.Linear):
             weight_t = weight_t.to(device=orig_device)
         linear.__class__ = cls
         linear.weight = nn.Parameter(weight_t, requires_grad=False)
-        return linear
+        return cast(SpyreClassifierLinear, linear)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
         weight = self.weight
-        if x.device != weight.device or x.dtype != weight.dtype:
+        if input.device != weight.device or input.dtype != weight.dtype:
             if weight.device.type == "spyre":
-                x = convert(x, weight.device, weight.dtype)
+                input = convert(input, weight.device, weight.dtype)
             else:
-                x = x.to(device=weight.device, dtype=weight.dtype)
-        return self._add_bias(spyre_classifier_gemm(x, weight))
+                input = input.to(device=weight.device, dtype=weight.dtype)
+        return self._add_bias(spyre_classifier_gemm(input, weight))
 
     @torch.compiler.disable
     def _add_bias(self, out: torch.Tensor) -> torch.Tensor:

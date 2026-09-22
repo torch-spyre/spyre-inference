@@ -194,7 +194,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
     # The base publishes one table per sequence; this layout needs two, so the pair travels
     # together and `_run_page_attn` picks the one its kernel reads.
-    def build_index_tables(  # ty: ignore[invalid-method-override]
+    def build_index_tables(
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
     ) -> list[tuple[list[torch.Tensor], list[torch.Tensor]]]:
         """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,

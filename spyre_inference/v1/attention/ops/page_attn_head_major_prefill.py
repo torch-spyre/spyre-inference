@@ -78,23 +78,24 @@ def page_attn_head_major_prefill_kernel(
             v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
             mask_tile = mask_tiles[group_start]
         else:
-            # The group's pages in one gather, joined along the token axis. The cat runs inside
-            # the traced region, so it yields a real offset-0 tensor rather than a view whose
-            # offset is dropped crossing the argument boundary (torch-spyre#3770).
-            page_idx = torch.cat(page_index_tables[group_start:group_end])
-            k_page = (
-                k_pages.index_select(0, page_idx)
-                .permute(1, 0, 2, 3)
-                .reshape(num_kv_heads, width * block_size, head_size)
-                .unsqueeze(1)
-            )
-            v_page = (
-                v_pages.index_select(0, page_idx)
-                .permute(1, 0, 2, 3)
-                .reshape(num_kv_heads, width * block_size, head_size)
-                .unsqueeze(1)
-            )
-            mask_tile = torch.cat(mask_tiles[group_start:group_end], dim=-1)
+            # One gather per page, joined along the token axis -- not one wide gather
+            # permuted into shape. Pages are [page, kv, block, head], so folding
+            # group x block puts the kv axis between the two merged axes: the merge is
+            # not viewable and lowers to a strided copy whose address map the backend
+            # cannot express ("Unexpected stick expression"). cat builds the same tensor
+            # contiguously, and runs inside the traced region so it yields a real
+            # offset-0 tensor rather than a view whose offset is dropped crossing the
+            # argument boundary (torch-spyre#3770).
+            group = slice(group_start, group_end)
+            k_page = torch.cat(
+                [k_pages.index_select(0, idx).squeeze(0) for idx in page_index_tables[group]],
+                dim=1,
+            ).unsqueeze(1)
+            v_page = torch.cat(
+                [v_pages.index_select(0, idx).squeeze(0) for idx in page_index_tables[group]],
+                dim=1,
+            ).unsqueeze(1)
+            mask_tile = torch.cat(mask_tiles[group], dim=-1)
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:

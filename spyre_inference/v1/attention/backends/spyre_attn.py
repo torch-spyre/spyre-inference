@@ -49,6 +49,10 @@ from spyre_inference.v1.attention.ops.layout import (
     stick_aligned_len,
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+from spyre_inference.v1.attention.ops.page_group import (
+    derive_page_group,
+    grouping_unsupported_reason,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
@@ -1103,6 +1107,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     via torch.compile, with their loop counts passed as arguments.
     """
 
+    # Derived group widths worth taking on this layout. Token-major merges a group's
+    # pages with a free view, so every width the hardware permits pays; a layout that
+    # copies instead narrows the band (see SpyreHeadMajorAttentionImpl).
+    _min_page_group: int = 1
+    _max_page_group: int | None = None
+
     def __init__(
         self,
         num_heads: int,
@@ -1130,9 +1140,39 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        # 0 means "derive from the hardware" (see ``ops/page_group.py``): the widest
+        # group that fits a core's LX scratchpad and the gather's addressing span.
         self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
-        if self._page_group < 1:
-            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}")
+        if self._page_group < 0:
+            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 0, got {self._page_group}")
+        if sliding_window is not None and self._page_group == 0:
+            # Derivation cannot help here for the reason the explicit path is
+            # rejected below, and a windowed model must not fail just because the
+            # width is left to us.
+            self._page_group = 1
+        # Read at construction: forward() runs past a custom-op boundary that loses
+        # the config. The builder asserts it matches the KV cache spec's block size.
+        self.block_size: int = get_current_vllm_config().cache_config.block_size
+        self._derived_page_groups: dict[tuple[int, int], int] = {}
+
+        # Grouping is also refused outright by the toolchain for some head shapes and
+        # in eager mode (see ops/page_group.py). Resolved once so the banner can say
+        # why a derived width never exceeds 1, and so an explicit width that is
+        # heading for a compile-time assertion says so before warmup does.
+        self._no_grouping_reason = grouping_unsupported_reason(
+            num_kv_heads=num_kv_heads,
+            num_queries_per_kv=self.num_queries_per_kv,
+            compiled=self._compile_attn,
+        )
+        if self._page_group > 1 and self._no_grouping_reason:
+            # Warn rather than raise: the law is empirical, and a pinned width is the
+            # escape hatch for exactly the case where it is wrong.
+            logger.warning_once(
+                "SPYRE_ATTN_PAGE_GROUP=%d is not expected to compile here (%s); "
+                "use 0 to let the hardware choose",
+                self._page_group,
+                self._no_grouping_reason,
+            )
         if sliding_window is not None and self._page_group != 1:
             # A window leaves the block count unpadded (see _record_one), so the tail
             # group takes an arbitrary width and Dynamo specializes on each one --
@@ -1199,6 +1239,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
+        # At INFO so a run's log states which page-group policy produced it; the
+        # per-bucket widths follow from _page_group_for_query.
+        if self._page_group != 0:
+            _policy = f"pinned to {self._page_group} (SPYRE_ATTN_PAGE_GROUP)"
+        elif self._no_grouping_reason:
+            _policy = f"derived as 1, grouping unavailable: {self._no_grouping_reason}"
+        else:
+            _policy = "derived per attention bucket from the hardware (SPYRE_ATTN_PAGE_GROUP=0)"
+        logger.info_once("KV page group: %s", _policy)
 
     def _staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Constant-shaped query and output buffers the kernel is called on.
@@ -1231,14 +1280,47 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
-    def _page_group_for_query(self, query_len: int) -> int:
+    def _page_group_for_query(self, query_len: int, num_blocks: int) -> int:
         """Group pages only for multi-token prefill/chunked-prefill sequences.
 
         At one query row the page transfer, not the online-softmax bookkeeping, is the
         cost, so grouping buys nothing there and would fragment the decode variants the
         recorder covers.
+
+        With ``SPYRE_ATTN_PAGE_GROUP=0`` the width comes from the hardware. It is keyed
+        on the same ``(num_blocks, query_len)`` the recorder buckets on and that Dynamo
+        already specializes, so deriving per bucket adds no warmup variants.
         """
-        return self._page_group if query_len > 1 else 1
+        if query_len <= 1:
+            return 1
+        if self._page_group:
+            return self._page_group
+        key = (num_blocks, query_len)
+        width = self._derived_page_groups.get(key)
+        if width is None:
+            width = derive_page_group(
+                num_blocks=num_blocks,
+                padded_query_len=query_len,
+                num_kv_heads=self.num_kv_heads,
+                num_queries_per_kv=self.num_queries_per_kv,
+                head_size=self.head_size,
+                block_size=self.block_size,
+                element_size=self.model_dtype.itemsize,
+                compiled=self._compile_attn,
+                min_width=self._min_page_group,
+                max_width=self._max_page_group,
+            )
+            self._derived_page_groups[key] = width
+            # INFO only where grouping actually engages: a width of 1 is the
+            # unremarkable case and every long-query bucket lands there.
+            log = logger.info if width > 1 else logger.debug
+            log(
+                "derived page group %d for num_blocks=%d padded_query_len=%d",
+                width,
+                num_blocks,
+                query_len,
+            )
+        return width
 
     def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
@@ -1769,7 +1851,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
-            self._page_group_for_query(padded_query_len),
+            self._page_group_for_query(padded_query_len, num_blocks),
             alibi_bias_tiles,
             out,
         )

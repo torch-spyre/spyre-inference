@@ -29,7 +29,6 @@ parameterised. This layout does not carry ALiBi.
 import contextlib
 
 import torch
-from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -131,10 +130,32 @@ class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
 class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache."""
 
+    # This layout cannot merge a group's pages with a view -- the kv axis sits between
+    # the two axes being merged -- so the prefill kernel concatenates them, paying a copy
+    # per group that token-major does not. Measured end to end on AIU, each sample against
+    # its own baseline: width 2 is a net loss (P99 ITL +4.1%, +4.6%) while width 4 wins
+    # (-6.4%, -6.5%). Wider is unmeasured here, so 4 is the whole band -- either the
+    # hardware permits it or this layout declines to group.
+    _min_page_group = 4
+    _max_page_group = 4
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # At construction: forward() runs past a custom-op boundary that loses the config.
-        self.block_size: int = get_current_vllm_config().cache_config.block_size
+        pinned = self._page_group
+        too_narrow = 1 < pinned < self._min_page_group
+        too_wide = self._max_page_group is not None and pinned > self._max_page_group
+        if too_narrow or too_wide:
+            # Warn rather than raise, as the base does for a width the toolchain is
+            # expected to refuse: the band is empirical, and pinning is the escape hatch
+            # for exactly the case where it is wrong.
+            logger.warning_once(
+                "SPYRE_ATTN_PAGE_GROUP=%d is outside the head-major layout's measured "
+                "band [%d, %d], where narrower widths measured slower than not grouping; "
+                "use 0 to let the hardware choose",
+                pinned,
+                self._min_page_group,
+                self._max_page_group,
+            )
 
         self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
         # Always the compiled kernel, even under --enforce-eager: the gather that keeps a
@@ -305,7 +326,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.head_size,
                     self.block_size,
                     self.logits_soft_cap,
-                    self._page_group_for_query(padded_query_len),
+                    self._page_group_for_query(padded_query_len, num_blocks),
                     out,
                 )
 

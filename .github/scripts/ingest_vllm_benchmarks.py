@@ -580,13 +580,20 @@ _BENCH_ID_KEYS = ("record_type", "run_mode", "tensor_parallel", "input_len", "ou
 # the cross-writer contract; benchmark_id is this producer's own, and pinned for the same
 # reason: benchmarks dedups across runs on it, so a re-key silently forks every trend line.
 IDENTITY_GOLDENS = (
-    (run_id_of, ("gha", "12345", "amd64", "integration"), "dab2a67f-14bf-53be-b6e4-fc9642086e47"),
     (
+        "run_id_of",
+        run_id_of,
+        ("gha", "12345", "amd64", "integration"),
+        "dab2a67f-14bf-53be-b6e4-fc9642086e47",
+    ),
+    (
+        "artifact_id_for",
         artifact_id_for,
         ("torch-spyre", "flex-rpm", "abc123def456", "amd64"),
         "86a5c6e3-bd2f-5d27-9a8f-9b8d23efc65b",
     ),
     (
+        "benchmark_id_for",
         benchmark_id_for,
         (
             BENCH_COMPONENT,

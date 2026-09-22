@@ -2111,7 +2111,7 @@ def test_spyre_attn_batched_decode_sliding_window(
     ],
 )
 def test_bucketed_block_ids_match_scalar_fill(
-    default_vllm_config, kv_lens: list[int], sliding_window: int | None
+    default_vllm_config, enable_batched_decode, kv_lens: list[int], sliding_window: int | None
 ) -> None:
     block_size = 64
     seq_lens = [(1, kv) for kv in kv_lens]
@@ -2144,6 +2144,31 @@ def test_bucketed_block_ids_match_scalar_fill(
             )
         for b in range(n_use, b_blocks):
             assert got[b, s].item() == 0, f"seq={s} block={b} (past end): got {got[b, s].item()}"
+
+
+@pytest.mark.parametrize("batched_decode", ["0", "1"])
+def test_batched_decode_metadata_follows_env(
+    default_vllm_config, monkeypatch, batched_decode: str
+) -> None:
+    """build() computes the batched-decode metadata only when the path is enabled.
+
+    With the env off the fields stay None at any batch size, so anything reading them
+    must gate on the same flag — `_batched_decode_preconditions_met` does.
+    """
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", batched_decode)
+    # 4 decode seqs: at or above _MIN_BATCHED_SEQS, so the count is not what gates here.
+    metadata = _padded_mask_metadata([(1, 256)] * 4, block_size=64)
+
+    if batched_decode == "1":
+        assert metadata.padded_num_seqs is not None
+        assert metadata.padded_batch_blocks is not None
+        assert metadata.rep_row_ids_cpu is not None
+        assert metadata.chunk_page_ids_cpu is not None
+    else:
+        assert metadata.padded_num_seqs is None
+        assert metadata.padded_batch_blocks is None
+        assert metadata.rep_row_ids_cpu is None
+        assert metadata.chunk_page_ids_cpu is None
 
 
 @pytest.mark.parametrize(

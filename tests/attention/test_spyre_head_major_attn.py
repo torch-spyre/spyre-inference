@@ -857,7 +857,7 @@ def test_page_attn_head_major_matches_fp32_reference():
     v = torch.randn(blocks * kv, block, d)
     # The kernel reads its row out of a wider staging buffer, and not the first one.
     query = torch.randn(3, heads, d)
-    rows = torch.tensor([2, 0, 1], dtype=torch.int32)
+    rows = torch.tensor([2], dtype=torch.int32)
     kv_tables = [
         torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
     ]

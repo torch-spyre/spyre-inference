@@ -50,8 +50,8 @@ def page_attn_head_major_decode_kernel(
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
-        query_row_index: int32 device tensor whose first padded_query_len entries are this
-            sequence's absolute query rows.
+        query_row_index: [padded_query_len] int32 device tensor of this sequence's
+            absolute query rows.
         k_pages / v_pages: [num_pages_total * num_kv_heads, block_size, head_size]
         kv_index_tables: per active block, a [num_kv_heads, 1] int32 device tensor of that
             block's ``page * num_kv_heads + kv`` rows. One real tensor per block, not a
@@ -65,8 +65,7 @@ def page_attn_head_major_decode_kernel(
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     num_queries_per_kv = num_heads // num_kv_heads
 
-    row = query_row_index[:1]
-    q = query.index_select(0, row).reshape(num_kv_heads, num_queries_per_kv, head_size)
+    q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
 
     tile_max = None
     tile_sum = None
@@ -111,6 +110,6 @@ def page_attn_head_major_decode_kernel(
     assert tile_out is not None and tile_sum is not None
     attn = (tile_out / tile_sum).reshape(1, num_heads, head_size)
     if out is not None:
-        out.index_copy_(0, row, attn)
+        out.index_copy_(0, query_row_index, attn)
         return out
     return attn

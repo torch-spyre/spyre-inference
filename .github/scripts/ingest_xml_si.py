@@ -17,6 +17,8 @@
 Parses spyre-inference's pytest JUnit XML into si_test_runs / si_test_cases /
 si_run_properties.
 
+Schema-v2 is written by the workflow's own ingest-xml-to-clickhouse call, not this script.
+
 Usage (called by the GHA workflow):
     python3 ingest_xml_si.py \
         --xml-dir xml_artifacts \
@@ -39,22 +41,8 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
-from ingest_identity import golden_drift, library_provenance
 from lxml import etree
-from spyre_clickhouse_ingest import (
-    case_id_for,
-    cases_already_ingested,
-    component_of,
-    extract_properties,
-    get_client,
-    insert_test_results,
-    promote_xpass,
-    run_id_for,
-    run_id_of,
-    source_and_external_run_id,
-    tables_present,
-    target_database,
-)
+from spyre_clickhouse_ingest import extract_properties, get_client, promote_xpass
 
 # ---------------------------------------------------------------------------
 # si_test_runs / si_test_cases / si_run_properties are provisioned out of
@@ -312,62 +300,6 @@ def _threaded_run_id(args) -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# ── SCHEMA v2: test_cases + test_case_runs ─────────────────────────────────
-#
-# ADDITIVE. Everything above still writes the v1 tables exactly as before; this
-# path writes the two v2 tables alongside them and is skipped entirely if they do
-# not exist, so the script is safe to deploy before the v2 migration lands.
-#
-# Both ids are DERIVED, never minted. Four writers (this script, the two sibling
-# product ingests, and the orchestrator's pushToClickhouse.pushArtifactResult)
-# compute them independently with no threading contract -- which is the only thing
-# that makes the tables joinable: v1 minted four unrelated identity schemes and
-# artifact_results.run_id consequently joined test_runs.run_id in 2 of 1,266 rows.
-#
-# BYTE-EXACTNESS IS THE CONTRACT. Disagree about the namespace, the separator, the
-# field order or the normalisation and you mint a different uuid for the same row --
-# and an orphaned row is indistinguishable from "no tests ran", so the failure is
-# silent. The reference implementation, its rule list and the golden values every
-# port must reproduce live in spyre-frameworks pipelines/lib/run_identity.py and
-# pipelines/lib/test_run_identity.py. Keep this block in sync with it.
-# ---------------------------------------------------------------------------
-
-# The product this script ingests for. Replaces v1's hf_/si_ table-name prefixes: one
-# v2 table pair serves all three products, discriminated by this column. It is also a
-# test_case_id hash input, so it cannot drift from the identity it is stamped on.
-COMPONENT_DEFAULT = "spyre-inference"
-
-# The two identities this script writes, pinned as literals against the library that mints
-# them. Installed from a floating `@main`, so the job that WRITES has to check them --
-# ingest_identity says why the test-time goldens are not enough.
-IDENTITY_GOLDENS = (
-    (run_id_of, ("gha", "123", "x86_64", "regression"), "1a6080e8-d061-547f-ab63-1af99b18ad0c"),
-    (
-        case_id_for,
-        ("torch-spyre", "test_ops", "test_add", ["testtype__trunk", "platform__x86_64"]),
-        "2f0e2626-3b33-56c7-9019-fb261450c7aa",
-    ),
-)
-
-
-def _leg_arch(xml_path: Path) -> str:
-    """The arch recorded beside this leg's XML by run-matrix-config, or "".
-
-    Per FILE, not per run: arch is hashed into run_id, and this ingest is pinned to x86_64, so one
-    run-wide value would mislabel every non-x86 leg into a colliding id.
-    """
-    sidecar = xml_path.with_name(xml_path.stem.replace("junit-", "leg-arch-") + ".txt")
-    for candidate in (sidecar, *sorted(xml_path.parent.glob("leg-arch-*.txt"))):
-        try:
-            arch = candidate.read_text().strip()
-        except OSError:
-            continue
-        if arch:
-            return arch
-    return ""
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml-dir", default=None)
@@ -376,23 +308,9 @@ def main():
     parser.add_argument("--branch", default="")
     parser.add_argument("--sha", default="")
     parser.add_argument("--run-id", default="")
-    parser.add_argument(
-        "--component",
-        default="",
-        help="Component to stamp on v2 rows. Defaults to this repo's own product; set it "
-        "when a cell runs ANOTHER component's suite through this script, so the rows (and "
-        "the test_case_id they hash into) name the suite's real owner.",
-    )
     parser.add_argument("--gha-run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
-    parser.add_argument(
-        "--jenkins-run-key",
-        default="",
-        help="This leg's own Jenkins externalizable id, e.g. 'Spyre/component-build#417'. "
-        "Hashed into the schema-v2 run_id, which is how the orchestrator's "
-        "artifact_results row and these per-case rows join without threading a uuid.",
-    )
     parser.add_argument(
         "--trigger-type",
         default="",
@@ -401,40 +319,14 @@ def main():
     parser.add_argument(
         "--platform",
         default=_platform.machine() or "",
-        help="Hardware platform the SUITE ran on, e.g. x86_64 | s390x | ppc64le. Folded into "
-        "the run_id hash, so a wrong value mints an id that joins to nothing: pass it "
-        "explicitly whenever the ingest does not run on the test host (the workflow_run "
-        "ingest does not -- it is pinned to x86_64). The default is the INGEST host's arch, "
-        "correct only for a direct run. An empty value makes run_id_of refuse to derive an "
-        "id, so every row lands unjoinable.",
+        help="Hardware platform the SUITE ran on, e.g. x86_64 | s390x | ppc64le.",
     )
     parser.add_argument(
         "--img-digest",
         default="",
         help="Digest of the runner image the suite ran against, if known",
     )
-    # Which schema generation to write. Defaults to v1 ONLY, so an un-updated caller behaves
-    # exactly as before -- this script runs from a BAKED image, so old and new images coexist
-    # until every product image is rebuilt.
-    #
-    # v1 is not a permanent home: v2 replaces these tables outright. run_properties becomes
-    # test_cases.tags, and the per-product test_runs/test_cases collapse into the shared
-    # test_cases + test_case_runs keyed by component -- which is why the spyre-frameworks v2
-    # DDL deliberately does not define them. No data is ported: v1 rows cannot produce a v2
-    # run_id, since the hash inputs were never recorded per row. New data only.
-    parser.add_argument(
-        "--schema",
-        choices=["v1", "v2", "both"],
-        default=os.environ.get("INGEST_SCHEMA", "v1"),
-        help="Which schema generation to write: v1 (default, the legacy per-product tables), "
-        "v2 (the shared replacement tables only), or both (the migration window). Also "
-        "settable via INGEST_SCHEMA so a workflow can set it once for every leg.",
-    )
     args = parser.parse_args()
-    # Resolved once, so the two paths cannot drift into disagreeing about what was asked for.
-    args.write_v1 = args.schema in ("v1", "both")
-    args.write_v2 = args.schema in ("v2", "both")
-    print(f"  schema={args.schema} (v1={args.write_v1} v2={args.write_v2})")
 
     if args.xml_file:
         xml_root = Path(args.xml_file).parent
@@ -455,36 +347,11 @@ def main():
         f"{os.environ['CLICKHOUSE_HOST']}:{os.environ.get('CLICKHOUSE_PORT', 443)} ..."
     )
     client = get_client()
-    # One client, both generations: v2 is reached by QUALIFYING every statement with this
-    # database name (see target_database). "" means v2 is not configured.
-    v2db = target_database() if args.write_v2 else ""
-    if args.write_v2 and not v2db:
-        print(
-            "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
-            file=sys.stderr,
-        )
-    if v2db:
-        # Printed whether or not it drifted: this is what attributes a row to the code that
-        # wrote it once `main` has moved past it.
-        print(f"  v2 identity: {library_provenance()}")
-        drift = golden_drift(IDENTITY_GOLDENS)
-        if drift:
-            # ::error:: so it is an annotation, not a line in a 10k-line log. v1 still runs:
-            # the drift costs v2 visibility, and writing ids nothing else can join costs more.
-            print(
-                "::error::v2 skipped — the shared identity library no longer mints the ids "
-                "this ingest was built against, so its rows would not join any other "
-                f"writer's: {'; '.join(drift)}",
-                file=sys.stderr,
-            )
-            v2db = ""
     client.command("SELECT 1")
     print("Connected.\n")
 
     db = os.environ.get("CLICKHOUSE_DB", "spyre")
-    # Gated on write_v1: this checks a V1 table, so under --schema v2 an absent v1 schema
-    # is expected, not a reason to abort before the v2 write runs.
-    if args.write_v1 and not tables_exist(client, db):
+    if not tables_exist(client, db):
         print(f"{db}.si_test_runs does not exist — nothing to ingest into. Silent no-op.")
         sys.exit(0)
 
@@ -516,25 +383,22 @@ def main():
         # but two distinct runs must never collapse. runner_run_id mirrors run_id for a
         # Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
         runner_run_id = _runner_run_id(args, run_id)
-        # v1-table reads, so gated on v1 being written. v2 dedups against its own
-        # table via cases_already_ingested(run_id, component).
-        if args.write_v1:
+        existing = client.query(
+            "SELECT count() FROM si_test_runs "
+            "WHERE run_id = {run_id:String} AND filename = {filename:String}",
+            parameters={"run_id": run_id, "filename": run["filename"]},
+        )
+        if existing.result_rows[0][0] == 0 and runner_run_id and runner_run_id != run_id:
+            # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric
+            # run id to keep that path idempotent.
             existing = client.query(
-                "SELECT count() FROM si_test_runs "
-                "WHERE run_id = {run_id:String} AND filename = {filename:String}",
-                parameters={"run_id": run_id, "filename": run["filename"]},
+                "SELECT count() FROM si_test_runs WHERE "
+                "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
+                parameters={"runner_run_id": runner_run_id, "filename": run["filename"]},
             )
-            if existing.result_rows[0][0] == 0 and runner_run_id and runner_run_id != run_id:
-                # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric
-                # run id to keep that path idempotent.
-                existing = client.query(
-                    "SELECT count() FROM si_test_runs WHERE "
-                    "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
-                    parameters={"runner_run_id": runner_run_id, "filename": run["filename"]},
-                )
-            if existing.result_rows[0][0] > 0:
-                print(f"  Already ingested — skipping {run['filename']}")
-                continue
+        if existing.result_rows[0][0] > 0:
+            print(f"  Already ingested — skipping {run['filename']}")
+            continue
 
         print(
             f"  run_id={run_id}  tests={run['total_tests']}  "
@@ -542,49 +406,15 @@ def main():
             f"xpass={run['xpass']}  xfail={run['xfail']}  skipped={run['skipped']}"
         )
 
-        if args.write_v1:
-            insert_run(client, run_id, run, args)
-            insert_cases(client, run_id, cases, workflow=args.workflow)
-            insert_properties(client, run_id, cases)
-        # v2 tables, alongside v1. Failure here must never cost a v1 row: v1 is still
-        # authoritative, so the experimental write is contained rather than allowed to
-        # abort the loop and drop every remaining file's v1 insert.
-        try:
-            if v2db and tables_present(client, v2db):
-                _v2_source, _v2_ext = source_and_external_run_id(args, run_id)
-                _v2_tier = (getattr(args, "trigger_type", "") or "").strip()
-                _v2_arch = (
-                    _leg_arch(xml_path) or args.platform or run.get("platform") or ""
-                ).strip()
-                _v2_run_id = run_id_for(args, run_id, _v2_arch, _v2_tier)
-                # Resolved once: the dedup probe and the insert must agree, since
-                # component hashes into test_case_id.
-                _v2_comp = component_of(args, COMPONENT_DEFAULT)
-                if not _v2_run_id:
-                    # Loud, because a blank run_id means these cases reach v2 unjoinable
-                    # to any artifact -- and that reads downstream as "no tests ran".
-                    print(
-                        f"  [warn] v2 skipped: run_id not derivable "
-                        f"(source={_v2_source} ext={_v2_ext!r} arch={_v2_arch!r} "
-                        f"tier={_v2_tier!r}); --trigger-type is the field usually missing",
-                        file=sys.stderr,
-                    )
-                elif cases_already_ingested(client, v2db, _v2_run_id, _v2_comp, xml_path.name):
-                    print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
-                else:
-                    _n = insert_test_results(
-                        client, v2db, _v2_comp, _v2_run_id, cases, xml_path.name
-                    )
-                    print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
-        except Exception as _v2_err:
-            print(f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}", file=sys.stderr)
+        insert_run(client, run_id, run, args)
+        insert_cases(client, run_id, cases, workflow=args.workflow)
+        insert_properties(client, run_id, cases)
 
         total_cases += len(cases)
-        if args.write_v1:
-            print(
-                f"  Inserted {len(cases)} test cases + "
-                f"{sum(len(c['properties']) for c in cases)} properties"
-            )
+        print(
+            f"  Inserted {len(cases)} test cases + "
+            f"{sum(len(c['properties']) for c in cases)} properties"
+        )
 
     print(f"\nDone. {len(xml_files)} file(s) processed.")
     print(f"  Test cases ingested:  {total_cases}")

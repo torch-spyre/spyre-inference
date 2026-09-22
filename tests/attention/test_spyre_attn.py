@@ -26,6 +26,7 @@ from spyre_testing_plugin.attn_helpers import (
     ref_attn,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -40,9 +41,307 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _mirror_mask_tiles,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+from spyre_inference.v1.attention.ops.page_group import (
+    derive_page_group,
+    grouping_unsupported_reason,
+    max_span_width,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
+
+
+@pytest.mark.parametrize("query_len", [1, 7])
+@pytest.mark.parametrize("page_group", [2, 3, 4, 8])
+@pytest.mark.parametrize("with_alibi", [False, True])
+def test_page_group_tail_matches_single_page_attention(query_len, page_group, with_alibi):
+    """Grouping is a reassociation of the online softmax, so it must not change the result.
+
+    5 blocks against groups of 2/3/4 exercises a short tail group, and group 8 a group
+    wider than the whole context.
+    """
+    generator = torch.Generator(device="cpu").manual_seed(0)
+    num_blocks, num_pages = 5, 8
+    num_heads, num_kv_heads = 4, 2
+    head_size, block_size = 16, 8
+    qpk = num_heads // num_kv_heads
+
+    query = torch.randn(query_len + 1, num_heads, head_size, generator=generator)
+    query_rows = torch.arange(query_len, dtype=torch.int32)
+    k_pages = torch.randn(num_pages, block_size, num_kv_heads, head_size, generator=generator)
+    v_pages = torch.randn(num_pages, block_size, num_kv_heads, head_size, generator=generator)
+    # Non-contiguous page ids: a grouped gather must still follow the table, not a range.
+    page_table = torch.zeros(num_blocks, 32, dtype=torch.int32)
+    page_table[:, 0] = torch.tensor([6, 1, 7, 3, 2], dtype=torch.int32)
+    masks = [torch.zeros(query_len, block_size) for _ in range(num_blocks)]
+    masks[-1][:, block_size // 2 :] = torch.finfo(torch.float32).min
+    alibi = None
+    if with_alibi:
+        alibi = [
+            torch.randn(num_kv_heads, qpk, 1, block_size, generator=generator) * 0.01
+            for _ in range(num_blocks)
+        ]
+
+    head = (
+        query,
+        query_rows,
+        k_pages,
+        v_pages,
+        page_table,
+        masks,
+        head_size**-0.5,
+        num_blocks,
+        query_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        2.0,
+    )
+    expected = page_attn_kernel(*head, 1, alibi, None)
+    actual = page_attn_kernel(*head, page_group, alibi, None)
+
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("page_group", [-1, -8])
+def test_invalid_page_group_is_rejected(default_vllm_config, monkeypatch, page_group):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", str(page_group))
+    with pytest.raises(ValueError, match="SPYRE_ATTN_PAGE_GROUP must be >= 0"):
+        SpyreAttentionImpl(
+            num_heads=4,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=2,
+        )
+
+
+def test_page_group_rejects_sliding_window(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "2")
+    with pytest.raises(ValueError, match="sliding-window"):
+        SpyreAttentionImpl(
+            num_heads=4,
+            head_size=64,
+            scale=0.125,
+            num_kv_heads=2,
+            sliding_window=128,
+        )
+
+
+def test_page_group_is_used_only_for_multi_token_queries(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "8")
+    impl = SpyreAttentionImpl(
+        num_heads=4,
+        head_size=64,
+        scale=0.125,
+        num_kv_heads=2,
+    )
+
+    assert impl._page_group_for_query(1, 16) == 1
+    assert impl._page_group_for_query(2, 16) == 8
+    assert impl._page_group_for_query(512, 16) == 8
+
+
+# The shape the widths were calibrated on: granite-3.3-8b at 32 cores, fp16.
+_GRANITE = dict(
+    num_kv_heads=8,
+    num_queries_per_kv=4,
+    head_size=128,
+    block_size=128,
+    element_size=2,
+    cores=32,
+    budget_bytes=1_625_344,
+)
+
+
+@pytest.mark.parametrize(
+    ("padded_query_len", "expected"),
+    [(128, 8), (256, 8), (512, 4), (1024, 2)],
+)
+def test_derived_page_group_matches_measured_widths(padded_query_len, expected):
+    """Anchor the derivation to the widths measured on device.
+
+    A wider group needs a proportionally wider score matmul, so the admissible
+    width falls as the query grows. These four points were swept on AIU; see
+    ``vllm_spyre_next/ZRL/claude/2026-09-21_kv_page_group_lx_capacity.md``.
+    """
+    derived = derive_page_group(num_blocks=64, padded_query_len=padded_query_len, **_GRANITE)
+    assert derived == expected
+
+
+def test_derived_page_group_never_grows_with_query_length():
+    widths = [
+        derive_page_group(num_blocks=64, padded_query_len=q, **_GRANITE)
+        for q in (8, 32, 64, 128, 256, 512, 1024)
+    ]
+    assert widths == sorted(widths, reverse=True)
+
+
+def test_derived_page_group_is_capped_by_addressing_span():
+    """A short query has LX to spare, but the gather's per-core span is hard-limited."""
+    assert derive_page_group(num_blocks=1024, padded_query_len=8, **_GRANITE) == 8
+
+
+def test_derived_page_group_needs_enough_pages_to_pay_off():
+    """Grouping is declined on the small KV buckets, where it measures slower.
+
+    The capacity ceilings alone would group a 4- or 8-block bucket at width 4, which made
+    prompts whose whole context fits in 8 blocks 21% slower end to end than ungrouped.
+    See ``_MIN_GROUPED_BLOCKS``.
+    """
+    small = [derive_page_group(num_blocks=nb, padded_query_len=512, **_GRANITE) for nb in (2, 4, 8)]
+    assert small == [1, 1, 1]
+    assert derive_page_group(num_blocks=16, padded_query_len=512, **_GRANITE) > 1
+
+
+def test_derived_page_group_declines_a_width_below_the_layout_minimum():
+    """A layout that only pays from width 4 gets 4 or nothing, never the narrower 2.
+
+    The ceilings above are properties of the hardware; whether a width they permit
+    actually pays is a property of the KV layout's group assembly. Where the ceilings
+    admit only 2, a layout whose minimum is 4 declines to group rather than take a width
+    measured slower than not grouping.
+    """
+    band = dict(min_width=4, max_width=4)
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **_GRANITE) == 8
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **_GRANITE, **band) == 4
+    # LX admits only 2 at this query length, which is below the band.
+    assert derive_page_group(num_blocks=64, padded_query_len=1024, **_GRANITE) == 2
+    assert derive_page_group(num_blocks=64, padded_query_len=1024, **_GRANITE, **band) == 1
+
+
+@pytest.mark.parametrize("halved", ["num_kv_heads", "head_size", "block_size"])
+def test_span_ceiling_scales_with_the_gathered_bytes(halved):
+    """The span tracks the gather's byte size, so a smaller page buys width.
+
+    Measured on AIU: at the granite shape a width of 16 is refused at compile time,
+    and halving any one of these three admits it.
+    """
+    shape = dict(num_kv_heads=8, head_size=128, block_size=128, element_size=2)
+    assert max_span_width(**shape) == 8
+    assert max_span_width(**{**shape, halved: shape[halved] // 2}) == 16
+
+
+def test_derived_page_group_never_exceeds_the_block_count():
+    """A bucket cannot be grouped wider than the pages it holds.
+
+    The binding example needs a bucket above ``_MIN_GROUPED_BLOCKS`` that is still
+    inside the addressing span, so it uses a smaller page than ``_GRANITE``: at
+    ``block_size=128`` the span caps the width at 8 before the block count can.
+    """
+    shape = {**_GRANITE, "block_size": 32}
+    assert derive_page_group(num_blocks=20, padded_query_len=8, **shape) == 20
+    for num_blocks in (16, 32, 64):
+        derived = derive_page_group(num_blocks=num_blocks, padded_query_len=8, **shape)
+        assert derived <= num_blocks
+
+
+def test_derived_page_group_is_one_for_decode():
+    assert derive_page_group(num_blocks=64, padded_query_len=1, **_GRANITE) == 1
+
+
+@pytest.fixture()
+def eager_attention(default_vllm_config):
+    """Present the run as eager.
+
+    ``VllmConfig`` resolves the fixture's unset compilation mode to STOCK, so the impl
+    reads the default fixture as compiled -- and grouping is compiled-only, so the eager
+    side of that law needs the mode said out loud.
+    """
+    get_current_vllm_config().compilation_config.mode = CompilationMode.NONE
+    yield
+
+
+def test_page_group_auto_derives_a_width_per_bucket(default_vllm_config, monkeypatch):
+    """The default asks the hardware, and a wider query gets a narrower group."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(1, 64) == 1
+    wide_query = impl._page_group_for_query(2048, 64)
+    narrow_query = impl._page_group_for_query(128, 64)
+    assert 1 <= wide_query < narrow_query
+
+
+# Two compile-time refusals the sizing model cannot see, both mapped on AIU over a
+# head-shape x width x block-size grid; see
+# ``vllm_spyre_next/ZRL/claude/2026-09-21_kv_page_group_lx_capacity.md``. A width the
+# compiler refuses is worse than one that is merely slow, so the derivation must never
+# propose one.
+
+
+@pytest.mark.parametrize(
+    ("num_kv_heads", "num_queries_per_kv"),
+    [(8, 1), (1, 8), (32, 1)],  # mha, mqa, and mha at 32 heads
+)
+def test_derived_page_group_is_one_without_a_reusable_batch_dim(num_kv_heads, num_queries_per_kv):
+    """The DXP scheduler asserts on a singleton batch dim, in both compile modes.
+
+    Not a head-count law: (32, 1) is refused and (2, 4) accepted at the same 8 or 32
+    heads, so what matters is that both dims exceed 1.
+    """
+    shape = {**_GRANITE, "num_kv_heads": num_kv_heads, "num_queries_per_kv": num_queries_per_kv}
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **shape) == 1
+    assert derive_page_group(num_blocks=64, padded_query_len=128, **_GRANITE) > 1
+
+
+def test_derived_page_group_is_one_in_eager_mode():
+    """Inductor cannot resolve the grouped stick layout when each group is dispatched
+    on its own; the same shapes compile and run under ``torch.compile``."""
+    assert derive_page_group(num_blocks=64, padded_query_len=128, compiled=False, **_GRANITE) == 1
+
+
+def test_grouping_unsupported_reason_names_the_limit():
+    """The reason reaches the log, so it has to say which limit refused."""
+    assert grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=4, compiled=True) is None
+    eager = grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=4, compiled=False)
+    assert eager is not None and "eager" in eager
+    mha = grouping_unsupported_reason(num_kv_heads=8, num_queries_per_kv=1, compiled=True)
+    assert mha is not None and "num_queries_per_kv=1" in mha
+
+
+def test_page_group_auto_is_one_for_eager_attention(eager_attention, monkeypatch):
+    """Same shape that derives 8 compiled; eager it has to stay at 1."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 64) == 1
+
+
+def test_page_group_auto_is_one_for_mha(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = SpyreAttentionImpl(num_heads=8, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 64) == 1
+
+
+def test_explicit_page_group_survives_an_unsupported_shape(default_vllm_config, monkeypatch):
+    """The law is empirical, so a pinned width stays the escape hatch: warn, not raise."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "4")
+    impl = SpyreAttentionImpl(num_heads=8, head_size=128, scale=0.125, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 64) == 4
+
+
+def test_page_group_auto_falls_back_to_one_under_sliding_window(default_vllm_config, monkeypatch):
+    """A windowed model must not fail just because the width was left to us."""
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    impl = SpyreAttentionImpl(
+        num_heads=4,
+        head_size=64,
+        scale=0.125,
+        num_kv_heads=2,
+        sliding_window=128,
+    )
+
+    assert impl._page_group_for_query(512, 16) == 1
+
+
+def test_derived_page_group_shrinks_when_cores_are_capped():
+    """Each core owns ``ceil(heads / cores)`` head rows, so fewer cores cost width."""
+    wide = derive_page_group(num_blocks=64, padded_query_len=128, **_GRANITE)
+    narrow = derive_page_group(num_blocks=64, padded_query_len=128, **{**_GRANITE, "cores": 8})
+    assert narrow < wide
 
 
 @pytest.fixture()

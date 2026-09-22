@@ -18,12 +18,14 @@ Both backends share everything above the cache layout, which ``test_spyre_attn.p
 already covers, so this file exercises only what the layout changes.
 """
 
+import collections
 import gc
 from unittest.mock import Mock
 
 import pytest
 import torch
 from spyre_testing_plugin.pytest_plugin import spyre_available
+from torch.fx.experimental.proxy_tensor import make_fx
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -43,6 +45,9 @@ from spyre_inference.v1.attention.ops.batched_decode_head_major import (
 )
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
+)
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
 )
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
@@ -837,6 +842,129 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+@pytest.mark.parametrize("page_group", [2, 3, 4, 8])
+def test_prefill_page_group_matches_single_page(page_group):
+    """Grouping pages reassociates the online softmax, so the result must not move.
+
+    5 blocks against groups of 2/3/4 covers a short tail group, and group 8 a group wider
+    than the whole context.
+    """
+    set_random_seed(0)
+    kv, qpk, d, block, blocks = 2, 2, 16, 8, 5
+    heads, query_len = kv * qpk, 7
+    pages = [6, 1, 7, 3, 2]
+
+    k = torch.randn(8, kv, block, d)
+    v = torch.randn(8, kv, block, d)
+    query = torch.randn(query_len + 1, heads, d)
+    rows = torch.arange(query_len, dtype=torch.int32)
+    # Non-contiguous page ids: a grouped gather must follow the tables, not a range.
+    page_tables = [torch.tensor([p], dtype=torch.int32) for p in pages]
+    masks = [torch.zeros(query_len, block) for _ in range(blocks)]
+    masks[-1][:, block // 2 :] = torch.finfo(torch.float32).min
+
+    for soft_cap in (0.0, 30.0):
+        head = (
+            query,
+            rows,
+            k,
+            v,
+            page_tables,
+            masks,
+            d**-0.5,
+            blocks,
+            query_len,
+            heads,
+            kv,
+            d,
+            block,
+            soft_cap,
+        )
+        expected = page_attn_head_major_prefill_kernel(*head, 1, None)
+        actual = page_attn_head_major_prefill_kernel(*head, page_group, None)
+
+        assert actual.shape == expected.shape == (query_len, heads, d)
+        torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
+def test_prefill_page_group_gathers_each_page_separately():
+    """A group's pages must be joined by concatenation, not by reshaping one wide gather.
+
+    Pages are ``[page, kv, block, head]``, so folding ``group * block`` leaves the kv axis
+    between the two merged axes: that merge is not viewable and lowers to a strided copy
+    whose address map the backend rejects ("Unexpected stick expression"). The numeric test
+    above cannot see it -- the copy is arithmetically correct and fails only at device
+    lowering -- so pin the assembly instead of the result.
+    """
+    set_random_seed(0)
+    kv, qpk, d, block, blocks, page_group = 2, 2, 16, 8, 8, 4
+    heads, query_len = kv * qpk, 7
+
+    k = torch.randn(blocks, kv, block, d)
+    v = torch.randn(blocks, kv, block, d)
+    query = torch.randn(query_len + 1, heads, d)
+    rows = torch.arange(query_len, dtype=torch.int32)
+    tables = [torch.tensor([p], dtype=torch.int32) for p in range(blocks)]
+    masks = [torch.zeros(query_len, block) for _ in range(blocks)]
+
+    traced = make_fx(
+        lambda q, k_in, v_in: page_attn_head_major_prefill_kernel(
+            q,
+            rows,
+            k_in,
+            v_in,
+            tables,
+            masks,
+            d**-0.5,
+            blocks,
+            query_len,
+            heads,
+            kv,
+            d,
+            block,
+            0.0,
+            page_group,
+            None,
+        )
+    )(query, k, v)
+    ops = collections.Counter(
+        str(node.target) for node in traced.graph.nodes if node.op == "call_function"
+    )
+
+    # Reordering the gathered pages' axes is the merge this layout cannot express; the
+    # query's own transposes trace as aten.transpose, not aten.permute.
+    assert "aten.permute.default" not in ops
+    # One gather per page for k and for v, plus the one that stages the query rows.
+    assert ops["aten.index_select.default"] == 2 * blocks + 1
+
+
+def test_head_major_derives_a_page_group_of_four_or_declines(default_vllm_config, monkeypatch):
+    """This layout groups at width 4, and only where grouping pays at all.
+
+    Its assembly copies a group together where token-major views it, so the payoff band is
+    narrower: width 2 measured slower than not grouping. Everything outside the band --
+    a bucket below ``_MIN_GROUPED_BLOCKS``, a query long enough that LX admits only 2, or
+    a single decode row -- declines rather than taking a narrower width.
+    """
+    from vllm.config import get_current_vllm_config
+
+    # setenv, not setattr: envs resolves through a module __getattr__, so patching the
+    # attribute shadows the env lookup for every later test in the process.
+    monkeypatch.setenv("SPYRE_ATTN_PAGE_GROUP", "0")
+    # Through monkeypatch: the config is shared, and the widths below are the granite
+    # shape's, which is calibrated at this block size.
+    monkeypatch.setattr(get_current_vllm_config().cache_config, "block_size", 128)
+    impl = SpyreHeadMajorAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+
+    assert impl._page_group_for_query(128, 16) == 4
+    assert impl._page_group_for_query(512, 64) == 4
+    # Too few pages for grouping to earn its fixed cost.
+    assert impl._page_group_for_query(512, 8) == 1
+    # A query long enough that LX admits only 2, which is below the band.
+    assert impl._page_group_for_query(1024, 64) == 1
+    assert impl._page_group_for_query(1, 64) == 1
 
 
 def test_page_attn_head_major_matches_fp32_reference():

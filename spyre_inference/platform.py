@@ -299,6 +299,9 @@ class TorchSpyrePlatform(CpuPlatform):
             # Honor a user-set list (#638), including an empty one to opt out
             # of bucketing; otherwise generate defaults.
             if vllm_config.compilation_config.compile_sizes is not None:
+                # None only reaches us because this hook runs before
+                # post_init_cudagraph_sizes(), which rewrites None to [].
+                # Reorder those and defaults are never generated again.
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).

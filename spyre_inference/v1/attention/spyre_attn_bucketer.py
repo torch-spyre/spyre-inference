@@ -35,6 +35,7 @@ consecutive buckets is the *bucket step*.
 from __future__ import annotations
 
 import bisect
+import functools
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -57,6 +58,71 @@ _MIN_BATCHED_SEQS = 4
 
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
+
+
+def sliding_active_blocks(
+    kv_len: int, context_len: int, sliding_window: int, block_size: int
+) -> range:
+    """The block indices a windowed sequence attends to.
+
+    The count is what the per-sequence kernel specializes on, so the enumerator needs
+    this alone; ``sliding_tile_plan`` builds on it for the per-block mask content.
+    """
+    # Bound by the EARLIEST query's window, not the latest (``kv_len - W``): early queries
+    # in a prefill batch have earlier windows, and the latest would drop blocks they need.
+    first_active = max(0, context_len - sliding_window + 1) // block_size
+    return range(first_active, (kv_len + block_size - 1) // block_size)
+
+
+def sliding_tile_plan(
+    kv_len: int,
+    query_len: int,
+    context_len: int,
+    sliding_window: int,
+    block_size: int,
+    apply_causal_mask: bool,
+) -> tuple[list[int], tuple[bool, ...]]:
+    """``(active_block_indices, needs_real_tile_per_block)`` for a sliding-window sequence.
+
+    Active blocks are those whose mask contributes to at least one query's attention, i.e.
+    inside the earliest query's window. Classification, by absolute block index ``b``:
+
+      - ``[0, first_active)``:
+            entirely outside every query's window; dropped.
+      - ``[first_active, last_lower_boundary]``:
+            lower-boundary blocks -- the window cutoff falls inside them for at least one
+            query. Real tile, with per-query-row cutoffs. Collapses to a single block in
+            decode (``query_len == 1``).
+      - ``(last_lower_boundary, last_causal_interior]``:
+            interior blocks -- fully inside every query's window AND fully below the
+            earliest query's causal limit. Mask is all-zero, so no real tile.
+      - ``(last_causal_interior, last_block)``:
+            causal-boundary blocks -- inside every window, but early queries have causal
+            cutoffs falling inside them (prefill only). Real tile.
+      - ``last_block``:
+            upper-boundary block -- always has KV padding, plus causal cutoffs during
+            prefill. Real tile.
+
+    When those ranges overlap (short ``kv_len``, single-block sequence) the union gets real
+    tiles -- never a zero tile where content is needed.
+    """
+    num_blocks = (kv_len + block_size - 1) // block_size
+    # Blocks up to the latest query's window start can hold a per-query cutoff.
+    last_lower_boundary = max(0, kv_len - sliding_window) // block_size
+    # Fully below the earliest query's causal limit iff
+    # (b + 1) * block_size - 1 <= context_len. Decode applies no causal mask.
+    last_causal_interior = (
+        (context_len + 1) // block_size - 1 if apply_causal_mask else num_blocks - 1
+    )
+    last_block = num_blocks - 1
+    active = list(sliding_active_blocks(kv_len, context_len, sliding_window, block_size))
+    needs_real_tile: list[bool] = []
+    for b in active:
+        is_lower_boundary = b <= last_lower_boundary
+        is_upper_boundary = (b == last_block) and not is_lower_boundary
+        is_causal_boundary = apply_causal_mask and b > last_causal_interior and b != last_block
+        needs_real_tile.append(is_lower_boundary or is_upper_boundary or is_causal_boundary)
+    return active, tuple(needs_real_tile)
 
 
 def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
@@ -167,9 +233,12 @@ class SpyreAttnBucketer:
     returns None, and the caller falls back to compiling on demand.
     """
 
-    def __init__(self, vllm_config: VllmConfig) -> None:
+    def __init__(self, vllm_config: VllmConfig, sliding_window: int | None = None) -> None:
         block_size = vllm_config.cache_config.block_size
         self.block_size = block_size
+        # This group's window, not the model's: gemma-4 runs windowed and full-attention
+        # layers side by side, and each attention group gets its own bucketer.
+        self._sliding_window = sliding_window
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
 
@@ -234,9 +303,21 @@ class SpyreAttnBucketer:
             {(kv + block_size - 1) // block_size for kv in self._kv_buckets}
         )
 
+        # How far `_sliding_variants` scans. One window plus one query bucket puts the
+        # window's lower boundary anywhere in the sequence; two further blocks walk it
+        # through every offset inside a block, after which the plan repeats with period
+        # block_size. Pinned by test_every_length_dispatches_to_an_enumerated_variant, which
+        # scans all the way to max_model_len and finds nothing new.
+        self._scan_limit = min(
+            max_model_len, (sliding_window or 0) + self._query_buckets[-1] + 2 * block_size
+        )
+
+        # Deliberately does not report the variant count: under a window that would force
+        # the `_sliding_variants` scan here, wasting it when recording is off. The recorder
+        # logs the count it is about to record anyway.
         logger.info(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "
-            "max num_blocks=%d",
+            "max num_blocks=%d, sliding_window=%s",
             len(self._kv_buckets),
             self._kv_buckets[0],
             self._kv_buckets[-1],
@@ -244,6 +325,7 @@ class SpyreAttnBucketer:
             self._query_buckets[0],
             self._query_buckets[-1],
             self._num_blocks_buckets[-1],
+            self._sliding_window,
         )
 
     @property
@@ -261,6 +343,73 @@ class SpyreAttnBucketer:
     @property
     def num_seqs_buckets(self) -> list[int]:
         return self._num_seqs_buckets
+
+    def witness(self, bucket: SpyreAttnBucket) -> tuple[int, int]:
+        """A ``(kv_len, query_len)`` one sequence can have that dispatches to ``bucket``.
+
+        Warmup needs a concrete sequence per variant. Without a window the bucket already
+        is one, since ``build()`` pads the block count up onto this ladder: ``num_blocks``
+        whole blocks holding the shortest query reaching this width dispatch there.
+        Under a window nothing pads, so the witness comes from the scan that found the
+        variant in the first place.
+        """
+        if self._sliding_window is not None:
+            return self._sliding_variants[bucket]
+        kv_len = bucket.num_blocks * self.block_size
+        query_len = self.min_real_query_len(bucket.padded_query_len)
+        assert query_len <= kv_len, f"{bucket} pairs a query length no sequence can reach"
+        return kv_len, query_len
+
+    def decode_witness_kv_len(self, num_blocks: int) -> int | None:
+        """A ``kv_len`` whose one-token decode step pads its block count onto ``num_blocks``.
+
+        ``None`` when no sequence can ask for that bucket, so the recorder skips it.
+
+        Without a window a block-aligned ``kv_len`` realizes exactly ``num_blocks``, so the
+        bucket is its own witness. Under one it is the *worst* possible choice: the window's
+        lower boundary lands on a block edge, so every block-aligned length leaves exactly
+        ``ceil(W / block_size)`` blocks active and every bucket above that realizes the same
+        one. A real decode reaches one block more (its ``kv_len`` is almost never
+        block-aligned), which rounds onto the next bucket up -- and that bucket then gets no
+        witness at any ``max_model_len``. Hence the search over realizable decode counts.
+        """
+        if self._sliding_window is None:
+            return num_blocks * self.block_size
+        counts = sorted(b.num_blocks for b in self._sliding_variants if b.padded_query_len == 1)
+        for count in counts:
+            if self.find_blocks_bucket(count) == num_blocks:
+                return self._sliding_variants[SpyreAttnBucket(count, 1)][0]
+        return None
+
+    @functools.cached_property
+    def _sliding_variants(self) -> dict[SpyreAttnBucket, tuple[int, int]]:
+        """Each windowed variant a sequence can reach, and the shortest sequence reaching it.
+
+        Enumerated by scanning ``(query_len, kv_len)``, not solved. Two reasons not to
+        reach for arithmetic here: the active count saws as the window's lower boundary
+        moves through a block, so it inverts to no closed form; and a closed *bound* on
+        the count is the kind of thing that is wrong by one in a corner (a window just
+        past a block multiple) and then silently drops a kernel -- which is the bug class
+        this whole path exists to fix. Scanning the definition cannot be off by one.
+
+        Runs once per bucketer -- shared by every layer in the attention group, while
+        ``record_graphs`` runs per layer -- and costs ~0.6s at gemma-4's shapes against the
+        minutes of Inductor compiles it sizes.
+        """
+        assert self._sliding_window is not None
+        out: dict[SpyreAttnBucket, tuple[int, int]] = {}
+        for query_len in range(1, min(self._query_buckets[-1], self._scan_limit) + 1):
+            width = 1 if query_len == 1 else self.find_query_bucket(query_len)
+            if width is None:
+                continue
+            for kv_len in range(query_len, self._scan_limit + 1):
+                active = sliding_active_blocks(
+                    kv_len, kv_len - query_len, self._sliding_window, self.block_size
+                )
+                if active:
+                    bucket = SpyreAttnBucket(num_blocks=len(active), padded_query_len=width)
+                    out.setdefault(bucket, (kv_len, query_len))
+        return out
 
     def find_kv_bucket(self, kv_len: int) -> int | None:
         return self._round_up(kv_len, self._kv_buckets)
@@ -287,16 +436,25 @@ class SpyreAttnBucketer:
     def variants(self) -> list[SpyreAttnBucket]:
         """Every variant worth recording, largest first.
 
-        The two size axes aren't independent: ``kv_len >= query_len`` always, so
-        a query bucket only pairs with block counts that can hold it -- the full
-        cross product would record many unreachable variants at a long context.
-        Requires the backend to round each sequence's own query_len, so the bound
-        holds per sequence and not against a batch max.
-        The bound is on the *smallest real* query_len that reaches a bucket, not
-        the bucket itself, since a 2-token query on a 1-block sequence still
-        dispatches to a large padded bucket; bounding by the bucket would prune
-        that variant and put a compile back in the serving path.
+        Under a window the block count is the ACTIVE count, which no kv ladder can reach:
+        for a block-aligned ``kv_len`` the window's lower boundary lands on a block edge,
+        so every kv bucket at or above the window leaves the same blocks active. The
+        reachable set is scanned instead -- see ``_sliding_variants``.
+
+        Without one, the two axes are the kv-derived block ladder and the query ladder,
+        bounded against each other: ``kv_len >= query_len`` always, so a query bucket only
+        pairs with block counts that can hold it, and the full cross product would record
+        many variants nothing reaches (each an Inductor compile). The bound is on the
+        *smallest real* query_len reaching a bucket, not the bucket itself, since a 2-token
+        query on a 1-block sequence still pads up to a large bucket; bounding by the bucket
+        would prune that variant and put a compile back in the serving path.
         """
+        if self._sliding_window is not None:
+            return sorted(
+                self._sliding_variants,
+                key=lambda b: (b.num_blocks, b.padded_query_len),
+                reverse=True,
+            )
         out: list[SpyreAttnBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             max_query_here = num_blocks * self.block_size
@@ -311,15 +469,25 @@ class SpyreAttnBucketer:
     def batched_decode_variants(self) -> list[SpyreAttnBatchedDecodeBucket]:
         """Every batched decode variant worth recording, largest first.
 
-        The full ``num_seqs_buckets x num_blocks_buckets`` grid: unlike
-        ``variants()`` there is no inter-axis bound to exploit, since a decode
-        batch of any size can sit at any context length. Both axes are geometric,
-        so the grid stays small.
+        The full ``num_seqs_buckets x num_blocks_buckets`` grid, minus the block counts a
+        windowed decode cannot ask for: unlike ``variants()`` there is no inter-axis bound
+        to exploit, since a decode batch of any size can sit at any context length. Both
+        axes are geometric, so the grid stays small.
+
+        Unlike the per-sequence axis this one still *pads* -- ``build()`` rounds the decode
+        block count onto it -- so a coarse ladder is only a throughput cost, not a
+        correctness one. What it cannot do is leave a reachable entry without a witness;
+        see ``decode_witness_kv_len``.
         """
         if not envs.SPYRE_BATCHED_DECODE:
             return []
         out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
+            if self.decode_witness_kv_len(num_blocks) is None:
+                # Windowed: the window caps the active count, so the upper ladder entries
+                # are unreachable. Recording them wastes a compile each and, worse, they
+                # all realize the same low bucket and look like coverage.
+                continue
             for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
                 blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
                 out.append(

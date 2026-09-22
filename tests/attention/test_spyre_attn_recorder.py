@@ -31,6 +31,7 @@ import torch
 from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import _print_warning_once
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference import envs
@@ -48,6 +49,8 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
     SpyreAttnBucketer,
+    batched_decode_chunking,
+    sliding_active_blocks,
 )
 
 pytestmark = pytest.mark.attention
@@ -57,6 +60,8 @@ NUM_KV_HEADS = 2
 HEAD_SIZE = 64
 BLOCK_SIZE = 64
 NUM_PAGES = 8
+# The whole KV cache, so a sequence can outgrow the wide window and leave blocks behind it.
+WIDE_MODEL_LEN = NUM_PAGES * BLOCK_SIZE
 
 
 def compiles() -> int:
@@ -118,10 +123,7 @@ def builder(default_vllm_config):
     )
 
 
-@pytest.fixture()
-def sliding_window_builder(default_vllm_config):
-    """A builder whose window leaves the active-block count unpadded, so several
-    requested buckets realize onto one kernel."""
+def _window_builder(sliding_window: int) -> SpyreAttentionMetadataBuilder:
     return _make_builder(
         FullAttentionSpec(
             block_size=BLOCK_SIZE,
@@ -129,18 +131,58 @@ def sliding_window_builder(default_vllm_config):
             head_size=HEAD_SIZE,
             head_size_v=HEAD_SIZE,
             dtype=torch.float16,
-            sliding_window=BLOCK_SIZE,
+            sliding_window=sliding_window,
         )
     )
 
 
-def make_bucketer(max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8):
+@pytest.fixture()
+def sliding_window_builder(default_vllm_config):
+    """A one-block window, which shrinks the batched kernel's gather to one block
+    per chunk -- what the batched-decode budget tests turn on."""
+    return _window_builder(BLOCK_SIZE)
+
+
+@pytest.fixture()
+def wide_window_builder(default_vllm_config):
+    """A window several blocks wide, so a sequence has *interior* blocks.
+
+    Those are the ones handed a shared all-zero mask tile instead of a real one, and
+    which tile object lands at which position is part of the kernel's identity guards.
+    A one-block window never produces one -- every active block is a boundary block --
+    so it cannot exercise that at all.
+    """
+    return _window_builder(3 * BLOCK_SIZE)
+
+
+def make_bucketer(
+    max_model_len=256, max_num_batched_tokens=64, max_num_seqs=8, sliding_window=None
+):
     config = MagicMock()
     config.cache_config.block_size = BLOCK_SIZE
     config.model_config.max_model_len = max_model_len
+    config.model_config.runner_type = "generate"
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
-    return SpyreAttnBucketer(config)
+    return SpyreAttnBucketer(config, sliding_window=sliding_window)
+
+
+def sliding_bucketer(builder, **kwargs):
+    """Swap in a bucketer carrying ``builder``'s own window.
+
+    Passing a windowless one would model a config that cannot occur -- the builder and
+    its bucketer read the same attention group's spec -- and would make every windowed
+    variant realize onto the wrong kernel.
+    """
+    builder._attn_bucketer = make_bucketer(sliding_window=builder.sliding_window, **kwargs)
+    return builder._attn_bucketer
+
+
+def _dispatch_shape(impl, builder, kv_cache, kv_len, query_len):
+    """Invoke the kernel a real sequence of exactly this shape reaches."""
+    attn_metadata = builder.build_for_shape(kv_len, query_len)
+    q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
+    impl.forward(MagicMock(), q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
 
 
 def _recordable(bucketer, pages: int = NUM_PAGES) -> list[SpyreAttnBucket]:
@@ -158,6 +200,35 @@ def _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len):
     impl._record_one(
         SpyreAttnBucket(num_blocks, padded_query_len), MagicMock(), kv_cache, builder, set()
     )
+
+
+def _dispatch_decode_batch(impl, builder, kv_cache, num_seqs, kv_len):
+    """Invoke the batched kernel a real all-decode batch at ``kv_len`` reaches.
+
+    Unlike ``_dispatch_batched`` this takes a LENGTH, not a bucket, so it exercises what
+    ``build()`` rounds that length onto rather than what the recorder chose to trace.
+    """
+    query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+    attn_metadata = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc,
+            seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
+            num_reqs=num_seqs,
+            num_actual_tokens=num_seqs,
+            max_query_len=1,
+            max_seq_len=kv_len,
+            block_table_tensor=torch.zeros(
+                num_seqs, (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, dtype=torch.int32
+            ),
+            slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+            causal=True,
+            is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+        ),
+    )
+    q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
+    impl.forward(MagicMock(), q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
 
 
 def _dispatch_batched(impl, builder, kv_cache, bucket):
@@ -221,26 +292,46 @@ class TestRecordGraphs:
         assert _record(impl, kv_cache, builder) == first
         assert compiles() == snapshot
 
-    def test_buckets_collapsing_onto_one_kernel_record_once(
-        self, impl, kv_cache, sliding_window_builder
+    def test_every_windowed_variant_records_its_own_kernel(
+        self, impl, kv_cache, wide_window_builder
     ):
-        """Deduping on the realized bucket must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        """Under a window, nothing pads: each enumerated active count is its own kernel."""
+        bucketer = sliding_bucketer(wide_window_builder, max_model_len=WIDE_MODEL_LEN)
 
-        recorded = _record(impl, kv_cache, sliding_window_builder)
+        recorded = _record(impl, kv_cache, wide_window_builder)
 
         requested = _recordable(bucketer)
-        assert 0 < recorded < len(requested), "no buckets collapsed; nothing deduped"
+        assert recorded == len(requested) > 0
 
         snapshot = compiles()
         for bucket in requested:
             _dispatch(
                 impl,
-                sliding_window_builder,
+                wide_window_builder,
                 kv_cache,
                 bucket.num_blocks,
                 bucket.padded_query_len,
             )
+        assert compiles() == snapshot
+
+    def test_windowed_lengths_sharing_a_block_count_share_a_kernel(
+        self, impl, kv_cache, wide_window_builder
+    ):
+        """No length may compile after warmup, whatever its interior blocks look like.
+
+        The regression this guards: interior blocks used to share ONE all-zero tile, and
+        Dynamo guards which mask-tile arguments are the same object, so two lengths with
+        the same active count and query width still compiled separately when their
+        boundary blocks fell in different places. Recording the block counts alone did
+        not cover them.
+        """
+        sliding_bucketer(wide_window_builder, max_model_len=WIDE_MODEL_LEN)
+        _record(impl, kv_cache, wide_window_builder)
+
+        snapshot = compiles()
+        for query_len in (1, 2, BLOCK_SIZE // 2, BLOCK_SIZE - 1, BLOCK_SIZE):
+            for kv_len in range(query_len, WIDE_MODEL_LEN + 1):
+                _dispatch_shape(impl, wide_window_builder, kv_cache, kv_len, query_len)
         assert compiles() == snapshot
 
     def test_collapsing_without_a_sliding_window_warns(
@@ -255,13 +346,12 @@ class TestRecordGraphs:
 
         assert "bucketer and build() have diverged" in caplog.text
 
-    def test_collapsing_with_a_sliding_window_is_quiet(
-        self, impl, kv_cache, sliding_window_builder, caplog
-    ):
-        sliding_window_builder._attn_bucketer = make_bucketer()
+    def test_windowed_buckets_realize_themselves(self, impl, kv_cache, wide_window_builder, caplog):
+        """A window is no excuse for drift either: the witness realizes the count exactly."""
+        sliding_bucketer(wide_window_builder, max_model_len=WIDE_MODEL_LEN)
 
         with caplog.at_level(logging.WARNING):
-            _record(impl, kv_cache, sliding_window_builder)
+            _record(impl, kv_cache, wide_window_builder)
 
         assert "diverged" not in caplog.text
 
@@ -469,6 +559,73 @@ class TestRecordGraphs:
         assert "every shape will compile on first use" in caplog.text
 
 
+class TestSlidingVariants:
+    """The enumeration itself, without a device: does it reach every length?
+
+    Cheap enough to sweep exhaustively, which is the point -- the bug this path fixes was
+    an enumeration that looked complete and was not, and no device test can cover every
+    (kv_len, query_len) a long context admits.
+    """
+
+    WINDOWS = (BLOCK_SIZE, 2 * BLOCK_SIZE, 3 * BLOCK_SIZE + 1, 500, 1024)
+
+    @pytest.mark.parametrize("sliding_window", WINDOWS)
+    @pytest.mark.parametrize("max_model_len", (128, 256, 512, 1536, 2048))
+    @pytest.mark.parametrize("max_num_batched_tokens", (1, 2, 64, 512))
+    def test_every_length_dispatches_to_an_enumerated_variant(
+        self, default_vllm_config, sliding_window, max_model_len, max_num_batched_tokens
+    ):
+        """No sequence may reach a (block count, query width) warmup did not record.
+
+        Scans all the way to ``max_model_len``, past the bucketer's own scan limit, so it
+        also pins the claim that the tile plan repeats with period ``block_size`` beyond
+        one window plus one query bucket.
+        """
+        if max_num_batched_tokens > max_model_len:
+            pytest.skip("the scheduler cannot batch more tokens than the model holds")
+        bucketer = make_bucketer(
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            sliding_window=sliding_window,
+        )
+        enumerated = set(bucketer.variants())
+
+        unreached = set()
+        for query_len in range(1, min(max_num_batched_tokens, max_model_len) + 1):
+            width = 1 if query_len == 1 else bucketer.find_query_bucket(query_len)
+            if width is None:
+                continue
+            for kv_len in range(query_len, max_model_len + 1):
+                active = sliding_active_blocks(
+                    kv_len, kv_len - query_len, sliding_window, BLOCK_SIZE
+                )
+                if not active:
+                    continue
+                bucket = SpyreAttnBucket(num_blocks=len(active), padded_query_len=width)
+                if bucket not in enumerated:
+                    unreached.add((bucket, kv_len, query_len))
+        assert not unreached, (
+            f"{len(unreached)} lengths reach no recorded kernel: {sorted(unreached)[:5]}"
+        )
+
+    @pytest.mark.parametrize("sliding_window", WINDOWS)
+    def test_each_variant_has_a_sequence_that_realizes_it(
+        self, default_vllm_config, sliding_window
+    ):
+        """Warmup records through ``witness``, so a variant it cannot realize is a variant
+        nothing records -- and the recorder would silently leave it to the serving path."""
+        bucketer = make_bucketer(
+            max_model_len=2048, max_num_batched_tokens=512, sliding_window=sliding_window
+        )
+        for bucket in bucketer.variants():
+            kv_len, query_len = bucketer.witness(bucket)
+            active = sliding_active_blocks(kv_len, kv_len - query_len, sliding_window, BLOCK_SIZE)
+            assert len(active) == bucket.num_blocks, (bucket, kv_len, query_len)
+            assert query_len <= kv_len <= 2048
+            reached = 1 if query_len == 1 else bucketer.find_query_bucket(query_len)
+            assert reached == bucket.padded_query_len, (bucket, query_len, reached)
+
+
 class TestRecompileLimit:
     def test_limit_is_raised_during_recording_and_restored(self, impl, kv_cache, builder):
         """Dynamo's accumulated limit is global, so more buckets than it allows would
@@ -635,31 +792,47 @@ class TestRecordBatchedDecode:
         assert len(batched) < len(bucketer.batched_decode_variants())
         assert recorded == len(_recordable(bucketer)) + len(batched)
 
-    def test_window_variants_over_the_requested_budget_still_record(
-        self, impl, kv_cache, sliding_window_builder
+    def test_unreachable_windowed_block_buckets_are_skipped(
+        self, impl, wide_cache, sliding_window_builder
     ):
-        """A window shrinks the realized entry axis, so the skip must key on that.
+        """The window caps the decode block count, so the upper ladder entries are dead.
 
-        Keying on the bucket's window-agnostic ``blocks_per_chunk`` would drop
-        variants whose realized gather fits the cache, putting their compile back
-        in the serving path.
+        Recording them is worse than wasteful: a block-aligned length realizes the same low
+        count for every one of them, so they look like coverage while the bucket a real
+        decode asks for goes untraced.
         """
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
-        # Over the budget as requested, but the window shrinks blocks_per_chunk to 1,
-        # so what the kernel actually gathers fits and dispatch does reach these.
-        reachable = [
-            v
-            for v in bucketer.batched_decode_variants()
-            if v.num_seqs * v.blocks_per_chunk >= NUM_PAGES and v.num_seqs < NUM_PAGES
-        ]
-        assert reachable, "no variant exceeds the requested budget; nothing under test"
+        bucketer = sliding_bucketer(sliding_window_builder)
 
-        _record(impl, kv_cache, sliding_window_builder)
+        enumerated = {v.num_blocks for v in bucketer.batched_decode_variants()}
+        assert enumerated < set(bucketer.num_blocks_buckets), (
+            "every ladder entry is reachable; nothing under test"
+        )
+        assert all(bucketer.decode_witness_kv_len(n) is not None for n in enumerated)
 
-        # Each one must have been traced during recording, so dispatch compiles nothing.
+    def test_every_decode_length_hits_a_recorded_batched_kernel(
+        self, impl, wide_cache, sliding_window_builder
+    ):
+        """The regression: no decode length may compile the batched kernel after warmup.
+
+        A block-aligned witness puts the window boundary on a block edge, so it realizes
+        ``ceil(W / block_size)`` active blocks for EVERY requested bucket -- and the bucket a
+        real, non-block-aligned decode rounds onto was therefore never traced.
+        """
+        bucketer = sliding_bucketer(sliding_window_builder)
+        window = sliding_window_builder.sliding_window
+        _record(impl, wide_cache, sliding_window_builder)
+
         snapshot = compiles()
-        for bucket in reachable:
-            _dispatch_batched(impl, sliding_window_builder, kv_cache, bucket)
+        for num_seqs in bucketer.num_seqs_buckets:
+            for kv_len in range(2, WIDE_MODEL_LEN + 1):
+                active = sliding_active_blocks(kv_len, kv_len - 1, window, BLOCK_SIZE)
+                if (
+                    num_seqs
+                    * batched_decode_chunking(num_seqs, bucketer.find_blocks_bucket(len(active)))[0]
+                    >= self.PAGES
+                ):
+                    continue  # the gather would outrun the cache; dispatch declines it too
+                _dispatch_decode_batch(impl, sliding_window_builder, wide_cache, num_seqs, kv_len)
         assert compiles() == snapshot
 
     def test_re_recording_compiles_nothing(self, impl, wide_cache, builder):
@@ -670,19 +843,15 @@ class TestRecordBatchedDecode:
         assert _record(impl, wide_cache, builder) == first
         assert compiles() == snapshot
 
-    def test_batched_buckets_collapsing_onto_one_kernel_record_once(
+    def test_every_batched_variant_realizes_its_own_kernel(
         self, impl, wide_cache, sliding_window_builder
     ):
-        """Deduping on the realized key must not drop a graph dispatch needs."""
-        bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
+        """Under a window each enumerated batched bucket must trace the kernel it names."""
+        bucketer = sliding_bucketer(sliding_window_builder)
         requested = self._recordable_batched(bucketer)
 
         recorded = _record(impl, wide_cache, sliding_window_builder)
-        # The window collapses both axes, so the total is below what either
-        # enumeration asks for on its own.
-        assert recorded < self._expected(bucketer, len(requested)), (
-            "nothing collapsed; the dedupe path is untested"
-        )
+        assert recorded == self._expected(bucketer, len(requested)) > 0
 
         # Every requested bucket must still reach a traced graph.
         snapshot = compiles()

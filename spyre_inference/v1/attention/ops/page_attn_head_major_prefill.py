@@ -50,8 +50,9 @@ def page_attn_head_major_prefill_kernel(
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
     # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
-    # layout -- test_spyre_compile_input_offset_specialises_the_graph.
-    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    # layout -- test_spyre_compile_input_offset_specialises_the_graph. The builder now
+    # creates this table at exactly padded_query_len rows.
+    q_rows = query.index_select(0, query_row_index)
     q = (
         q_rows.unsqueeze(0)
         .transpose(1, 2)
@@ -103,6 +104,6 @@ def page_attn_head_major_prefill_kernel(
     if out is not None:
         # Storing the full padded extent keeps this sequence's real query_len out of the
         # arguments, so it is not specialized on.
-        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        out.index_copy_(0, query_row_index, attn)
         return out
     return attn

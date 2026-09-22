@@ -41,8 +41,8 @@ def page_attn_kernel(
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
-        query_row_index: int32 device tensor whose first padded_query_len
-            entries are this sequence's absolute query rows.
+        query_row_index: [padded_query_len] int32 device tensor of this
+            sequence's absolute query rows.
         k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
         v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
@@ -61,8 +61,9 @@ def page_attn_kernel(
     num_queries_per_kv = num_heads // num_kv_heads
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
     # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
-    # layout -- test_spyre_compile_input_offset_specialises_the_graph.
-    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    # layout -- test_spyre_compile_input_offset_specialises_the_graph. The builder now
+    # creates this table at exactly padded_query_len rows.
+    q_rows = query.index_select(0, query_row_index)
     q = (
         q_rows.unsqueeze(0)
         .transpose(1, 2)
@@ -128,6 +129,6 @@ def page_attn_kernel(
         # arguments, so it is not specialized on; rows past it duplicate the
         # sequence's last row, so index_copy_'s undefined write order for
         # duplicate indices is harmless.
-        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        out.index_copy_(0, query_row_index, attn)
         return out
     return attn

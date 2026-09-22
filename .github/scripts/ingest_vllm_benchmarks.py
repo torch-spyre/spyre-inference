@@ -24,12 +24,26 @@ import glob
 import json
 import logging
 import os
+import re
 import sys
 import time
+import uuid
 from argparse import ArgumentParser
 from typing import Any
 
 import clickhouse_connect
+from ingest_identity import golden_drift, library_provenance
+from spyre_clickhouse_ingest import (
+    artifact_id_for,
+    benchmark_id_for,
+    benchmarks_already_ingested,
+    canonical_arch,
+    insert_benchmarks,
+    run_id_of,
+    schema,
+    tables_present,
+    target_database,
+)
 from utils import read_benchmark_results
 
 logging.basicConfig(level=logging.INFO)
@@ -51,7 +65,19 @@ def parse_args() -> Any:
     parser.add_argument("--workflow", type=str, default="vLLM Benchmark")
     parser.add_argument("--branch", type=str, required=True)
     parser.add_argument("--sha", type=str, required=True)
-    parser.add_argument("--run-id", type=str, required=True)
+    # --run-id is THIS RUN'S IDENTITY, and on the Jenkins path that is the orchestrator's uuid,
+    # used verbatim. Named for what a CALLER means by "the run id" rather than for what one
+    # column needs: spyre-frameworks' ingest_cmd already passes ${RUN_ID} (a uuid) here, so this
+    # naming makes the cross-repo caller correct without it having to know our column layout.
+    # The numeric GitHub run id is --gha-run-id, below, because it is GHA-specific and only
+    # in-repo workflows have one.
+    # Not required: a Jenkins standalone run may have neither, and the v2 write is then skipped
+    # rather than landing an unjoinable row.
+    parser.add_argument("--run-id", type=str, default="")
+    # The numeric GitHub Actions run id -> upstream's workflow_id (Int64) and, when --run-id
+    # carries no uuid, the external_run_id half of a DERIVED v2 run_id. GHA-only by nature:
+    # only an in-repo workflow has a github.run_id, and a Jenkins leg legitimately has none.
+    parser.add_argument("--gha-run-id", type=str, default=os.environ.get("GITHUB_RUN_ID", ""))
     parser.add_argument("--job-id", type=str, default="0")
     parser.add_argument("--pr-number", type=str, default="0")
     parser.add_argument(
@@ -59,6 +85,30 @@ def parse_args() -> Any:
         type=str,
         default=os.environ.get("BENCHMARK_ARCH", "x86_64"),
         help="hardware architecture the benchmark ran on (e.g. x86_64, ppc64le, s390x)",
+    )
+    parser.add_argument(
+        "--v2-run-id",
+        type=str,
+        default=os.environ.get("V2_RUN_ID", ""),
+        help="An ALREADY-DERIVED v2 run_id (a uuid). Jenkins passes the orchestrator's own "
+        "params.RUN_ID here and it is used VERBATIM -- re-hashing an already-hashed id "
+        "mints a third identity that joins to nothing. Mutually exclusive with the "
+        "derive-from-GHA path below.",
+    )
+    parser.add_argument(
+        "--test-type",
+        type=str,
+        default=os.environ.get("TRIGGER_TYPE", "perf"),
+        help="Tier for the run_id hash. 'perf' for a benchmark leg.",
+    )
+    parser.add_argument(
+        "--rpm-lock",
+        type=str,
+        default=os.environ.get("SPYRE_RPM_LOCK", "spyre-rpms.lock"),
+        help="Path to spyre-rpms.lock. On the GHA path this file IS the content identity of "
+        "the stack under test -- the leg builds nothing, it restores a cache keyed on this "
+        "file -- so each pinned RPM's artifact_id is recovered from it and an "
+        "artifact_results row is written per artifact. Empty disables the artifact write.",
     )
     parser.add_argument(
         "--dry-run",
@@ -284,7 +334,367 @@ def extract_rows(
     return rows
 
 
-def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
+# ── GHA artifact identity ────────────────────────────────────────────────────────────────
+# A GHA perf leg builds nothing: it restores a cache keyed on spyre-rpms.lock and extracts
+# those exact RPMs. So the honest content identity of what it measured is the LOCK, and the
+# artifact_id of each pinned RPM is recoverable from it -- the builder embeds the same id12
+# in the NEVRA that it puts in artifact_id and in the artifact_refs glob.
+#   NEVRA: ibm-flex-2.0.0-0.main.495+495.a86bb35a.3a6b688cc40a.a86bb35.el10
+#                                                 ^^^^^^^^^^^^ id12
+# This is why the GHA path does NOT need a digest threaded from Jenkins.
+
+_NEVRA_ID12 = re.compile(r"\.([0-9a-f]{12})\.")
+# name-<version>... : the package name is everything before the first -<digit>.
+_NEVRA_NAME = re.compile(r"^(.+?)-\d")
+
+
+def parse_rpm_lock(lock_path: str) -> list[tuple[str, str]]:
+    """[(package_name, id12)] for each pinned RPM. Skips any line without exactly one
+    id12-shaped token rather than guessing which to take -- a wrong artifact_id is worse
+    than an absent one, because it attributes results to the wrong build.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        with open(lock_path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        ids = _NEVRA_ID12.findall(line)
+        name = _NEVRA_NAME.match(line)
+        if len(ids) == 1 and name:
+            out.append((name.group(1), ids[0]))
+        else:
+            log.warning("spyre-rpms.lock: cannot derive a unique id12 from %r — skipped", line)
+    return out
+
+
+def rpm_artifact_ids(lock_path: str, arch: str) -> list[str]:
+    """artifact_id (v2 uuid5) for every RPM the leg installed.
+
+    The component is the RPM name minus its `ibm-` vendor prefix and any `-devel`/`-headers`
+    suffix, which is how the builder names it. Verified against prod: `ibm-flex-devel` and
+    `ibm-flex` share one id12 and one component, so the two rows collapse to one artifact.
+    """
+    a = canonical_arch(arch)
+    if not a:
+        return []
+    seen: dict[str, None] = {}
+    for name, id12 in parse_rpm_lock(lock_path):
+        base = name[4:] if name.startswith("ibm-") else name
+        # -devel/-headers ship alongside the base package from ONE build and share its id12.
+        # Verified against prod: the builder registers only the base name (ibm-flex, never
+        # ibm-flex-devel), so a per-subpackage artifact_id would name a row that cannot exist.
+        for suffix in ("-devel", "-headers"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        component = base
+        for suffix in ("-core", "-dd2", "-e2e"):
+            if component.endswith(suffix):
+                component = component[: -len(suffix)]
+                break
+        artifact_name = base if base.startswith("ibm-") else f"ibm-{base}"
+        # Derived, not built as a delimited string: artifact_results.artifact_id is a UUID in
+        # v2, and the orchestrator hashes these same four fields, so both sides agree without
+        # this leg ever being told the id.
+        aid = artifact_id_for(component, artifact_name, id12, a)
+        if aid:
+            seen.setdefault(aid, None)
+    return list(seen)
+
+
+def _parse_input_shapes(test_name: str) -> dict[str, str]:
+    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len}.
+
+    These are identity discriminators, not decoration: without them tp1 and tp4 are one
+    benchmark whose trend line alternates between two unrelated numbers.
+    """
+    out: dict[str, str] = {}
+    for token in (test_name or "").split("_"):
+        for prefix, key in (("tp", "tensor_parallel"), ("in", "input_len"), ("out", "output_len")):
+            rest = token[len(prefix) :]
+            if token.startswith(prefix) and rest.isdigit():
+                out[key] = rest
+    return out
+
+
+def _is_uuid(value) -> bool:
+    try:
+        uuid.UUID((value or "").strip())
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
+
+
+def effective_rpm_lock(args) -> str:
+    """The lock path to use, or "" to skip the RPM->artifact link.
+
+    The link belongs to the DERIVED (Actions) path alone. A UUID in --run-id or --v2-run-id
+    means Jenkins dispatched this leg and the orchestrator has already written an
+    artifact_results row for that run_id, so linking again would add one row per pinned RPM on
+    top of it -- and the writer's dedup guard cannot catch that, since it only skips when a row
+    is ALREADY present, making the outcome depend on which writer lands first.
+
+    Keyed on a UUID, not on a value merely being present: a NUMERIC --run-id is the old GHA
+    wiring, which does own the link.
+    """
+    if _is_uuid(getattr(args, "run_id", "")) or _is_uuid(getattr(args, "v2_run_id", "")):
+        return ""
+    return getattr(args, "rpm_lock", "")
+
+
+def resolve_v2_run_id(args) -> str:
+    """The v2 run_id for this leg, or "" when it cannot be derived.
+
+    Two paths, kept explicit. Jenkins already HOLDS the orchestrator's v2 run_id
+    (params.RUN_ID) -- use it verbatim. GHA holds only its own integer run id, so the id is
+    derived from (gha, run id, arch, test_type). Empty means the v2 write is skipped rather
+    than writing an unjoinable row, which downstream cannot tell apart from "no perf ran".
+    """
+    # --run-id first, then --v2-run-id: the latter is kept only so a caller already passing it
+    # keeps working. Both mean the same thing -- an already-derived uuid, used verbatim.
+    verbatim = (getattr(args, "run_id", "") or "").strip() or (
+        getattr(args, "v2_run_id", "") or ""
+    ).strip()
+    if verbatim:
+        try:
+            uuid.UUID(verbatim)
+        except (ValueError, AttributeError, TypeError):
+            # A numeric value here is the old wiring (GitHub's run id in --run-id). Fall through
+            # to the derive path rather than skipping: that is what the caller meant.
+            if verbatim.isdigit():
+                return run_id_of("gha", verbatim, args.arch, getattr(args, "test_type", "perf"))
+            log.warning("--run-id %r is neither a uuid nor numeric; v2 rows skipped", verbatim)
+            return ""
+        return verbatim
+    gha = (getattr(args, "gha_run_id", "") or "").strip()
+    if not gha:
+        return ""
+    return run_id_of("gha", gha, args.arch, getattr(args, "test_type", "perf"))
+
+
+def _write_artifact_results(client, db: str, rows, run_id_value: str, rpm_lock: str, arch: str):
+    """One artifact_results row per RPM the leg installed, linking perf to what it measured.
+
+    Why per RPM and not one row: a GHA perf leg has no single built image. Its stack is the set
+    of pinned RPMs, so every one of them is an artifact the run exercised, and pointing the
+    result at all of them is what makes each component's artifact page show the perf that ran
+    against it.
+
+    result_kind='performance' with test_type='perf', matching the rows Jenkins pushArtifactResult
+    already writes -- this is the same contract from the other launcher, not a new one.
+
+    Contained: this is the FIRST writer to artifact_results from Actions, so a failure here must
+    not cost the benchmark rows already written.
+    """
+    if not rpm_lock:
+        return
+    try:
+        ids = rpm_artifact_ids(rpm_lock, arch)
+        if not ids:
+            log.info("no artifact_id derivable from %s — artifact link skipped", rpm_lock)
+            return
+        table = schema.ARTIFACT_RESULTS
+        if not tables_present(client, db, tables=(table,)):
+            log.info("%s absent — artifact link skipped", table.qualified(db))
+            return
+        # artifact_results is a plain MergeTree with no dedup key, so a re-ingest of one leg
+        # DOUBLES its rows -- and every per-artifact counter is derived from them. Check first.
+        already = client.query(
+            f"SELECT count() FROM {table.qualified(db)} "
+            "WHERE run_id = {rid:UUID} AND result_kind = 'performance'",
+            parameters={"rid": run_id_value},
+        ).result_rows
+        if already and already[0][0] > 0:
+            log.info("artifact link already present for run_id=%s — skipping", run_id_value)
+            return
+        first, first_extra = rows[0], json.loads(rows[0]["extra"])
+        # No total_tests/passed/failed/errors/skipped: v2 does not store them, because they are
+        # derivable by counting the run's own rows and a stored copy is a second source of truth.
+        # The benchmark count still goes in props -- a perf leg has no test_case_runs rows to
+        # count, so this is the only record of how many benchmarks it measured. It counts
+        # BENCHMARKS not metrics: 26 metrics of one benchmark is one measurement, so counting
+        # metrics would inflate every perf leg ~26x.
+        benchmarks = len({json.loads(r["extra"]).get("test_name", "") for r in rows})
+        props = {
+            "source": "gha",
+            # run_url is THE link key across the whole v2 schema -- one key for a Jenkins build
+            # url or a GitHub Actions run url, so a reader never has to know which system
+            # produced the row. Built here rather than left to the reader: the URL shape is
+            # GitHub's, and a dashboard route should not have to know it.
+            "run_url": (
+                f"https://github.com/{first['repo']}/actions/runs/{first['workflow_id']}"
+                if first.get("repo") and first.get("workflow_id")
+                else ""
+            ),
+            "workflow_id": str(first["workflow_id"]),
+            "rpm_lock": rpm_lock,
+            "head_sha": first_extra.get("head_sha", ""),
+            "benchmarks": str(benchmarks),
+        }
+        schema.insert(
+            client,
+            table,
+            [
+                {
+                    "artifact_id": aid,
+                    "run_id": run_id_value,
+                    "result_kind": "performance",
+                    "test_type": "perf",
+                    "state": "passed",
+                    "arch": canonical_arch(arch),
+                    "duration_s": 0.0,
+                    "props": props,
+                }
+                for aid in ids
+            ],
+            db=db,
+        )
+        log.info("Linked %d artifact(s) to run_id=%s in artifact_results", len(ids), run_id_value)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("artifact_results link failed, benchmark rows unaffected: %r", exc)
+
+
+# ── v2 benchmarks / benchmark_runs ───────────────────────────────────────────────────────
+# The perf surfaces of the v2 dashboard read this dimension+fact pair, and the HUD's
+# oss_ci_benchmark_v3 / oss_ci_benchmark_metadata are materialized views over benchmark_runs
+# (schema/70-vllm-hud-projection.sql in torch-spyre). So this is the ONLY perf write: the
+# upstream-shaped rows are projected from it rather than inserted a second time, which is what
+# keeps the two from disagreeing.
+BENCH_COMPONENT = "spyre-inference"
+
+_BENCH_TABLES = (schema.BENCHMARKS, schema.BENCHMARK_RUNS)
+
+# In the hash, not merely in props: mode and the input shapes are what separate two runs of
+# the same model. component leads the hash, so a `latency` here cannot collide with a
+# same-named benchmark in another producer's suite.
+_BENCH_ID_KEYS = ("record_type", "run_mode", "tensor_parallel", "input_len", "output_len")
+
+# The three identities this script writes, pinned as literals against the library that mints
+# them. Installed from a floating `@main`, so the job that WRITES has to check them --
+# ingest_identity says why the test-time goldens are not enough. run_id and artifact_id are
+# the cross-writer contract; benchmark_id is this producer's own, and pinned for the same
+# reason: benchmarks dedups across runs on it, so a re-key silently forks every trend line.
+IDENTITY_GOLDENS = (
+    (
+        "run_id_of",
+        run_id_of,
+        ("gha", "12345", "amd64", "integration"),
+        "dab2a67f-14bf-53be-b6e4-fc9642086e47",
+    ),
+    (
+        "artifact_id_for",
+        artifact_id_for,
+        ("torch-spyre", "flex-rpm", "abc123def456", "amd64"),
+        "86a5c6e3-bd2f-5d27-9a8f-9b8d23efc65b",
+    ),
+    (
+        "benchmark_id_for",
+        benchmark_id_for,
+        (
+            BENCH_COMPONENT,
+            "latency_tp1_in64_out64",
+            [],
+            {
+                "record_type": "model",
+                "run_mode": "latency",
+                "tensor_parallel": "1",
+                "input_len": "64",
+                "output_len": "64",
+            },
+            _BENCH_ID_KEYS,
+        ),
+        "f07dc029-26b3-51d2-8109-7e32e0edc1b7",
+    ),
+)
+
+# The MV cannot see the CI coordinates, so it reads them off benchmark_runs.props; guessing
+# them downstream would put a wrong commit on a chart.
+_RUN_PROP_COLUMNS = ("repo", "head_branch", "workflow_id", "run_attempt", "job_id")
+_RUN_PROP_EXTRA_KEYS = ("head_sha", "arch", "hardware_type")
+
+
+def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The flat results_v3 rows in the shared writer's entry shape.
+
+    One entry per (benchmark, metric); insert_benchmarks merges them into one benchmark_runs
+    row per (benchmark, backend), so the 26 metrics of one benchmark stay one measurement
+    rather than 26 trend points.
+
+    iterations stays 0 throughout: vLLM's harness reports a pre-averaged value per metric and
+    does not tell us the n behind it, and the column's contract is the producer's reported
+    count, not a derived one.
+    """
+    entries = []
+    for r in rows:
+        extra = json.loads(r["extra"])
+        # Already suffix-stripped by _test_name, which is what makes the native json and the
+        # `.pytorch.json` copy of one benchmark reach one identity rather than two.
+        name = extra.get("test_name") or ""
+        if not name:
+            continue
+        # vLLM's own mode: latency | throughput | serve. Already the test_name prefix.
+        props = {"record_type": "model", "run_mode": name.split("_")[0]}
+        props.update(_parse_input_shapes(name))
+        model = extra.get("model", "")
+        # The native latency json carries no model, so _model_from_record falls back to the
+        # filename. Keep it only when it says something the name does not already.
+        if model and model != name:
+            props["model"] = model
+        run_props = {k: str(r.get(k, "")) for k in _RUN_PROP_COLUMNS}
+        run_props.update({k: str(extra.get(k, "")) for k in _RUN_PROP_EXTRA_KEYS})
+        entries.append(
+            {
+                "name": name,
+                "tags": [],
+                # backend is a COLUMN, never a hash input: it is the axis a cross-backend
+                # comparison pivots ON, so folding it into identity would make the two sides
+                # of the comparison different benchmarks.
+                "backend": extra.get("device", ""),
+                "props": props,
+                "measurements": {r["metric"]: [float(r["actual"])]},
+                "iterations": 0,
+                "run_props": run_props,
+                "disc": props,
+                "disc_keys": _BENCH_ID_KEYS,
+            }
+        )
+    return entries
+
+
+def _write_v2_benchmarks(client, db: str, rows, run_id_value: str) -> None:
+    """benchmarks + benchmark_runs for this leg. Additive and contained: an absent table is
+    the normal state until the DDL lands, and a failure must not cost the flat rows."""
+    try:
+        if not tables_present(client, db, tables=_BENCH_TABLES):
+            log.info("benchmarks/benchmark_runs absent or stale in %s — v2 perf rows skipped", db)
+            return
+        if benchmarks_already_ingested(client, db, run_id_value, BENCH_COMPONENT, "vllm"):
+            log.info("v2 perf rows already present for run_id=%s — skipping", run_id_value)
+            return
+        n = insert_benchmarks(
+            client,
+            db,
+            BENCH_COMPONENT,
+            run_id_value,
+            _bench_entries(rows),
+            report_kind="vllm",
+        )
+        log.info("Inserted %d benchmark_runs row(s) under run_id=%s", n, run_id_value)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
+
+
+def insert_to_clickhouse(
+    rows: list[dict[str, Any]],
+    v2_run_id_value: str = "",
+    rpm_lock: str = "",
+    arch: str = "",
+) -> None:
     """Insert rows into ClickHouse using environment-configured connection."""
     clickhouse_env_vars = {
         "CLICKHOUSE_HOST": os.environ.get("CLICKHOUSE_HOST"),
@@ -323,6 +733,46 @@ def insert_to_clickhouse(rows: list[dict[str, Any]]) -> None:
         column_names=columns,
     )
     log.info("Inserted %d rows into %s", len(rows), RESULTS_TABLE)
+
+    # v2 rows, additive. One client serves both generations, so every v2 statement is
+    # QUALIFIED with this database name; "" means v2 is not configured and the write is a
+    # clean no-op rather than an error.
+    v2db = target_database()
+    if v2db and v2_run_id_value:
+        # Logged whether or not it drifted: this is what attributes a row to the code that
+        # wrote it once `main` has moved past it.
+        log.info("v2 identity: %s", library_provenance())
+        drift = golden_drift(IDENTITY_GOLDENS)
+        if drift:
+            # ::error:: so it is an annotation, not a line in a 10k-line log. results_v3 and
+            # run_metadata still go in: the drift costs v2 visibility, and writing ids
+            # nothing else can join costs more.
+            print(
+                "::error::v2 skipped — the shared identity library no longer mints the ids "
+                "this ingest was built against, so its rows would not join any other "
+                f"writer's: {'; '.join(drift)}",
+                file=sys.stderr,
+            )
+            v2db = ""
+    if v2_run_id_value and v2db:
+        _write_artifact_results(client, v2db, rows, v2_run_id_value, rpm_lock, arch)
+        _write_v2_benchmarks(client, v2db, rows, v2_run_id_value)
+    elif v2_run_id_value:
+        # Cause-agnostic: a drift has already said its piece as an ::error:: above, and this
+        # is the only report when the database is simply not configured.
+        log.warning(
+            "no v2 database (CLICKHOUSE_DB_V2 unset, or the identity drift above) — "
+            "v2 perf rows skipped, %s still written",
+            RESULTS_TABLE,
+        )
+    else:
+        # Loud: without a run_id the perf numbers cannot reach an artifact, and a blank
+        # artifact page reads as "no perf ran" rather than "not linked".
+        log.warning(
+            "no v2 run_id (pass --v2-run-id on Jenkins, or --run-id + --arch on Actions) "
+            "— v2 perf rows skipped, %s still written",
+            RESULTS_TABLE,
+        )
 
     # Insert metadata rows (required for dashboard commit picker)
     metadata_rows: list[dict[str, Any]] = []
@@ -364,7 +814,9 @@ def main() -> None:
         results_dir=args.results_dir,
         branch=args.branch,
         sha=args.sha,
-        run_id=args.run_id,
+        # workflow_id's source: the NUMERIC id. --run-id may hold a uuid (Jenkins), which
+        # int()s to 0 and would blank run_url and collapse run_metadata's dedup key.
+        run_id=args.gha_run_id,
         job_id=args.job_id,
         workflow=args.workflow,
         pr_number=pr_number,
@@ -383,7 +835,16 @@ def main() -> None:
             print(f"... and {len(rows) - 5} more")
         return
 
-    insert_to_clickhouse(rows)
+    # The RPM->artifact link belongs to the DERIVED path only. A Jenkins-launched leg passes
+    # --v2-run-id verbatim and the orchestrator has already written an artifact_results row for
+    # that same run_id (pushArtifactResult, result_kind='performance'), so linking again here
+    # would add one row per pinned RPM on top of it. The existing dedup guard does not catch
+    # that: it only skips when a row for the run_id is ALREADY present, so whichever writer
+    # lands first wins and the other duplicates -- order-dependent, and every per-artifact
+    # counter is derived from these rows. Passing an empty lock path reuses the documented
+    # "empty disables the link" contract rather than adding a second flag.
+    _lock = effective_rpm_lock(args)
+    insert_to_clickhouse(rows, resolve_v2_run_id(args), _lock, args.arch)
 
 
 if __name__ == "__main__":

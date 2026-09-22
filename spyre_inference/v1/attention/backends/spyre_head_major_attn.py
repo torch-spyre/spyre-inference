@@ -282,6 +282,12 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         alibi_bias_tiles: list[torch.Tensor] | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
+        # at trace time — see the base's `_run_page_attn`, which this replaces rather than
+        # extends.
+        assert row_table.shape == (padded_query_len,), (
+            f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
+        )
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         kv_row_table, page_table = index_table
         # Beyond one query token the page transfer LX residency saves is amortised over every

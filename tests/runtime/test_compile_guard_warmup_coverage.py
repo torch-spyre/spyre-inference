@@ -208,7 +208,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         runner._dummy_run = dummy_run
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
         if not warmup_embeddings:
-            runner._warmup_input_embeddings = lambda bucket_sizes: None
+            runner._warmup_input_embedding = lambda num_tokens: None
 
         runner.warming_up_model()
         return runner, block, decoder

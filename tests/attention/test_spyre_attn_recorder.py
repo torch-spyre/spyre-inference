@@ -31,7 +31,6 @@ import torch
 from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import _print_warning_once
-from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference import envs
@@ -190,28 +189,10 @@ def _forward_shape(impl, builder, kv_cache, kv_len, query_len, num_seqs=1):
 
     Takes LENGTHS, not a bucket, so it exercises what ``build()`` rounds a length onto
     rather than what the recorder chose to trace -- the two coming apart is the whole bug
-    class here.
+    class here. Through the builder's own ``build_for_shape``, so the batch a test drives
+    cannot drift from the one warmup records.
     """
-    starts = [0] + [query_len * (i + 1) for i in range(num_seqs)]
-    query_start_loc = torch.tensor(starts, dtype=torch.int32)
-    attn_metadata = builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=CommonAttentionMetadata(
-            query_start_loc=query_start_loc,
-            query_start_loc_cpu=query_start_loc,
-            seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
-            num_reqs=num_seqs,
-            num_actual_tokens=query_len * num_seqs,
-            max_query_len=query_len,
-            max_seq_len=kv_len,
-            block_table_tensor=torch.zeros(
-                num_seqs, (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, dtype=torch.int32
-            ),
-            slot_mapping=torch.zeros(query_len * num_seqs, dtype=torch.int64),
-            causal=True,
-            is_prefilling=torch.full((num_seqs,), query_len > 1),
-        ),
-    )
+    attn_metadata = builder.build_for_shape(kv_len, query_len, num_seqs)
     q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
     impl.forward(MagicMock(), q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging)
     return attn_metadata
@@ -308,11 +289,8 @@ class TestRecordGraphs:
     def test_no_windowed_length_compiles_after_warmup(self, impl, kv_cache, sliding_window_builder):
         """The acceptance criterion, per length rather than per bucket.
 
-        Two levers have to hold for this to pass and it fails if either is reverted: the
-        count has to round onto a recorded rung, and the content-free tiles have to be
-        distinct per position -- Dynamo guards which mask-tile arguments are the same
-        object, so two lengths in one rung with differently-placed boundary blocks compile
-        separately while a shared tile is handed to all of them.
+        Fails if either lever is reverted: the count must round onto a recorded rung, and
+        the content-free tiles must be distinct per position.
         """
         windowed_bucketer(sliding_window_builder)
         _record(impl, kv_cache, sliding_window_builder)
@@ -569,13 +547,31 @@ class TestWindowedBlockLadder:
     def test_the_ladder_is_the_kv_one_capped_by_the_windows_own_maxima(self):
         """The kv rungs below the cap, plus one exact rung per query bucket.
 
-        ``[1, 2, 4, 8]`` are the kv ladder's. 9 is the most blocks a decode step can leave
-        active under a 1024 window at block 128 -- eight whole blocks plus the partial one
-        its boundary sits in -- and 13 the most a 512-token prefill chunk can. 16, the rung
-        the kv ladder offers a 2048 context, is above every reachable count, so it is
-        dropped rather than recorded.
+        ``[1, 2, 4, 8]`` are the kv ladder's; 9 caps decode under a 1024 window at block 128
+        and 13 caps a 512-token prefill chunk. 16 is above every reachable count, so the kv
+        ladder's top rung is dropped rather than recorded.
         """
         assert self._gemma4_bucketer().num_blocks_buckets == [1, 2, 4, 8, 9, 13]
+
+    @pytest.mark.parametrize("sliding_window", (BLOCK_SIZE, 3 * BLOCK_SIZE + 1, 500, 1024))
+    @pytest.mark.parametrize("max_model_len", (128, 512, 2048))
+    def test_the_cap_never_falls_as_the_query_grows(self, sliding_window, max_model_len):
+        """``_max_active_blocks`` is monotone in ``query_len``, which is what makes it a cap.
+
+        It is evaluated once per query *bucket* while ``_sliding_plan`` scans every real
+        ``query_len`` inside it, so the bucket's width bounds them all only under this
+        property. Nothing else pins it.
+        """
+        bucketer = make_bucketer(
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_model_len,
+            sliding_window=sliding_window,
+        )
+        caps = [bucketer._max_active_blocks(q) for q in range(1, max_model_len + 1)]
+        drops = [
+            (q + 2, caps[q], caps[q + 1]) for q in range(len(caps) - 1) if caps[q + 1] < caps[q]
+        ]
+        assert not drops, f"a wider query lowers the cap at (query_len, before, after): {drops[:5]}"
 
     @pytest.mark.parametrize("max_model_len", (2048, 4096, 32768))
     def test_the_ladder_stops_growing_once_the_window_clips(self, max_model_len):
@@ -643,10 +639,8 @@ class TestWindowedBlockLadder:
     ):
         """The padding blocks must be inert, not merely masked.
 
-        Each reads page 0 under an all-``finfo.min`` tile, so the online softmax rescales
-        by ``exp(0)`` and adds an exact zero to both accumulators -- which makes this a
-        bit-for-bit claim, not an approximate one. A mask that did not saturate would show
-        up here as a numerical difference.
+        Each reads page 0 under an all-``finfo.min`` tile, so the softmax rescales by
+        ``exp(0)`` and adds an exact zero -- a bit-for-bit claim, not an approximate one.
         """
         bucketer = windowed_bucketer(sliding_window_builder)
         window = sliding_window_builder.sliding_window

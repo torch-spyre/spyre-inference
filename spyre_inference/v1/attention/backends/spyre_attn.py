@@ -408,9 +408,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
-        # Mask tiles that carry no per-sequence content: all-zero for interior active
-        # blocks, all-masked for the blocks that pad the count onto a bucket. Keyed by
-        # (query width, position within the active list) -- see _get_constant_tile.
+        # Content-free mask tiles, keyed (query width, position, masked) -- see
+        # _get_constant_tile for why position is part of the key.
         self._constant_tiles: dict[tuple[int, int, bool], torch.Tensor] = {}
 
         static_ctx = vllm_config.compilation_config.static_forward_context
@@ -418,10 +417,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             static_ctx[name] for name in layer_names if name in static_ctx
         )
 
-        # record_graphs() enumerates this same instance, so the buckets warmup
-        # compiles are exactly the ones build() can round onto. The window matters: it
-        # caps the block axis, and a windowed group's counts come from window arithmetic
-        # rather than from the kv ladder.
+        # record_graphs() enumerates this same instance, so warmup compiles exactly the
+        # buckets build() can round onto. The window caps the block axis, so it belongs here.
         self._attn_bucketer = SpyreAttnBucketer(vllm_config, sliding_window=self.sliding_window)
 
         self._init_reorder_batch_threshold(
@@ -437,21 +434,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     ) -> torch.Tensor:
         """The content-free mask tile for the active block at ``block_pos``.
 
-        ``masked`` picks all-``finfo.min`` (a block padding the count onto a bucket)
-        over all-zero (an interior block, fully inside every window).
+        ``masked`` picks all-``finfo.min`` (a block padding the count onto a bucket) over
+        all-zero (an interior block).
 
-        One tile per (query width, position), not one per width. Dynamo guards *which*
-        of the kernel's mask-tile arguments are the same object, so a tile shared across
-        positions makes the kernel specialize on which blocks are interior -- a third key
-        axis on top of (block count, query width), and one no bucketing can reach, since
-        two sequences agreeing on both still differ in where their boundary blocks fall.
-        Distinct per position, every sequence sharing a bucket reaches one kernel.
-
+        One tile per (width, position), not per width: Dynamo guards *which* mask-tile
+        arguments are the same object, so sharing one across positions makes the kernel
+        specialize on which blocks are interior -- a key axis no bucketing can reach.
         Sequences in a batch still share a tile per position, so ``_mirror_mask_tiles``
-        still collapses the whole batch's content-free blocks to one H2D transfer each.
-
-        Read-only by contract: every block at this position, in every sequence, is handed
-        this same tensor, and attention kernels only read mask tiles.
+        keeps one H2D transfer each. Read-only by contract.
         """
         key = (aligned_query_len, block_pos, masked)
         tile = self._constant_tiles.get(key)
@@ -603,35 +593,15 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     ) -> tuple[list[int], list[torch.Tensor], int]:
         """Return (block_indices, mask_tiles, num_real_blocks) using arithmetic block-skip.
 
-        block_indices: absolute block indices whose mask contributes to at least
-        one query's attention (i.e. inside the window of the earliest query),
-        then padding entries rounding the count onto the recorder's buckets.
-        mask_tiles: one tile per entry, in the same order.
-        num_real_blocks: how many of them are active rather than padding. Only
-        those reach the page-index table; the padding reads page 0 under an
-        all-masked tile, whose scores saturate to finfo.min and contribute
-        nothing to either side of the online softmax.
+        ``block_indices`` holds the blocks inside the earliest query's window, then padding
+        entries rounding the count onto the recorder's buckets; ``mask_tiles`` is one tile
+        per entry in the same order. Only the first ``num_real_blocks`` reach the page-index
+        table -- the padding reads page 0 under an all-masked tile, which saturates to
+        finfo.min and contributes nothing to either side of the online softmax.
 
-        Block classification:
-          - [0, first_active):
-                entirely outside every query's window; skipped.
-          - [first_active, last_lower_boundary]:
-                lower-boundary blocks — the window cutoff falls inside them
-                for at least one query. Real tile with per-query-row cutoffs.
-                In decode (query_len == 1) this collapses to a single block.
-          - (last_lower_boundary, last_causal_interior]:
-                interior blocks — fully inside every query's window AND fully
-                below the earliest query's causal limit. Mask is all-zero.
-          - (last_causal_interior, last_block):
-                causal-boundary blocks — inside every window, but early
-                queries have causal cutoffs falling inside them (prefill
-                only). Real tile.
-          - last_block:
-                upper-boundary block — always has KV padding (and causal
-                cutoffs during prefill). Real tile.
-
-        When any of the boundary ranges overlap (short kv_len, single-block
-        sequence, etc.) real tiles are built for the union — never zero tiles.
+        Only boundary blocks get a real tile; interior ones (fully inside every window and,
+        for prefill, fully below the earliest query's causal limit) take an all-zero tile.
+        Where the boundary ranges overlap, real tiles are built for the union.
         """
         assert self.sliding_window is not None
         block_size = self.block_size
@@ -654,6 +624,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             sliding_active_blocks(kv_len, context_len, self.sliding_window, block_size)
         )
         if not active_bs:
+            # Deliberately not padded: find_blocks_bucket(0) is 1, and a lone all-masked
+            # block divides by a zero softmax denominator. Unreachable for real lengths.
             return [], [], 0
 
         tiles: list[torch.Tensor] = []
@@ -679,12 +651,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Mask is all-zero.
                 tiles.append(self._get_constant_tile(aligned_query_len, pos, masked=False))
 
-        # Round the count onto the ladder: it is what the kernel specializes on, and the
-        # counts a window reaches are dense where the ladder is geometric. The ladder
-        # carries the window's own caps, so the common counts land on a rung exactly --
-        # steady-state decode pads by nothing at all.
+        # Round the count onto the ladder: it is what the kernel specializes on. The ladder
+        # carries the window's own caps, so steady-state decode lands on a rung exactly.
         real = len(active_bs)
         for pos in range(real, self._pad_num_blocks(real)):
+            # Filler, not aliasing: only active_bs[:real] reaches a page-index table. A
+            # real index rather than a sentinel keeps forward()'s ALiBi tile in range.
             active_bs.append(active_bs[-1])
             tiles.append(self._get_constant_tile(aligned_query_len, pos, masked=True))
 
@@ -851,11 +823,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             if active_block_indices is None:
                 table[:, 0] = block_table[s, :n]
             else:
-                # Rows past the real active blocks stay 0 -- page 0 is vLLM's null block,
-                # never allocated and never written, so the ladder's padding blocks read
-                # zeros. That matters beyond tidiness: torch-spyre lets the content under a
-                # mask reach the kernel's output, so a padding block aimed at a page holding
-                # real KV would leak it, while zeros leak nothing.
+                # Rows past the real active blocks stay 0, vLLM's never-written null block.
+                # Load-bearing, not tidiness: torch-spyre lets content under a mask reach the
+                # output, so a padding block aimed at a real page would leak that page's KV.
                 real = real_num_blocks[s]
                 table[:real, 0] = block_table[s, active_block_indices[s][:real]]
             page_index_tables_cpu.append(table)
@@ -995,28 +965,48 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             mask_by_chunk_cpu=mask_by_chunk_cpu,
         )
 
-    def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
-        """Metadata for the one-sequence batch that dispatches to ``bucket``."""
-        kv_len, query_len = self._attn_bucketer.witness(bucket)
-        num_blocks = (kv_len + self.block_size - 1) // self.block_size
-        query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
-        # Every block points at page 0, vLLM's null block: nothing real is read.
+    def build_for_shape(
+        self,
+        kv_len: int,
+        query_len: int,
+        num_seqs: int = 1,
+        table_blocks: int | None = None,
+    ) -> SpyreAttentionMetadata:
+        """Metadata for ``num_seqs`` sequences of exactly ``(kv_len, query_len)``.
+
+        The one place a synthetic batch is shaped, so every recorder entry point reaches
+        ``build()`` the same way. Takes lengths, not a bucket: under a window the length
+        realizing a bucket is not derivable from it.
+
+        The default block table is only ``ceil(kv_len / block_size)`` wide, so a caller whose
+        indices run past that -- absolute ones under a window, or a padded count -- must pass
+        ``table_blocks``. Real batches never have to: the engine allocates the table at
+        ``ceil(max_model_len / block_size)``. Every entry is page 0, vLLM's null block.
+        """
+        if table_blocks is None:
+            table_blocks = (kv_len + self.block_size - 1) // self.block_size
+        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32) * query_len
         return self.build(
             common_prefix_len=0,
             common_attn_metadata=CommonAttentionMetadata(
                 query_start_loc=query_start_loc,
                 query_start_loc_cpu=query_start_loc,
-                seq_lens=torch.tensor([kv_len], dtype=torch.int32),
-                num_reqs=1,
-                num_actual_tokens=query_len,
+                seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
+                num_reqs=num_seqs,
+                num_actual_tokens=query_len * num_seqs,
                 max_query_len=query_len,
                 max_seq_len=kv_len,
-                block_table_tensor=torch.zeros(1, num_blocks, dtype=torch.int32),
-                slot_mapping=torch.zeros(query_len, dtype=torch.int64),
+                block_table_tensor=torch.zeros(num_seqs, table_blocks, dtype=torch.int32),
+                slot_mapping=torch.zeros(query_len * num_seqs, dtype=torch.int64),
                 causal=True,
-                is_prefilling=torch.tensor([query_len > 1]),
+                is_prefilling=torch.full((num_seqs,), query_len > 1),
             ),
         )
+
+    def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
+        """Metadata for the one-sequence batch that dispatches to ``bucket``."""
+        kv_len, query_len = self._attn_bucketer.witness(bucket)
+        return self.build_for_shape(kv_len, query_len)
 
     def build_for_batched_decode_variant(
         self, bucket: SpyreAttnBatchedDecodeBucket
@@ -1039,24 +1029,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # deliberately not block-aligned, so the table spans the witness rather than the
         # bucket. Wider than the bucket is harmless: only the per-chunk page lists the
         # kernel receives are bucket-sized.
-        table_blocks = max(bucket.num_blocks, (kv_len + self.block_size - 1) // self.block_size)
-        query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
-        metadata = self.build(
-            common_prefix_len=0,
-            common_attn_metadata=CommonAttentionMetadata(
-                query_start_loc=query_start_loc,
-                query_start_loc_cpu=query_start_loc,
-                seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
-                num_reqs=num_seqs,
-                num_actual_tokens=num_seqs,
-                max_query_len=1,
-                max_seq_len=kv_len,
-                # Every block points at page 0, vLLM's null block: nothing real is read.
-                block_table_tensor=torch.zeros(num_seqs, table_blocks, dtype=torch.int32),
-                slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
-                causal=True,
-                is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
-            ),
+        metadata = self.build_for_shape(
+            kv_len,
+            query_len=1,
+            num_seqs=num_seqs,
+            table_blocks=max(bucket.num_blocks, (kv_len + self.block_size - 1) // self.block_size),
         )
         assert metadata.padded_num_seqs is not None, (
             f"build() declined the batched path for {bucket}; the recorded variant would "
@@ -1460,10 +1437,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             num_blocks=len(attn_metadata.attention_mask_tiles[0]),
             padded_query_len=attn_metadata.aligned_query_lens[0],
         )
-        # Every requested bucket must realize itself: build() rounds the block count onto
-        # the bucketer's own ladder on both paths, and the witness under a window is a
-        # sequence chosen to round onto this entry. A mismatch means the two have drifted
-        # and dispatch can ask for a kernel warmup never recorded.
+        # A mismatch means the bucketer and build() have drifted, and dispatch can then ask
+        # for a kernel warmup never recorded.
         if realized != bucket:
             logger.warning(
                 "Attention variant %s realized as %s; the bucketer and build() have "
@@ -1547,10 +1522,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.blocks_per_chunk,
             len(attn_metadata.chunk_page_ids_cpu),
         )
-        # Every requested bucket must realize itself, window or not: build() rounds the
-        # decode block count onto the bucketer's own ladder, and the witness is chosen so
-        # it rounds onto the requested entry. A mismatch means the two have drifted and
-        # dispatch can ask for a kernel warmup never recorded.
+        # A mismatch means the bucketer and build() have drifted, and dispatch can then ask
+        # for a kernel warmup never recorded.
         requested = (bucket.num_seqs, bucket.blocks_per_chunk, bucket.num_chunks)
         if realized != requested:
             logger.warning(

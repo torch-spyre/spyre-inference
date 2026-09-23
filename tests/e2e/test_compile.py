@@ -134,6 +134,27 @@ def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_warmup_covers_every_compile_a_request_needs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Serve with ``SPYRE_COMPILE_GUARD=error``: a post-warmup compile kills the engine.
+
+    The only test that exercises the guard's integration rather than its mechanics --
+    the worker arming it after ``warming_up_model()``, and the ``watch`` registrations
+    in the attention backends, the model runner, the MoE regions and the FP8 linear
+    path. The unit tests hand-register their own functions on CPU, so a wrong callable
+    registered there, or a kernel nobody registered at all, passes them.
+
+    Uses the same model and shapes as ``test_basic_llm_inference``, so a failure here
+    is a coverage gap rather than a new workload: if warmup really compiles everything
+    a request needs, arming changes nothing.
+    """
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "\n\nIBMs main businesses are the companies that provide the services of the",
+        monkeypatch,
+    )
+
+
 def _assert_compiled_output(
     model: str,
     ref_output: str,

@@ -91,7 +91,7 @@ def patch_vision_attention() -> None:
         return out
 
     _forward._spyre_patched = True
-    attn_cls.forward = _forward  # ty: ignore[invalid-assignment]
+    attn_cls.forward = _forward
     logger.info(
         "Spyre: patched Pixtral vision Attention to stick-aligned padded "
         "on-card SDPA (pad L/D to 64, mask, crop)."
@@ -165,7 +165,7 @@ def patch_vision_rope_vit() -> None:
 
     _apply_rotary_emb_vit._spyre_patched = True
     pixtral.apply_rotary_emb_vit = _apply_rotary_emb_vit  # ty: ignore[invalid-assignment]
-    vt.freqs_cis = property(_freqs_cis_ondev)  # ty: ignore[invalid-assignment]
+    vt.freqs_cis = property(_freqs_cis_ondev)
     logger.info(
         "Spyre: patched Pixtral VisionTransformer 2D-RoPE to on-card real "
         "rotation (index_select freqs gather + pair-swap matmul)."
@@ -225,7 +225,7 @@ def patch_patch_merger() -> None:
         return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
 
     _forward._spyre_patched = True
-    pm_cls.forward = _forward  # ty: ignore[invalid-assignment]
+    pm_cls.forward = _forward
     logger.info(
         "Spyre: patched Pixtral PatchMerger permute to CPU (merging_layer GEMM stays on-card)."
     )

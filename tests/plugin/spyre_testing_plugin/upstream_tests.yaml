@@ -276,3 +276,11 @@ tests:
         - test: "test_chat" # Pixtral-12B, Mistral-Small-3.1-24B
           mode: skip
           tags: [model, multimodal, upstream, uses_subprocess]
+
+    # gRPC health servicer for `vllm serve --grpc`; host-side mocks, no card.
+    # Entirely importorskip, so it skips rather than fails without vllm[grpc].
+    - rel_path: tests/entrypoints/unit_tests/test_grpc_health.py
+      allow_list:
+        - test: "*"
+          mode: mandatory_pass
+          tags: [grpc, upstream]

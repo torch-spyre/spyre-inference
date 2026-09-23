@@ -21,9 +21,8 @@ then serving an off-bucket shape reproduces the production failure this guard ex
 to catch: ``SpyreShapeBucketer.find_bucket`` returns ``None``, nothing pads the
 batch, and the block recompiles mid-request.
 
-The stub also carries a real token embedding behind the wrapper the serving path embeds
-through: warmup covering the blocks says nothing about a layer outside them, which
-``compile_when_outermost`` compiles on its own.
+The stub also carries a real token embedding behind the serving path's wrapper: it sits
+outside the blocks, and ``compile_when_outermost`` compiles it on its own.
 
 CPU with ``backend="eager"``: the guard keys on the code object Dynamo traces, which
 is decided before any backend runs, so a real Spyre compile would only add minutes.
@@ -339,9 +338,7 @@ def test_an_mm_encoder_only_model_is_not_embedded_during_warmup(build_runner):
 def test_single_pass_without_buckets_still_warms_the_embedding(build_runner):
     """An explicit empty compile-size list still takes the multimodal request path."""
     runner, _, decoder = build_runner(bucket_sizes=[])
-    warmup_tokens = min(
-        max(16, MAX_NUM_REQS), runner.scheduler_config.max_num_batched_tokens
-    )
+    warmup_tokens = min(max(16, MAX_NUM_REQS), runner.scheduler_config.max_num_batched_tokens)
 
     assert decoder.embed_calls == [warmup_tokens]
     compile_guard.arm(CompileGuardLevel.ERROR)

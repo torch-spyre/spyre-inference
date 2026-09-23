@@ -900,17 +900,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
-        """Run the embedding step a dummy forward is handed the result of.
+        """Compile the embedding step a dummy run skips.
 
-        Upstream fills the ``inputs_embeds`` buffer with zeros, so a dummy run presents
-        the model the right input without ever producing it the way ``_preprocess``
-        does -- and producing it is what compiles the embedding. Called from
-        ``_dummy_run`` rather than from each warmup branch, so every branch is covered.
-
-        Driven through the wrapper, which is what pads the token count onto a bucket.
+        ``_dummy_run`` hands the model a zeroed ``inputs_embeds`` slice instead of
+        producing it the way ``_preprocess`` does, and producing it is what compiles.
         """
-        # A text-only ``embed_input_ids`` takes no multimodal arguments, so the wrapper
-        # call would raise -- and its dummy run already compiles the embedding.
+        # Only a decoder-only multimodal model embeds through ``embed_input_ids``: a
+        # text-only signature takes no multimodal arguments, so the call would raise.
         mm_config = getattr(self.model_config, "multimodal_config", None)
         if (
             not self.supports_mm_inputs
@@ -918,8 +914,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             or (mm_config is not None and mm_config.mm_encoder_only)
         ):
             return
-        # `embed_input_ids` is only on the wrapper, and `ty` cannot narrow `self.model`
-        # to it, as for `cast(VllmModelForPooling, ...)` in `_pool`.
         model = cast(_SpyreModelWrapper, self.model)
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
         model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
@@ -1237,9 +1231,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
-            # Before the forward, as `_preprocess` does it: upstream hands the model a
-            # slice of the `inputs_embeds` buffer without ever running the step that
-            # fills it, which is the step that compiles the embedding.
             self._warmup_input_embedding(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device

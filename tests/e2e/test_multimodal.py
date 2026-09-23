@@ -139,9 +139,8 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 def test_warmup_covers_the_multimodal_token_embedding(monkeypatch):
     """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
 
-    The text-only twin in ``tests/e2e/test_compile.py`` cannot stand in: only a
-    multimodal model reaches the token embedding through ``embed_input_ids``. Unknown
-    vision-tower compiles remain warnings by design and are outside this assertion.
+    Only a multimodal model reaches the token embedding through ``embed_input_ids``, so
+    the text-only twin in ``tests/e2e/test_compile.py`` cannot stand in.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")

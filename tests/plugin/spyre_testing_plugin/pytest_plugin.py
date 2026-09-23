@@ -689,6 +689,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 if item.name in {
                     "test_gsm8k_correctness[granite-4.1-3b]",
                     "test_gsm8k_correctness[mistral-7b-instruct-v0.3]",
+                    "test_gsm8k_correctness[qwen2.5-0.5b-instruct]",
+                    "test_models[ibm-ai-platform/micro-g3.3-8b-instruct-1b-transformers-num_fused0]",
+                    "test_models[meta-llama/Llama-3.2-1B-Instruct-transformers-num_fused1]",
                 }:
                     item.add_marker(pytest.mark.disable_co_optimizing_lx_planning)
 

@@ -816,8 +816,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
-        attention ``(B, L)`` at its full size. Both bucket loops also warm the input
-        embedding, which a multimodal model's dummy run never reaches.
+        attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
@@ -837,7 +836,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # would crash. _warmup_pooling_bucket_shapes below covers
                         # attention at the shapes that do respect max_model_len.
                         self._dummy_run(size, force_attention=size <= max_model_len)
-                        self._warmup_input_embedding(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()
@@ -885,7 +883,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
-                self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
@@ -903,10 +900,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
-        """Compile the token embedding at one token count a request can reach.
+        """Run the embedding step a dummy forward is handed the result of.
 
-        A multimodal model is fed ``inputs_embeds``, so the dummy run never reaches the
-        embedding; serving reaches it through ``embed_input_ids``, outside any graph.
+        Upstream fills the ``inputs_embeds`` buffer with zeros, so a dummy run presents
+        the model the right input without ever producing it the way ``_preprocess``
+        does -- and producing it is what compiles the embedding. Called from
+        ``_dummy_run`` rather than from each warmup branch, so every branch is covered.
+
         Driven through the wrapper, which is what pads the token count onto a bucket.
         """
         # A text-only ``embed_input_ids`` takes no multimodal arguments, so the wrapper
@@ -1232,6 +1232,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
+            # Before the forward, as `_preprocess` does it: upstream hands the model a
+            # slice of the `inputs_embeds` buffer without ever running the step that
+            # fills it, which is the step that compiles the embedding.
+            self._warmup_input_embedding(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

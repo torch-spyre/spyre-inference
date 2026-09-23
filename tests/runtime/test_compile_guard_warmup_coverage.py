@@ -41,6 +41,7 @@ from torch._dynamo.utils import counters
 from vllm.config import CompilationMode
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops import lazy_compile
 from spyre_inference.custom_ops.vocab_parallel_embedding import (
@@ -201,16 +202,20 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             model_dtype=torch.float32,
         )
 
-        def dummy_run(size, *args, **kwargs):
+        def base_dummy_run(_self, size, *args, **kwargs):
             hidden = torch.zeros(size, HIDDEN)
             return None, block(hidden)
 
-        runner._dummy_run = dummy_run
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
         if not warmup_embeddings:
             runner._warmup_input_embedding = lambda num_tokens: None
 
-        runner.warming_up_model()
+        # The *base* method is patched, not `runner._dummy_run`: the Spyre override is
+        # what drives the embedding, so stubbing it out would skip the thing under test.
+        with unittest.mock.patch.object(
+            GPUModelRunner, "_dummy_run", autospec=True, side_effect=base_dummy_run
+        ):
+            runner.warming_up_model()
         return runner, block, decoder
 
     return build

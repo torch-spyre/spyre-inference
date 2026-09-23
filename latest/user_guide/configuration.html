@@ -2165,22 +2165,43 @@ pad onto the same buckets clipped to <code>--max-num-seqs</code>, and warmup pro
 no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.</p>
 <h2 id="encoder-pooling-compile-buckets">Encoder / pooling compile buckets<a class="headerlink" href="#encoder-pooling-compile-buckets" title="Permanent link">&para;</a></h2>
 <p>Spyre compile is on by default (<code>STOCK_TORCH_COMPILE</code>, <code>dynamic=False</code>). Pass
-<code>--enforce-eager</code> to disable it. Body and attention are bucketed independently:</p>
+<code>--enforce-eager</code> to disable it.</p>
+<p>Everything derives from one number, <code>R</code> — the token budget. It is
+<code>--max-num-batched-tokens</code>, capped at 2048 (the measured throughput argmax across
+pooling models), floored at <code>--max-model-len</code> rounded up to a power-of-two multiple of
+64, and capped again at what <code>--max-num-seqs</code> sequences of that length could carry, then
+floored to a whole multiple of it so that every length divides <code>R</code>. <code>--max-num-seqs</code> is
+then lowered to <code>R / 64</code> if it was higher, since no batch wider than that fits.</p>
 <ul>
-<li><strong>Body</strong> (Linear / LN): pad the packed token count to the next 1D
-  <code>compile_sizes</code> bucket <code>T</code> (same dispatch as the decoder).</li>
-<li><strong>Attention</strong> (SDPA): gather into a dense <code>(B, L)</code> grid. This is the Spyre
-  workaround until flash-style attention lands; the body is not rewritten to
-  <code>T = B × L</code>.</li>
+<li><strong>Body</strong> (Linear / LN): one shape, <code>R</code> rows. Every pooling step pads to it.
+  Fixing it is what keeps the attention kernels keyed on sequence shapes alone.</li>
+<li><strong>Lengths</strong>: powers of two from 64 (one Spyre stick) up to <code>--max-model-len</code>, rounded
+  up to a power-of-two multiple of 64. Every length is then <code>64 * 2^k</code>, so each divides
+  <code>R</code> and each rectangle covers the body exactly. <code>SPYRE_ATTN_QUERY_BUCKETS</code> overrides the
+  ladder, rounded the same way.</li>
+<li><strong>Attention, rectangular path</strong>: for each length <code>L</code>, one rectangle <code>B = R / L</code>. The
+  runner pads every sequence to <code>L</code> and the batch to <code>B</code>, so Q/K/V <em>are</em> the grid:
+  one reshape, one <code>F.scaled_dot_product_attention</code>, one store, no data movement
+  inside the layer. Taken whenever <code>num_seqs &lt;= B</code>.</li>
+<li><strong>Attention, ragged path</strong>: for a batch too wide for any rectangle, Q/K/V stay
+  packed and requests are split into <em>groups</em> — the requests sharing one padded
+  length. Each group is one fused gather/attend/scatter keyed on <code>(group width,
+  extent)</code>, so a ragged step makes one kernel call per group rather than per
+  request. Widths are powers of two up to <code>B</code>; a wider group is chunked into
+  descending powers of two.</li>
 </ul>
-<p><code>compile_sizes</code> for pooling is the body <code>T</code> buckets (<code>64, 128, …</code> up to the
-token cap). Attention <code>L</code> comes from <code>--max-model-len</code> (<code>64, 128, …</code>).
-Attention <code>B</code> is powers of two up to <code>--max-num-seqs</code> (same as decoder).</p>
-<p>A 3-seq × 30-token request with <code>--max-num-seqs 4</code> pads the body to <code>T=128</code>
-and attention to <code>(B=4, L=64)</code>. Masks and pooling still use the real lengths.</p>
-<p>Compiled pooling warmup dummies 1D body sizes, then each attention <code>(B, L)</code>
-at full size. Eager pooling uses one short dummy, then runtime still
-1D-pads the body.</p>
+<p>With <code>--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048</code> that is
+23 shapes: one body, four rectangles (<code>(64,32) (128,16) (256,8) (512,4)</code>, each
+exactly 2048 rows), and 18 group pairs. At <code>--max-num-seqs 4</code> the group family is
+empty — no batch that narrow can miss the rectangular path — leaving five shapes.</p>
+<p>Both paths go through the same opaque attention op, so the block graph is identical
+for either and the choice is made once per step from the step's metadata. The
+runner counts them in <code>spyre_encoder_rect_steps</code> /
+<code>spyre_encoder_ragged_steps</code>.</p>
+<p>Compiled pooling warmup runs one dummy at the body shape; the first attention call
+in it traces every declared rectangle and group pair, against that call's own
+tensors (a Spyre tensor's device layout is part of its cache key). Eager pooling
+uses one short dummy and always takes the packed path.</p>
 <p>Example:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-embedding-125m-english<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span>--runner<span class="w"> </span>pooling<span class="w"> </span>--max-num-seqs<span class="w"> </span><span class="m">4</span><span class="w"> </span>--max-model-len<span class="w"> </span><span class="m">512</span>

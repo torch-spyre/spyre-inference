@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Spyre FP8 linear kernel — aten._scaled_mm path."""
+"""Tests for Spyre FP8 linear kernel — aten._scaled_mm path.
+
+Spyre ``qfp8ch``/``qfp8wt`` and SuperDSC ``_scaled_mm`` are not IEEE
+``float8_e4m3fn`` / CPU ``_scaled_mm``. These tests check shapes, layouts, and
+cache behavior. Numerical checks compare cached eager ``qfp8wt`` to the
+in-graph ``qfp8wt`` path  not a CPU golden.
+"""
 
 import warnings
 
@@ -90,6 +96,44 @@ _XFAIL_M1 = pytest.param(
 )
 
 
+@torch.compile(backend="inductor", dynamic=False)
+def _in_graph_qfp8wt_mm(
+    x: torch.Tensor,
+    weight_fp16: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    scale_a = torch.ops.spyre.quantscalepertokenfp8(x, FP8_E4M3FN_MAX)
+    x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+    w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(weight_fp16, weight_scale)
+    return torch.ops.aten._scaled_mm(
+        x_fp8,
+        w_fp8,
+        scale_a=scale_a,
+        scale_b=weight_scale,
+        bias=None,
+        out_dtype=torch.float16,
+    )
+
+
+@torch.compile(backend="inductor", dynamic=False)
+def _in_graph_qfp8wt_mm_static(
+    x: torch.Tensor,
+    scale_a: torch.Tensor,
+    weight_fp16: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
+    w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(weight_fp16, weight_scale)
+    return torch.ops.aten._scaled_mm(
+        x_fp8,
+        w_fp8,
+        scale_a=scale_a,
+        scale_b=weight_scale,
+        bias=None,
+        out_dtype=torch.float16,
+    )
+
+
 @pytest.mark.fp8
 class TestSpyreFp8LinearKernel:
     def test_register(self):
@@ -110,8 +154,8 @@ class TestSpyreFp8LinearKernel:
             f"Expected SpyreFp8LinearKernel, got {type(kernel).__name__}"
         )
 
-    def test_process_weights_keeps_fp8(self):
-        """Weights stay FP8 for aten._scaled_mm (no CPU dequant / weight_t)."""
+    def test_process_weights_dequants_fp8_for_h2d(self):
+        """Checkpoint FP8 becomes CPU fp16 so model.to('spyre') is a legal H2D."""
         if SpyreFp8LinearKernel is None:
             pytest.skip("vLLM FP8 kernel base unavailable")
 
@@ -130,7 +174,8 @@ class TestSpyreFp8LinearKernel:
         layer.weight_scale = torch.nn.Parameter(weight_scale.reshape(1), requires_grad=False)
         kernel.process_weights_after_loading(layer)
 
-        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight.dtype == torch.float16
+        assert layer.weight.device.type == "cpu"
         assert layer.weight.shape == (64, 128)
         assert layer.weight_scale.numel() == 1
         assert getattr(layer, "weight_t", None) is None
@@ -172,7 +217,7 @@ class TestSpyreFp8LinearKernel:
         )
         kernel.process_weights_after_loading(layer)
 
-        assert layer.weight.dtype == torch.float8_e4m3fn
+        assert layer.weight.dtype == torch.float16
         assert layer.weight.shape == (in_features, out_features)
         assert layer.weight_scale.shape == (1, out_features)
         assert layer.weight_scale.numel() == out_features
@@ -185,11 +230,11 @@ class TestSpyreFp8LinearKernel:
         assert getattr(layer, "weight_t", None) is None
 
     def _prepare_spyre_apply_layer(self, kernel, weight_kn, *, per_channel: bool):
-        """Load-time process on CPU, then move FP16 weight to Spyre.
+        """Load-time process on CPU, then move the fp16 working copy to Spyre.
 
-        Forward quantizes with ``quantize_weight_fp8_with_scale`` (``qfp8wt``)
-        inside the same compiled graph as ``_scaled_mm`` — torch-spyre's
-        ``test_fp8_scaled_mm_cpu``. CPU ``float8.to("spyre")`` is the wrong layout.
+        ``process_weights_after_loading`` dequants checkpoint FP8 to CPU fp16.
+        First ``apply_weights`` eager-quantizes SuperDSC N-tiles to ``qfp8wt``
+        and caches them; the compiled graph is qfp8ch + ``_scaled_mm``.
         """
         if per_channel:
             _weight_fp8, weight_scale = _quantize_weight_fp8_per_channel(weight_kn)
@@ -209,7 +254,7 @@ class TestSpyreFp8LinearKernel:
         return layer
 
     def _run_spyre_apply(self, kernel, layer, x):
-        """Call apply_weights on Spyre (one inductor graph: qfp8ch + qfp8wt + mm)."""
+        """Call apply_weights on Spyre (compiled graph: qfp8ch + cached qfp8wt)."""
         from torch_spyre.ops.fallbacks import FallbackWarning
 
         with warnings.catch_warnings():
@@ -218,7 +263,15 @@ class TestSpyreFp8LinearKernel:
         assert actual.device.type == "spyre", actual.device
         return actual
 
-    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 5, 128, 130])
+    def _assert_qfp8wt(self, weight):
+        layout = weight.device_tensor_layout()
+        if layout is None:
+            pytest.fail("cached weight has no device_tensor_layout")
+        from torch_spyre._C import ElementArrangement
+
+        assert layout.element_arrangement == ElementArrangement.QFP8WT, layout.element_arrangement
+
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 128])
     def test_scaled_mm_apply(self, num_tokens):
         """apply_weights runs aten._scaled_mm on Spyre.
 
@@ -338,9 +391,175 @@ class TestSpyreFp8LinearKernel:
         )
         assert isinstance(layer.quant_method.fp8_linear, SpyreFp8LinearKernel)
 
+    @pytest.mark.parametrize("per_channel", [False, True])
+    def test_qfp8wt_cached_and_reused(self, per_channel):
+        """First apply caches eager qfp8wt; the second apply reuses the same tiles."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=per_channel)
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(42)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=per_channel)
+        x = torch.randn(4, in_features, dtype=torch.float16, device="spyre")
+
+        actual = self._run_spyre_apply(kernel, layer, x)
+        splits = getattr(layer, "_qfp8wt_for_mm", None)
+        assert splits is not None
+        assert len(splits) == 1
+        cached = splits[0][0]
+        assert cached.device.type == "spyre"
+        assert cached.shape == (in_features, out_features)
+        self._assert_qfp8wt(cached)
+        assert getattr(layer, "_fp16_for_qfp8wt", None) is None
+
+        again = self._run_spyre_apply(kernel, layer, x)
+        assert layer._qfp8wt_for_mm[0][0] is cached
+        assert again.dtype == torch.float16
+        assert again.shape == actual.shape
+
+    def test_qfp8wt_n_splits_fused_qkv(self):
+        """Fused QKV N=6144 is prequantized as SuperDSC-legal tiles."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=True)
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(0)
+        in_features, out_features = 128, 6144
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=True)
+        x = torch.randn(4, in_features, dtype=torch.float16, device="spyre")
+        actual = self._run_spyre_apply(kernel, layer, x)
+        assert actual.shape == (4, out_features)
+        widths = [int(wj.shape[1]) for wj, _ in layer._qfp8wt_for_mm]
+        assert widths == [4096, 1024, 1024]
+        for wj, _ in layer._qfp8wt_for_mm:
+            self._assert_qfp8wt(wj)
+
+    def test_cpu_fp8_checkpoint_never_dmas_float8(self):
+        """process_weights dequants on CPU; apply H2Ds fp16 then caches qfp8wt."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(7)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        weight_fp8, weight_scale = _quantize_weight_fp8(weight_kn)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+        layer.weight_scale = torch.nn.Parameter(weight_scale.reshape(1), requires_grad=False)
+        kernel.process_weights_after_loading(layer)
+        assert layer.weight.dtype == torch.float16
+        assert layer.weight.device.type == "cpu"
+
+        x = torch.randn(4, in_features, dtype=torch.float16, device="spyre")
+        actual = self._run_spyre_apply(kernel, layer, x)
+        assert actual.shape == (4, out_features)
+        self._assert_qfp8wt(layer._qfp8wt_for_mm[0][0])
+
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 128])
+    def test_cached_qfp8wt_matches_in_graph_qfp8wt(self, num_tokens):
+        """Cached eager qfp8wt matches compiling qfp8wt in the GEMM graph.
+
+        Same check as spyre-inference#934 ``test_prequant_result_matches_fallback``
+        without an env-gated kernel path. The two quantize independently, so
+        fp8 rounding can differ by a few ULPs; one ULP dequanted to fp16 is
+        ~scale * 2/448 ≈ 2e-4, and 0.1 covers accumulation over K=128.
+        """
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel()
+        except ImportError:
+            pytest.skip("vLLM FP8 APIs unavailable")
+
+        torch.manual_seed(13)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=False)
+        x = torch.randn(num_tokens, in_features, dtype=torch.float16, device="spyre")
+        self._assert_cached_matches_in_graph(kernel, layer, x, num_tokens=num_tokens)
+
+    @pytest.mark.parametrize("num_tokens", [_XFAIL_M1, 4, 128])
+    def test_cached_qfp8wt_per_channel_matches_in_graph(self, num_tokens):
+        """Per-channel cached qfp8wt matches in-graph qfp8wt (PR #934)."""
+        if not spyre_available():
+            pytest.skip("Spyre device not available")
+        if SpyreFp8LinearKernel is None:
+            pytest.skip("vLLM FP8 kernel base unavailable")
+
+        register_spyre_fp8_linear_kernel()
+        try:
+            kernel = _make_kernel(granite_channel=True)
+        except ImportError:
+            pytest.skip("vLLM FP8 channel QuantKey unavailable")
+
+        torch.manual_seed(21)
+        in_features, out_features = 128, 128
+        weight_kn = torch.randn(in_features, out_features, dtype=torch.float16) * 0.05
+        layer = self._prepare_spyre_apply_layer(kernel, weight_kn, per_channel=True)
+        x = torch.randn(num_tokens, in_features, dtype=torch.float16, device="spyre")
+        self._assert_cached_matches_in_graph(kernel, layer, x, num_tokens=num_tokens)
+
+    def _assert_cached_matches_in_graph(self, kernel, layer, x, *, num_tokens: int) -> None:
+        from torch_spyre.ops.fallbacks import FallbackWarning
+
+        from spyre_inference.custom_ops.fp8_linear_kernel import _per_tensor_activation_scale
+
+        out_cached = self._run_spyre_apply(kernel, layer, x).cpu()
+        w = layer.weight
+        s = layer.weight_scale
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FallbackWarning)
+            if kernel._per_token_act:
+                out_graph = _in_graph_qfp8wt_mm(x, w, s).cpu()
+            else:
+                out_graph = _in_graph_qfp8wt_mm_static(
+                    x, _per_tensor_activation_scale(x), w, s
+                ).cpu()
+        assert out_cached.shape == out_graph.shape
+        max_diff = (out_cached.float() - out_graph.float()).abs().max().item()
+        assert max_diff < 0.1, (
+            f"cached qfp8wt vs in-graph qfp8wt max_diff={max_diff:.6f} (num_tokens={num_tokens})"
+        )
+
 
 class TestFp8TileHelpers:
     """SuperDSC-legal M/N splits from the Granite torch-spyre probe."""
+
+    def test_require_qfp8wt_fails_without_layout(self):
+        """Missing device_tensor_layout must error, not skip the QFP8WT check."""
+        from spyre_inference.custom_ops.fp8_linear_kernel import _require_qfp8wt
+
+        with pytest.raises(RuntimeError, match="device_tensor_layout"):
+            _require_qfp8wt(torch.zeros(2, 2, dtype=torch.float16))
 
     def test_m_tiles_4096_wide(self):
         from spyre_inference.custom_ops.fp8_linear_kernel import _m_tiles
@@ -360,6 +579,17 @@ class TestFp8TileHelpers:
         assert _n_tiles(6144) == [4096, 1024, 1024]
         assert _n_tiles(25600) == [4096] * 6 + [1024]
         assert _n_tiles(12800) == [4096, 4096, 4096, 128, 128, 128, 128]
+
+    def test_n_weight_splits_per_channel_qkv(self):
+        from spyre_inference.custom_ops.fp8_linear_kernel import _n_tiles, _n_weight_splits
+
+        w = torch.arange(8 * 6144, dtype=torch.float16).reshape(8, 6144)
+        s = torch.arange(6144, dtype=torch.float16).reshape(1, 6144)
+        parts = _n_weight_splits(w, s, _n_tiles(6144))
+        assert [int(wj.shape[1]) for wj, _ in parts] == [4096, 1024, 1024]
+        assert [int(sj.shape[1]) for _, sj in parts] == [4096, 1024, 1024]
+        torch.testing.assert_close(torch.cat([wj for wj, _ in parts], dim=1), w)
+        torch.testing.assert_close(torch.cat([sj for _, sj in parts], dim=1), s)
 
 
 class TestDetectFp8ForCompile:

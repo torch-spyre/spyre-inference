@@ -63,6 +63,7 @@ compiled graph (see below).
 | `ParallelLMHead` | `SpyreParallelLMHead` | Spyre | TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; `apply` runs `x @ Wᵀ` then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP `all_gather` |
 | `LogitsProcessor` | `SpyreLogitsProcessor` | Spyre → CPU | Moves logits to CPU so all downstream sampling runs on the host. `_apply_head` D2Hs on the single-card path; when TP>1 `_gather_logits` runs the `all_gather` on Spyre and then converts the result. Either way the sampler's `logits.to(torch.float32)` never runs on Spyre, where it would crash torch-spyre's `copy_from_d2d` |
 | `GateLinear` | `SpyreGateLinear` | Spyre | Clears `out_dtype` so MoE router logits stay in the weight dtype because Spyre cannot restickify fp32 (`spyre::ReStickifyOpHBM` is unsupported for IEEE_FP32). The MoE backend promotes stick-aligned full-softmax reductions to fp32 and returns them to the transport dtype |
+| FP8 `ColumnParallelLinear` / fused QKV / `MergedColumnParallelLinear` / `RowParallelLinear` | `SpyreFp8LinearKernel` | Spyre | Checkpoint FP8 is dequanted to CPU fp16 at load so `model.to("spyre")` is a legal H2D. First Spyre forward eager-quantizes each SuperDSC N-tile to `qfp8wt` and caches it; later forwards compile `quantscalepertokenfp8` + `qfp8ch` + `aten._scaled_mm`. LM head stays FP16 |
 
 ### Transposed linear weights
 
@@ -80,9 +81,12 @@ in two overrides:
 
 `SpyreUnquantizedLinearMethod` uses the base defaults (transpose in place, no padding); the five
 linear subclasses install it in `__init__`, but only when `quant_method` is an
-`UnquantizedLinearMethod`; quantized layers keep their own method and the slower
-`F.linear` path. This is the pure-PyTorch equivalent of torch-spyre's `[1,0]` weight
-layout, which only fires for `nn.Linear` and so misses every vLLM parallel-linear.
+`UnquantizedLinearMethod`; quantized layers keep their own method. This is the
+pure-PyTorch equivalent of torch-spyre's `[1,0]` weight layout, which only fires
+for `nn.Linear` and so misses every vLLM parallel-linear. FP8 checkpoints use
+`SpyreFp8LinearKernel` (`custom_ops/fp8_linear_kernel.py`) rather than `F.linear`:
+load dequants to fp16, the first Spyre forward caches `qfp8wt` per N-tile, and
+the compiled GEMM is `qfp8ch` + `aten._scaled_mm`.
 `SpyreUnquantizedLMHeadMethod` reuses the same base with `WEIGHT_T_ATTR="padded_weight_t"` and
 `ROW_ALIGN=64*32`, so the fast path and the padding/un-pad logic are defined once.
 

@@ -911,7 +911,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """
         # A text-only ``embed_input_ids`` takes no multimodal arguments, so the wrapper
         # call would raise -- and its dummy run already compiles the embedding.
-        if not self.supports_mm_inputs or self.model_config.is_encoder_decoder:
+        mm_config = getattr(self.model_config, "multimodal_config", None)
+        if (
+            not self.supports_mm_inputs
+            or self.model_config.is_encoder_decoder
+            or (mm_config is not None and mm_config.mm_encoder_only)
+        ):
             return
         # `embed_input_ids` is only on the wrapper, and `ty` cannot narrow `self.model`
         # to it, as for `cast(VllmModelForPooling, ...)` in `_pool`.

@@ -37,6 +37,34 @@ inputs:
     description: PR number associated with the rows (0 on non-PR runs).
     required: false
     default: '0'
+  arch:
+    description: >-
+      Hardware architecture the benchmark ran on. Folded into the run_id hash, so a wrong
+      value mints a run_id that joins to nothing. Defaulted rather than required to keep
+      existing callers working, but pass it explicitly on any non-x86 leg.
+    required: false
+    default: x86_64
+  v2-run-id:
+    description: >-
+      An ALREADY-DERIVED v2 run_id (uuid). Jenkins passes the orchestrator's params.RUN_ID
+      here and it is used verbatim. Leave empty on Actions, where the id is derived from
+      run-id + arch + test-type instead.
+    required: false
+    default: ""
+  test-type:
+    description: Tier for the run_id hash; 'perf' for a benchmark leg.
+    required: false
+    default: perf
+  rpm-lock:
+    description: >-
+      Path to spyre-rpms.lock, used ONLY on a direct Actions run. Such a leg has no built
+      image to point at -- it restores a cache keyed on this file and builds nothing -- so the
+      file IS the identity of the stack under test, and each pinned RPM's artifact_id is
+      derived from it and linked to this run. IGNORED when v2-run-id is set: that is the
+      Jenkins path, where the orchestrator has already written the artifact_results row for
+      the same run_id and linking again would duplicate it. Empty also disables the link.
+    required: false
+    default: spyre-rpms.lock
   clickhouse-host:
     description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
     required: false
@@ -55,6 +83,14 @@ inputs:
     default: ''
   clickhouse-db:
     description: ClickHouse database.
+    required: false
+    default: ''
+  clickhouse-db-v2:
+    description: >-
+      Schema-v2 database NAME, not a second connection: one instance holds both
+      generations, so the same client serves both provided every v2 statement is
+      qualified. Empty makes the v2 write (benchmarks / benchmark_runs / the artifact
+      link) a clean no-op, leaving results_v3 and run_metadata untouched.
     required: false
     default: ''
 
@@ -99,6 +135,9 @@ runs:
         uv venv "${RUNNER_TEMP}/ingest-venv"
         source "${RUNNER_TEMP}/ingest-venv/bin/activate"
         uv pip install clickhouse-connect
+        # Shared v2 identity, schema model and write path live in torch-spyre.
+        uv pip install \
+          "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
 
     - name: Ingest benchmark results into ClickHouse
       if: steps.gate.outputs.configured == 'true'
@@ -112,11 +151,13 @@ runs:
         CH_PORT_IN: ${{ inputs.clickhouse-port }}
         CH_USER_IN: ${{ inputs.clickhouse-user }}
         CH_DB_IN: ${{ inputs.clickhouse-db }}
+        CH_DB_V2_IN: ${{ inputs.clickhouse-db-v2 }}
       run: |
         source "${RUNNER_TEMP}/ingest-venv/bin/activate"
         [ -n "${CH_PORT_IN}" ] && export CLICKHOUSE_PORT="${CH_PORT_IN}"
         [ -n "${CH_USER_IN}" ] && export CLICKHOUSE_USER="${CH_USER_IN}"
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
+        [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         # Invoke by path: the script's own directory is sys.path[0], so its
         # sibling `from utils import ...` resolves without extra PYTHONPATH.
         python3 .github/scripts/ingest_vllm_benchmarks.py \
@@ -124,6 +165,10 @@ runs:
           --workflow "${{ inputs.workflow }}" \
           --branch "${{ inputs.branch }}" \
           --sha "${{ inputs.sha }}" \
-          --run-id "${{ inputs.run-id }}" \
+          --gha-run-id "${{ inputs.run-id }}" \
           --job-id "${{ inputs.job-id }}" \
-          --pr-number "${{ inputs.pr-number }}"
+          --pr-number "${{ inputs.pr-number }}" \
+          --arch "${{ inputs.arch }}" \
+          --v2-run-id "${{ inputs.v2-run-id }}" \
+          --test-type "${{ inputs.test-type }}" \
+          --rpm-lock "${{ inputs.rpm-lock }}"

@@ -17,6 +17,8 @@
 Parses spyre-inference's pytest JUnit XML into si_test_runs / si_test_cases /
 si_run_properties.
 
+Schema-v2 is written by the workflow's own ingest-xml-to-clickhouse call, not this script.
+
 Usage (called by the GHA workflow):
     python3 ingest_xml_si.py \
         --xml-dir xml_artifacts \
@@ -32,14 +34,15 @@ Usage (called by the GHA workflow):
 
 import argparse
 import os
+import platform as _platform
 import sys
 import uuid
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
-import clickhouse_connect
 from lxml import etree
+from spyre_clickhouse_ingest import extract_properties, get_client, promote_xpass
 
 # ---------------------------------------------------------------------------
 # si_test_runs / si_test_cases / si_run_properties are provisioned out of
@@ -82,38 +85,6 @@ def classify_testcase(tc_el):
         return "skipped", "", msg
 
     return "passed", "", ""
-
-
-def extract_properties(tc_el):
-    props = []
-    props_el = tc_el.find("properties")
-    if props_el is None:
-        return props
-    for p in props_el.findall("property"):
-        name = p.get("name", "").strip()
-        value = p.get("value", "").strip()
-        if name:
-            props.append((name, value))
-    return props
-
-
-def promote_xpass(raw_cases, suite_attrs):
-    """Mirror torch-spyre's ingest_xml.py: pytest's plain <failures> count
-    lumps strict and non-strict xfail-passed cases together with real
-    failures, so bare-passed cases must be promoted to "xpass" to reconcile
-    the suite-level failure count."""
-    failures = int(suite_attrs.get("failures", 0))
-    true_fail_raw = sum(1 for c in raw_cases if c["status"] in ("failed", "error"))
-    strict_xpass_raw = sum(1 for c in raw_cases if c["status"] == "xpass")
-    non_strict = max(0, failures - true_fail_raw - strict_xpass_raw)
-
-    promoted = 0
-    for c in raw_cases:
-        if promoted >= non_strict:
-            break
-        if c["_is_bare"]:
-            c["status"] = "xpass"
-            promoted += 1
 
 
 def parse_test_xml(xml_path: Path):
@@ -175,17 +146,6 @@ def parse_test_xml(xml_path: Path):
 # ---------------------------------------------------------------------------
 # ClickHouse insertion
 # ---------------------------------------------------------------------------
-
-
-def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-    )
 
 
 def insert_run(client, run_id: str, run: dict, args):
@@ -358,8 +318,8 @@ def main():
     )
     parser.add_argument(
         "--platform",
-        default="",
-        help="Hardware platform the suite ran on, e.g. x86_64 | s390x | ppc64le",
+        default=_platform.machine() or "",
+        help="Hardware platform the SUITE ran on, e.g. x86_64 | s390x | ppc64le.",
     )
     parser.add_argument(
         "--img-digest",

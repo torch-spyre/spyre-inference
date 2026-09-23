@@ -12,7 +12,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre[cpsat]",
-    "vllm>=0.28.0,<0.29",
+    "vllm[grpc]>=0.28.0,<0.29",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm

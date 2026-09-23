@@ -1,50 +1,118 @@
-# Serve benchmarks for Spyre devices
-- test_name: serve_granite8B_tp1_in64_out64
-  server_health_timeout: 1800
+# Serve benchmarks for Spyre devices, replaying agentic dataset traces.
+#
+# Each entry under `tests` is merged over `defaults` and can override any key.
+# run_vllm_benchmarks.py derives SPYRE_DEVICES / AIU_WORLD_SIZE from
+# tensor-parallel-size, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from
+# server_health_timeout, and the bench-side model from server_parameters; it
+# also always passes --skip-chat-template, since the trace prompts carry their
+# own template.
+#
+# dataset-path is an env var so each host can point at its own copy of the
+# trace: ${SPYRE_AIOPS_DATASET} and ${SPYRE_CICS_DATASET}. Both fall back to the
+# layout on the Spyre benchmark hosts; a selected entry whose file is absent
+# fails the run rather than being skipped.
+#
+# The trailing suffix names the trace an entry replays. Each one needs a
+# max-model-len that fits its requests, since longer ones are rejected: the
+# aiops trace runs at 4k, cics at 8k.
+
+defaults:
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
   server_parameters:
-    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    dtype: float16
     load-format: auto
     max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
   parameters:
-    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    # Warmup requests excluded from metrics (first requests pay per-shape compile).
-    num-warmups: 8
-    # Match max-num-seqs and burst so the batch fills without queueing.
+    dataset-name: custom
+    num-prompts: 100
+    # Keep each record's own output_tokens rather than forcing a fixed length.
+    custom-output-len: -1
+    ignore-eos: true
+    # Replay the recorded order so prefix-cache behaviour is reproducible.
+    disable-shuffle: true
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    # Match max-num-seqs: the client keeps exactly one batch in flight, so the
+    # server never queues and the measured latency is the batch's own.
     max-concurrency: 4
-    request-rate: inf
-- test_name: serve_granite33-8b_tp1_in64_out64
-  server_health_timeout: 1800
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
-  server_parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    dtype: float16
-    load-format: auto
-    max-num-seqs: 4
-    max-model-len: 128
-    port: 8000
-    host: 127.0.0.1
-  parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    input-len: 64
-    output-len: 64
-    num-prompts: 16
-    num-warmups: 8
-    # Match max-num-seqs and burst so the batch fills without queueing.
-    max-concurrency: 4
-    request-rate: inf
+
+tests:
+  - test_name: serve_granite33-8b_tp1_cics
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite33-8b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite41-8b_tp1_cics
+    server_health_timeout: 1800
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite41-8b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite33-8b-fp8_tp4_aiops
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_granite41-8b-fp8_tp4_aiops
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp1_cics
+    server_health_timeout: 1800
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      num-prompts: 50

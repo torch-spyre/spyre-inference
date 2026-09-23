@@ -233,3 +233,39 @@ def test_run_id_and_report_kind_are_stamped_on_every_fact_row(mod):
     _idents, facts = _write(mod, flat)
     assert facts and all(f["run_id"] == _RUN for f in facts)
     assert all(f["props"]["report_kind"] == "vllm" for f in facts)
+
+
+# --- _write_artifact_results: duration_s (was hardcoded 0.0 for every GHA perf leg) ----
+
+
+def _artifact_write(
+    mod, rows, monkeypatch, lock_lines=("ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm",)
+):
+    """Run the real _write_artifact_results over these flat rows; return its inserted rows."""
+    import tempfile
+
+    monkeypatch.setattr(mod, "tables_present", lambda *a, **k: True)
+    client = _Client()
+    with tempfile.TemporaryDirectory() as d:
+        lock_path = pathlib.Path(d) / "spyre-rpms.lock"
+        lock_path.write_text("\n".join(lock_lines) + "\n", encoding="utf-8")
+        mod._write_artifact_results(client, "v2", rows, _RUN, str(lock_path), "amd64")
+    return client.inserted.get("artifact_results", [])
+
+
+def test_artifact_results_duration_sums_elapsed_time_rows(mod, monkeypatch):
+    rows = [
+        _flat(metric="elapsed_time", actual=12.5, test_name="throughput_a"),
+        _flat(metric="elapsed_time", actual=7.5, test_name="throughput_b"),
+        _flat(metric="requests_per_second", actual=42.0, test_name="throughput_a"),
+    ]
+    written = _artifact_write(mod, rows, monkeypatch)
+    assert written, "expected an artifact_results row"
+    assert all(w["duration_s"] == pytest.approx(20.0) for w in written)
+
+
+def test_artifact_results_duration_is_zero_without_elapsed_time(mod, monkeypatch):
+    # A latency/serve-only leg reports no elapsed_time metric, so duration_s stays 0.0.
+    rows = [_flat(metric="avg_latency", actual=0.42, test_name="latency_a")]
+    written = _artifact_write(mod, rows, monkeypatch)
+    assert written and all(w["duration_s"] == 0.0 for w in written)

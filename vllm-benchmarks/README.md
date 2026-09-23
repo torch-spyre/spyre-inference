@@ -9,9 +9,9 @@ test entries; one entry per `(model, shape)`:
 - `serve-tests.yaml` → `vllm bench serve` (starts a server, waits for health,
   then benchmarks against it)
 
-Serve entries replay a recorded agentic trace: real router prompts, each request keeping the output length it actually produced, in recorded order. A trace rather than a fixed prompt shape is what makes prefill chunking, prefix reuse, and KV-block pressure visible. The `*_4k` / `*_8k` suffix is the `max-model-len` the trace needs.
+Serve entries replay a recorded agentic trace: real router prompts, each request keeping the output length it actually produced, in recorded order. A trace rather than a fixed prompt shape is what makes prefill chunking, prefix reuse, and KV-block pressure visible. A serve entry's trailing suffix names the trace it replays.
 
-Trace paths come from `SPYRE_AIOPS_DATASET` (`*_4k`) and `SPYRE_CICS_DATASET` (`*_8k`), so each host can point at its own copy; unset, each falls back to its location on the Spyre benchmark hosts. A selected entry whose file is absent fails the run, so a serve-only job cannot go green without measuring anything.
+Trace paths come from `SPYRE_AIOPS_DATASET` (`*_aiops`, run at 4k) and `SPYRE_CICS_DATASET` (`*_cics`, run at 8k), so each host can point at its own copy; unset, each falls back to its location on the Spyre benchmark hosts. A selected entry whose file is absent fails the run, so a serve-only job cannot go green without measuring anything.
 
 ## Running locally
 

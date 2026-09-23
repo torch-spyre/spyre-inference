@@ -56,13 +56,6 @@ DATASET_PATH_DEFAULTS = {
     ),
 }
 
-# Applied only where the host has not set them, so a host or a config's
-# `environment_variables` can override any of these.
-ENV_DEFAULTS = {
-    "OMP_NUM_THREADS": "8",
-    "LAYOUT_SOLVER": "greedy",
-}
-
 
 def parse_args():
     parser = ArgumentParser(description="Run vLLM benchmarks from JSON configs")
@@ -340,8 +333,6 @@ def run_benchmark(
     # The CLI device values are only a base: env_config carries the per-test
     # values from _derive_config and is applied last, so it wins.
     env = os.environ.copy()
-    for key, value in ENV_DEFAULTS.items():
-        env.setdefault(key, value)
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
     config_env = build_env_vars(env_config)
@@ -425,8 +416,6 @@ def run_serve_benchmark(
     # As in run_benchmark: env_config is applied last and overrides the CLI
     # device values.
     env = os.environ.copy()
-    for key, value in ENV_DEFAULTS.items():
-        env.setdefault(key, value)
     env["SPYRE_DEVICES"] = spyre_devices
     env["AIU_WORLD_SIZE"] = aiu_world_size
     config_env = build_env_vars(env_config)

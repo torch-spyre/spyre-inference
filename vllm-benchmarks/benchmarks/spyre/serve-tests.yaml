@@ -8,12 +8,13 @@
 # own template.
 #
 # dataset-path is an env var so each host can point at its own copy of the
-# trace: ${SPYRE_AIOPS_DATASET} (_4k entries) and ${SPYRE_CICS_DATASET} (_8k).
-# Both fall back to the layout on the Spyre benchmark hosts; a selected entry
-# whose file is absent fails the run rather than being skipped.
+# trace: ${SPYRE_AIOPS_DATASET} and ${SPYRE_CICS_DATASET}. Both fall back to the
+# layout on the Spyre benchmark hosts; a selected entry whose file is absent
+# fails the run rather than being skipped.
 #
-# The _4k/_8k suffix is the max-model-len the trace needs: longer requests are
-# rejected.
+# The trailing suffix names the trace an entry replays. Each one needs a
+# max-model-len that fits its requests, since longer ones are rejected: the
+# aiops trace runs at 4k, cics at 8k.
 
 defaults:
   environment_variables:
@@ -40,7 +41,7 @@ defaults:
     max-concurrency: 4
 
 tests:
-  - test_name: serve_granite33-8b_tp1_8k
+  - test_name: serve_granite33-8b_tp1_cics
     server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
@@ -49,7 +50,7 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
-  - test_name: serve_granite33-8b_tp4_8k
+  - test_name: serve_granite33-8b_tp4_cics
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
@@ -58,7 +59,7 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
-  - test_name: serve_granite41-8b_tp1_8k
+  - test_name: serve_granite41-8b_tp1_cics
     server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-4.1-8b
@@ -67,7 +68,7 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
-  - test_name: serve_granite41-8b_tp4_8k
+  - test_name: serve_granite41-8b_tp4_cics
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b
@@ -76,7 +77,7 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
 
-  - test_name: serve_granite33-8b-fp8_tp4_4k
+  - test_name: serve_granite33-8b-fp8_tp4_aiops
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct-FP8
@@ -86,7 +87,7 @@ tests:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       num-prompts: 50
 
-  - test_name: serve_granite41-8b-fp8_tp4_4k
+  - test_name: serve_granite41-8b-fp8_tp4_aiops
     server_health_timeout: 3600
     server_parameters:
       model: ibm-granite/granite-4.1-8b-fp8
@@ -96,7 +97,7 @@ tests:
       dataset-path: ${SPYRE_AIOPS_DATASET}
       num-prompts: 50
 
-  - test_name: serve_gemma4-26b-a4b_tp1_8k
+  - test_name: serve_gemma4-26b-a4b_tp1_cics
     server_health_timeout: 1800
     server_parameters:
       model: google/gemma-4-26B-A4B
@@ -106,7 +107,7 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
       num-prompts: 50
 
-  - test_name: serve_gemma4-26b-a4b_tp4_8k
+  - test_name: serve_gemma4-26b-a4b_tp4_cics
     server_health_timeout: 3600
     server_parameters:
       model: google/gemma-4-26B-A4B

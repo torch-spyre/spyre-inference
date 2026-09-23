@@ -47,7 +47,10 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
         mode=CompilationMode.NONE,
     )
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner.model_config = types.SimpleNamespace(runner_type="generate")
+    # Text-only, so warmup skips the input-embedding pass: there is no model to embed
+    # through here. test_compile_guard_warmup_coverage.py covers the multimodal case.
+    runner.model_config = types.SimpleNamespace(runner_type="generate", is_encoder_decoder=False)
+    runner.supports_mm_inputs = False
     runner.vllm_config = types.SimpleNamespace(
         model_config=types.SimpleNamespace(enforce_eager=False),
         compilation_config=compilation_config,

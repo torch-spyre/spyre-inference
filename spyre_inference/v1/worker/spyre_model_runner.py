@@ -890,6 +890,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+            self._warmup_input_embeddings(bucket_sizes)
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -897,6 +898,30 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _warmup_input_embeddings(self, bucket_sizes: list[int]) -> None:
+        """Compile the token embedding at every token count a request can reach.
+
+        A multimodal model is fed ``inputs_embeds``, so the dummy runs above never reach
+        the embedding; serving reaches it through ``embed_input_ids``, outside any graph.
+        Driven through the wrapper, which is what pads the token count onto a bucket.
+        """
+        # A text-only ``embed_input_ids`` takes no multimodal arguments, so the wrapper
+        # call would raise -- and its dummy run already compiles the embedding.
+        if not self.supports_mm_inputs or self.model_config.is_encoder_decoder:
+            return
+        t0 = time.time()
+        # `load_model` has already wrapped the model by the time warmup runs.
+        model = cast(_SpyreModelWrapper, self.model)
+        for size in sorted(bucket_sizes, reverse=True):
+            # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
+            model.embed_input_ids(torch.zeros(size, dtype=torch.int32))
+        logger.info(
+            "Input embedding warmup complete: %d token buckets in %.3fs.",
+            len(bucket_sizes),
+            time.time() - t0,
+        )
 
     @torch.inference_mode()
     def _record_encoder_pack_graphs(self) -> None:

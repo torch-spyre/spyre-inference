@@ -2590,6 +2590,16 @@ records its variants, the product of the KV-length (<code>num_blocks</code>) and
 buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 <code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
+<p>Under <code>dynamic=False</code> the Python loop over a sequence's KV pages is unrolled at trace
+time, so a graph holds one copy of the attention body per page and compile time grows
+with KV length. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> walks that axis with torch-spyre's
+<code>for_each_tile</code> instead, leaving one body plus a tile spec, and the same applies to the
+batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
+a <code>(tile_max, tile_sum, tile_output)</code> triple either way; <code>walk_tiles</code> picks the walk and
+is the only place that reads the variable. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> is the default;
+setting it to <code>0</code> runs the identical bodies under Python loops as a rollback path. The switch is
+read once at import, because it decides the <code>fullgraph</code> setting the tiled walk needs —
+setting it after <code>spyre_inference</code> is imported has no effect.</p>
 <h3 id="head-major-kv-cache">Head-major KV cache<a class="headerlink" href="#head-major-kv-cache" title="Permanent link">&para;</a></h3>
 <p><code>SPYRE_ATTN_KV_LAYOUT=head_major</code> selects a second backend,
 <code>SpyreHeadMajorAttentionBackend</code>, that stores a page as
@@ -2627,10 +2637,10 @@ at 8 cores; <code>SPYRE_ATTN_MAX_CORES</code> overrides that. And the layout car
 (which needs a bias tile per query group) nor batched decode (whose kernel gathers whole
 pages from the unfolded cache) — both are available on the token-major layout.</p>
 <p>Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts by <code>scripts/probes/lx_head_major_residency.py</code>. K's residency
-needs torch-spyre#4153: <code>q @ Kᵀ</code> lowers the transpose to a restickify, whose cross-frame
-barrier bars an LX-resident input without that PR's local-read proof. V is read directly
-by <code>probs @ V</code> and stays resident either way.</p>
+planner's own verdicts. K's residency needs torch-spyre#4153: <code>q @ Kᵀ</code> lowers the
+transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
+that PR's local-read proof. V is read directly by <code>probs @ V</code> and stays resident either
+way.</p>
 <p>Key constraints:</p>
 <ul>
 <li><strong>KV length bucketing</strong>: padded block count on power-of-two buckets from <code>block_size</code>

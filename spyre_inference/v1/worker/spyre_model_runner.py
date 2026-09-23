@@ -476,14 +476,21 @@ class _SpyreModelWrapper:
         output. `is_multimodal` is padded the same way so it still lines up with
         `input_ids` for the merge; the padded rows are never multimodal.
 
-        Only a merged result comes back on CPU: upstream copies what we return
-        into its persistent inputs_embeds buffer, and the merge's `torch.where`
-        output layout does not survive that d2d `copy_`. With no multimodal
-        embeddings there is no merge, so the text lookup stays on device instead
-        of paying a D2H that upstream's H2D immediately undoes -- which is every
-        decode step and every text-only prompt served by a multimodal model.
+        Everything comes back on device, merged or not. Upstream copies what we
+        return into a row-prefix view of its persistent inputs_embeds buffer
+        (`gpu_model_runner._preprocess`: `inputs_embeds.gpu[:n].copy_(...)`), and
+        torch-spyre#4730 rejects an H2D copy whose destination is narrowed -- it
+        requires `dev_sizes == dma_sizes`, while the view is `[n, hidden]` against
+        a base allocated at the full token budget. Returning a CPU tensor makes
+        that copy H2D and kills the engine on every multimodal request; keeping it
+        on device makes the same copy d2d, which the check allows. It also avoids
+        a D2H that upstream's H2D immediately undoes.
+
+        A merged result previously came back on CPU because the merge's
+        `torch.where` output layout did not survive that d2d `copy_`. If a merged
+        multimodal prompt starts producing garbage rather than failing, suspect
+        that layout again before anything else here.
         """
-        has_mm = multimodal_embeddings is not None and len(multimodal_embeddings) > 0
         num_tokens = input_ids.shape[0]
         bucketer = self._shape_bucketer
         padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
@@ -509,7 +516,7 @@ class _SpyreModelWrapper:
             result = tree_map(
                 lambda t: t[:num_tokens] if isinstance(t, torch.Tensor) else t, result
             )
-        return tree_map(self._to_cpu, result) if has_mm else result
+        return result
 
     def __getattr__(self, name):
         return getattr(self._model, name)

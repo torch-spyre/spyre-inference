@@ -816,7 +816,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
-        attention ``(B, L)`` at its full size.
+        attention ``(B, L)`` at its full size. Both bucket loops also warm the input
+        embedding, which a multimodal model's dummy run never reaches.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
@@ -836,6 +837,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # would crash. _warmup_pooling_bucket_shapes below covers
                         # attention at the shapes that do respect max_model_len.
                         self._dummy_run(size, force_attention=size <= max_model_len)
+                        self._warmup_input_embedding(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()

@@ -726,6 +726,6 @@ class TestRecordBatchedDecode:
                 key = (
                     metadata.padded_num_seqs,
                     metadata.blocks_per_chunk,
-                    len(metadata.chunk_page_ids_cpu),
+                    metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"

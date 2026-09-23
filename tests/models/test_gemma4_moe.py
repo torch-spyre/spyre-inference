@@ -382,8 +382,7 @@ def _dispatch_layer(routing):
         spyre_moe_gate=None,
         spyre_moe_up=None,
         spyre_moe_down=None,
-        # Divides both widths ``_apply`` builds, so these tests hit the token bound, not the
-        # row-addressability guard, which has its own test.
+        # Divides both widths ``_apply`` builds, so these tests hit the token bound, not the guard.
         spyre_moe_stick=16,
         spyre_moe_route_dtype=torch.float16,
         top_k=TOP_K,
@@ -501,7 +500,7 @@ def test_gathered_matches_dense_reference(moe_weights):
 
 
 # Row ``t`` of the router logits starts at ``t * num_experts``, which must span whole sticks to be
-# addressable. ``EXPERTS`` above deliberately does not, so the dispatch fallback is covered too.
+# addressable. ``EXPERTS`` above deliberately does not, so the fallback is covered too.
 STICK_EXPERTS = 64
 
 
@@ -530,8 +529,7 @@ def stick_aligned_moe_weights():
 def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
     """The per-token driver over a packed batch, against the same dense reference.
 
-    Also pins the buffer lifetime: a reused region output silently gives a row another token's
-    experts, which nothing but a value comparison would catch.
+    A reused region output would give a row another token's experts, which only values catch.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config

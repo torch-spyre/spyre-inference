@@ -493,8 +493,7 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
         with moe_scope:
-            # The gathered region lowers at exactly one token and the all-expert region has no
-            # single-row form, so a small batch drives gathered per token; the bound is tuning.
+            # A single row already sits at storage offset 0, so it needs no addressable stride.
             if tokens == 1 or (
                 tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
                 and _rows_start_on_sticks(x, router_logits, layer.spyre_moe_stick)

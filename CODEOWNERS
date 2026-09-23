@@ -16,6 +16,15 @@ spyre_inference/v1/worker/ @torch-spyre/spyre-inference-default-codeowners
 # Attention backend (PyTorch-native Spyre attention)
 spyre_inference/v1/attention/ @torch-spyre/spyre-inference-default-codeowners @jvlunteren @bringlein
 
+# Encoder models and pooling. Must stay below the worker and attention rules:
+# CODEOWNERS is last-match-wins, not additive.
+spyre_inference/models/bert.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/models/roberta.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/models/_token_type.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/v1/pool/ @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/v1/attention/backends/spyre_encoder_attn.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+spyre_inference/v1/worker/spyre_model_runner.py @torch-spyre/spyre-inference-default-codeowners @gkumbhat @GOavi101
+
 # CICD
 .github @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana
 Makefile @torch-spyre/spyre-inference-default-codeowners @HarikrishnanBalagopal @ashokponkumar @kmehant @anubhavjana

@@ -946,11 +946,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         return output
 
     def record_pack_graphs(self, device: torch.device) -> int:
-        """Trace ``scatter_pack`` on every ``reachable_pack_shapes`` triple.
+        """Trace ``scatter_pack`` *and* ``gather_unpack`` on every reachable shape.
 
-        Warmup's dummy runs reach the pack kernel at one body bucket per cell, leaving
-        most of its shape grid uncompiled. Tracing it needs no model forward, so the
-        whole grid is affordable here.
+        Warmup's dummy runs reach both at one body bucket per cell, leaving most of
+        their shape grid uncompiled. Tracing them needs no model forward, so the whole
+        grid is affordable here.
+
+        The unpack gather keys on the same two axes with the same
+        ``_is_b1_dense_body`` exemption, so ``reachable_pack_shapes`` covers it too; it
+        only sees the query head count, ``_packed_pv`` having merged the GQA group axis.
 
         Returns the number of traces; a failure is logged and skipped, costing one lazy
         compile rather than a dead engine.
@@ -1005,6 +1009,39 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                         exc_info=True,
                     )
                     continue
+                recorded += 1
+            unpack = _indices_for_device(
+                host_unpack_indices(
+                    [seq * per_seq for seq in range(filled)],
+                    [per_seq] * filled,
+                    aligned_len,
+                    num_src,
+                ),
+                device,
+            )
+            # forward hands gather_unpack the already stick-padded attention output.
+            attn_out = convert(
+                torch.zeros(
+                    batch,
+                    self.num_heads,
+                    aligned_len,
+                    _align_up(self.head_size),
+                    dtype=self.model_dtype,
+                ),
+                device,
+            )
+            try:
+                gather_unpack(attn_out, unpack, self.head_size)
+            except Exception:
+                logger.warning(
+                    "Encoder unpack graph (B=%d, L=%d, src=%d) failed to record; "
+                    "it will compile on first use instead.",
+                    batch,
+                    aligned_len,
+                    num_src,
+                    exc_info=True,
+                )
+            else:
                 recorded += 1
         return recorded
 

@@ -579,6 +579,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
         self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
 
+        # Body-bucket row counts whose pooler row widths warmup already traced.
+        self._pooler_row_widths_done: set[int] = set()
+
         # Replace Triton kernel with a pure-PyTorch implementation.
         # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
         # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
@@ -1182,6 +1185,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     num_tokens, force_attention=force_attention, create_mixed_batch=skewed
                 )
                 self._dummy_pooler_run(hidden_states)
+                self._warmup_pooler_row_widths(hidden_states)
                 if batch_size == 1:
                     # An exact fill satisfies _is_b1_fused_sdpa, so the run above
                     # traces only the fused kernel. One token short takes the
@@ -1195,8 +1199,39 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     )
                     hidden_states, _ = self._dummy_run(prompt_len - 1, force_attention=True)
                     self._dummy_pooler_run(hidden_states)
+                    self._warmup_pooler_row_widths(hidden_states)
         finally:
             self.scheduler_config.max_num_seqs = saved_max_num_seqs
+
+    @torch.inference_mode()
+    def _warmup_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
+        """Trace the pooler at every request count, not only the widest.
+
+        A seqwise pooler gathers one row per request, so ``index_select``'s output shape
+        *is* the request count, while ``_dummy_pooler_run`` derives that count from the
+        token count and only ever reaches ``max_num_seqs``. Keyed on the row count, so
+        cells padding to the same body bucket pay once.
+        """
+        if not self._pooling_on_spyre:
+            return
+        rows = int(hidden_states.shape[0])
+        if rows in self._pooler_row_widths_done:
+            return
+        self._pooler_row_widths_done.add(rows)
+        tasks = self.get_supported_pooling_tasks()
+        widths = range(min(self.max_num_reqs, rows), 0, -1)
+        t0 = time.time()
+        # Widest first: Inductor's caches warm on the most complex shape.
+        for num_reqs in widths:
+            for task in tasks:
+                self._dummy_pooler_run_task(hidden_states, task, num_reqs=num_reqs)
+        logger.info(
+            "Pooling row-width warmup: %d request counts x %d task(s) at %d rows in %.3fs.",
+            len(widths),
+            len(tasks),
+            rows,
+            time.time() - t0,
+        )
 
     @torch.inference_mode()
     def _dummy_run(self, *args, **kwargs):
@@ -1250,14 +1285,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self,
         hidden_states: torch.Tensor,
         task: PoolingTask,
+        num_reqs: int | None = None,
     ) -> PoolerOutput:
-        """Same as GPU dummy pooler, but the cursor stays on CPU like ``_pool``."""
+        """Same as GPU dummy pooler, but the cursor stays on CPU like ``_pool``.
+
+        ``num_reqs`` overrides upstream's ``min(num_tokens, max_num_seqs)``; see
+        ``_warmup_pooler_row_widths``.
+        """
         if not self._pooling_on_spyre:
             return super()._dummy_pooler_run_task(hidden_states, task)
 
         num_tokens = hidden_states.shape[0]
         max_num_reqs = self.scheduler_config.max_num_seqs
-        num_reqs = min(num_tokens, max_num_reqs)
+        num_reqs = min(num_tokens, max_num_reqs if num_reqs is None else num_reqs)
         min_tokens_per_req = num_tokens // num_reqs
         num_scheduled_tokens_np = np.full(num_reqs, min_tokens_per_req)
         num_scheduled_tokens_np[-1] += num_tokens % num_reqs

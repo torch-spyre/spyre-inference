@@ -24,9 +24,11 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+import torch
 
-from spyre_inference.v1.attention.backends import spyre_attn
+from spyre_inference.v1.attention.backends import spyre_attn, spyre_encoder_attn
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    SpyreEncoderAttentionImpl,
     _is_b1_dense_body,
     _is_b1_fused_sdpa,
     _ladder_encoder_shape,
@@ -138,6 +140,7 @@ class TestPoolingWarmupCoversBothSides:
         Returns one ``(num_tokens, skewed)`` pair per dummy run.
         """
         calls: list[tuple[int, bool]] = []
+        row_width_runs: list[object] = []
 
         def dummy_run(num_tokens, **kwargs):
             assert kwargs.get("force_attention") is True
@@ -155,11 +158,15 @@ class TestPoolingWarmupCoversBothSides:
             _spyre_kv_caches={},
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
+            _warmup_pooler_row_widths=row_width_runs.append,
         )
-        # Unbound call with a stub self: the method's whole surface is the five
-        # attributes above, so this stays host-only instead of building a runner.
+        # Unbound call with a stub self: the method's whole surface is these six
+        # attributes, so this stays host-only instead of building a runner.
         TorchSpyreModelRunner._warmup_pooling_bucket_shapes(cast(TorchSpyreModelRunner, runner))
         assert runner.scheduler_config.max_num_seqs == MAX_NUM_SEQS, "must restore on exit"
+        # A body bucket the sweep never sees is one whose pooler shapes compile
+        # while serving.
+        assert len(row_width_runs) == len(calls)
         return calls
 
     def test_every_b1_cell_gets_an_exact_and_a_partial_run(self):
@@ -257,6 +264,7 @@ class TestPoolingWarmupSkipsDecoderAttnBugForMultiRequestCells:
             _spyre_kv_caches=({"layer0": object()} if has_decoder_attn else {}),
             _dummy_run=dummy_run,
             _dummy_pooler_run=lambda hidden: None,
+            _warmup_pooler_row_widths=lambda hidden: None,
         )
         TorchSpyreModelRunner._warmup_pooling_bucket_shapes(cast(TorchSpyreModelRunner, runner))
         return calls
@@ -356,6 +364,157 @@ class TestPackKernelShapesAreAllRecorded:
         # max_model_len 320 tops the length ladder at 320 and the body ladder at 512,
         # so one 300-token sequence packs 320 rows out of 512.
         assert (1, 320, 512) in reachable_pack_shapes([(1, 320)], body, 2048)
+
+
+class TestUnpackGatherShapesAreAllRecorded:
+    """The unpack gather has the pack kernel's two axes and needs the same recording.
+
+    It keys on ``(B*L, body bucket)`` where the scatter keys on ``(B*L + 1, body
+    bucket)``, and is an eager aten op, so a missed shape compiles silently.
+    """
+
+    @staticmethod
+    def _recorded_keys(max_num_seqs, max_model_len, budget):
+        """What the gather keys on: ``(source rows, index length)``."""
+        cells = pooling_warmup_shapes(
+            max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=budget,
+            len_bucket=default_encoder_len_buckets(max_model_len),
+        )
+        triples = reachable_pack_shapes(cells, default_encoder_len_buckets(budget), budget)
+        return cells, {(batch * length, num_src) for batch, length, num_src in triples}
+
+    @staticmethod
+    def _step_unpack_key(query_lens, cells, max_num_seqs, max_model_len, budget):
+        """The gather shape one step reaches, mirroring ``forward`` + ``gather_unpack``.
+
+        ``None`` when the step never gathers: no warmed cell covers it, or
+        ``_is_b1_dense_body`` makes the unpack a reshape. The identity check inside
+        ``gather_unpack`` cannot fire once the indices are on the device.
+        """
+        pair = pick_encoder_attention_shape(
+            len(query_lens), max(query_lens), cells, max_num_seqs, max_model_len, budget
+        )
+        if pair is None:
+            return None
+        batch, aligned_len = pair
+        padded_tokens = next_bucket(sum(query_lens), default_encoder_len_buckets(budget))
+        if _is_b1_dense_body(batch, padded_tokens, aligned_len):
+            return None
+        return batch * aligned_len, padded_tokens
+
+    @pytest.mark.parametrize(("max_num_seqs", "max_model_len", "budget"), _CONFIGS)
+    def test_no_step_reaches_an_unrecorded_shape(self, max_num_seqs, max_model_len, budget):
+        cells, recorded = self._recorded_keys(max_num_seqs, max_model_len, budget)
+        checked = 0
+        for num_seqs in range(1, max_num_seqs + 1):
+            for length in range(1, max_model_len + 1, 7):
+                for lens in ([length] * num_seqs, [length] + [3] * (num_seqs - 1)):
+                    if sum(lens) > budget:
+                        continue
+                    key = self._step_unpack_key(lens, cells, max_num_seqs, max_model_len, budget)
+                    if key is None:
+                        continue
+                    assert key in recorded, (
+                        f"step {num_seqs}x{length} unpacks {key}, which warmup never traced"
+                    )
+                    checked += 1
+        assert checked > 100, f"only {checked} steps reached the gather -- test is near-vacuous"
+
+
+class TestRecordPackGraphsTracesBothDirections:
+    """Both halves of the ragged<->dense conversion, not just the scatter.
+
+    Stubs the kernels and the device moves; the method's gate only reads ``device.type``.
+    """
+
+    @staticmethod
+    def _impl(monkeypatch, *, num_heads=4, num_kv_heads=4, head_size=64, compile_sizes=(64, 128)):
+        from vllm.config import (
+            CacheConfig,
+            CompilationConfig,
+            CompilationMode,
+            DeviceConfig,
+            ModelConfig,
+            SchedulerConfig,
+            VllmConfig,
+            set_current_vllm_config,
+        )
+        from vllm.platforms import PlatformEnum, current_platform
+
+        monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
+        config = VllmConfig(
+            device_config=DeviceConfig(device="cpu"),
+            model_config=ModelConfig(dtype=torch.float16, max_model_len=128),
+            cache_config=CacheConfig(),
+            scheduler_config=SchedulerConfig(
+                max_num_seqs=2,
+                max_num_batched_tokens=128,
+                max_model_len=128,
+                is_encoder_decoder=False,
+            ),
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.STOCK_TORCH_COMPILE,
+                compile_sizes=list(compile_sizes),
+            ),
+        )
+        with set_current_vllm_config(config):
+            return SpyreEncoderAttentionImpl(
+                num_heads=num_heads,
+                head_size=head_size,
+                scale=head_size**-0.5,
+                num_kv_heads=num_kv_heads,
+                alibi_slopes=None,
+                sliding_window=None,
+                kv_cache_dtype="auto",
+                logits_soft_cap=None,
+            )
+
+    @staticmethod
+    def _stub_device_ops(monkeypatch, packed, gathered):
+        monkeypatch.setattr(spyre_encoder_attn, "convert", lambda tensor, *a, **k: tensor)
+        monkeypatch.setattr(spyre_encoder_attn, "_indices_for_device", lambda idx, device: idx)
+        monkeypatch.setattr(
+            spyre_encoder_attn,
+            "scatter_pack",
+            lambda flat, dest, batch, length, head_size_padded, **k: packed.append(
+                (flat.shape, dest.shape[0])
+            ),
+        )
+        monkeypatch.setattr(
+            spyre_encoder_attn,
+            "gather_unpack",
+            lambda attn_out, unpack, head_size: gathered.append(
+                (tuple(attn_out.shape), unpack.shape[0])
+            ),
+        )
+
+    def test_the_gather_is_traced_once_per_recorded_pack_shape(self, monkeypatch):
+        impl = self._impl(monkeypatch)
+        packed: list[tuple] = []
+        gathered: list[tuple] = []
+        self._stub_device_ops(monkeypatch, packed, gathered)
+
+        recorded = impl.record_pack_graphs(cast(torch.device, SimpleNamespace(type="spyre")))
+
+        assert gathered, "the unpack gather was never traced"
+        # One gather per deduped (B*L, source rows) pair; MHA, so one head family.
+        assert len(gathered) == len(packed)
+        assert recorded == len(packed) + len(gathered)
+
+    def test_the_gather_sees_the_query_head_count_only(self, monkeypatch):
+        """``_packed_pv`` merges the GQA group axis before the unpack."""
+        impl = self._impl(monkeypatch, num_heads=4, num_kv_heads=2)
+        packed: list[tuple] = []
+        gathered: list[tuple] = []
+        self._stub_device_ops(monkeypatch, packed, gathered)
+
+        impl.record_pack_graphs(cast(torch.device, SimpleNamespace(type="spyre")))
+
+        assert {shape[1] for shape, _src in gathered} == {4}
+        # The scatter is traced for both families, so the counts differ under GQA.
+        assert len(packed) == 2 * len(gathered)
 
 
 class TestRoundingTheBatchUpCannotRescueAMiss:

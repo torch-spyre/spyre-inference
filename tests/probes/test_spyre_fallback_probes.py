@@ -240,7 +240,7 @@ def test_spyre_index_add_for_mean_pooling(spyre_device):
         "torch-spyre#3499 (L3_ADDEARIMM overflow), #3502 (fused two gathers, "
         "different indices), #3503 (fused two gathers, shared index). "
         "spyre-inference works around this with host-built indices + "
-        "index_select (CLS/LAST) and CPU D2H before hidden_states[logits_indices]. "
+        "index_select for pooling and sampled-row gathering before D2H for generation. "
         "When this probe passes, revisit those workarounds."
     ),
 )

@@ -65,19 +65,16 @@ def batched_decode_head_major_kernel(
         # whole 32-entry sticks. Costs the eager path, which the preconditions decline.
         k_page = k_pages[page_idx].squeeze(1)
         v_page = v_pages[page_idx].squeeze(1)
-        # Builder already broadcast across KV heads; split them back out.
-        mask_tile = mask_by_chunk[c].reshape(entries, num_kv_heads, 1, block_size)
-
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        scores = scores + mask_tile
         # Leading-axis split only: torch-spyre rejects merging a permuted axis pair.
         sc = scores.reshape(
             num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
         )
+        sc = sc + mask_by_chunk[c].reshape(num_seqs, blocks_per_chunk, 1, 1, block_size)
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
 
         # The running max drives exp(), not the chunk's own: a chunk wholly past a

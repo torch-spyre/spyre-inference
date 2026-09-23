@@ -29,6 +29,15 @@ on:
         required: false
         type: boolean
         default: true
+      run_id:
+        description: >
+          UUID identifying this TEST RUN, threaded from the dispatching orchestrator. Uploaded
+          as the "run-id" artifact below so push-to-clickhouse.yaml -- which runs on
+          workflow_run AFTER this workflow and therefore cannot receive a dispatch input -- can
+          recover it and stamp test_case_runs with the same id artifact_results carries.
+        required: false
+        type: string
+        default: ''
       use_prebaked_image:
         # Skips only the "Install Spyre RPMs" step (the spyre-rpm-install
         # action). It does not change the override step or any other step.
@@ -135,6 +144,8 @@ on:
         required: false
       CLICKHOUSE_DB:
         required: false
+      CLICKHOUSE_DB_V2:
+        required: false
 
 defaults:
   run:
@@ -171,6 +182,24 @@ jobs:
           # vocabulary is the Makefile.
           RESOLVED_TEST_TYPE="$(make -s print-test-type TEST_TYPE="${RAW_TEST_TYPE}")"
           echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
+
+      # The threaded run_id has to reach push-to-clickhouse.yaml, which runs on workflow_run
+      # AFTER this workflow and so cannot take a dispatch input. An artifact is the channel that
+      # ingest ALREADY reads (it enumerates this run's artifacts to find the junit XML), so the
+      # uuid rides it rather than needing a new transport or a uuid in the run-name. Skipped when
+      # empty, so a GHA-initiated run uploads nothing and the ingest derives its own id.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
 
   # Pin the test-durations artifact this run's shard jobs weight their partition
   # by: one run id resolved once, so every shard of a suite reads identical
@@ -673,6 +702,11 @@ jobs:
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           test_type: ${{ inputs.test_type }}
+          # The declared membership set, not the invoked tier: one testtype__ tag per member,
+          # so a later run of another tier reuses this coverage instead of re-running it.
+          test_types: ${{ matrix.test_types }}
+          # First runs_on label is the arch; the ingest is pinned to x86_64 and cannot read it.
+          leg_arch: ${{ matrix.runs_on[0] }}
           # Echo the exact runner-label selectors this job's runs-on used, so keep this expression identical to it.
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
@@ -757,6 +791,10 @@ jobs:
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
           test_type: ${{ inputs.test_type }}
+          # Survives the retry hop: the failed-suite descriptor is toJSON(matrix), so the whole
+          # entry -- test_types and runs_on included -- is rebuilt by collect_failed_suites.
+          test_types: ${{ matrix.test_types }}
+          leg_arch: ${{ matrix.runs_on[0] }}
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
@@ -1081,3 +1119,4 @@ jobs:
           clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
           clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
           clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}

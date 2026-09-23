@@ -1446,6 +1446,32 @@ wheels = [
 ]
 
 [[package]]
+name = "grpcio-health-checking"
+version = "1.81.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/65/46/6b6678b5a922765ae7637205bb6d0618a4da8b35f2ce6116f8bcff262370/grpcio_health_checking-1.81.1.tar.gz", hash = "sha256:ecc61480e25058a4a04e11e4ab6900ad7439b32e60a8ce4ece7d9f219221c85d", size = 17107, upload-time = "2026-06-11T12:58:49.632Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/87/174bbfb5613794862c45b5cdf567fcfb478ad5a3a7b594e11d998656b2f9/grpcio_health_checking-1.81.1-py3-none-any.whl", hash = "sha256:cbc6a4171825ec64389de2f062d296ba129a5c27eefd0dd55fa837909184bdf9", size = 19120, upload-time = "2026-06-11T12:58:38.008Z" },
+]
+
+[[package]]
+name = "grpcio-reflection"
+version = "1.81.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c0/53/7bd579cb35ea5895cb1ef38066e2336324432b3d3eaa21f52f6b94457c2d/grpcio_reflection-1.81.1.tar.gz", hash = "sha256:3d7160000f5fdd0e241f9b1a3d402f15ebcd5f281be105b374a025f38c6434a8", size = 19203, upload-time = "2026-06-11T12:58:47.865Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3b/10/5152fbc98f6b5b4f54cdf97c585d19fe962c265774692e446ad6b4f4950c/grpcio_reflection-1.81.1-py3-none-any.whl", hash = "sha256:d82fc4ac39dd5dcfd63e577075f6a68eac4a765e66a453914bbf57caf35665d0", size = 22906, upload-time = "2026-06-11T12:58:03.183Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4795,6 +4821,41 @@ wheels = [
 ]
 
 [[package]]
+name = "smg-grpc-proto"
+version = "0.4.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ed/25/757249a1b76b7ec4c6826ea657ca0ab4386f0eddcfc5d9337aef00d25857/smg_grpc_proto-0.4.20.tar.gz", hash = "sha256:6077e092695248086254e3dc73ff4f2a686657cb7a325d72701ab1ff1c82bb43", size = 30155, upload-time = "2026-09-20T19:44:11.856Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/84/0f72bbaa4ede63b706641ae49e2f9ee41faf77d421e4596ccdfe684f559a/smg_grpc_proto-0.4.20-py3-none-any.whl", hash = "sha256:2f1f7315d6edc25c57eb4f031bc83dbf87090a36a0b393d45c365e5f20ee1f84", size = 99425, upload-time = "2026-09-20T19:44:10.23Z" },
+]
+
+[[package]]
+name = "smg-grpc-servicer"
+version = "0.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "grpcio-health-checking" },
+    { name = "grpcio-reflection" },
+    { name = "smg-grpc-proto" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/83/70/7e0053460efc8463e3bf8c84187b03601deb60a8e516d490dfdf661aa363/smg_grpc_servicer-0.12.0.tar.gz", hash = "sha256:d9862030174ede566a4d3165732b1f07e98391f6d3e0cceac41c3be2cf5327cd", size = 161544, upload-time = "2026-09-20T19:44:47.08Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/3b/ed2796e787cb6425fe4011c871e21428390aab89192066b455f5e1532a1c/smg_grpc_servicer-0.12.0-py3-none-any.whl", hash = "sha256:4f772cc20641280c3983c19eb0ec1ad391236e93621cedf98bf81347ad8cf695", size = 143398, upload-time = "2026-09-20T19:44:45.948Z" },
+]
+
+[package.optional-dependencies]
+vllm = [
+    { name = "msgspec" },
+    { name = "pyzmq" },
+    { name = "vllm" },
+]
+
+[[package]]
 name = "sniffio"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -4815,7 +4876,7 @@ dependencies = [
     { name = "torchvision", version = "0.29.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "platform_machine != 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin'" },
     { name = "torchvision", version = "0.29.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(platform_machine != 'ppc64le' and platform_machine != 's390x' and platform_machine not in 's390x, ppc64le' and sys_platform == 'linux') or (platform_machine == 'ppc64le' and platform_machine not in 's390x, ppc64le' and sys_platform == 'darwin') or (platform_machine not in 's390x, ppc64le' and sys_platform != 'darwin' and sys_platform != 'linux')" },
     { name = "transformers" },
-    { name = "vllm" },
+    { name = "vllm", extra = ["grpc"] },
 ]
 
 [package.dev-dependencies]
@@ -4831,7 +4892,7 @@ requires-dist = [
     { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=c36230e67f08fa1278a4761baab5e8c8a2fa1307" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
-    { name = "vllm", git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
+    { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -5568,6 +5629,11 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchfiles" },
     { name = "xgrammar", marker = "platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'ppc64le' or platform_machine == 's390x' or platform_machine == 'x86_64'" },
+]
+
+[package.optional-dependencies]
+grpc = [
+    { name = "smg-grpc-servicer", extra = ["vllm"] },
 ]
 
 [[package]]

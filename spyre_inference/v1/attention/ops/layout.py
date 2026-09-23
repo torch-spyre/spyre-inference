@@ -22,11 +22,6 @@ import torch
 INT32_ELEMS_PER_STICK = 32
 
 
-def stick_aligned_len(n: int) -> int:
-    """Round n up to a whole number of int32 sticks (see INT32_ELEMS_PER_STICK)."""
-    return (n + INT32_ELEMS_PER_STICK - 1) // INT32_ELEMS_PER_STICK * INT32_ELEMS_PER_STICK
-
-
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
     """Slot-axis-outermost layout. The default tiled layout spreads the slot index
     across two device dims, making the indirect store write to the wrong rows

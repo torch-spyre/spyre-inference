@@ -45,8 +45,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
+    batched_decode_kv_major_hinted_kernel,
+    batched_decode_kv_major_kernel,
 )
-from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
+from spyre_inference.v1.attention.ops.layout import head_major_kv_layout, kv_major_kv_layout
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
@@ -66,6 +68,10 @@ logger = init_logger(__name__)
 _page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
+_batched_decode_kv_major_compiled = torch.compile(batched_decode_kv_major_kernel, dynamic=False)
+_batched_decode_kv_major_hinted_compiled = torch.compile(
+    batched_decode_kv_major_hinted_kernel, dynamic=False
+)
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
 compile_guard.watch(
@@ -73,6 +79,8 @@ compile_guard.watch(
 )
 compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel (head-major)")
 compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel (head-major)")
+compile_guard.watch(batched_decode_kv_major_kernel, "batched decode kernel (KV-major)")
+compile_guard.watch(batched_decode_kv_major_hinted_kernel, "batched decode kernel (KV-major hinted)")
 compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel (head-major)")
 
 _SPYRE_CORES = 32
@@ -142,13 +150,23 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # by upcasting the int32 index to int64. Attention compiles in its own domain, so
         # this leaves the rest of the model eager.
         self._decode_attn_fn = _page_attn_decode_compiled
-        self._decode_fn = _batched_decode_compiled
+        self._kv_major_gather_2d = envs.SPYRE_KV_MAJOR_GATHER_2D
+        self._decode_fn = (
+            (
+                _batched_decode_kv_major_hinted_compiled
+                if envs.SPYRE_KV_MAJOR_WORK_DIV_HINTS
+                else _batched_decode_kv_major_compiled
+            )
+            if self._kv_major_gather_2d
+            else _batched_decode_compiled
+        )
         if self.alibi_slopes is not None:
             raise NotImplementedError(
                 "ALiBi is not supported on the head-major KV layout; use the default "
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
+        self._num_blocks: int | None = None
 
         logger.info_once(
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
@@ -160,8 +178,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         dtype = spec.dtype
-        layout = head_major_kv_layout(
-            num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
+        layout = (
+            kv_major_kv_layout(
+                spec.num_kv_heads, num_blocks, spec.block_size, spec.head_size, dtype
+            )
+            if envs.SPYRE_KV_MAJOR_GATHER_2D
+            else head_major_kv_layout(
+                num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
+            )
         )
         shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
         return SpyrePagedKVCache(
@@ -182,15 +206,20 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         silently wrong — so a short-token test passes while long prefill corrupts.
         """
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
-        base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
-        return [
-            convert(base + h * self.block_size, device=device) for h in range(self.num_kv_heads)
-        ]
+        base = block * self.block_size + slot_mapping % self.block_size
+        if not self._kv_major_gather_2d:
+            base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
+            stride = self.block_size
+        else:
+            assert self._num_blocks is not None
+            stride = self._num_blocks * self.block_size
+        return [convert(base + h * stride, device=device) for h in range(self.num_kv_heads)]
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
         """One row per (block, kv_head, token), which is what ``kv_write_index`` indexes."""
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
+            self._num_blocks = k_pages.shape[0]
             shape = (-1, k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
@@ -248,6 +277,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         block_size: int,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        if self._kv_major_gather_2d:
+            self._num_blocks = k_pages.shape[0] // self.num_kv_heads
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
             return _call_kernel(
                 "batched decode attention",
@@ -268,6 +299,26 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
             )
+
+    def build_chunk_index_tables(
+        self, attn_metadata: SpyreAttentionMetadata, device: torch.device
+    ) -> list[torch.Tensor]:
+        if not self._kv_major_gather_2d:
+            return super().build_chunk_index_tables(attn_metadata, device)
+        assert self._num_blocks is not None
+        tables_cpu = attn_metadata.chunk_page_ids_cpu
+        assert tables_cpu is not None
+        heads = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(1, -1)
+        assert attn_metadata.padded_num_seqs is not None
+        assert attn_metadata.blocks_per_chunk is not None
+        return [
+            (table.reshape(attn_metadata.padded_num_seqs, attn_metadata.blocks_per_chunk, 1)
+            + heads * self._num_blocks)
+            .unsqueeze(-1)
+            .contiguous()
+            .to(device=device, dtype=torch.int32)
+            for table in tables_cpu
+        ]
 
     def _run_page_attn(
         self,

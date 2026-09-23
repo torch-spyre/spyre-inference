@@ -863,7 +863,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Padding columns gather page 0 under an all--inf mask and
                 # contribute zero; chunk 0 still holds every real row's block 0,
                 # so the running max stays finite.
-                blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
+                blocks_per_chunk, num_chunks = batched_decode_chunking(
+                    b_seqs,
+                    b_blocks,
+                    envs.SPYRE_KV_MAJOR_CHUNK_SIZE if envs.SPYRE_KV_MAJOR_GATHER_2D else None,
+                )
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
                 entries = b_seqs * blocks_per_chunk
@@ -935,6 +939,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     .reshape(num_chunks, entries, 1, block_size)
                     .contiguous()
                 )
+                if envs.SPYRE_KV_MAJOR_GATHER_2D:
+                    mask_by_chunk_cpu = mask_by_chunk_cpu.repeat_interleave(
+                        self.num_kv_heads, dim=1
+                    )
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -1279,8 +1287,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             assert attn_metadata.rep_row_ids_cpu is not None
             assert attn_metadata.chunk_page_ids_cpu is not None
             assert attn_metadata.mask_by_chunk_cpu is not None
-            attn_metadata.rep_row_ids_dev = convert(
-                attn_metadata.rep_row_ids_cpu, device=_target_device
+            assert attn_metadata.rep_row_ids_cpu.dtype == torch.int32
+            attn_metadata.rep_row_ids_dev = attn_metadata.rep_row_ids_cpu.to(
+                device=_target_device, dtype=torch.int32
             )
             attn_metadata.chunk_page_ids_dev = self.build_chunk_index_tables(
                 attn_metadata, _target_device

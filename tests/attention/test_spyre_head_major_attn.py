@@ -1004,11 +1004,46 @@ def test_head_major_batched_decode_matches_fp32_reference(
     torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
-    indirect=True,
-)
+def test_kv_major_batched_decode_matches_fp32_reference():
+    """KV-major [entries * KV, 1] page gather matches head-major attention."""
+    from tests.attention.test_spyre_attn import _decode_reference_fp32
+    from spyre_inference.v1.attention.ops.batched_decode_head_major import (
+        batched_decode_kv_major_kernel,
+    )
+
+    torch.manual_seed(0)
+    num_seqs, b_seqs, blocks, bpc, kv, qpk = 4, 4, 8, 2, 8, 1
+    block_size, head_size, scale = 16, 8, 0.5
+    entries, chunks, num_heads = b_seqs * bpc, blocks // bpc, kv * qpk
+    page_ids = 1 + torch.arange(num_seqs * blocks).reshape(num_seqs, blocks)
+    query = torch.randn(b_seqs, num_heads * head_size)
+    k_pages = torch.randn(page_ids.max() + 1, block_size, kv, head_size)
+    v_pages = torch.randn_like(k_pages)
+    mask = torch.zeros(num_seqs, blocks, block_size)
+    rep_row_ids = torch.arange(b_seqs).repeat_interleave(bpc)
+    chunk_ids = [
+        (page_ids[:, c * bpc : (c + 1) * bpc].reshape(-1, 1) + torch.arange(kv) * k_pages.shape[0])
+        .reshape(-1, 1)
+        for c in range(chunks)
+    ]
+    mask_by_chunk = (
+        mask.reshape(b_seqs, chunks, bpc, block_size)
+        .permute(1, 0, 2, 3)
+        .reshape(chunks, entries, 1, block_size)
+        .repeat_interleave(kv, dim=1)
+    )
+    k_kv = k_pages.permute(2, 0, 1, 3).reshape(-1, block_size, head_size).contiguous()
+    v_kv = v_pages.permute(2, 0, 1, 3).reshape(-1, block_size, head_size).contiguous()
+    actual = batched_decode_kv_major_kernel(
+        query, rep_row_ids, k_kv, v_kv, chunk_ids, mask_by_chunk, scale,
+        b_seqs, bpc, kv, qpk, block_size, head_size,
+    )
+    expected = _decode_reference_fp32(
+        query, k_pages, v_pages, page_ids, mask, scale, kv, qpk, head_size
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
 def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
     """The batched kernel gathers whole pages, so its index is the builder's page ids.
 

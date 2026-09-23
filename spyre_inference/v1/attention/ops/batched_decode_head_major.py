@@ -23,7 +23,113 @@ same bytes, but folding costs ``num_kv_heads`` times the index entries, and gath
 scales with entries rather than bytes -- measured at ~2x the kernel time for 8 kv heads.
 """
 
+from contextlib import nullcontext
+
 import torch
+from torch_spyre._inductor import spyre_hint
+
+
+def _kv_major_work_div_hint(num_seqs, blocks_per_chunk, num_kv_heads):
+    from spyre_inference import envs
+
+    if not envs.SPYRE_KV_MAJOR_WORK_DIV_HINTS:
+        return None
+    remaining = 32 // num_kv_heads
+    seq_split = max(split for split in range(1, min(num_seqs, remaining) + 1) if num_seqs % split == 0)
+    remaining //= seq_split
+    block_split = max(
+        split for split in range(1, min(blocks_per_chunk, remaining) + 1) if blocks_per_chunk % split == 0
+    )
+    work_div = {"nkvheads": num_kv_heads, "nseqs": seq_split}
+    if block_split > 1:
+        work_div["nblocks"] = block_split
+    return work_div
+
+
+def _batched_decode_kv_major_kernel(
+    query,
+    rep_row_ids,
+    k_pages,
+    v_pages,
+    chunk_kv_page_ids,
+    mask_by_chunk,
+    scale,
+    num_seqs,
+    blocks_per_chunk,
+    num_kv_heads,
+    num_queries_per_kv,
+    block_size,
+    head_size,
+    logits_soft_cap=0.0,
+    out=None,
+    work_div=None,
+):
+    """Batched decode over KV-major folded cache rows with [entries * KV, 1] indices."""
+    num_heads = num_kv_heads * num_queries_per_kv
+    entries = num_seqs * blocks_per_chunk
+    q = query.index_select(0, rep_row_ids).reshape(
+        entries, num_kv_heads, num_queries_per_kv, head_size
+    )
+    tile_max = tile_sum = tile_output = None
+
+    for c, kv_page_ids in enumerate(chunk_kv_page_ids):
+        with spyre_hint(work_div=work_div) if work_div else nullcontext():
+            with spyre_hint(
+                named_dims=["nseqs", "nblocks", "nkvheads", "one", "block_tokens", "head_dim"]
+            ) if work_div else nullcontext():
+                k_page = k_pages[kv_page_ids].squeeze(1).reshape(
+                    entries, num_kv_heads, block_size, head_size
+                )
+                v_page = v_pages[kv_page_ids].squeeze(1).reshape(
+                    entries, num_kv_heads, block_size, head_size
+                )
+            # Reshape before score ops so reductions retain compatible seq/block ownership.
+            scores = torch.matmul(q, k_page.transpose(-2, -1)).reshape(
+                num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
+            )
+            mask_tile = mask_by_chunk[c].reshape(
+                num_seqs, blocks_per_chunk, num_kv_heads, 1, block_size
+            )
+            scores = scores * scale
+            if logits_soft_cap > 0.0:
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+            sc = scores + mask_tile
+            chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
+            new_max = chunk_max if c == 0 else torch.maximum(tile_max, chunk_max)
+            probs = torch.exp(sc - new_max)
+            chunk_sum = torch.sum(torch.sum(probs, dim=-1, keepdim=True), dim=1, keepdim=True)
+            probs_for_v = probs.reshape(entries, num_kv_heads, num_queries_per_kv, block_size)
+            pv = torch.matmul(probs_for_v, v_page)
+            chunk_out = torch.sum(
+                pv.reshape(num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, head_size),
+                dim=1,
+                keepdim=True,
+            )
+            if c == 0:
+                tile_max, tile_sum, tile_output = new_max, chunk_sum, chunk_out
+            else:
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale + chunk_out
+                tile_sum = tile_sum * rescale + chunk_sum
+                tile_max = new_max
+
+    attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
+    if out is not None:
+        out[:num_seqs].copy_(attn)
+        return out
+    return attn
+
+
+def batched_decode_kv_major_kernel(*args, **kwargs):
+    return _batched_decode_kv_major_kernel(*args, **kwargs)
+
+
+def batched_decode_kv_major_hinted_kernel(*args, **kwargs):
+    return _batched_decode_kv_major_kernel(
+        *args,
+        work_div=_kv_major_work_div_hint(args[7], args[8], args[9]),
+        **kwargs,
+    )
 
 
 def batched_decode_head_major_kernel(

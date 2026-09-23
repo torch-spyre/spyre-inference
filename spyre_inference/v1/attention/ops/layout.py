@@ -37,6 +37,19 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
+def kv_major_kv_layout(num_kv_heads: int, num_blocks: int, block_size: int, head_size: int, dtype: torch.dtype):
+    """KV-major cache layout with folded rows ``kv_head * num_blocks + page``."""
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (head_size + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[num_kv_heads * num_blocks, block_size, sticks, eps],
+        stride_map=[block_size * head_size, head_size, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
 def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype: torch.dtype):
     """Head-major cache with the (page, kv_head) row the kernel gathers at device dim 0.
 

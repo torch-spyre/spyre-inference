@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_KV_MAJOR_GATHER_2D: bool = False
+    SPYRE_KV_MAJOR_CHUNK_SIZE: int = 8
+    SPYRE_KV_MAJOR_WORK_DIV_HINTS: bool = False
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -91,6 +94,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # When "1", head-major batched decode stores cache rows KV-major and gathers them
+    # through a [entries * KV, 1] index tensor. Experimental; off by default.
+    "SPYRE_KV_MAJOR_GATHER_2D": lambda: bool(int(os.getenv("SPYRE_KV_MAJOR_GATHER_2D", "0"))),
+    # Blocks per KV-major batched-decode chunk. Experimental path only.
+    "SPYRE_KV_MAJOR_CHUNK_SIZE": lambda: int(os.getenv("SPYRE_KV_MAJOR_CHUNK_SIZE", "8")),
+    # When "1", force KV-major batched decode's BMMs to share KV-head and entry ownership.
+    "SPYRE_KV_MAJOR_WORK_DIV_HINTS": lambda: bool(
+        int(os.getenv("SPYRE_KV_MAJOR_WORK_DIV_HINTS", "0"))
+    ),
     # When "1" (default), enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
     # per-seq loop either way. "0" forces the loop for all batch sizes.

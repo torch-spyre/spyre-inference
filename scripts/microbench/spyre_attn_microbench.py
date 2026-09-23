@@ -198,7 +198,6 @@ def build_metadata(
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=DTYPE,
-            sliding_window=sliding_window,
         ),
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,
@@ -235,9 +234,19 @@ def _fused_qkv_kv_views(query, key, value, device):
 
 def _head_major_pages(k_cpu, v_cpu, device):
     """The zeroed pages the worker allocates, in the head-major device layout."""
-    from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
+    from spyre_inference.v1.attention.ops.layout import head_major_kv_layout, kv_major_kv_layout
 
     nb, bsz, kv, d = k_cpu.shape
+    if os.getenv("SPYRE_KV_MAJOR_GATHER_2D") == "1":
+        k_cpu = k_cpu.permute(2, 0, 1, 3).reshape(kv * nb, bsz, d).contiguous()
+        v_cpu = v_cpu.permute(2, 0, 1, 3).reshape(kv * nb, bsz, d).contiguous()
+        if device.type != "spyre":
+            return k_cpu.to(device), v_cpu.to(device)
+        layout = kv_major_kv_layout(kv, nb, bsz, d, k_cpu.dtype)
+        return (
+            k_cpu.to(device, device_layout=layout),
+            v_cpu.to(device, device_layout=layout),
+        )
     if device.type != "spyre":
         return (
             k_cpu.permute(0, 2, 1, 3).contiguous().to(device),
@@ -379,7 +388,11 @@ def build_inputs_from_requests(
 
     # Eager index_copy_ takes an int64 index, which falls back to CPU and lands the rows in
     # the wrong place, so make_forward writes the history through the impl's compiled store.
-    devfill = cache_device.type == "spyre" and bool(hist_slots)
+    devfill = (
+        cache_device.type == "spyre"
+        and bool(hist_slots)
+        and os.getenv("SPYRE_KV_MAJOR_GATHER_2D") != "1"
+    )
     hist_seed = None
     if devfill and (attn_kv_layout == "head_major" or kv_layout == "slot_major_devfill"):
         hist_seed = {
@@ -565,11 +578,15 @@ def make_forward(
     # not match, and the readback is then garbage.
     output = torch.empty_like(inputs["query_cpu"]).to(device)
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+    if os.getenv("SPYRE_KV_MAJOR_GATHER_2D") == "1":
+        impl._num_blocks = inputs["k_pages"].shape[0] // num_kv_heads
     q_staging, out_staging = impl.staging_buffers(device)
     rows = inputs["total_query_tokens"]
-    slots_dev = impl.kv_write_index(inputs["slot_mapping_cpu"], device)
-
     seed = inputs.get("hist_seed")
+    slots_dev = None
+    if kv_write or seed is not None:
+        impl.kv_slot_views(kv_cache)
+        slots_dev = impl.kv_write_index(inputs["slot_mapping_cpu"], device)
     if seed is not None:
         impl.do_kv_cache_update(
             None,
@@ -767,6 +784,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "decode_uniformity": float("nan"),
         "blocks_per_chunk": -1,
         "kv_write": bool(cfg.get("kv_write", False)),
+        "kv_major_gather_2d": os.getenv("SPYRE_KV_MAJOR_GATHER_2D") == "1",
         "late_compile": False,
         "kernels_attributed": -1,
         "kernels_expected": -1,
@@ -832,9 +850,12 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
-        k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
-        if attn_kv_layout == "head_major":
-            k_ref, v_ref = k_ref.permute(0, 2, 1, 3), v_ref.permute(0, 2, 1, 3)
+        if os.getenv("SPYRE_KV_MAJOR_GATHER_2D") == "1":
+            k_ref, v_ref = inputs["k_pages_cpu"], inputs["v_pages_cpu"]
+        else:
+            k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
+            if attn_kv_layout == "head_major":
+                k_ref, v_ref = k_ref.permute(0, 2, 1, 3), v_ref.permute(0, 2, 1, 3)
         ref = ref_attn(
             inputs["query_cpu"],
             k_ref,
@@ -1187,11 +1208,8 @@ def main():
     # Selects the backend via the platform, and is cached on first envs read like the rest.
     attn_kv_layout = cfg.setdefault("attn_kv_layout", "token_major")
     os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    if attn_kv_layout == "head_major" and next(iter(batched_modes)):
-        raise SystemExit(
-            "the head-major KV layout has no batched decode kernel; run the batched "
-            "variant on token_major."
-        )
+    if cfg.get("kv_major_gather_2d", False):
+        os.environ["SPYRE_KV_MAJOR_GATHER_2D"] = "1"
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries)

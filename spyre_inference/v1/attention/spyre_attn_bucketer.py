@@ -59,14 +59,17 @@ _MIN_BATCHED_SEQS = 4
 _SPYRE_CORE_COUNT = 32
 
 
-def batched_decode_chunking(b_seqs: int, b_blocks: int) -> tuple[int, int]:
+def batched_decode_chunking(
+    b_seqs: int, b_blocks: int, blocks_per_chunk: int | None = None
+) -> tuple[int, int]:
     """``(blocks_per_chunk, num_chunks)`` for a bucketed ``(num_seqs, num_blocks)`` pair.
 
     ``entries = b_seqs * blocks_per_chunk`` targets the cores: fewer under-fills
     them, more than one stick's worth hits a backend axis-merge limit. The block
     axis pads up to a whole chunk, so ``blocks_per_chunk * num_chunks >= b_blocks``.
     """
-    blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    blocks_per_chunk = blocks_per_chunk or max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
+    blocks_per_chunk = min(blocks_per_chunk, b_blocks)
     num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
     return blocks_per_chunk, num_chunks
 
@@ -321,7 +324,11 @@ class SpyreAttnBucketer:
         out: list[SpyreAttnBatchedDecodeBucket] = []
         for num_blocks in sorted(self._num_blocks_buckets, reverse=True):
             for num_seqs in sorted(self._num_seqs_buckets, reverse=True):
-                blocks_per_chunk, num_chunks = batched_decode_chunking(num_seqs, num_blocks)
+                blocks_per_chunk, num_chunks = batched_decode_chunking(
+                    num_seqs,
+                    num_blocks,
+                    envs.SPYRE_KV_MAJOR_CHUNK_SIZE if envs.SPYRE_KV_MAJOR_GATHER_2D else None,
+                )
                 out.append(
                     SpyreAttnBatchedDecodeBucket(
                         num_seqs=num_seqs,

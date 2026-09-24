@@ -498,6 +498,9 @@ class _SpyreModelWrapper:
         multimodal prompt starts producing garbage rather than failing, suspect
         that layout again before anything else here.
         """
+        if is_multimodal is not None and not bool(is_multimodal.any()):
+            is_multimodal = None
+
         num_tokens = input_ids.shape[0]
         bucketer = self._shape_bucketer
         padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None

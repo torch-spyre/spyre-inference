@@ -194,6 +194,24 @@ def test_wrapper_casts_multimodal_floats_to_the_model_dtype(monkeypatch):
     assert out.dtype == torch.bfloat16
 
 
+def test_wrapper_drops_all_false_multimodal_mask(monkeypatch):
+    monkeypatch.setattr(mr, "convert", lambda tensor, **kwargs: tensor)
+
+    class _Capture(nn.Module):
+        def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+            return is_multimodal
+
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("cpu"), model_dtype=torch.float16)
+
+    result = wrapper.embed_input_ids(
+        torch.tensor([1, 2]),
+        multimodal_embeddings=[torch.zeros(1, 4)],
+        is_multimodal=torch.zeros(2, dtype=torch.bool),
+    )
+
+    assert result is None
+
+
 def test_setattr_keeps_the_wrappers_own_state_off_the_model():
     """``__setattr__`` forwards to the wrapped model, so a write to one of the wrapper's
     own fields (``_model_dtype``) would land on the wrong object."""

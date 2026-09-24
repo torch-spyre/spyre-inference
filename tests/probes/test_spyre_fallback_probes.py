@@ -1126,16 +1126,14 @@ def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
 # ---------------------------------------------------------------------------
 #
 # torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
-# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
-# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
-# fallback.
+# (torch-spyre#1794). Heads downcast to fp16 (#868); this probe tracks native
+# fp32 linear.
 
 
 _FP32_BMM_REASON = (
     "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
-    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
-    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
-    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+    "batchmatmul / F.linear (torch-spyre#1794). Classifier heads downcast to "
+    "fp16 instead. When this XPASS-es, native fp32 linear is available."
 )
 
 

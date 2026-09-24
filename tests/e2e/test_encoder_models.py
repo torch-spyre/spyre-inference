@@ -59,9 +59,8 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
-# Token classification: the model applies its own classifier after casting to
-# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
-# runs on Spyre instead of detouring through SpyreCpuClassifier.
+# Token classification applies its own classifier after a head_dtype cast.
+# Same path as sequence-classify: fp16 x @ Wᵀ and bias on Spyre.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",
@@ -71,10 +70,13 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-# Sigmoid probabilities, most just above zero where an absolute bound permits an arbitrary
-# relative error, so the stricter of the two applies.
+# Sigmoid probabilities. An absolute bound of 0.03 permits an arbitrary relative
+# error on a near-zero score, so the relative bound applies there. fp16 still
+# moves a ~1e-5 probability by about that much, so the relative bound has a
+# floor; below it the document is already not relevant.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
+SCORE_REL_FLOOR = float(os.environ.get("SPYRE_TEST_SCORE_REL_FLOOR", "2e-5"))
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
@@ -259,8 +261,7 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
-    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
+    """Classifier GEMM runs on Spyre in fp16 (no fp32 matmul, torch-spyre#1794)."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
@@ -292,7 +293,7 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     )
 
     for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
-        tol = min(SCORE_ABS_TOL, SCORE_REL_TOL * ref_score)
+        tol = min(SCORE_ABS_TOL, max(SCORE_REL_TOL * ref_score, SCORE_REL_FLOOR))
         assert abs(score - ref_score) <= tol, (
             f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
             f"for {document!r}"

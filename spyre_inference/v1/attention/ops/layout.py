@@ -37,6 +37,23 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
+def temporary_chunk_major_page_index_layout(num_chunks: int, entries_per_chunk: int):
+    """TEMPORARY until torch-spyre#4603 is validated: one page ID per 128-byte stick.
+
+    Logical ``[C, E, 1]`` maps to device ``[C, 1, E, 32]``: each int32 ID uses
+    one of a stick's 32 positions. Only index metadata expands, not the KV cache.
+    Remove this layout and its upload/kernel branches once the native 2-D index
+    compiles, returns correct values and splits across cores in emitted code.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype
+
+    return SpyreTensorLayout(
+        [num_chunks, 1, entries_per_chunk, INT32_ELEMS_PER_STICK],
+        [entries_per_chunk, -1, 1, -1],
+        get_device_dtype(torch.int32),
+    )
+
+
 def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype: torch.dtype):
     """Head-major cache with the (page, kv_head) row the kernel gathers at device dim 0.
 

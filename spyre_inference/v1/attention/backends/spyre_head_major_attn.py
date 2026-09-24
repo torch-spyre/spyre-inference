@@ -39,13 +39,17 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyrePagedKVCache,
     _call_kernel,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
-from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
+from spyre_inference.v1.attention.ops.layout import (
+    head_major_kv_layout,
+    temporary_chunk_major_page_index_layout,
+)
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
@@ -234,6 +238,42 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 rows.reshape(num_pages, self.num_kv_heads, 1), device=device
             )
         return self._kv_row_pool_device
+
+    def _tiled_batched_decode_supported(self) -> bool:
+        # The split index below uploads one page ID per stick.
+        return True
+
+    def _mirror_batched_decode_indices(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> None:
+        # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
+        # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
+        if not USE_FOR_EACH_TILE:
+            return super()._mirror_batched_decode_indices(attn_metadata, device)
+        assert attn_metadata.rep_row_ids_cpu is not None
+        assert attn_metadata.chunk_page_ids_cpu is not None
+        assert attn_metadata.mask_by_chunk_cpu is not None
+        b = attn_metadata.padded_num_seqs
+        bpc = attn_metadata.blocks_per_chunk
+        assert b is not None and bpc is not None
+        e = bpc * b
+        c = attn_metadata.chunk_page_ids_cpu.shape[0] // bpc
+        idx = (
+            attn_metadata.chunk_page_ids_cpu.reshape(c, bpc, b)
+            .reshape(c, e, 1)
+            .to(torch.int32)
+            .contiguous()
+        )
+        attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
+            device, device_layout=temporary_chunk_major_page_index_layout(c, e)
+        )
+        attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        attn_metadata.mask_by_chunk_dev = convert(
+            attn_metadata.mask_by_chunk_cpu.reshape(
+                c, bpc, b, *attn_metadata.mask_by_chunk_cpu.shape[2:]
+            ),
+            device=device,
+        )
 
     def _run_batched_decode(
         self,

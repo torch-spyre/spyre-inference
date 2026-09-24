@@ -1,9 +1,10 @@
 [build-system]
 requires = [
   "setuptools>=82",
-  "setuptools_scm>=8"
+  "setuptools_scm>=10",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path  = ["."]
 
 [project]
 name = "spyre-inference"
@@ -12,7 +13,7 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre[cpsat]",
-    "vllm>=0.28.0,<0.29",
+    "vllm[grpc]>=0.28.0,<0.29",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
@@ -54,12 +55,10 @@ exclude = ["spyre_inference.testing*"]  # exclude testing module (now a separate
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.setuptools_scm]
-# Version files are optional, this just marginally speeds up version inspection
-# at runtime
+# _version.py is written at build time by setuptools_scm
 version_file = "spyre_inference/_version.py"
-# Version strings are formatted as `{version}+{local}`, e.g. "0.1.dev1+gb1a7032"
-# Local versioning is incompatible with pypi, so we disable it by default.
-local_scheme = "no-local-version"
+version_scheme = "semver-pep440-release-branch"
+local_scheme   = "_versioning:ci_local_scheme"
 
 
 [tool.uv]
@@ -128,7 +127,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "ae86b59983a75b24266c77485e3b5692ae338c5c" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "011e8df526102d9cb28702cab7be43a525e9835b" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -287,7 +286,9 @@ markers = [
     "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
+    "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
 ]
 # --8<-- [end:test-markers-definition]

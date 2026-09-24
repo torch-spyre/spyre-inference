@@ -88,7 +88,7 @@ class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
     The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
-    ``num_chunks`` (the per-chunk index list it unrolls at trace time).
+    ``num_chunks`` (derived from the logical block-axis tensor extent).
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
     """
@@ -172,6 +172,14 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+
+        # A pooling request's query_len is its own context_len, so it can't
+        # exceed max_model_len even when max_num_batched_tokens is larger (unlike
+        # a decoder's chunked-prefill step). Without this cap, warmup could record
+        # a query bucket with no matching num_blocks bucket, crashing with
+        # "num_blocks=N exceeds the largest recorded bucket".
+        if vllm_config.model_config.runner_type == "pooling":
+            max_batched = min(max_batched, max_model_len)
 
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of

@@ -20,8 +20,22 @@ inputs:
     default: ''
   test_type:
     description: >-
-      Raw test tier; resolved via `make print-test-type` and exported as
-      SPYRE_TEST_TIER for the testtype__<tier> tag. Empty = Makefile default.
+      Raw test tier this run was invoked as; resolved via `make print-test-type` and
+      exported as SPYRE_TEST_TIER. Recorded on the run row, never as a case tag.
+      Empty = Makefile default.
+    required: false
+    default: ''
+  test_types:
+    description: >-
+      Every tier this leg's tests belong to, whitespace-separated (the matrix entry's own
+      `test_types`). Exported as SPYRE_TEST_TIERS, one testtype__<tier> tag each. Empty
+      falls back to test_type.
+    required: false
+    default: ''
+  leg_arch:
+    description: >-
+      Arch this leg's tests run on, hashed into run_id by the ingest. Defaults to the test
+      host's own arch.
     required: false
     default: ''
   runner_labels:
@@ -204,6 +218,7 @@ runs:
       shell: bash
       env:
         RAW_TEST_TYPE: ${{ inputs.test_type }}
+        RAW_TEST_TYPES: ${{ inputs.test_types }}
       run: |
         echo "Running tests for config: ${{ inputs.cfg }}${{ inputs.retry == 'true' && ' (pod-level retry)' || '' }}..."
         # An empty TEST_TYPE fails the Makefile's validation, so omit the arg and
@@ -215,6 +230,10 @@ runs:
         fi
         export SPYRE_TEST_TIER
         echo "Resolved SPYRE_TEST_TIER=${SPYRE_TEST_TIER}"
+        # Verbatim, not via print-test-type: that resolves ONE tier and would collapse
+        # the declared set.
+        export SPYRE_TEST_TIERS="${RAW_TEST_TYPES}"
+        echo "Declared SPYRE_TEST_TIERS=${SPYRE_TEST_TIERS:-<unset, falling back to ${SPYRE_TEST_TIER}>}"
         timeout --signal=TERM --kill-after=1m 90m \
           make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
         echo "tests done"
@@ -244,11 +263,24 @@ runs:
     # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
     # the one aggregate report. overwrite: a pod-level retry replaces its failed
     # first attempt's file.
+    # The arch this leg ran on, for the workflow_run ingest: it is pinned to x86_64, so it
+    # cannot read the test host's arch, and arch is hashed into run_id -- a wrong value mints
+    # an id that joins to nothing. Rides beside the XML rather than as a case tag, which
+    # would fold arch into test_case_id and split one test per platform.
+    - name: Record leg arch for the ingest
+      if: always()
+      shell: bash
+      env:
+        LEG_ARCH: ${{ inputs.leg_arch }}
+      run: printf '%s' "${LEG_ARCH:-$(uname -m)}" > "leg-arch-${{ inputs.test_target }}.txt"
+
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: junit-${{ inputs.test_target }}
-        path: junit-${{ inputs.test_target }}.xml
+        path: |
+          junit-${{ inputs.test_target }}.xml
+          leg-arch-${{ inputs.test_target }}.txt
         retention-days: 14
         overwrite: ${{ inputs.retry }}

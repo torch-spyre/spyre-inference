@@ -18,7 +18,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
 from torch._dynamo.utils import counters
@@ -42,11 +42,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
     slot_major_kv_layout,
-    stick_aligned_len,
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
@@ -57,6 +57,13 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     batched_decode_chunking,
 )
+from spyre_inference.v1.worker import compile_guard
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        EncoderGroupPlan,
+        EncoderRectPlan,
+    )
 
 logger = init_logger(__name__)
 
@@ -122,30 +129,27 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
-def _mirror_mask_tiles(
-    tiles_cpu: list[list[torch.Tensor]], device: torch.device
-) -> list[list[torch.Tensor]]:
-    """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
+def _mirror_mask_stack(
+    attn_metadata: "SpyreAttentionMetadata", seq_idx: int, device: torch.device
+) -> torch.Tensor:
+    """Return one sequence's device mask stack, mirroring it at most once per step."""
+    stacks_cpu = attn_metadata.attention_mask_stacks
+    assert stacks_cpu is not None, "attention_mask_stacks must come from the metadata builder"
+    stack_cpu = stacks_cpu[seq_idx]
+    assert stack_cpu.numel(), "an empty mask stack must be skipped before mirroring"
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
-    """
-    mirrored: dict[int, torch.Tensor] = {}
-    tiles_device: list[list[torch.Tensor]] = []
-    for seq_tiles in tiles_cpu:
-        row: list[torch.Tensor] = []
-        for tile in seq_tiles:
-            dev_tile = mirrored.get(id(tile))
-            if dev_tile is None:
-                dev_tile = convert(tile, device=device)
-                mirrored[id(tile)] = dev_tile
-            row.append(dev_tile)
-        tiles_device.append(row)
-    return tiles_device
+    stacks_device = attn_metadata.attention_mask_stacks_device
+    if stacks_device is None:
+        stacks_device = [None] * attn_metadata.num_seqs
+        attn_metadata.attention_mask_stacks_device = stacks_device
+
+    stack_device = stacks_device[seq_idx]
+    if stack_device is None:
+        # `convert` copies, so even a nonzero-offset host view arrives contiguous at
+        # offset 0, ready for an in-graph dim-0 slice.
+        stack_device = convert(stack_cpu, device=device)
+        stacks_device[seq_idx] = stack_device
+    return stack_device
 
 
 def _build_query_row_tables(
@@ -164,18 +168,24 @@ def _build_query_row_tables(
     tables = []
     for s, aligned in enumerate(aligned_query_lens):
         # Width the recorder traced for this query length, not the batch max.
-        index_len = stick_aligned_len(aligned)
-        row = torch.zeros(index_len, dtype=torch.int32)
         last_real = max(int(lens[s]) - 1, 0)
-        row[:aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
+        row = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
         tables.append(convert(row, device=device))
     return tables
 
 
 # Attention compiles separately from the model's fullgraph capture, which can't
-# hold the per-sequence Python loop around these.
-_page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
+# hold the per-sequence Python loop around these. ``for_each_tile`` needs fullgraph.
+_page_attn_compiled = torch.compile(
+    page_attn_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+)
+_batched_decode_compiled = torch.compile(
+    batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
+)
+
+compile_guard.watch(page_attn_kernel, "page attention kernel")
+compile_guard.watch(batched_decode_kernel, "batched decode kernel")
+compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 _warmup_complete = False
 
@@ -260,19 +270,23 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Number of query heads.
     num_heads: int = 0
 
-    # Pre-tiled additive attention mask. attention_mask_tiles[seq_idx][i]
-    # gives the mask tile for the i-th ACTIVE block of one sequence (indexed
-    # by position within active_block_indices[seq_idx], not by absolute block
-    # index). Each tile: [aligned_query_lens[seq_idx], block_size] on CPU. When
-    # sliding_window is None, active == all blocks and the layout is
-    # equivalent to indexing by absolute block index.
-    attention_mask_tiles: list[list[torch.Tensor]] | None = None
+    # Additive attention mask, one CPU tensor per sequence: that sequence's per-block
+    # mask *tiles* stacked along dim 0, shaped
+    # [num_active, aligned_query_lens[seq_idx], block_size]. Row i is the tile for the
+    # i-th ACTIVE block -- a position within active_block_indices[seq_idx], not an
+    # absolute block index, though the two coincide when sliding_window is None.
+    # The stack is the unit of transfer (one H2D per sequence); the tile is what a
+    # kernel adds to one block's scores, narrowed back out in-graph -- `mask_stack[i]`
+    # under a Python page loop, a dim-0 window under a tiled one. So the block axis
+    # stays dim 0, and the split is per sequence rather than one batch-wide tensor:
+    # aligned_query_lens differs across sequences.
+    attention_mask_stacks: list[torch.Tensor] | None = None
 
     # For each sequence: absolute block indices whose mask is not fully
     # `-inf` (blocks that contribute to at least one query's attention).
     # None means all blocks are active (sliding_window is None, or the
     # window covers the whole sequence). When set, len(active_block_indices[s])
-    # matches len(attention_mask_tiles[s]).
+    # matches attention_mask_stacks[s].shape[0].
     active_block_indices: list[list[int]] | None = None
 
     # Per-sequence query_len rounded up onto the bucketer's query buckets
@@ -280,7 +294,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     aligned_query_lens: list[int] = field(default_factory=list)
 
     # Per-sequence padded active-block count, rounded up onto the recorder's
-    # buckets; equals len(attention_mask_tiles[s]). None on the sliding-window
+    # buckets; equals attention_mask_stacks[s].shape[0]. None on the sliding-window
     # path, which is left unpadded (see build()).
     padded_num_blocks: list[int] | None = None
 
@@ -303,8 +317,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # query_len repeat the sequence's last real row; the mask discards them.
     query_row_tables: list[torch.Tensor] | None = None
 
-    # Device mirror of attention_mask_tiles, filled once per step by forward().
-    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+    # Device mirror of attention_mask_stacks, filled lazily per sequence by the first
+    # layer whose per-sequence kernel reads it. None entries have not been mirrored yet.
+    attention_mask_stacks_device: list[torch.Tensor | None] | None = None
 
     # Batched-decode precomputes. None-valued when the batch is ineligible
     # (callers fall back to the per-seq loop). entries = B_seqs * blocks_per_chunk.
@@ -316,36 +331,17 @@ class SpyreAttentionMetadata(AttentionMetadata):
     blocks_per_chunk: int | None = None
     rep_row_ids_cpu: torch.Tensor | None = None  # [entries] int32
     rep_row_ids_dev: torch.Tensor | None = None
-    chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
-    # Built by build_chunk_index_tables, so the shape is the kernel's (as above).
-    chunk_page_ids_dev: list[torch.Tensor] | None = None
-    mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
+    chunk_page_ids_cpu: torch.Tensor | None = None  # [padded_batch_blocks, B_seqs] int32
+    chunk_page_ids_dev: torch.Tensor | None = None
+    # [padded_batch_blocks, B_seqs, KV or 1, 1, block] fp16; the KV extent is 1 unless the
+    # tiled walk needs it materialized (see the construction site).
+    mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # Encoder scatter dest ``[T]`` (int32 on Spyre) and gather unpack.
-    # Filled on the first layer of a step (page_index_tables pattern).
-    encoder_q_pack_idx: torch.Tensor | None = None
-    encoder_kv_pack_idx: torch.Tensor | None = None
-    encoder_unpack_idx: torch.Tensor | None = None
-    # Packed SDPA grid. ``None`` until layer 0; fused B=1 still sets these so
-    # later layers skip rebuild. Do not H2D a ``[B, 1, L, L]`` mask — forward
-    # only needs this pair plus ``encoder_key_pad_mask``.
-    encoder_pack_batch: int | None = None
-    encoder_pack_len: int | None = None
-    encoder_fused_sdpa: bool = False
-    # Host-built key-pad ``[B * KV, 1, 1, L]`` on the target device. ``None`` on
-    # the fused path. Broadcast onto encoder scores ``[BH, G, L, L]`` by the
-    # compiled add in ``_packed_pv``; a dense ``[BH, 1, L, L]`` was needed only
-    # while that add was eager.
-    encoder_key_pad_mask: torch.Tensor | None = None
-    # Slot-major scatter scratch ``[B*L+1, H, D]``. Alloc once per step; ``zero_``
-    # before each pack so pad slots stay empty. K and V must not share a buffer:
-    # at ``Hkv == 1`` ``permute.contiguous`` is a no-op view, so packing V into
-    # K's workspace would silently overwrite ``k_batched``. Q still differs
-    # under GQA.
-    encoder_q_workspace: torch.Tensor | None = None
-    encoder_kv_workspace: torch.Tensor | None = None
-    encoder_v_workspace: torch.Tensor | None = None
+    # Which one it is *is* the path selection: one rectangle for the dense path, a list
+    # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
+    # backend imports from this module, not the other way round.
+    encoder_plan: "EncoderRectPlan | list[EncoderGroupPlan] | None" = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -397,7 +393,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.num_kv_heads = kv_cache_spec.num_kv_heads
         # `model_config.dtype` is typed `ModelDType | torch.dtype`, but
         # `TorchSpyrePlatform.check_and_update_config` rejects anything but
-        # `torch.float16` upstream so it's always a real torch.dtype here.
+        # `torch.float16`/`torch.bfloat16` upstream, so it's always a real
+        # torch.dtype here.
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
@@ -736,7 +733,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             aligned_query_lens.append(aligned)
 
         block_size = self.block_size
-        attention_mask_tiles: list[list[torch.Tensor]] = []
+        attention_mask_stacks: list[torch.Tensor] = []
         active_block_indices: list[list[int]] | None = None
 
         padded_num_blocks: list[int] | None = None
@@ -753,7 +750,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             # Padded tiles need no special construction — kv_valid = kv_pos <
             # seq_lens already emits finfo.min past the true length.
-            attention_mask_tiles = [[] for _ in range(num_seqs)]
+            attention_mask_stacks = [
+                torch.empty(0, aligned, block_size, dtype=self.model_dtype)
+                for aligned in aligned_query_lens
+            ]
             for aligned_query_len in sorted(set(aligned_query_lens)):
                 group = [s for s in range(num_seqs) if aligned_query_lens[s] == aligned_query_len]
                 mask_cpu = self._build_attention_mask(
@@ -768,28 +768,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     torch.device("cpu"),
                 )
                 if aligned_query_len == 1:
-                    # One unbind beats a __getitem__ per tile at decode tile counts; the
-                    # clones stay, for storage offset 0 (torch-spyre#3770).
-                    # Width 1 only: wider needs a permute that copies the whole mask.
                     tiles_by_block = mask_cpu.reshape(
                         len(group), mask_cpu.shape[-1] // block_size, 1, block_size
                     )
                     for row, s in enumerate(group):
-                        attention_mask_tiles[s] = [
-                            tile.clone(memory_format=torch.contiguous_format)
-                            for tile in tiles_by_block[row].unbind(0)[: padded_num_blocks[s]]
-                        ]
+                        attention_mask_stacks[s] = tiles_by_block[row][: padded_num_blocks[s]]
                     continue
                 for row, s in enumerate(group):
-                    # `.contiguous()` is a no-op on a [1, N] slice, leaving
-                    # stride(0) == the mask width and a nonzero storage offset
-                    # reaching a compiled kernel (torch-spyre#3770), so clone.
-                    attention_mask_tiles[s] = [
-                        mask_cpu[row, :, b * block_size : (b + 1) * block_size].clone(
-                            memory_format=torch.contiguous_format
-                        )
-                        for b in range(padded_num_blocks[s])
-                    ]
+                    attention_mask_stacks[s] = (
+                        mask_cpu[row]
+                        .reshape(aligned_query_len, -1, block_size)
+                        .transpose(0, 1)[: padded_num_blocks[s]]
+                        .contiguous()
+                    )
             # active_block_indices stays None, so forward iterates all blocks.
         else:
             # Sliding window: arithmetic block-skip. Blocks entirely outside
@@ -815,11 +806,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     apply_causal_mask and aligned_query_lens[s] > 1,
                 )
                 active_block_indices.append(active_bs)
-                attention_mask_tiles.append(tiles)
+                # Interior blocks share one zero tile by reference; the stack copies it out.
+                attention_mask_stacks.append(
+                    torch.stack(tiles)
+                    if tiles
+                    else torch.empty(0, aligned_query_lens[s], block_size, dtype=self.model_dtype)
+                )
 
         # Sized per sequence, each its own allocation: a batch-max width becomes a
         # Dynamo guard the key cannot carry.
-        num_active = [len(tiles) for tiles in attention_mask_tiles]
+        num_active = [int(stack.shape[0]) for stack in attention_mask_stacks]
         page_index_tables_cpu = []
         for s, n in enumerate(num_active):
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
@@ -843,7 +839,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
         decode_uniformity = 0.0
-        if num_decode_seqs >= _MIN_BATCHED_SEQS:
+        if envs.SPYRE_BATCHED_DECODE and num_decode_seqs >= _MIN_BATCHED_SEQS:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
@@ -862,13 +858,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
-                entries = b_seqs * blocks_per_chunk
-
                 query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
                 query_row_ids[:num_decode_seqs] = query_start_loc[:num_decode_seqs].to(torch.int32)
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
                 assert query_row_ids[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
-                rep_row_ids_cpu = query_row_ids.repeat_interleave(blocks_per_chunk)
+                # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
+                rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
 
                 block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
                 bt = block_table[:num_decode_seqs].to(torch.int32)
@@ -886,49 +881,35 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                         n_use = min(len(abs_blocks), b_blocks)
                         for b, abs_b in enumerate(abs_blocks[:n_use]):
                             block_ids_padded[b, s] = bt[s, abs_b]
-                # Entry order (s, j), s major, matching rep_row_ids and the mask.
-                # One tensor per chunk, not slices of a stack: an index tensor
-                # reaches the device as a real argument and a view's storage
-                # offset is dropped (torch-spyre#3770), so a sliced chunk c > 0
-                # would silently gather chunk 0's pages. Probed by
-                # test_spyre_compile_input_honors_storage_offset; when that
-                # strict xfail flips, one stacked tensor also collapses the
-                # per-chunk H2D transfers into one.
-                chunk_page_ids_cpu = [
-                    block_ids_padded[c * blocks_per_chunk : (c + 1) * blocks_per_chunk]
-                    .t()
-                    .reshape(entries, 1)
-                    .contiguous()
-                    for c in range(num_chunks)
-                ]
+                # Kept whole at offset 0: both walks narrow the block axis in-graph, so
+                # this is one transfer per step rather than one per chunk.
+                chunk_page_ids_cpu = block_ids_padded
 
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions. Broadcast to KV heads and reshape to the
-                # kernel input shape [num_chunks, entries * KV, 1, block_size].
+                # valid positions. The kernel broadcasts the mask to KV heads.
                 mask_bs_bb = torch.full(
                     (b_seqs, padded_batch_blocks, block_size),
                     float("-inf"),
-                    dtype=torch.float16,
+                    dtype=self.model_dtype,
                 )
                 for s in range(num_decode_seqs):
                     n_use = min(blocks_per_seq[s], b_blocks)
                     if n_use:
-                        mask_bs_bb[s, :n_use] = torch.stack(
-                            [attention_mask_tiles[s][b][0] for b in range(n_use)]
-                        )
+                        mask_bs_bb[s, :n_use] = attention_mask_stacks[s][:n_use, 0]
                 # A row past the batch is -inf in every block, so its softmax is NaN and
                 # the in-graph store would publish it. A real row always has a valid
                 # block 0, so its padded blocks can stay -inf and contribute zero.
                 # Holds under a window too: first_active <= num_blocks - 1.
-                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(torch.float16).min
-                # 4-D, not 5-D: the kernel slices dim 0 per chunk, and a dim-0
-                # slice of a 5-D base fails torch-spyre layout propagation.
+                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
+                # Block-major, so each blocks_per_chunk tile is contiguous. The KV axis
+                # is only materialized for the tiled walk, whose body cannot propagate a
+                # broadcast window's layout through a trip.
+                kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
                 mask_by_chunk_cpu = (
-                    mask_bs_bb.reshape(b_seqs, num_chunks, blocks_per_chunk, block_size)
-                    .permute(1, 0, 2, 3)
+                    mask_bs_bb.transpose(0, 1)
+                    .unsqueeze(2)
                     .unsqueeze(3)
-                    .expand(num_chunks, b_seqs, blocks_per_chunk, self.num_kv_heads, block_size)
-                    .reshape(num_chunks, entries * self.num_kv_heads, 1, block_size)
+                    .expand(padded_batch_blocks, b_seqs, kv_extent, 1, block_size)
                     .contiguous()
                 )
 
@@ -945,7 +926,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             apply_causal_mask=apply_causal_mask,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
-            attention_mask_tiles=attention_mask_tiles,
+            attention_mask_stacks=attention_mask_stacks,
             active_block_indices=active_block_indices,
             page_index_tables_cpu=page_index_tables_cpu,
             aligned_query_lens=aligned_query_lens,
@@ -1030,10 +1011,14 @@ class SpyreAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
+        # Only reachable through an explicit `--dtype bfloat16`; the platform's own
+        # default is float16 for every model.
+        torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
+        "bfloat16",
     ]
 
     @staticmethod
@@ -1120,12 +1105,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
+        # Resolved before the ALiBi slopes below, which are built at this dtype.
+        # TorchSpyrePlatform.check_and_update_config enforces float16 or bfloat16.
+        _dtype = get_current_vllm_config().model_config.dtype
+        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
+
+        # The kernels read a page at model dtype and Spyre has no cast on the way in, so
+        # the two 2-byte dtypes are not interchangeable per-cache.
+        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+            raise ValueError(
+                f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
+                f"{self.model_dtype} on Spyre; use 'auto'."
+            )
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
         # cleanly against the score-tile shape.
         if alibi_slopes is not None:
-            slopes_t = torch.tensor(alibi_slopes, dtype=torch.float16)
+            slopes_t = torch.tensor(alibi_slopes, dtype=self.model_dtype)
             if slopes_t.numel() != num_heads:
                 raise ValueError(
                     f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
@@ -1140,11 +1138,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # can bake it as a closure constant. logits_soft_cap == 0.0 disables
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
-
-        # The recorder needs the model's dtype to fabricate dummy args.
-        # TorchSpyrePlatform.check_and_update_config enforces float16 upstream.
-        _dtype = get_current_vllm_config().model_config.dtype
-        self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
@@ -1175,10 +1168,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         The kernel cannot take the caller's buffers: their row count is the model
         graph's token bucket, which Dynamo then guards on, so no recorded variant
-        ever matches. Nor can it take a bucket-sized view of them -- a compiled
-        kernel reads its arguments from storage offset 0 (torch-spyre#3770), so a
-        slice past row 0 reads the wrong storage. Allocated whole (hence at offset
-        0) and reused, at one size for the whole run.
+        ever matches. A bucket-sized view of them does not help either -- the view
+        is what carries the guarded row count. Allocated whole and reused, at one
+        size for the whole run.
 
         Row-outermost: the kernels gather from and scatter into the row axis, which the
         default tiled layout would relayout whole per call.
@@ -1207,6 +1199,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # num_seqs ladder starts there, so they have no batched variant to
         # dispatch to. Set SPYRE_BATCHED_DECODE=0 to force the loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
+            return False
+        # A multi-block tile makes the page gather's index tile-relative. The
+        # tiled lowering cannot yet resolve that induction symbol, so the two
+        # optimizations do not compose (the same limitation as grouped KV pages).
+        if tile_loop.USE_FOR_EACH_TILE:
             return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index
         # to int64 and fails eager; eager takes the per-seq loop instead.
@@ -1247,14 +1244,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
 
-        if attn_metadata.attention_mask_tiles_device is None:
-            tiles_cpu = attn_metadata.attention_mask_tiles
-            assert tiles_cpu is not None, (
-                "attention_mask_tiles must be precomputed by the metadata builder"
-            )
-            attn_metadata.attention_mask_tiles_device = _mirror_mask_tiles(
-                tiles_cpu, _target_device
-            )
+        # The mask stacks are mirrored lazily, by the only code that reads them: when
+        # the batched kernel covers every decode sequence the per-sequence loop never
+        # runs, and transferring for it would be pure waste.
 
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
@@ -1272,8 +1264,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.rep_row_ids_dev = convert(
                 attn_metadata.rep_row_ids_cpu, device=_target_device
             )
-            attn_metadata.chunk_page_ids_dev = self.build_chunk_index_tables(
-                attn_metadata, _target_device
+            attn_metadata.chunk_page_ids_dev = convert(
+                attn_metadata.chunk_page_ids_cpu, device=_target_device
             )
             attn_metadata.mask_by_chunk_dev = convert(
                 attn_metadata.mask_by_chunk_cpu, device=_target_device
@@ -1333,7 +1325,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 decode_variants, layer, kv_cache, builder, num_pages
             )
         finally:
-            torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
+            torch._dynamo.config.accumulated_recompile_limit = prev_limit
 
         if recorded == 0 and variants:
             # Recording nothing is a broken pass, not a degenerate bucket set: the
@@ -1399,9 +1391,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> "SpyreAttnBucket | None":
         """Trace the kernel ``bucket`` needs; None if ``build()`` realized one already traced."""
         attn_metadata = builder.build_for_variant(bucket)
-        assert attn_metadata.attention_mask_tiles is not None
+        assert attn_metadata.attention_mask_stacks is not None
         realized = SpyreAttnBucket(
-            num_blocks=len(attn_metadata.attention_mask_tiles[0]),
+            num_blocks=int(attn_metadata.attention_mask_stacks[0].shape[0]),
             padded_query_len=attn_metadata.aligned_query_lens[0],
         )
         # Several requested buckets realize onto one kernel: a sliding window leaves
@@ -1490,7 +1482,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         realized = (
             attn_metadata.padded_num_seqs,
             attn_metadata.blocks_per_chunk,
-            len(attn_metadata.chunk_page_ids_cpu),
+            attn_metadata.chunk_page_ids_cpu.shape[0] // attn_metadata.blocks_per_chunk,
         )
         # Several requested buckets realize onto one kernel: a sliding window leaves
         # the block count unpadded. Without a window build() rounds onto the bucketer's
@@ -1525,13 +1517,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
         # Host-allocated then transferred: only .to() takes a device_layout.
+        dtype = spec.dtype
         layout = slot_major_kv_layout(
-            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+            num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, dtype
         )
         shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
         return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
-            v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            k_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
 
     def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
@@ -1588,11 +1581,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output: torch.Tensor,
     ) -> None:
         # Spyre-lowering shapes drive several structural choices here: K/V/q keep
-        # (entries, KV) as the two batch axes lower_bmm allows; the kernel's
-        # per-chunk index stays at Dynamo-trace time (torch-spyre would emit
-        # Mod(d0, num_chunks) for a runtime .select); and the result scatter is a
-        # single contiguous copy_ at offset 0, valid because the decode prefix's
-        # query rows are range(num_decode_seqs) (asserted in the builder).
+        # (entries, KV) as the two batch axes lower_bmm allows; for_each_tile keeps
+        # each chunk block-major to avoid an int32 index relayout; and the result
+        # scatter is a single contiguous copy_ at offset 0, valid because the decode
+        # prefix's query rows are range(num_decode_seqs) (asserted in the builder).
         b_seqs = attn_metadata.padded_num_seqs
         blocks_per_chunk = attn_metadata.blocks_per_chunk
         num_decode_seqs = attn_metadata.num_decode_seqs
@@ -1647,7 +1639,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         rep_row_ids: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        chunk_index_tables: list[torch.Tensor],
+        chunk_index_tables: torch.Tensor,
         mask_by_chunk: torch.Tensor,
         b_seqs: int,
         blocks_per_chunk: int,
@@ -1675,15 +1667,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out,
         )
 
-    def build_chunk_index_tables(
-        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
-    ) -> list[torch.Tensor]:
-        """Per chunk, the device index table the batched kernel gathers pages with."""
-        tables_cpu = attn_metadata.chunk_page_ids_cpu
-        assert tables_cpu is not None, "chunk_page_ids_cpu must come from the builder"
-        # Fresh offset-0 allocations (torch-spyre#3770).
-        return [convert(table, device=device) for table in tables_cpu]
-
     def build_index_tables(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> list:
@@ -1706,13 +1689,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         index_table,
-        mask_tiles: list[torch.Tensor],
+        mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_bias_tiles: list[torch.Tensor] | None,
+        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run one sequence's page attention. The point where a subclass swaps kernels."""
+        # The kernels index `row_table` whole rather than slicing it to padded_query_len,
+        # so a wrong width is a shape mismatch at trace time — a surprise compile in the
+        # serving path. Checked here, where every kernel variant converges.
+        assert row_table.shape == (padded_query_len,), (
+            f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
+        )
         return _call_kernel(
             "page attention",
             self._attn_fn,
@@ -1721,7 +1710,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             k_pages,
             v_pages,
             index_table,
-            mask_tiles,
+            mask_stack,
             self.scale,
             num_blocks,
             padded_query_len,
@@ -1729,7 +1718,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self.num_kv_heads,
             self.head_size,
             self.logits_soft_cap,
-            alibi_bias_tiles,
+            alibi_stack,
             out,
         )
 
@@ -1763,16 +1752,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_tiles_all = attn_metadata.attention_mask_tiles_device
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
         index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
-        assert mask_tiles_all is not None, (
-            "attention_mask_tiles_device must be mirrored by forward()"
-        )
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
@@ -1782,6 +1767,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 return output
             batched_done = True
 
+        # Past the early return, so a step the batched kernel fully served pays nothing.
+        # Entries are filled at their read site below: in a mixed batch, the decode
+        # prefix was already served by the batched kernel and needs no mask transfer.
         # Mirrors the batch layout row for row, so the absolute query_start_loc
         # offsets in the row tables still apply.
         q_staging, out_staging = self._staging_buffers(_target_device)
@@ -1834,10 +1822,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
             # cache key misses. Narrowing belongs before the convert, not here.
             index_table = index_tables[seq_idx]
-            # mask_tiles_all[seq_idx] is indexed by position within active_bs.
-            mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
+            mask_stack = _mirror_mask_stack(attn_metadata, seq_idx, _target_device)
+            # Indexed by position within active_bs; a prefix keeps storage_offset 0.
+            mask_stack = mask_stack[: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
-            assert len(mask_tiles) == len(active_bs)
+            assert mask_stack.shape[0] == len(active_bs)
+            if isinstance(index_table, torch.Tensor):
+                assert index_table.shape[0] == len(active_bs)
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
@@ -1856,19 +1847,23 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             #
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
-            alibi_bias_tiles: list[torch.Tensor] | None = None
+            #
+            # Stacked block-major on the host, then one transfer, because the
+            # kernel tiles the block axis rather than indexing a list.
+            alibi_stack: torch.Tensor | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len
-                alibi_bias_tiles = []
+                bias_tiles = []
                 for b in active_bs:
                     kv_pos = torch.arange(
                         b * block_size,
                         (b + 1) * block_size,
-                        dtype=torch.float16,
+                        dtype=self.model_dtype,
                     )
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-                    bias = self.alibi_slopes * rel
-                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+                    bias_tiles.append(self.alibi_slopes * rel)
+                alibi_stack = convert(torch.stack(bias_tiles), device=_target_device)
+                assert alibi_stack.shape[0] == len(active_bs)
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
@@ -1883,10 +1878,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 k_pages,
                 v_pages,
                 index_table,
-                mask_tiles,
+                mask_stack,
                 len(active_bs),
                 aligned_query_lens[seq_idx],
-                alibi_bias_tiles,
+                alibi_stack,
                 out_staging if store_out else None,
             )
 

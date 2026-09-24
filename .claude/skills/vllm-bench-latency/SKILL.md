@@ -70,7 +70,7 @@ Derive the list from the config, don't copy it. `bs=1`, `in64/out64/max128`: dec
 
 Also pass `--no-enable-prefix-caching`: with it on, timed iterations hit the cache the warmup iterations filled, so `num_computed_tokens` differs, the prefill chunks come out a different size, and that new shape re-records *inside* the measured window.
 
-**Warm the shape you measure.** `--num-iters-warmup ≥ 2` for `bench latency`; for `bench serve`, `--num-warmups` must be at least `--max-concurrency` so the first fully-concurrent wave is not itself the warmup.
+**Warm the shape you measure.** `--num-iters-warmup ≥ 2` for `bench latency`. `bench serve` needs no warmup requests: attention kernels are recorded during server warmup, so no request pays per-shape compile.
 
 Report `Warmup complete in <N>s for <M> buckets` from the log so the compile saving is visible.
 

@@ -21,7 +21,7 @@ implementations by layer class.
 
 import torch
 
-from . import pixtral
+from . import clip, gemma4_vision, pixtral
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -31,8 +31,23 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
     # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
-    # Mistral3 `vision_tower`. Ungated, the patches rewrite vLLM's shared module.
-    if not any(hasattr(model, attr) for attr in ("vision_encoder", "vision_tower")):
-        return
+    # Mistral3 and Gemma 4 `vision_tower`. Ungated, the patches rewrite vLLM's shared
+    # module. `is not None` rather than `or`: an empty container module is falsy.
+    vision_tower = getattr(model, "vision_tower", None)
+    if vision_tower is None:
+        vision_tower = getattr(model, "vision_encoder", None)
+    if vision_tower is not None:
+        # Gemma4VisionModel is a stock transformers class, not vLLM's Pixtral -- dispatch
+        # by class name rather than the shared `vision_tower` attribute name.
+        if type(vision_tower).__name__ == "Gemma4VisionModel":
+            gemma4_vision.apply(model, device)
+        else:
+            pixtral.apply(model, device)
 
-    pixtral.apply(model, device)
+    # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
+    # Gated on model_type, not just attribute presence: other architectures (e.g.
+    # BLIP-2) also set `vision_model`, and clip.apply() assumes CLIP's specific
+    # LayerNorm-based boundary norms.
+    hf_config = getattr(model, "config", None)
+    if getattr(hf_config, "model_type", None) == "clip":
+        clip.apply(model, device)

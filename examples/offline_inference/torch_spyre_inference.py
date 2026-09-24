@@ -36,9 +36,9 @@ def parse_args():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--model", type=str, default="ibm-ai-platform/micro-g3.3-8b-instruct-1b")
     parser.add_argument("--max-model-len", type=int, default=2048, dest="max_model_len")
-    parser.add_argument("--max-num-seqs", type=int, default=2, dest="max_num_seqs")
+    parser.add_argument("--max-num-seqs", type=int, default=4, dest="max_num_seqs")
     parser.add_argument(
-        "--max-num-batched-tokens", type=int, default=2, dest="max_num_batched_tokens"
+        "--max-num-batched-tokens", type=int, default=128, dest="max_num_batched_tokens"
     )
     parser.add_argument(
         "--num-gpu-blocks-override", type=int, default=None, dest="num_gpu_blocks_override"
@@ -63,6 +63,12 @@ def parse_args():
         action="store_true",
         dest="enforce_eager",
         help="Skip torch.compile (whole model and attention kernel), run in eager mode",
+    )
+    parser.add_argument(
+        "--no-compile-sizes",
+        action="store_true",
+        dest="no_compile_sizes",
+        help="Compile without 1D body token buckets, disabling the shape bucketer",
     )
     return parser.parse_args()
 
@@ -137,15 +143,8 @@ def main():
         dtype="float16",
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
+        compilation_config={"compile_sizes": []} if args.no_compile_sizes else None,
     )
-
-    # When compiling, run an untimed warmup pass first so any lazy per-shape
-    # Inductor recompiles happen outside the timed GENERATE window below.
-    if not args.enforce_eager:
-        print("=============== WARMUP")
-        t_warm = time.time()
-        llm.generate(prompts, sampling_params)
-        print(f"Warmup pass took {time.time() - t_warm:.2f} sec")
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.

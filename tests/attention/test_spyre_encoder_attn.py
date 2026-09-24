@@ -16,33 +16,77 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
-from spyre_inference.v1.attention.backends import spyre_encoder_attn as encoder_attn
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    ENCODER_LEN_ALIGNMENT,
+    EncoderRectPlan,
     SpyreEncoderAttentionImpl,
-    _content_query_lens,
-    build_attention_mask,
-    build_key_pad_mask,
-    dummy_pack_row,
-    gather_pack,
-    gather_unpack,
-    host_key_pad_mask,
-    host_pack_indices,
-    host_scatter_pack_dest,
-    scatter_pack,
+    _alignment_units_for,
+    _encoder_gather_kernel,
+    _encoder_sdpa_kernel,
+    build_encoder_plan,
+    encoder_index_dtype,
+    encoder_key_pad_mask,
+    encoder_row_table,
 )
+from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
+
+
+def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
+    """Single-sequence mask, the shape these tests were written against."""
+    return encoder_key_pad_mask(extent, [kv_len], dtype)
+
 
 # extra `encoder_attention` mark so CI can split this into its own job
 # because these tests are pretty slow.
 pytestmark = [pytest.mark.attention, pytest.mark.encoder_attention]
+
+
+def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int):
+    """Test helper: bind the non-tensor args the way a forward call would."""
+
+    def specialized_dense_attn_kernel(q_rows, k_rows, v_rows, mask, scale):
+        return _encoder_sdpa_kernel(
+            q_rows, k_rows, v_rows, mask, scale, 1, num_heads, num_kv_heads, head_size
+        )
+
+    return specialized_dense_attn_kernel
+
+
+def dense_sdpa_reference(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """Per-sequence eager SDPA on the packed list (probe / unit-test reference)."""
+    outs: list[torch.Tensor] = []
+    start = 0
+    for length in query_lens:
+        q = query[start : start + length]
+        k = key[start : start + length]
+        v = value[start : start + length]
+        qh = q.unsqueeze(0).transpose(1, 2)
+        kh = k.unsqueeze(0).transpose(1, 2)
+        vh = v.unsqueeze(0).transpose(1, 2)
+        kwargs: dict = {"is_causal": False, "scale": scale}
+        if q.shape[1] != k.shape[1]:
+            kwargs["enable_gqa"] = True
+        out = F.scaled_dot_product_attention(qh, kh, vh, **kwargs)
+        outs.append(out.transpose(1, 2).squeeze(0))
+        start += length
+    return torch.cat(outs, dim=0)
 
 
 @pytest.fixture()
@@ -79,8 +123,8 @@ def configure_compilation(request, monkeypatch):
     original_limit = torch._dynamo.config.accumulated_recompile_limit
 
     cfg.mode = compilation_mode
-    # Increase recompilation limit: the page-attention kernel is specialized
-    # (and so recompiled) per unique (num_blocks, padded_query_len)
+    # Increase recompilation limit: the block kernel is specialized (and so
+    # recompiled) per unique (group, extent, buffer_rows).
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -89,6 +133,20 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
+
+
+def _vllm_style_output(query: torch.Tensor, device) -> torch.Tensor:
+    """Allocate the attention output the way vLLM does.
+
+    ``Attention.forward`` allocates ``[num_tokens, num_heads * head_size]`` and
+    views it as 3-D, so its device layout is a flat one. A plain
+    ``empty_like(query)`` allocates 3-D instead, and for a head size below one
+    stick that layout differs in a way this backend is sensitive to -- a shape
+    real traffic never produces.
+    """
+    tokens, heads, head_size = query.shape
+    flat = torch.empty((tokens, heads * head_size), dtype=query.dtype)
+    return flat.to(device).view(-1, heads, head_size)
 
 
 def _build_metadata(
@@ -253,106 +311,148 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
-def _loop_attention_mask(
-    num_seqs: int,
-    aligned_len: int,
-    query_lens: list[int],
-    kv_lens: list[int],
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    """Host slice-write reference for ``build_attention_mask``."""
-    neg_inf = torch.finfo(dtype).min
-    mask = torch.full((num_seqs, 1, aligned_len, aligned_len), neg_inf, dtype=dtype)
-    for s in range(num_seqs):
-        q_len = query_lens[s]
-        kv_len = min(q_len, kv_lens[s])
-        mask[s, 0, :q_len, :kv_len] = 0.0
-    return mask
+def test_alignment_units_for_rounds_up_to_powers_of_two():
+    assert [_alignment_units_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [
+        1,
+        1,
+        2,
+        2,
+        4,
+        4,
+        8,
+    ]
 
 
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "query_lens,kv_lens,aligned_len",
-    [
-        pytest.param([32], [32], 64, id="single_32"),
-        pytest.param([9, 70, 5], [9, 70, 5], 128, id="batch_unaligned"),
-        pytest.param([16, 8], [8, 8], 64, id="kv_shorter_than_q"),
-    ],
-)
-@torch.inference_mode()
-def test_build_attention_mask_matches_loop(
-    configure_device: str,
-    query_lens: list[int],
-    kv_lens: list[int],
-    aligned_len: int,
-) -> None:
-    """Vectorized host mask must match the slice-write reference.
+def test_encoder_mask_cuts_at_the_boundary_block():
+    mask = encoder_mask(3 * ENCODER_LEN_ALIGNMENT, 100, torch.float32)
+    masked = torch.finfo(torch.float32).min / 2
+    # Head and query axes stay 1 and broadcast: an encoder mask depends only on
+    # the KV column, so it need not be materialised per head.
+    assert mask.shape == (1, 1, 1, 3 * ENCODER_LEN_ALIGNMENT)
+    # Block 0 (cols 0:64) is all real keys, block 1 (64:128) straddles
+    # kv_len=100, block 2 (128:192) is all padding.
+    assert torch.equal(mask[..., :64], torch.zeros_like(mask[..., :64]))
+    assert torch.equal(mask[..., 64:100], torch.zeros_like(mask[..., 64:100]))
+    assert torch.equal(mask[..., 100:128], torch.full_like(mask[..., 100:128], masked))
+    assert torch.equal(mask[..., 128:], torch.full_like(mask[..., 128:], masked))
 
-    Spyre ``convert`` of fp16 ``finfo.min`` (-65504) is not bit-exact (off by
-    32). Attend slots must stay 0; pad slots must stay hugely negative.
+
+def test_encoder_mask_at_one_alignment_unit_is_a_single_row():
+    mask = encoder_mask(ENCODER_LEN_ALIGNMENT, 64, torch.float32)
+    assert mask.shape == (1, 1, 1, ENCODER_LEN_ALIGNMENT)
+
+
+def test_row_table_clamps_padding_lanes_to_the_last_real_row():
+    rows = encoder_row_table(10, 3, ENCODER_LEN_ALIGNMENT, torch.int64)
+    assert rows[:3].tolist() == [10, 11, 12]
+    # Padding lanes repeat row 12 so the gather never reads the next request.
+    assert rows[3:].unique().tolist() == [12]
+
+
+def test_dense_attn_kernel_never_calls_arange(monkeypatch):
+    """Regression guard: the original bug was building block indices inside
+    the attention kernel, which falls back to CPU on real hardware (torch-spyre
+    has no on-device ``arange``). The kernel takes already-gathered,
+    fixed-shape tensors and a precomputed mask, and must not construct
+    anything itself.
     """
-    dtype = torch.float16
-    device = torch.device(configure_device)
-    ref = _loop_attention_mask(len(query_lens), aligned_len, query_lens, kv_lens, dtype)
-    got = build_attention_mask(
-        len(query_lens),
-        aligned_len,
-        query_lens,
-        kv_lens,
-        dtype=dtype,
-        device=device,
-    ).cpu()
-    attend = ref == 0
-    torch.testing.assert_close(got[attend], ref[attend], atol=0, rtol=0)
-    if configure_device == "cpu":
-        torch.testing.assert_close(got, ref, atol=0, rtol=0)
-        return
-    assert bool((got[~attend] < -1e4).all()), "pad slots must stay a large negative"
+    length = 70
+    num_heads, num_kv_heads, head_size = 4, 4, 64
+    extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
+    torch.manual_seed(0)
+    q_rows = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
+    k_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    v_rows = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    mask = convert(encoder_mask(extent, length, q_rows.dtype), q_rows.device)
+
+    real_arange = torch.arange
+    calls = {"n": 0}
+
+    def counting_arange(*args, **kwargs):
+        calls["n"] += 1
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", counting_arange)
+    attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
+    attn_fn(q_rows, k_rows, v_rows, mask, head_size**-0.5)
+    assert calls["n"] == 0, "the attention kernel must not build any index tensor itself"
+
+
+def test_gather_kernel_never_calls_arange(monkeypatch):
+    length = 70
+    num_heads, num_kv_heads, head_size = 4, 4, 64
+    extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
+    torch.manual_seed(0)
+    query = torch.randn(extent, num_heads, head_size, dtype=torch.float32)
+    key = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    value = torch.randn(extent, num_kv_heads, head_size, dtype=torch.float32)
+    row_index = encoder_row_table(0, length, extent, torch.int64)
+
+    real_arange = torch.arange
+    calls = {"n": 0}
+
+    def counting_arange(*args, **kwargs):
+        calls["n"] += 1
+        return real_arange(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "arange", counting_arange)
+    _encoder_gather_kernel(query, key, value, row_index)
+    assert calls["n"] == 0, "the gather kernel must not build any index tensor itself"
+
+
+def _dense_attn(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    query_lens: list[int],
+    scale: float,
+) -> torch.Tensor:
+    """Drive gather + dense attention over a packed list the way ``forward`` does."""
+    num_heads, head_size = query.shape[1], query.shape[2]
+    num_kv_heads = key.shape[1]
+    index_dtype = encoder_index_dtype(query.device)
+    attn_fn = _create_dense_attn_kernel(num_heads, num_kv_heads, head_size)
+    out = torch.zeros_like(query)
+    start = 0
+    for length in query_lens:
+        extent = _alignment_units_for(length) * ENCODER_LEN_ALIGNMENT
+        row_index = encoder_row_table(start, length, extent, index_dtype)
+        mask = convert(encoder_mask(extent, length, query.dtype), query.device)
+        q_rows, k_rows, v_rows = _encoder_gather_kernel(query, key, value, row_index)
+        attn = attn_fn(q_rows, k_rows, v_rows, mask, scale)
+        out.index_copy_(0, row_index, attn)
+        start += length
+    return out
 
 
 @pytest.mark.parametrize(
-    "query_lens,kv_lens,aligned_len,num_kv_heads",
+    "query_lens",
     [
-        pytest.param([32], [32], 64, 12, id="single_32"),
-        pytest.param([9, 70, 5], [9, 70, 5], 128, 12, id="batch_unaligned"),
-        pytest.param([16, 8], [8, 8], 64, 4, id="kv_shorter_than_q"),
-        pytest.param([5, 0], [5, 0], 64, 1, id="dummy_seq"),
-        pytest.param([0], [0], 64, 8, id="all_dummy"),
+        pytest.param([32], id="single_32"),
+        pytest.param([9, 70, 5], id="batch_unaligned"),
+        pytest.param([16, 8], id="two_seqs"),
     ],
 )
-@torch.inference_mode()
-def test_build_key_pad_mask_matches_sliced_square(
-    query_lens: list[int],
-    kv_lens: list[int],
-    aligned_len: int,
-    num_kv_heads: int,
+@pytest.mark.parametrize(
+    "num_heads",
+    [pytest.param((4, 1), id="GQA"), pytest.param((4, 4), id="MHA")],
+)
+def test_dense_kernel_matches_dense_sdpa_reference(
+    query_lens: list[int], num_heads: tuple[int, int]
 ) -> None:
-    """Direct ``[B*KV, 1, 1, L]`` row must match slicing query-row 0 of the square."""
-    dtype = torch.float16
-    square = build_attention_mask(
-        len(query_lens),
-        aligned_len,
-        query_lens,
-        kv_lens,
-        dtype=dtype,
-    )
-    sliced = host_key_pad_mask(square, num_kv_heads)
-    got = build_key_pad_mask(
-        len(query_lens),
-        aligned_len,
-        [min(q, k) for q, k in zip(query_lens, kv_lens)],
-        num_kv_heads,
-        dtype=dtype,
-    )
-    assert got.shape == (len(query_lens) * num_kv_heads, 1, 1, aligned_len)
-    torch.testing.assert_close(got, sliced, atol=0, rtol=0)
+    """The gather + dense-attention path must match a dense SDPA computation."""
+    num_query_heads, num_kv_heads = num_heads
+    head_size = 64
+    scale = head_size**-0.5
+    torch.manual_seed(0)
+    total = sum(query_lens)
+    query = torch.randn(total, num_query_heads, head_size, dtype=torch.float32)
+    key = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
+    value = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
+
+    got = _dense_attn(query, key, value, query_lens, scale)
+    ref = dense_sdpa_reference(query, key, value, query_lens, scale)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize(
@@ -391,8 +491,11 @@ def test_build_key_pad_mask_matches_sliced_square(
 @pytest.mark.parametrize(
     "head_size",
     [
-        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32.
+        # Product encoder models (Granite/E5/RoBERTa) use D=64; MiniLM uses 32,
+        # which is half a Spyre stick -- a reshape/transpose there can produce a
+        # sub-stick interleaved index the backend rejects.
         pytest.param(64, id="head_size(64)"),
+        pytest.param(32, id="head_size(32)"),
     ],
 )
 @pytest.mark.parametrize(
@@ -422,11 +525,6 @@ def test_spyre_encoder_attn(
     configure_device: str,
 ) -> None:
     """Validate SpyreEncoderAttentionImpl against a bidirectional reference."""
-    # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
-    # "missing device_tensor_layout on graph input arg0_1"
-    if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
-        pytest.skip("STOCK + device_spyre, currently fails.")
-
     num_query_heads, num_kv_heads = num_heads
     # only for preparation, actual device is set via `configure_device`
     torch.set_default_device("cpu")
@@ -477,7 +575,7 @@ def test_spyre_encoder_attn(
     )
 
     cache_device = torch.device(configure_device)
-    output = torch.empty_like(query).to(cache_device)
+    output = _vllm_style_output(query, cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
     attn_impl.forward(
         layer=None,
@@ -515,17 +613,83 @@ def test_spyre_encoder_attn(
     )
 
 
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
 @torch.inference_mode()
-def test_encoder_pack_cache_reused_across_layers(monkeypatch, default_vllm_config) -> None:
-    """Second layer must reuse dest, mask, and scatter scratch, not realloc them."""
-    allocs = {"n": 0}
-    real_zeros = encoder_attn._zeros_slot_major
+def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
+    default_vllm_config, configure_device: str
+) -> None:
+    """Regression test: a single request whose length exactly equals the padded
+    extent used to take a no-gather path, which handed the raw
+    query/key/value straight to the attention math with no normalization. A
+    model with a fused QKV projection (``qkv.split(...)``) hands out *strided*
+    views there, not contiguous tensors -- on real Spyre hardware this crashed
+    with "no mechanism to resolve stick incompatibility" the first time a
+    request landed on this exact shape (a single sequence, no batching, exactly
+    filling its body bucket). Build query/key/value the same way: slice them out
+    of one fused buffer instead of allocating them independently.
+    """
+    num_heads, num_kv_heads, head_size, block_size = 4, 4, 64, 64
+    total_tokens = 64  # == extent, so this is the single-sequence exact-fill case
+    dtype = torch.float16
+    torch.set_default_device("cpu")
+    set_random_seed(0)
 
-    def count_zeros(*args, **kwargs):
-        allocs["n"] += 1
-        return real_zeros(*args, **kwargs)
+    fused = torch.randn(total_tokens, 3 * num_heads * head_size, dtype=dtype)
+    query, key, value = fused.split([num_heads * head_size] * 3, dim=-1)
+    query = query.view(total_tokens, num_heads, head_size)
+    key = key.view(total_tokens, num_kv_heads, head_size)
+    value = value.view(total_tokens, num_kv_heads, head_size)
+    assert not query.is_contiguous(), "the fused-QKV slice must stay a strided view"
 
-    monkeypatch.setattr(encoder_attn, "_zeros_slot_major", count_zeros)
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([total_tokens], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, total_tokens], dtype=torch.int32),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+    device = torch.device(configure_device)
+    output = _vllm_style_output(query, device)
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    ref = dense_sdpa_reference(
+        query.contiguous(), key.contiguous(), value.contiguous(), [total_tokens], head_size**-0.5
+    )
+    torch.testing.assert_close(output.to("cpu"), ref, atol=0.2, rtol=0.2)
+
+
+@torch.inference_mode()
+def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -> None:
+    """Second layer's forward() must reuse the first layer's plans, not rebuild them."""
     torch.set_default_device("cpu")
     set_random_seed(0)
     query_lens = [32]
@@ -566,611 +730,13 @@ def test_encoder_pack_cache_reused_across_layers(monkeypatch, default_vllm_confi
         attn_metadata=attn_metadata,
     )
     impl.forward(**fwd, output=torch.empty_like(query))
-    cached_q = attn_metadata.encoder_q_pack_idx
-    cached_kv = attn_metadata.encoder_kv_pack_idx
-    cached_unpack = attn_metadata.encoder_unpack_idx
-    cached_batch = attn_metadata.encoder_pack_batch
-    cached_len = attn_metadata.encoder_pack_len
-    cached_fused = attn_metadata.encoder_fused_sdpa
-    cached_key_pad = attn_metadata.encoder_key_pad_mask
-    cached_q_ws = attn_metadata.encoder_q_workspace
-    cached_kv_ws = attn_metadata.encoder_kv_workspace
-    cached_v_ws = attn_metadata.encoder_v_workspace
-    assert cached_q is not None
-    assert cached_kv is not None
-    assert cached_unpack is not None
-    assert cached_batch is not None
-    assert cached_len is not None
-    assert cached_key_pad is not None
-    assert cached_q_ws is not None
-    assert cached_kv_ws is not None
-    assert cached_v_ws is not None
-    assert cached_q_ws is not cached_kv_ws
-    assert cached_kv_ws is not cached_v_ws
-    assert not cached_fused
-    assert getattr(attn_metadata, "encoder_attn_mask", None) is None
-    assert cached_q.shape == (total_tokens,)
-    assert cached_q.dtype == torch.int64
-    assert allocs["n"] == 3
+    cached_plans = attn_metadata.encoder_plan
+    assert cached_plans is not None
+    assert len(cached_plans) == 1
+    assert cached_plans[0].query_lens == [32]
+
     impl.forward(**fwd, output=torch.empty_like(query))
-    assert allocs["n"] == 3
-    assert attn_metadata.encoder_q_pack_idx is cached_q
-    assert attn_metadata.encoder_kv_pack_idx is cached_kv
-    assert attn_metadata.encoder_unpack_idx is cached_unpack
-    assert attn_metadata.encoder_pack_batch == cached_batch
-    assert attn_metadata.encoder_pack_len == cached_len
-    assert attn_metadata.encoder_fused_sdpa is cached_fused
-    assert attn_metadata.encoder_key_pad_mask is cached_key_pad
-    assert attn_metadata.encoder_q_workspace is cached_q_ws
-    assert attn_metadata.encoder_kv_workspace is cached_kv_ws
-    assert attn_metadata.encoder_v_workspace is cached_v_ws
-
-
-def _b1_dense_forward_setup(total_tokens: int = 64):
-    """B=1 body already at attention L so the fused SDPA path fires."""
-    torch.set_default_device("cpu")
-    set_random_seed(0)
-    num_heads, num_kv_heads, head_size, block_size = 16, 4, 64, 64
-    dtype = torch.float16
-    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
-    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
-    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
-    attn_metadata = _build_metadata(
-        num_query_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        block_size=block_size,
-        seq_lens=torch.tensor([total_tokens], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, total_tokens], dtype=torch.int32),
-        block_table=torch.zeros(1, 1, dtype=torch.int32),
-        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
-    )
-    impl = SpyreEncoderAttentionImpl(
-        num_heads=num_heads,
-        head_size=head_size,
-        scale=head_size**-0.5,
-        num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-        logits_soft_cap=None,
-    )
-    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
-    fwd = dict(
-        layer=None,
-        query=query,
-        key=key,
-        value=value,
-        kv_cache=kv_cache,
-        attn_metadata=attn_metadata,
-    )
-    return impl, fwd, query, attn_metadata
-
-
-@torch.inference_mode()
-def test_b1_dense_forward_skips_scatter_pack(monkeypatch, default_vllm_config) -> None:
-    """Serve B=1 T==L must not eager-pack Q/K/V (that was the D2D clone tax)."""
-    calls = {"n": 0}
-    real = encoder_attn.scatter_pack
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "scatter_pack", counting)
-    impl, fwd, query, _meta = _b1_dense_forward_setup()
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert calls["n"] == 0
-
-
-@torch.inference_mode()
-def test_b1_dense_pack_dest_stays_on_host(monkeypatch, default_vllm_config) -> None:
-    """Fused B=1 path does not H2D dest, unpack, or build a key-pad mask."""
-    idx_calls = {"n": 0}
-    real_idx = encoder_attn._indices_for_device
-
-    def count_idx(*args, **kwargs):
-        idx_calls["n"] += 1
-        return real_idx(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "_indices_for_device", count_idx)
-    pad_calls = {"n": 0}
-    real_pad = encoder_attn.host_key_pad_mask
-
-    def count_pad(*args, **kwargs):
-        pad_calls["n"] += 1
-        return real_pad(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_pad)
-    mask_calls = {"n": 0}
-    real_mask = encoder_attn.build_attention_mask
-
-    def count_mask(*args, **kwargs):
-        mask_calls["n"] += 1
-        return real_mask(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "build_attention_mask", count_mask)
-    row_calls = {"n": 0}
-    real_row = encoder_attn.build_key_pad_mask
-
-    def count_row(*args, **kwargs):
-        row_calls["n"] += 1
-        return real_row(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
-    impl, fwd, query, meta = _b1_dense_forward_setup()
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert idx_calls["n"] == 0
-    assert pad_calls["n"] == 0
-    assert mask_calls["n"] == 0
-    assert row_calls["n"] == 0
-    assert meta.encoder_fused_sdpa
-    assert meta.encoder_pack_batch == 1
-    assert meta.encoder_pack_len == 64
-    assert meta.encoder_q_pack_idx is None
-    assert meta.encoder_kv_pack_idx is None
-    assert meta.encoder_unpack_idx is None
-    assert meta.encoder_key_pad_mask is None
-    assert meta.encoder_q_workspace is None
-    assert meta.encoder_kv_workspace is None
-    assert meta.encoder_v_workspace is None
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert idx_calls["n"] == 0
-    assert mask_calls["n"] == 0
-    assert row_calls["n"] == 0
-
-
-@torch.inference_mode()
-def test_packed_path_builds_key_pad_row_not_square(monkeypatch, default_vllm_config) -> None:
-    """Serve must not allocate ``[B, 1, L, L]`` just to throw away all but row 0."""
-    square = {"n": 0}
-    slice_row = {"n": 0}
-    row = {"n": 0}
-    real_square = encoder_attn.build_attention_mask
-    real_slice = encoder_attn.host_key_pad_mask
-    real_row = encoder_attn.build_key_pad_mask
-
-    def count_square(*args, **kwargs):
-        square["n"] += 1
-        return real_square(*args, **kwargs)
-
-    def count_slice(*args, **kwargs):
-        slice_row["n"] += 1
-        return real_slice(*args, **kwargs)
-
-    def count_row(*args, **kwargs):
-        row["n"] += 1
-        return real_row(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "build_attention_mask", count_square)
-    monkeypatch.setattr(encoder_attn, "host_key_pad_mask", count_slice)
-    monkeypatch.setattr(encoder_attn, "build_key_pad_mask", count_row)
-    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
-    meta.seq_lens = torch.tensor([5], dtype=torch.int32)
-    meta.num_actual_tokens = 5
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert square["n"] == 0
-    assert slice_row["n"] == 0
-    assert row["n"] == 1
-    _assert_pad_mask(meta, 5)
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert row["n"] == 1
-
-
-def _run_b1_padded_forward(monkeypatch, *, seq_len: int, qsl_end: int, actual: int):
-    fused_calls = {"n": 0}
-    scatter_calls = {"n": 0}
-    packed_calls = {"n": 0}
-    index_copy_calls = {"n": 0}
-    real_fused = encoder_attn._b1_dense_attention
-    real_scatter = encoder_attn.scatter_pack
-    real_packed = encoder_attn._packed_masked_attention
-    real_index = encoder_attn._index_copy
-
-    def count_fused(*args, **kwargs):
-        fused_calls["n"] += 1
-        return real_fused(*args, **kwargs)
-
-    def count_scatter(*args, **kwargs):
-        scatter_calls["n"] += 1
-        return real_scatter(*args, **kwargs)
-
-    def count_packed(*args, **kwargs):
-        packed_calls["n"] += 1
-        return real_packed(*args, **kwargs)
-
-    def count_index(*args, **kwargs):
-        index_copy_calls["n"] += 1
-        return real_index(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "_b1_dense_attention", count_fused)
-    monkeypatch.setattr(encoder_attn, "scatter_pack", count_scatter)
-    monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
-    monkeypatch.setattr(encoder_attn, "_index_copy", count_index)
-    impl, fwd, query, meta = _b1_dense_forward_setup(total_tokens=64)
-    meta.query_start_loc = torch.tensor([0, qsl_end], dtype=torch.int32)
-    meta.seq_lens = torch.tensor([seq_len], dtype=torch.int32)
-    meta.num_actual_tokens = actual
-    impl.forward(**fwd, output=torch.empty_like(query))
-    return fused_calls["n"], scatter_calls["n"], packed_calls["n"], index_copy_calls["n"], meta
-
-
-@torch.inference_mode()
-def test_b1_padded_body_uses_packed_mask(monkeypatch, default_vllm_config) -> None:
-    """Short prompt padded to T=L=64 uses packed QK, not fused SDPA; no index_copy_."""
-    fused, scatter, packed, index_copy, meta = _run_b1_padded_forward(
-        monkeypatch, seq_len=5, qsl_end=64, actual=5
-    )
-    assert fused == 0
-    assert packed == 1
-    assert scatter == 3
-    assert index_copy == 0
-    _assert_pad_mask(meta, 5)
-
-
-@torch.inference_mode()
-def test_b1_padded_qsl_and_seq_use_actual_tokens(monkeypatch, default_vllm_config) -> None:
-    """Upstream can pad both cu_seqlens and seq_lens; num_actual_tokens still marks pad."""
-    fused, scatter, packed, index_copy, meta = _run_b1_padded_forward(
-        monkeypatch, seq_len=64, qsl_end=64, actual=5
-    )
-    assert fused == 0
-    assert packed == 1
-    assert scatter == 3
-    assert index_copy == 0
-    _assert_pad_mask(meta, 5)
-
-
-def _assert_pad_mask(meta, real_len: int) -> None:
-    assert not meta.encoder_fused_sdpa
-    assert meta.encoder_pack_batch is not None
-    assert meta.encoder_pack_len is not None
-    key_pad = meta.encoder_key_pad_mask
-    assert key_pad is not None
-    key_cpu = key_pad.cpu() if key_pad.device.type != "cpu" else key_pad
-    # Query axis stays 1: the same key-pad row applies to every query row and the
-    # compiled add in _packed_pv broadcasts it. A dense [.., L, L] here would be
-    # 6.3 MB fp16 at Hkv=12, L=512 (~7 ms H2D per step).
-    assert key_cpu.shape[-2] == 1
-    assert key_cpu.shape[-1] == meta.encoder_pack_len
-    assert key_cpu[0, 0, 0, 0].item() == 0.0
-    assert key_cpu[0, 0, 0, real_len].item() < -1.0e3
-
-
-def test_content_query_lens_prefers_seq_over_padded_qsl():
-    assert _content_query_lens([64], [5]) == [5]
-    assert _content_query_lens([5, 12], [5, 12]) == [5, 12]
-    assert _content_query_lens([32, 32], [5, 12]) == [5, 12]
-
-
-def test_content_query_lens_actual_tokens_beat_padded_qsl_and_seq():
-    assert _content_query_lens([64], [64], num_actual_tokens=5) == [5]
-    assert _content_query_lens([5, 12], [5, 12], num_actual_tokens=17) == [5, 12]
-    with pytest.raises(AssertionError, match="Per-seq padded qsl"):
-        _content_query_lens([32, 32], [32, 32], num_actual_tokens=17)
-
-
-@torch.inference_mode()
-def test_b1_short_seq_scatter_uses_packed_mask(monkeypatch, default_vllm_config) -> None:
-    """T != L (BGE short prompts) scatters; F.sdpa would drop the pad mask."""
-    sdpa = {"n": 0}
-    packed = {"n": 0}
-    real_sdpa = encoder_attn.F.scaled_dot_product_attention
-    real_packed = encoder_attn._packed_masked_attention
-
-    def count_sdpa(*args, **kwargs):
-        sdpa["n"] += 1
-        return real_sdpa(*args, **kwargs)
-
-    def count_packed(*args, **kwargs):
-        packed["n"] += 1
-        return real_packed(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn.F, "scaled_dot_product_attention", count_sdpa)
-    monkeypatch.setattr(encoder_attn, "_packed_masked_attention", count_packed)
-    impl, fwd, query, _meta = _b1_dense_forward_setup(total_tokens=5)
-    impl.forward(**fwd, output=torch.empty_like(query))
-    assert packed["n"] == 1
-    assert sdpa["n"] == 0
-
-
-def test_scatter_pack_reused_workspace_zeros_pad_slots():
-    """Cached scratch must zero_ before pack; leftover pad would leak into SDPA."""
-    batch, aligned_len, heads, dim = 1, 8, 2, 8
-    rows = batch * aligned_len + 1
-    dirty = torch.ones(rows, heads, dim)
-    dest = host_scatter_pack_dest(
-        q_starts=[0],
-        lengths=[3],
-        aligned_len=aligned_len,
-        num_src_rows=3,
-        dummy_row=3,
-    )
-    flat = torch.arange(3 * heads * dim, dtype=torch.float32).reshape(3, heads, dim)
-    got = scatter_pack(flat, dest, batch, aligned_len, dim, workspace=dirty)
-    assert torch.equal(got[0, :, :3, :], flat.permute(1, 0, 2))
-    assert torch.equal(got[0, :, 3:, :], torch.zeros(heads, aligned_len - 3, dim))
-
-
-def test_scatter_pack_h1_shared_workspace_does_not_clobber_k():
-    """H=1 ``permute.contiguous`` is a view of the scratch. Packing V into the
-    same buffer must not rewrite ``k_batched`` (MQA; BGE/MiniLM are MHA)."""
-    batch, aligned_len, heads, dim = 1, 8, 1, 8
-    rows = batch * aligned_len + 1
-    dest = host_scatter_pack_dest(
-        q_starts=[0],
-        lengths=[5],
-        aligned_len=aligned_len,
-        num_src_rows=5,
-        dummy_row=5,
-    )
-    torch.manual_seed(0)
-    key = torch.randn(5, heads, dim)
-    value = torch.randn(5, heads, dim) + 10
-    ws = torch.zeros(rows, heads, dim)
-    k_batched = scatter_pack(key, dest, batch, aligned_len, dim, workspace=ws)
-    k_before = k_batched.clone()
-    v_batched = scatter_pack(value, dest, batch, aligned_len, dim, workspace=ws)
-    torch.testing.assert_close(k_batched, k_before)
-    assert not torch.equal(k_batched, v_batched)
-    assert k_batched.untyped_storage().data_ptr() != ws.untyped_storage().data_ptr()
-    assert v_batched.untyped_storage().data_ptr() != ws.untyped_storage().data_ptr()
-
-
-def test_packed_masked_qk_matches_softmax_reference():
-    torch.manual_seed(0)
-    batch, heads, length, dim = 1, 4, 64, 64
-    query = torch.randn(batch, heads, length, dim)
-    key = torch.randn(batch, heads, length, dim)
-    value = torch.randn(batch, heads, length, dim)
-    real_len = 5
-    mask = build_attention_mask(1, length, [real_len], [real_len], dtype=query.dtype)
-    scale = dim**-0.5
-    key_pad = encoder_attn.host_key_pad_mask(mask, heads)
-    got = encoder_attn._packed_masked_attention(query, key, value, key_pad, scale)
-    ref = torch.matmul(
-        torch.softmax(
-            torch.matmul(query, key.transpose(-2, -1)) * scale + mask[:, :, :1, :],
-            dim=-1,
-        ),
-        value,
-    )
-    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
-
-
-def test_packed_attention_compiles_matmul_without_mask(monkeypatch) -> None:
-    """Serve must not compile ``matmul + mask`` (Inductor → SDPA drops pad)."""
-    seen: list[str] = []
-    real = encoder_attn._compile_if_spyre
-
-    def rec(kernel, device_type):
-        seen.append(kernel.__name__)
-        return real(kernel, device_type)
-
-    monkeypatch.setattr(encoder_attn, "_compile_if_spyre", rec)
-    torch.manual_seed(0)
-    batch, heads, length, dim = 2, 4, 64, 64
-    query = torch.randn(batch, heads, length, dim)
-    key = torch.randn(batch, heads, length, dim)
-    value = torch.randn(batch, heads, length, dim)
-    mask = build_attention_mask(batch, length, [5, 12], [5, 12], dtype=query.dtype)
-    key_pad = encoder_attn.host_key_pad_mask(mask, heads)
-    encoder_attn._packed_masked_attention(query, key, value, key_pad, dim**-0.5)
-    assert seen == ["_packed_qk_matmul", "_packed_pv"]
-
-
-def _assert_scatter_matches_gather(
-    q_starts: list[int],
-    query_lens: list[int],
-    batch: int,
-    aligned_len: int,
-    heads: int,
-    dim: int,
-    extra_src_rows: int = 0,
-) -> None:
-    num_tokens = sum(query_lens)
-    num_src = num_tokens + extra_src_rows
-    torch.manual_seed(0)
-    flat = torch.randn(num_src, heads, dim)
-    pad_row = num_src
-    padded_starts = list(q_starts) + [num_tokens] * (batch - len(q_starts))
-    padded_lens = list(query_lens) + [0] * (batch - len(query_lens))
-    pack_idx = host_pack_indices(padded_starts, padded_lens, aligned_len, pad_row)
-    dest = host_scatter_pack_dest(
-        padded_starts,
-        padded_lens,
-        aligned_len,
-        num_src_rows=num_src,
-        dummy_row=dummy_pack_row(padded_lens, aligned_len),
-    )
-    ref = gather_pack(flat, pack_idx, dim)
-    got = scatter_pack(flat, dest, batch, aligned_len, dim)
-    assert torch.equal(got, ref)
-
-
-def test_dummy_pack_row_first_pad_or_zero_when_full():
-    assert dummy_pack_row([62], 64) == 62
-    assert dummy_pack_row([30, 12, 8, 0], 64) == 30
-    assert dummy_pack_row([64, 64], 64) == 0
-
-
-def test_scatter_pack_matches_gather_b1_pad():
-    """62-token prompt on L=64 (vllm --random-input-len 64). T != L, still scatter."""
-    _assert_scatter_matches_gather(
-        q_starts=[0],
-        query_lens=[62],
-        batch=1,
-        aligned_len=64,
-        heads=2,
-        dim=8,
-    )
-
-
-def test_scatter_pack_matches_gather_b4_pad():
-    """3 real seqs padded to B=4, L=64."""
-    _assert_scatter_matches_gather(
-        q_starts=[0, 30, 42],
-        query_lens=[30, 12, 8],
-        batch=4,
-        aligned_len=64,
-        heads=2,
-        dim=8,
-    )
-
-
-def test_scatter_pack_strided_qkv_source_matches_contiguous():
-    """Fused QKV views are not contiguous; scatter must densify before index_copy."""
-    torch.manual_seed(0)
-    t, h, d = 8, 4, 8
-    qkv = torch.randn(t, 3 * h * d)
-    q = qkv[:, : h * d].view(t, h, d)
-    assert not q.is_contiguous()
-    dest = host_scatter_pack_dest([0, 4], [4, 4], 8, 8, dummy_row=16)
-    got = scatter_pack(q, dest, batch=2, aligned_len=8, head_size_padded=d)
-    ref = scatter_pack(q.contiguous(), dest, batch=2, aligned_len=8, head_size_padded=d)
-    torch.testing.assert_close(got, ref)
-
-
-def _count_select_rows(monkeypatch):
-    """Wrap ``select_rows`` so tests can assert identity B=1 skips gather."""
-    real = encoder_attn.select_rows
-    calls = {"n": 0}
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "select_rows", counting)
-    return calls
-
-
-def _count_index_copy(monkeypatch):
-    """Wrap ``_index_copy`` so tests can assert B=1 dense body skips scatter."""
-    real = encoder_attn._index_copy
-    calls = {"n": 0}
-
-    def counting(*args, **kwargs):
-        calls["n"] += 1
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(encoder_attn, "_index_copy", counting)
-    return calls
-
-
-def test_gather_pack_b1_identity_skips_index_select(monkeypatch):
-    """B=1 with ``T == L`` is already dense; do not ``index_select`` the full pack."""
-    calls = _count_select_rows(monkeypatch)
-    length, heads, dim = 4, 2, 8
-    flat = torch.arange(length * heads * dim, dtype=torch.float32).reshape(length, heads, dim)
-    pack_idx = torch.arange(length, dtype=torch.int64).view(1, length)
-
-    out = gather_pack(flat, pack_idx, dim)
-
-    assert calls["n"] == 0
-    expected = flat.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-    assert torch.equal(out, expected)
-
-
-def test_gather_unpack_b1_identity_skips_index_select(monkeypatch):
-    calls = _count_select_rows(monkeypatch)
-    batch, heads, length, dim = 1, 2, 4, 8
-    attn_out = torch.arange(batch * heads * length * dim, dtype=torch.float32).reshape(
-        batch, heads, length, dim
-    )
-    unpack_idx = torch.arange(length, dtype=torch.int64)
-
-    out = gather_unpack(attn_out, unpack_idx, dim)
-
-    assert calls["n"] == 0
-    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
-    assert torch.equal(out, expected)
-
-
-def test_gather_pack_b1_pad_slots_still_index_select(monkeypatch):
-    """Pad slots still gather the extra zero row; identity skip must not fire."""
-    calls = _count_select_rows(monkeypatch)
-    tokens, heads, dim = 3, 2, 8
-    flat = torch.arange(tokens * heads * dim, dtype=torch.float32).reshape(tokens, heads, dim)
-    # Last slot is the F.pad zero row (index == T).
-    pack_idx = torch.tensor([[0, 1, 2, tokens]], dtype=torch.int64)
-
-    out = gather_pack(flat, pack_idx, dim)
-
-    assert calls["n"] == 1
-    assert torch.equal(out[0, :, 3, :], torch.zeros(heads, dim))
-
-
-def test_gather_pack_multi_seq_still_index_select(monkeypatch):
-    """B>1 keeps per-layer gather even when rows are 0..T-1 (reverted pack-once)."""
-    calls = _count_select_rows(monkeypatch)
-    batch, length, heads, dim = 2, 4, 2, 8
-    flat = torch.randn(batch * length, heads, dim)
-    pack_idx = torch.arange(batch * length, dtype=torch.int64).view(batch, length)
-
-    gather_pack(flat, pack_idx, dim)
-
-    assert calls["n"] == 1
-
-
-def test_scatter_pack_b1_body_bucket_skips_index_copy(monkeypatch):
-    """Body-bucket T=64 with 62 real tokens: skip scatter; mask covers pad slots."""
-    calls = _count_index_copy(monkeypatch)
-    tokens, aligned_len, heads, dim = 62, 64, 2, 8
-    extra = aligned_len - tokens
-    torch.manual_seed(0)
-    flat = torch.randn(tokens + extra, heads, dim)
-    dest = host_scatter_pack_dest(
-        q_starts=[0],
-        lengths=[tokens],
-        aligned_len=aligned_len,
-        num_src_rows=tokens + extra,
-        dummy_row=dummy_pack_row([tokens], aligned_len),
-    )
-
-    got = scatter_pack(flat, dest, batch=1, aligned_len=aligned_len, head_size_padded=dim)
-
-    assert calls["n"] == 0
-    expected = flat.unsqueeze(0).permute(0, 2, 1, 3).contiguous()
-    assert torch.equal(got, expected)
-
-
-def test_scatter_pack_b1_short_seq_still_index_copy(monkeypatch):
-    """T=62, L=64: body is not dense; still scatter."""
-    calls = _count_index_copy(monkeypatch)
-    _assert_scatter_matches_gather(
-        q_starts=[0],
-        query_lens=[62],
-        batch=1,
-        aligned_len=64,
-        heads=2,
-        dim=8,
-    )
-    assert calls["n"] == 1
-
-
-def test_scatter_pack_multi_seq_still_index_copy(monkeypatch):
-    """B>1 still scatters even when T == B×L."""
-    calls = _count_index_copy(monkeypatch)
-    batch, length, heads, dim = 2, 4, 2, 8
-    flat = torch.randn(batch * length, heads, dim)
-    dest = torch.arange(batch * length, dtype=torch.int64)
-    scatter_pack(flat, dest, batch, length, dim)
-    assert calls["n"] == 1
-
-
-def test_gather_unpack_b1_dense_body_skips_index_select(monkeypatch):
-    """62-in-64 unpack is not identity (tail stays 0) but T==L still reshapes."""
-    calls = _count_select_rows(monkeypatch)
-    batch, heads, length, dim, real = 1, 2, 64, 8, 62
-    attn_out = torch.randn(batch, heads, length, dim)
-    unpack_idx = torch.zeros(length, dtype=torch.int64)
-    unpack_idx[:real] = torch.arange(real, dtype=torch.int64)
-
-    out = gather_unpack(attn_out, unpack_idx, dim)
-
-    assert calls["n"] == 0
-    expected = attn_out.permute(0, 2, 1, 3).contiguous().reshape(length, heads, dim)
-    assert torch.equal(out, expected)
+    assert attn_metadata.encoder_plan is cached_plans
 
 
 def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs: int):
@@ -1199,7 +765,7 @@ def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs
 def test_encoder_build_skips_kv_cache_fields(default_vllm_config) -> None:
     meta = _profile_metadata(EncoderOnlyAttentionSpec, max_model_len=512, prompt_len=64, num_seqs=2)
     assert meta.padded_num_blocks is None
-    assert not meta.attention_mask_tiles
+    assert not meta.attention_mask_stacks
     assert meta.page_index_tables_cpu is None
     assert meta.active_block_indices is None
     # Everything SpyreEncoderAttentionImpl.forward actually reads.
@@ -1229,37 +795,247 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
         _profile_metadata(AttentionSpec, max_model_len=256, prompt_len=512, num_seqs=1)
 
 
-def test_eager_config_has_no_body_ladder_to_cache(monkeypatch) -> None:
-    """``--enforce-eager`` leaves ``compile_sizes`` unset, and init must tolerate it.
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+@pytest.mark.parametrize("batched", [False, True], ids=["grouping_off", "grouping_on"])
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # All one extent: one group, no remainder.
+        pytest.param([(64, 64)] * 4, id="4seqs_same_extent"),
+        # Five members at one extent must split 4 + 1, not pad up to 8.
+        pytest.param([(64, 64)] * 5, id="5seqs_splits_4plus1"),
+        # Different extents must not be grouped together, and members sharing an
+        # extent may still have different real kv_len.
+        pytest.param([(40, 40), (50, 50), (300, 300), (310, 310), (20, 20)], id="mixed_extents"),
+    ],
+)
+@torch.inference_mode()
+def test_grouped_attention_matches_the_per_sequence_reference(
+    default_vllm_config,
+    batched: bool,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Batching equal-extent requests into one kernel call must not change results.
 
-    ``apply_config_platform_defaults`` returns at ``CompilationMode.NONE`` before it
-    builds the body ladder, so every eager pooling engine died in this constructor.
+    Runs the same batch with grouping off and on: both are checked against the
+    bidirectional reference, so a grouping bug cannot hide behind a shared
+    implementation. ``mixed_extents`` also covers members that share an extent
+    while having different real ``kv_len`` -- only their masks differ, and those
+    are concatenated in member order to match the kernel's folded batch dim.
     """
-    from vllm.config import (
-        CompilationMode,
-        DeviceConfig,
-        ModelConfig,
-        VllmConfig,
-        set_current_vllm_config,
-    )
-    from vllm.platforms import PlatformEnum, current_platform
+    num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
+    dtype = torch.float16
+    torch.set_default_device("cpu")
+    set_random_seed(0)
 
-    monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
-    config = VllmConfig(
-        device_config=DeviceConfig(device="cpu"),
-        model_config=ModelConfig(dtype=torch.float16, enforce_eager=True),
+    query_lens = [q for q, _ in seq_lens]
+    kv_lens = [k for _, k in seq_lens]
+    total_tokens = sum(query_lens)
+    scale = head_size**-0.5
+
+    query = torch.randn(total_tokens, num_heads, head_size, dtype=dtype)
+    key = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(total_tokens, num_kv_heads, head_size, dtype=dtype)
+    cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
     )
-    assert config.compilation_config.mode == CompilationMode.NONE
-    assert config.compilation_config.compile_sizes is None, "the hook now builds a ladder here"
-    with set_current_vllm_config(config):
-        impl = SpyreEncoderAttentionImpl(
-            num_heads=16,
-            head_size=64,
-            scale=64**-0.5,
-            num_kv_heads=4,
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32),
+        query_start_loc=cu_query_lens,
+        block_table=torch.zeros(
+            len(seq_lens), (max(query_lens) + block_size - 1) // block_size, dtype=torch.int32
+        ),
+        slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
+    )
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+        logits_soft_cap=None,
+    )
+    output = _vllm_style_output(query, torch.device(configure_device))
+    # Pre-built rather than left to the impl, which always groups under a compiled
+    # config: `batched=False` is the shape the eager path builds.
+    attn_metadata.encoder_plan = build_encoder_plan(
+        attn_metadata,
+        rectangles=(),
+        width_cap_for=impl._width_caps,
+        device=output.device,
+        dtype=dtype,
+        batched=batched,
+    )
+    impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0)),
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    groups = [getattr(p, "group", 1) for p in attn_metadata.encoder_plan]
+    if batched:
+        assert any(g > 1 for g in groups), (
+            "grouping was enabled but every plan stayed a single sequence"
+        )
+    else:
+        assert groups == [1] * len(groups), "grouping was disabled but a plan batched"
+
+    ref_output = ref_encoder_attn(
+        query=query, key=key, value=value, query_lens=query_lens, scale=scale
+    )
+    assert_close_outliers(
+        output.to("cpu"),
+        ref_output,
+        max_outliers=8,
+        atol=0.3,
+        rtol=0.2,
+        outlier_atol=0.6,
+        outlier_rtol=0.4,
+    )
+
+
+@pytest.mark.parametrize("configure_device", ["cpu", "spyre"], indirect=True)
+@pytest.mark.parametrize("configure_compilation", ["STOCK_TORCH_COMPILE"], indirect=True)
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        pytest.param([64, 64, 64, 64], id="uniform_full_extent"),
+        pytest.param([40, 64, 17, 64], id="ragged_within_one_extent"),
+        pytest.param([100, 30, 128, 7], id="ragged_across_extents"),
+        pytest.param([64], id="single_request"),
+        # Fewer requests than the rectangle is wide, so batch-pad lanes are live.
+        pytest.param([50, 60], id="batch_pad_lanes"),
+    ],
+)
+@torch.inference_mode()
+def test_fast_and_ragged_paths_agree(
+    default_vllm_config,
+    query_lens: list[int],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """The same batch down both paths must give the same answer.
+
+    This is what keeps the ragged path a fallback rather than a second implementation
+    that silently diverges. The two see different inputs by construction -- the rectangular
+    path a dense ``[B, L]`` grid, the ragged path the packed list -- so the test builds
+    both from one set of activations and compares only the real token rows.
+    """
+    num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
+    dtype = torch.float16
+    device = torch.device(configure_device)
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    extent = _alignment_units_for(max(query_lens)) * ENCODER_LEN_ALIGNMENT
+    width = len(query_lens)
+    scale = head_size**-0.5
+
+    def make_impl():
+        return SpyreEncoderAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
             alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="auto",
             logits_soft_cap=None,
         )
-    assert impl._cached_body_buckets == []
+
+    def metadata(lens):
+        cu = torch.tensor([0] + list(lens), dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+        return _build_metadata(
+            num_query_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            block_size=block_size,
+            seq_lens=torch.tensor(list(lens), dtype=torch.int32),
+            query_start_loc=cu,
+            block_table=torch.zeros(len(lens), extent // block_size, dtype=torch.int32),
+            slot_mapping=torch.arange(sum(lens), dtype=torch.int64),
+        )
+
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+
+    # One set of activations, laid out both ways. Grid row `s * extent + i` is packed
+    # row `cumsum(lens)[s] + i`; pad rows are zero and their outputs are dropped.
+    packed_q = torch.randn(sum(query_lens), num_heads, head_size, dtype=dtype)
+    packed_k = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    packed_v = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+
+    rows = encoder_dense_row_indices(query_lens, extent)
+
+    def to_grid(packed, heads):
+        grid = torch.zeros(width * extent, heads, head_size, dtype=dtype)
+        grid[rows] = packed
+        return grid
+
+    # Ragged path: metadata carries no plan, so the impl builds a packed one.
+    slow_md = metadata(query_lens)
+    slow_out = _vllm_style_output(packed_q, device)
+    make_impl().forward(
+        layer=None,
+        query=convert(packed_q, device),
+        key=convert(packed_k, device),
+        value=convert(packed_v, device),
+        kv_cache=kv_cache,
+        attn_metadata=slow_md,
+        output=slow_out,
+    )
+    assert not isinstance(slow_md.encoder_plan, EncoderRectPlan), "expected the packed path"
+
+    # Rectangular path: the runner would have padded the body and laid out the grid, so the
+    # plan is built here with the covering rectangle declared.
+    grid_q = to_grid(packed_q, num_heads)
+    fast_md = metadata(query_lens)
+    fast_md.encoder_plan = build_encoder_plan(
+        fast_md,
+        rectangles=[(extent, width)],
+        width_cap_for={},
+        device=device,
+        dtype=dtype,
+        batched=True,
+    )
+    assert isinstance(fast_md.encoder_plan, EncoderRectPlan), "expected the rectangle path"
+    fast_out = _vllm_style_output(grid_q, device)
+    make_impl().forward(
+        layer=None,
+        query=convert(grid_q, device),
+        key=convert(to_grid(packed_k, num_kv_heads), device),
+        value=convert(to_grid(packed_v, num_kv_heads), device),
+        kv_cache=kv_cache,
+        attn_metadata=fast_md,
+        output=fast_out,
+    )
+
+    # Only the real token rows: pad rows differ by construction and nothing reads them.
+    assert_close_outliers(
+        fast_out.to("cpu")[rows],
+        slow_out.to("cpu"),
+        max_outliers=8,
+        atol=0.3,
+        rtol=0.2,
+        outlier_atol=0.6,
+        outlier_rtol=0.4,
+    )

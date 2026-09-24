@@ -62,28 +62,18 @@
 
   <rect x="46" y="610" width="970" height="240" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
   <text class="t bt" x="531" y="638" text-anchor="middle">Encoder attention: the only request-aware stage</text>
-  <text class="t bdl" x="531" y="660" text-anchor="middle">dense-grid strategy (compared with the planned flash variant at the foot of this diagram) · rounds up its own grid: S to a power of two, L already 64-aligned</text>
+  <text class="t bdl" x="531" y="660" text-anchor="middle">per-extent groups: requests sharing a padded length are served by one batched SDPA · gather, attend and store are one compiled graph</text>
 
   <rect x="70" y="674" width="922" height="52" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="531" y="695" text-anchor="middle">Batch-shape tables, built once per step and carried on the attention metadata</text>
-  <text class="t id" x="531" y="714" text-anchor="middle">additive mask + three gather index lists · derived from S and the per-request lengths, so identical for every layer</text>
+  <text class="t it" x="531" y="695" text-anchor="middle">Row tables and masks, built once per step and carried on the attention metadata</text>
+  <text class="t id" x="531" y="714" text-anchor="middle">one int32 row table and one [group, 1, 1, extent] mask per plan · derived from the per-request lengths, so identical for every layer</text>
 
-  <rect x="70" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="217" y="758" text-anchor="middle">gather_pack</text>
-  <text class="t id" x="217" y="776" text-anchor="middle">[T, H, D] → [S, H, L, D]</text>
-  <text class="t id" x="217" y="791" text-anchor="middle">pad slots point at a zero row</text>
+  <rect x="70" y="736" width="922" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
+  <text class="t it" x="531" y="757" text-anchor="middle">Fused kernel: gather → SDPA → store, one compiled graph</text>
+  <text class="t id" x="531" y="775" text-anchor="middle">index_select the plan's rows into [group × extent, H, D] · batched SDPA · index_copy_ the result back</text>
+  <text class="t id" x="531" y="791" text-anchor="middle">keyed on (buffer_rows, group, extent) · pad lanes clamp to the sequence's last real row, so no zero row is needed</text>
 
-  <rect x="384" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="531" y="758" text-anchor="middle">SDPA on device</text>
-  <text class="t id" x="531" y="776" text-anchor="middle">bidirectional, additive mask</text>
-  <text class="t id" x="531" y="791" text-anchor="middle">one fused kernel per (S, L)</text>
-
-  <rect x="698" y="736" width="294" height="62" rx="6" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="845" y="758" text-anchor="middle">gather_unpack</text>
-  <text class="t id" x="845" y="776" text-anchor="middle">[S, H, L, D] → [T, H, D]</text>
-  <text class="t id" x="845" y="791" text-anchor="middle">single bulk output copy</text>
-
-  <text class="t bdl" x="531" y="826" text-anchor="middle">tables on the metadata instead of rebuilt per layer ⇒ roughly 4 host/device barriers per pass, not one set per layer</text>
+  <text class="t bdl" x="531" y="826" text-anchor="middle">tables on the metadata instead of rebuilt per layer · one launch per plan per layer, where the three-stage split cost three</text>
 
   <path class="edge" d="M 531 850 V 880" marker-end="url(#arrow)" />
 
@@ -107,20 +97,20 @@
 
   <rect x="1076" y="142" width="578" height="62" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
   <text class="t it" x="1365" y="163" text-anchor="middle">T &#160;·&#160; tokens in the step</text>
-  <text class="t id" x="1365" y="182" text-anchor="middle">sum of the batched prompt lengths · bucketed to 64 / 128 / 256 / 512 tokens</text>
+  <text class="t id" x="1365" y="182" text-anchor="middle">sum of the batched prompt lengths · bucketed to 256 / 512 / 1024 / 2048 tokens</text>
 
   <rect x="1076" y="210" width="578" height="62" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="1365" y="231" text-anchor="middle">S &#160;·&#160; requests in the step</text>
-  <text class="t id" x="1365" y="250" text-anchor="middle">how many prompts are batched together · bucketed to 1 / 2 / 4 / 8 …</text>
+  <text class="t it" x="1365" y="231" text-anchor="middle">group &#160;·&#160; requests in one attention call</text>
+  <text class="t id" x="1365" y="250" text-anchor="middle">requests sharing an extent, in powers of two, capped by max_num_seqs</text>
 
   <rect x="1076" y="278" width="578" height="68" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="1.5" />
-  <text class="t it" x="1365" y="299" text-anchor="middle">L &#160;·&#160; the width of attention's grid</text>
-  <text class="t id" x="1365" y="317" text-anchor="middle">every request gets one row of L columns; L = align_up(longest prompt, 64)</text>
-  <text class="t id" x="1365" y="333" text-anchor="middle">short requests leave their remaining columns as padding</text>
+  <text class="t it" x="1365" y="299" text-anchor="middle">extent &#160;·&#160; one request's padded length</text>
+  <text class="t id" x="1365" y="317" text-anchor="middle">per request, not per step: its own length in 64-token units, rounded to a power of two</text>
+  <text class="t id" x="1365" y="333" text-anchor="middle">so a 260-token request attends over 512 · requests sharing an extent can be grouped</text>
 
   <rect x="1076" y="352" width="578" height="40" rx="6" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
   <text class="t note" x="1365" y="369" text-anchor="middle" font-weight="700">Worked example, prompts of 40, 12 and 58 tokens:</text>
-  <text class="t note" x="1365" y="385" text-anchor="middle">T = 110 → T_padded = 128 · S = 3 → 4 · L = 64 · grid = 4 × 64. Note S × L ≠ T.</text>
+  <text class="t note" x="1365" y="385" text-anchor="middle">T = 110 → T_padded = 256 · every extent = 64 · group 3 chunks to 2 + 1, so two plans.</text>
 
   <!-- ================= RIGHT 2: compilation mode ================= -->
   <rect x="1056" y="412" width="618" height="178" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
@@ -136,20 +126,20 @@
 
   <!-- ================= RIGHT 3: warmup ================= -->
   <rect x="1056" y="604" width="618" height="236" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
-  <text class="t sect" x="1076" y="632">Startup: warmup walks both sets of buckets</text>
+  <text class="t sect" x="1076" y="632">Startup: warmup walks every bucket set</text>
 
   <rect x="1076" y="648" width="578" height="52" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
   <text class="t bt" x="1365" y="672" text-anchor="middle">for T in token buckets: _dummy_run(T)</text>
   <text class="t bdl" x="1365" y="691" text-anchor="middle">one compiled body graph per bucket</text>
 
   <rect x="1076" y="710" width="578" height="66" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
-  <text class="t bt" x="1365" y="733" text-anchor="middle">for (S, L): _dummy_run(force_attention=True)</text>
-  <text class="t bdl" x="1365" y="752" text-anchor="middle">without the flag no attention metadata is built,</text>
-  <text class="t bdl" x="1365" y="768" text-anchor="middle">so the attention path is never traced or compiled</text>
+  <text class="t bt" x="1365" y="733" text-anchor="middle">_warm_kernels, called from forward</text>
+  <text class="t bdl" x="1365" y="752" text-anchor="middle">sweeps (extent, group) on the first call per buffer_rows · the dummy</text>
+  <text class="t bdl" x="1365" y="768" text-anchor="middle">runs cannot span it: an extent follows the request, not the bucket</text>
 
   <rect x="1076" y="786" width="578" height="48" rx="8" fill="#1565c0" stroke="#0d47a1" stroke-width="2" />
-  <text class="t bt" x="1365" y="807" text-anchor="middle">_dummy_pooler_run(hidden_states)</text>
-  <text class="t bdl" x="1365" y="825" text-anchor="middle">warms pooler shapes · upstream's version is only a memory probe</text>
+  <text class="t bt" x="1365" y="807" text-anchor="middle">_dummy_pooler_run + _warm_pooler_row_widths</text>
+  <text class="t bdl" x="1365" y="825" text-anchor="middle">pooler cost follows the request count, so row widths are swept too</text>
 
   <path d="M 1056 718 H 1030 V 470 H 1000" stroke="#0d47a1" stroke-width="2" stroke-dasharray="7 5" fill="none" marker-end="url(#arrow-dash)" />
   <text class="t id" x="1026" y="710" text-anchor="end" fill="#0d47a1">warms</text>
@@ -166,42 +156,42 @@
 
   <!-- ================= BOTTOM: attention strategy comparison ================= -->
   <rect x="26" y="1130" width="1648" height="470" rx="10" fill="#EEF1F8" stroke="#CFD2DD" stroke-width="2" />
-  <text class="t sect" x="46" y="1158">Attention shape strategy: the dense grid used above, and how flash attention would change it</text>
+  <text class="t sect" x="46" y="1158">Attention shape strategy: the per-extent groups used above, and how flash attention would change it</text>
 
   <rect x="46" y="1174" width="790" height="252" rx="8" fill="#E3E9FD" stroke="#0d47a1" stroke-width="2" />
-  <text class="t it" x="66" y="1198">A · Dense grid, the strategy shown above</text>
-  <text class="t id" x="66" y="1222">Pack the ragged flat list into a rectangle, so every shape is fixed at compile time.</text>
-  <text class="t id" x="66" y="1242">Needed because an offset computed from data does not lower under compilation</text>
-  <text class="t id" x="66" y="1260">(torch-spyre#3508) — and that arithmetic is exactly what flash relies on. Eager</text>
-  <text class="t id" x="66" y="1278">tolerates it; compiled mode, our target, does not.</text>
-  <text class="t id" x="66" y="1304">· build an additive mask [S, 1, L, L] marking padding and cross-request slots</text>
-  <text class="t id" x="66" y="1324">· build three index lists, then gather Q / K / V into [S, H, L, D]</text>
-  <text class="t id" x="66" y="1344">· one fused SDPA kernel per (S, L), then gather the results back out</text>
-  <text class="t id" x="66" y="1370" font-weight="700">Shape axes: T for the body, (S, L) for attention. Two sets of buckets to warm.</text>
-  <text class="t id" x="66" y="1392">Costs: the mask grows with L² · index lists and a barrier per gather.</text>
-  <text class="t id" x="66" y="1414">Works today. This is the current implementation.</text>
+  <text class="t it" x="66" y="1198">A · Per-extent groups, the strategy shown above</text>
+  <text class="t id" x="66" y="1222">Gather each group's rows out of the flat list into a dense batch, so every shape is</text>
+  <text class="t id" x="66" y="1242">fixed at compile time. Needed because an offset computed from data does not lower</text>
+  <text class="t id" x="66" y="1260">under compilation (torch-spyre#3508) — exactly the arithmetic flash relies on.</text>
+  <text class="t id" x="66" y="1278">Eager tolerates it; compiled mode, our target, does not.</text>
+  <text class="t id" x="66" y="1304">· group the step's requests by padded length, so each plan has one extent</text>
+  <text class="t id" x="66" y="1324">· one compiled graph per plan does gather, SDPA and store together</text>
+  <text class="t id" x="66" y="1344">· mask is [group, 1, 1, extent]; head and query axes broadcast</text>
+  <text class="t id" x="66" y="1370" font-weight="700">Shape axes: T for the body, (buffer_rows, group, extent) for attention.</text>
+  <text class="t id" x="66" y="1392">Costs: the pack is still paid, and fusion put buffer_rows into the attention key.</text>
+  <text class="t id" x="66" y="1414">Cheaper than masking a block-diagonal over the flat list. Current implementation.</text>
 
   <rect x="858" y="1174" width="790" height="252" rx="8" fill="#E8F5E9" stroke="#2e7d32" stroke-width="2" />
   <text class="t it" x="878" y="1198">B · Flash-style attention, planned</text>
-  <text class="t id" x="878" y="1222">Never materialise the rectangle. Each block of queries reads its request's offset from the</text>
+  <text class="t id" x="878" y="1222">Never materialise the batch. Each block of queries reads its request's offset from the</text>
   <text class="t id" x="878" y="1242">metadata at runtime and works directly on the flat list, carrying a running softmax maximum</text>
   <text class="t id" x="878" y="1260">and sum — the online-softmax structure the Spyre decoder path already uses over KV pages.</text>
-  <text class="t id" x="878" y="1286">· no [S, 1, L, L] mask; request boundaries are the offsets</text>
-  <text class="t id" x="878" y="1306">· no gather_pack / gather_unpack; the kernel reads the flat list directly</text>
-  <text class="t id" x="878" y="1326">· no per-layer index lists, so no per-gather barriers</text>
-  <text class="t id" x="878" y="1352" font-weight="700">Shape axis: block count, bucketed like the decoder's page loop. L disappears.</text>
-  <text class="t src" x="878" y="1376">Both upstream backends already work this way: flash attention consumes the flat list with</text>
-  <text class="t src" x="878" y="1392">cu_seqlens_q = query_start_loc, and the CPU backend passes query[:num_actual_tokens]</text>
-  <text class="t src" x="878" y="1408">straight to a C++ kernel. Neither pads into a rectangle.</text>
+  <text class="t id" x="878" y="1286">· no [group, 1, 1, extent] mask; request boundaries are the offsets</text>
+  <text class="t id" x="878" y="1306">· no gather or store; the kernel reads the flat list directly</text>
+  <text class="t id" x="878" y="1326">· extent disappears, replaced by a block count</text>
+  <text class="t id" x="878" y="1352" font-weight="700">Two separate prerequisites, often conflated:</text>
+  <text class="t id" x="878" y="1374">· torch-spyre#3508, data-dependent offsets → flat-list attention, coarse block count</text>
+  <text class="t id" x="878" y="1392">· symbolic shapes (the backend rejects SymInt today) → no bucketing on any axis</text>
+  <text class="t src" x="878" y="1412">With #3508 alone the block count stays bucketed, as the decoder's page loop is.</text>
 
   <rect x="46" y="1442" width="1180" height="142" rx="8" fill="#FFF8E1" stroke="#F9A825" stroke-width="2" />
-  <text class="t it" x="66" y="1464">If flash attention lands, the diagram above simplifies and converges on the upstream design:</text>
-  <text class="t note" x="66" y="1486">· the second shape axis collapses; bucket T and a block count, which is much closer to upstream's single axis</text>
-  <text class="t note" x="66" y="1504">· the "batch-shape tables" box disappears, and with it the per-layer rebuild problem and its host/device barriers</text>
-  <text class="t note" x="66" y="1522">· gather_pack / SDPA / gather_unpack collapse into one blocked-attention kernel</text>
-  <text class="t note" x="66" y="1540">· the mask's L² growth at long prompts disappears, today's largest untested risk at realistic prompt lengths</text>
-  <text class="t note" x="66" y="1560" font-weight="700">Open question: whether a Spyre kernel can do the runtime offset arithmetic this depends on. If it cannot, the block</text>
-  <text class="t note" x="66" y="1578">count stays bucketed. Everything else holds either way: padding seam, unpadded metadata, warmup, compilation mode.</text>
+  <text class="t it" x="66" y="1464">If flash attention lands, what changes — and what fusion already changed:</text>
+  <text class="t note" x="66" y="1486">· attention stops gathering, so the pack and its launch go away; extent collapses to a coarser block count</text>
+  <text class="t note" x="66" y="1504">· the mask disappears entirely; request boundaries become offsets read at runtime</text>
+  <text class="t note" x="66" y="1526" font-weight="700">What fusion already did, and what it cost: collapsing gather, SDPA and store into one graph removed two launches</text>
+  <text class="t note" x="66" y="1544">per plan per layer, but pulled buffer_rows into the attention key. The branch moved toward flash's shape while moving</text>
+  <text class="t note" x="66" y="1562">away from its single axis. Flash would not remove buffer_rows either — attention still writes the body-sized buffer.</text>
+  <text class="t note" x="66" y="1582">Unchanged either way: the padding seam, metadata describing the real batch, warmup coverage, compilation mode.</text>
 
   <rect x="1246" y="1442" width="428" height="142" rx="8" fill="#FFFFFF" stroke="#CFD2DD" stroke-width="2" />
   <text class="t it" x="1266" y="1466">Legend</text>
@@ -210,7 +200,7 @@
   <rect x="1266" y="1501" width="14" height="14" rx="3" fill="#1565c0" stroke="#0d47a1" />
   <text class="t lg" x="1290" y="1512">spyre-inference component</text>
   <rect x="1266" y="1523" width="14" height="14" rx="3" fill="#E3E9FD" stroke="#0d47a1" />
-  <text class="t lg" x="1290" y="1534">Internal step · dense-grid path</text>
+  <text class="t lg" x="1290" y="1534">Internal step · current path</text>
   <rect x="1266" y="1545" width="14" height="14" rx="3" fill="#E8F5E9" stroke="#2e7d32" />
   <text class="t lg" x="1290" y="1556">Planned flash-attention path</text>
   <rect x="1266" y="1567" width="14" height="14" rx="3" fill="#FFF8E1" stroke="#F9A825" />

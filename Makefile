@@ -394,16 +394,19 @@ endif
 
 # Optional benchmark filters (empty = run everything). MODELS narrows to a
 # comma-separated set of model names -- CI passes the per-model matrix entry
-# here so each job benches a single model. BENCH_TYPES narrows to a subset of
+# here so each job benches a single model. TPS narrows to a comma-separated set
+# of tensor-parallel sizes, e.g. TPS=1,4. BENCH_TYPES narrows to a subset of
 # latency,throughput,serve for quick local iteration.
 MODELS ?=
+TPS ?=
 BENCH_TYPES ?=
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
 	mkdir -p "$(RESULTS_DIR)"
 	$(AIU_SETUP_CMD); \
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
 		--results-dir "$(RESULTS_DIR)" \
 		--models "$(MODELS)" \
+		--tps "$(TPS)" \
 		--bench-types "$(BENCH_TYPES)"

@@ -70,10 +70,13 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-# Sigmoid probabilities, most just above zero where an absolute bound permits an arbitrary
-# relative error, so the stricter of the two applies.
+# Sigmoid probabilities. An absolute bound of 0.03 permits an arbitrary relative
+# error on a near-zero score, so the relative bound applies there. fp16 still
+# moves a ~1e-5 probability by about that much, so the relative bound has a
+# floor; below it the document is already not relevant.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
+SCORE_REL_FLOOR = float(os.environ.get("SPYRE_TEST_SCORE_REL_FLOOR", "2e-5"))
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
@@ -290,7 +293,7 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     )
 
     for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
-        tol = min(SCORE_ABS_TOL, SCORE_REL_TOL * ref_score)
+        tol = min(SCORE_ABS_TOL, max(SCORE_REL_TOL * ref_score, SCORE_REL_FLOOR))
         assert abs(score - ref_score) <= tol, (
             f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
             f"for {document!r}"

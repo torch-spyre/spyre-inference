@@ -159,17 +159,21 @@ def test_unquantized_layers_get_spyre_method(tp_group):
 
 
 def _rows_reaching_gemm(gate_up, x, monkeypatch):
-    """Rows reaching the GEMM: on CPU `out[:m]` is identical whether or not padding fired."""
-    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
+    """Rows that reach ``torch.matmul``.
+
+    Short-row padding happens inside ``spyre_linear_t``, so ``apply`` still sees
+    the real token count. On CPU ``out[:m]`` matches whether or not the pad fired.
+    """
+    from spyre_inference.custom_ops import linear as linear_mod
 
     seen = []
-    real_apply = SpyreUnquantizedLinearMethod.apply
+    real_matmul = linear_mod.torch.matmul
 
-    def spy(self, layer, activations, bias=None):
+    def spy(activations, weight, *args, **kwargs):
         seen.append(activations.shape[0])
-        return real_apply(self, layer, activations, bias)
+        return real_matmul(activations, weight, *args, **kwargs)
 
-    monkeypatch.setattr(SpyreUnquantizedLinearMethod, "apply", spy)
+    monkeypatch.setattr(linear_mod.torch, "matmul", spy)
     out = _forward(gate_up, x)
     assert len(seen) == 1
     return seen[0], out

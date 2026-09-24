@@ -32,6 +32,7 @@ Hook Execution Order
 ---------------------
 1. pytest_configure (tryfirst)
     - Loads Spyre plugins (custom ops, platform)
+    - Sizes this process's torch thread pool to the container's CPU budget
     - Detects local vLLM repo OR clones to ~/.cache/vllm-upstream-tests/
     - Injects test paths into pytest collection
 
@@ -54,12 +55,15 @@ UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
 XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
+SPYRE_NUM_CPUS          CPU budget for the torch thread clamp (default: auto-detected)
+SPYRE_UPDATE_THREAD_CONFIG  Set to 0 to leave this process's torch thread pool alone
 """
 
 from __future__ import annotations
 
 import atexit
 import fnmatch
+import math
 import os
 import re
 import socket
@@ -157,6 +161,32 @@ def _log(msg: str):
     else:
         # Fallback to stderr when terminal reporter not available
         print(msg, file=sys.stderr)
+
+
+def _clamp_torch_threads() -> None:
+    """Size this process's torch intra-op pool to the container's CPU budget.
+
+    libgomp reads OMP_NUM_THREADS once, when torch loads it, so `configure_threading`'s
+    env-var rewrite cannot resize a pool that already exists -- only torch can.
+    """
+    from spyre_inference import envs
+    from spyre_inference.threading_config import get_cpu_count
+
+    if not envs.SPYRE_UPDATE_THREAD_CONFIG:
+        return
+
+    cpu_count, detection_message = get_cpu_count()
+    if cpu_count is None:
+        _log("[threads] No CPU budget detected, leaving torch intra-op threads alone")
+        return
+
+    # floor, unlike configure_threading's ceiling, which must not leave a worker at zero.
+    threads = max(1, math.floor(cpu_count))
+    current = torch.get_num_threads()
+    if threads >= current:
+        return
+    _log(f"[threads] {detection_message}: torch intra-op threads {current} -> {threads}")
+    torch.set_num_threads(threads)
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +567,8 @@ def pytest_configure(config):
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
+
+    _clamp_torch_threads()
 
     # Register sharding for its own trylast pytest_collection_modifyitems, which must
     # land after pytest's -m deselection. Registered here (not via the plugin's -p

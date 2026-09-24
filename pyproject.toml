@@ -1,9 +1,10 @@
 [build-system]
 requires = [
   "setuptools>=82",
-  "setuptools_scm>=8"
+  "setuptools_scm>=10",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path  = ["."]
 
 [project]
 name = "spyre-inference"
@@ -54,12 +55,10 @@ exclude = ["spyre_inference.testing*"]  # exclude testing module (now a separate
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.setuptools_scm]
-# Version files are optional, this just marginally speeds up version inspection
-# at runtime
+# _version.py is written at build time by setuptools_scm
 version_file = "spyre_inference/_version.py"
-# Version strings are formatted as `{version}+{local}`, e.g. "0.1.dev1+gb1a7032"
-# Local versioning is incompatible with pypi, so we disable it by default.
-local_scheme = "no-local-version"
+version_scheme = "semver-pep440-release-branch"
+local_scheme   = "_versioning:ci_local_scheme"
 
 
 [tool.uv]

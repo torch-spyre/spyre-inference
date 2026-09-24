@@ -471,17 +471,6 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-attention-shard-9
-          # Focused compiled integration gate. The Make target sets the switch
-          # before pytest imports tile_loop; the regular suite defaults to the
-          # Python page walk and remains the rollback-path coverage.
-          - cfg: Spyre attention for_each_tile on-device
-            test_types: unit regression trunk
-            runs_on:
-              - x86_64
-              - spyre_pf_x1
-              - linux
-            image_label: image_torch_spyre
-            test_target: test-attention-for-each-tile
           - cfg: Encoder attention tests
             test_types: unit regression trunk
             runs_on:

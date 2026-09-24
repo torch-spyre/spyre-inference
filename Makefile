@@ -125,7 +125,7 @@ RESULTS_DIR ?= .
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
         test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
-        test-attention test-attention-shard test-attention-for-each-tile \
+        test-attention test-attention-shard \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
         test-upstream-distributed \
         tests-single-card tests-multi-card
@@ -266,25 +266,6 @@ test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHA
 # ATTN_SHARD_ID. ATTN_SHARDS (the total) comes from its default above.
 test-attention-shard-%:
 	$(MAKE) test-attention-shard ATTN_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
-
-# One case per tiled kernel: per-sequence page attention and batched decode, each on
-# both KV layouts, plus ALiBi (the only walk with a sixth tiled operand). A batched
-# decode case needs at least _MIN_BATCHED_SEQS sequences or the builder declines the
-# kernel and the case silently covers the per-sequence walk instead; the padded-bucket
-# cases also carry padded rows and ragged block counts. Renaming a parametrize id here
-# fails the job (pytest exits non-zero on an unmatched node id) rather than dropping
-# coverage quietly.
-test-attention-for-each-tile: ## Run compiled on-device attention with for_each_tile enabled before import.
-	SPYRE_ATTN_FOR_EACH_TILE=1 $(MAKE) run-one \
-	  MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' \
-	  PYTEST_ARGS='$(PYTEST_ARGS) \
-	    "tests/attention/test_spyre_attn.py::test_spyre_attn_compiled_multi_seq[batch_prefill(2seqs)-compilation_STOCK-device_spyre]" \
-	    "tests/attention/test_spyre_attn.py::test_spyre_attn_compiled_multi_seq[batch_mixed(3seqs)-compilation_STOCK-device_spyre]" \
-	    "tests/attention/test_spyre_attn.py::test_spyre_attn_alibi[prefill(q=32,kv=256)-compilation_STOCK-device_spyre]" \
-	    "tests/attention/test_spyre_attn.py::test_spyre_attn_batched_decode_correctness[bucket_pad(N=5_bucket=8)-compilation_STOCK-device_spyre]" \
-	    "tests/attention/test_spyre_head_major_attn.py::test_head_major_attn_core[device_spyre-compiled-prefill_single]" \
-	    "tests/attention/test_spyre_head_major_attn.py::test_head_major_batched_decode_correctness[device_spyre-compiled-bucket_exact(N=8)]"' \
-	  JUNIT_XML=$(JUNIT_XML)
 
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)

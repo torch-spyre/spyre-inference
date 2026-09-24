@@ -38,7 +38,6 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
 )
-from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
@@ -840,18 +839,10 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     gc.collect()
 
 
-@pytest.mark.parametrize("for_each_tile", [False, True], ids=["loop", "for_each_tile"])
-def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile):
-    """The per-sequence decode kernel matches the suite's CPU reference, on both page walks.
-
-    The reference has no walk to gate, so a fault in the tiled body cannot cancel out the
-    way it would if the two walks were only held against each other. Card-free and fp32, as
-    its batched twin: it pins the group fold and the ragged tail's mask, not the fp16
-    tolerances.
-    """
+def test_page_attn_head_major_matches_fp32_reference():
+    """The per-sequence decode kernel matches the suite's CPU reference."""
     from spyre_testing_plugin.attn_helpers import ref_attn
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     set_random_seed(0)
     kv, qpk, d, block, blocks = 8, 4, 128, 64, 5
@@ -910,25 +901,18 @@ def test_page_attn_head_major_matches_fp32_reference(monkeypatch, for_each_tile)
 
 
 @pytest.mark.parametrize(
-    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged,for_each_tile",
+    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged",
     [
-        pytest.param(4, 4, 8, 8, 2, 1, False, False, id="one_chunk"),
-        pytest.param(4, 4, 8, 2, 2, 1, False, False, id="four_chunks"),
-        pytest.param(4, 4, 8, 1, 2, 1, False, False, id="bpc_1"),
-        pytest.param(3, 4, 8, 4, 2, 1, False, False, id="padded_batch_rows"),
-        pytest.param(4, 4, 8, 2, 2, 4, True, False, id="gqa_ragged"),
-        pytest.param(5, 8, 12, 4, 1, 2, True, False, id="uneven_buckets_ragged"),
-        pytest.param(4, 4, 12, 8, 2, 1, True, False, id="padded_block_axis_ragged"),
-        # The tiled walk, on a subset: eagerly every tile of every operand is
-        # cloned on every trip, so the cross-product would not pay for itself.
-        pytest.param(4, 4, 8, 8, 2, 1, False, True, id="one_chunk_for_each_tile"),
-        pytest.param(4, 4, 8, 1, 2, 1, False, True, id="bpc_1_for_each_tile"),
-        pytest.param(4, 4, 8, 2, 2, 4, True, True, id="gqa_ragged_for_each_tile"),
-        pytest.param(4, 4, 12, 8, 2, 1, True, True, id="padded_block_axis_ragged_for_each_tile"),
+        pytest.param(4, 4, 8, 8, 2, 1, False, id="one_chunk"),
+        pytest.param(4, 4, 8, 2, 2, 1, False, id="four_chunks"),
+        pytest.param(4, 4, 8, 1, 2, 1, False, id="bpc_1"),
+        pytest.param(3, 4, 8, 4, 2, 1, False, id="padded_batch_rows"),
+        pytest.param(4, 4, 8, 2, 2, 4, True, id="gqa_ragged"),
+        pytest.param(5, 8, 12, 4, 1, 2, True, id="uneven_buckets_ragged"),
+        pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
     ],
 )
 def test_head_major_batched_decode_matches_fp32_reference(
-    monkeypatch,
     num_seqs: int,
     b_seqs: int,
     num_blocks: int,
@@ -936,19 +920,14 @@ def test_head_major_batched_decode_matches_fp32_reference(
     num_kv_heads: int,
     qpk: int,
     ragged: bool,
-    for_each_tile: bool,
 ) -> None:
     """The head-major page read feeds the same reduction the token-major kernel gets.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
-    kv-minor row order the mask is broadcast in, not the fp16 tolerances. Both walks
-    run it; the mask keeps a materialized query-group axis here, where its twin
-    passes the size-1 axis the builder transfers, so between them the kernel is
-    pinned against either.
+    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
     from tests.attention.test_spyre_attn import _decode_reference_fp32
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     set_random_seed(0)
 

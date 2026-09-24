@@ -1819,25 +1819,19 @@ def test_batched_decode_chunking_covers_every_block(
         )
 
 
-@pytest.mark.parametrize("for_each_tile", [False, True], ids=["loop", "for_each_tile"])
 def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     default_vllm_config,
     enable_batched_decode,
-    monkeypatch,
-    for_each_tile: bool,
 ) -> None:
-    """The decode mask's KV axis follows the layer's head count, on either walk.
+    """The decode mask's KV axis follows the layer's head count.
 
     A model with per-layer head counts (gemma-4) has attention layers whose
-    num_kv_heads is not `model_config.get_num_kv_heads()`. The tiled walk needs the
-    axis materialized, and taking the model-level count there asks for the wrong
-    number of elements, so every batched-decode variant fails to compile. The plain
-    walk broadcasts it instead, which is the narrower transfer; both parametrizations
-    run so neither path can drift from what the builder sends.
+    num_kv_heads is not `model_config.get_num_kv_heads()`. Taking the model-level
+    count asks for the wrong number of elements, so every batched-decode variant
+    fails to compile.
     """
     from vllm.config import get_current_vllm_config
 
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     block_size = 128
     # This group's own counts; get_num_kv_heads() reports 8 below, the 4x-too-wide
@@ -1872,10 +1866,8 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
 
     assert md.blocks_per_chunk is not None, "batched decode declined this batch"
     assert md.mask_by_chunk_cpu is not None
-    expected_kv = num_kv_heads if for_each_tile else 1
-    assert md.mask_by_chunk_cpu.shape[2] == expected_kv, (
-        f"mask carries {md.mask_by_chunk_cpu.shape[2]} KV heads; this group has "
-        f"{num_kv_heads} and the walk expects {expected_kv}"
+    assert md.mask_by_chunk_cpu.shape[2] == num_kv_heads, (
+        f"mask carries {md.mask_by_chunk_cpu.shape[2]} KV heads; this group has {num_kv_heads}"
     )
     # This layer is GQA (4 query heads over 2 KV heads), so a materialized
     # query-group axis would double the transfer for nothing; it broadcasts instead.
@@ -1925,29 +1917,21 @@ def _decode_reference_fp32(
 
 
 @pytest.mark.parametrize(
-    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged,for_each_tile",
+    "num_seqs,b_seqs,num_blocks,bpc,num_kv_heads,qpk,ragged",
     [
-        pytest.param(4, 4, 8, 8, 2, 1, False, False, id="one_chunk"),
-        pytest.param(4, 4, 8, 2, 2, 1, False, False, id="four_chunks"),
-        pytest.param(4, 4, 8, 1, 2, 1, False, False, id="bpc_1"),
-        pytest.param(3, 4, 8, 4, 2, 1, False, False, id="padded_batch_rows"),
-        pytest.param(4, 4, 8, 2, 2, 4, True, False, id="gqa_ragged"),
-        pytest.param(5, 8, 12, 4, 1, 2, True, False, id="uneven_buckets_ragged"),
+        pytest.param(4, 4, 8, 8, 2, 1, False, id="one_chunk"),
+        pytest.param(4, 4, 8, 2, 2, 1, False, id="four_chunks"),
+        pytest.param(4, 4, 8, 1, 2, 1, False, id="bpc_1"),
+        pytest.param(3, 4, 8, 4, 2, 1, False, id="padded_batch_rows"),
+        pytest.param(4, 4, 8, 2, 2, 4, True, id="gqa_ragged"),
+        pytest.param(5, 8, 12, 4, 1, 2, True, id="uneven_buckets_ragged"),
         # blocks_per_chunk does not divide the block count, so the kernel sees the
         # padded block axis the builder rounds up to.
-        pytest.param(4, 4, 12, 8, 2, 1, True, False, id="padded_block_axis_ragged"),
-        pytest.param(6, 6, 10, 5, 2, 1, True, False, id="non_pow2_seq_bucket_ragged"),
-        # The tiled walk, on the cases that vary trip count, tile width and
-        # raggedness. A subset, not the cross-product: eagerly `tile_dim_marker`
-        # clones every tile of every operand on every trip.
-        pytest.param(4, 4, 8, 8, 2, 1, False, True, id="one_chunk_for_each_tile"),
-        pytest.param(4, 4, 8, 1, 2, 1, False, True, id="bpc_1_for_each_tile"),
-        pytest.param(4, 4, 8, 2, 2, 4, True, True, id="gqa_ragged_for_each_tile"),
-        pytest.param(4, 4, 12, 8, 2, 1, True, True, id="padded_block_axis_ragged_for_each_tile"),
+        pytest.param(4, 4, 12, 8, 2, 1, True, id="padded_block_axis_ragged"),
+        pytest.param(6, 6, 10, 5, 2, 1, True, id="non_pow2_seq_bucket_ragged"),
     ],
 )
 def test_batched_decode_matches_fp32_reference(
-    monkeypatch,
     num_seqs: int,
     b_seqs: int,
     num_blocks: int,
@@ -1955,7 +1939,6 @@ def test_batched_decode_matches_fp32_reference(
     num_kv_heads: int,
     qpk: int,
     ragged: bool,
-    for_each_tile: bool,
 ) -> None:
     """The chunked reduction equals an unchunked per-sequence softmax.
 
@@ -1964,11 +1947,9 @@ def test_batched_decode_matches_fp32_reference(
     down to a different length, which is what puts wholly--inf chunks and -inf
     padding columns in front of the running max.
 
-    Both walks run the same body against the same reference: `for_each_tile`
-    dispatches to `scan`, which is a real Python loop eagerly, so the tiled path
-    is drivable without a card.
+    The production tiled walk dispatches to `scan`, which is drivable eagerly
+    without a card.
     """
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     set_random_seed(0)
 
@@ -2051,24 +2032,19 @@ def test_batched_decode_matches_fp32_reference(
 
 
 @pytest.mark.parametrize(
-    "num_blocks,padded_query_len,num_kv_heads,qpk,for_each_tile,use_alibi",
+    "num_blocks,padded_query_len,num_kv_heads,qpk,use_alibi",
     [
-        pytest.param(1, 4, 2, 1, False, False, id="one_block"),
-        pytest.param(4, 4, 2, 1, False, False, id="four_blocks"),
-        pytest.param(3, 8, 2, 2, False, False, id="gqa"),
-        pytest.param(1, 4, 2, 1, True, False, id="one_block_for_each_tile"),
-        pytest.param(4, 4, 2, 1, True, False, id="four_blocks_for_each_tile"),
-        pytest.param(3, 8, 2, 2, True, False, id="gqa_for_each_tile"),
-        pytest.param(4, 8, 2, 2, True, True, id="alibi_for_each_tile"),
+        pytest.param(1, 4, 2, 1, False, id="one_block"),
+        pytest.param(4, 4, 2, 1, False, id="four_blocks"),
+        pytest.param(3, 8, 2, 2, False, id="gqa"),
+        pytest.param(4, 8, 2, 2, True, id="alibi"),
     ],
 )
 def test_page_attn_matches_fp32_reference(
-    monkeypatch,
     num_blocks: int,
     padded_query_len: int,
     num_kv_heads: int,
     qpk: int,
-    for_each_tile: bool,
     use_alibi: bool,
 ) -> None:
     """Prefill's online softmax equals one softmax over the whole KV window.
@@ -2077,7 +2053,6 @@ def test_page_attn_matches_fp32_reference(
     rescale that both walks share, which the integration tests only reach through
     fp16 tolerances on the card.
     """
-    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", for_each_tile)
     torch.set_default_device("cpu")
     set_random_seed(0)
 

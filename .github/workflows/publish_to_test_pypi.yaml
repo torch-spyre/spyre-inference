@@ -1,14 +1,14 @@
 # This tests the publication process for spyre-inference by pushing a pre-release
-# to test.pypi.org. Only triggers on pre-release tags (e.g. spyre-inference-v0.1.0-rc1)
+# to test.pypi.org. Run manually against a release tag (e.g. v0.5.0-rc.1).
 name: Test publication of spyre-inference on test.pypi.org
 
 on:
-  push:
-    tags:
-      - 'spyre-inference-v*-rc*'
+  workflow_dispatch:
 
 jobs:
   build:
+    # A non-tag ref builds a PEP 440 local version, which PyPI rejects.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     environment:

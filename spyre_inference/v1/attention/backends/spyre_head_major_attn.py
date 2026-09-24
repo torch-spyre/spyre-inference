@@ -39,7 +39,6 @@ from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
-    SpyreAttentionMetadata,
     SpyrePagedKVCache,
     _call_kernel,
 )
@@ -56,6 +55,7 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE
 from spyre_inference.v1.worker import compile_guard
 
 logger = init_logger(__name__)
@@ -63,9 +63,17 @@ logger = init_logger(__name__)
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
-_page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
-_page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
-_batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
+#
+# The kernels that walk their pages tiled need fullgraph because of ``for_each_tile``.
+_page_attn_prefill_compiled = torch.compile(
+    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
+_page_attn_decode_compiled = torch.compile(
+    page_attn_head_major_decode_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
+_batched_decode_compiled = torch.compile(
+    batched_decode_head_major_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
+)
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
 compile_guard.watch(
@@ -149,6 +157,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
+        self._kv_row_pool_device: torch.Tensor | None = None
 
         logger.info_once(
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
@@ -177,7 +186,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
         One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
         storage offset is still dropped on the way to the device (torch-spyre#3770 is
-        closed, but its fix covers float16 only -- see build_index_tables). That corruption is
+        closed, but its fix covers float16 only -- see ``_kv_row_pool``). That corruption is
         shape-dependent — correct while a row fits one int32 stick, every head past it
         silently wrong — so a short-token test passes while long prefill corrupts.
         """
@@ -202,38 +211,29 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._folded
 
-    # The base publishes one table per sequence; this layout needs two, so the pair travels
-    # together and `_run_page_attn` picks the one its kernel reads.
-    def build_index_tables(  # ty: ignore[invalid-method-override]
-        self, attn_metadata: SpyreAttentionMetadata, device: torch.device
-    ) -> list[tuple[list[torch.Tensor], torch.Tensor | None]]:
-        """Per sequence, per active block, that block's ``page * num_kv_heads + kv`` rows,
-        paired with the page ids alone for the wide-query kernel.
+    def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
+        """Every page's rows in the folded cache, for the decode kernel to gather from.
 
-        The folded rows are one [KV, 1] tensor per block, not rows of one table: an int32
-        argument's nonzero storage offset is still read as 0, so every block would gather
-        block 0, and an in-graph slice of a stacked table still gathers the wrong rows at
-        this shape. torch-spyre#3770 is closed, but the fix (torch-spyre#4449) landed for
-        float16 only; strict xfails pin both int32 cases on the pinned stack --
-        test_spyre_compile_input_honors_storage_offset (its int32 parametrization) and
-        test_spyre_in_graph_slice_of_stacked_kv_row_index.
+        A page's rows are ``page * num_kv_heads + kv``, which the kernel cannot compute
+        from the page id: int32 arithmetic has no device op mapping. The kernel gathers
+        them out of this pool rather than reading a per-block table, which also settles the
+        int32 offset question the unrolled walk had to work around: an int32 argument's
+        nonzero storage offset is still read as 0 and an in-graph slice of a stacked table
+        still gathers the wrong rows at that shape (torch-spyre#3770 is closed, but the fix
+        in torch-spyre#4449 landed for float16 only; strict xfails pin both cases --
+        test_spyre_compile_input_honors_storage_offset's int32 parametrization and
+        test_spyre_in_graph_slice_of_stacked_kv_row_index). A gather is offset-free, so one
+        pool serves every block.
+
+        Pure cache geometry, so it is built once rather than per step, unlike the index
+        tables -- which retires one H2D transfer per active block per sequence per step.
         """
-        tables_cpu = attn_metadata.page_index_tables_cpu
-        assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
-        heads = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(self.num_kv_heads, 1)
-        query_lens = attn_metadata.aligned_query_lens
-        return [
-            (
-                [
-                    convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
-                    for b in range(pages.shape[0])
-                ],
-                # Only a wide query reads this, and building it for a decode step would add
-                # an H2D transfer to the path this layout exists to speed up.
-                convert(pages[:, 0:1].contiguous(), device=device) if query_lens[s] > 1 else None,
+        if self._kv_row_pool_device is None:
+            rows = torch.arange(num_pages * self.num_kv_heads, dtype=torch.int32)
+            self._kv_row_pool_device = convert(
+                rows.reshape(num_pages, self.num_kv_heads, 1), device=device
             )
-            for s, pages in enumerate(tables_cpu)
-        ]
+        return self._kv_row_pool_device
 
     def _run_batched_decode(
         self,
@@ -241,7 +241,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         rep_row_ids: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        chunk_index_tables: list[torch.Tensor],
+        chunk_index_tables: torch.Tensor,
         mask_by_chunk: torch.Tensor,
         b_seqs: int,
         blocks_per_chunk: int,
@@ -275,11 +275,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         row_table: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        index_table,
+        index_table: torch.Tensor,
         mask_stack: torch.Tensor,
         num_blocks: int,
         padded_query_len: int,
-        alibi_bias_tiles: list[torch.Tensor] | None,
+        alibi_stack: torch.Tensor | None,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         # Both kernels below index `row_table` whole, so a wrong width is a shape mismatch
@@ -288,13 +288,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         assert row_table.shape == (padded_query_len,), (
             f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
         )
-        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
-        kv_row_table, page_table = index_table
-        assert len(kv_row_table) == num_blocks
+        # Both kernels tile `index_table` on dim 0, so a short table is a trip-count
+        # mismatch rather than a shape error.
+        assert index_table.shape[0] == num_blocks, (
+            f"index table has {index_table.shape[0]} rows for {num_blocks} blocks"
+        )
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
-            assert page_table is not None and page_table.shape[0] == num_blocks
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
@@ -303,7 +304,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     row_table,
                     k_pages,
                     v_pages,
-                    page_table,
+                    index_table,
                     mask_stack,
                     self.scale,
                     num_blocks,
@@ -316,6 +317,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     out,
                 )
 
+        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
+        kv_row_pool = self._kv_row_pool(k_pages.shape[0], query.device)
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.
         with _capped_cores(self.num_kv_heads * padded_query_len):
@@ -326,7 +329,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 row_table,
                 k_folded,
                 v_folded,
-                kv_row_table,
+                index_table,
+                kv_row_pool,
                 mask_stack,
                 self.scale,
                 num_blocks,

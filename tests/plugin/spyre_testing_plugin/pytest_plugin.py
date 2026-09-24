@@ -69,7 +69,6 @@ import tempfile
 import time
 import tomllib
 import traceback
-import warnings
 from pathlib import Path
 
 import pytest
@@ -686,15 +685,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
                 for tag in allow_entry.tags:
                     item.add_marker(getattr(pytest.mark, tag))
 
-                if item.name in {
-                    "test_gsm8k_correctness[granite-4.1-3b]",
-                    "test_gsm8k_correctness[mistral-7b-instruct-v0.3]",
-                    "test_gsm8k_correctness[qwen2.5-0.5b-instruct]",
-                    "test_models[ibm-ai-platform/micro-g3.3-8b-instruct-1b-transformers-num_fused0]",
-                    "test_models[meta-llama/Llama-3.2-1B-Instruct-transformers-num_fused1]",
-                }:
-                    item.add_marker(pytest.mark.disable_co_optimizing_lx_planning)
-
             if allow_entry is None:
                 item.add_marker(pytest.mark.skip(reason="not in allow_list"))
                 continue
@@ -744,21 +734,6 @@ def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
         return (priority, stable_map[item])
 
     items.sort(key=sort_key)
-
-
-@pytest.fixture(autouse=True)
-def _disable_co_optimizing_lx_planning(request, monkeypatch):
-    if request.node.get_closest_marker("disable_co_optimizing_lx_planning") is None:
-        return
-
-    monkeypatch.setenv("CO_OPTIMIZING_LX_PLANNING", "0")
-    warnings.warn(
-        "Temporarily forcing CO_OPTIMIZING_LX_PLANNING=0 for this slow-compiling test. "
-        "Remove the disable_co_optimizing_lx_planning marker once torch-spyre makes "
-        "co-optimized planning affordable again (torch-spyre#4455).",
-        UserWarning,
-        stacklevel=1,
-    )
 
 
 def _convert_yaml_value(value):

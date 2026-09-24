@@ -110,17 +110,7 @@ def _generate(
 
 
 @pytest.mark.multimodal
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(
-            False,
-            id="compiled",
-            marks=pytest.mark.disable_co_optimizing_lx_planning,
-        ),
-    ],
-)
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """Smoke: the whole vision path (conv patch embed -> vision rope -> padded
@@ -164,17 +154,7 @@ def test_two_image_prompt_produces_output():
 
 @pytest.mark.multimodal
 @pytest.mark.gemma4_vision
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(True, id="eager"),
-        pytest.param(
-            False,
-            id="compiled",
-            marks=pytest.mark.disable_co_optimizing_lx_planning,
-        ),
-    ],
-)
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
 @pytest.mark.uses_subprocess
 def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the

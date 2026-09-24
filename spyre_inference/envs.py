@@ -111,8 +111,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of topping itself up with a short chunk of the next. Any non-positive
     # value removes the cap, as does a pooling runner, which never decodes.
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
-    # Largest packed-token count driven through the gathered region once per token. Gathered
-    # lowers at one token; all-expert reads every expert whatever the count, so it wins above.
+    # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
+    # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
     "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).

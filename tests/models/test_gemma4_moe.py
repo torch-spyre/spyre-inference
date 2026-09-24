@@ -362,7 +362,7 @@ def _dispatch_recorder(monkeypatch, fail_on=None):
             calls.append((name, fn.__name__))
             if name == fail_on:
                 raise RuntimeError("region blew up")
-            return torch.zeros(1)
+            return torch.zeros(args[1].shape[0] if name == "gathered_batch" else 1)
 
         return run
 
@@ -404,12 +404,12 @@ def test_single_token_dispatches_to_the_gathered_form(monkeypatch):
     assert resets == [], "the gathered form declares no persistent dims to reset"
 
 
-def test_a_small_batch_drives_the_gathered_form_once_per_token(monkeypatch):
-    """Below the bound each token gets its own gathered call, since it lowers at one."""
+def test_a_small_batch_uses_the_compiled_gathered_loop(monkeypatch):
+    """Below the bound the packed batch is handled by one compiled gathered loop."""
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch)
     out = _apply(_dispatch_layer("full_softmax"), tokens=3)
-    assert calls == [("gathered", "_gathered")] * 3
+    assert calls == [("gathered_batch", "_gathered_tokens")]
     assert out.shape[0] == 3, "the per-token results must be reassembled into one batch"
     assert resets == [], "the gathered form declares no persistent dims to reset"
 
@@ -554,7 +554,6 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
     A CPU fallback would still pass the tolerance while inverting the point, hence that assert.
     """
     from torch_spyre._C import get_elem_in_stick
-    from torch_spyre._inductor import config as spyre_config
     from torch_spyre.ops.fallbacks import FallbackWarning
 
     from spyre_inference.moe import SpyreMoERecipe, _gathered_tokens
@@ -577,11 +576,11 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", FallbackWarning)
-        actual = _gathered_tokens(
+        region = torch.compile(_gathered_tokens, backend="inductor", fullgraph=True, dynamic=False)
+        actual = region(
             layer,
             x.to("spyre"),
             logits.to("spyre"),
-            spyre_config.patch({"frontend_pool_allocation": True}),
         )
 
     fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]

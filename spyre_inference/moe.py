@@ -313,39 +313,15 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, scope: Any
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 ) -> torch.Tensor:
-    region = _region(layer, "gathered", _gathered)
-    tokens = x.shape[0]
-    if tokens == 1:
-        with scope:
-            return region(layer, x, router_logits)
-    # Two calls of one graph can share an output address under ``frontend_pool_allocation``, so a
-    # region result is only valid until the next call. Growing the batch pairwise copies more
-    # bytes than cloning each row and concatenating once, but costs one launch fewer, and a
-    # launch is the unit of cost at these widths.
-    packed = _gathered_row(region, layer, x, router_logits, 0, scope).clone()
-    for token in range(1, tokens):
-        packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token, scope)])
-    return packed
-
-
-def _gathered_row(
-    region: Any,
-    layer: RoutedExperts,
-    x: torch.Tensor,
-    router_logits: torch.Tensor,
-    token: int,
-    scope: Any,
-) -> torch.Tensor:
-    # A compiled region reads its inputs from storage offset 0 whatever the view's offset
-    # (torch-spyre#3770), so the slices must be cloned or every row would read row 0. The clones
-    # stay outside ``scope`` because ``compile_once`` memoises each eager kernel globally on its
-    # first call, which would bake the region's config into a ``clone`` used elsewhere.
-    row = slice(token, token + 1)
-    row_x, row_logits = x[row].clone(), router_logits[row].clone()
-    with scope:
-        return region(layer, row_x, row_logits)
+    # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
+    # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
+    rows = [
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        for token in range(x.shape[0])
+    ]
+    return torch.cat(rows)
 
 
 def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
@@ -511,7 +487,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
             and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
         ):
-            return _gathered_tokens(layer, x, router_logits, moe_scope)
+            with moe_scope:
+                if tokens == 1:
+                    return _region(layer, "gathered", _gathered)(layer, x, router_logits)
+                return _region(layer, "gathered_batch", _gathered_tokens)(layer, x, router_logits)
         with moe_scope:
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":

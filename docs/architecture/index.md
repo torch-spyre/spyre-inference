@@ -134,7 +134,8 @@ Two adaptations worth knowing:
   `SPYRE_MOE_GATHERED_MAX_TOKENS` — a decode batch, or a prompt that buckets that short — the
   gathered form is driven once per token, and above it the all-expert form takes the whole
   batch in one call. A batch whose rows are not stick-addressable takes the all-expert form
-  whatever its size, since each row's storage offset has to span whole sticks to be cloned.
+  whatever its size, since each row's storage offset has to span whole sticks for the compiled
+  loop to address it.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
   the `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing

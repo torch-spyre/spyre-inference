@@ -172,11 +172,7 @@ def register_aliased_scalars(decoder: nn.Module) -> None:
 
 
 def reject_masked_per_layer_vocab(decoder: SpyreGemma4SelfDecoderLayers) -> None:
-    """Reject a PLE checkpoint whose per-layer vocab is narrower than the full one.
-
-    Upstream masks ``input_ids`` down to it, a ``torch.bool`` result over an int operand
-    that torch-spyre lowers in neither mode: eager dispatches through Inductor too.
-    """
+    """Reject PLE vocab masking, which torch-spyre cannot lower for integer inputs."""
     if decoder.embed_tokens_per_layer is None:
         return
     per_layer, full = decoder.vocab_size_per_layer_input, decoder.config.vocab_size
@@ -214,10 +210,7 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
 
 
 class _PerLayerRows(torch.Tensor):
-    """Projected PLE whose ``[:, layer_idx, :]`` hands back a precomputed row.
-
-    A compiled block reads that nonzero-offset view from offset 0 (torch-spyre#3770).
-    """
+    """Return materialized PLE rows to avoid nonzero-offset views (torch-spyre#3770)."""
 
     # No subclass propagation: only the instance the projection hands back carries rows.
     __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
@@ -236,17 +229,13 @@ class _PerLayerRows(torch.Tensor):
 
 
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
-    """Self-decoder adapting the two PLE operations Spyre cannot lower."""
-
     @compile_when_outermost
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """Materialize every PLE row at offset zero in one compiled operation."""
         return tuple(
             ple[:, layer_idx, :].clone() for layer_idx in range(self.config.num_hidden_layers)
         )
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
-        """Upstream's, minus the mask ``reject_masked_per_layer_vocab`` makes a no-op."""
         if self.embed_tokens_per_layer is None:
             return None
         per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
@@ -261,7 +250,6 @@ class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
         inputs_embeds: torch.Tensor,
         per_layer_inputs: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        """Use upstream's projection and materialize the rows its model loop slices."""
         ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
         if ple is None:
             return None

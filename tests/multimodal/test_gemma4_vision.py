@@ -445,7 +445,6 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
 
 
 def test_apply_moves_plain_per_layer_embedding_cache(monkeypatch):
-    """The multimodal PLE cache is not a buffer, so model.to() leaves it on CPU."""
     from spyre_inference.multimodal import gemma4_vision
 
     model = torch.nn.Module()

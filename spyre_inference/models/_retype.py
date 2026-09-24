@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Retyping an upstream-built submodule to its Spyre subclass.
-
-A vLLM model that hardcodes a submodule's class offers no ``embedding_class``-style hook
-to pass a subclass through, so ``super().__init__()`` builds the tree and this swaps the
-class afterwards.
-"""
+"""Retype upstream-built submodules that provide no subclass hook."""
 
 from __future__ import annotations
 
@@ -30,11 +25,7 @@ _ModuleT = TypeVar("_ModuleT", bound="nn.Module")
 
 
 def retype(module: object, spyre: type[_ModuleT]) -> _ModuleT:
-    """Retype ``module`` to the Spyre subclass ``spyre``, and hand it back.
-
-    ``spyre`` must name its mixins first (``class SpyreX(SomeMixin, UpstreamX)``): its last
-    base is the class ``module`` must be an exact instance of.
-    """
+    """Retype a module; the Spyre subclass's final base must be its exact current type."""
     upstream = spyre.__bases__[-1]
     if type(module) is not upstream:
         raise RuntimeError(

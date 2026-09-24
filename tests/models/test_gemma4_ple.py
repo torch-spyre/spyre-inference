@@ -12,12 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma-4's per-layer-embedding (PLE) adaptations.
-
-Both are host-side and need no card: the row cut upstream's backbone loop takes out of the
-projected PLE tensor, and the per-layer vocab width the Spyre path requires.
-"""
-
 from types import SimpleNamespace
 
 import pytest
@@ -55,9 +49,6 @@ def _backbone(layers: list[nn.Module], rows: _PerLayerRows) -> upstream.Gemma4Mo
 
 
 def test_upstream_backbone_loop_uses_precomputed_per_layer_rows(monkeypatch):
-    """The only PLE cut Spyre reaches: upstream's other one, in ``_run_decoder_layers``,
-    needs ``fast_prefill_forward``, which the platform rejects for PLE models.
-    """
     monkeypatch.setattr(
         upstream,
         "get_pp_group",
@@ -67,7 +58,7 @@ def test_upstream_backbone_loop_uses_precomputed_per_layer_rows(monkeypatch):
     rows = torch.zeros(3, len(layers), 4).as_subclass(_PerLayerRows)
     rows.spyre_rows = tuple(torch.full((3, 4), i + 1.0) for i in range(len(layers)))
 
-    # Unbound: support_torch_compile's __call__ reads do_not_compile, which only __init__ sets.
+    # Avoid support_torch_compile.__call__, whose state is initialized by the skipped constructor.
     upstream.Gemma4Model.forward(
         _backbone(layers, rows),
         None,
@@ -91,7 +82,6 @@ def _decoder_with_masked_ple() -> SpyreGemma4SelfDecoderLayers:
 
 
 def test_masked_per_layer_vocab_is_rejected():
-    """Unconditional: eager dispatches through Inductor too, so enforce_eager cannot help."""
     with pytest.raises(NotImplementedError, match="vocab_size_per_layer_input"):
         reject_masked_per_layer_vocab(_decoder_with_masked_ple())
 
@@ -121,7 +111,6 @@ def test_has_per_layer_embeddings_reads_the_config(attr, expected):
 
 
 def test_has_per_layer_embeddings_defaults_to_false_without_the_attribute():
-    """Every non-gemma-4 config: the guards must not reject them."""
     from spyre_inference.models import has_per_layer_embeddings
 
     assert has_per_layer_embeddings(SimpleNamespace()) is False

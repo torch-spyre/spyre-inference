@@ -17,6 +17,7 @@
 # aiops trace runs at 4k, cics at 8k.
 
 defaults:
+  server_health_timeout: 1800
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
@@ -42,7 +43,6 @@ defaults:
 
 tests:
   - test_name: serve_granite33-8b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
       tensor-parallel-size: 1
@@ -60,7 +60,6 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite41-8b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-4.1-8b
       tensor-parallel-size: 1
@@ -98,7 +97,6 @@ tests:
       num-prompts: 50
 
   - test_name: serve_gemma4-26b-a4b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: google/gemma-4-26B-A4B
       tensor-parallel-size: 1
@@ -118,7 +116,6 @@ tests:
       num-prompts: 50
 
   - test_name: serve_granite-embedding-125m-english_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-embedding-125m-english
       runner: pooling
@@ -138,7 +135,6 @@ tests:
       request-rate: inf
 
   - test_name: serve_granite-embedding-278m-multilingual_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
       runner: pooling
@@ -158,7 +154,6 @@ tests:
       request-rate: inf
 
   - test_name: serve_multilingual-e5-large_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: intfloat/multilingual-e5-large
       runner: pooling
@@ -178,7 +173,6 @@ tests:
       request-rate: inf
 
   - test_name: serve_all-roberta-large-v1_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: sentence-transformers/all-roberta-large-v1
       runner: pooling
@@ -198,7 +192,6 @@ tests:
       request-rate: inf
 
   - test_name: serve_bge-reranker-v2-m3_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: BAAI/bge-reranker-v2-m3
       runner: pooling
@@ -218,7 +211,6 @@ tests:
       request-rate: inf
 
   - test_name: serve_bge-reranker-large_tp1_in64
-    server_health_timeout: 1800
     server_parameters:
       model: BAAI/bge-reranker-large
       runner: pooling

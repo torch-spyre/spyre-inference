@@ -444,6 +444,31 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     assert called == [], "a text-only model must get no vision patches"
 
 
+def test_apply_moves_plain_per_layer_embedding_cache(monkeypatch):
+    """The multimodal PLE cache is not a buffer, so model.to() leaves it on CPU."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    model = torch.nn.Module()
+    model.per_layer_embeddings = torch.zeros(3, 2, 4)
+    moved = torch.ones_like(model.per_layer_embeddings)
+
+    monkeypatch.setattr(gemma4_vision, "patch_rms_norm", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_patch_embedder", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_pooler", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_vision_encoder", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "pad_vision_weights", lambda model: None)
+    monkeypatch.setattr(gemma4_vision, "place_vision_tail_on_cpu", lambda model: None)
+    monkeypatch.setattr(
+        gemma4_vision,
+        "convert",
+        lambda tensor, *, device: moved if device == torch.device("spyre") else tensor,
+    )
+
+    gemma4_vision.apply(model, torch.device("spyre"))
+
+    assert model.per_layer_embeddings is moved
+
+
 # ---------------------------------------------------------------------------
 # Correctness regressions
 # ---------------------------------------------------------------------------

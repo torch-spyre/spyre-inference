@@ -722,8 +722,16 @@ def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
     )
 
 
+def place_per_layer_embeddings(model: torch.nn.Module, device: torch.device) -> None:
+    """Move vLLM's plain multimodal PLE cache with the model."""
+    per_layer_embeddings = getattr(model, "per_layer_embeddings", None)
+    if per_layer_embeddings is not None and per_layer_embeddings.device != device:
+        model.per_layer_embeddings = convert(per_layer_embeddings, device=device)
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Gemma 4 vision-tower workaround."""
+    place_per_layer_embeddings(model, device)
     del device
     patch_rms_norm()
     patch_patch_embedder()

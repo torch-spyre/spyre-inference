@@ -685,9 +685,10 @@ def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
     """A row view whose width is not a whole number of sticks.
 
     test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
-    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
-    gates the per-token row clones on exactly that property, so the off-stick width is the
-    case that decides whether the gate can go.
+    sticks wide, so its offsets are stick multiples. ``_rows_are_stick_addressable`` in the
+    MoE gates the per-token row clones on the same property — row ``t`` starts at
+    ``storage_offset() + t * stride(0)`` — so an off-stick row stride is the case that
+    decides whether the gate can go.
     """
     rows, width = 2, 40
     assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"

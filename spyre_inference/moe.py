@@ -313,33 +313,52 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, scope: Any
 ) -> torch.Tensor:
+    """Drive the gathered region once per packed token and reassemble the batch."""
     region = _region(layer, "gathered", _gathered)
     tokens = x.shape[0]
     if tokens == 1:
-        return region(layer, x, router_logits)
+        with scope:
+            return region(layer, x, router_logits)
     # Under ``frontend_pool_allocation`` two calls of one graph can share an output address, so a
     # region result is only valid until the next call: hence the copy and the per-row concatenate.
-    packed = _gathered_row(region, layer, x, router_logits, 0).clone()
+    # Growing the batch pairwise copies more bytes than cloning every row and concatenating once,
+    # but costs one launch per row where that costs one more, and at these widths a launch is the
+    # unit of cost (measured: per-launch cost is flat across cat arities, the fwd pass is
+    # host-bound).
+    packed = _gathered_row(region, layer, x, router_logits, 0, scope).clone()
     for token in range(1, tokens):
-        packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token)])
+        packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token, scope)])
     return packed
 
 
-def _rows_start_on_sticks(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
-    # Copying row ``t`` bakes its storage offset ``t * width`` into the kernel coordinate, and the
-    # backend can only express an offset that is a whole number of sticks.
-    return x.shape[-1] % stick == 0 and router_logits.shape[-1] % stick == 0
-
-
 def _gathered_row(
-    region: Any, layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, token: int
+    region: Any,
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    token: int,
+    scope: Any,
 ) -> torch.Tensor:
     # A compiled region reads its inputs from storage offset 0 whatever the view's offset
-    # (torch-spyre#3770), so the slices must be cloned or every row would read row 0.
+    # (torch-spyre#3770), so the slices must be cloned or every row would read row 0. The clones
+    # stay outside ``scope``: only the region needs that config, and ``compile_once`` memoises
+    # each eager kernel globally on first call, so a copy compiled in here would bake the
+    # region's config into a ``clone`` that unrelated call sites then reuse.
     row = slice(token, token + 1)
-    return region(layer, x[row].clone(), router_logits[row].clone())
+    row_x, row_logits = x[row].clone(), router_logits[row].clone()
+    with scope:
+        return region(layer, row_x, row_logits)
+
+
+def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
+    # Cloning row ``t`` bakes its flat storage offset into the kernel coordinate, and the backend
+    # can only bake an offset that is a whole number of sticks. Row ``t`` sits at
+    # ``storage_offset() + t * stride(0)``, so both terms must be stick multiples for every ``t``.
+    return all(
+        t.storage_offset() % stick == 0 and t.stride(0) % stick == 0 for t in (x, router_logits)
+    )
 
 
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
@@ -492,13 +511,13 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         layer = cast("RoutedExperts", layer)
         moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
+        # A single row is handed to the region whole, so no row slice needs an addressable offset.
+        if tokens == 1 or (
+            tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+            and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
+        ):
+            return _gathered_tokens(layer, x, router_logits, moe_scope)
         with moe_scope:
-            # A single row already sits at storage offset 0, so it needs no addressable stride.
-            if tokens == 1 or (
-                tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
-                and _rows_start_on_sticks(x, router_logits, layer.spyre_moe_stick)
-            ):
-                return _gathered_tokens(layer, x, router_logits)
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)

@@ -425,6 +425,30 @@ def test_a_batch_whose_rows_are_not_stick_addressable_takes_the_all_expert_form(
     assert resets == [1]
 
 
+def test_a_batch_at_an_unaddressable_storage_offset_takes_the_all_expert_form(monkeypatch):
+    """The guard is about where a row starts, not how wide it is.
+
+    Both widths here span whole sticks, so a width-only check would wrongly admit the batch;
+    the rows themselves begin half a stick into their storage, which cannot be baked into the
+    kernel coordinate.
+    """
+    from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
+
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    calls, resets = _dispatch_recorder(monkeypatch)
+    layer = _dispatch_layer("full_softmax")
+    method = object.__new__(SpyreUnquantizedFusedMoEMethod)
+    offset = layer.spyre_moe_stick // 2
+    x = torch.zeros(2 * HIDDEN + offset)[offset:].view(2, HIDDEN)
+    logits = torch.zeros(2 * EXPERTS + offset)[offset:].view(2, EXPERTS)
+    assert x.shape[-1] % layer.spyre_moe_stick == 0, "the widths must be stick multiples"
+    assert logits.shape[-1] % layer.spyre_moe_stick == 0, "the widths must be stick multiples"
+
+    method.apply_monolithic(layer, x, logits)
+    assert calls == [("probs", "_probs"), ("route", "_route"), ("experts", "_experts")]
+    assert resets == [1]
+
+
 def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatch):
     """The bound is the seam: one token past it the whole batch goes all-expert."""
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "2")
@@ -499,8 +523,9 @@ def test_gathered_matches_dense_reference(moe_weights):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# Row ``t`` of the router logits starts at ``t * num_experts``, which must span whole sticks to be
-# addressable. ``EXPERTS`` above deliberately does not, so the fallback is covered too.
+# Row ``t`` of the router logits starts at ``t * stride(0)``, i.e. ``t * num_experts`` for these
+# contiguous tensors, and that offset must span whole sticks to be addressable. ``EXPERTS`` above
+# deliberately does not, so the fallback is covered too.
 STICK_EXPERTS = 64
 
 
@@ -525,14 +550,20 @@ def stick_aligned_moe_weights():
     return host, device
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4])
+# ``max_num_seqs=3`` puts 3 in ``compile_sizes`` verbatim, and that is the bucket the e2e
+# quality gate decodes at; 2 and 4 bracket it. ``T`` sets the source row count each row is
+# copied out of, so none of the three subsumes another.
+@pytest.mark.parametrize("num_tokens", [2, 3, 4])
 def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
     """The per-token driver over a packed batch, against the same dense reference.
 
     A reused region output would give a row another token's experts, which only values catch.
+    The mechanism is ``2T`` eager clones and one ``cat``: a fallback would still pass at
+    ``atol=2e-2`` while inverting the point of the change, so absence of one is asserted too.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config
+    from torch_spyre.ops.fallbacks import FallbackWarning
 
     from spyre_inference.moe import SpyreMoERecipe, _gathered_tokens
 
@@ -552,8 +583,17 @@ def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_to
         top_k=TOP_K,
     )
 
-    with spyre_config.patch({"frontend_pool_allocation": True}):
-        actual = _gathered_tokens(layer, x.to("spyre"), logits.to("spyre"))
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", FallbackWarning)
+        actual = _gathered_tokens(
+            layer,
+            x.to("spyre"),
+            logits.to("spyre"),
+            spyre_config.patch({"frontend_pool_allocation": True}),
+        )
+
+    fallbacks = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not fallbacks, f"the gathered loop fell back to CPU: {fallbacks}"
 
     expected = _dense_reference(
         x,

@@ -44,29 +44,26 @@ _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
 
-def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
+def spyre_linear_t(
+    x: torch.Tensor,
+    weight_t: torch.Tensor,
+    bias: torch.Tensor | None,
+    pad_rows: bool = False,
+):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
+
+    ``pad_rows`` pads a short 2-D row block up to ``_PAD_ROWS`` and slices it
+    back (torch-spyre#4032). Callers that must not pad leave it off.
     """
-    out = torch.matmul(x, weight_t)
-    if bias is not None:
-        out = out + bias
-    return out
-
-
-def spyre_classifier_gemm(x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:
-    """Isolated classifier GEMM: pre-transposed ``x @ Wᵀ``, no bias.
-
-    ``F.linear`` decomposes to ``weight.T`` then ``mm``. In a standalone graph that
-    permute+mm of a CLS row lowers as fp32 ``batchmatmul`` (no native fp16 GEMM).
-    Decoder layers already store ``Wᵀ`` and pad short row blocks to ``_PAD_ROWS``.
-    """
-    rows = x.shape[0] if x.dim() == 2 else 0
+    rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
     if 0 < rows < _PAD_ROWS:
         x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
     out = torch.matmul(x, weight_t)
+    if bias is not None:
+        out = out + bias
     if 0 < rows < _PAD_ROWS:
         out = out[:rows]
     return out
@@ -115,13 +112,21 @@ class SpyreTransposedWeightMethod:
         # distinct WEIGHT_T_ATTR leaves the source `weight` untouched.
         setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
 
+    def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
+        return False
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        out = spyre_linear_t(x, getattr(layer, self.WEIGHT_T_ATTR), bias)
+        out = spyre_linear_t(
+            x,
+            getattr(layer, self.WEIGHT_T_ATTR),
+            bias,
+            pad_rows=self._pad_short_rows(layer),
+        )
         padding = cast(int, layer.spyre_row_padding)
         if padding:
             # Drop the trailing pad columns; the slice lowers on-device eagerly
@@ -146,6 +151,9 @@ class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
     def _pads(self, layer: torch.nn.Module) -> bool:
         return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT
 
+    def _pad_short_rows(self, layer: torch.nn.Module) -> bool:
+        return self._pads(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
         if self._pads(layer):
@@ -155,17 +163,6 @@ class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
                 layer.__class__.__name__,
                 _PAD_ROWS,
             )
-
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        bias: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        m = x.shape[0] if x.dim() == 2 else 0
-        if 0 < m < _PAD_ROWS and self._pads(layer):
-            return super().apply(layer, F.pad(x, (0, 0, 0, _PAD_ROWS - m)), bias)[:m]
-        return super().apply(layer, x, bias)
 
 
 class _SpyreTransposedLinearMixin:

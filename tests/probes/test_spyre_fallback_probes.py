@@ -743,6 +743,208 @@ def test_spyre_compile_input_honors_last_dim_window(spyre_device, start):
 
 
 # ---------------------------------------------------------------------------
+# 8c. storage_offset is a graph guard, so a varying one is a recompile axis
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_compile_input_offset_specialises_the_graph(spyre_device):
+    """One compiled variant per distinct storage_offset.
+
+    torch-spyre#4449 fixed the silent offset-0 read of torch-spyre#3770 with a Dynamo
+    guard on the offset (``_monkey_patch.py``), not a runtime read, so a caller whose
+    offset varies recompiles. This is what keeps the paged-attention query rows gathered.
+    """
+    rows, width = 4, 64
+    base = torch.stack([torch.full((rows, width), float(s)) for s in range(3)])
+    base = base.to(torch.float16).to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    code = fn._torchdynamo_orig_callable.__code__  # ty: ignore[unresolved-attribute]
+    for s in range(3):
+        fn(base[s])
+    entries = torch._dynamo.eval_frame._debug_get_cache_entry_list(code)
+    assert len(entries) == 3, (
+        f"expected one compiled variant per storage offset, got {len(entries)}; if this "
+        "is now 1, torch-spyre reads the offset at runtime and a slice is free to "
+        "replace a gather"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8d. Slicing a stacked input INSIDE the graph, the other way to avoid offsets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("query_len", [1, 64])
+def test_spyre_in_graph_slice_of_stacked_fp16_input(spyre_device, query_len):
+    """One stacked mask sliced per block in-graph, the form the mask mirror uses.
+
+    No offset reaches a guard, unlike a sliced graph input.
+    """
+    blocks, block_size = 8, 128
+    stack_cpu = torch.stack(
+        [torch.full((query_len, block_size), float(b)) for b in range(blocks)]
+    ).to(torch.float16)
+    stack = stack_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(s):
+        acc = s[0] * 2.0
+        for i in range(1, blocks):
+            acc = acc + s[i] * 2.0
+        return acc
+
+    expected = sum(stack_cpu[b] * 2.0 for b in range(blocks))
+    torch.testing.assert_close(fn(stack).cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 8e. The transfer collapses a host view's offset, which is what 8d relies on
+# ---------------------------------------------------------------------------
+
+
+def test_spyre_transfer_lands_a_host_view_at_offset_zero(spyre_device):
+    """A nonzero-offset host view arrives on device contiguous at offset 0.
+
+    The mask mirror hands over exactly this: the width-1 builder path assigns a row of
+    a per-group tensor, so the host stack starts mid-storage. If the transfer preserved
+    that offset, every consumer that narrows dim 0 in-graph (8d, and a tiled page walk)
+    would instead be slicing a graph input at a varying offset -- one compiled variant
+    per sequence at best (8c), wrong rows for int32 at worst (8).
+    """
+    rows, blocks, block_size = 4, 8, 128
+    # Bounded like `_stacked_index_pages`: the compare is exact, so a value and its double
+    # both have to be representable in fp16. Still unique per (row, block) and varying
+    # inside a tile, so a misread row, block or element each show up.
+    base = (
+        torch.arange(rows).reshape(rows, 1, 1, 1) * 32
+        + torch.arange(blocks).reshape(1, blocks, 1, 1) * 4
+        + torch.arange(block_size).reshape(1, 1, 1, block_size) % 4
+    ).to(torch.float16)
+
+    @torch.compile(dynamic=False)
+    def fn(s, i):
+        return s[i] * 2.0
+
+    for row in range(1, rows):
+        view = base[row][: blocks - 3]
+        assert view.is_contiguous() and view.storage_offset() > 0
+        stack = view.to(spyre_device)
+        assert stack.is_contiguous() and stack.storage_offset() == 0
+        for i in (0, blocks - 4):
+            torch.testing.assert_close(fn(stack, i).cpu(), view[i] * 2.0, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("query_len", [1, 64])
+def test_spyre_for_each_tile_consumes_transferred_mask_stack(spyre_device, dtype, query_len):
+    """The tiled attention mask layout survives transfer, broadcast, and reduction."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows, blocks, kv_heads, qpk, block_size = 3, 4, 2, 2, 128
+    base = torch.zeros(rows, blocks, query_len, block_size, dtype=dtype)
+    for b in range(blocks):
+        base[:, b] = b / 8
+    host_view = base[1]
+    assert host_view.storage_offset() > 0
+    stack = host_view.to(spyre_device)
+    assert stack.storage_offset() == 0
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def fn(mask_stack):
+        scores = mask_stack.new_zeros(kv_heads, qpk, query_len, block_size)
+        init = mask_stack.new_zeros(kv_heads, qpk, query_len)
+
+        def body(total, operands):
+            (mask_tile,) = operands
+            probs = torch.exp(scores + mask_tile[0])
+            return total + probs.sum(dim=-1), None
+
+        total, _ = for_each_tile(
+            body,
+            (mask_stack,),
+            dims=(0,),
+            tile_size=1,
+            init=init,
+        )
+        return total
+
+    expected = sum(
+        torch.exp(host_view[b]).sum(dim=-1).expand(kv_heads, qpk, query_len) for b in range(blocks)
+    )
+    torch.testing.assert_close(fn(stack).cpu(), expected, atol=0.02, rtol=0.02)
+
+
+def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
+    pages_cpu = (torch.arange(blocks * entries * block_size * head_size) % 97).reshape(
+        blocks * entries, block_size, head_size
+    )
+    pages_cpu = pages_cpu.to(torch.float16)
+    return pages_cpu, pages_cpu.to(spyre_device)
+
+
+def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
+    """One stacked [num_blocks, 1] int32 table, sliced in-graph, feeding index_select.
+
+    An int32 argument's offset is dropped
+    (test_spyre_compile_input_honors_storage_offset[dtype1]); an in-graph slice of a
+    stacked table is a different mechanism and holds at this shape, which is what
+    ``page_attn_head_major_prefill`` reads.
+    """
+    blocks, block_size, head_size = 4, 64, 64
+    pages_cpu, pages = _stacked_index_pages(blocks, 1, block_size, head_size, spyre_device)
+    table_cpu = torch.arange(blocks, dtype=torch.int32).reshape(blocks, 1)
+    table = table_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(p, t):
+        acc = p.index_select(0, t[0])
+        for i in range(1, blocks):
+            acc = acc + p.index_select(0, t[i])
+        return acc
+
+    expected = sum(pages_cpu.index_select(0, table_cpu[b].to(torch.int64)) for b in range(blocks))
+    torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "An in-graph row slice of a stacked [num_blocks, KV, 1] int32 table gathers the "
+        "wrong rows -- silently, with no compile error. The [num_blocks, 1] form above "
+        "works, so the head-major kv_index_tables cannot be collapsed into one transfer "
+        "the way its page indices can."
+    ),
+)
+def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
+    """The same idea at the [KV, 1] entry shape ``page_attn_head_major`` gathers with.
+
+    A 2-D entry cannot go through index_select, hence the subscript.
+    """
+    blocks, kv, block_size, head_size = 4, 8, 64, 64
+    pages_cpu, pages = _stacked_index_pages(blocks, kv, block_size, head_size, spyre_device)
+    rows = torch.arange(kv, dtype=torch.int32).reshape(kv, 1)
+    table_cpu = torch.stack([b * kv + rows for b in range(blocks)])
+    table = table_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(p, t):
+        acc = p[t[0]].reshape(kv, block_size, head_size)
+        for i in range(1, blocks):
+            acc = acc + p[t[i]].reshape(kv, block_size, head_size)
+        return acc
+
+    expected = sum(
+        pages_cpu[table_cpu[b].to(torch.int64)].reshape(kv, block_size, head_size)
+        for b in range(blocks)
+    )
+    torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
 # 9. Slot-major KV cache: the indirect scatter write
 # ---------------------------------------------------------------------------
 

@@ -131,8 +131,18 @@ def spyre_vllm_config(compiled: bool, block_size: int, limits: dict):
         yield config
 
 
-def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, block_size, scale):
-    """Full-causal varlen reference, no alibi/soft-cap/window (Granite shape)."""
+def ref_attn(
+    query,
+    key_cache,
+    value_cache,
+    query_lens,
+    kv_lens,
+    block_tables,
+    block_size,
+    scale,
+    sliding_window=None,
+):
+    """Causal varlen reference, optionally restricted to a sliding window."""
     block_tables_np = block_tables.cpu().numpy()
     outputs = []
     start = 0
@@ -147,6 +157,10 @@ def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, b
             v = torch.repeat_interleave(v, rep, dim=1)
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
         mask = torch.triu(torch.ones(query_len, kv_len), diagonal=kv_len - query_len + 1).bool()
+        if sliding_window is not None:
+            q_pos = torch.arange(query_len) + kv_len - query_len
+            k_pos = torch.arange(kv_len)
+            mask |= k_pos.unsqueeze(0) < (q_pos - sliding_window + 1).unsqueeze(1)
         attn.masked_fill_(mask, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         outputs.append(torch.einsum("hqk,khd->qhd", attn, v))
@@ -163,13 +177,14 @@ def build_metadata(
     query_start_loc,
     block_table,
     slot_mapping,
+    sliding_window=None,
 ):
     """Drive the real SpyreAttentionMetadataBuilder."""
     from unittest.mock import Mock
 
     from vllm.config import get_current_vllm_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 
@@ -177,12 +192,15 @@ def build_metadata(
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
     vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
 
+    spec_cls = FullAttentionSpec if sliding_window is not None else AttentionSpec
+    spec_kwargs = {"sliding_window": sliding_window} if sliding_window is not None else {}
     builder = SpyreAttentionMetadataBuilder(
-        kv_cache_spec=AttentionSpec(
+        kv_cache_spec=spec_cls(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=DTYPE,
+            **spec_kwargs,
         ),
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,
@@ -247,6 +265,7 @@ def build_inputs_from_requests(
     seed=0,
     kv_layout="slot_major_devfill",
     attn_kv_layout="token_major",
+    sliding_window=None,
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
@@ -321,6 +340,7 @@ def build_inputs_from_requests(
         torch.tensor([0] + list(query_lens), dtype=torch.int32).cumsum(0, dtype=torch.int32),
         block_tables,
         slot_mapping,
+        sliding_window,
     )
 
     cache_device = torch.device(device)
@@ -627,7 +647,9 @@ def unreachable_reason(query_lens) -> str:
 
 def record_padding(row, attn_metadata, query_lens, seq_lens, block_size):
     """Record the shape the kernel got, and flag it when that is not the one asked for."""
-    realized_blocks = [len(tiles) for tiles in attn_metadata.attention_mask_tiles]
+    # A mask stack holds one [aligned_query_len, block_size] mask tile per active block,
+    # so shape[0] is the number of blocks the kernel iterated for that sequence.
+    realized_blocks = [int(m.shape[0]) for m in attn_metadata.attention_mask_stacks]
     realized_query = list(attn_metadata.aligned_query_lens)
     row["num_kv_blocks_iterated"] = max(realized_blocks)
     row["padded_query_len"] = max(realized_query)
@@ -775,6 +797,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             seed=cfg.get("seed", 0),
             kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
             attn_kv_layout=attn_kv_layout,
+            sliding_window=cfg.get("sliding_window"),
         )
         if inputs is None:
             from vllm.config import get_current_vllm_config
@@ -823,6 +846,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             inputs["block_tables"],
             block_size,
             inputs["scale"],
+            cfg.get("sliding_window"),
         ).float()
         diff = (got - ref).abs()
         n_outliers = int((diff > atol + rtol * ref.abs()).sum().item())
@@ -1030,6 +1054,7 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         cfg["device"],
         kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
         attn_kv_layout=cfg.get("attn_kv_layout", "token_major"),
+        sliding_window=cfg.get("sliding_window"),
     )
     probe_run, _, _ = make_forward(
         probe_inputs,

@@ -19,7 +19,7 @@ never picks up a longer sibling's version (`-devel`), and `--merge` leaves
 untouched components alone.
 
 The cache-key tests feed the generated file to torch-spyre's own
-`_get_dxp_version` and `code_hash` rather than re-deriving the key format here,
+`_get_backend_compiler_version` and `code_hash` rather than re-deriving the key format here,
 so they check the real contract: different RPMs, different key.
 """
 
@@ -239,11 +239,11 @@ requires_kernel_cache = pytest.mark.skipif(
 def _cache_key_for(components_path, monkeypatch):
     """torch-spyre's own cache key for a components.txt, kernel content fixed."""
     from torch._inductor.codecache import code_hash
-    from torch_spyre.execution.kernel_cache import _get_dxp_version
+    from torch_spyre.execution.kernel_cache import _get_backend_compiler_version
 
     monkeypatch.setenv("LIB_VERSION_FILE", str(components_path))
-    _get_dxp_version.cache_clear()  # lru_cache would pin the first file read
-    return code_hash(b"identical-kernel-content", extra=_get_dxp_version())
+    _get_backend_compiler_version.cache_clear()  # lru_cache would pin the first file read
+    return code_hash(b"identical-kernel-content", extra=_get_backend_compiler_version())
 
 
 @requires_kernel_cache
@@ -253,7 +253,7 @@ def test_two_rpm_sets_give_torch_spyre_two_cache_keys(tmp_path, monkeypatch):
     This is the whole point of the script: an identical kernel compiled against
     different deeptools/flex builds must not collide in the cache. Rather than
     re-deriving the key format here, feed each generated file to torch-spyre's
-    own `_get_dxp_version` and `code_hash` and require the results to differ.
+    own `_get_backend_compiler_version` and `code_hash` and require the results to differ.
     """
     old_flex = "2.0.0-0.main.1+553.8581a91_384.el10"
     new_flex = "3.1.0-0.main.7+9999.abcdef1_777.el10"

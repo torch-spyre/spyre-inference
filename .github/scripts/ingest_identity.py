@@ -59,12 +59,14 @@ def golden_drift(goldens) -> list[str]:
     """The identities this writer was built against that the installed library no longer
     mints, as human-readable lines. Empty means the contract still holds.
 
-    `goldens` is (callable, args, expected) -- the callable resolved from the library, so a
-    rename or a re-implementation is caught as well as a changed hash.
+    `goldens` is (name, callable, args, expected). `name` is a caller-supplied label, not
+    `callable.__name__`: the library re-exports these as bound methods (`RunId.derive`, ...),
+    so every one of them reports `__name__ == "derive"` -- introspecting the callable would
+    make every drift message identical and useless for telling which identity moved.
     """
     drift = []
-    for fn, args, want in goldens:
+    for name, fn, args, want in goldens:
         got = str(fn(*args))
         if got != want:
-            drift.append(f"{fn.__name__}{args!r} -> {got}, expected {want}")
+            drift.append(f"{name}{args!r} -> {got}, expected {want}")
     return drift

@@ -24,14 +24,17 @@ does not have (torch-spyre#4123).
 
 import torch
 
+from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
 
 def page_attn_head_major_decode_kernel(
     query,
     query_row_index,
     k_pages,
     v_pages,
-    kv_index_tables,
-    mask_tiles,
+    page_index_table,
+    kv_row_pool,
+    mask_stack,
     scale,
     num_blocks,
     padded_query_len,
@@ -44,20 +47,24 @@ def page_attn_head_major_decode_kernel(
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
-    Heads are kv-major, so the fold is a reshape, and it needs no head gather. Under
-    `dynamic=False` Dynamo specializes on every non-tensor argument, so the page loop is
-    unrolled per variant.
+    Heads are kv-major, so the fold is a reshape, and it needs no head gather. The page
+    walk goes through `walk_tiles`, which holds one block body rather than an unrolled
+    copy per page when SPYRE_ATTN_FOR_EACH_TILE is set.
 
     Expected shapes:
         query: [num_tokens, num_heads, head_size], the whole batch's query
-        query_row_index: int32 device tensor whose first padded_query_len entries are this
-            sequence's absolute query rows.
+        query_row_index: [padded_query_len] int32 device tensor of this sequence's
+            absolute query rows.
         k_pages / v_pages: [num_pages_total * num_kv_heads, block_size, head_size]
-        kv_index_tables: per active block, a [num_kv_heads, 1] int32 device tensor of that
-            block's ``page * num_kv_heads + kv`` rows. One real tensor per block, not a
-            slice of a table: an index tensor reaches the hardware as a tensor argument,
-            so a slice's nonzero storage offset is dropped (torch-spyre#3770).
-        mask_tiles: [num_blocks], each [padded_query_len, block_size]
+        page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor whose
+            row i holds the i-th active block's page id in column 0, the base's table
+            unchanged.
+        kv_row_pool: [num_pages_total, num_kv_heads, 1] int32 device tensor of every
+            page's folded-cache rows, ``page * num_kv_heads + kv``. Gathered rather than
+            computed (int32 arithmetic has no device op mapping) or sliced out of a
+            per-block table (an int32 argument's nonzero storage offset still reads as 0,
+            torch-spyre#3770). Pure cache geometry, so it is built once.
+        mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
@@ -65,18 +72,17 @@ def page_attn_head_major_decode_kernel(
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     num_queries_per_kv = num_heads // num_kv_heads
 
-    row = query_row_index[:1]
-    q = query.index_select(0, row).reshape(num_kv_heads, num_queries_per_kv, head_size)
+    q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
 
-    tile_max = None
-    tile_sum = None
-    tile_out = None
-
-    for i in range(num_blocks):
-        # Subscripting, not index_select, which takes only a 1-D index: that puts the
-        # entry axis on the index's own stick axis, splittable only in whole 32-entry
-        # sticks. [num_kv_heads, 1] lets the split land per kv head.
-        kv_rows = kv_index_tables[i]
+    def block_body(carry, tiles):
+        page_index, k_pages, v_pages, mask_tile, q, kv_row_pool = tiles
+        # A tile is readable whole or as the single element `page_index[0, 0:1]` is; a
+        # [num_kv_heads]-wide read of a wider row is neither, so the rows come from the
+        # pool. See the `kv_row_pool` docstring.
+        kv_rows = kv_row_pool.index_select(0, page_index[0, 0:1])
+        # Subscripting, not index_select, which takes only a 1-D index: that puts the entry
+        # axis on the index's own stick axis, splittable only in whole 32-entry sticks.
+        # [num_kv_heads, 1] lets the split land per kv head.
         k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
         v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
 
@@ -87,30 +93,45 @@ def page_attn_head_major_decode_kernel(
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # At one query row the mask is head-independent, so its [1, block_size] tile
         # broadcasts across the folded group axis.
-        scores = scores + mask_tiles[i]
+        scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
+        if carry is None:
             probs = torch.exp(scores - scores_max)
-            tile_max = scores_max
-            tile_out = torch.matmul(probs, v_page)
-            tile_sum = probs.sum(dim=-1, keepdim=True)
-        else:
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_out is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_out = tile_out * rescale
-            tile_sum = tile_sum * rescale
-            probs = torch.exp(scores - new_max)
-            tile_out = tile_out + torch.matmul(probs, v_page)
-            tile_sum = tile_sum + probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
+            return (
+                scores_max,
+                probs.sum(dim=-1, keepdim=True),
+                torch.matmul(probs, v_page),
+            ), None
 
-    assert tile_out is not None and tile_sum is not None
-    attn = (tile_out / tile_sum).reshape(1, num_heads, head_size)
+        tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
+        rescale = torch.exp(-torch.relu(scores_max - tile_max))
+        new_max = torch.maximum(tile_max, scores_max)
+        probs = torch.exp(scores - new_max)
+        return (
+            new_max,
+            tile_sum * rescale + probs.sum(dim=-1, keepdim=True),
+            tile_output * rescale + torch.matmul(probs, v_page),
+        ), None
+
+    state_shape = (num_kv_heads, num_queries_per_kv, 1)
+    state_kwargs = {"dtype": q.dtype, "device": q.device}
+    (_, tile_sum, tile_output), _ = walk_tiles(
+        block_body,
+        (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q, kv_row_pool),
+        dims=(0, None, None, 0, None, None),
+        tile_size=1,
+        init=(
+            torch.full(state_shape, float("-inf"), **state_kwargs),
+            torch.zeros(state_shape, **state_kwargs),
+            torch.zeros((num_kv_heads, num_queries_per_kv, head_size), **state_kwargs),
+        ),
+    )
+    attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
     if out is not None:
-        out.index_copy_(0, row, attn)
+        out.index_copy_(0, query_row_index, attn)
         return out
     return attn

@@ -41,10 +41,10 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 
+from spyre_inference.custom_ops.utils import register as register_spyre_convert
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,
     SpyreClassifierLinear,
-    SpyreClassifierPoolerHead,
     SpyreCLSPool,
     SpyreCpuClassifier,
     SpyreDispatchPooler,
@@ -57,6 +57,10 @@ from spyre_inference.v1.pool.spyre_pooler import (
     patch_pooler_for_spyre,
     run_pooling_tail_on_cpu,
 )
+
+# Downcast goes through spyre_convert. Production registers it at plugin load;
+# these tests pass a CPU device and never import the plugin.
+register_spyre_convert()
 
 _SPYRE = torch.device("cpu")  # configure only needs a device label for logging
 
@@ -137,7 +141,7 @@ def test_configure_pooling_fp32_classifier_downcasts_to_fp16():
     assert model.classifier.bias is not None
     assert tuple(model.classifier.bias.shape) == (2,)
     assert model.classifier.weight.shape == (8, 2)
-    assert isinstance(model.pooler.head, SpyreClassifierPoolerHead)
+    assert isinstance(model.pooler.head, ClassifierPoolerHead)
     assert model.pooler.head.head_dtype == torch.float16
 
 
@@ -156,7 +160,7 @@ def test_configure_pooling_dispatch_classify_sets_head_dtype():
     model.classifier = classifier
     assert configure_pooling_for_spyre(model, _SPYRE) is True
     classify = model.pooler.poolers_by_task["classify"]
-    assert isinstance(classify.head, SpyreClassifierPoolerHead)
+    assert isinstance(classify.head, ClassifierPoolerHead)
     assert classify.head.head_dtype == torch.float16
     assert isinstance(classify.head.classifier, SpyreClassifierLinear)
     assert classify.head.classifier.weight.dtype == torch.float16
@@ -213,7 +217,7 @@ def test_configure_pooling_roberta_head_dense_and_out_proj_downcast():
     assert head.out_proj.weight.dtype == torch.float16
     assert head.dense.bias is not None
     assert tuple(head.dense.bias.shape) == (8,)
-    assert isinstance(model.pooler.head, SpyreClassifierPoolerHead)
+    assert isinstance(model.pooler.head, ClassifierPoolerHead)
     assert model.pooler.head.head_dtype == torch.float16
 
 
@@ -246,9 +250,9 @@ def test_spyre_classifier_linear_matches_nn_linear_on_cpu():
 
 
 def test_spyre_classifier_linear_cls_warmup_shape_compiles_on_spyre():
-    """B=1, H=1024 + bias is the bge-reranker dense that mixed-EA'd isolated F.linear."""
+    """B=1, H=1024 + bias stays on Spyre through dense and out_proj."""
     if not spyre_available():
-        pytest.skip("needs Spyre: mixed-EA bias add is a device compile failure")
+        pytest.skip("needs Spyre")
 
     torch.manual_seed(0)
     src = nn.Linear(1024, 1024, dtype=torch.float16)
@@ -258,13 +262,14 @@ def test_spyre_classifier_linear_cls_warmup_shape_compiles_on_spyre():
     x = x_cpu.to("spyre")
     out = wrapped(x)
     assert out.shape == (1, 1024)
-    assert out.device.type == "cpu"
+    assert out.device.type == "spyre"
     torch.testing.assert_close(out.cpu().float(), ref.float(), atol=2e-2, rtol=2e-2)
 
     out_proj_src = nn.Linear(1024, 1, dtype=torch.float16)
     out_proj = SpyreClassifierLinear.convert(out_proj_src).to("spyre")
     logits = out_proj(out)
     assert logits.shape == (1, 1)
+    assert logits.device.type == "spyre"
 
     ner_src = nn.Linear(768, 9, dtype=torch.float16)
     x_ner_cpu = torch.randn(16, 768, dtype=torch.float16)
@@ -272,6 +277,7 @@ def test_spyre_classifier_linear_cls_warmup_shape_compiles_on_spyre():
     ner = SpyreClassifierLinear.convert(ner_src).to("spyre")
     ner_out = ner(x_ner_cpu.to("spyre"))
     assert ner_out.shape == (16, 9)
+    assert ner_out.device.type == "spyre"
     torch.testing.assert_close(ner_out.cpu().float(), ner_ref.float(), atol=2e-2, rtol=2e-2)
 
 
@@ -428,14 +434,14 @@ def test_spyre_all_pool_rounds_onto_the_length_ladder():
     assert [c.shape[0] for c in without] == [320]
 
 
-def test_configure_pooling_threads_max_model_len_into_the_ladder():
+def test_configure_pooling_threads_the_declared_lengths_into_the_ladder():
     """The ladder reaches SpyreAllPool from configure, not from a contextvar."""
     model = _model_with_pooler(_token_pooler(AllPool))
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is True
     assert model.pooler.pooling.len_ladder == _LADDER
 
 
-def test_configure_pooling_without_max_model_len_leaves_the_ladder_empty():
+def test_configure_pooling_without_a_ladder_leaves_it_empty():
     """Degrades to stick alignment rather than raising; configure warns."""
     model = _model_with_pooler(_token_pooler(AllPool))
     assert configure_pooling_for_spyre(model, _SPYRE) is True
@@ -529,7 +535,7 @@ def _dispatch_metadata(counts: list[int], tasks: list[str]):
 def test_configure_pooling_installs_spyre_dispatch_pooler():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool())})
     model = _model_with_pooler(pooler)
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is True
     assert type(model.pooler) is SpyreDispatchPooler
 
 
@@ -599,5 +605,5 @@ def test_mixed_dispatch_pooler_is_not_swapped():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool()), "encode": _UnrecognisedPooler()})
     model = _model_with_pooler(pooler)
 
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is False
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is False
     assert type(model.pooler) is DispatchPooler

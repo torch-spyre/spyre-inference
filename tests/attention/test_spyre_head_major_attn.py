@@ -41,6 +41,7 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
 )
+from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
@@ -494,8 +495,7 @@ _SHAPES = [
 
 # Spyre and compiled only: the kernel's page gather lowers to aten.index, which fails
 # eager, so the impl always compiles attention. Residency itself is a property of the
-# layout plan rather than a result, and is measured by
-# scripts/probes/lx_head_major_residency.py.
+# layout plan rather than a result, so it is not asserted here.
 @pytest.mark.parametrize("seq_lens", _SHAPES)
 @pytest.mark.parametrize(
     "configure_compilation",
@@ -840,11 +840,7 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
 
 def test_page_attn_head_major_matches_fp32_reference():
-    """The per-sequence decode kernel matches the suite's CPU reference.
-
-    Card-free and fp32, as its batched twin: it pins the group fold and the ragged tail's
-    mask, not the fp16 tolerances.
-    """
+    """The per-sequence decode kernel matches the suite's CPU reference."""
     from spyre_testing_plugin.attn_helpers import ref_attn
 
     torch.set_default_device("cpu")
@@ -856,13 +852,18 @@ def test_page_attn_head_major_matches_fp32_reference():
     k = torch.randn(blocks * kv, block, d)
     v = torch.randn(blocks * kv, block, d)
     # The kernel reads its row out of a wider staging buffer, and not the first one.
-    query = torch.randn(3, heads, d)
-    rows = torch.tensor([2], dtype=torch.int32)
-    kv_tables = [
-        torch.tensor([[p * kv + h] for h in range(kv)], dtype=torch.int32) for p in range(blocks)
-    ]
-    masks = torch.zeros(blocks, 1, block)
-    masks[-1, 0, block // 2 :] = torch.finfo(torch.float32).min
+    query = torch.randn(query_len + 2, heads, d)
+    rows = (torch.arange(query_len, dtype=torch.int32) + 2) % (query_len + 2)
+    # The base's page table: stick-wide rows, page id in column 0.
+    page_ids = torch.tensor([3, 1, 4, 0, 2], dtype=torch.int32)
+    page_table = torch.zeros(blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    page_table[:, 0] = page_ids
+    kv_row_pool = torch.arange(blocks * kv, dtype=torch.int32).reshape(blocks, kv, 1)
+    # Causal: query row q sits at absolute position kv_len - query_len + q.
+    q_abs = kv_len - query_len + torch.arange(query_len).unsqueeze(1)
+    pos = torch.arange(blocks * block).reshape(blocks, 1, block)
+    allow = (pos <= q_abs) & (pos < kv_len)
+    masks = torch.where(allow, 0.0, torch.finfo(torch.float32).min)
 
     for soft_cap in (0.0, 30.0):
         got = page_attn_head_major_decode_kernel(
@@ -870,7 +871,8 @@ def test_page_attn_head_major_matches_fp32_reference():
             rows,
             k,
             v,
-            kv_tables,
+            page_table,
+            kv_row_pool,
             masks,
             d**-0.5,
             blocks,
@@ -883,13 +885,13 @@ def test_page_attn_head_major_matches_fp32_reference():
             None,
         )
         expected = ref_attn(
-            query=query.index_select(0, rows[:query_len].to(torch.int64)),
+            query=query.index_select(0, rows.to(torch.int64)),
             # ref_attn indexes a page's token axis first.
             key_cache=k.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
             value_cache=v.reshape(blocks, kv, block, d).permute(0, 2, 1, 3),
             query_lens=[query_len],
             kv_lens=[kv_len],
-            block_tables=torch.arange(blocks, dtype=torch.int32).unsqueeze(0),
+            block_tables=page_ids.unsqueeze(0),
             block_size=block,
             scale=d**-0.5,
             soft_cap=soft_cap,
@@ -922,7 +924,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     """The head-major page read feeds the same reduction the token-major kernel gets.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
-    page-row mask broadcast, not the fp16 tolerances.
+    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
     from tests.attention.test_spyre_attn import _decode_reference_fp32
 
@@ -932,8 +934,6 @@ def test_head_major_batched_decode_matches_fp32_reference(
     block_size, head_size = 16, 8
     num_heads = num_kv_heads * qpk
     padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
-    num_chunks = padded_blocks // bpc
-    entries = b_seqs * bpc
     scale = 0.5
 
     n_pages = padded_blocks * b_seqs + 1
@@ -952,18 +952,17 @@ def test_head_major_batched_decode_matches_fp32_reference(
             page_ids[s, b] = 1 + s * padded_blocks + b
             mask[s, b, : min(block_size, kv_len - b * block_size)] = 0.0
     mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+    mask.masked_fill_(torch.isneginf(mask), torch.finfo(torch.float32).min)
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
-    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
+    rep_row_ids = rep_row_ids.repeat(bpc)
     # One index row per page, in int64 for eager CPU indexing.
-    chunk_page_ids = [
-        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
+    chunk_page_ids = page_ids.t().contiguous()
     mask_by_chunk = (
-        mask.reshape(b_seqs, num_chunks, bpc, block_size)
-        .permute(1, 0, 2, 3)
-        .reshape(num_chunks, entries, 1, block_size)
+        mask.transpose(0, 1)
+        .unsqueeze(2)
+        .unsqueeze(3)
+        .expand(padded_blocks, b_seqs, num_kv_heads, qpk, block_size)
         .contiguous()
     )
 
@@ -1049,13 +1048,12 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     assert attn_metadata.chunk_page_ids_cpu is not None
     assert attn_metadata.padded_num_seqs is not None
     assert attn_metadata.blocks_per_chunk is not None
-    entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
-
-    tables = impl.build_chunk_index_tables(attn_metadata, torch.device("cpu"))
-    assert len(tables) == len(attn_metadata.chunk_page_ids_cpu)
-    for pages, table in zip(attn_metadata.chunk_page_ids_cpu, tables, strict=True):
-        assert table.shape == (entries, 1)
-        torch.testing.assert_close(table, pages)
+    table = attn_metadata.chunk_page_ids_cpu
+    assert table.shape == (
+        attn_metadata.padded_batch_blocks,
+        attn_metadata.padded_num_seqs,
+    )
+    assert table.dtype == torch.int32
 
 
 @pytest.fixture()

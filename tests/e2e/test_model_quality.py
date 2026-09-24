@@ -81,20 +81,7 @@ _REF_PATH = Path(__file__).parent.parent / "data" / "decoder_output_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        pytest.param(
-            model,
-            marks=(
-                pytest.mark.disable_co_optimizing_lx_planning
-                if model == "google/gemma-4-31B"
-                else ()
-            ),
-        )
-        for model in DECODER_MODELS
-    ],
-)
+@pytest.mark.parametrize("model", DECODER_MODELS)
 def test_decoder_model_output(
     model: str,
     monkeypatch: pytest.MonkeyPatch,

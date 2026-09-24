@@ -289,14 +289,14 @@ def test_spyre_all_pool_rounds_onto_the_length_ladder():
     assert [c.shape[0] for c in without] == [320]
 
 
-def test_configure_pooling_threads_max_model_len_into_the_ladder():
+def test_configure_pooling_threads_the_declared_lengths_into_the_ladder():
     """The ladder reaches SpyreAllPool from configure, not from a contextvar."""
     model = _model_with_pooler(_token_pooler(AllPool))
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is True
     assert model.pooler.pooling.len_ladder == _LADDER
 
 
-def test_configure_pooling_without_max_model_len_leaves_the_ladder_empty():
+def test_configure_pooling_without_a_ladder_leaves_it_empty():
     """Degrades to stick alignment rather than raising; configure warns."""
     model = _model_with_pooler(_token_pooler(AllPool))
     assert configure_pooling_for_spyre(model, _SPYRE) is True
@@ -400,7 +400,7 @@ def _real_dispatch_metadata(counts: list[int], tasks: list[str]) -> PoolingMetad
 def test_configure_pooling_installs_spyre_dispatch_pooler():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool())})
     model = _model_with_pooler(pooler)
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is True
     assert type(model.pooler) is SpyreDispatchPooler
 
 
@@ -447,7 +447,8 @@ def test_spyre_dispatch_pooler_defers_to_upstream_off_device(monkeypatch):
 
 
 def test_group_row_bucket_rounds_onto_powers_of_two():
-    assert group_row_bucket(1, 1024) == 64
+    assert group_row_bucket(1, 1024) == 1
+    assert group_row_bucket(9, 1024) == 16
     assert group_row_bucket(64, 1024) == 64
     assert group_row_bucket(65, 1024) == 128
     assert group_row_bucket(300, 1024) == 512
@@ -474,7 +475,7 @@ def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
     pooler(hidden_states, _real_dispatch_metadata([100, 100, 9], ["embed", "embed", "token_embed"]))
 
     assert embed.seen_rows == 256
-    assert token.seen_rows == 64, "a later group must be bucketed, not sliced to 9"
+    assert token.seen_rows == 16, "a later group must be bucketed, not sliced to 9"
 
 
 def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
@@ -499,7 +500,7 @@ def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
     assert torch.equal(got[9:], hidden_states[108].expand(got.shape[0] - 9, -1))
 
 
-@pytest.mark.parametrize("tail", [9, 20, 50, 64])
+@pytest.mark.parametrize("tail", [33, 40, 50, 64])
 def test_spyre_dispatch_pooler_group_shape_does_not_track_the_token_sum(tail):
     """The defect, stated as a test: distinct group sums must share one shape."""
     if not spyre_available():
@@ -608,5 +609,5 @@ def test_mixed_dispatch_pooler_is_not_swapped():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool()), "encode": _UnrecognisedPooler()})
     model = _model_with_pooler(pooler)
 
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is False
+    assert configure_pooling_for_spyre(model, _SPYRE, _LADDER) is False
     assert type(model.pooler) is DispatchPooler

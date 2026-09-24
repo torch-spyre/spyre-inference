@@ -133,11 +133,7 @@ def test_tp2_llm_generate_matches_tp1() -> None:
         # gemma-4 vision checkpoints resolve the multimodal architecture, so this row
         # pins the text-only backbone -- the decoder is what TP splits anyway, and the
         # tower's weights and warmup would be paid for nothing.
-        pytest.param(
-            "google/gemma-4-26B-A4B",
-            GEMMA4_TEXT_BACKBONE_OVERRIDE,
-            marks=pytest.mark.disable_co_optimizing_lx_planning,
-        ),
+        ("google/gemma-4-26B-A4B", GEMMA4_TEXT_BACKBONE_OVERRIDE),
     ],
     ids=["micro-g3.3", "gemma-4-26B-A4B-text"],
 )

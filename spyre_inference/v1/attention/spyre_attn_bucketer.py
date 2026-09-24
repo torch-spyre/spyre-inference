@@ -88,7 +88,7 @@ class SpyreAttnBatchedDecodeBucket:
     """One recordable batched decode kernel variant.
 
     The kernel specializes on ``num_seqs``, ``blocks_per_chunk`` and
-    ``num_chunks`` (the per-chunk index list it unrolls at trace time).
+    ``num_chunks`` (derived from the logical block-axis tensor extent).
     ``num_blocks`` is the bucket they were derived from, kept so the recorder can
     skip a bucket that outruns the KV allocation.
     """

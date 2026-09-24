@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from itertools import groupby
 
 import torch
@@ -37,10 +38,7 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    default_encoder_len_buckets,
-    next_bucket,
-)
+from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
 
@@ -108,6 +106,29 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     return ends - 1 if last else ends - counts
 
 
+def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Pad a per-request row index up to a power-of-two length.
+
+    ``select_rows``' ``index_select`` specializes on the *exact* index length,
+    and serving pools one row per request -- any count from 1 to
+    ``max_num_seqs``. Left alone that is up to 64 graphs per body bucket, each
+    compiling the first time its request count appears mid-serve. Rounding the
+    count to a power of two caps it at a handful of widths that warmup can
+    afford to sweep (see ``_warm_pooler_row_widths``).
+
+    Padding lanes repeat the last real row, so the extra rows are duplicates
+    the caller drops; they never introduce a row that was not already pooled.
+    Returns the padded index and the real row count to trim back to.
+    """
+    n = int(row_indices.numel())
+    if n <= 1:
+        return row_indices, n
+    target = 1 << (n - 1).bit_length()
+    if target == n:
+        return row_indices, n
+    return torch.cat([row_indices, row_indices[-1:].expand(target - n)]), n
+
+
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
     """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
@@ -131,7 +152,9 @@ class SpyreCLSPool(CLSPool):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=False))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=False))
+        pooled = select_rows(hidden_states, idx)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreLastPool(LastPool):
@@ -139,7 +162,9 @@ class SpyreLastPool(LastPool):
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
+        pooled = select_rows(hidden_states, idx)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreMeanPool(MeanPool):
@@ -171,15 +196,15 @@ class SpyreMeanPool(MeanPool):
 
 
 def group_row_bucket(num_group_tokens: int, total_rows: int) -> int:
-    """Rows to gather for one task group: a power-of-two bucket, capped at ``total_rows``.
+    """Rows to gather for one task group: a power of two, capped at ``total_rows``.
 
-    The cap is a warmed shape, so a wide group is free. The ladder comes from
-    ``total_rows`` and not ``max_model_len``, which does not bound a sum over a subset
-    of the batch.
+    Same rounding as ``pad_row_count_to_bucket``, on a token sum rather than a request
+    count. The cap is the declared body shape, so a group covering most of the batch
+    costs no shape of its own.
     """
     if num_group_tokens >= total_rows:
         return total_rows
-    return min(next_bucket(num_group_tokens, default_encoder_len_buckets(total_rows)), total_rows)
+    return min(1 << (num_group_tokens - 1).bit_length(), total_rows)
 
 
 class SpyreDispatchPooler(DispatchPooler):
@@ -546,7 +571,7 @@ def patch_pooler_for_spyre(
 
 
 def configure_pooling_for_spyre(
-    model: nn.Module, spyre_device: torch.device, max_model_len: int | None = None
+    model: nn.Module, spyre_device: torch.device, len_ladder: Sequence[int] | None = None
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
@@ -555,19 +580,20 @@ def configure_pooling_for_spyre(
     is garbage (torch-spyre#2971). False if the method is unknown or the
     head is an FP32 linear.
 
-    ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
-    It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
-    the pooler because only the caller is guaranteed to run inside a
-    ``set_current_vllm_config`` context; token pooling degrades to plain stick
-    alignment without it.
+    ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
+    of two from one stick to ``max_model_len``), which are the only per-request widths
+    ``SpyreAllPool``'s bucketed gather can see. Not the body's ``compile_sizes``, which is
+    one entry. Passed in rather than re-derived here because only the caller is guaranteed
+    to run inside a ``set_current_vllm_config`` context; without it token pooling falls
+    back to plain stick alignment.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
         return False
 
-    len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
-    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
+    ladder = sorted(set(len_ladder)) if len_ladder else []
+    num_patched, unsupported = patch_pooler_for_spyre(pooler, ladder)
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__
         logger.info(
@@ -580,11 +606,11 @@ def configure_pooling_for_spyre(
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
     if token_level:
-        if not len_ladder:
+        if not ladder:
             logger.warning(
-                "Pooling: token pooling has no length ladder (max_model_len was "
-                "not passed); gathers round to every 64-multiple instead of the "
-                "power-of-two buckets, so more shapes compile than necessary"
+                "Pooling: token pooling got no declared prompt lengths, so its gather "
+                "rounds row counts to every 64-multiple rather than to the declared "
+                "lengths, compiling more shapes than necessary"
             )
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 

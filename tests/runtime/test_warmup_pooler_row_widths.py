@@ -12,87 +12,52 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pooling warmup runs the pooler at every request count, not only the widest.
-
-A seqwise pooler gathers one row per request, and both the index length and the source
-row count are compiled shape axes on Spyre, so every request count is a shape.
-``_dummy_pooler_run`` derives its count from the token count and only reaches
-``max_num_seqs``. The pooling twin of ``test_warmup_logits_widths.py``.
-"""
+"""The pooler row sweep covers the width the poolers round up to, not just the limit."""
 
 from __future__ import annotations
 
 import types
-from typing import cast
 
+import pytest
 import torch
 
+from spyre_inference.v1.worker import spyre_model_runner
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
-TASKS = ["embed", "token_embed"]
+ROWS = 64
+HIDDEN = 8
 
 
-def _runner(max_num_reqs: int = 8, tasks: list[str] | None = None, on_spyre: bool = True):
-    """Stub self. The method's whole surface is these five attributes."""
-    traced: list[tuple[int, str, int | None]] = []
-    runner = types.SimpleNamespace(
-        _pooling_on_spyre=on_spyre,
-        max_num_reqs=max_num_reqs,
-        _pooler_row_widths_done=set(),
-        get_supported_pooling_tasks=lambda: list(TASKS if tasks is None else tasks),
-        _dummy_pooler_run_task=lambda hidden, task, num_reqs=None: traced.append(
-            (hidden.shape[0], task, num_reqs)
-        ),
+def _swept_widths(monkeypatch, max_num_seqs: int) -> list[int]:
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner._pooling_on_spyre = True
+    runner.scheduler_config = types.SimpleNamespace(max_num_seqs=max_num_seqs)
+
+    widths: list[int] = []
+    monkeypatch.setattr(
+        spyre_model_runner,
+        "select_rows",
+        lambda hidden_states, row_indices: widths.append(int(row_indices.numel())),
     )
-    return runner, traced
-
-
-def _sweep(runner, rows: int) -> None:
-    TorchSpyreModelRunner._warmup_pooler_row_widths(
-        cast(TorchSpyreModelRunner, runner), torch.zeros(rows, 4, dtype=torch.float16)
+    TorchSpyreModelRunner._warm_pooler_row_widths(
+        runner, torch.zeros(ROWS, HIDDEN, dtype=torch.float16)
     )
+    return widths
 
 
-def test_every_request_count_is_traced_for_each_task():
-    runner, traced = _runner(max_num_reqs=8)
-    _sweep(runner, 512)
-
-    for task in TASKS:
-        counts = sorted(num_reqs for _rows, seen, num_reqs in traced if seen == task)
-        assert counts == [1, 2, 3, 4, 5, 6, 7, 8]
-
-
-def test_widest_first():
-    """Inductor's caches warm on the widest shape, as with the body buckets."""
-    runner, traced = _runner(max_num_reqs=4)
-    _sweep(runner, 512)
-
-    assert [num_reqs for _rows, task, num_reqs in traced if task == "embed"] == [4, 3, 2, 1]
+@pytest.mark.parametrize(
+    ("max_num_seqs", "expected"),
+    [
+        pytest.param(6, [1, 2, 4, 8], id="six_rounds_up_to_eight"),
+        pytest.param(24, [1, 2, 4, 8, 16, 32], id="twenty_four_rounds_up_to_thirty_two"),
+        pytest.param(4, [1, 2, 4], id="a_power_of_two_is_unchanged"),
+        pytest.param(1, [1], id="one_sequence"),
+    ],
+)
+def test_sweep_reaches_the_rounded_up_width(monkeypatch, max_num_seqs, expected):
+    assert _swept_widths(monkeypatch, max_num_seqs) == expected
 
 
-def test_a_row_count_is_swept_once():
-    """Cells padding to the same body bucket must not re-pay the sweep."""
-    runner, traced = _runner(max_num_reqs=4)
-    _sweep(runner, 256)
-    first = len(traced)
-    _sweep(runner, 256)
-    assert len(traced) == first
-
-    _sweep(runner, 512)
-    assert len(traced) == 2 * first, "a different body bucket is a different shape"
-
-
-def test_the_request_count_cannot_exceed_the_rows_available():
-    """``num_reqs > rows`` would make ``num_tokens // num_reqs`` zero."""
-    runner, traced = _runner(max_num_reqs=8)
-    _sweep(runner, 3)
-
-    assert max(num_reqs for _rows, _task, num_reqs in traced) == 3
-
-
-def test_a_cpu_pooler_is_not_swept():
-    """An unpatched pooler runs on the host, where no shape compiles."""
-    runner, traced = _runner(on_spyre=False)
-    _sweep(runner, 512)
-
-    assert traced == []
+def test_sweep_never_exceeds_the_available_rows(monkeypatch):
+    """A body smaller than the rounded-up width has nothing to gather from."""
+    assert max(_swept_widths(monkeypatch, ROWS * 4)) <= ROWS

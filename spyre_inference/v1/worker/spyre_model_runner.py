@@ -1291,16 +1291,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
-        """Compile every index width against the fixed pooling body source.
-
-        ``_dummy_pooler_run`` only ever pools ``min(num_tokens, max_num_seqs)``
-        rows, but serving pools one row per *request* -- any count from 1 up. That
-        gather specializes on the exact index length, so every unseen count paid a
-        full Inductor compile mid-request. Token pooling has a separate domain --
-        declared prompt lengths -- just as decoder logits have sampled-row widths
-        separate from body buckets. Mixed-task dispatch keeps every group at the body
-        width, so warming both index domains from this one source closes the set.
-        """
+        """Compile sequence and token index widths against the fixed body source."""
         if not self._pooling_on_spyre:
             return
         rows = hidden_states.shape[0]

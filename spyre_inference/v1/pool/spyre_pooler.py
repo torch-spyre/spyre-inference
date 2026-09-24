@@ -211,30 +211,7 @@ class SpyreMeanPool(MeanPool):
 
 
 class SpyreDispatchPooler(DispatchPooler):
-    """``DispatchPooler`` that keeps every sub-pooler on the body row count.
-
-    Upstream slices ``hidden_states`` down to the group's *real* token count
-    before handing it to the sub-pooler (``DispatchPooler.forward``:
-    ``hidden_states[token_offset : token_offset + num_group_tokens]``). On Spyre
-    that makes ``select_rows``' ``index_select`` source shape track the prompt
-    length, so ``torch.compile(dynamic=False)`` adds a specialization per distinct
-    length and Dynamo rescans a growing guard chain on every later call —
-    throughput decays as more distinct lengths are seen, which is why
-    ``TorchSpyreModelRunner._pool`` deliberately hands this a padded tensor in the
-    first place. Undoing the slice here is what makes that intent hold.
-
-    Safe because the Spyre seqwise poolers address rows through
-    ``cursor_row_indices_cpu``, which only ever names rows inside the real range —
-    they never read the padding the slice would have removed.
-
-    A batch can carry several task groups -- ``DispatchPooler.for_embedding`` serves
-    both ``embed`` and ``token_embed``, and ``PoolingMetadata.tasks`` is per request.
-    Every sub-pooler derives its row indices from the group's token counts alone, base
-    0, so a group at a nonzero offset is gathered back onto the fixed body row count
-    instead of upstream's exact slice; the first group already has that shape. This is
-    the same normalization used by the model body: one source width is cheaper to warm
-    completely than the Cartesian product of group and downstream gather widths.
-    """
+    """Keep every task group's hidden states at the warmed body row count."""
 
     def forward(self, hidden_states, pooling_metadata):
         if hidden_states.device.type != "spyre" or pooling_metadata.pooling_cursor is None:
@@ -276,12 +253,7 @@ def _gather_group_rows(
     num_group_tokens: int,
     total_rows: int,
 ) -> torch.Tensor:
-    """The group's rows, starting at 0, padded to the fixed body row count.
-
-    A plain slice would carry a real-length shape *and* a varying ``storage_offset``,
-    which is a graph guard of its own (torch-spyre#4449).
-    """
-    # Rows past the group clamp onto its last one: in bounds, and never addressed.
+    # Slicing adds shape and storage-offset guards (torch-spyre#4449).
     indices = token_offset + torch.arange(total_rows, dtype=torch.int64).clamp(
         max=num_group_tokens - 1
     )
@@ -289,11 +261,6 @@ def _gather_group_rows(
 
 
 def _rebase_group_rows(group_metadata, group_cursor, token_offset: int):
-    """Upstream's cursor rebase, so absolute row indices match the gathered rows.
-
-    The Spyre poolers read ``num_scheduled_tokens_cpu`` instead, so this only matters
-    to a sub-pooler that indexes the cursor directly.
-    """
     return dataclasses.replace(
         group_metadata,
         pooling_cursor=dataclasses.replace(

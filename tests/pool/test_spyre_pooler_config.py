@@ -389,11 +389,10 @@ def test_spyre_token_pooler_trims_bucketed_rows_to_real_lengths():
 
 
 class _SubclassTokenPooler(TokenPooler):
-    """A ``TokenPooler`` subclass; the installed vllm ships none."""
+    pass
 
 
 def test_token_pooler_subclass_is_patched_but_warns_that_gathers_stay_real_length(caplog):
-    """Without the trim the gather keeps the real length, and nothing reports it."""
     pooling = AllPool.__new__(AllPool)
     nn.Module.__init__(pooling)
     pooling.enable_chunked_prefill = False
@@ -530,8 +529,6 @@ _ANY_TASK = ("embed", "encode", "token_embed", "classify")
 
 
 class _RecordingPooler(nn.Module):
-    """Stands in for a sub-pooler; records what each call was handed."""
-
     def __init__(self) -> None:
         super().__init__()
         self.seen_rows: int | None = None
@@ -551,7 +548,6 @@ class _RecordingPooler(nn.Module):
 
 
 def _real_dispatch_metadata(counts: list[int], tasks: list[str]) -> PoolingMetadata:
-    """A genuine ``PoolingMetadata``: the dispatcher slices and rebases it per group."""
     prompt_lens = torch.tensor(counts, dtype=torch.int64)
     metadata = PoolingMetadata(
         prompt_lens=prompt_lens,
@@ -593,7 +589,6 @@ def test_spyre_dispatch_pooler_keeps_hidden_states_bucketed():
 
 
 def test_spyre_dispatch_pooler_defers_to_upstream_off_device(monkeypatch):
-    """The bypass is a Spyre workaround; CPU keeps upstream's exact slice."""
     called: list[bool] = []
 
     def fake_super_forward(self, hidden_states, pooling_metadata):
@@ -611,14 +606,7 @@ def test_spyre_dispatch_pooler_defers_to_upstream_off_device(monkeypatch):
     assert called == [True]
 
 
-# ---------------------------------------------------------------------------
-# Multi-task groups. Upstream slices each group to its real token sum, which is
-# one compiled index_select shape per distinct sum; these pin the fixed-body gather.
-# ---------------------------------------------------------------------------
-
-
 def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
-    """Group 0 already starts at row 0, so it needs no gather at all."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -634,7 +622,6 @@ def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
 
 
 def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
-    """The gather rebases the group onto row 0: every sub-pooler indexes from 0."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -657,7 +644,6 @@ def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
 
 @pytest.mark.parametrize("tail", [33, 40, 50, 64])
 def test_spyre_dispatch_pooler_group_shape_does_not_track_the_token_sum(tail):
-    """The defect, stated as a test: distinct group sums must share one shape."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -672,7 +658,6 @@ def test_spyre_dispatch_pooler_group_shape_does_not_track_the_token_sum(tail):
 
 
 def test_spyre_dispatch_pooler_rebases_the_cursor_onto_the_gathered_rows():
-    """Upstream's rebase, kept: an unpatched sub-pooler reads these indices."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -691,7 +676,6 @@ def test_spyre_dispatch_pooler_rebases_the_cursor_onto_the_gathered_rows():
 
 
 def test_spyre_dispatch_pooler_interleaved_tasks_give_one_group_per_request():
-    """groupby matches upstream: consecutive runs, so alternating tasks split fully."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -711,7 +695,6 @@ def test_spyre_dispatch_pooler_interleaved_tasks_give_one_group_per_request():
 
 
 def test_spyre_dispatch_pooler_tolerates_an_empty_later_group():
-    """A zero-token group has no last real row to clamp a gather onto."""
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 

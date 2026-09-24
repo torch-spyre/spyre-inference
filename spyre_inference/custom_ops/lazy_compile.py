@@ -39,9 +39,12 @@ F = TypeVar("F", bound=Callable)
 class CompileOutermost:
     """Base for layers with one ``@compile_when_outermost`` kernel.
 
-    The mode is sampled here because construction is the only point where the vLLM
+    The mode is sampled at construction because that is the only point where the vLLM
     config context is live; ``enforce_eager`` arrives as mode ``NONE``.
     """
+
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
 
     allow_inference_recompiles: bool = False
     """Set on subclasses whose kernel legitimately recompiles per input shape.
@@ -54,9 +57,13 @@ class CompileOutermost:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.init_spyre_compile()
+
+    def init_spyre_compile(self) -> None:
+        """Sample the compile mode; also called after a ``retype``, which skips ``__init__``."""
         mode = get_cached_compilation_config().mode
         self.spyre_compile_enabled = mode is not CompilationMode.NONE
-        self.spyre_compiled_kernel: Callable | None = None
+        self.spyre_compiled_kernel = None
 
 
 def compile_when_outermost(method: F) -> F:

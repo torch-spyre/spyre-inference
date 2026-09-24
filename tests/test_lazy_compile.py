@@ -187,6 +187,7 @@ def test_the_real_layers_opt_in() -> None:
     from spyre_inference.custom_ops.vocab_parallel_embedding import (
         SpyreVocabParallelEmbedding,
     )
+    from spyre_inference.models.gemma4 import SpyreGemma4SelfDecoderLayers
 
     for cls, method in (
         (SpyreGemmaRMSNorm, "forward_oot"),
@@ -194,6 +195,7 @@ def test_the_real_layers_opt_in() -> None:
         (SpyreVocabParallelEmbedding, "forward"),
         (SpyreUnquantizedLMHeadMethod, "apply"),
         (SpyreLogitsProcessor, "_all_gather_logits"),
+        (SpyreGemma4SelfDecoderLayers, "split_per_layer_inputs"),
     ):
         assert issubclass(cls, CompileOutermost), cls.__name__
         wrapped = getattr(cls, method)

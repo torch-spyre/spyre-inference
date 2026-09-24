@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from spyre_inference.models._retype import retype
+
 if TYPE_CHECKING:
     from torch import nn
     from vllm.sequence import IntermediateTensors
@@ -105,15 +107,7 @@ class SpyreTokenTypeModel:
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)  # ty: ignore[unknown-argument]
-        embeddings = self.spyre_embeddings()
-        upstream_class = self.spyre_embedding_class.__bases__[-1]
-        if type(embeddings) is not upstream_class:
-            raise RuntimeError(
-                f"expected {upstream_class.__name__} embeddings, got "
-                f"{type(embeddings).__name__}; the Spyre token_type transport "
-                "needs updating for this vLLM version."
-            )
-        embeddings.__class__ = self.spyre_embedding_class
+        retype(self.spyre_embeddings(), self.spyre_embedding_class)
 
     def spyre_embeddings(self) -> SpyreTokenTypeEmbedding:
         return getattr(self, self.spyre_encoder_attr).embeddings

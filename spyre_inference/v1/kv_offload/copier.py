@@ -15,38 +15,40 @@
 """Byte-exact KV-page DMA between a Spyre device tensor and a shared host pool."""
 
 import torch
-from torch_spyre._C import (  # ty: ignore[unresolved-import]
-    SharedHostPool,
-    copy_tensor_raw,
-    get_composite_address,
-)
+import torch_spyre._C as torch_spyre_c  # ty: ignore[unresolved-import]
 
 
 class SpyreKvDmaCopier:
     def copy_d2h(
         self,
         dev_tensor: torch.Tensor,
-        pool: SharedHostPool,
+        pool: torch_spyre_c.SharedHostPool,
         slot_id: int,
         *,
         non_blocking: bool = False,
     ) -> None:
-        copy_tensor_raw(dev_tensor, pool, slot_id, to_device=False, non_blocking=non_blocking)
+        torch_spyre_c.copy_tensor_raw(
+            dev_tensor, pool, slot_id, to_device=False, non_blocking=non_blocking
+        )
 
     def copy_h2d(
         self,
         dev_tensor: torch.Tensor,
-        pool: SharedHostPool,
+        pool: torch_spyre_c.SharedHostPool,
         slot_id: int,
         *,
         non_blocking: bool = False,
     ) -> None:
-        copy_tensor_raw(dev_tensor, pool, slot_id, to_device=True, non_blocking=non_blocking)
+        torch_spyre_c.copy_tensor_raw(
+            dev_tensor, pool, slot_id, to_device=True, non_blocking=non_blocking
+        )
 
     @staticmethod
     def slot_bytes_for(dev_tensor: torch.Tensor) -> int:
-        return get_composite_address(dev_tensor).total_size
+        return torch_spyre_c.get_composite_address(dev_tensor).total_size
 
     @staticmethod
-    def create_or_attach_pool(name: str, num_slots: int, slot_bytes: int) -> SharedHostPool:
-        return SharedHostPool.create_or_attach(name, num_slots, slot_bytes)
+    def create_or_attach_pool(
+        name: str, num_slots: int, slot_bytes: int
+    ) -> torch_spyre_c.SharedHostPool:
+        return torch_spyre_c.SharedHostPool.create_or_attach(name, num_slots, slot_bytes)

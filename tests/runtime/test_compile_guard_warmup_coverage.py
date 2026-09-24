@@ -165,7 +165,10 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             ),
         )
         runner.vllm_config = types.SimpleNamespace(
-            model_config=types.SimpleNamespace(enforce_eager=False),
+            model_config=types.SimpleNamespace(
+                enforce_eager=False,
+                max_model_len=runner.model_config.max_model_len,
+            ),
             compilation_config=compilation_config,
         )
         runner.compilation_config = compilation_config
@@ -178,8 +181,12 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             max_num_batched_tokens=64,
             max_num_seqs=MAX_NUM_REQS,
         )
+        runner.vllm_config.scheduler_config = runner.scheduler_config
         runner.supports_mm_inputs = supports_mm_inputs
         runner._spyre_kv_caches = {}
+        runner._encoder_budget = max(bucket_sizes, default=64)
+        runner._encoder_rectangles = []
+        runner._pooling_on_spyre = False
 
         attn = Attention(
             num_heads=1,
@@ -225,8 +232,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             return None, block(hidden)
 
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
-        runner._warmup_pooling_bucket_shapes = lambda: None
-        runner._record_encoder_pack_graphs = lambda: None
+        runner._dummy_pooler_run = lambda hidden_states: None
         runner._record_attention_graphs = lambda: None
         if not warmup_embeddings:
             runner._warmup_input_embedding = lambda num_tokens: None

@@ -136,6 +136,25 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
+def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
+    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
+
+    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
+    avoiding unrelated first-use compiles in the vision tower.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    (text,) = _generate([_conversation()], enforce_eager=False)
+
+    assert text.strip(), "empty text-only generation from the multimodal model"
+
+
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
 def test_two_image_prompt_produces_output():
     """Two images make the vision mask non-trivial: a pair of strided sub-block writes
     rather than one full-range write, which is what `patch_block_attention_mask` is for.

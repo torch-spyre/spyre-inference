@@ -17,6 +17,7 @@
 # aiops trace runs at 4k, cics at 8k.
 
 defaults:
+  server_health_timeout: 1800
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
@@ -42,7 +43,6 @@ defaults:
 
 tests:
   - test_name: serve_granite33-8b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-3.3-8b-instruct
       tensor-parallel-size: 1
@@ -60,7 +60,6 @@ tests:
       dataset-path: ${SPYRE_CICS_DATASET}
 
   - test_name: serve_granite41-8b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: ibm-granite/granite-4.1-8b
       tensor-parallel-size: 1
@@ -98,7 +97,6 @@ tests:
       num-prompts: 50
 
   - test_name: serve_gemma4-26b-a4b_tp1_cics
-    server_health_timeout: 1800
     server_parameters:
       model: google/gemma-4-26B-A4B
       tensor-parallel-size: 1
@@ -116,3 +114,123 @@ tests:
     parameters:
       dataset-path: ${SPYRE_CICS_DATASET}
       num-prompts: 50
+
+  - test_name: serve_granite-embedding-125m-english_tp1_in64
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-125m-english
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_in64
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_multilingual-e5-large_tp1_in64
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: intfloat/multilingual-e5-large
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_all-roberta-large-v1_tp1_in64
+    server_parameters:
+      model: sentence-transformers/all-roberta-large-v1
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 256
+    parameters:
+      model: sentence-transformers/all-roberta-large-v1
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 256
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_bge-reranker-v2-m3_tp1_in64
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: BAAI/bge-reranker-v2-m3
+      backend: vllm-rerank
+      endpoint: /rerank
+      dataset-name: random-rerank
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_bge-reranker-large_tp1_in64
+    server_parameters:
+      model: BAAI/bge-reranker-large
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: BAAI/bge-reranker-large
+      backend: vllm-rerank
+      endpoint: /rerank
+      dataset-name: random-rerank
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf

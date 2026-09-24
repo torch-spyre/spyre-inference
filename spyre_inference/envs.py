@@ -98,8 +98,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
     # When "1", enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
-    # per-seq loop either way. Disabled by default because the batched kernel's
-    # multi-block tile is not supported by the default tiled attention walk.
+    # per-seq loop either way. Disabled by default. Under the default tiled walk
+    # it applies only to the head-major cache, which uses a split page index.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache

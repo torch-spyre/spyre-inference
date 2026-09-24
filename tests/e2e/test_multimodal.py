@@ -136,11 +136,11 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-def test_warmup_covers_the_multimodal_token_embedding(monkeypatch):
+def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
     """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
 
-    Only a multimodal model reaches the token embedding through ``embed_input_ids``, so
-    the text-only twin in ``tests/e2e/test_compile.py`` cannot stand in.
+    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
+    avoiding unrelated first-use compiles in the vision tower.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")
@@ -148,10 +148,9 @@ def test_warmup_covers_the_multimodal_token_embedding(monkeypatch):
     monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
-    uri = _synthetic_image_data_uri()
-    (text,) = _generate([_conversation(uri)], enforce_eager=False)
+    (text,) = _generate([_conversation()], enforce_eager=False)
 
-    assert text.strip(), "empty generation from the multimodal path"
+    assert text.strip(), "empty text-only generation from the multimodal model"
 
 
 @pytest.mark.multimodal

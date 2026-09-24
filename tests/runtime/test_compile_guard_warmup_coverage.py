@@ -146,6 +146,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         warmup_embeddings: bool = True,
         bucket_sizes: tuple[int, ...] = tuple(BODY_BUCKETS),
         mm_encoder_only: bool = False,
+        runner_type: str = "generate",
     ):
         # NONE keeps warmup off the attention recorder, which needs a real KV cache.
         compilation_config = types.SimpleNamespace(
@@ -156,8 +157,9 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         )
         runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
         runner.model_config = types.SimpleNamespace(
-            runner_type="generate",
+            runner_type=runner_type,
             is_encoder_decoder=False,
+            max_model_len=max(bucket_sizes, default=64),
             multimodal_config=(
                 types.SimpleNamespace(mm_encoder_only=True) if mm_encoder_only else None
             ),
@@ -172,8 +174,12 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             SpyreShapeBucketer(runner.vllm_config) if bucket_sizes else None
         )
         runner.max_num_reqs = MAX_NUM_REQS
-        runner.scheduler_config = types.SimpleNamespace(max_num_batched_tokens=64)
+        runner.scheduler_config = types.SimpleNamespace(
+            max_num_batched_tokens=64,
+            max_num_seqs=MAX_NUM_REQS,
+        )
         runner.supports_mm_inputs = supports_mm_inputs
+        runner._spyre_kv_caches = {}
 
         attn = Attention(
             num_heads=1,
@@ -219,6 +225,9 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
             return None, block(hidden)
 
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
+        runner._warmup_pooling_bucket_shapes = lambda: None
+        runner._record_encoder_pack_graphs = lambda: None
+        runner._record_attention_graphs = lambda: None
         if not warmup_embeddings:
             runner._warmup_input_embedding = lambda num_tokens: None
 
@@ -335,8 +344,15 @@ def test_an_mm_encoder_only_model_is_not_embedded_during_warmup(build_runner):
     assert decoder.embed_calls == []
 
 
+def test_pooling_warms_each_embedding_bucket_once(build_runner):
+    """Attention-shape dummy runs must not replay compiled embedding collectives."""
+    _, _, decoder = build_runner(runner_type="pooling")
+
+    assert decoder.embed_calls == sorted(BODY_BUCKETS, reverse=True)
+
+
 def test_single_pass_without_buckets_still_warms_the_embedding(build_runner):
-    """An explicit empty compile-size list still takes the multimodal request path."""
+    """An empty compile-size list warms the single configured dummy width."""
     runner, _, decoder = build_runner(bucket_sizes=[])
     warmup_tokens = min(max(16, MAX_NUM_REQS), runner.scheduler_config.max_num_batched_tokens)
 

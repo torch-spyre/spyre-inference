@@ -836,6 +836,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # would crash. _warmup_pooling_bucket_shapes below covers
                         # attention at the shapes that do respect max_model_len.
                         self._dummy_run(size, force_attention=size <= max_model_len)
+                        self._warmup_input_embedding(size)
                     self.spyre_shape_bucketer.mark_warmed_up()
                 self._warmup_pooling_bucket_shapes()
                 self._record_encoder_pack_graphs()
@@ -862,6 +863,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
+                self._warmup_input_embedding(num_tokens)
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -883,6 +885,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
+                self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
@@ -1231,7 +1234,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
             attn_layer.publish_null_slots(num_tokens)
-            self._warmup_input_embedding(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

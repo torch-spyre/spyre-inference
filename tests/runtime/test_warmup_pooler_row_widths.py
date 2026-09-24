@@ -28,21 +28,29 @@ ROWS = 64
 HIDDEN = 8
 
 
-def _swept_widths(monkeypatch, max_num_seqs: int) -> list[int]:
+def _swept_shapes(
+    monkeypatch, max_num_seqs: int, len_ladder: list[int] | None = None
+) -> list[tuple[int, int]]:
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner._pooling_on_spyre = True
     runner.scheduler_config = types.SimpleNamespace(max_num_seqs=max_num_seqs)
+    runner._encoder_len_ladder = len_ladder or []
 
-    widths: list[int] = []
+    shapes: list[tuple[int, int]] = []
+
+    def record(hidden_states, row_indices):
+        shapes.append((hidden_states.shape[0], int(row_indices.numel())))
+        return torch.zeros(row_indices.numel(), HIDDEN, dtype=torch.float16)
+
     monkeypatch.setattr(
         spyre_model_runner,
         "select_rows",
-        lambda hidden_states, row_indices: widths.append(int(row_indices.numel())),
+        record,
     )
     TorchSpyreModelRunner._warm_pooler_row_widths(
         runner, torch.zeros(ROWS, HIDDEN, dtype=torch.float16)
     )
-    return widths
+    return shapes
 
 
 @pytest.mark.parametrize(
@@ -55,9 +63,19 @@ def _swept_widths(monkeypatch, max_num_seqs: int) -> list[int]:
     ],
 )
 def test_sweep_reaches_the_rounded_up_width(monkeypatch, max_num_seqs, expected):
-    assert _swept_widths(monkeypatch, max_num_seqs) == expected
+    shapes = set(_swept_shapes(monkeypatch, max_num_seqs))
+    assert {(ROWS, width) for width in expected} <= shapes
 
 
 def test_sweep_never_exceeds_the_available_rows(monkeypatch):
     """A body smaller than the rounded-up width has nothing to gather from."""
-    assert max(_swept_widths(monkeypatch, ROWS * 4)) <= ROWS
+    assert max(width for _, width in _swept_shapes(monkeypatch, ROWS * 4)) <= ROWS
+
+
+def test_sweep_covers_token_lengths_from_the_fixed_body(monkeypatch):
+    shapes = set(_swept_shapes(monkeypatch, max_num_seqs=2, len_ladder=[64, 128]))
+
+    assert (ROWS, 1) in shapes
+    assert (ROWS, 2) in shapes
+    assert (ROWS, 64) in shapes
+    assert (ROWS, 128) in shapes, "token gather may pad past its source width"

@@ -210,20 +210,8 @@ class SpyreMeanPool(MeanPool):
         return super().forward(hidden_states, pooling_metadata)
 
 
-def group_row_bucket(num_group_tokens: int, total_rows: int) -> int:
-    """Rows to gather for one task group: a power of two, capped at ``total_rows``.
-
-    Same rounding as ``pad_row_count_to_bucket``, on a token sum rather than a request
-    count. The cap is the declared body shape, so a group covering most of the batch
-    costs no shape of its own.
-    """
-    if num_group_tokens >= total_rows:
-        return total_rows
-    return min(1 << (num_group_tokens - 1).bit_length(), total_rows)
-
-
 class SpyreDispatchPooler(DispatchPooler):
-    """``DispatchPooler`` that hands every sub-pooler a *bucketed* row count.
+    """``DispatchPooler`` that keeps every sub-pooler on the body row count.
 
     Upstream slices ``hidden_states`` down to the group's *real* token count
     before handing it to the sub-pooler (``DispatchPooler.forward``:
@@ -242,8 +230,10 @@ class SpyreDispatchPooler(DispatchPooler):
     A batch can carry several task groups -- ``DispatchPooler.for_embedding`` serves
     both ``embed`` and ``token_embed``, and ``PoolingMetadata.tasks`` is per request.
     Every sub-pooler derives its row indices from the group's token counts alone, base
-    0, so a group at a nonzero offset gets a gather onto ``group_row_bucket`` instead
-    of upstream's exact slice; the first group already starts at row 0.
+    0, so a group at a nonzero offset is gathered back onto the fixed body row count
+    instead of upstream's exact slice; the first group already has that shape. This is
+    the same normalization used by the model body: one source width is cheaper to warm
+    completely than the Cartesian product of group and downstream gather widths.
     """
 
     def forward(self, hidden_states, pooling_metadata):
@@ -286,14 +276,15 @@ def _gather_group_rows(
     num_group_tokens: int,
     total_rows: int,
 ) -> torch.Tensor:
-    """The group's rows, starting at 0, padded up to ``group_row_bucket``.
+    """The group's rows, starting at 0, padded to the fixed body row count.
 
     A plain slice would carry a real-length shape *and* a varying ``storage_offset``,
     which is a graph guard of its own (torch-spyre#4449).
     """
-    rows = group_row_bucket(num_group_tokens, total_rows)
     # Rows past the group clamp onto its last one: in bounds, and never addressed.
-    indices = token_offset + torch.arange(rows, dtype=torch.int64).clamp(max=num_group_tokens - 1)
+    indices = token_offset + torch.arange(total_rows, dtype=torch.int64).clamp(
+        max=num_group_tokens - 1
+    )
     return select_rows(hidden_states, indices)
 
 

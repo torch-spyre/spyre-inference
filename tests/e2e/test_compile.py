@@ -120,6 +120,46 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
+def test_compiled_pooling_mixed_tasks_need_no_late_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed embed/token_embed groups stay within the warmed gather shapes."""
+    from vllm import LLM
+    from vllm.config import PoolerConfig
+    from vllm.outputs import PoolingRequestOutput
+    from vllm.pooling_params import PoolingParams
+
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    engine = LLM(
+        model=_POOLING_MODEL,
+        runner="pooling",
+        enforce_eager=False,
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=128,
+        pooler_config=PoolerConfig(task="embed"),
+    )
+
+    for iteration, token_len in enumerate((33, 40, 50, 64)):
+        embed_id = str(iteration * 2)
+        token_id = str(iteration * 2 + 1)
+        engine.llm_engine.add_request(
+            embed_id,
+            {"prompt_token_ids": [1] * 32},
+            PoolingParams(task="embed"),
+        )
+        engine.llm_engine.add_request(
+            token_id,
+            {"prompt_token_ids": [1] * token_len},
+            PoolingParams(task="token_embed"),
+        )
+        outputs = engine._run_engine(PoolingRequestOutput, use_tqdm=False)
+        by_id = {output.request_id: output for output in outputs}
+        assert len(by_id[embed_id].outputs.data) == 768
+        assert by_id[token_id].outputs.data.shape == (token_len, 768)
+
+
 def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compile the Transformers backend and check against a known reference.
 

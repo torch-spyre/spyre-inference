@@ -59,7 +59,6 @@ from spyre_inference.v1.pool.spyre_pooler import (
     SpyreNormalize,
     SpyreTokenPooler,
     configure_pooling_for_spyre,
-    group_row_bucket,
     patch_pooler_for_spyre,
     run_pooling_tail_on_cpu,
 )
@@ -614,24 +613,8 @@ def test_spyre_dispatch_pooler_defers_to_upstream_off_device(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # Multi-task groups. Upstream slices each group to its real token sum, which is
-# one compiled index_select shape per distinct sum; these pin the bucketed gather.
+# one compiled index_select shape per distinct sum; these pin the fixed-body gather.
 # ---------------------------------------------------------------------------
-
-
-def test_group_row_bucket_rounds_onto_powers_of_two():
-    assert group_row_bucket(1, 1024) == 1
-    assert group_row_bucket(9, 1024) == 16
-    assert group_row_bucket(64, 1024) == 64
-    assert group_row_bucket(65, 1024) == 128
-    assert group_row_bucket(300, 1024) == 512
-
-
-def test_group_row_bucket_caps_at_the_padded_row_count():
-    """The full tensor is itself a warmed shape, so a wide group is free."""
-    assert group_row_bucket(200, 256) == 256
-    assert group_row_bucket(256, 256) == 256
-    # Never below the real count, even when the cap is not itself a bucket.
-    assert group_row_bucket(80, 100) == 100
 
 
 def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
@@ -647,7 +630,7 @@ def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
     pooler(hidden_states, _real_dispatch_metadata([100, 100, 9], ["embed", "embed", "token_embed"]))
 
     assert embed.seen_rows == 256
-    assert token.seen_rows == 16, "a later group must be bucketed, not sliced to 9"
+    assert token.seen_rows == 256, "every group must keep the warmed body shape"
 
 
 def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
@@ -685,7 +668,7 @@ def test_spyre_dispatch_pooler_group_shape_does_not_track_the_token_sum(tail):
 
     pooler(hidden_states, _real_dispatch_metadata([100, tail], ["embed", "token_embed"]))
 
-    assert token.seen_rows == 64
+    assert token.seen_rows == 256
 
 
 def test_spyre_dispatch_pooler_rebases_the_cursor_onto_the_gathered_rows():

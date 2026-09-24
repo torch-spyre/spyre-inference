@@ -118,6 +118,7 @@ tests:
   - test_name: serve_granite-embedding-125m-english_tp1_in64
     server_parameters:
       model: ibm-granite/granite-embedding-125m-english
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 512
@@ -137,6 +138,7 @@ tests:
   - test_name: serve_granite-embedding-278m-multilingual_tp1_in64
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 512
@@ -156,6 +158,7 @@ tests:
   - test_name: serve_multilingual-e5-large_tp1_in64
     server_parameters:
       model: intfloat/multilingual-e5-large
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 512
@@ -175,6 +178,7 @@ tests:
   - test_name: serve_all-roberta-large-v1_tp1_in64
     server_parameters:
       model: sentence-transformers/all-roberta-large-v1
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 256
@@ -194,6 +198,7 @@ tests:
   - test_name: serve_bge-reranker-v2-m3_tp1_in64
     server_parameters:
       model: BAAI/bge-reranker-v2-m3
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 512
@@ -213,6 +218,7 @@ tests:
   - test_name: serve_bge-reranker-large_tp1_in64
     server_parameters:
       model: BAAI/bge-reranker-large
+      tensor-parallel-size: 1
       runner: pooling
       dtype: float16
       max-model-len: 512

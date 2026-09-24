@@ -24,7 +24,7 @@ import torch
 from spyre_inference.v1.worker import spyre_model_runner
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
-ROWS = 64
+ROWS = 128
 HIDDEN = 8
 
 
@@ -78,4 +78,9 @@ def test_sweep_covers_token_lengths_from_the_fixed_body(monkeypatch):
     assert (ROWS, 1) in shapes
     assert (ROWS, 2) in shapes
     assert (ROWS, 64) in shapes
-    assert (ROWS, 128) in shapes, "token gather may pad past its source width"
+    assert (ROWS, 128) in shapes
+
+
+def test_sweep_rejects_a_token_length_larger_than_the_fixed_body(monkeypatch):
+    with pytest.raises(AssertionError, match="pooler gather width exceeds"):
+        _swept_shapes(monkeypatch, max_num_seqs=2, len_ladder=[64, ROWS * 2])

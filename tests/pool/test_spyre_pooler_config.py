@@ -26,8 +26,6 @@ of a device fp32 sum is ``test_spyre_fp32_reduce_d2h_with_destagger``
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import pytest
 import torch
@@ -392,20 +390,18 @@ class _SubclassTokenPooler(TokenPooler):
     pass
 
 
-def test_token_pooler_subclass_is_patched_but_warns_that_gathers_stay_real_length(caplog):
+def test_token_pooler_subclass_is_unsupported_and_left_unchanged():
     pooling = AllPool.__new__(AllPool)
     nn.Module.__init__(pooling)
     pooling.enable_chunked_prefill = False
     pooler = _SubclassTokenPooler(pooling=pooling, head=None)
 
-    with caplog.at_level(logging.WARNING):
-        num_patched, unsupported = patch_pooler_for_spyre(pooler)
+    original_pooling = pooler.pooling
+    num_patched, unsupported = patch_pooler_for_spyre(pooler)
 
-    assert (num_patched, unsupported) == (1, [])
-    assert isinstance(pooler.pooling, SpyreAllPool)
-    assert pooler.pooling.defer_trim is False
+    assert (num_patched, unsupported) == (0, ["_SubclassTokenPooler"])
+    assert pooler.pooling is original_pooling
     assert not isinstance(pooler, SpyreTokenPooler)
-    assert "subclasses TokenPooler" in caplog.text
 
 
 def test_token_pooler_step_pool_is_unsupported():
@@ -694,7 +690,7 @@ def test_spyre_dispatch_pooler_interleaved_tasks_give_one_group_per_request():
     assert token.seen_calls == 2
 
 
-def test_spyre_dispatch_pooler_tolerates_an_empty_later_group():
+def test_spyre_dispatch_pooler_rejects_an_empty_group():
     if not spyre_available():
         pytest.skip("needs Spyre: the bypass is device-gated")
 
@@ -703,9 +699,8 @@ def test_spyre_dispatch_pooler_tolerates_an_empty_later_group():
     pooler.__class__ = SpyreDispatchPooler
     hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
 
-    pooler(hidden_states, _real_dispatch_metadata([100, 0], ["embed", "token_embed"]))
-
-    assert token.seen_rows == 256
+    with pytest.raises(ValueError, match="at least one scheduled token"):
+        pooler(hidden_states, _real_dispatch_metadata([100, 0], ["embed", "token_embed"]))
 
 
 def test_spyre_dispatch_pooler_rejects_an_unsupported_task():

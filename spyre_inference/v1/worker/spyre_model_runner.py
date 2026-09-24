@@ -1329,6 +1329,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             width *= 2
 
         downstream_widths = sorted(set(request_widths) | set(self._encoder_len_ladder))
+        assert not downstream_widths or downstream_widths[-1] <= rows, (
+            f"pooler gather width exceeds the fixed encoder body: {downstream_widths[-1]} > {rows}"
+        )
         for index_rows in downstream_widths:
             select_rows(hidden_states, torch.zeros(index_rows, dtype=torch.int64))
 

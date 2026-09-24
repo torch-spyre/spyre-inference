@@ -233,13 +233,14 @@ class SpyreDispatchPooler(DispatchPooler):
             group_cursor = group_metadata.pooling_cursor
             assert group_cursor is not None
             num_group_tokens = int(group_cursor.num_scheduled_tokens_cpu.sum())
-            if token_offset and num_group_tokens:
+            if not num_group_tokens:
+                raise ValueError("A pooling task group must contain at least one scheduled token")
+            if token_offset:
                 group_metadata = _rebase_group_rows(group_metadata, group_cursor, token_offset)
                 group_hidden_states = _gather_group_rows(
                     hidden_states, token_offset, num_group_tokens, total_rows
                 )
             else:
-                # An empty group has no last real row to clamp a gather onto.
                 group_hidden_states = hidden_states
             outputs.extend(pooler(group_hidden_states, group_metadata))
             req_offset += num_items
@@ -604,6 +605,11 @@ def patch_pooler_for_spyre(
         elif isinstance(pooling, SequencePoolingMethod):
             unsupported.append(type(pooling).__name__)
     elif isinstance(pooler, TokenPooler):
+        if type(pooler) is not TokenPooler and not isinstance(pooler, SpyreTokenPooler):
+            # SpyreTokenPooler.forward delegates to TokenPooler.forward, so changing
+            # an arbitrary subclass's class would silently drop its behavior.
+            unsupported.append(type(pooler).__name__)
+            return num_patched, unsupported
         pooling = pooler.pooling
         if isinstance(pooling, SpyreAllPool):
             num_patched += 1
@@ -615,18 +621,8 @@ def patch_pooler_for_spyre(
         # Bucketing the gather is only safe when something trims afterwards, so
         # the two are switched on together and never independently.
         if isinstance(pooler.pooling, SpyreAllPool) and not isinstance(pooler, SpyreTokenPooler):
-            if type(pooler) is TokenPooler:
-                pooler.__class__ = SpyreTokenPooler
-                pooler.pooling.defer_trim = True
-            else:
-                # The swap must be exact: SpyreTokenPooler.forward delegates to
-                # TokenPooler.forward, so rebasing a subclass would drop what it adds.
-                logger.warning(
-                    "Pooling: %s subclasses TokenPooler, so the trim that makes a "
-                    "bucketed gather safe cannot be installed; token gathers keep each "
-                    "request's real length and compile one shape per distinct length.",
-                    type(pooler).__name__,
-                )
+            pooler.__class__ = SpyreTokenPooler
+            pooler.pooling.defer_trim = True
     elif isinstance(pooler, DispatchPooler):
         for sub in pooler.poolers_by_task.values():
             sub_patched, sub_unsupported = patch_pooler_for_spyre(sub, len_ladder)

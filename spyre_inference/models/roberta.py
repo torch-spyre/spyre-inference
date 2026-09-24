@@ -90,18 +90,29 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     model_config.max_model_len = usable
 
 
-def offset_roberta_position_ids(
-    position_ids: torch.Tensor, padding_idx: int, device: torch.device
-) -> torch.Tensor:
+@torch.library.custom_op("spyre_inference::roberta_offset_positions", mutates_args=())
+def offset_roberta_position_ids(position_ids: torch.Tensor, padding_idx: int) -> torch.Tensor:
     """``position_ids + padding_idx + 1`` on CPU, then H2D as int64.
 
     Stock torch-spyre cannot schedule SDSC int32 add (warmup crash:
     ``0_add``), and int64 add CPU-falls-back through ``to_dtype``. Keep the
     offset off the device so position embedding is only a gather.
+
+    A custom op, not a plain function, so the host round trip is one opaque node.
+    Inlined, the intermediate is a CPU tensor *inside* the graph, and Inductor lowers
+    its dtype conversion to ``spyre::to_dtype_cpu``, which has no CPU registration --
+    whole-model compile then dies in warmup. ``convert`` is opaque for the same reason;
+    it is the arithmetic between two converts that has to be hidden too.
     """
+    device = position_ids.device
     pos = convert(position_ids, device="cpu")
     pos = pos + int(padding_idx) + 1
     return convert(pos, device=device, dtype=torch.int64)
+
+
+@offset_roberta_position_ids.register_fake
+def _offset_roberta_position_ids_fake(position_ids: torch.Tensor, padding_idx: int) -> torch.Tensor:
+    return torch.empty_like(position_ids, dtype=torch.int64)
 
 
 class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
@@ -120,9 +131,7 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
         embeddings = (
             inputs_embeds
             + self.spyre_token_type_embeddings(input_ids)
-            + self.position_embeddings(
-                offset_roberta_position_ids(position_ids, self.padding_idx, input_ids.device)
-            )
+            + self.position_embeddings(offset_roberta_position_ids(position_ids, self.padding_idx))
         )
         return self.LayerNorm(embeddings)
 

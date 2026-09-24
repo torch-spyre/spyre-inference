@@ -47,6 +47,7 @@ from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kerne
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
     slot_major_kv_layout,
+    temporary_chunk_major_page_index_layout,
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
@@ -1216,7 +1217,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _tiled_batched_decode_supported(self) -> bool:
         """Whether batched decode may run under the tiled walk; overridable."""
-        return False
+        return True
 
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
         if not self._batched_decode_supported():
@@ -1635,6 +1636,30 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.rep_row_ids_cpu is not None
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
+        if tile_loop.USE_FOR_EACH_TILE:
+            # The CPU fields keep their main shape for every other reader.
+            b = attn_metadata.padded_num_seqs
+            bpc = attn_metadata.blocks_per_chunk
+            assert b is not None and bpc is not None
+            e = bpc * b
+            c = attn_metadata.chunk_page_ids_cpu.shape[0] // bpc
+            idx = (
+                attn_metadata.chunk_page_ids_cpu.reshape(c, bpc, b)
+                .reshape(c, e, 1)
+                .to(torch.int32)
+                .contiguous()
+            )
+            attn_metadata.chunk_page_ids_dev = idx.to(  # ty: ignore[no-matching-overload]
+                device, device_layout=temporary_chunk_major_page_index_layout(c, e)
+            )
+            attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+            attn_metadata.mask_by_chunk_dev = convert(
+                attn_metadata.mask_by_chunk_cpu.reshape(
+                    c, bpc, b, *attn_metadata.mask_by_chunk_cpu.shape[2:]
+                ),
+                device=device,
+            )
+            return
         attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
         attn_metadata.chunk_page_ids_dev = convert(attn_metadata.chunk_page_ids_cpu, device=device)
         attn_metadata.mask_by_chunk_dev = convert(attn_metadata.mask_by_chunk_cpu, device=device)

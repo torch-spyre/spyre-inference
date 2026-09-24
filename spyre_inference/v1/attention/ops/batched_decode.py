@@ -16,7 +16,7 @@
 
 import torch
 
-from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+from spyre_inference.v1.attention.ops.tile_loop import USE_FOR_EACH_TILE, walk_tiles
 
 
 def batched_decode_kernel(
@@ -53,6 +53,7 @@ def batched_decode_kernel(
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
+    split_index = USE_FOR_EACH_TILE
     q = query.index_select(0, rep_row_ids).reshape(
         entries, num_kv_heads, num_queries_per_kv, head_size
     )
@@ -72,6 +73,10 @@ def batched_decode_kernel(
 
     def chunk_body(carry, tiles):
         page_ids, mask_rows, k_pages, v_pages, q = tiles
+        if split_index:
+            # The tile is chunk-major, so shape[3:] still carries the KV axis.
+            page_ids = page_ids[0]
+            mask_rows = mask_rows.reshape(blocks_per_chunk, num_seqs, *mask_rows.shape[3:])
         # Advanced indexing on the [block-slot, sequence] tile, not index_select on a
         # 1-D one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
         # so a narrow gather gets one core, and flattening the tile first needs an
@@ -128,7 +133,7 @@ def batched_decode_kernel(
         chunk_body,
         (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
         dims=(0, 0, None, None, None),
-        tile_size=blocks_per_chunk,
+        tile_size=1 if split_index else blocks_per_chunk,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),
             torch.zeros(state_shape, **state_kwargs),

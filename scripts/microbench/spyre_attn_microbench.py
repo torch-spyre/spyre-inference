@@ -1100,7 +1100,7 @@ def main():
         default=None,
         help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
         "'head_major' stores a page as [KV, block_size, head_size] and selects the "
-        "head-major backend, which has no batched decode kernel.",
+        "head-major backend.",
     )
     ap.add_argument(
         "--span",
@@ -1189,11 +1189,6 @@ def main():
     # Selects the backend via the platform, and is cached on first envs read like the rest.
     attn_kv_layout = cfg.setdefault("attn_kv_layout", "token_major")
     os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    if attn_kv_layout == "head_major" and next(iter(batched_modes)):
-        raise SystemExit(
-            "the head-major KV layout has no batched decode kernel; run the batched "
-            "variant on token_major."
-        )
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries)

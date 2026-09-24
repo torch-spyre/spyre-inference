@@ -28,12 +28,18 @@ def pytest_collection_modifyitems(items):
         # Match only the test id/class/parameter portion, not the file path: the
         # global skip must not exclude the card-free entry-local CPU tests by filename.
         nodeid = item.nodeid.partition("::")[2].lower()
-        if (
+        token_major_fet = "test_spyre_attn_batched_decode_correctness" in nodeid and (
+            "bucket_pad(n=9_bucket=16)" in nodeid or "bucket_exact(n=32)" in nodeid
+        )
+        if token_major_fet:
+            continue
+        batched_decode_test = (
             "batched_decode" in nodeid
             or "batcheddecode" in nodeid
             or "enable_batched_decode" in item.fixturenames
             or "batched_decode_calls" in item.fixturenames
-        ):
+        )
+        if batched_decode_test and "device_spyre" in nodeid:
             item.add_marker(skip)
 
 

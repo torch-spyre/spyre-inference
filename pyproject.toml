@@ -82,8 +82,6 @@ override-dependencies = [
     # stale 0.2.0 wheel back in on Power/Z.
     "torchvision; platform_machine not in 's390x, ppc64le'",
 
-    "torchcodec; platform_machine == 'never'",
-
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
 
@@ -129,7 +127,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "336dad3003f6f85d13cda0dc3f9f0983371deb33" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "011e8df526102d9cb28702cab7be43a525e9835b" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

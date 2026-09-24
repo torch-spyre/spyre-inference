@@ -568,6 +568,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_buffer_rows = 0
         # (extent, width, query_lens) on the rectangular path; None on the ragged one.
         self._encoder_grid: tuple[int, int, list[int]] | None = None
+        # Warmup only; see _warm_encoder_inline_paths.
+        self._forced_encoder_rect: tuple[int, int] | None = None
+        self._force_encoder_ragged = False
         self.spyre_encoder_rect_steps = 0
         self.spyre_encoder_ragged_steps = 0
         self.spyre_encoder_real_tokens = 0
@@ -873,6 +876,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         self._dummy_pooler_run(hidden_states)
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
+                    self._warm_encoder_inline_paths()
                     self.spyre_shape_bucketer.mark_warmed_up()
                 if self._spyre_kv_caches:
                     # A decoder-type text tower (e.g. CLIP's) has a real KV cache;
@@ -1061,6 +1065,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
             EncoderRectPlan,
             build_encoder_plan,
+            publish_encoder_grid,
         )
 
         rows = int(kwargs.get("num_tokens_padded") or self._encoder_buffer_rows or 0)
@@ -1069,6 +1074,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # before the bucketer is warmed. Those take the packed path, which works at
         # any row count.
         rectangles = self._encoder_rectangles if rows == self._encoder_budget else []
+        if self._force_encoder_ragged:
+            rectangles = []
 
         per_layer = out[0] if isinstance(out, tuple) else out
         groups = per_layer if isinstance(per_layer, list) else [per_layer]
@@ -1083,7 +1090,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 seen.add(id(md))
                 if md.encoder_plan is None:
                     encoder_md = cast(SpyreAttentionMetadata, md)
-                    plan = build_encoder_plan(
+                    plan = self._forced_encoder_plan() or build_encoder_plan(
                         encoder_md,
                         rectangles=rectangles,
                         width_cap_for=self._encoder_width_caps,
@@ -1099,6 +1106,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else:
                     plan = md.encoder_plan
 
+        # A rectangle's mask shape is how a traced forward reads the grid; the ragged path
+        # publishes nothing and so stays opaque.
+        publish_encoder_grid(plan)
         if isinstance(plan, EncoderRectPlan):
             self._encoder_grid = (plan.extent, plan.width, plan.query_lens)
             self.spyre_encoder_rect_steps += 1
@@ -1114,6 +1124,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     rows,
                 )
         return out
+
+    def _forced_encoder_plan(self):
+        """Warmup's declared rectangle, ignoring the dummy batch's own shape.
+
+        Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
+        ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
+        ``sum(query_lens)`` the body row count, which keeps ``_preprocess``'s expansion an
+        identity.
+        """
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            EncoderRectPlan,
+            encoder_key_pad_mask,
+        )
+
+        if self._forced_encoder_rect is None:
+            return None
+        extent, width = self._forced_encoder_rect
+        return EncoderRectPlan(
+            extent=extent,
+            width=width,
+            mask=convert(
+                encoder_key_pad_mask(extent, [extent] * width, self._model_dtype()),
+                self._spyre_device,
+            ),
+            query_lens=[extent] * width,
+        )
 
     def _record_encoder_dispatch(self, real_tokens: int, num_seqs: int, rows: int) -> None:
         """Accumulate the dispatch ratio and body occupancy, and log them periodically.
@@ -1274,6 +1310,43 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if width <= rows:
                 select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
             width *= 2
+
+    @torch.inference_mode()
+    def _warm_encoder_inline_paths(self) -> None:
+        """One block graph per declared rectangle, plus the one that keeps attention opaque.
+
+        With attention traced in, the block graph specialises on ``(width, extent)``, so the
+        single body-shape dummy above covers only whichever rectangle its own batch landed
+        on. The trailing ragged run compiles the opaque-attention block graph and is what
+        reaches ``warm_kernels`` for the group shapes, since a traced rectangle never calls
+        the impl; it is skipped when the group table is empty, which is the bucketer's own
+        statement that no batch can miss its rectangle.
+        """
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            encoder_inline_active,
+        )
+
+        if not encoder_inline_active() or not self._encoder_rectangles:
+            return
+        groups = encoder_group_shapes(self.vllm_config)
+        logger.info(
+            "Warming %d encoder rectangle block graph(s)%s.",
+            len(self._encoder_rectangles),
+            " plus the opaque-attention one" if groups else "",
+        )
+        for rect in sorted(self._encoder_rectangles, reverse=True):
+            self._forced_encoder_rect = rect
+            try:
+                self._dummy_run(self._encoder_budget, force_attention=True)
+            finally:
+                self._forced_encoder_rect = None
+        if not groups:
+            return
+        self._force_encoder_ragged = True
+        try:
+            self._dummy_run(self._encoder_budget, force_attention=True)
+        finally:
+            self._force_encoder_ragged = False
 
     @torch.inference_mode()
     def _warm_encoder_unpack(self, hidden_states: torch.Tensor) -> None:

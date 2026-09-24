@@ -36,14 +36,18 @@ Three torch-spyre constraints shape the design:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import types
+import weakref
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.math_utils import cdiv, next_power_of_2
-from vllm.v1.attention.backend import AttentionLayer
+from vllm.v1.attention.backend import AttentionLayer, AttentionType
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -67,6 +71,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 # aligned, and it is the width of a shared mask tile. Encoder attention has no KV
 # cache and so no block walk -- this is alignment, not a block size.
 ENCODER_LEN_ALIGNMENT = 64
+
+logger = init_logger(__name__)
 
 
 def _alignment_units_for(length: int) -> int:
@@ -590,7 +596,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         index_dtype = encoder_index_dtype(device)
         traced = 0
 
-        for extent, width in self._rectangles:
+        # Traced in, a rectangle's shape *is* a block graph, warmed by the runner's
+        # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
+        rectangles = [] if encoder_inline_active() else self._rectangles
+        for extent, width in rectangles:
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
             self._run_rect(
                 output, query, key, value, mask, width, extent, num_heads, num_kv_heads, head_size
@@ -769,3 +778,123 @@ class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type[SpyreEncoderAttentionImpl]:
         return SpyreEncoderAttentionImpl
+
+
+_ORIG_ATTENTION_FORWARD = Attention.forward
+
+
+class EncoderGrid:
+    """This step's ``[width, 1, 1, extent]`` mask, or ``None`` off the rectangular path.
+
+    ``(width, extent)`` is read from the mask's *shape*, not off the step's plan: ``view``
+    needs both as trace-time ints, and the plan is a fresh object every step, so Dynamo
+    would guard on attributes of an ever-changing identity instead of on a static shape.
+    ``attn_metadata[layer_name]`` cannot serve either -- vLLM hoists layer names into
+    opaque graph inputs (torch >= 2.11), so that lookup does not resolve at trace time.
+    """
+
+    def __init__(self) -> None:
+        self.mask: torch.Tensor | None = None
+
+    def publish(self, mask: torch.Tensor | None) -> None:
+        self.mask = mask
+
+
+_encoder_grid = EncoderGrid()
+_inline_layers: weakref.WeakSet[Attention] = weakref.WeakSet()
+
+
+def encoder_grid() -> EncoderGrid:
+    return _encoder_grid
+
+
+def encoder_inline_active() -> bool:
+    return len(_inline_layers) > 0
+
+
+def publish_encoder_grid(plan: object) -> None:
+    """Publish a rectangle's mask, or ``None`` for the ragged path.
+
+    The ragged path must keep publishing ``None``: it dispatches once per group, so tracing
+    it in would make the block graph's *structure* depend on the step's group multiset --
+    unbounded, and impossible to warm at startup.
+    """
+    _encoder_grid.publish(plan.mask if isinstance(plan, EncoderRectPlan) else None)
+
+
+def _spyre_encoder_attention_forward(
+    self: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Trace the rectangular path into the caller's graph; anything else falls through.
+
+    Deliberately bypasses the impl: going through it would re-enter ``torch.compile`` for
+    the already-compiled kernel and run ``_call_kernel``'s host-side counters inside a
+    traced region. The fallthrough is upstream's own ``forward`` rather than a copy, so the
+    ragged path is untouched.
+    """
+    mask = _encoder_grid.mask
+    # The inline path returns [tokens, num_heads * head_size], so a caller asking for any
+    # other output shape or dtype has to take the fallthrough.
+    if mask is None or output_dtype not in (None, query.dtype) or output_shape is not None:
+        return _ORIG_ATTENTION_FORWARD(self, query, key, value, output_shape, output_dtype)
+
+    num_heads, num_kv_heads = self.num_heads, self.num_kv_heads
+    head_size = self.head_size
+    attn = _encoder_rect_kernel(
+        query.view(-1, num_heads, head_size),
+        key.view(-1, num_kv_heads, head_size),
+        value.view(-1, num_kv_heads, head_size),
+        mask,
+        self.impl.scale,
+        mask.shape[0],
+        mask.shape[-1],
+        num_heads,
+        num_kv_heads,
+        head_size,
+    )
+    return attn.reshape(-1, num_heads * head_size)
+
+
+def _inline_refusal(layer: Attention) -> str | None:
+    if not isinstance(layer.impl, SpyreEncoderAttentionImpl):
+        return f"impl is {type(layer.impl).__name__}, not the Spyre encoder impl"
+    if not layer.impl._compile_attn:
+        return "attention is eager, so there is no outer graph to fuse into"
+    if layer.head_size != layer.head_size_v:
+        return f"head_size {layer.head_size} != head_size_v {layer.head_size_v}"
+    if layer.head_size % ENCODER_LEN_ALIGNMENT:
+        # _widen_head_dim round-trips through the host, which cannot be traced at all.
+        return (
+            f"head_size {layer.head_size} is not a whole {ENCODER_LEN_ALIGNMENT}-element "
+            "stick, so attention has to run widened via the host"
+        )
+    return None
+
+
+def install_encoder(layers: Iterable[Attention]) -> EncoderGrid:
+    """Bind the traced forward onto eligible encoder layers."""
+    encoder = [
+        layer
+        for layer in layers
+        if layer.attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY)
+    ]
+    if not encoder:
+        return _encoder_grid
+
+    refusal = next((r for r in map(_inline_refusal, encoder) if r is not None), None)
+    if refusal is not None:
+        logger.info("Encoder attention stays behind the opaque op: %s.", refusal)
+        return _encoder_grid
+
+    for layer in encoder:
+        layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+            _spyre_encoder_attention_forward, layer
+        )
+        _inline_layers.add(layer)
+    logger.info("Tracing encoder attention into the outer graph for %d layers.", len(encoder))
+    return _encoder_grid

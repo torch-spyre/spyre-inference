@@ -39,11 +39,24 @@ def test_offset_roberta_position_ids_runs_on_cpu(monkeypatch):
     monkeypatch.setattr("spyre_inference.models.roberta.convert", fake_convert)
 
     pos = torch.tensor([0, 1, 2], dtype=torch.int64)
-    out = offset_roberta_position_ids(pos, padding_idx=1, device=torch.device("meta"))
+    out = offset_roberta_position_ids(pos, 1)
+    # Round trips through the host, and lands back on the input's own device.
     assert seen_devices[0] == "cpu"
-    assert seen_devices[1] == torch.device("meta")
+    assert seen_devices[1] == pos.device
     assert out.dtype == torch.int64
     torch.testing.assert_close(out, torch.tensor([2, 3, 4], dtype=torch.int64))
+
+
+def test_offset_roberta_position_ids_is_an_opaque_op():
+    """Whole-model compile needs the host round trip hidden behind one node: inlined,
+    the CPU intermediate makes Inductor emit spyre::to_dtype_cpu, which has no CPU
+    registration."""
+    assert hasattr(torch.ops.spyre_inference, "roberta_offset_positions")
+    pos = torch.tensor([0, 1, 2], dtype=torch.int64)
+    torch.testing.assert_close(
+        torch.ops.spyre_inference.roberta_offset_positions(pos, 1),
+        torch.tensor([2, 3, 4], dtype=torch.int64),
+    )
 
 
 def test_wrapper_converts_ints_to_int64(monkeypatch):

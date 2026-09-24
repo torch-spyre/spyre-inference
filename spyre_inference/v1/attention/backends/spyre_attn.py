@@ -403,9 +403,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tiles: dict[int, torch.Tensor] = {}
 
         static_ctx = vllm_config.compilation_config.static_forward_context
-        self._slot_mapping = attn_layer.install(
-            static_ctx[name] for name in layer_names if name in static_ctx
-        )
+        own_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
+        self._slot_mapping = attn_layer.install(own_layers)
+        # Imported here, not at module scope: spyre_encoder_attn imports this module.
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import install_encoder
+
+        self._encoder_grid = install_encoder(own_layers)
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.

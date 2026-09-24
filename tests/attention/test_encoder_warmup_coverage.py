@@ -26,6 +26,7 @@ import torch
 from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig
 
+from spyre_inference.v1.attention.backends import spyre_encoder_attn
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     ENCODER_LEN_ALIGNMENT,
     EncoderRectPlan,
@@ -131,6 +132,39 @@ class TestWarmKernelsTracesTheDeclaredSet:
         assert seen_rects == encoder_rectangles(config)
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_rects) + len(seen_groups)
+
+    @pytest.mark.parametrize(("max_model_len", "max_num_seqs", "budget"), _CONFIGS)
+    def test_rectangles_are_left_to_the_block_graph_when_inlined(
+        self, monkeypatch, max_model_len, max_num_seqs, budget
+    ):
+        """Traced in, a rectangle's shape is a block graph the runner's dummy runs compile.
+
+        The group shapes are still this method's: the ragged path stays behind the opaque op.
+        """
+        monkeypatch.setattr(spyre_encoder_attn, "encoder_inline_active", lambda: True)
+        config = _config(max_model_len, max_num_seqs, budget)
+        impl = _make_impl(config)
+
+        seen_rects: list[tuple[int, int]] = []
+        seen_groups: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            impl, "_run_rect", lambda out, q, k, v, m, w, e, *a: seen_rects.append((e, w))
+        )
+        monkeypatch.setattr(
+            impl,
+            "_run_fused",
+            lambda out, rows, q, k, v, m, g, *a: seen_groups.append((g, rows.shape[0] // g)),
+        )
+        traced = impl.warm_kernels(
+            *_buffers(impl, encoder_shape_tables(config).budget),
+            impl.num_heads,
+            impl.num_kv_heads,
+            64,
+        )
+
+        assert seen_rects == []
+        assert seen_groups == encoder_group_shapes(config)
+        assert traced == len(seen_groups)
 
     def test_warmed_against_the_callers_own_output_tensor(self, monkeypatch):
         """Regression: the store's destination layout is part of its cache key.

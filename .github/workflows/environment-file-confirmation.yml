@@ -1,0 +1,242 @@
+name: Environment file confirmation
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  checks: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: >-
+    environment-file-confirmation-${{
+      github.event.pull_request.number || github.event.issue.number ||
+      github.event.merge_group.head_sha
+    }}
+  cancel-in-progress: false
+
+jobs:
+  confirm-environment-files:
+    name: Environment file policy runner
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/confirm-environment-changes'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate confirmation
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const marker = '<!-- environment-file-confirmation';
+            const checkName = 'Environment file confirmation';
+            const protectedFiles = new Set([
+              'pyproject.toml',
+              'uv.lock',
+              'spyre-rpms.lock',
+            ]);
+            const {owner, repo} = context.repo;
+
+            const listChangedFiles = async (pull_number) => {
+              const files = await github.paginate(github.rest.pulls.listFiles, {
+                owner,
+                repo,
+                pull_number,
+                per_page: 100,
+              });
+              return [...new Set(files.flatMap(({filename, previous_filename}) =>
+                [filename, previous_filename].filter(
+                  (name) => name && protectedFiles.has(name),
+                ),
+              ))];
+            };
+
+            const findPolicyComment = async (issue_number) => {
+              const comments = await github.paginate(
+                github.rest.issues.listComments,
+                {owner, repo, issue_number, per_page: 100},
+              );
+              return comments.find(({body, user}) =>
+                user.type === 'Bot' && body?.includes(marker));
+            };
+
+            const updatePolicyComment = async (pull, files, confirmed) => {
+              const existing = await findPolicyComment(pull.number);
+              const commandSha = pull.head.sha.slice(0, 12);
+              const state = confirmed ? ` confirmed-sha=${pull.head.sha}` : '';
+              const status = confirmed
+                ? `Confirmed for commit \`${commandSha}\`.`
+                : [
+                    `@${pull.user.login}, did you intend to change these environment files?`,
+                    '',
+                    ...files.map((file) => `- \`${file}\``),
+                    '',
+                    'The PR author or a repository maintainer with `maintain` or `admin` permission must confirm by commenting:',
+                    '',
+                    `\`/confirm-environment-changes ${commandSha}\``,
+                    '',
+                    'Confirmation applies only to this commit and is reset by the next push.',
+                  ].join('\n');
+              const body = `${marker}${state} -->\n${status}`;
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: pull.number,
+                  body,
+                });
+              }
+            };
+
+            const deletePolicyComment = async (pull_number) => {
+              const existing = await findPolicyComment(pull_number);
+              if (existing) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                });
+              }
+            };
+
+            const isConfirmed = (comment, sha) =>
+              comment?.body?.includes(`confirmed-sha=${sha}`) ?? false;
+
+            const setCheck = async (sha, confirmed, files) => {
+              const conclusion = confirmed ? 'success' : 'action_required';
+              const summary = confirmed
+                ? 'No unconfirmed environment file changes were found.'
+                : `Confirmation is required for: ${files.join(', ')}`;
+              const {data} = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: sha,
+                check_name: checkName,
+                per_page: 100,
+              });
+              const existing = data.check_runs
+                .filter(({name, app}) =>
+                  name === checkName && app?.slug === 'github-actions')
+                .sort((a, b) => b.id - a.id)[0];
+              const params = {
+                owner,
+                repo,
+                name: checkName,
+                status: 'completed',
+                conclusion,
+                output: {title: checkName, summary},
+              };
+
+              if (existing) {
+                await github.rest.checks.update({
+                  ...params,
+                  check_run_id: existing.id,
+                });
+              } else {
+                await github.rest.checks.create({...params, head_sha: sha});
+              }
+            };
+
+            let pullNumber;
+            let checkSha;
+            if (context.eventName === 'merge_group') {
+              const match = context.payload.merge_group.head_ref.match(/\/pr-(\d+)-/);
+              if (!match) {
+                throw new Error(
+                  `Cannot determine PR from ${context.payload.merge_group.head_ref}`,
+                );
+              }
+              pullNumber = Number(match[1]);
+              checkSha = context.payload.merge_group.head_sha;
+            } else {
+              pullNumber = context.payload.pull_request?.number
+                ?? context.payload.issue.number;
+            }
+
+            const {data: pull} = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: pullNumber,
+            });
+            checkSha ??= pull.head.sha;
+            const files = await listChangedFiles(pull.number);
+
+            if (files.length === 0) {
+              if (context.eventName !== 'merge_group') {
+                await deletePolicyComment(pull.number);
+              }
+              await setCheck(checkSha, true, files);
+              return;
+            }
+
+            if (context.eventName === 'issue_comment') {
+              const match = context.payload.comment.body.trim().match(
+                /^\/confirm-environment-changes\s+([0-9a-f]{7,40})$/i,
+              );
+              const requestedSha = match?.[1].toLowerCase();
+              const shaMatches = requestedSha
+                && pull.head.sha.toLowerCase().startsWith(requestedSha);
+              const commenter = context.payload.comment.user.login;
+              let authorized = commenter === pull.user.login;
+
+              if (!authorized) {
+                try {
+                  const {data} = await github.rest.repos.getCollaboratorPermissionLevel({
+                    owner,
+                    repo,
+                    username: commenter,
+                  });
+                  authorized = ['admin', 'maintain'].includes(data.permission);
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+
+              if (!authorized || !shaMatches) {
+                await github.rest.reactions.createForIssueComment({
+                  owner,
+                  repo,
+                  comment_id: context.payload.comment.id,
+                  content: '-1',
+                });
+                core.warning(
+                  authorized
+                    ? `Confirmation does not match current head ${pull.head.sha}`
+                    : `${commenter} is not allowed to confirm this change`,
+                );
+                return;
+              }
+
+              await updatePolicyComment(pull, files, true);
+              await setCheck(pull.head.sha, true, files);
+              await github.rest.reactions.createForIssueComment({
+                owner,
+                repo,
+                comment_id: context.payload.comment.id,
+                content: '+1',
+              });
+              return;
+            }
+
+            const policyComment = await findPolicyComment(pull.number);
+            const confirmed = isConfirmed(policyComment, pull.head.sha);
+            if (context.eventName !== 'merge_group') {
+              await updatePolicyComment(pull, files, confirmed);
+            }
+            await setCheck(checkSha, confirmed, files);

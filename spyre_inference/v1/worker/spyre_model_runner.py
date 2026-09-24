@@ -874,6 +874,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if self.spyre_shape_bucketer is not None:
                     for size in sorted(self.spyre_shape_bucketer.bucket_sizes, reverse=True):
                         hidden_states, _ = self._dummy_run(size, force_attention=True)
+                        self._warmup_input_embedding(size)
                         self._dummy_pooler_run(hidden_states)
                         self._warm_pooler_row_widths(hidden_states)
                         self._warm_encoder_unpack(hidden_states)
@@ -901,6 +902,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
+                self._warmup_input_embedding(num_tokens)
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -922,6 +924,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
+                self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
             # Row buckets, not one run per body bucket: the prefill bucket's token count
@@ -936,6 +939,27 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _warmup_input_embedding(self, num_tokens: int) -> None:
+        """Compile the embedding step a dummy run skips.
+
+        ``_dummy_run`` hands the model a zeroed ``inputs_embeds`` slice instead of
+        producing it the way ``_preprocess`` does, and producing it is what compiles.
+        """
+        # Only a decoder-only multimodal model embeds through ``embed_input_ids``: a
+        # text-only signature takes no multimodal arguments, so the call would raise.
+        mm_config = getattr(self.model_config, "multimodal_config", None)
+        if (
+            not self.supports_mm_inputs
+            or self.model_config.is_encoder_decoder
+            or (mm_config is not None and mm_config.mm_encoder_only)
+        ):
+            return
+        model = cast(_SpyreModelWrapper, self.model)
+        # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
+        model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+        logger.info_once("Warming the input embedding through embed_input_ids.")
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:

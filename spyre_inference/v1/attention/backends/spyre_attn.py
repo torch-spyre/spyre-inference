@@ -1203,10 +1203,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # dispatch to. Set SPYRE_BATCHED_DECODE=0 to force the loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
-        # A multi-block tile makes the page gather's index tile-relative. The
-        # tiled lowering cannot yet resolve that induction symbol, so the two
-        # optimizations do not compose (the same limitation as grouped KV pages).
-        if tile_loop.USE_FOR_EACH_TILE:
+        # Under the tiled walk, batched decode is validated only where the backend
+        # uploads its page index one entry per stick; the rest keep the per-seq loop.
+        if tile_loop.USE_FOR_EACH_TILE and not self._tiled_batched_decode_supported():
             return False
         # The 2-D page index lowers to aten.index, which upcasts the int32 index
         # to int64 and fails eager; eager takes the per-seq loop instead.
@@ -1214,6 +1213,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return False
         # The batched kernel doesn't implement ALiBi.
         return self.alibi_slopes is None
+
+    def _tiled_batched_decode_supported(self) -> bool:
+        """Whether batched decode may run under the tiled walk; overridable."""
+        return False
 
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
         if not self._batched_decode_supported():
@@ -1261,18 +1264,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self._batched_decode_preconditions_met(attn_metadata)
             and attn_metadata.rep_row_ids_dev is None
         ):
-            assert attn_metadata.rep_row_ids_cpu is not None
-            assert attn_metadata.chunk_page_ids_cpu is not None
-            assert attn_metadata.mask_by_chunk_cpu is not None
-            attn_metadata.rep_row_ids_dev = convert(
-                attn_metadata.rep_row_ids_cpu, device=_target_device
-            )
-            attn_metadata.chunk_page_ids_dev = convert(
-                attn_metadata.chunk_page_ids_cpu, device=_target_device
-            )
-            attn_metadata.mask_by_chunk_dev = convert(
-                attn_metadata.mask_by_chunk_cpu, device=_target_device
-            )
+            self._mirror_batched_decode_indices(attn_metadata, _target_device)
 
         output = self._online_softmax_attention(
             query,
@@ -1635,6 +1627,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         result_flat = result.reshape(b_seqs, num_heads, head_size)
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
+
+    def _mirror_batched_decode_indices(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> None:
+        """Mirror the batched-decode precomputes to ``device`` once per step; overridable."""
+        assert attn_metadata.rep_row_ids_cpu is not None
+        assert attn_metadata.chunk_page_ids_cpu is not None
+        assert attn_metadata.mask_by_chunk_cpu is not None
+        attn_metadata.rep_row_ids_dev = convert(attn_metadata.rep_row_ids_cpu, device=device)
+        attn_metadata.chunk_page_ids_dev = convert(attn_metadata.chunk_page_ids_cpu, device=device)
+        attn_metadata.mask_by_chunk_dev = convert(attn_metadata.mask_by_chunk_cpu, device=device)
 
     def _run_batched_decode(
         self,

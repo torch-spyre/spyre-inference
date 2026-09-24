@@ -25,7 +25,9 @@ def pytest_collection_modifyitems(items):
         reason="will be re-enabled once batched decode is working with for_each_tile"
     )
     for item in items:
-        nodeid = item.nodeid.lower()
+        # Match only the test id/class/parameter portion, not the file path: the
+        # global skip must not exclude the card-free entry-local CPU tests by filename.
+        nodeid = item.nodeid.partition("::")[2].lower()
         if (
             "batched_decode" in nodeid
             or "batcheddecode" in nodeid

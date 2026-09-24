@@ -315,18 +315,15 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
 def _gathered_tokens(
     layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor, scope: Any
 ) -> torch.Tensor:
-    """Drive the gathered region once per packed token and reassemble the batch."""
     region = _region(layer, "gathered", _gathered)
     tokens = x.shape[0]
     if tokens == 1:
         with scope:
             return region(layer, x, router_logits)
-    # Under ``frontend_pool_allocation`` two calls of one graph can share an output address, so a
-    # region result is only valid until the next call: hence the copy and the per-row concatenate.
-    # Growing the batch pairwise copies more bytes than cloning every row and concatenating once,
-    # but costs one launch per row where that costs one more, and at these widths a launch is the
-    # unit of cost (measured: per-launch cost is flat across cat arities, the fwd pass is
-    # host-bound).
+    # Two calls of one graph can share an output address under ``frontend_pool_allocation``, so a
+    # region result is only valid until the next call. Growing the batch pairwise copies more
+    # bytes than cloning each row and concatenating once, but costs one launch fewer, and a
+    # launch is the unit of cost at these widths.
     packed = _gathered_row(region, layer, x, router_logits, 0, scope).clone()
     for token in range(1, tokens):
         packed = torch.cat([packed, _gathered_row(region, layer, x, router_logits, token, scope)])
@@ -343,9 +340,8 @@ def _gathered_row(
 ) -> torch.Tensor:
     # A compiled region reads its inputs from storage offset 0 whatever the view's offset
     # (torch-spyre#3770), so the slices must be cloned or every row would read row 0. The clones
-    # stay outside ``scope``: only the region needs that config, and ``compile_once`` memoises
-    # each eager kernel globally on first call, so a copy compiled in here would bake the
-    # region's config into a ``clone`` that unrelated call sites then reuse.
+    # stay outside ``scope`` because ``compile_once`` memoises each eager kernel globally on its
+    # first call, which would bake the region's config into a ``clone`` used elsewhere.
     row = slice(token, token + 1)
     row_x, row_logits = x[row].clone(), router_logits[row].clone()
     with scope:
@@ -353,9 +349,8 @@ def _gathered_row(
 
 
 def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
-    # Cloning row ``t`` bakes its flat storage offset into the kernel coordinate, and the backend
-    # can only bake an offset that is a whole number of sticks. Row ``t`` sits at
-    # ``storage_offset() + t * stride(0)``, so both terms must be stick multiples for every ``t``.
+    # Cloning row ``t`` bakes its flat storage offset, ``storage_offset() + t * stride(0)``, into
+    # the kernel coordinate, and the backend can only bake whole sticks: hence both terms.
     return all(
         t.storage_offset() % stick == 0 and t.stride(0) % stick == 0 for t in (x, router_logits)
     )

@@ -426,12 +426,7 @@ def test_a_batch_whose_rows_are_not_stick_addressable_takes_the_all_expert_form(
 
 
 def test_a_batch_at_an_unaddressable_storage_offset_takes_the_all_expert_form(monkeypatch):
-    """The guard is about where a row starts, not how wide it is.
-
-    Both widths here span whole sticks, so a width-only check would wrongly admit the batch;
-    the rows themselves begin half a stick into their storage, which cannot be baked into the
-    kernel coordinate.
-    """
+    """Both widths span whole sticks here, so a width-only check would wrongly admit the batch."""
     from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
 
     monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
@@ -523,9 +518,8 @@ def test_gathered_matches_dense_reference(moe_weights):
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# Row ``t`` of the router logits starts at ``t * stride(0)``, i.e. ``t * num_experts`` for these
-# contiguous tensors, and that offset must span whole sticks to be addressable. ``EXPERTS`` above
-# deliberately does not, so the fallback is covered too.
+# Row ``t`` of the router logits starts at ``t * num_experts``, which must span whole sticks to
+# be addressable. ``EXPERTS`` above deliberately does not, so the fallback is covered too.
 STICK_EXPERTS = 64
 
 
@@ -550,16 +544,14 @@ def stick_aligned_moe_weights():
     return host, device
 
 
-# ``max_num_seqs=3`` puts 3 in ``compile_sizes`` verbatim, and that is the bucket the e2e
-# quality gate decodes at; 2 and 4 bracket it. ``T`` sets the source row count each row is
-# copied out of, so none of the three subsumes another.
+# 3 is the bucket the e2e quality gate decodes at; ``T`` sets the row count each row is copied
+# out of, so 4 does not subsume it.
 @pytest.mark.parametrize("num_tokens", [2, 3, 4])
 def test_gathered_loop_matches_dense_reference(stick_aligned_moe_weights, num_tokens):
     """The per-token driver over a packed batch, against the same dense reference.
 
     A reused region output would give a row another token's experts, which only values catch.
-    The mechanism is ``2T`` eager clones and one ``cat``: a fallback would still pass at
-    ``atol=2e-2`` while inverting the point of the change, so absence of one is asserted too.
+    A CPU fallback would still pass the tolerance while inverting the point, hence that assert.
     """
     from torch_spyre._C import get_elem_in_stick
     from torch_spyre._inductor import config as spyre_config

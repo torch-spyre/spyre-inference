@@ -838,6 +838,46 @@ def test_spyre_transfer_lands_a_host_view_at_offset_zero(spyre_device):
             torch.testing.assert_close(fn(stack, i).cpu(), view[i] * 2.0, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("query_len", [1, 64])
+def test_spyre_for_each_tile_consumes_transferred_mask_stack(spyre_device, dtype, query_len):
+    """The tiled attention mask layout survives transfer, broadcast, and reduction."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows, blocks, kv_heads, qpk, block_size = 3, 4, 2, 2, 128
+    base = torch.zeros(rows, blocks, query_len, block_size, dtype=dtype)
+    for b in range(blocks):
+        base[:, b] = b / 8
+    host_view = base[1]
+    assert host_view.storage_offset() > 0
+    stack = host_view.to(spyre_device)
+    assert stack.storage_offset() == 0
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def fn(mask_stack):
+        scores = mask_stack.new_zeros(kv_heads, qpk, query_len, block_size)
+        init = mask_stack.new_zeros(kv_heads, qpk, query_len)
+
+        def body(total, operands):
+            (mask_tile,) = operands
+            probs = torch.exp(scores + mask_tile[0])
+            return total + probs.sum(dim=-1), None
+
+        total, _ = for_each_tile(
+            body,
+            (mask_stack,),
+            dims=(0,),
+            tile_size=1,
+            init=init,
+        )
+        return total
+
+    expected = sum(
+        torch.exp(host_view[b]).sum(dim=-1).expand(kv_heads, qpk, query_len) for b in range(blocks)
+    )
+    torch.testing.assert_close(fn(stack).cpu(), expected, atol=0.02, rtol=0.02)
+
+
 def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
     pages_cpu = (torch.arange(blocks * entries * block_size * head_size) % 97).reshape(
         blocks * entries, block_size, head_size
@@ -1086,16 +1126,14 @@ def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
 # ---------------------------------------------------------------------------
 #
 # torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
-# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
-# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
-# fallback.
+# (torch-spyre#1794). Heads downcast to fp16 (#868); this probe tracks native
+# fp32 linear.
 
 
 _FP32_BMM_REASON = (
     "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
-    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
-    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
-    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+    "batchmatmul / F.linear (torch-spyre#1794). Classifier heads downcast to "
+    "fp16 instead. When this XPASS-es, native fp32 linear is available."
 )
 
 

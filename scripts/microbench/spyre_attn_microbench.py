@@ -184,7 +184,7 @@ def build_metadata(
 
     from vllm.config import get_current_vllm_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
     from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 
@@ -192,13 +192,15 @@ def build_metadata(
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
     vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
 
+    spec_cls = FullAttentionSpec if sliding_window is not None else AttentionSpec
+    spec_kwargs = {"sliding_window": sliding_window} if sliding_window is not None else {}
     builder = SpyreAttentionMetadataBuilder(
-        kv_cache_spec=AttentionSpec(
+        kv_cache_spec=spec_cls(
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
             dtype=DTYPE,
-            sliding_window=sliding_window,
+            **spec_kwargs,
         ),
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,

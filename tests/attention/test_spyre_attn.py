@@ -39,7 +39,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_stack,
 )
+from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
+from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -1290,7 +1293,7 @@ def test_sliding_window_boundary_conditions(default_vllm_config):
 
 
 def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monkeypatch):
-    """Full decode, mixed, and later fallback paths transfer only masks they read."""
+    """Only requested stacks transfer, once each, with their exact byte volume."""
     torch.set_default_device("cpu")
 
     block_size = 64
@@ -1324,6 +1327,9 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
         seq_idx: _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) for seq_idx in (2, 3)
     }
     assert calls == [stacks_cpu[2], stacks_cpu[3]]
+    assert sum(t.numel() * t.element_size() for t in calls) == sum(
+        stacks_cpu[i].numel() * stacks_cpu[i].element_size() for i in (2, 3)
+    )
     for seq_idx in (2, 3):
         assert _mirror_mask_stack(metadata, seq_idx, torch.device("cpu")) is suffix[seq_idx]
     assert calls == [stacks_cpu[2], stacks_cpu[3]]
@@ -1334,8 +1340,7 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
     }
     assert calls == [stacks_cpu[2], stacks_cpu[3], stacks_cpu[0], stacks_cpu[1]]
     assert metadata.attention_mask_stacks_device is not None
-    expected = prefix | suffix
-    for seq_idx, stack_device in expected.items():
+    for seq_idx, stack_device in (prefix | suffix).items():
         assert metadata.attention_mask_stacks_device[seq_idx] is stack_device
         assert torch.equal(stack_device, stacks_cpu[seq_idx])
         assert stack_device.is_contiguous()
@@ -1693,9 +1698,6 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
     # One chunk covering both blocks, so entries = num_seqs * 2.
     bpc = num_blocks
-    num_chunks = num_blocks // bpc
-    entries = num_seqs * bpc
-
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
@@ -1703,14 +1705,12 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
     # int64 here, not the production int32: this runs eager on CPU, where
     # advanced indexing needs int64.
-    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat_interleave(bpc)
-    # [num_blocks, num_seqs] transposed to entry order (seq major, slot minor).
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat(bpc)
+    # [num_blocks, num_seqs] is already block-slot-major, sequence-minor.
     block_ids = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
-    chunk_page_ids = [
-        block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
-    mask_by_chunk = torch.zeros(num_chunks, entries, 1, block_size, dtype=torch.float32)
+    mask_by_chunk = torch.zeros(
+        num_blocks, num_seqs, num_kv_heads, qpk, block_size, dtype=torch.float32
+    )
 
     def run(cap: float):
         return batched_decode_kernel(
@@ -1718,7 +1718,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
             rep_row_ids,
             k_pages,
             v_pages,
-            chunk_page_ids,
+            block_ids,
             mask_by_chunk,
             1.0,
             num_seqs,
@@ -1807,22 +1807,28 @@ def test_batched_decode_chunking_covers_every_block(
             f"num_seqs={num_seqs}: chunks cover {padded} of {max_blocks} blocks"
         )
         # The mask carries the same axis, so a mismatch here is the reshape that
-        # would have raised inside build().
+        # would have raised inside build(). Its KV axis follows the walk in force:
+        # broadcast for the plain loop, materialized for the tiled one.
         assert md.mask_by_chunk_cpu is not None
-        num_chunks = md.mask_by_chunk_cpu.shape[0]
-        assert num_chunks * bpc == padded
+        assert md.mask_by_chunk_cpu.shape == (
+            padded,
+            md.padded_num_seqs,
+            num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1,
+            1,
+            block_size,
+        )
 
 
 def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     default_vllm_config,
     enable_batched_decode,
 ) -> None:
-    """The decode mask is broadcast over the KV-cache spec's head count.
+    """The decode mask's KV axis follows the layer's head count.
 
     A model with per-layer head counts (gemma-4) has attention layers whose
-    num_kv_heads is not `model_config.get_num_kv_heads()`. The kernel reshapes the
-    mask with the layer's, so building it from the model-level one asks for the
-    wrong number of elements and every batched-decode variant fails to compile.
+    num_kv_heads is not `model_config.get_num_kv_heads()`. Taking the model-level
+    count asks for the wrong number of elements, so every batched-decode variant
+    fails to compile.
     """
     from vllm.config import get_current_vllm_config
 
@@ -1860,12 +1866,26 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
 
     assert md.blocks_per_chunk is not None, "batched decode declined this batch"
     assert md.mask_by_chunk_cpu is not None
-    entries = md.padded_num_seqs * md.blocks_per_chunk
-    assert md.mask_by_chunk_cpu.shape[1] == entries, (
-        f"mask has {md.mask_by_chunk_cpu.shape[1]} rows; expected one row per sequence/block entry"
+    assert md.mask_by_chunk_cpu.shape[2] == num_kv_heads, (
+        f"mask carries {md.mask_by_chunk_cpu.shape[2]} KV heads; this group has {num_kv_heads}"
     )
-    # Both token- and head-major kernels broadcast this over KV heads.
-    md.mask_by_chunk_cpu[0].reshape(md.padded_num_seqs, md.blocks_per_chunk, 1, 1, block_size)
+    # This layer is GQA (4 query heads over 2 KV heads), so a materialized
+    # query-group axis would double the transfer for nothing; it broadcasts instead.
+    assert md.mask_by_chunk_cpu.shape[3] == 1, (
+        f"query-group axis is {md.mask_by_chunk_cpu.shape[3]} wide; it should broadcast "
+        f"in the kernel, not be transferred {num_query_heads // num_kv_heads} times"
+    )
+    # The add the kernel actually performs, one chunk at a time: the mask tile must
+    # broadcast against the score tile.
+    scores = torch.zeros(
+        md.blocks_per_chunk,
+        md.padded_num_seqs,
+        num_kv_heads,
+        num_query_heads // num_kv_heads,
+        block_size,
+    )
+    masked = scores + md.mask_by_chunk_cpu.narrow(0, 0, md.blocks_per_chunk)
+    assert masked.shape == scores.shape
 
 
 def _decode_reference_fp32(
@@ -1926,6 +1946,9 @@ def test_batched_decode_matches_fp32_reference(
     tolerances the integration tests have to use. ``ragged`` masks each sequence
     down to a different length, which is what puts wholly--inf chunks and -inf
     padding columns in front of the running max.
+
+    The production tiled walk dispatches to `scan`, which is drivable eagerly
+    without a card.
     """
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -1933,8 +1956,6 @@ def test_batched_decode_matches_fp32_reference(
     block_size, head_size = 16, 8
     num_heads = num_kv_heads * qpk
     padded_blocks = ((num_blocks + bpc - 1) // bpc) * bpc
-    num_chunks = padded_blocks // bpc
-    entries = b_seqs * bpc
     scale = 0.5
 
     n_pages = padded_blocks * b_seqs + 1
@@ -1960,17 +1981,18 @@ def test_batched_decode_matches_fp32_reference(
     # A row past the batch is -inf everywhere, which would make its softmax NaN;
     # the builder keeps block 0 finite for exactly this reason.
     mask[num_seqs:, 0] = torch.finfo(torch.float16).min
+    mask.masked_fill_(torch.isneginf(mask), torch.finfo(torch.float32).min)
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
-    rep_row_ids = rep_row_ids.repeat_interleave(bpc)
-    chunk_page_ids = [
-        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
-        for c in range(num_chunks)
-    ]
+    rep_row_ids = rep_row_ids.repeat(bpc)
+    chunk_page_ids = page_ids.t().contiguous()
+    # Query-group axis 1, as the builder transfers it: the kernel broadcasts it
+    # over the group rather than being handed qpk copies.
     mask_by_chunk = (
-        mask.reshape(b_seqs, num_chunks, bpc, block_size)
-        .permute(1, 0, 2, 3)
-        .reshape(num_chunks, entries, 1, block_size)
+        mask.transpose(0, 1)
+        .unsqueeze(2)
+        .unsqueeze(3)
+        .expand(padded_blocks, b_seqs, num_kv_heads, 1, block_size)
         .contiguous()
     )
 
@@ -2007,6 +2029,102 @@ def test_batched_decode_matches_fp32_reference(
 
     assert torch.isfinite(actual[:num_seqs]).all()
     torch.testing.assert_close(actual[:num_seqs], expected[:num_seqs], atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "num_blocks,padded_query_len,num_kv_heads,qpk,use_alibi",
+    [
+        pytest.param(1, 4, 2, 1, False, id="one_block"),
+        pytest.param(4, 4, 2, 1, False, id="four_blocks"),
+        pytest.param(3, 8, 2, 2, False, id="gqa"),
+        pytest.param(4, 8, 2, 2, True, id="alibi"),
+    ],
+)
+def test_page_attn_matches_fp32_reference(
+    num_blocks: int,
+    padded_query_len: int,
+    num_kv_heads: int,
+    qpk: int,
+    use_alibi: bool,
+) -> None:
+    """Prefill's online softmax equals one softmax over the whole KV window.
+
+    Card-free and fp32, as the batched-decode reference test: it pins the running-max
+    rescale that both walks share, which the integration tests only reach through
+    fp16 tolerances on the card.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    block_size, head_size = 16, 8
+    num_heads = num_kv_heads * qpk
+    kv_len = num_blocks * block_size
+    scale = 0.5
+    first_row = 3
+
+    # Page 0 and the rows before first_row belong to other sequences, so both
+    # gathers have to actually move.
+    query = torch.randn(first_row + padded_query_len, num_heads, head_size, dtype=torch.float32)
+    k_pages = torch.randn(num_blocks + 1, block_size, num_kv_heads, head_size, dtype=torch.float32)
+    v_pages = torch.randn(num_blocks + 1, block_size, num_kv_heads, head_size, dtype=torch.float32)
+
+    # int64 here, not the production int32: this runs eager on CPU, where
+    # advanced indexing needs int64.
+    query_row_index = torch.arange(first_row, first_row + padded_query_len, dtype=torch.int64)
+    page_ids = torch.arange(1, num_blocks + 1, dtype=torch.int64)
+    page_index_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int64)
+    page_index_table[:, 0] = page_ids
+
+    # Causal, with the query window at the end of the KV window: the last block is
+    # partly -inf per query row, which is what the running max has to survive.
+    q_pos = kv_len - padded_query_len + torch.arange(padded_query_len)
+    mask_min = torch.finfo(torch.float32).min
+    mask = torch.full((padded_query_len, kv_len), mask_min, dtype=torch.float32)
+    mask.masked_fill_(torch.arange(kv_len).unsqueeze(0) <= q_pos.unsqueeze(1), 0.0)
+    mask_tiles = mask.reshape(padded_query_len, num_blocks, block_size).transpose(0, 1).contiguous()
+    alibi_stack = None
+    alibi = torch.zeros(num_kv_heads, qpk, 1, kv_len, dtype=torch.float32)
+    if use_alibi:
+        slopes = torch.linspace(0.01, 0.08, num_heads).reshape(num_kv_heads, qpk, 1, 1)
+        alibi_stack = torch.stack(
+            [
+                slopes * torch.arange(b * block_size, (b + 1) * block_size).reshape(1, 1, 1, -1)
+                for b in range(num_blocks)
+            ]
+        )
+        alibi = alibi_stack.permute(1, 2, 3, 0, 4).reshape(num_kv_heads, qpk, 1, kv_len)
+
+    actual = page_attn_kernel(
+        query,
+        query_row_index,
+        k_pages,
+        v_pages,
+        page_index_table,
+        mask_tiles,
+        scale,
+        num_blocks,
+        padded_query_len,
+        num_heads,
+        num_kv_heads,
+        head_size,
+        alibi_stack=alibi_stack,
+    )
+
+    q_rows = query.index_select(0, query_row_index)
+    q = q_rows.transpose(0, 1).reshape(num_kv_heads, qpk, padded_query_len, head_size)
+    k = k_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
+    v = v_pages[page_ids].reshape(kv_len, num_kv_heads, head_size)
+    scores = torch.einsum("hgid,thd->hgit", q, k) * scale + alibi + mask
+    probs = torch.softmax(scores, dim=-1)
+    expected = (
+        torch.einsum("hgit,thd->hgid", probs, v)
+        .reshape(num_heads, padded_query_len, head_size)
+        .transpose(0, 1)
+    )
+
+    assert actual.shape == (padded_query_len, num_heads, head_size)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -2117,15 +2235,7 @@ def test_bucketed_block_ids_match_scalar_fill(
     assert metadata.blocks_per_chunk is not None
     assert metadata.padded_num_seqs is not None
 
-    # Unpack the per-chunk [entries, 1] index tensors back into the
-    # [padded_batch_blocks, b_seqs] fill they were built from. Entry order is
-    # (s, j) with s major, so each chunk transposes back.
-    bpc = metadata.blocks_per_chunk
-    b_seqs = metadata.padded_num_seqs
-    chunks = metadata.chunk_page_ids_cpu
-    got = torch.zeros(len(chunks) * bpc, b_seqs, dtype=torch.int32)
-    for c, chunk in enumerate(chunks):
-        got[c * bpc : (c + 1) * bpc] = chunk.reshape(b_seqs, bpc).t()
+    got = metadata.chunk_page_ids_cpu
     assert got.shape[0] == metadata.padded_batch_blocks
     bt = metadata.block_table
     active = metadata.active_block_indices
@@ -2424,17 +2534,11 @@ def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm
     assert stacks[0].shape[0] == tables[0].shape[0] == len(active[0])
 
     mask_min = torch.finfo(stacks[0].dtype).min
+    open_positions = []
     for row, logical_block in enumerate(active[0]):
         assert tables[0][row, 0] == block_table[0, logical_block]
         open_offsets = (stacks[0][row, 0] > mask_min).nonzero().flatten().tolist()
-        open_positions = [logical_block * block_size + offset for offset in open_offsets]
-        assert all(kv_len - window <= pos < kv_len for pos in open_positions)
-
-    open_positions = [
-        logical_block * block_size + offset
-        for row, logical_block in enumerate(active[0])
-        for offset in (stacks[0][row, 0] > mask_min).nonzero().flatten().tolist()
-    ]
+        open_positions.extend(logical_block * block_size + offset for offset in open_offsets)
     assert open_positions == list(range(kv_len - window, kv_len))
 
 

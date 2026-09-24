@@ -16,11 +16,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import cast
+
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
-from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
+from vllm.model_executor.layers.pooler.seqwise.heads import (
+    ClassifierPoolerHead,
+    EmbeddingPoolerHead,
+)
 from vllm.model_executor.layers.pooler.seqwise.methods import (
     CLSPool,
     LastPool,
@@ -29,41 +35,49 @@ from vllm.model_executor.layers.pooler.seqwise.methods import (
 )
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
+from vllm.model_executor.layers.pooler.tokwise.heads import TokenClassifierPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
+from spyre_inference.custom_ops.linear import spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    default_encoder_len_buckets,
-    next_bucket,
-)
+from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
+
+
+def _cpu_cast_if_needed(pooled_data, head_dtype):
+    """Host cast when a Spyre tensor's dtype differs. Same-dtype is a no-op.
+
+    On-device fp16↔fp32 is staggered garbage (torch-spyre#2971). Upstream
+    ``.to(head_dtype)`` then sees a CPU tensor and does not cast again.
+    """
+    if head_dtype is None:
+        return pooled_data
+    sample = pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
+    if (
+        isinstance(sample, torch.Tensor)
+        and sample.device.type == "spyre"
+        and sample.dtype != head_dtype
+    ):
+        if isinstance(pooled_data, list):
+            pooled_data = torch.stack(pooled_data)
+        pooled_data = convert(pooled_data, "cpu").to(head_dtype)
+    return pooled_data
 
 
 class SpyreEmbeddingPoolerHead(EmbeddingPoolerHead):
     """D2H before ``.to(head_dtype)`` when dtype changes; rest is upstream.
 
     Pooling defaults ``head_dtype=float32``. Spyre fp16→fp32 cast after CLS
-    corrupts embeddings; keep gather on Spyre and cast on CPU.
+    corrupts embeddings; keep gather on Spyre and cast on CPU. Classifier
+    heads are not wrapped: ``_set_classifier_head_dtype`` already points them
+    at fp16, and ``SpyreClassifierLinear`` casts a mismatched row itself.
     """
 
     def forward(self, pooled_data, pooling_metadata):
-        if self.head_dtype is not None:
-            sample = (
-                pooled_data[0] if isinstance(pooled_data, list) and pooled_data else pooled_data
-            )
-            if (
-                isinstance(sample, torch.Tensor)
-                and sample.device.type == "spyre"
-                and sample.dtype != self.head_dtype
-            ):
-                if isinstance(pooled_data, list):
-                    pooled_data = torch.stack(pooled_data)
-                # Upstream ``.to(head_dtype)`` is then a no-op on CPU.
-                pooled_data = convert(pooled_data, "cpu").to(self.head_dtype)
-        return super().forward(pooled_data, pooling_metadata)
+        return super().forward(_cpu_cast_if_needed(pooled_data, self.head_dtype), pooling_metadata)
 
 
 def _pooler_output_on_cpu(raw_pooler_output: PoolerOutput) -> PoolerOutput:
@@ -105,6 +119,29 @@ def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     return ends - 1 if last else ends - counts
 
 
+def pad_row_count_to_bucket(row_indices: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Pad a per-request row index up to a power-of-two length.
+
+    ``select_rows``' ``index_select`` specializes on the *exact* index length,
+    and serving pools one row per request -- any count from 1 to
+    ``max_num_seqs``. Left alone that is up to 64 graphs per body bucket, each
+    compiling the first time its request count appears mid-serve. Rounding the
+    count to a power of two caps it at a handful of widths that warmup can
+    afford to sweep (see ``_warm_pooler_row_widths``).
+
+    Padding lanes repeat the last real row, so the extra rows are duplicates
+    the caller drops; they never introduce a row that was not already pooled.
+    Returns the padded index and the real row count to trim back to.
+    """
+    n = int(row_indices.numel())
+    if n <= 1:
+        return row_indices, n
+    target = 1 << (n - 1).bit_length()
+    if target == n:
+        return row_indices, n
+    return torch.cat([row_indices, row_indices[-1:].expand(target - n)]), n
+
+
 def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch.Tensor:
     """Row gather via ``index_select`` (no Spyre ``aten::index.Tensor``).
 
@@ -128,7 +165,9 @@ class SpyreCLSPool(CLSPool):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=False))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=False))
+        pooled = select_rows(hidden_states, idx)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreLastPool(LastPool):
@@ -136,7 +175,9 @@ class SpyreLastPool(LastPool):
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
-        return select_rows(hidden_states, cursor_row_indices_cpu(cursor, last=True))
+        idx, n_rows = pad_row_count_to_bucket(cursor_row_indices_cpu(cursor, last=True))
+        pooled = select_rows(hidden_states, idx)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreMeanPool(MeanPool):
@@ -316,30 +357,123 @@ class SpyreTokenPooler(TokenPooler):
         return trimmed
 
 
-def prepare_token_head_for_spyre(
-    model: nn.Module, pooler: nn.Module, spyre_device: torch.device
-) -> None:
-    """Keep the token-level tail in fp16 so it can run on Spyre.
+def _iter_modules(module: nn.Module):
+    """``children()`` plus ``DispatchPooler.poolers_by_task``.
 
-    Heads cast per chunk to a float32 ``head_dtype`` and the model casts before
-    its own classifier; both are wrong on device, and Spyre has no fp32 matmul.
+    That map is a plain dict, so ``modules()`` never yields the classify head.
+    Its ``head_dtype`` stays the pooling default ``float32``, and
+    ``pooled_data.to(float32)`` then runs on Spyre before the classifier GEMM.
     """
-    # Scope to the token sub-poolers: a DispatchPooler can also hold a sequence
-    # pooler whose fp32 head is handled by SpyreEmbeddingPoolerHead instead.
-    targets = [m for m in pooler.modules() if isinstance(m, TokenPooler)]
-    classifier = getattr(model, "classifier", None)
-    if classifier is not None:
-        targets.append(classifier)
+    seen: set[int] = set()
+    stack = [module]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, nn.Module) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        stack.extend(current.children())
+        task_poolers = getattr(current, "poolers_by_task", None)
+        if task_poolers is not None:
+            stack.extend(task_poolers.values())
+
+
+def _downcast_module_to_fp16(module: nn.Module, spyre_device: torch.device) -> None:
+    """On-device fp32→fp16 is staggered garbage (torch-spyre#2971); go via host."""
+    for param in module.parameters(recurse=True):
+        if param.dtype != torch.float32:
+            continue
+        # convert() detours a Spyre dtype change via the host (torch-spyre#2971).
+        param.data = convert(param.data, spyre_device, torch.float16)
+
+
+def _set_classifier_head_dtype(pooler: nn.Module) -> None:
+    """Point classifier heads at fp16. Leave embed heads at their fp32 default."""
+    for child in _iter_modules(pooler):
+        if not isinstance(child, ClassifierPoolerHead | TokenClassifierPoolerHead):
+            continue
+        if child.head_dtype is not None:
+            child.head_dtype = torch.float16
+
+
+def prepare_fp32_head_for_spyre(
+    model: nn.Module,
+    pooler: nn.Module,
+    spyre_device: torch.device,
+    roots: list[nn.Module],
+) -> None:
+    """Downcast classifier weights to fp16; Spyre has no fp32 matmul (torch-spyre#1794).
+
+    ``roots`` is the list ``configure_pooling_for_spyre`` already built. Only
+    those modules are downcast. An embed projector that shares the
+    ``DispatchPooler`` stays fp32 and keeps the CPU cast in its own head.
+    """
+    _set_classifier_head_dtype(pooler)
+    for root in roots:
+        _downcast_module_to_fp16(root, spyre_device)
     if getattr(model, "head_dtype", None) is not None:
         model.head_dtype = torch.float16
-    for target in targets:
-        for module in target.modules():
-            if getattr(module, "head_dtype", None) is not None:
-                module.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
-        # A dtype cast on device returns wrong data; convert() detours via host.
-        for param in target.parameters(recurse=True):
-            if param.dtype == torch.float32:
-                param.data = convert(param.data, spyre_device, torch.float16)
+
+
+class SpyreClassifierLinear(nn.Linear):
+    """Classifier Linear: decoder-style ``x @ Wᵀ`` on Spyre, bias in the same op.
+
+    Isolated ``F.linear`` of a CLS row lowers as fp32 ``batchmatmul``. Store
+    ``Wᵀ`` like the decoder and pad short rows. Bias stays in ``spyre_linear_t``,
+    the same on-device add every decoder linear uses, so a RoBERTa dense → tanh
+    → out_proj chain does not bounce through the host. Activations must already
+    be fp16; a leftover fp32 row is cast on the host so the matmul stays fp16.
+    """
+
+    @classmethod
+    def convert(cls, linear: nn.Linear) -> SpyreClassifierLinear:
+        orig_device = linear.weight.device
+        w = linear.weight.data
+        if orig_device.type == "spyre":
+            w = convert(w, "cpu")
+        weight_t = w.t().contiguous()
+        if orig_device.type == "spyre":
+            weight_t = convert(weight_t, orig_device)
+        else:
+            weight_t = weight_t.to(device=orig_device)
+        linear.__class__ = cls
+        linear.weight = nn.Parameter(weight_t, requires_grad=False)
+        return cast(SpyreClassifierLinear, linear)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        weight = self.weight
+        if input.device != weight.device or input.dtype != weight.dtype:
+            if weight.device.type == "spyre":
+                input = convert(input, weight.device, weight.dtype)
+            else:
+                input = input.to(device=weight.device, dtype=weight.dtype)
+        return spyre_linear_t(input, weight, self.bias, pad_rows=True)
+
+
+def _classifier_roots(model: nn.Module) -> list[nn.Module]:
+    """Classifier modules even when not registered in ``_modules``.
+
+    ``_iter_modules`` yields ``model`` first and follows ``pooler``, including
+    a ``DispatchPooler``'s ``poolers_by_task`` dict.
+    """
+    roots: dict[int, nn.Module] = {}
+    for parent in _iter_modules(model):
+        classifier = getattr(parent, "classifier", None)
+        if isinstance(classifier, nn.Module):
+            roots[id(classifier)] = classifier
+    return list(roots.values())
+
+
+def patch_classifier_linears_for_spyre(roots: list[nn.Module]) -> int:
+    """Convert every ``nn.Linear`` under a classifier, in place."""
+    n = 0
+    for root in roots:
+        candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
+        for child in candidates:
+            if type(child) is nn.Linear:
+                SpyreClassifierLinear.convert(child)
+                n += 1
+    return n
 
 
 class SpyreCpuClassifier(nn.Module):
@@ -382,12 +516,14 @@ def _module_has_float32_params(module: nn.Module) -> bool:
 
 
 def patch_normalize_for_spyre(pooler: nn.Module) -> int:
-    """Replace ``PoolerNormalize`` with ``SpyreNormalize``. Recurses ``DispatchPooler``."""
-    if isinstance(pooler, DispatchPooler):
-        return sum(patch_normalize_for_spyre(sub) for sub in pooler.poolers_by_task.values())
+    """Replace ``PoolerNormalize`` with ``SpyreNormalize``.
 
+    Walks with ``_iter_modules`` so a ``DispatchPooler``'s ``poolers_by_task``
+    dict is visible. Snapshot first: the walk must not follow a child this
+    loop has just replaced.
+    """
     num_patched = 0
-    for module in list(pooler.modules()):
+    for module in list(_iter_modules(pooler)):
         for name, child in list(module.named_children()):
             if isinstance(child, PoolerNormalize) and not isinstance(child, SpyreNormalize):
                 setattr(module, name, SpyreNormalize())
@@ -396,12 +532,12 @@ def patch_normalize_for_spyre(pooler: nn.Module) -> int:
 
 
 def patch_embedding_heads_for_spyre(pooler: nn.Module) -> int:
-    """Swap ``EmbeddingPoolerHead`` so fp32 ``head_dtype`` cast runs on CPU."""
-    if isinstance(pooler, DispatchPooler):
-        return sum(patch_embedding_heads_for_spyre(sub) for sub in pooler.poolers_by_task.values())
+    """Swap ``EmbeddingPoolerHead`` so fp32 ``head_dtype`` cast runs on CPU.
 
+    Same ``_iter_modules`` walk as ``patch_normalize_for_spyre``.
+    """
     num_patched = 0
-    for module in list(pooler.modules()):
+    for module in list(_iter_modules(pooler)):
         for name, child in list(module.named_children()):
             if isinstance(child, EmbeddingPoolerHead) and not isinstance(
                 child, SpyreEmbeddingPoolerHead
@@ -474,28 +610,30 @@ def patch_pooler_for_spyre(
 
 
 def configure_pooling_for_spyre(
-    model: nn.Module, spyre_device: torch.device, max_model_len: int | None = None
+    model: nn.Module, spyre_device: torch.device, len_ladder: Sequence[int] | None = None
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
     CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
     reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
-    is garbage (torch-spyre#2971). False if the method is unknown or the
-    head is an FP32 linear.
+    is garbage (torch-spyre#2971). Classifier / reranker heads are downcast
+    to fp16 (no native fp32 matmul, torch-spyre#1794). False if the pooling
+    method is unknown.
 
-    ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
-    It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
-    the pooler because only the caller is guaranteed to run inside a
-    ``set_current_vllm_config`` context; token pooling degrades to plain stick
-    alignment without it.
+    ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
+    of two from one stick to ``max_model_len``), which are the only per-request widths
+    ``SpyreAllPool``'s bucketed gather can see. Not the body's ``compile_sizes``, which is
+    one entry. Passed in rather than re-derived here because only the caller is guaranteed
+    to run inside a ``set_current_vllm_config`` context; without it token pooling falls
+    back to plain stick alignment.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
         return False
 
-    len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
-    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
+    ladder = sorted(set(len_ladder)) if len_ladder else []
+    num_patched, unsupported = patch_pooler_for_spyre(pooler, ladder)
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__
         logger.info(
@@ -507,27 +645,30 @@ def configure_pooling_for_spyre(
 
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
-    if token_level:
-        if not len_ladder:
-            logger.warning(
-                "Pooling: token pooling has no length ladder (max_model_len was "
-                "not passed); gathers round to every 64-multiple instead of the "
-                "power-of-two buckets, so more shapes compile than necessary"
+    if token_level and not ladder:
+        logger.warning(
+            "Pooling: token pooling got no declared prompt lengths, so its gather "
+            "rounds row counts to every 64-multiple rather than to the declared "
+            "lengths, compiling more shapes than necessary"
+        )
+    roots = _classifier_roots(model)
+    n_classifier_gemms = 0
+    if token_level or roots:
+        prepare_fp32_head_for_spyre(model, pooler, spyre_device, roots)
+        n_classifier_gemms = patch_classifier_linears_for_spyre(roots)
+        if n_classifier_gemms:
+            logger.info(
+                "Pooling: downcast %d classifier Linear(s) to fp16 (GEMM and bias on Spyre)",
+                n_classifier_gemms,
             )
-        prepare_token_head_for_spyre(model, pooler, spyre_device)
 
-    # torch-spyre SPYRE_FP32_OPS has add/mul/sum/mean, but not batchmatmul
-    # (torch-spyre#1794). Reranker / classifier heads stay float32, so those
-    # stay on CPU.
+    # Leftover fp32 (embed projector, no classifier) still has no Spyre matmul.
     fp32_head = _module_has_float32_params(pooler) or (
         classifier is not None and _module_has_float32_params(classifier)
     )
     if fp32_head:
         run_pooling_tail_on_cpu(model, pooler)
-        logger.info(
-            "Pooling: FP32 classifier/head unsupported on Spyre "
-            "(no FP32 batchmatmul); running pooler on CPU"
-        )
+        logger.info("Pooling: leftover FP32 weights have no Spyre matmul; running pooler on CPU")
         return False
 
     num_norm = patch_normalize_for_spyre(pooler)
@@ -539,11 +680,12 @@ def configure_pooling_for_spyre(
     if classifier is not None:
         staying.append("classifier")
     logger.info(
-        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads)",
+        "Pooling: %s stay on %s (%d method(s), %d normalize, %d embed heads, %d classifier GEMMs)",
         ", ".join(staying),
         spyre_device,
         num_patched,
         num_norm,
         num_heads,
+        n_classifier_gemms,
     )
     return True

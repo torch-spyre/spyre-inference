@@ -22,6 +22,8 @@ every query row, so this kernel spends it instead: batched GQA over
 
 import torch
 
+from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
 
 def page_attn_head_major_prefill_kernel(
     query,
@@ -42,9 +44,12 @@ def page_attn_head_major_prefill_kernel(
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
-    Shapes are ``page_attn_head_major_decode``'s, except ``page_index_table``: one
-    [num_blocks, 1] int32 tensor of page ids into
-    ``[num_blocks, num_kv_heads, block_size, head_size]``, sliced per block in-graph.
+    The page walk goes through `walk_tiles`. Shapes are
+    ``page_attn_head_major_decode``'s, except:
+        page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device tensor, row i
+            holding the i-th active block's page index at column 0, indexing
+            ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
+        mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
     """
     num_queries_per_kv = num_heads // num_kv_heads
 
@@ -59,45 +64,63 @@ def page_attn_head_major_prefill_kernel(
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
 
-    tile_max = None
-    tile_sum = None
-    tile_output = None
+    # Both walks tile tensor axes, so what an unrolled walk read per block arrives
+    # stacked on dim 0.
+    operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
+    dims: tuple[int | None, ...] = (0, None, None, 0, None)
 
-    for i in range(num_blocks):
+    def block_body(carry, tiles):
+        page_index, k_pages, v_pages, mask_tile, q = tiles
+
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
-        page_idx = page_index_table[i]
+        page_idx = page_index[0, 0:1]
         k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        mask_tile = mask_stack[i]
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        scores = scores + mask_tile
+        scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
-            tile_max = scores_max
-            tile_probs = torch.exp(scores - tile_max)
-            tile_output = torch.matmul(tile_probs, v_page)
-            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
-        else:
-            assert tile_max is not None
-            assert tile_sum is not None
-            assert tile_output is not None
-            new_max = torch.maximum(tile_max, scores_max)
-            rescale = torch.exp(tile_max - new_max)
-            tile_output = tile_output * rescale
-            tile_sum = tile_sum * rescale
-            tile_probs = torch.exp(scores - new_max)
-            tile_output = tile_output + torch.matmul(tile_probs, v_page)
-            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
-            tile_max = new_max
+        # `carry is None` is required for SPYRE_ATTN_FOR_EACH_TILE=0
+        if carry is None:
+            tile_probs = torch.exp(scores - scores_max)
+            return (
+                scores_max,
+                tile_probs.sum(dim=-1, keepdim=True),
+                torch.matmul(tile_probs, v_page),
+            ), None
 
-    assert tile_output is not None and tile_sum is not None
+        tile_max, tile_sum, tile_output = carry
+        # Read tile_max before the maximum that supersedes it, or the tiled lowering
+        # copies the whole carry every trip. Identical to exp(tile_max - new_max).
+        rescale = torch.exp(-torch.relu(scores_max - tile_max))
+        new_max = torch.maximum(tile_max, scores_max)
+        tile_probs = torch.exp(scores - new_max)
+        new_sum = tile_sum * rescale + tile_probs.sum(dim=-1, keepdim=True)
+        new_output = tile_output * rescale + torch.matmul(tile_probs, v_page)
+        return (new_max, new_sum, new_output), None
+
+    state_shape = (num_kv_heads, num_queries_per_kv, padded_query_len, 1)
+    state_kwargs = {"dtype": q.dtype, "device": q.device}
+    (_, tile_sum, tile_output), _ = walk_tiles(
+        block_body,
+        operands,
+        dims=dims,
+        tile_size=1,
+        init=(
+            torch.full(state_shape, float("-inf"), **state_kwargs),
+            torch.zeros(state_shape, **state_kwargs),
+            torch.zeros(
+                (num_kv_heads, num_queries_per_kv, padded_query_len, head_size),
+                **state_kwargs,
+            ),
+        ),
+    )
     attn = tile_output / tile_sum
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)

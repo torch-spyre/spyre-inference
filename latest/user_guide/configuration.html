@@ -2238,9 +2238,9 @@ every schedulable length keeps a bucket.</p>
 <p>The default KV buckets are geometric (powers of two) precisely because the recorded set
 is a product. If your context never exceeds 2048, dropping the higher powers removes
 variants from warmup at no serving cost.</p>
-<p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default; the
-head-major layout has no batched kernel and ignores it), warmup also records it over the
-KV-length × num-sequences grid. <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>
+<p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default; under the
+default tiled walk it is reached on the head-major layout only, and a token-major run keeps
+the per-sequence loop), warmup also records it over the KV-length × num-sequences grid. <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>
 (default: powers of two from 4 to <code>--max-num-seqs</code>) is the extra lever there, and the same
 keep-it-short advice applies.</p>
 <h2 id="pyprojecttoml-reference">pyproject.toml Reference<a class="headerlink" href="#pyprojecttoml-reference" title="Permanent link">&para;</a></h2>

@@ -56,3 +56,5 @@ public_models:
   - repo: google/gemma-4-26B-A4B-it
     revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
   - qwrt/Swedish0.1M
+  - distilbert/distilbert-base-uncased-finetuned-sst-2-english
+  - papluca/xlm-roberta-base-language-detection

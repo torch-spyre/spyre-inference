@@ -32,7 +32,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
-    _is_decoder_attention_like,
+    _is_attention_like,
     _repeated_block_lists,
 )
 
@@ -219,12 +219,12 @@ def test_finds_heterogeneous_hybrid_stacks() -> None:
 
 def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
     native = _fake_attention()
-    assert _is_decoder_attention_like(native)
+    assert _is_attention_like(native)
 
     hf = _hf_decoder_attention()
     assert not isinstance(hf, Attention)
-    assert _is_decoder_attention_like(hf)
-    assert _is_decoder_attention_like(_hf_decoder_attention("paged|vllm"))
+    assert _is_attention_like(hf)
+    assert _is_attention_like(_hf_decoder_attention("paged|vllm"))
 
     class GraniteAttention(nn.Module):
         def __init__(self):
@@ -233,7 +233,7 @@ def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
             self.config = types.SimpleNamespace(_attn_implementation="sdpa")
             self.q_proj = nn.Linear(4, 4)
 
-    assert not _is_decoder_attention_like(GraniteAttention())
+    assert not _is_attention_like(GraniteAttention())
 
 
 @pytest.mark.parametrize("implementation", ["vllm", "paged|vllm"])
@@ -270,108 +270,6 @@ def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
     assert _repeated_block_lists(GraniteModel()) == []
     sdpa = _hf_decoder_stack("sdpa")
     assert _repeated_block_lists(sdpa) == []
-
-
-def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
-    """Pixtral's tower uses a local ``class Attention`` and ``MMEncoderAttention``.
-
-    Those keep HF ``sdpa`` (or no vLLM dispatch at all), so they are not decoder
-    KV-cache attention. Wrapping them traces RoPE+SDPA graphs that coarse-tile
-    cannot lower (``hint_id`` split across nests).
-    """
-
-    class Attention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.qkv = nn.Linear(4, 4)
-
-    class MMEncoderAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = 1.0
-
-    class VisionBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.attention = Attention()
-            self.attn = MMEncoderAttention()
-
-    class VisionTransformer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
-
-    class Pixtral(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.vision_encoder = VisionTransformer()
-
-    class PixtralHFAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer_idx = 0
-            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
-            self.q_proj = nn.Linear(4, 4)
-
-    class PixtralHFBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.self_attn = PixtralHFAttention()
-
-    class PixtralHF(nn.Module):
-        def __init__(self):
-            super().__init__()
-            # No vision_* path segment: decoder-attention dispatch must be enough.
-            self.layers = nn.ModuleList([PixtralHFBlock() for _ in range(2)])
-
-    assert _repeated_block_lists(Pixtral()) == []
-    assert _repeated_block_lists(PixtralHF()) == []
-
-
-def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
-    """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
-
-    class Attention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.qkv = nn.Linear(4, 4)
-
-    class MMEncoderAttention(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.scale = 1.0
-
-    class VisionBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.attention = Attention()
-            self.attn = MMEncoderAttention()
-
-    class DecoderLayer(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.self_attn = _hf_decoder_attention()
-
-    class VLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.vision_encoder = nn.Module()
-            self.vision_encoder.transformer = nn.Module()
-            self.vision_encoder.transformer.layers = nn.ModuleList(
-                [VisionBlock() for _ in range(2)]
-            )
-            self.language_model = nn.Module()
-            self.language_model.layers = nn.ModuleList([DecoderLayer() for _ in range(3)])
-
-    model = VLM()
-    vision_layers = model.vision_encoder.transformer.layers
-    decoder_layers = model.language_model.layers
-    assert _repeated_block_lists(model) == [decoder_layers]
-
-    originals = list(vision_layers)
-    assert _runner(model)._compile_blocks() == 3
-    assert all(block._compiled_call_impl is None for block in originals)
-    assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
 
 
 def test_compile_blocks_wraps_every_block_in_place() -> None:

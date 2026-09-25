@@ -26,6 +26,7 @@ of a device fp32 sum is ``test_spyre_fp32_reduce_d2h_with_destagger``
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -40,6 +41,8 @@ from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
 from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
+from vllm.pooling_params import PoolingParams
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference.custom_ops.utils import register as register_spyre_convert
 from spyre_inference.v1.pool.spyre_pooler import (
@@ -383,6 +386,24 @@ def test_spyre_token_pooler_trims_bucketed_rows_to_real_lengths():
         assert torch.equal(chunk, expected)
 
 
+class _SubclassTokenPooler(TokenPooler):
+    pass
+
+
+def test_token_pooler_subclass_is_unsupported_and_left_unchanged():
+    pooling = AllPool.__new__(AllPool)
+    nn.Module.__init__(pooling)
+    pooling.enable_chunked_prefill = False
+    pooler = _SubclassTokenPooler(pooling=pooling, head=None)
+
+    original_pooling = pooler.pooling
+    num_patched, unsupported = patch_pooler_for_spyre(pooler)
+
+    assert (num_patched, unsupported) == (0, ["_SubclassTokenPooler"])
+    assert pooler.pooling is original_pooling
+    assert not isinstance(pooler, SpyreTokenPooler)
+
+
 def test_token_pooler_step_pool_is_unsupported():
     """StepPool subclasses AllPool but indexes by step tag; keep it on CPU."""
     pooler = _token_pooler(StepPool)
@@ -495,41 +516,48 @@ def test_spyre_token_pooler_converts_every_item_including_exact_bucket(monkeypat
 
 # ---------------------------------------------------------------------------
 # SpyreDispatchPooler: everything else leans on it not slicing, so pin that it
-# is installed, that the single-group path hands the sub-pooler the full
-# bucketed tensor, and that anything else defers to upstream.
+# is installed, that the first group gets the full bucketed tensor, and that a
+# later group gets a *bucketed* gather rather than upstream's real-length slice.
 # ---------------------------------------------------------------------------
 
 
-_ANY_TASK = ("embed", "encode", "token_embed", "classify", "score")
+_ANY_TASK = ("embed", "encode", "token_embed", "classify")
 
 
 class _RecordingPooler(nn.Module):
-    """Stands in for a sub-pooler; records the row count it was handed."""
-
     def __init__(self) -> None:
         super().__init__()
         self.seen_rows: int | None = None
+        self.seen_tensor: torch.Tensor | None = None
+        self.seen_cursor = None
+        self.seen_calls = 0
 
     def get_supported_tasks(self):
         return _ANY_TASK
 
     def forward(self, hidden_states, pooling_metadata):
         self.seen_rows = hidden_states.shape[0]
+        self.seen_tensor = hidden_states
+        self.seen_cursor = pooling_metadata.pooling_cursor
+        self.seen_calls += 1
         return [hidden_states]
 
 
-def _dispatch_metadata(counts: list[int], tasks: list[str]):
-    cursor = type("C", (), {"num_scheduled_tokens_cpu": torch.tensor(counts)})()
-
-    class _Meta:
-        def __init__(self) -> None:
-            self.tasks = tasks
-            self.pooling_cursor = cursor
-
-        def get_pooling_cursor(self):
-            return cursor
-
-    return _Meta()
+def _real_dispatch_metadata(counts: list[int], tasks: list[str]) -> PoolingMetadata:
+    prompt_lens = torch.tensor(counts, dtype=torch.int64)
+    metadata = PoolingMetadata(
+        prompt_lens=prompt_lens,
+        prompt_token_ids=None,
+        prompt_token_ids_cpu=None,
+        pooling_params=[PoolingParams(task=task) for task in tasks],
+        pooling_states=[PoolingStates() for _ in tasks],
+    )
+    metadata.build_pooling_cursor(
+        np.asarray(counts),
+        seq_lens_cpu=prompt_lens,
+        device=torch.device("cpu"),
+    )
+    return metadata
 
 
 def test_configure_pooling_installs_spyre_dispatch_pooler():
@@ -550,17 +578,13 @@ def test_spyre_dispatch_pooler_keeps_hidden_states_bucketed():
     # 5 real tokens padded up to a 64-row bucket.
     hidden_states = torch.zeros(64, 9, dtype=torch.float16, device="spyre")
 
-    out = pooler(hidden_states, _dispatch_metadata([5], ["embed"]))
+    out = pooler(hidden_states, _real_dispatch_metadata([5], ["embed"]))
 
     assert sub.seen_rows == 64, "sub-pooler must see the bucketed length, not 5"
     assert len(out) == 1
 
 
-def test_spyre_dispatch_pooler_defers_to_upstream_for_mixed_tasks(monkeypatch):
-    """Several groups need upstream's per-group offsets, so do not bypass."""
-    if not spyre_available():
-        pytest.skip("needs Spyre: the bypass is device-gated")
-
+def test_spyre_dispatch_pooler_defers_to_upstream_off_device(monkeypatch):
     called: list[bool] = []
 
     def fake_super_forward(self, hidden_states, pooling_metadata):
@@ -569,13 +593,126 @@ def test_spyre_dispatch_pooler_defers_to_upstream_for_mixed_tasks(monkeypatch):
 
     monkeypatch.setattr(DispatchPooler, "forward", fake_super_forward)
 
-    pooler = DispatchPooler({"embed": _RecordingPooler(), "encode": _RecordingPooler()})
+    pooler = DispatchPooler({"embed": _RecordingPooler()})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(64, 9, dtype=torch.float16)
+
+    pooler(hidden_states, _real_dispatch_metadata([5], ["embed"]))
+
+    assert called == [True]
+
+
+def test_spyre_dispatch_pooler_first_group_keeps_the_full_bucketed_tensor():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
+
+    pooler(hidden_states, _real_dispatch_metadata([100, 100, 9], ["embed", "embed", "token_embed"]))
+
+    assert embed.seen_rows == 256
+    assert token.seen_rows == 256, "every group must keep the warmed body shape"
+
+
+def test_spyre_dispatch_pooler_later_group_rows_start_at_zero():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    hidden_states = torch.arange(256 * 4, dtype=torch.float16).reshape(256, 4)
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+
+    pooler(
+        hidden_states.to("spyre"),
+        _real_dispatch_metadata([100, 9], ["embed", "token_embed"]),
+    )
+
+    got = token.seen_tensor.cpu()
+    assert torch.equal(got[:9], hidden_states[100:109])
+    # Padding duplicates the group's last row, so a count-indexed sub-pooler cannot
+    # reach another group's tokens.
+    assert torch.equal(got[9:], hidden_states[108].expand(got.shape[0] - 9, -1))
+
+
+@pytest.mark.parametrize("tail", [33, 40, 50, 64])
+def test_spyre_dispatch_pooler_group_shape_does_not_track_the_token_sum(tail):
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
+
+    pooler(hidden_states, _real_dispatch_metadata([100, tail], ["embed", "token_embed"]))
+
+    assert token.seen_rows == 256
+
+
+def test_spyre_dispatch_pooler_rebases_the_cursor_onto_the_gathered_rows():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
+
+    pooler(hidden_states, _real_dispatch_metadata([100, 5, 4], ["embed", "token_embed", "embed"]))
+
+    # Group 1 starts at absolute row 100 and group 2 at 105; both must read as 0.
+    assert token.seen_cursor.first_token_indices_gpu.tolist() == [0]
+    assert token.seen_cursor.last_token_indices_gpu.tolist() == [4]
+    assert embed.seen_cursor.first_token_indices_gpu.tolist() == [0]
+    assert embed.seen_cursor.last_token_indices_gpu.tolist() == [3]
+
+
+def test_spyre_dispatch_pooler_interleaved_tasks_give_one_group_per_request():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
+
+    out = pooler(
+        hidden_states,
+        _real_dispatch_metadata([10, 10, 10, 10], ["embed", "token_embed", "embed", "token_embed"]),
+    )
+
+    assert len(out) == 4, "one output per request, in request order"
+    assert embed.seen_calls == 2
+    assert token.seen_calls == 2
+
+
+def test_spyre_dispatch_pooler_rejects_an_empty_group():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    embed, token = _RecordingPooler(), _RecordingPooler()
+    pooler = DispatchPooler({"embed": embed, "token_embed": token})
+    pooler.__class__ = SpyreDispatchPooler
+    hidden_states = torch.zeros(256, 9, dtype=torch.float16, device="spyre")
+
+    with pytest.raises(ValueError, match="at least one scheduled token"):
+        pooler(hidden_states, _real_dispatch_metadata([100, 0], ["embed", "token_embed"]))
+
+
+def test_spyre_dispatch_pooler_rejects_an_unsupported_task():
+    if not spyre_available():
+        pytest.skip("needs Spyre: the bypass is device-gated")
+
+    pooler = DispatchPooler({"embed": _RecordingPooler()})
     pooler.__class__ = SpyreDispatchPooler
     hidden_states = torch.zeros(64, 9, dtype=torch.float16, device="spyre")
 
-    pooler(hidden_states, _dispatch_metadata([5, 5], ["embed", "encode"]))
-
-    assert called == [True], "mixed-task batch must defer to upstream"
+    with pytest.raises(ValueError, match="Unsupported task"):
+        pooler(hidden_states, _real_dispatch_metadata([5], ["classify"]))
 
 
 # ---------------------------------------------------------------------------

@@ -569,6 +569,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_width_caps: dict[int, int] = (
             encoder_group_width_caps(vllm_config) if is_pooling else {}
         )
+        self._encoder_len_ladder = encoder_len_ladder(vllm_config) if is_pooling else []
         self._encoder_budget = encoder_shape_tables(vllm_config).budget if is_pooling else 0
         self._encoder_buffer_rows = 0
         # (extent, width, query_lens) on the rectangular path; None on the ragged one.
@@ -677,7 +678,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
-                self.model, self._spyre_device, encoder_len_ladder(self.vllm_config)
+                self.model, self._spyre_device, self._encoder_len_ladder
             )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
@@ -1322,26 +1323,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
-        """Compile the pooler's row gather at every row count serving can present.
-
-        ``_dummy_pooler_run`` only ever pools ``min(num_tokens, max_num_seqs)``
-        rows, but serving pools one row per *request* -- any count from 1 up. That
-        gather specializes on the exact index length, so every unseen count paid a
-        full Inductor compile mid-request; it was the whole residual warm-up gap
-        once the attention kernels were covered. The poolers round their row count
-        to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
-        """
+        """Compile sequence and token index widths against the fixed body source."""
         if not self._pooling_on_spyre:
             return
         rows = hidden_states.shape[0]
         # Up to the power of two at or above the limit, which is not itself always one:
         # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
         limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
+        request_widths = []
         width = 1
-        while width <= limit:
-            if width <= rows:
-                select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
+        while width <= min(limit, rows):
+            request_widths.append(width)
             width *= 2
+
+        downstream_widths = sorted(set(request_widths) | set(self._encoder_len_ladder))
+        assert not downstream_widths or downstream_widths[-1] <= rows, (
+            f"pooler gather width exceeds the fixed encoder body: {downstream_widths[-1]} > {rows}"
+        )
+        for index_rows in downstream_widths:
+            select_rows(hidden_states, torch.zeros(index_rows, dtype=torch.int64))
 
     @torch.inference_mode()
     def _warm_encoder_inline_paths(self) -> None:

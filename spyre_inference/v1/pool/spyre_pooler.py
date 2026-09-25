@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
+from itertools import groupby
 from typing import cast
 
 import torch
@@ -209,47 +211,65 @@ class SpyreMeanPool(MeanPool):
 
 
 class SpyreDispatchPooler(DispatchPooler):
-    """``DispatchPooler`` that leaves ``hidden_states`` at its bucketed length.
-
-    Upstream slices ``hidden_states`` down to the group's *real* token count
-    before handing it to the sub-pooler (``DispatchPooler.forward``:
-    ``hidden_states[token_offset : token_offset + num_group_tokens]``). On Spyre
-    that makes ``select_rows``' ``index_select`` source shape track the prompt
-    length, so ``torch.compile(dynamic=False)`` adds a specialization per distinct
-    length and Dynamo rescans a growing guard chain on every later call —
-    throughput decays as more distinct lengths are seen, which is why
-    ``TorchSpyreModelRunner._pool`` deliberately hands this a padded tensor in the
-    first place. Undoing the slice here is what makes that intent hold.
-
-    Safe because the Spyre seqwise poolers address rows through
-    ``cursor_row_indices_cpu``, which only ever names rows inside the real range —
-    they never read the padding the slice would have removed.
-
-    Only the single-task-group case is handled. With several groups each one
-    starts at a nonzero token offset and upstream rebases the cursor's row
-    indices onto its slice; without the slice those indices would need the offset
-    added back instead, so anything else defers to upstream unchanged.
-    """
+    """Keep every task group's hidden states at the warmed body row count."""
 
     def forward(self, hidden_states, pooling_metadata):
-        tasks = list(pooling_metadata.tasks)
-        if (
-            hidden_states.device.type != "spyre"
-            or pooling_metadata.pooling_cursor is None
-            or len(set(tasks)) != 1
-        ):
+        if hidden_states.device.type != "spyre" or pooling_metadata.pooling_cursor is None:
             return super().forward(hidden_states, pooling_metadata)
 
-        task = tasks[0]
-        if not (pooler := self.poolers_by_task.get(task)):
-            raise ValueError(
-                f"Unsupported task: {task!r} Supported tasks: {self.get_supported_tasks()}"
-            )
         # Mirror upstream's accumulation: a sub-pooler may return a stacked
         # tensor, which upstream flattens into one entry per request.
         outputs: list[torch.Tensor | None] = []
-        outputs.extend(pooler(hidden_states, pooling_metadata))
+        total_rows = hidden_states.shape[0]
+        req_offset = 0
+        token_offset = 0
+        for task, group in groupby(pooling_metadata.tasks):
+            if not (pooler := self.poolers_by_task.get(task)):
+                raise ValueError(
+                    f"Unsupported task: {task!r} Supported tasks: {self.get_supported_tasks()}"
+                )
+            num_items = len(list(group))
+            group_metadata = pooling_metadata[req_offset : req_offset + num_items]
+            group_cursor = group_metadata.pooling_cursor
+            assert group_cursor is not None
+            num_group_tokens = int(group_cursor.num_scheduled_tokens_cpu.sum())
+            if not num_group_tokens:
+                raise ValueError("A pooling task group must contain at least one scheduled token")
+            if token_offset:
+                group_metadata = _rebase_group_rows(group_metadata, group_cursor, token_offset)
+                group_hidden_states = _gather_group_rows(
+                    hidden_states, token_offset, num_group_tokens, total_rows
+                )
+            else:
+                group_hidden_states = hidden_states
+            outputs.extend(pooler(group_hidden_states, group_metadata))
+            req_offset += num_items
+            token_offset += num_group_tokens
         return outputs
+
+
+def _gather_group_rows(
+    hidden_states: torch.Tensor,
+    token_offset: int,
+    num_group_tokens: int,
+    total_rows: int,
+) -> torch.Tensor:
+    # Slicing adds shape and storage-offset guards (torch-spyre#4449).
+    indices = token_offset + torch.arange(total_rows, dtype=torch.int64).clamp(
+        max=num_group_tokens - 1
+    )
+    return select_rows(hidden_states, indices)
+
+
+def _rebase_group_rows(group_metadata, group_cursor, token_offset: int):
+    return dataclasses.replace(
+        group_metadata,
+        pooling_cursor=dataclasses.replace(
+            group_cursor,
+            first_token_indices_gpu=group_cursor.first_token_indices_gpu - token_offset,
+            last_token_indices_gpu=group_cursor.last_token_indices_gpu - token_offset,
+        ),
+    )
 
 
 class SpyreNormalize(PoolerNormalize):
@@ -585,6 +605,11 @@ def patch_pooler_for_spyre(
         elif isinstance(pooling, SequencePoolingMethod):
             unsupported.append(type(pooling).__name__)
     elif isinstance(pooler, TokenPooler):
+        if type(pooler) is not TokenPooler and not isinstance(pooler, SpyreTokenPooler):
+            # SpyreTokenPooler.forward delegates to TokenPooler.forward, so changing
+            # an arbitrary subclass's class would silently drop its behavior.
+            unsupported.append(type(pooler).__name__)
+            return num_patched, unsupported
         pooling = pooler.pooling
         if isinstance(pooling, SpyreAllPool):
             num_patched += 1
@@ -595,7 +620,7 @@ def patch_pooler_for_spyre(
             unsupported.append(type(pooling).__name__)
         # Bucketing the gather is only safe when something trims afterwards, so
         # the two are switched on together and never independently.
-        if isinstance(pooler.pooling, SpyreAllPool) and type(pooler) is TokenPooler:
+        if isinstance(pooler.pooling, SpyreAllPool) and not isinstance(pooler, SpyreTokenPooler):
             pooler.__class__ = SpyreTokenPooler
             pooler.pooling.defer_trim = True
     elif isinstance(pooler, DispatchPooler):

@@ -2367,7 +2367,7 @@ compiled graph (see below).</p>
 <td><code>GemmaRMSNorm</code></td>
 <td><code>SpyreGemmaRMSNorm</code></td>
 <td>Spyre</td>
-<td>An fp16 body with no dtype promotion. Plain <code>RMSNorm</code> needs no replacement — upstream's fp32 <code>forward_native</code> lowers — but Gemma's trailing fp32 <code>weight</code> multiply does not: a STANDARD <code>[hidden]</code> operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger.</td>
+<td>A <code>maybe_compile(force=True)</code> <code>forward_native</code>, so the fp32 promotion is kept. Plain <code>RMSNorm</code> needs no replacement — upstream's fp32 <code>forward_native</code> lowers eagerly — but Gemma's trailing fp32 <code>weight</code> multiply does not: a STANDARD <code>[hidden]</code> operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger, so the kernel has to be compiled even under <code>enforce_eager</code>.</td>
 </tr>
 <tr>
 <td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>
@@ -2537,8 +2537,12 @@ which needs torch &gt;= 2.11 and <code>VLLM_USE_LAYERNAME=1</code>. Without it e
 own layer name and compiles separately, which is worse than the whole-model graph; the
 runner logs a warning when it detects this. Inductor freezing (enabled by <code>max_autotune</code>)
 defeats sharing the same way, by folding each block's weights into its own graph.</p>
-<p>Embeddings and the final norm sit outside the block list and stay eager. <code>lm_head</code> was
-never in the compiled region; <code>compute_logits</code> is a separate call on the wrapper.</p>
+<p>Embeddings and the final norm sit outside the block list, so no enclosing block graph
+covers them. Both stay eager when compilation is off, except a Gemma final norm:
+<code>SpyreGemmaRMSNorm</code> passes <code>force=True</code>, so it compiles as its own one-op graph
+in every mode, including <code>enforce_eager</code>, because its fp32 weight multiply has no working
+eager form. <code>lm_head</code> was never in the compiled region; <code>compute_logits</code> is a separate
+call on the wrapper.</p>
 <p><code>SPYRE_COMPILE_GRANULARITY=model</code> restores the whole-model fullgraph, whose compile cost
 grows with layer count.</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>

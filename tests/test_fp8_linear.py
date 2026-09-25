@@ -233,8 +233,8 @@ class TestSpyreFp8LinearKernel:
         """Load-time process on CPU, then move the fp16 working copy to Spyre.
 
         ``process_weights_after_loading`` dequants checkpoint FP8 to CPU fp16.
-        First ``apply_weights`` eager-quantizes SuperDSC N-tiles to ``qfp8wt``
-        and caches them; the compiled graph is qfp8ch + ``_scaled_mm``.
+        First ``apply_weights`` eager-quantizes the full weight to ``qfp8wt``
+        and caches it; the compiled graph is qfp8ch + ``_scaled_mm``.
         """
         if per_channel:
             _weight_fp8, weight_scale = _quantize_weight_fp8_per_channel(weight_kn)
@@ -393,7 +393,7 @@ class TestSpyreFp8LinearKernel:
 
     @pytest.mark.parametrize("per_channel", [False, True])
     def test_qfp8wt_cached_and_reused(self, per_channel):
-        """First apply caches eager qfp8wt; the second apply reuses the same tiles."""
+        """First apply caches eager qfp8wt; the second apply reuses the same weight."""
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -426,8 +426,8 @@ class TestSpyreFp8LinearKernel:
         assert again.dtype == torch.float16
         assert again.shape == actual.shape
 
-    def test_qfp8wt_n_splits_fused_qkv(self):
-        """Fused QKV N=6144 is prequantized as SuperDSC-legal tiles."""
+    def test_qfp8wt_fused_qkv_is_one_weight(self):
+        """Fused QKV N=6144 is one cached qfp8wt, not SuperDSC N-tiles."""
         if not spyre_available():
             pytest.skip("Spyre device not available")
         if SpyreFp8LinearKernel is None:
@@ -447,9 +447,8 @@ class TestSpyreFp8LinearKernel:
         actual = self._run_spyre_apply(kernel, layer, x)
         assert actual.shape == (4, out_features)
         widths = [int(wj.shape[1]) for wj, _ in layer._qfp8wt_for_mm]
-        assert widths == [4096, 1024, 1024]
-        for wj, _ in layer._qfp8wt_for_mm:
-            self._assert_qfp8wt(wj)
+        assert widths == [6144]
+        self._assert_qfp8wt(layer._qfp8wt_for_mm[0][0])
 
     def test_cpu_fp8_checkpoint_never_dmas_float8(self):
         """process_weights dequants on CPU; apply H2Ds fp16 then caches qfp8wt."""
@@ -550,46 +549,12 @@ class TestSpyreFp8LinearKernel:
             f"cached qfp8wt vs in-graph qfp8wt max_diff={max_diff:.6f} (num_tokens={num_tokens})"
         )
 
-
-class TestFp8TileHelpers:
-    """SuperDSC-legal M/N splits from the Granite torch-spyre probe."""
-
     def test_require_qfp8wt_fails_without_layout(self):
         """Missing device_tensor_layout must error, not skip the QFP8WT check."""
         from spyre_inference.custom_ops.fp8_linear_kernel import _require_qfp8wt
 
         with pytest.raises(RuntimeError, match="device_tensor_layout"):
             _require_qfp8wt(torch.zeros(2, 2, dtype=torch.float16))
-
-    def test_m_tiles_4096_wide(self):
-        from spyre_inference.custom_ops.fp8_linear_kernel import _m_tiles
-
-        assert _m_tiles(1, 4096, 4096) == [1]
-        assert _m_tiles(4, 4096, 4096) == [4]
-        assert _m_tiles(16, 4096, 4096) == [4, 4, 4, 4]
-        assert _m_tiles(3, 4096, 4096) == [4]
-        assert _m_tiles(6, 4096, 4096) == [4, 4]
-        assert _m_tiles(128, 128, 128) == [128]
-
-    def test_n_tiles_granite(self):
-        from spyre_inference.custom_ops.fp8_linear_kernel import _n_tiles
-
-        assert _n_tiles(4096) == [4096]
-        assert _n_tiles(1024) == [1024]
-        assert _n_tiles(6144) == [4096, 1024, 1024]
-        assert _n_tiles(25600) == [4096] * 6 + [1024]
-        assert _n_tiles(12800) == [4096, 4096, 4096, 128, 128, 128, 128]
-
-    def test_n_weight_splits_per_channel_qkv(self):
-        from spyre_inference.custom_ops.fp8_linear_kernel import _n_tiles, _n_weight_splits
-
-        w = torch.arange(8 * 6144, dtype=torch.float16).reshape(8, 6144)
-        s = torch.arange(6144, dtype=torch.float16).reshape(1, 6144)
-        parts = _n_weight_splits(w, s, _n_tiles(6144))
-        assert [int(wj.shape[1]) for wj, _ in parts] == [4096, 1024, 1024]
-        assert [int(sj.shape[1]) for _, sj in parts] == [4096, 1024, 1024]
-        torch.testing.assert_close(torch.cat([wj for wj, _ in parts], dim=1), w)
-        torch.testing.assert_close(torch.cat([sj for _, sj in parts], dim=1), s)
 
 
 class TestDetectFp8ForCompile:

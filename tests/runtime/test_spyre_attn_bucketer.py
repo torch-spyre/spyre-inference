@@ -140,17 +140,27 @@ class TestPoolingQueryBucketCap:
     """Pooling's query_len can't exceed max_model_len; without this cap, warmup
     could record a query bucket with no matching num_blocks bucket, crashing
     with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
-    max_model_len=77, max_num_batched_tokens much larger)."""
+    max_model_len=77, max_num_batched_tokens much larger).
 
-    def test_pooling_caps_query_buckets_at_max_model_len(self):
+    Stick-aligned the same way the encoder shape ladder pads a request
+    (_align_up_pow2): CLIP's max_model_len=77 pads to 128, not 77."""
+
+    def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
         b = SpyreAttnBucketer(
             make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
         )
-        assert b.query_buckets[-1] == 77
+        assert b.query_buckets[-1] == 128
         # The largest recorded query bucket must round onto a real num_blocks
         # bucket -- this is what crashed for CLIP.
         largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
         assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_pooling_query_bucket_covers_clip_text_tower_padded_length(self):
+        """CLIP's max_model_len=77 pads to query_len=128; that must round onto a bucket."""
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.find_query_bucket(128) == 128
 
     def test_generate_is_unaffected(self):
         b = SpyreAttnBucketer(

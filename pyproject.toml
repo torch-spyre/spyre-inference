@@ -108,6 +108,13 @@ override-dependencies = [
     "pyzmq>=27.2.0",
 ]
 
+constraint-dependencies = [
+    # ortools caps protobuf <6.34 on x86_64 and uv unifies that onto every platform, landing
+    # s390x on a protobuf whose upb decoder mis-handles big-endian; both fixes are in 7.36.1
+    # (protocolbuffers/protobuf#25363, #25683).
+    "protobuf>=7.36.1; platform_machine == 's390x'",
+]
+
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
@@ -294,6 +301,7 @@ markers = [
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
     "mm_encoder_attention: SpyreMMEncoderAttention and SDPA-helper tests (tests/custom_ops/test_mm_encoder_attention.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
 ]
 # --8<-- [end:test-markers-definition]

@@ -1,0 +1,144 @@
+# Model Registry for Spyre Inference
+#
+# Each model entry contains:
+# - platforms: list of supported CPU architectures.  Omit to support all.
+#   Valid values: x86_64, s390x, ppc64le
+# - continuous_batching_configs: list of supported serving configurations.
+#   Each entry specifies tp_size, max_model_len, and max_num_seqs.
+
+# ---------------------------------------------------------------------------
+# Model registry
+# ---------------------------------------------------------------------------
+models:
+
+  # ---- Gemma 3 1B Instruct (CI test model, no platform restriction) -------
+  google/gemma-3-1b-it:
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 32768
+        max_num_seqs: 32
+
+  # ---- Gemma 4 26B-A4B Instruct (MoE + vision) ----------------------------
+  google/gemma-4-26B-A4B-it:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+
+  # ---- Granite 4.1 decoder models ------------------------------------------
+  ibm-granite/granite-4.1-8b:
+    platforms: [x86_64, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+
+  ibm-granite/granite-4.1-8b-fp8:
+    platforms: [x86_64, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+
+  # ---- Granite Vision 4.1 4B -----------------------------------------------
+  ibm-granite/granite-vision-4.1-4b:
+    platforms: [x86_64, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 8192
+        max_num_seqs: 16
+
+  # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
+
+  sentence-transformers/all-MiniLM-L6-v2:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  sentence-transformers/all-roberta-large-v1:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  sentence-transformers/clip-ViT-B-32:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 77
+        max_num_seqs: 256
+
+  # Granite embedding models — English
+  ibm-granite/granite-embedding-30m-english:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  ibm-granite/granite-embedding-125m-english:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # Multilingual RAG — embedding dim 768
+  ibm-granite/granite-embedding-278m-multilingual:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # Multilingual embedding — XLM-RoBERTa-large backbone
+  intfloat/multilingual-e5-large:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  # NLI / zero-shot classification — embedding dim 1024
+  FacebookAI/roberta-large-mnli:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  # Token classification / NER — embedding dim 768 (BERT-base)
+  dslim/bert-base-NER:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  # Token classification / NER — embedding dim 1024 (RoBERTa-large)
+  Jean-Baptiste/roberta-large-ner-english:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  # ---- Cross-encoder / Reranker models ------------------------------------
+
+  BAAI/bge-reranker-large:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
+
+  BAAI/bge-reranker-v2-m3:
+    platforms: [x86_64, s390x, ppc64le]
+    continuous_batching_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128

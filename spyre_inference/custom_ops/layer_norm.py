@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import torch
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 
 
 def _layer_norm_kernel(
@@ -84,7 +84,7 @@ class SpyreLayerNorm(CompileOutermost, torch.nn.LayerNorm):
         bias = self.bias if self.elementwise_affine else None
         return self._spyre_forward(input, weight, bias)
 
-    @compile_when_outermost
+    @maybe_compile
     def _spyre_forward(
         self, x: torch.Tensor, weight: torch.Tensor | None, bias: torch.Tensor | None
     ) -> torch.Tensor:

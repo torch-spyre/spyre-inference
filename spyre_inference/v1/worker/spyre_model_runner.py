@@ -108,6 +108,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_len_ladder,
     encoder_rectangles,
     encoder_shape_tables,
+    expand_packed_embeds_to_encoder_grid,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
     logits_row_buckets,
@@ -1440,24 +1441,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if grid is None:
             return out
         input_ids, inputs_embeds, positions, *rest = out
-        if input_ids is None:
-            # Multimodal pooling would need the same rearrangement on the embeds.
-            raise NotImplementedError(
-                "Dense encoder expansion supports token inputs only; this model "
-                "supplied inputs_embeds."
-            )
-
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
-        ids, pos = expand_packed_to_encoder_grid(
-            input_ids[:num_tokens].cpu(),
-            positions[:num_tokens].cpu(),
-            query_lens,
-            width,
-            extent,
-            pad_token_id=self._encoder_pad_token_id(),
-        )
-        assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+
+        if input_ids is not None:
+            ids, pos = expand_packed_to_encoder_grid(
+                input_ids[:num_tokens].cpu(),
+                positions[:num_tokens].cpu(),
+                query_lens,
+                width,
+                extent,
+                pad_token_id=self._encoder_pad_token_id(),
+            )
+            assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+            grid_ids = convert(ids, input_ids.device)
+            grid_embeds = inputs_embeds
+        else:
+            # A multimodal pooling model (e.g. CLIP) preprocesses straight to
+            # embeddings; expand those instead of ids. Positions still need the
+            # same padding, so reuse that helper with dummy ids (discarded).
+            assert inputs_embeds is not None, "upstream must supply ids or embeds"
+            _, pos = expand_packed_to_encoder_grid(
+                torch.zeros(num_tokens, dtype=torch.int64),
+                positions[:num_tokens].cpu(),
+                query_lens,
+                width,
+                extent,
+            )
+            grid_ids = None
+            grid_embeds = convert(
+                expand_packed_embeds_to_encoder_grid(
+                    inputs_embeds[:num_tokens].cpu(), query_lens, width, extent
+                ),
+                inputs_embeds.device,
+            )
+            assert grid_embeds.shape[0] == width * extent, (grid_embeds.shape[0], width * extent)
 
         # token_type_ids rides through `rest` in model_kwargs and is one value per packed
         # token, so it needs the same rearrangement or every sequence past the first gets
@@ -1483,8 +1501,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             regrouped.append(model_kwargs)
 
         return (
-            convert(ids, input_ids.device),
-            inputs_embeds,
+            grid_ids,
+            grid_embeds,
             convert(pos, positions.device),
             *regrouped,
         )

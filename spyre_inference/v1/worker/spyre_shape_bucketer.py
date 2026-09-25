@@ -377,6 +377,25 @@ def expand_packed_token_types(
     return torch.tensor(grid, dtype=token_type_ids.dtype)
 
 
+def expand_packed_embeds_to_encoder_grid(
+    inputs_embeds: torch.Tensor,
+    query_lens: Sequence[int],
+    batch_bucket: int,
+    len_bucket: int,
+) -> torch.Tensor:
+    """Scatter packed input embeddings into the ``[B*L, hidden]`` grid; every pad row is zero.
+
+    ``expand_packed_to_encoder_grid``'s counterpart for a multimodal pooling model (e.g.
+    CLIP) whose preprocessing produces embeddings rather than ids. Pad rows are zero, same
+    as ``expand_packed_token_types``: always masked out of attention before being read.
+    """
+    grid = torch.zeros(
+        batch_bucket * len_bucket, inputs_embeds.shape[-1], dtype=inputs_embeds.dtype
+    )
+    grid[encoder_dense_row_indices(query_lens, len_bucket)] = inputs_embeds
+    return grid
+
+
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
     """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
     cap = max(1, max_num_reqs)

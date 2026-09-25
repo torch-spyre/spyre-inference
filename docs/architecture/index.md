@@ -54,7 +54,7 @@ compiled graph (see below).
 
 | vLLM Layer | Spyre Replacement | Device | Notes |
 |---|---|---|---|
-| `GemmaRMSNorm` | `SpyreGemmaRMSNorm` | Spyre | An fp16 body with no dtype promotion. Plain `RMSNorm` needs no replacement — upstream's fp32 `forward_native` lowers — but Gemma's trailing fp32 `weight` multiply does not: a STANDARD `[hidden]` operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger. |
+| `GemmaRMSNorm` | `SpyreGemmaRMSNorm` | Spyre | A `maybe_compile(force=True)` `forward_native`, so the fp32 promotion is kept. Plain `RMSNorm` needs no replacement — upstream's fp32 `forward_native` lowers eagerly — but Gemma's trailing fp32 `weight` multiply does not: a STANDARD `[hidden]` operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger, so the kernel has to be compiled even under `enforce_eager`. |
 | `RotaryEmbedding`, `Llama3RotaryEmbedding` | `SpyreRotaryEmbedding`, `SpyreLlama3RotaryEmbedding` | Spyre | Fully on-device, no opaque op. A device-resident 4D rotation cache (`[max_pos, 2, 2, rotary_dim//2]`) is built from `cos_sin_cache` and **primed on-device in `_apply` before `torch.compile`**; `forward_oot` then gathers this pass's per-token slice with `index_select` and applies the 2×2 rotation-matrix formulation (`_rotate_neox_2x2`) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise `NotImplementedError` at construction. The 2×2 inner dim `rotary_dim//2` must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below) |
 | `VocabParallelEmbedding` | `SpyreVocabParallelEmbedding` | Spyre (TP tables built on CPU at load) | The weight moves to Spyre with the model and the embedding gather runs on-device (`aten.embedding` now has a Spyre kernel, torch-spyre#420). TP=1 gathers directly. When TP>1, the per-vocab reindex/keep tables are built once on CPU at load and registered as device buffers; `forward` derives `masked_input`/`keep` from them on-device (`index_select`/`F.embedding`), applies the keep mask, and `all_reduce`s — no per-step CPU round-trip |
 | `ColumnParallelLinear`, `MergedColumnParallelLinear`, `QKVParallelLinear`, `RowParallelLinear`, `ReplicatedLinear` | `SpyreColumnParallelLinear`, `SpyreMergedColumnParallelLinear`, `SpyreQKVParallelLinear`, `SpyreRowParallelLinear`, `SpyreReplicatedLinear` | Spyre | All five swap in `SpyreUnquantizedLinearMethod` (the transposed-weight fast path below). `SpyreQKVParallelLinear` additionally asserts `gather_output=False`; `SpyreRowParallelLinear` (`o_proj`, `down_proj`) inherits upstream's `all_reduce` when `reduce_results=True` under TP>1 |
@@ -189,8 +189,12 @@ own layer name and compiles separately, which is worse than the whole-model grap
 runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
 defeats sharing the same way, by folding each block's weights into its own graph.
 
-Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
-never in the compiled region; `compute_logits` is a separate call on the wrapper.
+Embeddings and the final norm sit outside the block list, so no enclosing block graph
+covers them. Both stay eager when compilation is off, except a Gemma final norm:
+`SpyreGemmaRMSNorm` passes `force=True`, so it compiles as its own one-op graph
+in every mode, including `enforce_eager`, because its fp32 weight multiply has no working
+eager form. `lm_head` was never in the compiled region; `compute_logits` is a separate
+call on the wrapper.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.

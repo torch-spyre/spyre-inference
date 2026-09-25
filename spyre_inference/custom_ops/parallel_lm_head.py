@@ -29,7 +29,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 from .linear import SpyreTransposedWeightMethod
 
 logger = init_logger(__name__)
@@ -48,7 +48,7 @@ class SpyreUnquantizedLMHeadMethod(
     WEIGHT_T_ATTR = "padded_weight_t"
     ROW_ALIGN = 64 * 32
 
-    @compile_when_outermost
+    @maybe_compile
     def apply(
         self,
         layer: torch.nn.Module,

@@ -2483,9 +2483,15 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   for an out-of-tree platform (it selects <code>UnquantizedMoeBackend.OOT</code> — no kernel — and
   leaves <code>process_weights_after_loading</code> to the plugin). A <code>CustomOp.register_oot</code>
   replacement for <code>UnquantizedFusedMoEMethod</code> computes the experts in two Spyre forms —
-  gathered for a single-token decode step, all-expert persistent for a prefill chunk — and,
-  in the post-load hook, rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into the
-  <code>[E,H,M]</code> / <code>[E,M,H]</code> layout those forms contract on, freeing each source stack as it goes,
+  gathered, which reads only a token's routed experts but lowers one token at a time, and
+  all-expert persistent. Dispatch looks only at the packed token count: up to
+  <code>SPYRE_MOE_GATHERED_MAX_TOKENS</code> — a decode batch, or a prompt that buckets that short — the
+  gathered form is driven once per token, and above it the all-expert form takes the whole
+  batch in one call. A batch whose rows are not stick-addressable takes the all-expert form
+  whatever its size, since each row's storage offset has to span whole sticks for the compiled
+  loop to address it.
+  In the post-load hook it also rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into
+  the <code>[E,H,M]</code> / <code>[E,M,H]</code> layout those forms contract on, freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing
   further: upstream shards each expert's intermediate dim, so the forms just see a
   narrower <code>M</code> — zero-widened to whole sticks where a shard lands mid-stick — and

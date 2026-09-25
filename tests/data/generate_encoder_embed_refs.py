@@ -30,6 +30,10 @@ EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
+    # head_size=32 (below one stick): the models the encoder attention host
+    # round-trip / bert_head_pad load-time padding exist for.
+    "ibm-granite/granite-embedding-30m-english",
+    "sentence-transformers/all-MiniLM-L6-v2",
 ]
 
 # Written into the JSON and read back by the test, so an upstream re-upload cannot redefine
@@ -39,6 +43,8 @@ MODEL_REVISIONS = {
     "ibm-granite/granite-embedding-278m-multilingual": "a9cb5338491faf32b73dd17b714a31821c021bbf",
     "intfloat/multilingual-e5-large": "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3",
     "sentence-transformers/all-roberta-large-v1": "cf74d8acd4f198de950bf004b262e6accfed5d2c",
+    "ibm-granite/granite-embedding-30m-english": "9b5b096411652ec1189c68fcfb90d0a82c5b45af",
+    "sentence-transformers/all-MiniLM-L6-v2": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
 }
 
 EMBEDDING_PROMPTS = [

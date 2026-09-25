@@ -289,7 +289,12 @@ markers = [
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
     "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
+    "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
+    "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
+    "mm_encoder_attention: SpyreMMEncoderAttention and SDPA-helper tests (tests/custom_ops/test_mm_encoder_attention.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
 ]
 # --8<-- [end:test-markers-definition]
 

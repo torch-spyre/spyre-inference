@@ -458,41 +458,58 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
-        """Override hf_config.head_dim to a 128-multiple when the native head_dim
-        is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
+        """Override hf_config.head_dim to a stick-aligned size when the native
+        head_dim isn't one, stashing the original as ``_spyre_orig_head_dim``.
 
         Applies to the Transformers backend too: padding only the RoPE rotation leaves
         the KV cache allocated at the native ``get_head_size()``, which the device copy
         requires to be stick-aligned.
 
-        No-op for models whose head_dim is already a multiple of 128 (e.g.
-        head_size=128 Granite) and for models without RoPE. The restickify failure
-        this works around is RoPE-induced, so non-RoPE models (OPT, GPT-2,
-        GPT-BigCode) lower fine at head=64; padding them is both unnecessary and
-        unsupported by the port, which assumes a RoPE model that sizes attention from
-        ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
-        ``config.head_dim`` and uses ``out_proj``).
+        Two independent restickify failures share this hook, at different widths:
+        RoPE models pad to the next 128-multiple (the failure is RoPE-induced, so
+        non-RoPE decoders like OPT/GPT-2 lower fine at head=64 and are skipped).
+        Pooling/encoder-only models (BERT/RoBERTa) have no RoPE, so theirs is the
+        plain sub-stick failure (e.g. head_size=32 sharing a stick between two
+        heads) -- the next 64-multiple is enough, applied via the construction
+        patch in ``spyre_inference.custom_ops.bert_head_pad`` (the generic
+        property-shim doesn't work on BertSelfAttention's own assert).
+
+        No-op for models whose head_dim is already a multiple of the applicable size.
         """
         from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        num_heads = getattr(hf_config, "num_attention_heads", None)
-        hidden_size = getattr(hf_config, "hidden_size", None)
+        target_cfg = getattr(hf_config, "text_config", None) or hf_config
+        num_heads = getattr(target_cfg, "num_attention_heads", None)
+        hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
             return
 
         # transformers 5.x unifies all RoPE config under `rope_parameters`
-        cfgs = (hf_config, model_config.hf_text_config)
-        if not any(getattr(c, "rope_parameters", None) for c in cfgs):
+        cfgs = tuple(
+            c
+            for c in (
+                hf_config,
+                getattr(hf_config, "text_config", None),
+                model_config.hf_text_config,
+            )
+            if c is not None
+        )
+        has_rope = any(getattr(c, "rope_parameters", None) for c in cfgs)
+        if has_rope:
+            multiple = 128
+        elif cls._is_pooling_model(vllm_config):
+            multiple = 64
+        else:
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
+        orig = getattr(target_cfg, "head_dim", None) or hidden_size // num_heads
+        if orig % multiple == 0:
             return
 
-        padded = ((orig + 127) // 128) * 128
-        for cfg in (hf_config, model_config.hf_text_config):
+        padded = ((orig + multiple - 1) // multiple) * multiple
+        for cfg in cfgs:
             reason = reduced_rotary_dim_reason(cfg)
             if reason is not None:
                 raise NotImplementedError(
@@ -500,7 +517,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"alignment, but this model reduces the rotary dimension below "
                     f"head_dim ({reason})."
                 )
-        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+        for cfg in {id(c): c for c in cfgs}.values():
             cfg._spyre_orig_head_dim = orig
             cfg.head_dim = padded
         # ModelConfig snapshots head_size into model_arch_config in __post_init__,

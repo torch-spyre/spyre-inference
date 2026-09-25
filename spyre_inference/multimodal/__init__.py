@@ -21,7 +21,14 @@ implementations by layer class.
 
 import torch
 
-from . import clip, gemma4_vision, pixtral
+from . import (
+    blip2,
+    clip,
+    gemma4_vision,
+    granite4_vision,
+    pixtral,
+    siglip,
+)
 
 
 def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> None:
@@ -37,11 +44,23 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     if vision_tower is None:
         vision_tower = getattr(model, "vision_encoder", None)
     if vision_tower is not None:
-        # Gemma4VisionModel is a stock transformers class, not vLLM's Pixtral -- dispatch
-        # by class name rather than the shared `vision_tower` attribute name.
-        if type(vision_tower).__name__ == "Gemma4VisionModel":
+        # Dispatch by tower class name: the `vision_tower` / `vision_encoder`
+        # attribute is shared across architectures, so we cannot infer the model
+        # family from the attribute name alone.
+        tower_cls = type(vision_tower).__name__
+        if tower_cls == "Gemma4VisionModel":
             gemma4_vision.apply(model, device)
+        elif tower_cls == "SiglipVisionModel":
+            # Granite4Vision uses a SigLIP tower. All three patches are
+            # needed together and none apply to any other architecture.
+            siglip.apply(model, device)
+            granite4_vision.apply(model, device)
+            blip2.apply(model, device)
         else:
+            # Pixtral (mistral-format, VisionTransformer) and Mistral3 HF-format
+            # (PixtralHFVisionModel) both need the Pixtral patches. Any tower that
+            # is not Gemma4 or SigLIP goes here; the patch functions are
+            # individually guarded and no-op when the expected symbols are absent.
             pixtral.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.

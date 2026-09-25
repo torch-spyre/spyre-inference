@@ -1333,3 +1333,37 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
     out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
 
     torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# 15. BLIP-2 Q-Former attention: upstream switch to F.scaled_dot_product_attention
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Blip2QFormerMultiHeadAttention.forward still uses an explicit "
+        "torch.matmul / torch.softmax chain whose permute/matmul/softmax layout "
+        "Spyre's restickify and bmm_padding passes cannot reconcile, forcing the "
+        "entire module to run on CPU (spyre_inference/multimodal/blip2.py). "
+        "vllm-project/vllm@a1541f5 replaces that chain with a single "
+        "F.scaled_dot_product_attention call. When this probe XPASS-es, "
+        "drop blip2.py and its call site in apply()."
+    ),
+)
+def test_vllm_blip2_qformer_uses_sdpa():
+    """Blip2QFormerMultiHeadAttention.forward must use scaled_dot_product_attention.
+
+    Source inspection: the current forward contains an explicit matmul/softmax
+    chain that Spyre cannot restickify.  vllm-project/vllm@a1541f5 replaces it
+    with F.scaled_dot_product_attention; when that version is in use this probe
+    flips to XPASS.
+    """
+    blip2 = pytest.importorskip("vllm.model_executor.models.blip2")
+
+    src = inspect.getsource(blip2.Blip2QFormerMultiHeadAttention.forward)
+    assert re.search(r"\bscaled_dot_product_attention\b", src), (
+        "Blip2QFormerMultiHeadAttention.forward still uses the matmul/softmax "
+        "chain; spyre_inference/multimodal/blip2.py CPU-fallback patch still needed"
+    )

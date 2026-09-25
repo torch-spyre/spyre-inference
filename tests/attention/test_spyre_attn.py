@@ -2499,8 +2499,16 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     context_len = kv_len - query_len
     first_active = max(0, context_len - window + 1) // block_size
     num_blocks = (kv_len + block_size - 1) // block_size
+    real_active = list(range(first_active, num_blocks))
     assert metadata.active_block_indices is not None
-    assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
+    active = metadata.active_block_indices[0]
+    # This case does pad, so assert the padded length first: the tail checks below
+    # are vacuous on an empty tail and would pass a regression to no padding.
+    assert len(active) == num_blocks > len(real_active)
+    # The real prefix is what the clamp could have disturbed; the tail is bucket
+    # padding, which repeats the last real block.
+    assert active[: len(real_active)] == real_active
+    assert set(active[len(real_active) :]) == {real_active[-1]}
 
 
 def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm_config):

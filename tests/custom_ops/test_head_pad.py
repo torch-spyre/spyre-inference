@@ -75,6 +75,7 @@ def _fake_model_config(monkeypatch, *, padded=True, classes=None, transformers_b
         hf_config._spyre_orig_head_dim = _ORIG
     return SimpleNamespace(
         hf_config=hf_config,
+        hf_text_config=hf_config,  # for non-multimodal models text_config == hf_config
         using_transformers_backend=lambda: transformers_backend,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
@@ -141,6 +142,7 @@ def test_shim_skips_the_shared_vllm_attention_layers(monkeypatch):
     )
     model_config = SimpleNamespace(
         hf_config=hf_config,
+        hf_text_config=hf_config,
         using_transformers_backend=lambda: False,
         registry=SimpleNamespace(
             resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
@@ -314,3 +316,224 @@ def test_pad_weight_splits_a_fused_qkv_projection():
     v_out = v.view(n_kv, _PADDED, hidden)
     assert torch.equal(v_out[:, :_ORIG], v_src)
     assert not v_out[:, _ORIG:].any()
+
+
+# ---------------------------------------------------------------------------
+# Granite Vision 4.1 — composite arch head_dim shim
+# ---------------------------------------------------------------------------
+# Granite Vision 4.1-4B is a composite model: a Granite text decoder wraps a
+# SigLIP vision encoder and a BLIP-2 Q-Former projector.
+#
+# Bug: the top-level arch (granite4_vision.py) contains no *Attention class —
+# GraniteAttention lives in granite.py, SiglipAttention in siglip.py.
+# `install_padded_head_dim` only iterated the top-level module, so the shim
+# never reached GraniteAttention, the text decoder ran at head_dim=64, and
+# the weight pass emitted 128-wide tensors causing a shape mismatch at load.
+#
+# Fix: the `text_archs` loop resolves the text backbone architecture from
+# hf_text_config.architectures and iterates that module, so GraniteAttention
+# is shimmed even when it lives outside the top-level arch module.
+
+# Text decoder dims (Granite 3.x: head_dim already 128, no padding in practice,
+# but use 64->128 to match the existing test fixtures so we can reuse helpers).
+_LANG_ORIG, _LANG_PADDED = 64, 128
+
+# SigLIP vision encoder dims (head_dim = 1152 // 16 = 72, padded to 128).
+_VIS_ORIG, _VIS_PADDED = 72, 128
+
+
+def test_vision_tower_weights_are_not_padded():
+    """Weight names outside ``language_model.`` must pass through _pad_weight unchanged.
+
+    ``install_head_pad_weight_loader`` passes ``text_prefix="language_model."`` for
+    composite checkpoints, restricting padding to the text backbone.  Vision-tower
+    weights that share suffix patterns with language attention weights (q_proj,
+    v_proj) must not be padded — they use a different head_dim and the interleave
+    would corrupt every Q/K/V shape in the vision encoder.
+    """
+    n_heads, hidden = 16, 1152  # SigLIP-SO400M dims
+    rows = n_heads * _VIS_ORIG
+    w = torch.arange(float(rows * hidden)).reshape(rows, hidden)
+
+    for layer_name in (
+        "vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+        "vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "vision_tower.encoder.layers.0.self_attn.v_proj.weight",
+    ):
+        out = _pad_weight(
+            layer_name, w, n_heads, n_heads, _VIS_ORIG, _VIS_PADDED, text_prefix="language_model."
+        )
+        assert torch.equal(out, w), (
+            f"_pad_weight must return the tensor unchanged for {layer_name!r}; "
+            "vision-tower weights must not be padded with language head dims"
+        )
+
+    # Positive side: a weight under the text backbone prefix must be padded.
+    # Guards against _is_target_attn_weight being broken in the other direction
+    # (returning False for everything would make all the assertions above pass
+    # trivially while silently leaving language weights unpadded).
+    lang_name = "language_model.model.layers.0.self_attn.q_proj.weight"
+    out = _pad_weight(
+        lang_name, w, n_heads, n_heads, _VIS_ORIG, _VIS_PADDED, text_prefix="language_model."
+    )
+    assert not torch.equal(out, w), f"_pad_weight must pad {lang_name!r} when text_prefix matches"
+
+
+def test_text_backbone_attention_shimmed_when_in_separate_module(monkeypatch):
+    """install_padded_head_dim must shim GraniteAttention via the text_archs loop
+    when it lives in a different module from the top-level composite arch class.
+
+    This is the regression test for the PR's fix: the top-level arch module
+    (granite4_vision_module) contains no *Attention class, mirroring the real
+    granite4_vision.py.  Before the fix the shim would patch nothing.  After the
+    fix the text_archs loop resolves GraniteForCausalLM from hf_text_config and
+    finds GraniteAttention in that separate module.
+    """
+    import types
+
+    # Top-level composite arch module: no *Attention classes (mirrors granite4_vision.py).
+    top_module_name = "spyre_test_granite4_vision_module"
+    top_module = types.ModuleType(top_module_name)
+    model_cls = type("GraniteVisionForConditionalGeneration", (), {})
+    model_cls.__module__ = top_module_name
+    top_module.GraniteVisionForConditionalGeneration = model_cls
+    monkeypatch.setitem(sys.modules, top_module_name, top_module)
+
+    # Text backbone module: contains GraniteAttention (mirrors granite.py).
+    text_module_name = "spyre_test_granite_module"
+    text_module = types.ModuleType(text_module_name)
+
+    class GraniteAttention(_DerivesOwnHeadDim):
+        def __init__(self):
+            super().__init__(hidden_size=1024, num_heads=16)  # head_dim=64=_LANG_ORIG
+
+    GraniteAttention.__module__ = text_module_name
+    text_cls = type("GraniteForCausalLM", (), {})
+    text_cls.__module__ = text_module_name
+    text_module.GraniteAttention = GraniteAttention
+    text_module.GraniteForCausalLM = text_cls
+    monkeypatch.setitem(sys.modules, text_module_name, text_module)
+
+    hf_config = SimpleNamespace(
+        head_dim=_LANG_PADDED,
+        _spyre_orig_head_dim=_LANG_ORIG,
+        architectures=["GraniteVisionForConditionalGeneration"],
+    )
+    hf_text_config = SimpleNamespace(
+        head_dim=_LANG_PADDED,
+        _spyre_orig_head_dim=_LANG_ORIG,
+        architectures=["GraniteForCausalLM"],
+    )
+
+    def resolve(archs, model_config):
+        if archs[0] == "GraniteVisionForConditionalGeneration":
+            return model_cls, archs[0]
+        if archs[0] == "GraniteForCausalLM":
+            return text_cls, archs[0]
+        raise ValueError(f"Unknown arch: {archs[0]}")
+
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_text_config,
+        using_transformers_backend=lambda: False,
+        registry=SimpleNamespace(resolve_model_cls=resolve),
+    )
+
+    install_padded_head_dim(model_config)
+
+    # GraniteAttention must be shimmed via the text_archs loop — it is not in the
+    # top-level arch module, so without the fix it would remain at the native width.
+    assert GraniteAttention().head_dim == _LANG_PADDED, (
+        "GraniteAttention in the text backbone module must be shimmed by the "
+        "text_archs loop; without the PR fix it would remain at the native width"
+    )
+
+
+# Raw HF names: separate Q/K/V tensors, no RoPE. 32->64 is the actual shape
+# this dispatch exists for (granite-embedding-30m-english).
+_BERT_ORIG, _BERT_PADDED, _BERT_HEADS = 32, 64, 12
+
+
+def test_pad_weight_bert_qkv_end_pad_no_interleave():
+    """No RoPE, so Q gets the plain end-pad too, unlike the decoder's Q branch."""
+    hidden = 384
+    w = torch.arange(float(_BERT_HEADS * _BERT_ORIG * hidden)).reshape(
+        _BERT_HEADS * _BERT_ORIG, hidden
+    )
+    for name in (
+        "encoder.layer.0.attention.self.query.weight",
+        "encoder.layer.0.attention.self.key.weight",
+        "encoder.layer.0.attention.self.value.weight",
+    ):
+        out = _pad_weight(name, w, _BERT_HEADS, _BERT_HEADS, _BERT_ORIG, _BERT_PADDED)
+        assert out.shape == (_BERT_HEADS * _BERT_PADDED, hidden)
+        out = out.view(_BERT_HEADS, _BERT_PADDED, hidden)
+        src = w.view(_BERT_HEADS, _BERT_ORIG, hidden)
+        assert torch.equal(out[:, :_BERT_ORIG], src)
+        assert not out[:, _BERT_ORIG:].any()
+
+    bias = torch.arange(float(_BERT_HEADS * _BERT_ORIG))
+    out_bias = _pad_weight(
+        "encoder.layer.0.attention.self.query.bias",
+        bias,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+    assert out_bias.shape == (_BERT_HEADS * _BERT_PADDED,)
+
+
+def test_pad_weight_bert_attention_output_dense_input_end_pad():
+    hidden = 384
+    w = torch.arange(float(hidden * _BERT_HEADS * _BERT_ORIG)).reshape(
+        hidden, _BERT_HEADS * _BERT_ORIG
+    )
+    out = _pad_weight(
+        "encoder.layer.0.attention.output.dense.weight",
+        w,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+    assert out.shape == (hidden, _BERT_HEADS * _BERT_PADDED)
+    out = out.view(hidden, _BERT_HEADS, _BERT_PADDED)
+    src = w.view(hidden, _BERT_HEADS, _BERT_ORIG)
+    assert torch.equal(out[:, :, :_BERT_ORIG], src)
+    assert not out[:, :, _BERT_ORIG:].any()
+
+
+def test_pad_weight_bert_ffn_output_dense_left_alone():
+    """The FFN's own `output.dense` (BertOutput, no "attention." segment) must not
+    be mistaken for the attention output projection."""
+    hidden, intermediate = 384, 1536
+    w = torch.randn(hidden, intermediate)
+
+    out = _pad_weight(
+        "encoder.layer.0.output.dense.weight",
+        w,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+
+    assert torch.equal(out, w)
+
+
+def test_pad_weight_bert_attention_output_dense_bias_left_alone():
+    """Unlike the weight, the attention output bias is [hidden_size] already and
+    is unrelated to head_dim -- it must pass through untouched."""
+    bias = torch.randn(384)
+
+    out = _pad_weight(
+        "encoder.layer.0.attention.output.dense.bias",
+        bias,
+        _BERT_HEADS,
+        _BERT_HEADS,
+        _BERT_ORIG,
+        _BERT_PADDED,
+    )
+
+    assert torch.equal(out, bias)

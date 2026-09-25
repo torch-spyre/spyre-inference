@@ -35,6 +35,10 @@ EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
+    # head_size=32 (below one stick): the models the encoder attention host
+    # round-trip / bert_head_pad load-time padding exist for.
+    "ibm-granite/granite-embedding-30m-english",
+    "sentence-transformers/all-MiniLM-L6-v2",
 ]
 
 # MEAN product models. The default embed e2e uses max_num_seqs=1; batched MEAN

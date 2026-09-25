@@ -30,12 +30,17 @@ public_models:
     revision: 3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3
   - repo: sentence-transformers/all-roberta-large-v1
     revision: cf74d8acd4f198de950bf004b262e6accfed5d2c
+  - repo: ibm-granite/granite-embedding-30m-english
+    revision: 9b5b096411652ec1189c68fcfb90d0a82c5b45af
+  - repo: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
   - repo: BAAI/bge-reranker-v2-m3
     revision: 953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e
   - repo: BAAI/bge-reranker-large
     revision: 55611d7bca2a7133960a6d3b71e083071bbfc312
   - ibm-ai-platform/micro-g3.3-8b-instruct-1b
   - ibm-granite/granite-4.1-3b
+  - ibm-granite/granite-vision-4.1-4b
   - repo: ibm-granite/granite-3.3-8b-instruct
     revision: 51dd4bc2ade4059a6bd87649d68aa11e4fb2529b
   - repo: ibm-granite/granite-4.1-8b

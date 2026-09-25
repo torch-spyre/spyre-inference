@@ -128,10 +128,36 @@ def _pad_fused_qkv(
     )
 
 
+def _is_target_attn_weight(name: str, text_prefix: str | None = None) -> bool:
+    """True when *name* is an attention weight that should be padded.
+
+    For composite (multimodal) checkpoints ``text_prefix`` is the dotted path
+    prefix under which the language backbone lives (e.g. ``"language_model."``).
+    Only weights under that prefix are padded; everything else (vision towers,
+    projectors, adapters) is left untouched.  This is an allowlist: any new
+    sub-model in the checkpoint that does not live under ``text_prefix``
+    automatically passes through unmodified, with no maintenance required here.
+
+    For single-config (text-only) checkpoints ``text_prefix`` is ``None`` and
+    every weight is a candidate — the original behaviour.
+    """
+    if text_prefix is not None:
+        return text_prefix in name
+    return True
+
+
 def _pad_weight(
-    name: str, w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
+    name: str,
+    w: torch.Tensor,
+    n_heads: int,
+    n_kv_heads: int,
+    orig: int,
+    padded: int,
+    text_prefix: str | None = None,
 ) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right padding by its name."""
+    if not _is_target_attn_weight(name, text_prefix):
+        return w
     # Must precede the v_proj test: "qkv_proj.weight" also ends with "v_proj.weight".
     if name.endswith(("qkv_proj.weight", "qkv_proj.bias")):
         return _pad_fused_qkv(w, n_heads, n_kv_heads, orig, padded)
@@ -146,6 +172,16 @@ def _pad_weight(
     # QK-norm (Qwen3): pad only a norm taken over head_dim; other widths are untouched.
     if name.endswith(("q_norm.weight", "k_norm.weight")) and w.numel() == orig:
         return _pad_qk_norm_weight(w, orig, padded)
+    # Raw HF names (pre-WeightsMapper): three separate Q/K/V tensors, no RoPE.
+    # "attention.output.dense" (not bare "output.dense") excludes BertOutput's FFN.
+    if name.endswith(("attention.self.query.weight", "attention.self.query.bias")):
+        return _pad_output_end(w, n_heads, orig, padded)
+    if name.endswith(("attention.self.key.weight", "attention.self.key.bias")):
+        return _pad_output_end(w, n_kv_heads, orig, padded)
+    if name.endswith(("attention.self.value.weight", "attention.self.value.bias")):
+        return _pad_output_end(w, n_kv_heads, orig, padded)
+    if name.endswith("attention.output.dense.weight"):
+        return _pad_input_end(w, n_heads, orig, padded)
     return w
 
 
@@ -171,18 +207,35 @@ def install_padded_head_dim(model_config) -> None:
     Skipped on the Transformers backend: HF attention sizes itself from
     ``config.head_dim``, so the override already lands there.
     """
-    if not head_padding_active(model_config.hf_config):
+    target_config = model_config.hf_text_config
+    if not head_padding_active(target_config):
         return
     if model_config.using_transformers_backend():
         return
-    orig = getattr(model_config.hf_config, _ORIG_ATTR)
-    padded = model_config.hf_config.head_dim
+    orig = getattr(target_config, _ORIG_ATTR)
+    padded = target_config.head_dim
 
+    modules = set()
     architectures = getattr(model_config.hf_config, "architectures", None) or []
-    model_cls, _ = model_config.registry.resolve_model_cls(architectures, model_config=model_config)
-    module = sys.modules.get(model_cls.__module__)
-    if module is None:
-        logger.warning("Cannot locate module for %s; head_dim not shimmed.", model_cls)
+    if architectures:
+        model_cls, _ = model_config.registry.resolve_model_cls(
+            architectures, model_config=model_config
+        )
+        if model_cls and sys.modules.get(model_cls.__module__):
+            modules.add(sys.modules[model_cls.__module__])
+
+    # For multimodal composite architectures, also check the text backbone module
+    text_archs = getattr(target_config, "architectures", None) or []
+    for arch in text_archs:
+        try:
+            text_cls, _ = model_config.registry.resolve_model_cls([arch], model_config=model_config)
+            if text_cls and sys.modules.get(text_cls.__module__):
+                modules.add(sys.modules[text_cls.__module__])
+        except Exception as e:
+            logger.warning("Cannot resolve text backbone %r for head_dim shim: %s", arch, e)
+
+    if not modules:
+        logger.warning("Cannot locate modules for %s; head_dim not shimmed.", architectures)
         return
 
     def _make_head_dim_property(orig: int, padded: int) -> property:
@@ -203,26 +256,27 @@ def install_padded_head_dim(model_config) -> None:
         return prop
 
     patched = []
-    for name, obj in vars(module).items():
-        # Model-level attention classes only. The shared vLLM attention *layers* are
-        # imported into the same namespace but are handed an already-padded
-        # head_size, and patching them would mutate a class the whole process uses.
-        if (
-            not isinstance(obj, type)
-            or not name.endswith("Attention")
-            or obj.__module__.startswith("vllm.model_executor.layers")
-        ):
-            continue
-        existing = vars(obj).get("head_dim")
-        # Replace a shim left by an earlier model in this process (its widths may
-        # differ); leave anything the model itself defines alone.
-        if (
-            existing is not None
-            and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
-        ):
-            continue
-        obj.head_dim = _make_head_dim_property(orig, padded)
-        patched.append(name)
+    for mod in modules:
+        for name, obj in vars(mod).items():
+            # Model-level attention classes only. The shared vLLM attention *layers* are
+            # imported into the same namespace but are handed an already-padded
+            # head_size, and patching them would mutate a class the whole process uses.
+            if (
+                not isinstance(obj, type)
+                or not name.endswith("Attention")
+                or obj.__module__.startswith("vllm.model_executor.layers")
+            ):
+                continue
+            existing = vars(obj).get("head_dim")
+            # Replace a shim left by an earlier model in this process (its widths may
+            # differ); leave anything the model itself defines alone.
+            if (
+                existing is not None
+                and getattr(getattr(existing, "fget", None), "_spyre_shim", None) is None
+            ):
+                continue
+            obj.head_dim = _make_head_dim_property(orig, padded)
+            patched.append(name)
     logger.info("Shimmed head_dim %d -> %d on: %s", orig, padded, ", ".join(patched))
 
 
@@ -260,13 +314,21 @@ def verify_padded_head_dim(model, hf_config) -> None:
         )
 
 
-def install_head_pad_weight_loader(model_loader, hf_config) -> None:
-    """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim 64->128.
+def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -> None:
+    """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim to the width
+    the platform chose (64->128 for RoPE decoders, 32->64 for pooling models).
 
     The transform runs on the raw ``(name, tensor)`` stream before vLLM's
     ``WeightsMapper`` and ``weight_loader`` (which ``.narrow`` and assert exact
     shapes against the now-128-wide params). Full unsharded tensors are padded
     per-head, so TP narrowing downstream still selects whole padded heads.
+
+    For composite (multimodal) checkpoints, where ``model_config.hf_text_config
+    is not model_config.hf_config``, only weights under the language backbone
+    prefix ``"language_model."`` are padded.  vLLM composite models consistently
+    store the text backbone under ``self.language_model`` (and therefore under
+    ``language_model.`` in the checkpoint), so this allowlist is forward-compatible
+    with any new composite architecture without requiring additions here.
     """
     if not head_padding_active(hf_config):
         return
@@ -282,11 +344,19 @@ def install_head_pad_weight_loader(model_loader, hf_config) -> None:
     n_heads = hf_config.num_attention_heads
     n_kv_heads = getattr(hf_config, "num_key_value_heads", None) or n_heads
 
+    # For composite (multimodal) models, restrict padding to the text backbone.
+    # vLLM composite models store the language backbone as ``self.language_model``,
+    # so its checkpoint weights live under the ``language_model.`` prefix.
+    text_prefix: str | None = None
+    if model_config is not None and model_config.hf_text_config is not model_config.hf_config:
+        text_prefix = "language_model."
+        logger.debug("Composite model detected; head padding restricted to prefix %r.", text_prefix)
+
     original_get_all_weights = model_loader.get_all_weights
 
     def padded_get_all_weights(model_config, model) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in original_get_all_weights(model_config, model):
-            yield name, _pad_weight(name, weight, n_heads, n_kv_heads, orig, padded)
+            yield name, _pad_weight(name, weight, n_heads, n_kv_heads, orig, padded, text_prefix)
 
     model_loader.get_all_weights = padded_get_all_weights
 

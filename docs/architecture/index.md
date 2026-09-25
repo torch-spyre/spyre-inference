@@ -107,11 +107,29 @@ that has to follow `.to("spyre")`, an expert dispatch Spyre can lower. Those liv
 `spyre_inference/models/`, one module per architecture, as **subclasses of the upstream vLLM
 class** rather than runtime monkey-patches. `models/__init__.py` holds `spyre_models()`
 (architecture string → Spyre class, built from the `_ADAPTED_MODULES` and `_ADAPTED_ARCHS`
-tables) and `register_models()`, which points vLLM's `ModelRegistry` at them; `_`-prefixed
+tables), the separate `_ALIASED_ARCHS` table described below, and `register_models()`,
+which points vLLM's `ModelRegistry` at all of them; `_`-prefixed
 modules hold machinery those subclasses share or delegate to and register no architecture of
 their own. Registration is lazy — nothing is imported until vLLM resolves the architecture —
 and `register_models()` first checks every key against vLLM's own registry, so an upstream
 rename fails loudly instead of silently falling through to the unadapted class.
+
+`_ALIASED_ARCHS` is the one table that is not an adaptation. Some checkpoints are an
+architecture vLLM already implements, published under another name: the weights load into
+the upstream class as they are and need no Spyre code at all, but vLLM does not know the
+architecture string, so it never resolves the class. An entry there registers the
+architecture straight to the upstream class. vLLM's own registry does exactly this for
+`CwmForCausalLM`, `InternLM3ForCausalLM`, `IQuestCoderForCausalLM` and
+`TeleChat3ForCausalLM`, all mapped to `LlamaForCausalLM` (the last three being
+`trust_remote_code` models transformers does not know either), so an alias here is that
+same statement made from a plugin. Because the keys are *absent* from vLLM's table rather
+than present in it, they are exempt from the upstream-rename check, and the tests assert
+the reverse: a key that shows up in vLLM's registry means upstream has landed the mapping
+and the local entry should go. Reach for this only when nothing needs adapting; a
+checkpoint that needs any Spyre-specific behaviour wants a subclass, not an alias.
+BharatGen Param (`models/param.py`) is the current example: a Llama state dict tensor
+for tensor, whose remote code is Llama's arithmetic under renamed classes, so it is
+registered to `LlamaForCausalLM` and only its config is translated.
 
 Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
 `embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same

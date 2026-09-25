@@ -16,8 +16,11 @@
 
 Every architecture ``spyre_models()`` names is replaced by a subclass that lives
 in the matching module here; ``_``-prefixed modules hold machinery shared between
-them. Registration is lazy: nothing is imported until vLLM resolves the
-architecture, so an architecture this deployment never serves costs nothing.
+them. ``_ALIASED_ARCHS`` is the other kind of entry: an architecture vLLM does not
+know at all, pointed at the upstream class that already executes its weights
+correctly, with no Spyre code in between. Registration is lazy either way: nothing
+is imported until vLLM resolves the architecture, so an architecture this
+deployment never serves costs nothing.
 """
 
 from __future__ import annotations
@@ -46,6 +49,24 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"
     ),
+}
+
+# Architectures vLLM does not register, served by an upstream vLLM class unchanged.
+#
+# Distinct from _ADAPTED_ARCHS in both directions: the keys are *absent* from vLLM's
+# table rather than present in it, and the values are upstream classes rather than
+# Spyre subclasses. So these are exempt from the unknown-architecture check below,
+# and from the subclass assertion in tests/models/test_model_registration.py.
+#
+# This is vLLM's own idiom for a checkpoint that is an existing architecture under
+# another name: its registry maps CwmForCausalLM, InternLM3ForCausalLM,
+# IQuestCoderForCausalLM and TeleChat3ForCausalLM to LlamaForCausalLM the same way,
+# and the last three are trust_remote_code models transformers does not know either.
+# An entry here is the same statement, made from a plugin instead of the table.
+_ALIASED_ARCHS: dict[str, str] = {
+    # BharatGen Param is Llama: a Llama state dict tensor for tensor, and remote
+    # code that is Llama's arithmetic under renamed classes. See models/param.py.
+    "ParamBharatGenForCausalLM": "vllm.model_executor.models.llama:LlamaForCausalLM",
 }
 
 
@@ -83,6 +104,13 @@ def register_models() -> None:
     stays lazy. Whether each *value* names a class that exists cannot be checked
     without importing it, which is what the tests do instead.
 
+    ``_ADAPTED_ARCHS`` overrides an architecture vLLM already serves, so an unknown
+    key there means this package has drifted from vLLM and the adaptation is
+    silently not applying. ``_ALIASED_ARCHS`` adds one vLLM does *not* serve, so the
+    same check would reject every entry by construction; it is registered after, and
+    a key that turns up in vLLM's own table means the alias is now redundant (which
+    the tests assert, since registering over it would shadow upstream's mapping).
+
     Raises:
         RuntimeError: if an adapted architecture is unknown to vLLM.
     """
@@ -100,14 +128,45 @@ def register_models() -> None:
     for arch, model_cls in models.items():
         ModelRegistry.register_model(arch, model_cls)
 
+    # Also registered from apply_prelaunch_overrides, which is what gets them in before
+    # ModelConfig validates; repeated here so a worker process that only calls this
+    # (spyre_worker) still resolves them.
+    register_aliased_archs()
+
+
+def register_aliased_archs() -> None:
+    """Register ``_ALIASED_ARCHS`` into vLLM's registry.
+
+    Separate from ``register_models()`` because the timing requirement is different.
+    ``ModelConfig`` *validates* ``architectures`` against the registry as it is built,
+    so an alias missing at that moment is a hard ValidationError ("are not supported
+    for now") rather than a silent fallthrough, so these have to be in place before
+    ``create_model_config`` runs. The ``_ADAPTED_ARCHS`` overrides replace classes vLLM
+    already knows, so validation passes either way and they can land later, which is
+    why ``register_models()`` runs from the ``register_ops`` entry point.
+
+    Idempotent: re-registering the same architecture is a no-op overwrite.
+    """
+    from vllm.model_executor.models import ModelRegistry
+
+    for arch, model_cls in _ALIASED_ARCHS.items():
+        ModelRegistry.register_model(arch, model_cls)
+
 
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
     builds the ModelConfig (e.g. text-only backbone selection)."""
-    from spyre_inference.models import clip, gemma4
+    from spyre_inference.models import clip, gemma4, param
+
+    # Before anything reads the config: ModelConfig rejects an unregistered
+    # architecture as it is built, and these are architectures vLLM does not know.
+    register_aliased_archs()
 
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
+    # Param's architecture is registered (_ALIASED_ARCHS), so this only translates the
+    # config fields vLLM's Llama spells differently. It does not touch architectures.
+    param.normalize_param_config(engine_args)
 
 
 def install_pooling_model_patches() -> None:

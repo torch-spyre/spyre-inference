@@ -109,6 +109,16 @@ class TorchSpyreWorker(Worker):
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
 
+        # flex's force-synchronous launch default deadlocks once two collectives
+        # are outstanding on one stream (torch-spyre#4889). Only a set-but-empty
+        # value opts out: unset falls through to the default. The deadlock is not
+        # gemma-4 specific (two bare collectives reproduce it), so this gate is
+        # blast-radius caution -- widen it by dropping the model check.
+        from spyre_inference.models.gemma4 import is_gemma4
+
+        if world_size > 1 and is_gemma4(getattr(self.model_config, "hf_config", None)):
+            os.environ.setdefault("FORCE_SYNCHRONOUS_EXECUTION", "")
+
         # Trigger torch_spyre's autoload manually now that the env vars
         # are set. Autoload registers the `spyre` device and the
         # `spyreccl` distributed backend, and imports

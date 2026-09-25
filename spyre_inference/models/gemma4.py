@@ -99,6 +99,11 @@ GEMMA4_TEXT_BACKBONE_OVERRIDE = {"architectures": ["Gemma4ForCausalLM"]}
 _GEMMA4_TEXT_MODEL_TYPES = {"gemma4", "gemma4_text"}
 
 
+def is_gemma4(hf_config: Any) -> bool:
+    """True for any gemma-4 config, including the vision and unified variants."""
+    return str(getattr(hf_config, "model_type", "") or "").startswith("gemma4")
+
+
 def is_multimodal_gemma4(hf_config: Any) -> bool:
     """True for a gemma-4 config carrying a vision tower. Audio is out of scope."""
     if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:

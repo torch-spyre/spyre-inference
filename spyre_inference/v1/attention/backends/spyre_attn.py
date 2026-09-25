@@ -40,7 +40,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
@@ -1255,9 +1255,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         if self._staging is None:
             shape = (self.staging_rows, self.num_heads, self.head_size)
+            layout = (
+                row_outermost_layout(shape, self.model_dtype) if device.type == "spyre" else None
+            )
             self._staging = (
-                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
-                convert(torch.zeros(shape, dtype=self.model_dtype), device, row_major=True),
+                convert(
+                    torch.zeros(shape, dtype=self.model_dtype),
+                    device,
+                    device_layout=layout,
+                ),
+                convert(
+                    torch.zeros(shape, dtype=self.model_dtype),
+                    device,
+                    device_layout=layout,
+                ),
             )
         return self._staging
 

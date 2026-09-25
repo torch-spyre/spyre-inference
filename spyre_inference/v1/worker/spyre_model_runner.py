@@ -71,6 +71,7 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
 from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
+from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
     fix_padded_rope,
@@ -82,7 +83,7 @@ from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
     verify_padded_intermediate_size,
 )
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
@@ -371,23 +372,13 @@ class _SpyreModelWrapper:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
         # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
         # in models/roberta.py.
-        def _convert_int(t):
-            if (
-                t is not None
-                and isinstance(t, torch.Tensor)
-                and t.dtype in (torch.int32, torch.int64)
-            ):
-                return convert(t, dtype=torch.int64, device=self._spyre_device)
-            return t
-
-        args_converted = []
-        for arg in args:
-            args_converted.append(_convert_int(arg))
-
-        kwargs_converted = {}
-        for key in kwargs:
-            val = kwargs.get(key)
-            kwargs_converted[key] = _convert_int(val)
+        is_integer = lambda t: t.dtype in (torch.int32, torch.int64)
+        args_converted = convert_tensor_tree(
+            args, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
+        kwargs_converted = convert_tensor_tree(
+            kwargs, device=self._spyre_device, dtype=torch.int64, predicate=is_integer
+        )
 
         # The Llama-4 scale cache keys on `positions` identity, blind to an in-place rewrite.
         reset_llama4_scale_cache()
@@ -397,11 +388,7 @@ class _SpyreModelWrapper:
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
-
-            def _to_cpu(x):
-                return convert(x, device="cpu")
-
-            result = tree_map(_to_cpu, result)
+            result = convert_tensor_tree(result, device="cpu")
 
         input_ids = kwargs_converted.get("input_ids")
         num_tokens = input_ids.shape[0] if input_ids is not None else -1
@@ -437,7 +424,7 @@ class _SpyreModelWrapper:
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
-        hidden_states = convert(hidden_states, device=self._spyre_device)
+        hidden_states = convert_tensor_tree(hidden_states, device=self._spyre_device)
         logits = self._model.compute_logits(hidden_states, *args, **kwargs)
 
         if padded_rows != num_rows and logits is not None:
@@ -620,7 +607,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
+        block_table._compute_slot_mapping_kernel = (  # ty: ignore[invalid-assignment]
+            _compute_slot_mapping_kernel
+        )
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""
@@ -671,6 +660,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+        for module in self.model.modules():
+            if isinstance(module, SpyreConv2d):
+                module.process_weights_after_loading()
 
         # CLS/LAST gather on Spyre. MEAN copies packed [T, H]; reduce is MeanPool.
         # FP32 linear heads stay on CPU.

@@ -35,7 +35,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.multimodal import NestedTensors
 
-from .utils import convert
+from .utils import convert, row_outermost_layout
 
 logger = init_logger(__name__)
 
@@ -82,7 +82,11 @@ def _spyre_merge_multimodal_embeddings(
     merged = torch.where(mask, scattered, inputs_embeds)
     # Upstream's copy into inputs_embeds.gpu is a single row on a one-token step, which
     # torch-spyre cannot restickify from the merge's own layout (torch-spyre#4883).
-    return convert(convert(merged, device="cpu"), device=inputs_embeds.device, row_major=True)
+    return convert(
+        convert(merged, device="cpu"),
+        device=inputs_embeds.device,
+        device_layout=row_outermost_layout(merged.shape, merged.dtype),
+    )
 
 
 def register() -> None:

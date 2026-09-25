@@ -116,7 +116,7 @@ override-dependencies = [
 VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
-# Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
+# Disable the torch-spyre build-time profiler due to performance overhead on some workloads torch-spyre#XXXX
 [tool.uv.extra-build-variables.torch-spyre]
 USE_SPYRE_PROFILER = "0"
 

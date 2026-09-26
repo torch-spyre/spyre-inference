@@ -184,6 +184,39 @@ def extract_vllm_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     return pairs
 
 
+def sample_count(record: dict[str, Any]) -> int:
+    """The n behind a native record's aggregates: latency iterations, serve requests, or the
+    one timed pass of a throughput run. 0 when the record does not say."""
+    if "avg_latency" in record:
+        latencies = record.get("latencies")
+        return len(latencies) if isinstance(latencies, list) else 0
+    if "requests_per_second" in record or "tokens_per_second" in record:
+        return 1
+    if "request_throughput" in record or "output_throughput" in record:
+        completed = record.get("completed")
+        return completed if isinstance(completed, int) and not isinstance(completed, bool) else 0
+    return 0
+
+
+_UNITS = {
+    "elapsed_time": "s",
+    "requests_per_second": "req/s",
+    "request_throughput": "req/s",
+    "tokens_per_second": "tok/s",
+    "output_throughput": "tok/s",
+    "total_token_throughput": "tok/s",
+}
+
+
+def metric_unit(metric: str) -> str:
+    """vLLM's own unit for a metric; its names encode ms but not seconds (latency, p99_latency)."""
+    if metric.endswith("_ms"):
+        return "ms"
+    if metric.endswith("latency"):
+        return "s"
+    return _UNITS.get(metric, "")
+
+
 def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     """Return (metric_name, value) pairs from one PyTorch-format record.
 
@@ -237,10 +270,10 @@ def extract_rows(
 
     The vLLM benchmark runner writes native `{test_name}.json` files
     (latency / throughput / serve schemas). When SAVE_TO_PYTORCH_BENCHMARK_FORMAT
-    is set it ALSO writes `{test_name}.pytorch.json`. This reads both: the
-    PyTorch-format files via their `benchmark`/`metric` schema, and every other
-    `*.json` via the native vLLM schema. A `.pytorch.json` file is not read
-    twice (it is excluded from the native pass).
+    is set it ALSO writes `{test_name}.pytorch.json`, which re-reports a subset of
+    the same numbers. The PyTorch file is the source for every metric it carries
+    (its names are what the HUD reads); the native file adds only the metrics the
+    PyTorch file lacks, so no measurement is stored twice.
     """
     rows = []
     ts = int(time.time() * 1000)
@@ -255,19 +288,19 @@ def extract_rows(
         results_dir,
     )
 
-    def _emit(filename: str, model: str, metric_name: str, value: float) -> None:
-        extra = json.dumps(
-            {
-                "device": "spyre",
-                "arch": arch,
-                "hardware_type": "IBM_Spyre",
-                "model": model,
-                "test_name": _test_name(filename),
-                "head_sha": sha,
-                "pr_number": pr_number,
-                "value": value,
-            }
-        )
+    def _emit(filename: str, model: str, metric_name: str, value: float, n: int = 0) -> None:
+        info = {
+            "device": "spyre",
+            "arch": arch,
+            "hardware_type": "IBM_Spyre",
+            "model": model,
+            "test_name": _test_name(filename),
+            "head_sha": sha,
+            "pr_number": pr_number,
+            "value": value,
+        }
+        if n:
+            info["iterations"] = n
         rows.append(
             {
                 "timestamp": ts,
@@ -281,7 +314,7 @@ def extract_rows(
                 "workflow_id": int(run_id) if run_id.isdigit() else 0,
                 "job_id": int(job_id) if job_id.isdigit() else 0,
                 "run_attempt": 1,
-                "extra": extra,
+                "extra": json.dumps(info),
             }
         )
 
@@ -291,6 +324,7 @@ def extract_rows(
     # Relies on SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 in CI; a deeper fix would
     # inject the model into the native JSON at run time (run_vllm_benchmarks.py).
     model_by_test: dict[str, str] = {}
+    pytorch_metrics: dict[str, set[str]] = {}
 
     for file, extractor in [
         *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
@@ -316,13 +350,20 @@ def extract_rows(
                 continue
             model = _model_from_record(record, filename)
             # Cache model from pytorch files; use cached model for native files
-            if filename.endswith(".pytorch.json"):
+            is_pytorch = filename.endswith(".pytorch.json")
+            if is_pytorch:
                 if model != test_name:
                     model_by_test[test_name] = model
             elif model == test_name and test_name in model_by_test:
                 model = model_by_test[test_name]
+            covered = pytorch_metrics.setdefault(test_name, set())
+            n = 0 if is_pytorch else sample_count(record)
             for metric_name, value in extractor(record):
-                _emit(filename, model, metric_name, value)
+                if is_pytorch:
+                    covered.add(metric_name)
+                elif metric_name in covered:
+                    continue
+                _emit(filename, model, metric_name, value, n)
 
         extracted = len(rows) - before_rows
         if extracted:
@@ -627,11 +668,11 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     row per (benchmark, backend), so the 26 metrics of one benchmark stay one measurement
     rather than 26 trend points.
 
-    iterations stays 0 throughout: vLLM's harness reports a pre-averaged value per metric and
-    does not tell us the n behind it, and the column's contract is the producer's reported
-    count, not a derived one.
+    iterations is the n the native record reports (sample_count), set on ONE entry per
+    benchmark: insert_benchmarks sums it across the merged entries.
     """
     entries = []
+    counted: set[str] = set()
     for r in rows:
         extra = json.loads(r["extra"])
         # Already suffix-stripped by _test_name, which is what makes the native json and the
@@ -649,6 +690,15 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             props["model"] = model
         run_props = {k: str(r.get(k, "")) for k in _RUN_PROP_COLUMNS}
         run_props.update({k: str(extra.get(k, "")) for k in _RUN_PROP_EXTRA_KEYS})
+        # One key per metric: the writer merges run_props by update, so a single JSON blob
+        # would keep only the last entry's metric.
+        unit = metric_unit(r["metric"])
+        if unit:
+            run_props[f"unit.{r['metric']}"] = unit
+        iterations = 0
+        if extra.get("iterations") and name not in counted:
+            counted.add(name)
+            iterations = int(extra["iterations"])
         entries.append(
             {
                 "name": name,
@@ -659,7 +709,7 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "backend": extra.get("device", ""),
                 "props": props,
                 "measurements": {r["metric"]: [float(r["actual"])]},
-                "iterations": 0,
+                "iterations": iterations,
                 "run_props": run_props,
                 "disc": props,
                 "disc_keys": _BENCH_ID_KEYS,

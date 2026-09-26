@@ -149,6 +149,7 @@ def test_run_props_carry_the_ci_coordinates_the_hud_view_reads(mod):
         "head_sha": "abc123",
         "arch": "x86_64",
         "hardware_type": "IBM_Spyre",
+        "unit.latency": "s",
     }
 
 
@@ -165,7 +166,7 @@ def test_run_mode_comes_from_the_test_name_prefix(mod):
 
 
 def test_which_file_reported_it_does_not_split_the_benchmark(mod):
-    # The writer reads both the native json and the .pytorch.json copy, and a benchmark_id is
+    # Both the native json and the .pytorch.json feed one benchmark, and a benchmark_id is
     # a content hash of the name -- so the two must converge before they reach the hash.
     assert mod._test_name("latency_tp1.json") == mod._test_name("latency_tp1.pytorch.json")
     a = _flat(test_name="latency_tp1")
@@ -179,13 +180,130 @@ def test_unnamed_benchmarks_are_skipped_not_merged(mod):
     assert mod._bench_entries([_flat(test_name="")]) == []
 
 
-def test_iterations_stays_zero(mod):
-    # 0 is the column's "the producer did not say": vLLM reports a pre-averaged value per
-    # metric and never the n behind it. insert_benchmarks SUMS iterations across the merged
-    # entries, so any per-metric placeholder would add up to the metric count.
+def test_iterations_stays_zero_when_unreported(mod):
     flat = [_flat(metric=m) for m in ("p50", "p90", "p99")]
     _idents, (fact,) = _write(mod, flat)
     assert fact["iterations"] == 0
+
+
+def test_iterations_is_counted_once_per_benchmark(mod):
+    # insert_benchmarks SUMS iterations across merged entries; per-metric copies would
+    # report 3 metrics x 10 iterations as 30.
+    flat = [_flat(metric=m, iterations=10) for m in ("avg_latency", "p50_latency", "p99_latency")]
+    _idents, (fact,) = _write(mod, flat)
+    assert fact["iterations"] == 10
+
+
+@pytest.mark.parametrize(
+    "record, n",
+    [
+        ({"avg_latency": 1.0, "latencies": [1.0] * 10, "percentiles": {}}, 10),
+        ({"requests_per_second": 2.0, "tokens_per_second": 3.0, "num_requests": 16}, 1),
+        # serve also carries a `latencies` list; its n is the completed request count.
+        ({"request_throughput": 1.0, "completed": 32, "latencies": [1.0] * 40}, 32),
+        ({"benchmark": {}, "metric": {}}, 0),
+    ],
+)
+def test_sample_count_per_vllm_schema(mod, record, n):
+    assert mod.sample_count(record) == n
+
+
+def test_units_ride_run_props_per_metric(mod):
+    flat = [
+        _flat(metric=m) for m in ("latency", "p99_latency", "mean_ttft_ms", "tokens_per_second")
+    ]
+    _idents, (fact,) = _write(mod, flat)
+    assert {k: v for k, v in fact["props"].items() if k.startswith("unit.")} == {
+        "unit.latency": "s",
+        "unit.p99_latency": "s",
+        "unit.mean_ttft_ms": "ms",
+        "unit.tokens_per_second": "tok/s",
+    }
+
+
+# --- extract_rows: one source per metric -----------------------------------------------
+
+
+def _extract(mod, monkeypatch, tmp_path, files):
+    for name, record in files.items():
+        (tmp_path / name).write_text(json.dumps(record), encoding="utf-8")
+
+    def _read(path):
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else [data]
+
+    monkeypatch.setattr(mod, "read_benchmark_results", _read)
+    return mod.extract_rows(str(tmp_path), "main", "abc", "7", "0", "wf", 0)
+
+
+def _pytorch(name, values, model="granite"):
+    return {
+        "benchmark": {"name": "vLLM benchmark"},
+        "model": {"name": model},
+        "metric": {"name": name, "benchmark_values": values},
+    }
+
+
+def test_a_metric_in_both_files_is_stored_once(mod, monkeypatch, tmp_path):
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {
+            "throughput_x.pytorch.json": [
+                _pytorch("requests_per_second", [2.0]),
+                _pytorch("tokens_per_second", [280.0]),
+            ],
+            "throughput_x.json": {
+                "elapsed_time": 7.3,
+                "num_requests": 16,
+                "requests_per_second": 2.0,
+                "tokens_per_second": 280.0,
+            },
+        },
+    )
+    _idents, (fact,) = _write(mod, rows)
+    assert fact["measurements"] == {
+        "requests_per_second": [2.0],
+        "tokens_per_second": [280.0],
+        "elapsed_time": [7.3],
+    }
+    assert fact["iterations"] == 1
+
+
+def test_native_adds_only_what_pytorch_lacks(mod, monkeypatch, tmp_path):
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {
+            "latency_x.pytorch.json": [_pytorch("latency", [1.5, 1.6])],
+            "latency_x.json": {
+                "avg_latency": 1.55,
+                "latencies": [1.5, 1.6],
+                "percentiles": {"50": 1.55},
+            },
+        },
+    )
+    _idents, (fact,) = _write(mod, rows)
+    assert fact["measurements"] == {
+        "latency": [1.5, 1.6],
+        "avg_latency": [1.55],
+        "p50_latency": [1.55],
+    }
+    assert fact["iterations"] == 2
+
+
+def test_native_alone_is_ingested_whole(mod, monkeypatch, tmp_path):
+    # SAVE_TO_PYTORCH_BENCHMARK_FORMAT unset: the native file is the only source.
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {"throughput_x.json": {"elapsed_time": 7.3, "requests_per_second": 2.0}},
+    )
+    assert {r["metric"] for r in rows} == {"elapsed_time", "requests_per_second"}
 
 
 # --- what the shared writer makes of them ----------------------------------------------

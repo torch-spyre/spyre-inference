@@ -80,8 +80,11 @@ def test_every_golden_names_its_function_and_both_values(vllm_mod):
 
 
 def test_a_renamed_or_re_keyed_function_is_drift(vllm_mod):
-    assert golden_drift([("canonical_arch", vllm_mod.canonical_arch, ("amd64",), "x86_64")]) == []
-    assert golden_drift([("canonical_arch", vllm_mod.canonical_arch, ("amd64",), "amd64")]) != []
+    golden = "dab2a67f-14bf-53be-b6e4-fc9642086e47"
+    ok = ("gha", "12345", "amd64", "integration")
+    rekeyed = ("gha", "12345", "s390x", "integration")
+    assert golden_drift([("run_id_of", vllm_mod.run_id_of, ok, golden)]) == []
+    assert golden_drift([("run_id_of", vllm_mod.run_id_of, rekeyed, golden)]) != []
 
 
 # --- provenance -------------------------------------------------------------------------

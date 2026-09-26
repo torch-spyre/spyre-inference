@@ -57,14 +57,19 @@ inputs:
     default: perf
   rpm-lock:
     description: >-
-      Path to spyre-rpms.lock, used ONLY on a direct Actions run. Such a leg has no built
-      image to point at -- it restores a cache keyed on this file and builds nothing -- so the
-      file IS the identity of the stack under test, and each pinned RPM's artifact_id is
-      derived from it and linked to this run. IGNORED when v2-run-id is set: that is the
-      Jenkins path, where the orchestrator has already written the artifact_results row for
-      the same run_id and linking again would duplicate it. Empty also disables the link.
+      spyre-rpms.lock the leg installed on top of the runner image; its digest joins the
+      installed delta hashed into the leg's artifact_id. Empty when the image ran as baked.
+      The artifact link is skipped when v2-run-id is set: the orchestrator already wrote it.
     required: false
     default: spyre-rpms.lock
+  installed:
+    description: Anything else installed on top of the image, space- or comma-separated.
+    required: false
+    default: ''
+  state:
+    description: The benchmark step's verdict (passed | failed) for artifact_results.
+    required: false
+    default: passed
   clickhouse-host:
     description: ClickHouse host. Empty = skip the whole ingest (clean no-op).
     required: false
@@ -171,4 +176,7 @@ runs:
           --arch "${{ inputs.arch }}" \
           --v2-run-id "${{ inputs.v2-run-id }}" \
           --test-type "${{ inputs.test-type }}" \
-          --rpm-lock "${{ inputs.rpm-lock }}"
+          --rpm-lock "${{ inputs.rpm-lock }}" \
+          --installed "${{ inputs.installed }}" \
+          --state "${{ inputs.state }}" \
+          --repository "${{ github.repository }}"

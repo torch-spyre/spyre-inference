@@ -235,22 +235,52 @@ def test_run_id_and_report_kind_are_stamped_on_every_fact_row(mod):
     assert all(f["props"]["report_kind"] == "vllm" for f in facts)
 
 
-# --- _write_artifact_results: duration_s (was hardcoded 0.0 for every GHA perf leg) ----
+# --- _write_artifact_results: the leg's artifact and its verdict ------------------------
+
+_BASE = "6ecddb3f-1809-533f-9552-fafdba8a331d"
 
 
-def _artifact_write(
-    mod, rows, monkeypatch, lock_lines=("ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm",)
-):
-    """Run the real _write_artifact_results over these flat rows; return its inserted rows."""
-    import tempfile
-
-    monkeypatch.setattr(mod, "tables_present", lambda *a, **k: True)
+def _artifact_write(mod, rows, monkeypatch, base=_BASE, **leg):
+    """Run the real _write_artifact_results over these flat rows; return what it inserted."""
+    monkeypatch.setattr(mod, "base_artifact_id", lambda *a, **k: base)
+    fields = dict(
+        sha="abc123def4567890",
+        rpm_lock="",
+        installed="",
+        arch="amd64",
+        test_type="perf",
+        state="passed",
+        repository="torch-spyre/spyre-inference",
+        gha_run_id="36128188844",
+        branch="main",
+    )
+    fields.update(leg)
     client = _Client()
-    with tempfile.TemporaryDirectory() as d:
-        lock_path = pathlib.Path(d) / "spyre-rpms.lock"
-        lock_path.write_text("\n".join(lock_lines) + "\n", encoding="utf-8")
-        mod._write_artifact_results(client, "v2", rows, _RUN, str(lock_path), "amd64")
-    return client.inserted.get("artifact_results", [])
+    mod._write_artifact_results(client, "v2", rows, _RUN, types.SimpleNamespace(**fields))
+    return client.inserted
+
+
+def test_leg_writes_its_artifact_and_a_performance_verdict(mod, monkeypatch):
+    got = _artifact_write(mod, [_flat()], monkeypatch, state="failed")
+    (artifact,) = got["artifacts"]
+    (result,) = got["artifact_results"]
+    assert artifact["component"] == "spyre-inference"
+    assert artifact["props"]["base_artifact_id"] == _BASE
+    assert artifact["props"]["installed"] == "spyre-inference@abc123def456"
+    assert result["artifact_id"] == artifact["artifact_id"] != _BASE
+    assert (result["run_id"], result["result_kind"], result["test_type"]) == (
+        _RUN,
+        "performance",
+        "perf",
+    )
+    assert result["state"] == "failed"
+    assert result["props"]["run_url"].endswith(
+        "/torch-spyre/spyre-inference/actions/runs/36128188844"
+    )
+
+
+def test_no_base_id_means_no_link(mod, monkeypatch):
+    assert _artifact_write(mod, [_flat()], monkeypatch, base="") == {}
 
 
 def test_artifact_results_duration_sums_elapsed_time_rows(mod, monkeypatch):
@@ -259,13 +289,12 @@ def test_artifact_results_duration_sums_elapsed_time_rows(mod, monkeypatch):
         _flat(metric="elapsed_time", actual=7.5, test_name="throughput_b"),
         _flat(metric="requests_per_second", actual=42.0, test_name="throughput_a"),
     ]
-    written = _artifact_write(mod, rows, monkeypatch)
-    assert written, "expected an artifact_results row"
-    assert all(w["duration_s"] == pytest.approx(20.0) for w in written)
+    (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
+    assert result["duration_s"] == pytest.approx(20.0)
 
 
 def test_artifact_results_duration_is_zero_without_elapsed_time(mod, monkeypatch):
     # A latency/serve-only leg reports no elapsed_time metric, so duration_s stays 0.0.
     rows = [_flat(metric="avg_latency", actual=0.42, test_name="latency_a")]
-    written = _artifact_write(mod, rows, monkeypatch)
-    assert written and all(w["duration_s"] == 0.0 for w in written)
+    (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
+    assert result["duration_s"] == 0.0

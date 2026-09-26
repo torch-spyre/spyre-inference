@@ -125,6 +125,41 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+# 8/5 leaves a largest gap of 1.625x above 256 tokens, where powers of two leave 2.0x.
+_KV_LADDER_NUMBER = 8
+_KV_LADDER_DENOM = 5
+_KV_LADDER_GRAIN = 64
+
+
+def _geometric_union_up_to(
+    n: int, start: int, block_size: int, grain: int = _KV_LADDER_GRAIN
+) -> tuple[int, ...]:
+    """Powers of two in [start, n] unioned with a geometric series, plus n itself.
+
+    Every power of two is kept, so a KV length's bucket can only move down relative
+    to the powers-of-two ladder, never up.
+    """
+    if n < 1:
+        return ()
+
+    def _series(step: int) -> list[int]:
+        out = []
+        v = step
+        while True:
+            v = v * _KV_LADDER_NUMBER // _KV_LADDER_DENOM
+            if v >= n:
+                return out
+            aligned = (v // step) * step
+            if aligned > start:
+                out.append(aligned)
+
+    # Whether a 64-token grain keeps every bucket a whole number of blocks depends on
+    # where this series lands, not on a divisibility rule: it fails from block_size 256.
+    if any(v % block_size for v in _series(grain)):
+        grain = block_size
+    return tuple(sorted(set(_powers_of_two_up_to(n, start=start)) | set(_series(grain)) | {n}))
+
+
 def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     """The smallest KV head count any layer carries, after the TP split.
 
@@ -243,7 +278,9 @@ class SpyreAttnBucketer:
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: list(
+                _geometric_union_up_to(max_model_len, start=block_size, block_size=block_size)
+            ),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv

@@ -151,7 +151,7 @@ def test_logprobs_do_not_depend_on_earlier_requests(monkeypatch: pytest.MonkeyPa
 # divergence only at the larger bucket.
 _PAD_MAX_MODEL_LEN = 1024
 _BLOCK_SIZE = 128
-_PAD_PROMPT_LEN = 300
+_PAD_PROMPT_LEN = 700
 
 
 def _block_counts() -> tuple[int, int]:

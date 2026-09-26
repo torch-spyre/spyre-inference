@@ -23,6 +23,7 @@ import pytest
 from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
+    _geometric_union_up_to,
     _parse_buckets,
     _powers_of_two_up_to,
     batched_decode_chunking,
@@ -71,6 +72,10 @@ def _list_pow2(limit: int, start: int = 1) -> list[int]:
     return list(_powers_of_two_up_to(limit, start=start))
 
 
+def _list_default(limit, start=BLOCK_SIZE, block_size=None):
+    return list(_geometric_union_up_to(limit, start=start, block_size=block_size or start))
+
+
 @pytest.fixture()
 def bucketer():
     return SpyreAttnBucketer(make_config())
@@ -85,9 +90,31 @@ def _clear_env_cache(monkeypatch):
 
 
 class TestBuckets:
-    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
-        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+    def test_kv_buckets_are_the_default_ladder_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == _list_default(2048)
         assert bucketer.kv_buckets[-1] == 2048
+
+    def test_kv_buckets_contain_every_power_of_two(self, bucketer):
+        assert set(_list_pow2(2048, start=BLOCK_SIZE)) <= set(bucketer.kv_buckets)
+
+    def test_kv_buckets_are_denser_than_powers_of_two(self, bucketer):
+        assert len(bucketer.kv_buckets) > len(_list_pow2(2048, start=BLOCK_SIZE))
+
+    @pytest.mark.parametrize("max_model_len", [2048, 4096, 8192, 16384, 32768])
+    def test_kv_buckets_never_round_up_further_than_powers_of_two(self, max_model_len):
+        b = SpyreAttnBucketer(make_config(max_model_len=max_model_len))
+        pow2 = _list_pow2(max_model_len, start=BLOCK_SIZE)
+
+        def bucket_for(kv, ladder):
+            return next(v for v in ladder if kv <= v)
+
+        for kv in range(1, max_model_len + 1):
+            assert bucket_for(kv, b.kv_buckets) <= bucket_for(kv, pow2)
+
+    @pytest.mark.parametrize("block_size", [64, 128, 256, 512])
+    def test_kv_buckets_are_whole_numbers_of_blocks(self, block_size):
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
+        assert [v for v in b.kv_buckets if v % block_size] == []
 
     def test_kv_buckets_start_at_block_size(self, bucketer):
         """Buckets below block_size all collapse to num_blocks == 1, so the
@@ -97,14 +124,16 @@ class TestBuckets:
     @pytest.mark.parametrize("block_size", [64, 128, 256])
     def test_kv_buckets_start_tracks_block_size(self, block_size):
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
-        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+        assert b.kv_buckets == _list_default(4096, start=block_size)
+        assert b.kv_buckets[0] == block_size
 
     def test_kv_buckets_round_non_power_of_two_block_size_up(self):
         """The platform only forces block_size to a multiple of 64, so a
         non-power-of-two value is reachable; buckets stay a clean doubling
         sequence by starting at the next power of two."""
         b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
-        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+        assert b.kv_buckets == _list_default(4096, start=256, block_size=192)
+        assert b.kv_buckets[0] == 256
 
     def test_query_buckets_lead_with_decode_case(self, bucketer):
         assert bucketer.query_buckets[0] == 1
@@ -120,7 +149,8 @@ class TestBuckets:
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
-        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.kv_buckets == _list_default(3000)
+        assert b.kv_buckets[-1] == 3000
         assert b.query_buckets == [1, 100]
 
     def test_largest_bucket_is_always_the_limit(self):
@@ -181,7 +211,7 @@ class TestFindBucket:
         assert bucketer.find_query_bucket(512) == 512
 
     def test_rounds_up(self, bucketer):
-        assert bucketer.find_kv_bucket(257) == 512
+        assert bucketer.find_kv_bucket(257) == 384
         assert bucketer.find_query_bucket(33) == 512
 
     def test_query_len_one_maps_to_decode_bucket(self, bucketer):

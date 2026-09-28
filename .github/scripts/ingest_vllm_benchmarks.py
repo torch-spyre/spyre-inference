@@ -21,10 +21,10 @@ Expects the following environment variables:
 """
 
 import glob
+import hashlib
 import json
 import logging
 import os
-import re
 import sys
 import time
 import uuid
@@ -35,10 +35,12 @@ import clickhouse_connect
 from ingest_identity import golden_drift, library_provenance
 from spyre_clickhouse_ingest import (
     artifact_id_for,
+    base_artifact_id,
     benchmark_id_for,
     benchmarks_already_ingested,
-    canonical_arch,
+    gha_artifact_id,
     insert_benchmarks,
+    insert_gha_artifact_result,
     run_id_of,
     schema,
     tables_present,
@@ -105,10 +107,28 @@ def parse_args() -> Any:
         "--rpm-lock",
         type=str,
         default=os.environ.get("SPYRE_RPM_LOCK", "spyre-rpms.lock"),
-        help="Path to spyre-rpms.lock. On the GHA path this file IS the content identity of "
-        "the stack under test -- the leg builds nothing, it restores a cache keyed on this "
-        "file -- so each pinned RPM's artifact_id is recovered from it and an "
-        "artifact_results row is written per artifact. Empty disables the artifact write.",
+        help="spyre-rpms.lock the leg installed on top of the image; its digest joins the "
+        "installed delta hashed into the leg's artifact_id. Empty when the image ran as baked.",
+    )
+    parser.add_argument(
+        "--installed",
+        type=str,
+        default="",
+        help="Anything else installed on top of the image (override RPMs, a torch-spyre ref), "
+        "space- or comma-separated.",
+    )
+    parser.add_argument(
+        "--state",
+        choices=("passed", "failed"),
+        default="passed",
+        help="The benchmark step's verdict for artifact_results; partial results are still "
+        "ingested when it failed.",
+    )
+    parser.add_argument(
+        "--repository",
+        type=str,
+        default=os.environ.get("GITHUB_REPOSITORY", ""),
+        help="owner/name, for the run url and the artifact's sources.",
     )
     parser.add_argument(
         "--dry-run",
@@ -184,6 +204,39 @@ def extract_vllm_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     return pairs
 
 
+def sample_count(record: dict[str, Any]) -> int:
+    """The n behind a native record's aggregates: latency iterations, serve requests, or the
+    one timed pass of a throughput run. 0 when the record does not say."""
+    if "avg_latency" in record:
+        latencies = record.get("latencies")
+        return len(latencies) if isinstance(latencies, list) else 0
+    if "requests_per_second" in record or "tokens_per_second" in record:
+        return 1
+    if "request_throughput" in record or "output_throughput" in record:
+        completed = record.get("completed")
+        return completed if isinstance(completed, int) and not isinstance(completed, bool) else 0
+    return 0
+
+
+_UNITS = {
+    "elapsed_time": "s",
+    "requests_per_second": "req/s",
+    "request_throughput": "req/s",
+    "tokens_per_second": "tok/s",
+    "output_throughput": "tok/s",
+    "total_token_throughput": "tok/s",
+}
+
+
+def metric_unit(metric: str) -> str:
+    """vLLM's own unit for a metric; its names encode ms but not seconds (latency, p99_latency)."""
+    if metric.endswith("_ms"):
+        return "ms"
+    if metric.endswith("latency"):
+        return "s"
+    return _UNITS.get(metric, "")
+
+
 def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     """Return (metric_name, value) pairs from one PyTorch-format record.
 
@@ -237,10 +290,10 @@ def extract_rows(
 
     The vLLM benchmark runner writes native `{test_name}.json` files
     (latency / throughput / serve schemas). When SAVE_TO_PYTORCH_BENCHMARK_FORMAT
-    is set it ALSO writes `{test_name}.pytorch.json`. This reads both: the
-    PyTorch-format files via their `benchmark`/`metric` schema, and every other
-    `*.json` via the native vLLM schema. A `.pytorch.json` file is not read
-    twice (it is excluded from the native pass).
+    is set it ALSO writes `{test_name}.pytorch.json`, which re-reports a subset of
+    the same numbers. The PyTorch file is the source for every metric it carries
+    (its names are what the HUD reads); the native file adds only the metrics the
+    PyTorch file lacks, so no measurement is stored twice.
     """
     rows = []
     ts = int(time.time() * 1000)
@@ -255,19 +308,19 @@ def extract_rows(
         results_dir,
     )
 
-    def _emit(filename: str, model: str, metric_name: str, value: float) -> None:
-        extra = json.dumps(
-            {
-                "device": "spyre",
-                "arch": arch,
-                "hardware_type": "IBM_Spyre",
-                "model": model,
-                "test_name": _test_name(filename),
-                "head_sha": sha,
-                "pr_number": pr_number,
-                "value": value,
-            }
-        )
+    def _emit(filename: str, model: str, metric_name: str, value: float, n: int = 0) -> None:
+        info = {
+            "device": "spyre",
+            "arch": arch,
+            "hardware_type": "IBM_Spyre",
+            "model": model,
+            "test_name": _test_name(filename),
+            "head_sha": sha,
+            "pr_number": pr_number,
+            "value": value,
+        }
+        if n:
+            info["iterations"] = n
         rows.append(
             {
                 "timestamp": ts,
@@ -281,7 +334,7 @@ def extract_rows(
                 "workflow_id": int(run_id) if run_id.isdigit() else 0,
                 "job_id": int(job_id) if job_id.isdigit() else 0,
                 "run_attempt": 1,
-                "extra": extra,
+                "extra": json.dumps(info),
             }
         )
 
@@ -291,6 +344,9 @@ def extract_rows(
     # Relies on SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 in CI; a deeper fix would
     # inject the model into the native JSON at run time (run_vllm_benchmarks.py).
     model_by_test: dict[str, str] = {}
+    pytorch_metrics: dict[str, set[str]] = {}
+    # Kept apart from the rows: a native record whose metrics all dedup away still has an n.
+    samples_by_test: dict[str, int] = {}
 
     for file, extractor in [
         *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
@@ -316,13 +372,22 @@ def extract_rows(
                 continue
             model = _model_from_record(record, filename)
             # Cache model from pytorch files; use cached model for native files
-            if filename.endswith(".pytorch.json"):
+            is_pytorch = filename.endswith(".pytorch.json")
+            if is_pytorch:
                 if model != test_name:
                     model_by_test[test_name] = model
             elif model == test_name and test_name in model_by_test:
                 model = model_by_test[test_name]
+            covered = pytorch_metrics.setdefault(test_name, set())
+            n = 0 if is_pytorch else sample_count(record)
+            if n:
+                samples_by_test.setdefault(test_name, n)
             for metric_name, value in extractor(record):
-                _emit(filename, model, metric_name, value)
+                if is_pytorch:
+                    covered.add(metric_name)
+                elif metric_name in covered:
+                    continue
+                _emit(filename, model, metric_name, value, n)
 
         extracted = len(rows) - before_rows
         if extracted:
@@ -330,81 +395,40 @@ def extract_rows(
         else:
             log.warning("No usable metrics in %s", filename)
 
+    counted = set()
+    for r in rows:
+        extra = json.loads(r["extra"])
+        if extra.get("iterations"):
+            counted.add(extra.get("test_name"))
+    for r in rows:
+        extra = json.loads(r["extra"])
+        name = extra.get("test_name")
+        if name in samples_by_test and name not in counted:
+            extra["iterations"] = samples_by_test[name]
+            r["extra"] = json.dumps(extra)
+            counted.add(name)
+
     log.info("Total rows extracted: %d", len(rows))
     return rows
 
 
 # ── GHA artifact identity ────────────────────────────────────────────────────────────────
-# A GHA perf leg builds nothing: it restores a cache keyed on spyre-rpms.lock and extracts
-# those exact RPMs. So the honest content identity of what it measured is the LOCK, and the
-# artifact_id of each pinned RPM is recoverable from it -- the builder embeds the same id12
-# in the NEVRA that it puts in artifact_id and in the artifact_refs glob.
-#   NEVRA: ibm-flex-2.0.0-0.main.495+495.a86bb35a.3a6b688cc40a.a86bb35.el10
-#                                                 ^^^^^^^^^^^^ id12
-# This is why the GHA path does NOT need a digest threaded from Jenkins.
-
-_NEVRA_ID12 = re.compile(r"\.([0-9a-f]{12})\.")
-# name-<version>... : the package name is everything before the first -<digit>.
-_NEVRA_NAME = re.compile(r"^(.+?)-\d")
+# The same derivation torch-spyre's GHA legs use: the runner image's stamped artifact_id with
+# this leg's installed delta chained onto it (gha_artifact_id). Computed inline, since this
+# ingest runs on the card runner that can read the image's id file.
 
 
-def parse_rpm_lock(lock_path: str) -> list[tuple[str, str]]:
-    """[(package_name, id12)] for each pinned RPM. Skips any line without exactly one
-    id12-shaped token rather than guessing which to take -- a wrong artifact_id is worse
-    than an absent one, because it attributes results to the wrong build.
-    """
-    out: list[tuple[str, str]] = []
-    try:
-        with open(lock_path, encoding="utf-8") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return out
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        ids = _NEVRA_ID12.findall(line)
-        name = _NEVRA_NAME.match(line)
-        if len(ids) == 1 and name:
-            out.append((name.group(1), ids[0]))
-        else:
-            log.warning("spyre-rpms.lock: cannot derive a unique id12 from %r — skipped", line)
-    return out
-
-
-def rpm_artifact_ids(lock_path: str, arch: str) -> list[str]:
-    """artifact_id (v2 uuid5) for every RPM the leg installed.
-
-    The component is the RPM name minus its `ibm-` vendor prefix and any `-devel`/`-headers`
-    suffix, which is how the builder names it. Verified against prod: `ibm-flex-devel` and
-    `ibm-flex` share one id12 and one component, so the two rows collapse to one artifact.
-    """
-    a = canonical_arch(arch)
-    if not a:
-        return []
-    seen: dict[str, None] = {}
-    for name, id12 in parse_rpm_lock(lock_path):
-        base = name[4:] if name.startswith("ibm-") else name
-        # -devel/-headers ship alongside the base package from ONE build and share its id12.
-        # Verified against prod: the builder registers only the base name (ibm-flex, never
-        # ibm-flex-devel), so a per-subpackage artifact_id would name a row that cannot exist.
-        for suffix in ("-devel", "-headers"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-                break
-        component = base
-        for suffix in ("-core", "-dd2", "-e2e"):
-            if component.endswith(suffix):
-                component = component[: -len(suffix)]
-                break
-        artifact_name = base if base.startswith("ibm-") else f"ibm-{base}"
-        # Derived, not built as a delimited string: artifact_results.artifact_id is a UUID in
-        # v2, and the orchestrator hashes these same four fields, so both sides agree without
-        # this leg ever being told the id.
-        aid = artifact_id_for(component, artifact_name, id12, a)
-        if aid:
-            seen.setdefault(aid, None)
-    return list(seen)
+def leg_installed(sha: str, rpm_lock: str, extra: str) -> str:
+    """What this leg installed on top of the image, as the token set gha_artifact_id hashes."""
+    tokens = [f"{BENCH_COMPONENT}@{sha[:12]}"] if sha else []
+    if rpm_lock:
+        try:
+            with open(rpm_lock, "rb") as fh:
+                tokens.append(f"spyre-rpms.lock@{hashlib.sha256(fh.read()).hexdigest()[:12]}")
+        except OSError:
+            log.warning("%s unreadable — left out of the installed delta", rpm_lock)
+    tokens += (extra or "").replace(",", " ").split()
+    return " ".join(tokens)
 
 
 def _parse_input_shapes(test_name: str) -> dict[str, str]:
@@ -430,21 +454,13 @@ def _is_uuid(value) -> bool:
     return True
 
 
-def effective_rpm_lock(args) -> str:
-    """The lock path to use, or "" to skip the RPM->artifact link.
+def links_artifact(args) -> bool:
+    """Does this leg own its artifact_results row?
 
-    The link belongs to the DERIVED (Actions) path alone. A UUID in --run-id or --v2-run-id
-    means Jenkins dispatched this leg and the orchestrator has already written an
-    artifact_results row for that run_id, so linking again would add one row per pinned RPM on
-    top of it -- and the writer's dedup guard cannot catch that, since it only skips when a row
-    is ALREADY present, making the outcome depend on which writer lands first.
-
-    Keyed on a UUID, not on a value merely being present: a NUMERIC --run-id is the old GHA
-    wiring, which does own the link.
+    Not when a uuid was threaded in: the orchestrator already wrote that run_id's row, and a
+    second writer would duplicate it. A NUMERIC --run-id is the old GHA wiring, which does.
     """
-    if _is_uuid(getattr(args, "run_id", "")) or _is_uuid(getattr(args, "v2_run_id", "")):
-        return ""
-    return getattr(args, "rpm_lock", "")
+    return not (_is_uuid(getattr(args, "run_id", "")) or _is_uuid(getattr(args, "v2_run_id", "")))
 
 
 def resolve_v2_run_id(args) -> str:
@@ -477,86 +493,46 @@ def resolve_v2_run_id(args) -> str:
     return run_id_of("gha", gha, args.arch, getattr(args, "test_type", "perf"))
 
 
-def _write_artifact_results(client, db: str, rows, run_id_value: str, rpm_lock: str, arch: str):
-    """One artifact_results row per RPM the leg installed, linking perf to what it measured.
+def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> None:
+    """This leg's artifacts row and its performance verdict in artifact_results.
 
-    Why per RPM and not one row: a GHA perf leg has no single built image. Its stack is the set
-    of pinned RPMs, so every one of them is an artifact the run exercised, and pointing the
-    result at all of them is what makes each component's artifact page show the perf that ran
-    against it.
-
-    result_kind='performance' with test_type='perf', matching the rows Jenkins pushArtifactResult
-    already writes -- this is the same contract from the other launcher, not a new one.
-
-    Contained: this is the FIRST writer to artifact_results from Actions, so a failure here must
-    not cost the benchmark rows already written.
+    Contained: a failure here must not cost the benchmark rows already written.
     """
-    if not rpm_lock:
-        return
     try:
-        ids = rpm_artifact_ids(rpm_lock, arch)
-        if not ids:
-            log.info("no artifact_id derivable from %s — artifact link skipped", rpm_lock)
+        tables = (schema.ARTIFACTS, schema.ARTIFACT_RESULTS)
+        if not tables_present(client, db, tables=tables):
+            log.info("artifacts/artifact_results absent in %s — artifact link skipped", db)
             return
-        table = schema.ARTIFACT_RESULTS
-        if not tables_present(client, db, tables=(table,)):
-            log.info("%s absent — artifact link skipped", table.qualified(db))
+        base = base_artifact_id()
+        if not base:
+            # Nothing to chain onto; a coordinate invented here would be shared by every such leg.
+            log.info("runner image carries no artifact id — artifact link skipped")
             return
-        # artifact_results is a plain MergeTree with no dedup key, so a re-ingest of one leg
-        # DOUBLES its rows -- and every per-artifact counter is derived from them. Check first.
-        already = client.query(
-            f"SELECT count() FROM {table.qualified(db)} "
-            "WHERE run_id = {rid:UUID} AND result_kind = 'performance'",
-            parameters={"rid": run_id_value},
-        ).result_rows
-        if already and already[0][0] > 0:
-            log.info("artifact link already present for run_id=%s — skipping", run_id_value)
-            return
-        first, first_extra = rows[0], json.loads(rows[0]["extra"])
-        # No total_tests/passed/failed/errors/skipped: v2 does not store them, because they are
-        # derivable by counting the run's own rows and a stored copy is a second source of truth.
-        # The benchmark count still goes in props -- a perf leg has no test_case_runs rows to
-        # count, so this is the only record of how many benchmarks it measured. It counts
-        # BENCHMARKS not metrics: 26 metrics of one benchmark is one measurement, so counting
-        # metrics would inflate every perf leg ~26x.
-        benchmarks = len({json.loads(r["extra"]).get("test_name", "") for r in rows})
-        # Suite wall clock: sum of each throughput-schema file's own elapsed_time metric.
-        duration_s = sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time")
-        props = {
-            "source": "gha",
-            # run_url is THE link key across the whole v2 schema -- one key for a Jenkins build
-            # url or a GitHub Actions run url, so a reader never has to know which system
-            # produced the row. Built here rather than left to the reader: the URL shape is
-            # GitHub's, and a dashboard route should not have to know it.
-            "run_url": (
-                f"https://github.com/{first['repo']}/actions/runs/{first['workflow_id']}"
-                if first.get("repo") and first.get("workflow_id")
-                else ""
-            ),
-            "workflow_id": str(first["workflow_id"]),
-            "rpm_lock": rpm_lock,
-            "head_sha": first_extra.get("head_sha", ""),
-            "benchmarks": str(benchmarks),
-        }
-        schema.insert(
+        installed = leg_installed(leg.sha, leg.rpm_lock, leg.installed)
+        aid = gha_artifact_id(BENCH_COMPONENT, base, installed, leg.arch)
+        repo, gha = leg.repository, leg.gha_run_id
+        run_url = f"https://github.com/{repo}/actions/runs/{gha}" if repo and gha else ""
+        wrote = insert_gha_artifact_result(
             client,
-            table,
-            [
-                {
-                    "artifact_id": aid,
-                    "run_id": run_id_value,
-                    "result_kind": "performance",
-                    "test_type": "perf",
-                    "state": "passed",
-                    "arch": canonical_arch(arch),
-                    "duration_s": duration_s,
-                    "props": props,
-                }
-                for aid in ids
-            ],
-            db=db,
+            db,
+            artifact_id=aid,
+            component=BENCH_COMPONENT,
+            arch=leg.arch,
+            run_id=run_id_value,
+            test_type=leg.test_type,
+            state=leg.state,
+            result_kind="performance",
+            # Suite wall clock: each throughput run's own elapsed_time.
+            duration_s=sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time"),
+            base_artifact_id=base,
+            installed=installed,
+            repo=repo,
+            git_ref=leg.branch,
+            git_sha=leg.sha,
+            run_url=run_url,
         )
-        log.info("Linked %d artifact(s) to run_id=%s in artifact_results", len(ids), run_id_value)
+        if wrote:
+            log.info("Linked artifact %s (base %s) to run_id=%s", aid, base, run_id_value)
     except Exception as exc:  # noqa: BLE001
         log.warning("artifact_results link failed, benchmark rows unaffected: %r", exc)
 
@@ -576,10 +552,10 @@ _BENCH_TABLES = (schema.BENCHMARKS, schema.BENCHMARK_RUNS)
 # same-named benchmark in another producer's suite.
 _BENCH_ID_KEYS = ("record_type", "run_mode", "tensor_parallel", "input_len", "output_len")
 
-# The three identities this script writes, pinned as literals against the library that mints
+# The identities this script writes, pinned as literals against the library that mints
 # them. Installed from a floating `@main`, so the job that WRITES has to check them --
-# ingest_identity says why the test-time goldens are not enough. run_id and artifact_id are
-# the cross-writer contract; benchmark_id is this producer's own, and pinned for the same
+# ingest_identity says why the test-time goldens are not enough. run_id and the artifact ids
+# are the cross-writer contract; benchmark_id is this producer's own, and pinned for the same
 # reason: benchmarks dedups across runs on it, so a re-key silently forks every trend line.
 IDENTITY_GOLDENS = (
     (
@@ -593,6 +569,17 @@ IDENTITY_GOLDENS = (
         artifact_id_for,
         ("torch-spyre", "flex-rpm", "abc123def456", "amd64"),
         "86a5c6e3-bd2f-5d27-9a8f-9b8d23efc65b",
+    ),
+    (
+        "gha_artifact_id",
+        gha_artifact_id,
+        (
+            BENCH_COMPONENT,
+            "6ecddb3f-1809-533f-9552-fafdba8a331d",
+            "spyre-inference@abc123def456 spyre-rpms.lock@0123456789ab",
+            "amd64",
+        ),
+        "932cc6a6-c3eb-5be2-8057-a4fe5303ffd3",
     ),
     (
         "benchmark_id_for",
@@ -627,11 +614,11 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     row per (benchmark, backend), so the 26 metrics of one benchmark stay one measurement
     rather than 26 trend points.
 
-    iterations stays 0 throughout: vLLM's harness reports a pre-averaged value per metric and
-    does not tell us the n behind it, and the column's contract is the producer's reported
-    count, not a derived one.
+    iterations is the n the native record reports (sample_count), set on ONE entry per
+    benchmark: insert_benchmarks sums it across the merged entries.
     """
     entries = []
+    counted: set[str] = set()
     for r in rows:
         extra = json.loads(r["extra"])
         # Already suffix-stripped by _test_name, which is what makes the native json and the
@@ -649,6 +636,15 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             props["model"] = model
         run_props = {k: str(r.get(k, "")) for k in _RUN_PROP_COLUMNS}
         run_props.update({k: str(extra.get(k, "")) for k in _RUN_PROP_EXTRA_KEYS})
+        # One key per metric: the writer merges run_props by update, so a single JSON blob
+        # would keep only the last entry's metric.
+        unit = metric_unit(r["metric"])
+        if unit:
+            run_props[f"unit.{r['metric']}"] = unit
+        iterations = 0
+        if extra.get("iterations") and name not in counted:
+            counted.add(name)
+            iterations = int(extra["iterations"])
         entries.append(
             {
                 "name": name,
@@ -659,7 +655,7 @@ def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "backend": extra.get("device", ""),
                 "props": props,
                 "measurements": {r["metric"]: [float(r["actual"])]},
-                "iterations": 0,
+                "iterations": iterations,
                 "run_props": run_props,
                 "disc": props,
                 "disc_keys": _BENCH_ID_KEYS,
@@ -694,8 +690,7 @@ def _write_v2_benchmarks(client, db: str, rows, run_id_value: str) -> None:
 def insert_to_clickhouse(
     rows: list[dict[str, Any]],
     v2_run_id_value: str = "",
-    rpm_lock: str = "",
-    arch: str = "",
+    leg: Any = None,
 ) -> None:
     """Insert rows into ClickHouse using environment-configured connection."""
     clickhouse_env_vars = {
@@ -757,7 +752,8 @@ def insert_to_clickhouse(
             )
             v2db = ""
     if v2_run_id_value and v2db:
-        _write_artifact_results(client, v2db, rows, v2_run_id_value, rpm_lock, arch)
+        if leg is not None:
+            _write_artifact_results(client, v2db, rows, v2_run_id_value, leg)
         _write_v2_benchmarks(client, v2db, rows, v2_run_id_value)
     elif v2_run_id_value:
         # Cause-agnostic: a drift has already said its piece as an ::error:: above, and this
@@ -837,16 +833,7 @@ def main() -> None:
             print(f"... and {len(rows) - 5} more")
         return
 
-    # The RPM->artifact link belongs to the DERIVED path only. A Jenkins-launched leg passes
-    # --v2-run-id verbatim and the orchestrator has already written an artifact_results row for
-    # that same run_id (pushArtifactResult, result_kind='performance'), so linking again here
-    # would add one row per pinned RPM on top of it. The existing dedup guard does not catch
-    # that: it only skips when a row for the run_id is ALREADY present, so whichever writer
-    # lands first wins and the other duplicates -- order-dependent, and every per-artifact
-    # counter is derived from these rows. Passing an empty lock path reuses the documented
-    # "empty disables the link" contract rather than adding a second flag.
-    _lock = effective_rpm_lock(args)
-    insert_to_clickhouse(rows, resolve_v2_run_id(args), _lock, args.arch)
+    insert_to_clickhouse(rows, resolve_v2_run_id(args), args if links_artifact(args) else None)
 
 
 if __name__ == "__main__":

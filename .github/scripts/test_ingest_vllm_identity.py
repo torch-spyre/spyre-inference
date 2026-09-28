@@ -51,8 +51,8 @@ _NS = "cb0af9bf-2858-5eab-9211-f51190531bf3"
 _GOLDEN_RUN_ID = "dab2a67f-14bf-53be-b6e4-fc9642086e47"
 # torch-spyre|flex-rpm|abc123def456|x86_64
 _GOLDEN_ARTIFACT_ID = "86a5c6e3-bd2f-5d27-9a8f-9b8d23efc65b"
-# flex|ibm-flex|abc123def456|x86_64
-_GOLDEN_FLEX_ID = "937c72dc-85e1-5c35-9093-4a18cac7cda3"
+# spyre-inference|<base>|<installed digest>|x86_64, via gha_artifact_id
+_GOLDEN_LEG_ID = "932cc6a6-c3eb-5be2-8057-a4fe5303ffd3"
 
 
 @pytest.fixture(scope="module")
@@ -104,14 +104,15 @@ def test_run_id_is_blank_on_incomplete_input(mod):
 
 @pytest.mark.parametrize("alias", ["amd64", "x86", "x86-64", "x86_64", "AMD64", " amd64 "])
 def test_arch_aliases_all_fold(mod, alias):
-    assert mod.canonical_arch(alias) == "x86_64"
+    assert mod.run_id_of("gha", "1", alias, "perf") == mod.run_id_of("gha", "1", "x86_64", "perf")
 
 
 @pytest.mark.parametrize(
     ("raw", "expected"), [("S390X", "s390x"), ("ppc64le", "ppc64le"), ("PPC64LE", "ppc64le")]
 )
 def test_non_x86_arch_is_lowercased_not_folded(mod, raw, expected):
-    assert mod.canonical_arch(raw) == expected
+    assert mod.run_id_of("gha", "1", raw, "perf") == mod.run_id_of("gha", "1", expected, "perf")
+    assert mod.run_id_of("gha", "1", raw, "perf") != mod.run_id_of("gha", "1", "x86_64", "perf")
 
 
 def test_arch_spelling_does_not_change_the_run_id(mod):
@@ -161,47 +162,40 @@ def test_content_changes_the_identity(mod):
         assert other != a
 
 
-# ── the lockfile -> artifact_id path ──────────────────────────────────────────
+# ── the leg's artifact: image base id + installed delta ───────────────────────
 
 
-def _lock(tmp_path, *lines):
-    p = tmp_path / "spyre-rpms.lock"
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return str(p)
-
-
-def test_lockfile_yields_the_golden_flex_id(mod, tmp_path):
-    """The whole design in one assertion: a leg that only read its lockfile derives the id
-    the orchestrator wrote, so the perf numbers reach the artifact page."""
-    path = _lock(tmp_path, "ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm")
-    assert mod.rpm_artifact_ids(path, "amd64") == [_GOLDEN_FLEX_ID]
-
-
-def test_devel_subpackage_collapses_onto_the_base_artifact(mod, tmp_path):
-    """-devel/-headers ship from ONE build and share its id12; the builder registers only the
-    base name, so a per-subpackage id would name a row that cannot exist."""
-    path = _lock(
-        tmp_path,
-        "ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm",
-        "ibm-flex-devel-1.2.3-0.next.abc123def456.el10.x86_64.rpm",
-        "ibm-flex-headers-1.2.3-0.next.abc123def456.el10.x86_64.rpm",
+def test_leg_id_matches_the_golden_value(mod):
+    got = mod.gha_artifact_id(
+        "spyre-inference",
+        "6ecddb3f-1809-533f-9552-fafdba8a331d",
+        "spyre-inference@abc123def456 spyre-rpms.lock@0123456789ab",
+        "amd64",
     )
-    assert mod.rpm_artifact_ids(path, "amd64") == [_GOLDEN_FLEX_ID]
+    assert got == _GOLDEN_LEG_ID
 
 
-def test_every_id_is_a_uuid_not_a_delimited_string(mod, tmp_path):
-    """artifact_results.artifact_id is UUID in v2; a `component|name|id12|arch` string would
-    be rejected at insert."""
-    path = _lock(
-        tmp_path,
-        "ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm",
-        "ibm-deeptools-2.0.0-0.next.fedcba987654.el10.x86_64.rpm",
-    )
-    ids = mod.rpm_artifact_ids(path, "amd64")
-    assert len(ids) == 2
-    for got in ids:
-        uuid.UUID(got)  # raises if not a uuid
-        assert "|" not in got
+def test_installed_names_the_commit_the_lock_and_extras(mod, tmp_path):
+    lock = tmp_path / "spyre-rpms.lock"
+    lock.write_text("version = 2\n", encoding="utf-8")
+    got = mod.leg_installed("abc123def4567890", str(lock), "ibm-flex-pr-7, torch-spyre@deadbeef")
+    tokens = got.split()
+    assert tokens[0] == "spyre-inference@abc123def456"
+    assert tokens[1].startswith("spyre-rpms.lock@") and len(tokens[1].split("@")[1]) == 12
+    assert tokens[2:] == ["ibm-flex-pr-7", "torch-spyre@deadbeef"]
+
+
+def test_lock_content_changes_the_leg_id(mod, tmp_path):
+    lock = tmp_path / "spyre-rpms.lock"
+    lock.write_text("a", encoding="utf-8")
+    first = mod.leg_installed("abc", str(lock), "")
+    lock.write_text("b", encoding="utf-8")
+    assert mod.leg_installed("abc", str(lock), "") != first
+
+
+def test_prebaked_leg_has_no_lock_token(mod):
+    # The image's own RPMs ran unchanged, so the lock is not part of what was measured.
+    assert mod.leg_installed("abc", "", "") == "spyre-inference@abc"
 
 
 # ── which flag carries which id ────────────────────────────────────────────────
@@ -258,12 +252,9 @@ def test_no_id_at_all_skips_the_v2_write(mod):
     assert mod.resolve_v2_run_id(_args(mod)) == ""
 
 
-# ── the RPM->artifact link is the DERIVED path's alone ────────────────────────
+# ── the artifact link is the DERIVED path's alone ─────────────────────────────
 #
-# Jenkins passes --v2-run-id verbatim and the orchestrator has already written an
-# artifact_results row for that run_id, so linking again would add one row per pinned RPM on
-# top of it. The dedup guard inside the writer cannot catch that -- it only skips when a row
-# is ALREADY present, so whichever writer lands first wins and the other duplicates.
+# A threaded uuid means the orchestrator already wrote artifact_results for that run_id.
 
 
 def test_workflow_id_comes_from_the_numeric_flag(mod):
@@ -284,48 +275,23 @@ def test_workflow_id_comes_from_the_numeric_flag(mod):
     )
 
 
-def _lock_for(mod, **kw):
-    """Call the REAL gate (effective_rpm_lock), never a local reimplementation of it.
-
-    An earlier version of these tests re-derived the rule inline, so mutating the production
-    logic left them green -- they were testing the test.
-    """
-    return mod.effective_rpm_lock(_args(mod, **kw))
-
-
-def test_jenkins_uuid_in_run_id_does_not_link_rpms(mod):
+def test_jenkins_uuid_in_run_id_does_not_link(mod):
     """The cross-repo caller's shape: Jenkins owns the artifact_results row for this run."""
-    assert (
-        _lock_for(mod, run_id="dab2a67f-14bf-53be-b6e4-fc9642086e47", rpm_lock="spyre-rpms.lock")
-        == ""
-    )
+    assert not mod.links_artifact(_args(mod, run_id="dab2a67f-14bf-53be-b6e4-fc9642086e47"))
 
 
-def test_jenkins_uuid_in_legacy_flag_does_not_link_rpms(mod):
-    assert (
-        _lock_for(mod, v2_run_id="dab2a67f-14bf-53be-b6e4-fc9642086e47", rpm_lock="spyre-rpms.lock")
-        == ""
-    )
+def test_jenkins_uuid_in_legacy_flag_does_not_link(mod):
+    assert not mod.links_artifact(_args(mod, v2_run_id="dab2a67f-14bf-53be-b6e4-fc9642086e47"))
 
 
-def test_gha_path_links_rpms(mod):
-    assert _lock_for(mod, gha_run_id="34958223121", rpm_lock="spyre-rpms.lock") == "spyre-rpms.lock"
+def test_gha_path_links(mod):
+    assert mod.links_artifact(_args(mod, gha_run_id="34958223121"))
 
 
-def test_a_numeric_run_id_still_links_rpms(mod):
+def test_a_numeric_run_id_still_links(mod):
     """The old wiring put GitHub's numeric id in --run-id. That is a GHA leg, which DOES own
     the link -- keying the gate on "any value present" would wrongly skip it."""
-    assert _lock_for(mod, run_id="34958223121", rpm_lock="spyre-rpms.lock") == "spyre-rpms.lock"
-
-
-def test_gha_path_honours_an_explicit_empty_lock(mod):
-    """Empty stays the documented opt-out on the path that does own the link."""
-    assert _lock_for(mod, gha_run_id="34958223121", rpm_lock="") == ""
-
-
-def test_unknown_arch_yields_nothing(mod, tmp_path):
-    path = _lock(tmp_path, "ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm")
-    assert mod.rpm_artifact_ids(path, "") == []
+    assert mod.links_artifact(_args(mod, run_id="34958223121"))
 
 
 def test_identity_comes_from_the_shared_library_not_a_local_copy(mod):
@@ -334,5 +300,5 @@ def test_identity_comes_from_the_shared_library_not_a_local_copy(mod):
     # object identity: editing the library must change what this writer executes.
     import spyre_clickhouse_ingest as lib
 
-    for name in ("canonical_arch", "run_id_of", "artifact_id_for"):
+    for name in ("run_id_of", "artifact_id_for", "base_artifact_id", "gha_artifact_id"):
         assert getattr(mod, name) is getattr(lib, name), name

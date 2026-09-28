@@ -183,6 +183,7 @@ jobs:
           echo "### Benchmarking vLLM [${HEAD_SHA}](https://github.com/vllm-project/vllm/commit/${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run vLLM benchmarks
+        id: bench
         # aiu-setup + the benchmark invocation both live in the Makefile's
         # perf-tests target now -- the single entrypoint, so this doesn't
         # hand-duplicate ibm-aiu-setup.sh sourcing.
@@ -195,14 +196,15 @@ jobs:
             MODELS="${MATRIX_MODELS}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
+      # !cancelled(): a later benchmark failing must not discard the ones that completed.
       - name: Install ClickHouse ingest dependencies
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         run: |
           set -eux
           uv pip install -r .github/scripts/requirements-benchmark.txt
 
       - name: Ingest benchmark results into ClickHouse
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
           # A push to main has no clickhouse_env input, so the selector resolves
           # to prod. A manual dispatch can pick dev with the *_DEV secret set.
@@ -215,6 +217,9 @@ jobs:
           BENCHMARK_BRANCH: ${{ github.ref_name }}
           BENCHMARK_SHA: ${{ github.sha }}
           PR_NUMBER: "0"
+          BENCH_STATE: ${{ steps.bench.outcome == 'success' && 'passed' || 'failed' }}
+          # The baked stack ran unchanged, so the lock is not part of what was measured.
+          RPM_LOCK: ${{ !inputs.use_prebaked_image && 'spyre-rpms.lock' || '' }}
         run: |
           set -eux
 
@@ -222,6 +227,10 @@ jobs:
           echo "PyTorch JSON result files found: ${JSON_COUNT}"
 
           if [[ "${JSON_COUNT}" -eq 0 ]]; then
+            if [[ "${BENCH_STATE}" == "failed" ]]; then
+              echo "No benchmark completed; nothing to ingest."
+              exit 0
+            fi
             echo "No PyTorch benchmark result files found; failing ClickHouse ingest."
             exit 1
           fi
@@ -236,7 +245,9 @@ jobs:
             --pr-number "${PR_NUMBER}" \
             --arch "${BENCHMARK_ARCH:-x86_64}" \
             --test-type perf \
-            --rpm-lock spyre-rpms.lock
+            --rpm-lock "${RPM_LOCK}" \
+            --state "${BENCH_STATE}" \
+            --repository "${{ github.repository }}"
 
       - name: Job Summary
         if: always()

@@ -384,9 +384,11 @@ def test_tied_head_promoted_on_first_logits_call(tp_group, vocab_size):
     assert not hasattr(embed, "padded_weight_t")
 
     weight_before = embed.weight
+    prepared_method = embed._spyre_lm_head_method
     promote_tied_lm_head(embed)
 
     assert isinstance(embed.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert embed.quant_method is prepared_method
     assert embed.weight is weight_before
     torch.testing.assert_close(embed.weight.data, loaded, atol=0.0, rtol=0.0)
 

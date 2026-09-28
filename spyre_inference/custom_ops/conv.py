@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 
 logger = init_logger(__name__)
 
@@ -95,7 +95,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         super().__init__(*args, **kwargs)
         self._w_dev: torch.Tensor | None = None
 
-    @compile_when_outermost
+    @maybe_compile
     def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
         return F.conv2d(
             x,

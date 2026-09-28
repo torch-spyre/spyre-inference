@@ -1130,8 +1130,9 @@ def main():
         choices=["token_major", "head_major"],
         default=None,
         help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
-        "'head_major' stores a page as [KV, block_size, head_size] and selects the "
-        "head-major backend, which has no batched decode kernel.",
+        "'head_major' (default) stores a page as [KV, block_size, head_size] and selects "
+        "the head-major backend, the only one whose batched decode kernel runs under the "
+        "default tiled walk.",
     )
     ap.add_argument(
         "--span",
@@ -1218,12 +1219,18 @@ def main():
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
     # Selects the backend via the platform, and is cached on first envs read like the rest.
-    attn_kv_layout = cfg.setdefault("attn_kv_layout", "token_major")
+    attn_kv_layout = cfg.setdefault("attn_kv_layout", "head_major")
     os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    if attn_kv_layout == "head_major" and next(iter(batched_modes)):
+    from spyre_inference import envs
+
+    if (
+        attn_kv_layout == "token_major"
+        and next(iter(batched_modes))
+        and envs.SPYRE_ATTN_FOR_EACH_TILE
+    ):
         raise SystemExit(
-            "the head-major KV layout has no batched decode kernel; run the batched "
-            "variant on token_major."
+            "token-major batched decode is declined under the tiled walk; run the batched "
+            "variant on head_major, or set SPYRE_ATTN_FOR_EACH_TILE=0."
         )
 
     entries = entries_from_config(cfg)

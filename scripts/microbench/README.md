@@ -35,8 +35,8 @@ uv run --no-sync vllm bench latency \
     --profiler-config.torch_profiler_record_shapes=true
 ```
 
-Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace, and
-`SPYRE_BATCHED_DECODE=1` to make it take the batched decode path.
+Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
+`SPYRE_BATCHED_DECODE=1` is the default, so it already takes the batched decode path.
 
 ### Which scope to measure
 
@@ -126,7 +126,10 @@ is reported as a row with `error` set rather than an assertion mid-sweep.
 The batched decode kernel needs the `batched_decode_compiled` variant, which sets
 `SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
 variant in one run). It also needs `num_decode_seqs >= 4`, a compiled build, and a
-resolvable sequence/blocks bucket pair.
+resolvable sequence/blocks bucket pair. Under the default tiled walk the kernel is
+reached on the head-major layout only, which is `--attn-kv-layout`'s default; pairing
+the batched variant with `token_major` is refused up front rather than measured as a
+silent per-seq fallback.
 
 The batch axis is bucketed like the other two — one bucket per captured batch size,
 so each of `granite33_8b_batched_decode.json`'s 4/8/16/32 captures dispatches to its

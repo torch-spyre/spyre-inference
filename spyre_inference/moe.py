@@ -34,6 +34,8 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
     UnquantizedFusedMoEMethod,
 )
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
@@ -310,6 +312,26 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
     )
 
 
+def _gathered_tokens(
+    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+) -> torch.Tensor:
+    # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
+    # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
+    rows = [
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        for token in range(x.shape[0])
+    ]
+    return torch.cat(rows)
+
+
+def _rows_are_stick_addressable(x: torch.Tensor, router_logits: torch.Tensor, stick: int) -> bool:
+    # Cloning row ``t`` bakes its flat storage offset, ``storage_offset() + t * stride(0)``, into
+    # the kernel coordinate, and the backend can only bake whole sticks: hence both terms.
+    return all(
+        t.storage_offset() % stick == 0 and t.stride(0) % stick == 0 for t in (x, router_logits)
+    )
+
+
 def _topk_probs(router_logits: torch.Tensor, top_k: int) -> torch.Tensor:
     """Materialize canonical vLLM top-k weights in dense expert order."""
     topk_weights, topk_ids = _routing_weights(
@@ -459,9 +481,17 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
         moe_scope, persistent_scope = _compiler_scopes()
+        tokens = x.shape[0]
+        # A single row is handed to the region whole, so no row slice needs an addressable offset.
+        if tokens == 1 or (
+            tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
+            and _rows_are_stick_addressable(x, router_logits, layer.spyre_moe_stick)
+        ):
+            with moe_scope:
+                if tokens == 1:
+                    return _region(layer, "gathered", _gathered)(layer, x, router_logits)
+                return _region(layer, "gathered_batch", _gathered_tokens)(layer, x, router_logits)
         with moe_scope:
-            if x.shape[0] == 1:
-                return _region(layer, "gathered", _gathered)(layer, x, router_logits)
             recipe = layer.spyre_moe_recipe
             if recipe.routing == "full_softmax":
                 probs = _region(layer, "probs", _probs)(router_logits, layer.spyre_moe_route_dtype)

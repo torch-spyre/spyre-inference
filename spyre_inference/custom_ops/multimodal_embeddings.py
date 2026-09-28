@@ -79,7 +79,10 @@ def _spyre_merge_multimodal_embeddings(
 
     scattered = convert(scattered_cpu, device=inputs_embeds.device)
     mask = convert(is_multimodal_cpu, device=inputs_embeds.device).unsqueeze(-1)
-    return torch.where(mask, scattered, inputs_embeds)
+    merged = torch.where(mask, scattered, inputs_embeds)
+    # Upstream's copy into inputs_embeds.gpu is a single row on a one-token step, which
+    # torch-spyre cannot restickify from the merge's own layout (torch-spyre#4883).
+    return convert(convert(merged, device="cpu"), device=inputs_embeds.device, row_major=True)
 
 
 def register() -> None:

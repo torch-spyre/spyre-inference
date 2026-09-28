@@ -20,7 +20,7 @@ the tests only assert that the full pipeline (SigLIP encoder → BLIP-2
 Q-Former projector → Granite decoder) runs and produces non-empty text.
 
 Both `enforce_eager` modes are covered:
-- eager: every `compile_when_outermost` kernel falls through to eager;
+- eager: every `maybe_compile` kernel falls through to eager;
   the three CPU-offload patches (InterpolateDownsampler,
   _pack_and_unpad_image_features, Blip2QFormerMultiHeadAttention) are the
   only non-trivial code paths exercised.

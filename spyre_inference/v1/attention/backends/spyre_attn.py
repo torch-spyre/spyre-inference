@@ -373,6 +373,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self.head_size = kv_cache_spec.head_size
         # No KV cache, so build() skips every block-, page- and tile-shaped field.
         self._encoder_only = isinstance(kv_cache_spec, EncoderOnlyAttentionSpec)
+        # Real requests satisfy query_len == seq_len <= max_model_len; build()
+        # clamps to this when a pooling model's dummy warmup batch does not.
+        self._is_pooling = vllm_config.model_config.runner_type == "pooling"
+        self._max_model_len = vllm_config.model_config.max_model_len
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
@@ -752,6 +756,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         num_seqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc[1 : num_seqs + 1] - query_start_loc[:num_seqs]
+
+        if self._is_pooling:
+            # Real requests satisfy query_len == seq_len <= max_model_len (see
+            # __init__); vLLM's warmup dummy batch does not, which crashes the
+            # block-count bucket lookup below for a decoder-typed layer.
+            seq_lens = seq_lens.clamp(max=self._max_model_len)
+            query_lens = query_lens.clamp(max=self._max_model_len)
+            max_seq_len = min(max_seq_len, self._max_model_len)
 
         aligned_query_lens: list[int] = []
         for query_len in query_lens.tolist():
@@ -1880,7 +1892,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if active_block_indices_all is not None:
                 active_bs = active_block_indices_all[seq_idx]
             elif padded_num_blocks is not None:
-                active_bs = list(range(padded_num_blocks[seq_idx]))
+                # Repeat the last real block rather than counting past it, as the
+                # sliding-window branch does: block_table is only
+                # ceil(max_model_len / block_size) wide, which a floored bucket exceeds.
+                real_bs = (kv_len + block_size - 1) // block_size
+                active_bs = list(range(real_bs)) + [real_bs - 1] * (
+                    padded_num_blocks[seq_idx] - real_bs
+                )
             else:
                 active_bs = list(range((kv_len + block_size - 1) // block_size))
 

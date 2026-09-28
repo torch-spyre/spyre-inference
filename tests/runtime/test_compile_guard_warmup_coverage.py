@@ -22,7 +22,7 @@ to catch: ``SpyreShapeBucketer.find_bucket`` returns ``None``, nothing pads the
 batch, and the block recompiles mid-request.
 
 The stub also carries a real token embedding behind the serving path's wrapper: it sits
-outside the blocks, and ``compile_when_outermost`` compiles it on its own.
+outside the blocks, and ``maybe_compile`` compiles it on its own.
 
 CPU with ``backend="eager"``: the guard keys on the code object Dynamo traces, which
 is decided before any backend runs, so a real Spyre compile would only add minutes.

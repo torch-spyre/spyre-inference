@@ -16,7 +16,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
 from .utils import convert
 from .vocab_parallel_embedding import promote_tied_lm_head
 
@@ -42,7 +42,7 @@ class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
             logits = convert(logits, device="cpu")
         return logits
 
-    @compile_when_outermost
+    @maybe_compile
     def _all_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
         return tensor_model_parallel_all_gather(logits)
 

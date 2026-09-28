@@ -620,12 +620,40 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _warn_if_not_in_registry(cls, vllm_config: VllmConfig) -> None:
+        """Warn when the requested model/tp/max_model_len/platform is not in the registry.
+
+        The registry is not exhaustive — unknown models may still work — so this
+        is a warning, not an error.
+        """
+        from spyre_inference.config import current_platform, lookup_config
+
+        model_id = vllm_config.model_config.model
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        max_model_len = vllm_config.model_config.max_model_len
+        machine = current_platform()
+
+        cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len, machine=machine)
+        if cfg is None:
+            logger.warning(
+                "Model %r with tp_size=%d max_model_len=%d platform=%s is not in the "
+                "Spyre model registry. The run may still succeed, but this "
+                "configuration has not been validated.",
+                model_id,
+                tp_size,
+                max_model_len,
+                machine,
+            )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
+            cls._warn_if_not_in_registry(vllm_config)
+
             # From here, not from `hf_overrides`, so a user-supplied override does not skip
             # it; no-op for every other model. Runs again for the nested text config a
             # multimodal model builds its decoder from.

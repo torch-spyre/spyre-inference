@@ -37,6 +37,8 @@ def make_config(
     block_size=BLOCK_SIZE,
     max_num_seqs=8,
     runner_type="generate",
+    num_kv_heads=8,
+    per_layer_kv_heads=None,
 ):
     config = MagicMock()
     config.cache_config.block_size = block_size
@@ -44,6 +46,23 @@ def make_config(
     config.model_config.runner_type = runner_type
     config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     config.scheduler_config.max_num_seqs = max_num_seqs
+
+    arch = config.model_config.model_arch_config
+    if per_layer_kv_heads is None:
+        arch.per_layer_overrides = None
+        config.model_config.get_num_kv_heads.return_value = num_kv_heads
+    else:
+        # A heterogeneous config, whose model-wide number hides the smallest layer.
+        arch.per_layer_overrides = [{} for _ in per_layer_kv_heads]
+        layers = []
+        for n in per_layer_kv_heads:
+            layer = MagicMock()
+            layer.kv = n
+            layers.append(layer)
+        arch.__getitem__.side_effect = layers.__getitem__
+        config.model_config.get_num_kv_heads.side_effect = (
+            lambda _pc, arch_config=None: num_kv_heads if arch_config is None else arch_config.kv
+        )
     return config
 
 
@@ -121,17 +140,27 @@ class TestPoolingQueryBucketCap:
     """Pooling's query_len can't exceed max_model_len; without this cap, warmup
     could record a query bucket with no matching num_blocks bucket, crashing
     with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
-    max_model_len=77, max_num_batched_tokens much larger)."""
+    max_model_len=77, max_num_batched_tokens much larger).
 
-    def test_pooling_caps_query_buckets_at_max_model_len(self):
+    Stick-aligned the same way the encoder shape ladder pads a request
+    (_align_up_pow2): CLIP's max_model_len=77 pads to 128, not 77."""
+
+    def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
         b = SpyreAttnBucketer(
             make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
         )
-        assert b.query_buckets[-1] == 77
+        assert b.query_buckets[-1] == 128
         # The largest recorded query bucket must round onto a real num_blocks
         # bucket -- this is what crashed for CLIP.
         largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
         assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_pooling_query_bucket_covers_clip_text_tower_padded_length(self):
+        """CLIP's max_model_len=77 pads to query_len=128; that must round onto a bucket."""
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.find_query_bucket(128) == 128
 
     def test_generate_is_unaffected(self):
         b = SpyreAttnBucketer(
@@ -477,3 +506,52 @@ class TestBatchedDecodeVariants:
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
         assert len(b.batched_decode_variants()) < 100
+
+
+class TestSingleKvHeadBlockFloor:
+    """A lone KV head on a lone page will not compile under the head-major layout, so
+    the block ladder floors to two -- see the note at the floor."""
+
+    @pytest.fixture(autouse=True)
+    def _head_major(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
+        envs.clear_env_cache()
+
+    def test_floors_the_ladder_at_one_kv_head(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
+        assert min(b.num_blocks_buckets) == 2
+        assert 1 not in b.num_blocks_buckets
+
+    def test_a_short_context_still_gets_a_two_block_bucket(self):
+        """max_model_len <= block_size otherwise admits only a single-page walk, which
+        is the shape both failing CI configs had."""
+        b = SpyreAttnBucketer(make_config(max_model_len=BLOCK_SIZE, num_kv_heads=1))
+        assert b.num_blocks_buckets == [2]
+
+    def test_a_single_kv_head_layer_floors_a_heterogeneous_model(self):
+        """The gemma-4 shape: the model-wide count is 8, one layer type carries 1."""
+        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 1]))
+        assert min(b.num_blocks_buckets) == 2
+
+    def test_no_floor_when_every_layer_has_several_kv_heads(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 4]))
+        assert min(b.num_blocks_buckets) == 1
+
+    def test_an_empty_override_list_falls_back_to_the_model_wide_count(self):
+        """A config reporting no per-layer overrides is homogeneous, so the model-wide
+        count decides; min() over no layers must not raise."""
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1, per_layer_kv_heads=[]))
+        assert min(b.num_blocks_buckets) == 2
+
+    def test_no_floor_above_one_kv_head(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=2))
+        assert min(b.num_blocks_buckets) == 1
+
+
+class TestSingleKvHeadBlockFloorTokenMajor:
+    def test_token_major_keeps_the_single_block_bucket(self, monkeypatch):
+        """Only the head-major decode kernel has the constraint."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
+        assert min(b.num_blocks_buckets) == 1

@@ -155,12 +155,12 @@ def _compiled_fp8_mm(
     )
     x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
         x,  # ty: ignore[invalid-argument-type]
-        scale_a,
+        scale_a,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,
+        x_fp8,  # ty: ignore[invalid-argument-type]
         weight_qfp8wt,  # ty: ignore[invalid-argument-type]
-        scale_a=scale_a,
+        scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
         bias=bias,  # ty: ignore[invalid-argument-type]
         out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
@@ -180,7 +180,7 @@ def _compiled_fp8_mm_static_scale(
         scale_a,  # ty: ignore[invalid-argument-type]
     )
     return torch.ops.aten._scaled_mm(
-        x_fp8,
+        x_fp8,  # ty: ignore[invalid-argument-type]
         weight_qfp8wt,  # ty: ignore[invalid-argument-type]
         scale_a=scale_a,  # ty: ignore[invalid-argument-type]
         scale_b=weight_scale,  # ty: ignore[invalid-argument-type]

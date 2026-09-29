@@ -69,7 +69,7 @@ def patch_blip2_qformer_attention() -> None:
             self.to(target_device)
         return convert(out, device=target_device)
 
-    _blip2_attn_forward_cpu._spyre_patched = True
+    _blip2_attn_forward_cpu._spyre_patched = True  # type: ignore[attr-defined]
     Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_cpu  # type: ignore[method-assign]
     logger.info(
         "Spyre: patched Blip2QFormerMultiHeadAttention.forward to run on CPU "

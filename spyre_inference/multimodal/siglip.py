@@ -125,7 +125,7 @@ def patch_siglip_vision_embeddings(model: torch.nn.Module, device: torch.device)
             pos_emb = self.position_embedding(self.position_ids)
         return convert(embeddings_cpu + pos_emb, device=device)
 
-    _siglip_embeddings_forward._spyre_patched = True
+    _siglip_embeddings_forward._spyre_patched = True  # type: ignore[attr-defined]
     SiglipVisionEmbeddings.forward = _siglip_embeddings_forward  # type: ignore[method-assign]
 
     # Pin weights and buffers to CPU on every existing instance so the forward
@@ -243,7 +243,7 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
         attn_output, _ = self.out_proj(attn_out)
         return attn_output, None
 
-    _siglip_attention_forward._spyre_patched = True
+    _siglip_attention_forward._spyre_patched = True  # type: ignore[attr-defined]
     SiglipAttention.forward = _siglip_attention_forward  # type: ignore[method-assign]
     logger.info(
         "Spyre: padded SiglipAttention head_dim %d -> %d and replaced forward "

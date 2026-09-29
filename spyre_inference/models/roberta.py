@@ -110,7 +110,12 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
 
 
 def offset_host_positions(positions: torch.Tensor, delta: int) -> torch.Tensor:
-    """Add ``delta`` to every position on the host, as one new int64 tensor."""
+    """Add ``delta`` to every position on the host, as one new int64 tensor.
+
+    Python rather than ``aten::add``. This runs on the per-step preprocess path,
+    and every extra CPU aten op there lengthens the eager guard chain (#981).
+    The rectangular path adds the same offset inside ``expand_packed_to_encoder_grid``.
+    """
     if delta == 0:
         return positions
     values = positions.detach().cpu().tolist()

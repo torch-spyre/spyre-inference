@@ -59,6 +59,20 @@ class CompileOutermost:
         self.spyre_compiled_kernel: Callable | None = None
 
 
+def arm_outer_compile(module: object) -> None:
+    """Give a class-swapped module the flags ``maybe_compile`` reads.
+
+    ``SpyreTokenTypeModel`` retypes an already-built embedding, so
+    ``CompileOutermost.__init__`` never ran for that instance. This is called
+    from the model constructor, while the vLLM config context is still live.
+    """
+    if hasattr(module, "spyre_compile_enabled"):
+        return
+    mode = get_cached_compilation_config().mode
+    setattr(module, "spyre_compile_enabled", mode is not CompilationMode.NONE)
+    setattr(module, "spyre_compiled_kernel", None)
+
+
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
     """Compile ``method`` on its first call that no other graph is already tracing.
 

@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from spyre_inference.custom_ops.lazy_compile import arm_outer_compile
+
 if TYPE_CHECKING:
     from torch import nn
     from vllm.sequence import IntermediateTensors
@@ -80,14 +82,23 @@ class SpyreTokenTypeEmbedding:
             n = token_type_ids.shape[0]
             buffer[:n].copy_(token_type_ids[:n])
 
-    def spyre_token_type_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def spyre_token_type_ids_for(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Segment ids matching ``input_ids``, or zeros for a single-segment model.
+
+        Read outside any compiled embedding forward. The buffer is a plain
+        attribute, not a registered parameter, so tracing the read would guard
+        on the first step's tensor.
+        """
         token_type_ids = self.spyre_token_type_ids
         if token_type_ids is None or token_type_ids.shape != input_ids.shape:
             # No buffer: single-segment model, every token is segment 0. A
             # mismatched one is unreachable via set_spyre_token_type_ids, and
             # all-zeros beats failing to lower the add.
-            token_type_ids = torch.zeros_like(input_ids)
-        return self.token_type_embeddings(token_type_ids)
+            return torch.zeros_like(input_ids)
+        return token_type_ids
+
+    def spyre_token_type_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.token_type_embeddings(self.spyre_token_type_ids_for(input_ids))
 
 
 class SpyreTokenTypeModel:
@@ -114,6 +125,10 @@ class SpyreTokenTypeModel:
                 "needs updating for this vLLM version."
             )
         embeddings.__class__ = self.spyre_embedding_class
+        # The swap does not rerun ``__init__``, and the compiled embedding
+        # forward reads these flags. Sampling the mode here is still inside
+        # model construction.
+        arm_outer_compile(embeddings)
 
     def spyre_embeddings(self) -> SpyreTokenTypeEmbedding:
         return getattr(self, self.spyre_encoder_attr).embeddings

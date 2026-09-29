@@ -15,8 +15,10 @@
 """Spyre adaptations for vLLM RoBERTa / XLM-R pooling models.
 
 RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
-``spyre_inference.models.bert``; the embedding differs only in RoBERTa's
-position offset, which runs on CPU (SDSC cannot schedule integer add).
+``spyre_inference.models.bert``. The position offset (``padding_idx + 1``) is
+applied on the host in ``TorchSpyreModelRunner._preprocess``, before the ids
+are copied up: SDSC cannot schedule that integer add, and doing it inside the
+embedding forward splits the prologue into six launches.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from vllm.model_executor.models.roberta import (
     RobertaForTokenClassification,
 )
 
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
@@ -51,7 +54,7 @@ logger = init_logger(__name__)
 def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     """Lower ``max_model_len`` to what the offset position embedding can index.
 
-    ``offset_roberta_position_ids`` gathers ``position_ids + pad_token_id + 1``, so the
+    The runner gathers ``position_ids + pad_token_id + 1``, so the
     usable context is ``max_position_embeddings - pad_token_id - 1`` -- 512 for the
     514-row table, not the 514 vLLM derives.
 
@@ -90,6 +93,33 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     model_config.max_model_len = usable
 
 
+def roberta_position_delta(hf_config: Any) -> int:
+    """``padding_idx + 1`` for absolute-position RoBERTa, else ``0``.
+
+    The embedding table is indexed by ``position_ids + padding_idx + 1``. SDSC
+    cannot schedule that integer add, so the runner applies it on the host.
+    """
+    if hf_config is None:
+        return 0
+    architectures = getattr(hf_config, "architectures", None) or []
+    if not any("Roberta" in arch for arch in architectures):
+        return 0
+    if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
+        return 0
+    pad_token_id = getattr(hf_config, "pad_token_id", None)
+    if not isinstance(pad_token_id, int):
+        return 0
+    return pad_token_id + 1
+
+
+def offset_host_positions(positions: torch.Tensor, delta: int) -> torch.Tensor:
+    """Add ``delta`` to every position on the host, as one new int64 tensor."""
+    if delta == 0:
+        return positions
+    values = positions.detach().cpu().tolist()
+    return torch.tensor([int(value) + delta for value in values], dtype=torch.int64)
+
+
 @torch.library.custom_op("spyre_inference::roberta_offset_positions", mutates_args=())
 def offset_roberta_position_ids(position_ids: torch.Tensor, padding_idx: int) -> torch.Tensor:
     """``position_ids + padding_idx + 1`` on CPU, then H2D as int64.
@@ -98,11 +128,11 @@ def offset_roberta_position_ids(position_ids: torch.Tensor, padding_idx: int) ->
     ``0_add``), and int64 add CPU-falls-back through ``to_dtype``. Keep the
     offset off the device so position embedding is only a gather.
 
-    A custom op, not a plain function, so the host round trip is one opaque node.
-    Inlined, the intermediate is a CPU tensor *inside* the graph, and Inductor lowers
-    its dtype conversion to ``spyre::to_dtype_cpu``, which has no CPU registration --
-    whole-model compile then dies in warmup. ``convert`` is opaque for the same reason;
-    it is the arithmetic between two converts that has to be hidden too.
+    A custom op, not a plain function, so a caller that still holds device ids
+    hides the host round trip behind one node. Inlined, the intermediate is a
+    CPU tensor *inside* the graph, and Inductor lowers its dtype conversion to
+    ``spyre::to_dtype_cpu``, which has no CPU registration. The embedding
+    forward does not call this: the runner adds the offset before the H2D.
     """
     device = position_ids.device
     pos = convert(position_ids, device="cpu")
@@ -115,8 +145,12 @@ def _offset_roberta_position_ids_fake(position_ids: torch.Tensor, padding_idx: i
     return torch.empty_like(position_ids, dtype=torch.int64)
 
 
-class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
-    """``RobertaEmbedding`` reading segment ids from the side buffer."""
+class SpyreRobertaEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, RobertaEmbedding):
+    """``RobertaEmbedding`` reading segment ids from the side buffer.
+
+    ``position_ids`` already include ``padding_idx + 1``. One compiled forward
+    so the three gathers, the two adds, and the layer norm are one program.
+    """
 
     padding_idx: int
 
@@ -126,12 +160,30 @@ class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Resolved outside the compiled region: the side buffer is not a
+        # registered parameter, so reading it inside the graph would guard on
+        # the first step's tensor. ``position_ids`` already include the offset.
+        return self._compiled_forward(
+            input_ids,
+            position_ids,
+            self.spyre_token_type_ids_for(input_ids),
+            inputs_embeds,
+        )
+
+    @maybe_compile
+    def _compiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         embeddings = (
             inputs_embeds
-            + self.spyre_token_type_embeddings(input_ids)
-            + self.position_embeddings(offset_roberta_position_ids(position_ids, self.padding_idx))
+            + self.token_type_embeddings(token_type_ids)
+            + self.position_embeddings(position_ids)
         )
         return self.LayerNorm(embeddings)
 

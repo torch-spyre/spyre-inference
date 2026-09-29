@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    encoder_cls_rows,
     encoder_dense_row_indices,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
@@ -77,6 +78,25 @@ def test_real_pad_continues_positions_and_batch_pad_restarts():
     # Every position stays inside the declared length, which is what keeps an
     # offset position table in bounds.
     assert int(grid_pos.max()) == extent - 1
+
+
+def test_roberta_offset_is_added_on_the_host_grid():
+    """``padding_idx + 1`` lands on real rows, real pad, and batch pad together."""
+    extent, width = 64, 2
+    query_lens = [3]
+    ids = torch.tensor([10, 11, 12], dtype=torch.int64)
+    positions = torch.tensor([0, 1, 2], dtype=torch.int64)
+    _, grid_pos = expand_packed_to_encoder_grid(
+        ids, positions, query_lens, width, extent, position_offset=2
+    )
+    assert grid_pos[:5].tolist() == [2, 3, 4, 5, 6]
+    assert grid_pos[extent : extent + 3].tolist() == [2, 3, 4]
+    assert int(grid_pos.max()) == extent - 1 + 2
+
+
+def test_cls_row_is_the_start_of_each_rectangle_lane():
+    assert encoder_cls_rows(3, 64) == [0, 64, 128]
+    assert encoder_cls_rows(0, 64) == []
 
 
 def test_positions_never_exceed_the_declared_length():

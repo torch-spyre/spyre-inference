@@ -31,11 +31,11 @@ whose embeddings differ only in position handling.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from spyre_inference.custom_ops.lazy_compile import arm_outer_compile
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost
 
 if TYPE_CHECKING:
     from torch import nn
@@ -122,10 +122,8 @@ class SpyreTokenTypeModel:
                 "needs updating for this vLLM version."
             )
         embeddings.__class__ = self.spyre_embedding_class
-        # The swap does not rerun ``__init__``, and the compiled embedding
-        # forward reads these flags. Sampling the mode here is still inside
-        # model construction.
-        arm_outer_compile(embeddings)
+        # The swap does not rerun ``__init__``. This is that constructor hook.
+        CompileOutermost.arm_outer_compile(cast(CompileOutermost, embeddings))
 
     def spyre_embeddings(self) -> SpyreTokenTypeEmbedding:
         return getattr(self, self.spyre_encoder_attr).embeddings

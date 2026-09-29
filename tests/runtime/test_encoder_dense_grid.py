@@ -18,9 +18,22 @@ gathers them back for the pooler. They share one row-index table, so a round tri
 the thing worth testing.
 """
 
+import numpy as np
 import pytest
 import torch
+import torch.nn as nn
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
+from vllm.pooling_params import PoolingParams
+from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
+from spyre_inference.models.bert import SpyreBertEmbedding
+from spyre_inference.models.roberta import SpyreRobertaEmbedding
+from spyre_inference.v1.pool.spyre_pooler import (
+    SpyreCLSPool,
+    SpyreLastPool,
+    set_cls_grid_rows,
+)
+from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
     encoder_dense_row_indices,
@@ -166,3 +179,130 @@ def test_token_types_are_not_left_packed():
     assert grid[:4].tolist() == [0, 0, 0, 0]
     assert grid[4:extent].sum() == 0, "sequence 0's pad rows must not carry segment 1"
     assert grid[extent : extent + 3].tolist() == [1, 1, 1]
+
+
+def _bare_embedding(cls, *, vocab: int, positions: int, types: int, hidden: int):
+    """The embedding arithmetic, without VocabParallelEmbedding or a compile context.
+
+    ``_compiled_forward`` only needs the three tables, the layer norm, and the
+    compile flag. Leaving compile off runs that body eagerly on CPU.
+    """
+    emb = cls.__new__(cls)
+    nn.Module.__init__(emb)
+    emb.word_embeddings = nn.Embedding(vocab, hidden)
+    emb.position_embeddings = nn.Embedding(positions, hidden)
+    emb.token_type_embeddings = nn.Embedding(types, hidden)
+    emb.LayerNorm = nn.LayerNorm(hidden, eps=1e-5)
+    emb.spyre_token_type_ids = None
+    emb.spyre_compile_enabled = False
+    emb.spyre_compiled_kernel = None
+    return emb
+
+
+def _unfused_embedding(emb, input_ids, position_ids, token_type_ids, inputs_embeds=None):
+    """The embedding body from before the single compiled forward."""
+    if inputs_embeds is None:
+        inputs_embeds = emb.word_embeddings(input_ids)
+    return emb.LayerNorm(
+        inputs_embeds
+        + emb.token_type_embeddings(token_type_ids)
+        + emb.position_embeddings(position_ids)
+    )
+
+
+def test_fused_bert_embedding_matches_the_unfused_body():
+    torch.manual_seed(0)
+    emb = _bare_embedding(SpyreBertEmbedding, vocab=8, positions=6, types=2, hidden=4)
+    input_ids = torch.tensor([1, 3, 0, 2])
+    position_ids = torch.arange(4)
+    token_types = torch.tensor([0, 1, 0, 1])
+    emb.spyre_token_type_ids = token_types
+    embeds = torch.randn(4, 4)
+
+    fused = emb.forward(input_ids, position_ids)
+    unfused = _unfused_embedding(emb, input_ids, position_ids, token_types)
+    torch.testing.assert_close(fused, unfused)
+
+    fused_embeds = emb.forward(input_ids, position_ids, embeds)
+    unfused_embeds = _unfused_embedding(
+        emb, input_ids, position_ids, token_types, inputs_embeds=embeds
+    )
+    torch.testing.assert_close(fused_embeds, unfused_embeds)
+
+
+def test_fused_roberta_embedding_matches_the_offset_then_gather():
+    """The offset stays outside the compiled body. Passing already-offset ids
+    matches the old forward, which added ``padding_idx + 1`` itself."""
+    torch.manual_seed(1)
+    padding_idx = 1
+    delta = padding_idx + 1
+    emb = _bare_embedding(SpyreRobertaEmbedding, vocab=8, positions=8, types=2, hidden=4)
+    emb.padding_idx = padding_idx
+    input_ids = torch.tensor([2, 4, 1, 0])
+    raw_positions = torch.arange(4)
+    token_types = torch.zeros(4, dtype=torch.int64)
+    emb.spyre_token_type_ids = token_types
+
+    fused = emb.forward(input_ids, raw_positions + delta)
+    unfused = _unfused_embedding(emb, input_ids, raw_positions + delta, token_types)
+    torch.testing.assert_close(fused, unfused)
+    # The compiled body does not add the offset a second time.
+    doubled = _unfused_embedding(emb, input_ids, raw_positions + 2 * delta, token_types)
+    assert not torch.equal(fused, doubled)
+
+
+def _pooling_metadata(lengths: list[int]) -> PoolingMetadata:
+    prompt = torch.tensor(lengths, dtype=torch.int64)
+    metadata = PoolingMetadata(
+        prompt_lens=prompt,
+        prompt_token_ids=None,
+        prompt_token_ids_cpu=None,
+        pooling_params=[PoolingParams(task="embed") for _ in lengths],
+        pooling_states=[PoolingStates() for _ in lengths],
+    )
+    metadata.build_pooling_cursor(
+        np.array(lengths, dtype=np.int32),
+        seq_lens_cpu=prompt.clone(),
+        device=torch.device("cpu"),
+    )
+    return metadata
+
+
+def _runner(pooler, grid):
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner._encoder_grid = grid
+    runner.model = type("_Model", (), {})()
+    runner.model.pooler = pooler
+    return runner
+
+
+def test_rectangular_cls_matches_unpad_then_gather():
+    """Grid CLS rows name the same vectors the packed cursor names after unpad."""
+    extent, width = 8, 3
+    query_lens = [3, 1, 2]
+    hidden = (
+        torch.arange(width * extent, dtype=torch.float32).unsqueeze(1).expand(-1, 4).contiguous()
+    )
+    metadata = _pooling_metadata(query_lens)
+    pooler = SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity())
+    runner = _runner(pooler, (extent, width, query_lens))
+
+    assert runner._rectangular_cls(metadata)
+    assert not _runner(
+        SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()),
+        (extent, width, query_lens),
+    )._rectangular_cls(metadata)
+
+    packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
+    cls = SpyreCLSPool()
+    try:
+        set_cls_grid_rows(None)
+        from_unpad = cls(packed, metadata)
+        set_cls_grid_rows(torch.tensor(encoder_cls_rows(len(query_lens), extent), dtype=torch.int64))
+        from_grid = cls(hidden, metadata)
+    finally:
+        set_cls_grid_rows(None)
+
+    torch.testing.assert_close(from_grid, from_unpad)
+    # Sequence starts: rows 0, 8 and 16 of the grid.
+    assert from_grid[:, 0].tolist() == [0, 8, 16]

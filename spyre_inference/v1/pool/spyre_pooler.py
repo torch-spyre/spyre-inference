@@ -46,17 +46,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
 
-# CLS rows in the rectangular grid for the step currently inside ``_pool``.
-# ``None`` on the packed path, where ``SpyreCLSPool`` uses the cursor. Cleared
-# before ``_pool`` returns so a later LAST/MEAN step cannot observe it.
-_cls_grid_rows: torch.Tensor | None = None
-
-
-def set_cls_grid_rows(rows: torch.Tensor | None) -> None:
-    """Publish this step's CLS rows, or ``None`` to use the packed cursor."""
-    global _cls_grid_rows
-    _cls_grid_rows = rows
-
 
 def _cpu_cast_if_needed(pooled_data, head_dtype):
     """Host cast when a Spyre tensor's dtype differs. Same-dtype is a no-op.
@@ -172,17 +161,17 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
 class SpyreCLSPool(CLSPool):
     """CLS via ``index_select`` (keeps upstream ``isinstance`` checks).
 
-    On the rectangular path the runner publishes ``_cls_grid_rows`` (sequence
-    ``i`` at row ``i * extent``) and skips the unpad gather. Packed steps leave
-    the slot empty and this reads the cursor, as before.
+    On a rectangle the runner sets ``pooling_metadata.spyre_cls_rows``
+    (sequence ``i`` at row ``i * extent``) and skips the unpad gather.
+    Packed steps leave it unset and this reads the cursor.
     """
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        base = _cls_grid_rows
-        if base is None:
+        base = getattr(pooling_metadata, "spyre_cls_rows", None)
+        if not isinstance(base, torch.Tensor):
             base = cursor_row_indices_cpu(cursor, last=False)
         idx, n_rows = pad_row_count_to_bucket(base)
         pooled = select_rows(hidden_states, idx)

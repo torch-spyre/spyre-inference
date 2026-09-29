@@ -28,11 +28,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference.models.bert import SpyreBertEmbedding
 from spyre_inference.models.roberta import SpyreRobertaEmbedding
-from spyre_inference.v1.pool.spyre_pooler import (
-    SpyreCLSPool,
-    SpyreLastPool,
-    set_cls_grid_rows,
-)
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
@@ -295,15 +291,11 @@ def test_rectangular_cls_matches_unpad_then_gather():
 
     packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
     cls = SpyreCLSPool()
-    try:
-        set_cls_grid_rows(None)
-        from_unpad = cls(packed, metadata)
-        set_cls_grid_rows(
-            torch.tensor(encoder_cls_rows(len(query_lens), extent), dtype=torch.int64)
-        )
-        from_grid = cls(hidden, metadata)
-    finally:
-        set_cls_grid_rows(None)
+    from_unpad = cls(packed, metadata)
+    metadata.spyre_cls_rows = torch.tensor(
+        encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
+    )
+    from_grid = cls(hidden, metadata)
 
     torch.testing.assert_close(from_grid, from_unpad)
     # Sequence starts: rows 0, 8 and 16 of the grid.

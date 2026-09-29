@@ -102,11 +102,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
-from spyre_inference.v1.pool.spyre_pooler import (
-    SpyreCLSPool,
-    SpyreDispatchPooler,
-    set_cls_grid_rows,
-)
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreDispatchPooler
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -1657,23 +1653,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):
             extent, _width, query_lens = grid
-            set_cls_grid_rows(
-                torch.tensor(encoder_cls_rows(len(query_lens), extent), dtype=torch.int64)
+            # SpyreCLSPool.forward reads these rows off this step's metadata.
+            cast(Any, pooling_metadata).spyre_cls_rows = torch.tensor(
+                encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
             )
         else:
-            set_cls_grid_rows(None)
             # Not a crop: the row count stays the buffer's. On the rectangular path
             # this re-compacts the grid to the packed order the cursor addresses; on
             # the ragged path it is a no-op.
             hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
 
         model = cast(VllmModelForPooling, self.model)
-        try:
-            raw_pooler_output: PoolerOutput = model.pooler(
-                hidden_states=hidden_states, pooling_metadata=pooling_metadata
-            )
-        finally:
-            set_cls_grid_rows(None)
+        raw_pooler_output: PoolerOutput = model.pooler(
+            hidden_states=hidden_states, pooling_metadata=pooling_metadata
+        )
 
         finished_mask = [
             seq_len == prompt_len

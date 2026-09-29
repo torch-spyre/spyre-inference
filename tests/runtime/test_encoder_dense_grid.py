@@ -298,7 +298,9 @@ def test_rectangular_cls_matches_unpad_then_gather():
     try:
         set_cls_grid_rows(None)
         from_unpad = cls(packed, metadata)
-        set_cls_grid_rows(torch.tensor(encoder_cls_rows(len(query_lens), extent), dtype=torch.int64))
+        set_cls_grid_rows(
+            torch.tensor(encoder_cls_rows(len(query_lens), extent), dtype=torch.int64)
+        )
         from_grid = cls(hidden, metadata)
     finally:
         set_cls_grid_rows(None)

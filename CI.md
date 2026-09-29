@@ -13,7 +13,7 @@ Located in `.github/workflows/`
 
 - A weekday cron [pr_reminder_slack.yaml](.github/workflows/pr_reminder_slack.yaml) posts the stalest open PRs to Slack to keep reviews moving. Setup, configuration variables and the failure-escalation behaviour are documented in [scripts/pr_reminder/README.md](scripts/pr_reminder/README.md)
 
-- Changes to `pyproject.toml`, `uv.lock`, or `spyre-rpms.lock` require explicit confirmation from the PR author or a repository maintainer with `maintain` or `admin` permission. [environment-file-confirmation.yml](.github/workflows/environment-file-confirmation.yml) posts one commit-specific prompt and reports the `Environment file confirmation` check. Configure that check as required in the `main` branch ruleset so an unconfirmed change cannot merge.
+- Changes to `pyproject.toml`, `uv.lock`, or `spyre-rpms.lock` ask for confirmation from the PR author or a repository maintainer with `maintain` or `admin` permission. [environment-file-confirmation.yml](.github/workflows/environment-file-confirmation.yml) posts one commit-specific prompt and reports the `Environment file confirmation` check, which passes only when every open PR sharing that head commit is confirmed. The check blocks merging only once it is added as a required GitHub Actions check to the `main` branch ruleset; until then it is advisory.
 
 > NOTE: Unfortunately GitHub does not allow secrets in workflow runs triggered on pull requests from forks.
 >

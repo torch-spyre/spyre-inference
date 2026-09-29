@@ -1441,7 +1441,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         input_ids, inputs_embeds, positions, *rest = out
         extent, width, query_lens = grid
         num_tokens = sum(query_lens)
-        position_offset = self._roberta_position_delta()
+        hf_config = getattr(self.model_config, "hf_config", None)
+        position_offset = roberta_position_delta(hf_config)
 
         if input_ids is not None:
             ids, pos = expand_packed_to_encoder_grid(
@@ -1508,10 +1509,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             *regrouped,
         )
 
-    def _roberta_position_delta(self) -> int:
-        """RoBERTa's ``padding_idx + 1``, or 0 for every other embedding."""
-        return roberta_position_delta(getattr(self.model_config, "hf_config", None))
-
     def _offset_preprocess_positions(self, out: Any) -> Any:
         """Add the RoBERTa offset on the packed path, before the wrapper's H2D.
 
@@ -1519,7 +1516,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Here the body stays packed, so the position tensor upstream returned is
         rewritten in place in the tuple.
         """
-        delta = self._roberta_position_delta()
+        hf_config = getattr(self.model_config, "hf_config", None)
+        delta = roberta_position_delta(hf_config)
         if delta == 0 or not isinstance(out, tuple) or len(out) < 3:
             return out
         positions = out[2]

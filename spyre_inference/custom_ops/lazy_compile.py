@@ -69,8 +69,8 @@ def arm_outer_compile(module: object) -> None:
     if hasattr(module, "spyre_compile_enabled"):
         return
     mode = get_cached_compilation_config().mode
-    setattr(module, "spyre_compile_enabled", mode is not CompilationMode.NONE)
-    setattr(module, "spyre_compiled_kernel", None)
+    module.spyre_compile_enabled = mode is not CompilationMode.NONE
+    module.spyre_compiled_kernel = None
 
 
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:

@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 import torch
 from vllm.config import CompilationMode, get_cached_compilation_config
@@ -69,8 +69,11 @@ def arm_outer_compile(module: object) -> None:
     if hasattr(module, "spyre_compile_enabled"):
         return
     mode = get_cached_compilation_config().mode
-    module.spyre_compile_enabled = mode is not CompilationMode.NONE
-    module.spyre_compiled_kernel = None
+    # ``object`` has no such fields. A cast keeps the assignment off ``setattr``,
+    # which ruff rejects, and off the protocol ``hasattr`` narrows ``module`` to.
+    compiled = cast(Any, module)
+    compiled.spyre_compile_enabled = mode is not CompilationMode.NONE
+    compiled.spyre_compiled_kernel = None
 
 
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:

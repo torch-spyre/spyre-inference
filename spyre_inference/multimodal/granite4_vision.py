@@ -57,7 +57,7 @@ def patch_interpolate_downsampler() -> None:
         out_cpu = small.permute(0, 2, 3, 1).flatten(1, 2)
         return convert(out_cpu, device=dev)
 
-    _interpolate_downsampler_call._spyre_patched = True  # type: ignore[attr-defined]
+    _interpolate_downsampler_call._spyre_patched = True
     InterpolateDownsampler.__call__ = _interpolate_downsampler_call  # type: ignore[method-assign]
     logger.info(
         "Spyre: patched InterpolateDownsampler to run on CPU"
@@ -96,7 +96,7 @@ def patch_pack_and_unpad_image_features() -> None:
             result_cpu = [convert(f, device=dev) for f in result_cpu]
         return result_cpu
 
-    _pack_and_unpad_cpu._spyre_patched = True  # type: ignore[attr-defined]
+    _pack_and_unpad_cpu._spyre_patched = True
     Granite4VisionForConditionalGeneration._pack_and_unpad_image_features = _pack_and_unpad_cpu  # type: ignore[method-assign]
     logger.info(
         "Spyre: patched Granite4VisionForConditionalGeneration._pack_and_unpad_image_features "
@@ -205,7 +205,7 @@ def patch_embed_input_ids() -> None:
         self._ds_num_tokens = N
         return inputs_embeds
 
-    _embed_input_ids_spyre._spyre_patched = True  # type: ignore[attr-defined]
+    _embed_input_ids_spyre._spyre_patched = True
     Granite4VisionForConditionalGeneration.embed_input_ids = _embed_input_ids_spyre  # type: ignore[method-assign]
     logger.info(
         "Spyre: patched Granite4VisionForConditionalGeneration.embed_input_ids"

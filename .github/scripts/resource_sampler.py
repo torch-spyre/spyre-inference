@@ -14,7 +14,7 @@
 
 """Host resource sampler: samples cgroup CPU% and memory during benchmark runs.
 
-Writes one *.host_resources.pytorch.json (JSONEachRow) per test, picked up by
+Writes one *.host_resources.json (JSONEachRow) per test, picked up by
 ingest_vllm_benchmarks.py without changes.
 """
 
@@ -166,24 +166,26 @@ def write_resource_metrics(
     summary: dict[str, Any],
     model: str = "",
 ) -> None:
-    """Write summary as JSONEachRow into <test_name>.host_resources.pytorch.json."""
+    """Write summary as JSONEachRow into <test_name>.host_resources.json.
+
+    Each line: {"test_name": "...", "metric": "host_cpu_pct_total_mean", "value": 42.1}
+    Suffix is distinct from .pytorch.json so ingest uses a dedicated extractor.
+    test_name is top-level so identity is never derived from the filename.
+    """
     if not summary:
         return
 
-    out = results_dir / f"{test_name}.host_resources.pytorch.json"
-    benchmark_meta: dict[str, Any] = {"test_name": test_name}
-    if model:
-        benchmark_meta["model"] = model
+    out = results_dir / f"{test_name}.host_resources.json"
     with open(out, "w") as f:
         for metric_name, stats in summary.items():
             for stat_key, value in stats.items():
-                record = {
-                    "benchmark": benchmark_meta,
-                    "metric": {
-                        "name": f"{metric_name}_{stat_key}",
-                        "benchmark_values": [round(value, 3)],
-                    },
+                record: dict[str, Any] = {
+                    "test_name": test_name,
+                    "metric": f"{metric_name}_{stat_key}",
+                    "value": round(value, 3),
                 }
+                if model:
+                    record["model"] = model
                 f.write(json.dumps(record) + "\n")
 
     log.info("Wrote host resource metrics to %s", out.name)

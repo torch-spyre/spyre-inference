@@ -229,11 +229,16 @@ _UNITS = {
 
 
 def metric_unit(metric: str) -> str:
-    """vLLM's own unit for a metric; its names encode ms but not seconds (latency, p99_latency)."""
+    """vLLM's own unit for a metric; its names encode ms but not seconds (latency, p99_latency).
+    Host-resource metrics: *_pct_* are %, *_mb_* are MB."""
     if metric.endswith("_ms"):
         return "ms"
     if metric.endswith("latency"):
         return "s"
+    if "_pct_" in metric:
+        return "%"
+    if "_mb_" in metric or metric.endswith("_mb"):
+        return "MB"
     return _UNITS.get(metric, "")
 
 
@@ -249,6 +254,19 @@ def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
     metric = record["metric"]
     metric_name = metric.get("name", "unknown")
     return [(metric_name, float(v)) for v in metric.get("benchmark_values", [])]
+
+
+def extract_host_resource_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
+    """Return (metric_name, value) pairs from one *.host_resources.json record.
+
+    Expected shape: {"test_name": "...", "metric": "host_cpu_pct_total_mean", "value": 42.1}
+    """
+    if "metric" not in record or "value" not in record:
+        return []
+    try:
+        return [(record["metric"], float(record["value"]))]
+    except (TypeError, ValueError):
+        return []
 
 
 def _test_name(filename: str) -> str:
@@ -293,28 +311,33 @@ def extract_rows(
     is set it ALSO writes `{test_name}.pytorch.json`, which re-reports a subset of
     the same numbers. The PyTorch file is the source for every metric it carries
     (its names are what the HUD reads); the native file adds only the metrics the
-    PyTorch file lacks, so no measurement is stored twice.
+    PyTorch file lacks, so no measurement is stored twice. The host resource sampler
+    writes `{test_name}.host_resources.json`.
     """
     rows = []
     ts = int(time.time() * 1000)
 
     all_json = set(glob.glob(f"{results_dir}/*.json"))
     pytorch_files = set(glob.glob(f"{results_dir}/*.pytorch.json"))
-    native_files = sorted(all_json - pytorch_files)
+    host_resource_files = set(glob.glob(f"{results_dir}/*.host_resources.json"))
+    native_files = sorted(all_json - pytorch_files - host_resource_files)
     log.info(
-        "Found %d vLLM-native and %d PyTorch-format benchmark JSON files in %s",
+        "Found %d vLLM-native, %d PyTorch-format, and %d host-resource JSON files in %s",
         len(native_files),
         len(pytorch_files),
+        len(host_resource_files),
         results_dir,
     )
 
-    def _emit(filename: str, model: str, metric_name: str, value: float, n: int = 0) -> None:
+    def _emit(
+        filename: str, model: str, metric_name: str, value: float, n: int = 0, test_name: str = ""
+    ) -> None:
         info = {
             "device": "spyre",
             "arch": arch,
             "hardware_type": "IBM_Spyre",
             "model": model,
-            "test_name": _test_name(filename),
+            "test_name": test_name or _test_name(filename),
             "head_sha": sha,
             "pr_number": pr_number,
             "value": value,
@@ -351,6 +374,7 @@ def extract_rows(
     for file, extractor in [
         *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
         *[(f, extract_vllm_metrics) for f in native_files],
+        *[(f, extract_host_resource_metrics) for f in sorted(host_resource_files)],
     ]:
         filename = os.path.basename(file)
         test_name = _test_name(filename)
@@ -367,27 +391,43 @@ def extract_rows(
 
         before_rows = len(rows)
 
+        is_pytorch = filename.endswith(".pytorch.json")
+        is_host_resource = filename.endswith(".host_resources.json")
+
         for record in records:
             if not isinstance(record, dict):
                 continue
-            model = _model_from_record(record, filename)
+            # host_resources records embed test_name; use it directly to avoid
+            # filename-derived corruption (dots in the stem confuse _test_name).
+            effective_test_name = record.get("test_name") if is_host_resource else test_name
+            effective_test_name = effective_test_name or test_name
+            # host_resources records carry 'model' directly; fall back to the
+            # model_by_test cache (populated from pytorch files) rather than to
+            # the mangled filename stem that _model_from_record would produce.
+            if is_host_resource:
+                raw = record.get("model")
+                model = (raw if isinstance(raw, str) and raw else None) or model_by_test.get(
+                    effective_test_name, effective_test_name
+                )
+            else:
+                model = _model_from_record(record, filename)
             # Cache model from pytorch files; use cached model for native files
-            is_pytorch = filename.endswith(".pytorch.json")
             if is_pytorch:
                 if model != test_name:
                     model_by_test[test_name] = model
-            elif model == test_name and test_name in model_by_test:
+            elif not is_host_resource and model == test_name and test_name in model_by_test:
                 model = model_by_test[test_name]
-            covered = pytorch_metrics.setdefault(test_name, set())
-            n = 0 if is_pytorch else sample_count(record)
+            # Dedup set is keyed on the resolved test_name, not the filename stem.
+            covered = pytorch_metrics.setdefault(effective_test_name, set())
+            n = 0 if (is_pytorch or is_host_resource) else sample_count(record)
             if n:
-                samples_by_test.setdefault(test_name, n)
+                samples_by_test.setdefault(effective_test_name, n)
             for metric_name, value in extractor(record):
                 if is_pytorch:
                     covered.add(metric_name)
                 elif metric_name in covered:
                     continue
-                _emit(filename, model, metric_name, value, n)
+                _emit(filename, model, metric_name, value, n, test_name=effective_test_name)
 
         extracted = len(rows) - before_rows
         if extracted:

@@ -85,9 +85,7 @@ class SpyreTokenTypeEmbedding:
     def spyre_token_type_ids_for(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Segment ids matching ``input_ids``, or zeros for a single-segment model.
 
-        Read outside any compiled embedding forward. The buffer is a plain
-        attribute, not a registered parameter, so tracing the read would guard
-        on the first step's tensor.
+        The embedding forward calls this and passes the tensor into the compiled gather.
         """
         token_type_ids = self.spyre_token_type_ids
         if token_type_ids is None or token_type_ids.shape != input_ids.shape:

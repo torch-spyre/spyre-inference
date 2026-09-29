@@ -57,9 +57,7 @@ class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbeddin
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Resolved outside the compiled region: the side buffer is not a
-        # registered parameter, so reading it inside the graph would guard on
-        # the first step's tensor.
+        # Copy segment ids out of the side buffer and pass that tensor into the compiled gather.
         return self._compiled_forward(
             input_ids,
             position_ids,

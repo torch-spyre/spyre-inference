@@ -51,6 +51,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def roberta_position_delta(hf_config: Any) -> int:
+    """``padding_idx + 1`` for absolute-position RoBERTa, else ``0``.
+
+    The embedding table is indexed by ``position_ids + padding_idx + 1``. SDSC
+    cannot schedule that integer add, so the runner applies it on the host.
+    """
+    if hf_config is None:
+        return 0
+    architectures = getattr(hf_config, "architectures", None) or []
+    if not any("Roberta" in arch for arch in architectures):
+        return 0
+    if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
+        return 0
+    pad_token_id = getattr(hf_config, "pad_token_id", None)
+    if not isinstance(pad_token_id, int):
+        return 0
+    return pad_token_id + 1
+
+
 def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     """Lower ``max_model_len`` to what the offset position embedding can index.
 
@@ -69,47 +88,26 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     ``SchedulerConfig`` validation. No-op for every other architecture.
     """
     hf_config = model_config.hf_config
-    architectures = getattr(hf_config, "architectures", None) or []
-    if not any("Roberta" in arch for arch in architectures):
-        return
-    if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
+    delta = roberta_position_delta(hf_config)
+    if delta == 0:
         return
     rows = getattr(hf_config, "max_position_embeddings", None)
-    pad_token_id = getattr(hf_config, "pad_token_id", None)
-    if not isinstance(rows, int) or not isinstance(pad_token_id, int):
+    if not isinstance(rows, int):
         return
-    usable = rows - pad_token_id - 1
+    usable = rows - delta
     if usable < 1 or model_config.max_model_len <= usable:
         return
+    architectures = getattr(hf_config, "architectures", None) or ["Roberta"]
     logger.warning(
         "Lowering max_model_len %d -> %d: %s offsets positions by pad_token_id+1=%d "
         "into a %d-row position embedding.",
         model_config.max_model_len,
         usable,
         architectures[0],
-        pad_token_id + 1,
+        delta,
         rows,
     )
     model_config.max_model_len = usable
-
-
-def roberta_position_delta(hf_config: Any) -> int:
-    """``padding_idx + 1`` for absolute-position RoBERTa, else ``0``.
-
-    The embedding table is indexed by ``position_ids + padding_idx + 1``. SDSC
-    cannot schedule that integer add, so the runner applies it on the host.
-    """
-    if hf_config is None:
-        return 0
-    architectures = getattr(hf_config, "architectures", None) or []
-    if not any("Roberta" in arch for arch in architectures):
-        return 0
-    if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
-        return 0
-    pad_token_id = getattr(hf_config, "pad_token_id", None)
-    if not isinstance(pad_token_id, int):
-        return 0
-    return pad_token_id + 1
 
 
 def offset_host_positions(positions: torch.Tensor, delta: int) -> torch.Tensor:

@@ -375,7 +375,7 @@ def expand_packed_token_types(
     One value per packed token, so it takes the same layout as ``input_ids``. Left packed
     it would pair each sequence's segment ids with another sequence's tokens, and
     silently: the buffer still matches ``input_ids`` in shape, so the all-zeros fallback
-    in ``spyre_token_type_embeddings`` never fires.
+    in ``spyre_token_type_ids_for`` never fires.
     """
     values = token_type_ids.tolist()
     grid = [0] * (batch_bucket * len_bucket)

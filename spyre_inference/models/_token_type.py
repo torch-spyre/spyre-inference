@@ -97,9 +97,6 @@ class SpyreTokenTypeEmbedding:
             return torch.zeros_like(input_ids)
         return token_type_ids
 
-    def spyre_token_type_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.token_type_embeddings(self.spyre_token_type_ids_for(input_ids))
-
 
 class SpyreTokenTypeModel:
     """Top-level mixin handing ``token_type_ids`` to the embedding out of band.

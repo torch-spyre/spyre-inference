@@ -37,7 +37,6 @@ from vllm.model_executor.models.roberta import (
 )
 
 from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
-from spyre_inference.custom_ops.utils import convert
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
@@ -116,31 +115,6 @@ def offset_host_positions(positions: torch.Tensor, delta: int) -> torch.Tensor:
         return positions
     values = positions.detach().cpu().tolist()
     return torch.tensor([int(value) + delta for value in values], dtype=torch.int64)
-
-
-@torch.library.custom_op("spyre_inference::roberta_offset_positions", mutates_args=())
-def offset_roberta_position_ids(position_ids: torch.Tensor, padding_idx: int) -> torch.Tensor:
-    """``position_ids + padding_idx + 1`` on CPU, then H2D as int64.
-
-    Stock torch-spyre cannot schedule SDSC int32 add (warmup crash:
-    ``0_add``), and int64 add CPU-falls-back through ``to_dtype``. Keep the
-    offset off the device so position embedding is only a gather.
-
-    A custom op, not a plain function, so a caller that still holds device ids
-    hides the host round trip behind one node. Inlined, the intermediate is a
-    CPU tensor *inside* the graph, and Inductor lowers its dtype conversion to
-    ``spyre::to_dtype_cpu``, which has no CPU registration. The embedding
-    forward does not call this: the runner adds the offset before the H2D.
-    """
-    device = position_ids.device
-    pos = convert(position_ids, device="cpu")
-    pos = pos + int(padding_idx) + 1
-    return convert(pos, device=device, dtype=torch.int64)
-
-
-@offset_roberta_position_ids.register_fake
-def _offset_roberta_position_ids_fake(position_ids: torch.Tensor, padding_idx: int) -> torch.Tensor:
-    return torch.empty_like(position_ids, dtype=torch.int64)
 
 
 class SpyreRobertaEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, RobertaEmbedding):

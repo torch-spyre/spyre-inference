@@ -17,8 +17,7 @@
 RoBERTa reuses BERT's ``token_type_ids`` bit-pack transport, so these mirror
 ``spyre_inference.models.bert``. The position offset (``padding_idx + 1``) is
 applied on the host in ``TorchSpyreModelRunner._preprocess``, before the ids
-are copied up: SDSC cannot schedule that integer add, and doing it inside the
-embedding forward splits the prologue into six launches.
+are copied up. The embedding forward gathers those positions in one program.
 """
 
 from __future__ import annotations
@@ -53,8 +52,8 @@ logger = init_logger(__name__)
 def roberta_position_delta(hf_config: Any) -> int:
     """``padding_idx + 1`` for absolute-position RoBERTa, else ``0``.
 
-    The embedding table is indexed by ``position_ids + padding_idx + 1``. SDSC
-    cannot schedule that integer add, so the runner applies it on the host.
+    The embedding table is indexed by ``position_ids + padding_idx + 1``. The
+    runner adds that on the host before the ids are copied up.
     """
     if hf_config is None:
         return 0

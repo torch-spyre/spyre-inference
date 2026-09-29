@@ -47,8 +47,7 @@ class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbeddin
     """``BertEmbedding`` reading segment ids from the side buffer.
 
     One compiled forward: the word, segment, and position tables and the
-    layer norm inline into it. Left alone, each ``CompileOutermost`` child
-    compiles itself and the embedding prologue is six launches.
+    layer norm inline into it.
     """
 
     def forward(

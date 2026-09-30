@@ -96,6 +96,23 @@ git checkout origin/main -- uv.lock   # likewise for the other two
 If the change does need one of them, keep that diff minimal (no unrelated transitive
 bumps from a re-resolve) and say in the PR body why it changed.
 
+### New models
+
+If the PR adds a new model, audit every change outside the new model file
+(`spyre_inference/models/<model>.py`) one at a time. For each, ask: is this patch really
+necessary, or is there an established precedent for injecting the custom behaviour more
+cleanly? Precedents to check first:
+
+- the model's Spyre subclass in `spyre_inference/models/`, registered in
+  `spyre_inference/models/__init__.py`
+- a Spyre out-of-tree op in `spyre_inference/custom_ops/`
+- a registry entry in `spyre_inference/config/model_configs.yaml`
+
+Move anything that fits one of these, and drop anything that turns out not to be needed.
+A change that stays in shared code (platform, worker, model runner, attention, other
+models) must work for every model, not just the new one, and needs a one-line reason
+in the PR body.
+
 ## 4. Format and verify
 
 ```bash

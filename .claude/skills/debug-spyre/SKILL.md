@@ -1,6 +1,6 @@
 ---
 name: debug-spyre
-description: Debug numerical, compilation, or correctness failures anywhere the Spyre backend is involved — custom ops, attention, model runner, end-to-end vLLM runs. Use whenever a user reports failing Spyre tests, accuracy/tolerance mismatches against a CPU reference, torch.compile errors on `spyre` device, silent CPU fallbacks, or generally "something on Spyre is broken." Most bugs here are not in our code — they are torch-spyre op gaps or dtype/layout limitations, so debugging requires tracing into the torch-spyre site-packages, not just reading `spyre_inference/`. For attention-specific hints (cache-seeding, KV alignment, MHA/MQA, broadcast diagnosis), see `attention-notes.md` next to this file.
+description: Debug numerical, compilation, or correctness failures anywhere the Spyre backend is involved — custom ops, attention, model runner, end-to-end vLLM runs. Use whenever a user reports failing Spyre tests, accuracy/tolerance mismatches against a CPU reference, torch.compile errors on `spyre` device, silent CPU fallbacks, or generally "something on Spyre is broken." Most bugs here are not in our code — they are torch-spyre op gaps or dtype/layout limitations, so debugging requires tracing into the torch-spyre site-packages, not just reading `spyre_inference/`. For attention-specific hints (KV write and layout, mask tiles, KV alignment, batched vs per-sequence decode, broadcast diagnosis), see `attention-notes.md` next to this file.
 ---
 
 # Debug Spyre Failures
@@ -248,7 +248,7 @@ A fix that clears the baseline probe is a strong signal, not a finish line. Befo
 
 1. **Identify the failing surface.** Which test file? Which module under `spyre_inference/`? Which custom op? Read the test, the module under test, and any CPU reference the test compares against.
 2. **Read the module's docstring and top-of-file comments.** In this repo, modules that wrap torch-spyre often enumerate the limitations they route around (no advanced indexing, no in-device transpose+contiguous, no simultaneous dtype+device conversion, alignment constants, etc.). That list tells you which lines exist for *correctness* vs which exist for *performance* — and the former are landmines if you "simplify" them.
-3. **Re-read `CLAUDE.md`** — Spyre-specific constraints (head_size%64, fp16-only, TP=1, eager mode in the platform layer) are documented there.
+3. **Re-read `CLAUDE.md`** — Spyre-specific constraints (head_size%64, fp16-only, TP≥1 with DP/PP rejected, compiled-by-default with attention in its own compile domain, the two KV layouts) are documented there.
 4. **Look at the relevant torch-spyre site-packages files** — see "Tracing into torch-spyre" below. The site-packages copy is the source of truth for what is and isn't on-device.
 
 ## Reproducing a single failure
@@ -303,9 +303,9 @@ Turn the warning into an error using the specific `FallbackWarning` filter shown
 `torch-spyre` is installed from GitHub (see `pyproject.toml` `tool.uv.sources`), so the site-packages copy is the source of truth. Key files:
 
 - `.venv/lib/python3.12/site-packages/torch_spyre/ops/eager.py`
-    - Lists every aten op registered as a Spyre kernel via `register_torch_compile_kernel([...])`. If an op is **not** in that list, it either has a fallback or is missing entirely. Currently covered: `mm`, `bmm`, `cat`, `add`, `mul`, `div`, `exp`, `log`, `_softmax`, `sum`, `sqrt`, `rsqrt`, `sigmoid`, `relu`, `tanh`, `sub`, `addmm`, `eq`, `ge`, `gt`, `lt`, `maximum`, `pow`, `linalg_vector_norm`, and a few others. Anything else goes through fallbacks.
+    - `COMPILED_OPS` lists every aten op registered as a standalone-compiled Spyre kernel (via `register_torch_compile_kernel`), and the in-place variants are derived from it. If an op is **not** in that list, it either has a fallback, a decomposition, or is missing entirely. The list grows with each torch-spyre release (`index_select`, `stack`, `mean`, `abs`, `silu` and more are there now) — read it at the pinned rev rather than trusting a copy.
 - `.venv/lib/python3.12/site-packages/torch_spyre/ops/fallbacks.py`
-    - Every op that moves to CPU and back. Notable: `arange`, `sin`, `cos`, `embedding`, `tril`, `triu`, `bitwise_or`/`xor`, `argmax`, `cumsum`, `repeat.out`, `isin`, `max_dim_int64_fallback`, `max_default_int64_fallback`. Read the top-of-file comment block — it documents the *process* for adding new fallbacks.
+    - Every op that moves to CPU and back. Notable at the v0.5.0-rc.1 pin: `arange`, `argmax`/`argmin`, `bitwise_or`/`xor`, `cumsum`, `index_copy`, `isin`, `normal_`/`random_`, `repeat`, `tril`/`triu`, and the `ne`/`where` overloads `COMPILED_OPS` does not cover (`sin`/`cos` now have decompositions and `embedding` a compiled kernel, so they no longer fall back). Read the top-of-file comment block — it documents the *process* for adding new fallbacks.
 - `.venv/lib/python3.12/site-packages/torch_spyre/_monkey_patch.py`
     - Patches `torch.Tensor.to`, `torch.empty`, and `__repr__` for Spyre. Explains why `.to(device="spyre")` can behave oddly when combined with dtype changes (the patch only kicks in when `device_layout` is provided).
 - `.venv/lib/python3.12/site-packages/torch_spyre/_inductor/` — decompositions, lowerings, and custom ops. If a compile error blames an inductor pass, this is the place.
@@ -329,14 +329,14 @@ When you see odd code in this repo, it usually exists because of one of these. B
 
 | Limitation | How code in this repo works around it |
 |---|---|
-| No advanced/fancy indexing on device | Build one-hot row/col selectors on CPU, use `bmm` + mask blend instead of `cache[idx] = values` |
+| Indexed reads/writes lower only in specific forms | Gathers go through `index_select` with a stick-aligned int32 index, writes through `index_copy_` in a compiled graph (eager `index_copy_` falls back to CPU), and an indexed tensor is placed with the indexed dim outermost (`place_row_gathered`, `slot_major_kv_layout`); boolean-mask `index_put` is replaced by host scatter + `torch.where` |
 | No in-device transpose + contiguous | Compute permutations on CPU where possible, or interleave `transpose + contiguous` against ops that tolerate non-contiguous inputs |
 | No simultaneous dtype + device conversion | `custom_ops/utils.py::convert` does the dtype change on CPU first, then moves to Spyre |
 | `torch.compile` recompiles on shape change | Modules pre-align inputs to fixed bucket sizes (e.g. KV-length alignment, query-chunk size) so the same compiled kernel is reused |
-| No tensor parallelism | All custom layers assume `TP=1` |
-| Only `float16` is supported | `TorchSpyrePlatform` forces dtype; custom ops list `float16` only as `supported_dtypes` |
+| Collectives are fp16-only and pad-sensitive | `SpyreCommunicator` flattens rank-3 `all_reduce` inputs and pads `all_gather` shards to 64 elements; the platform rejects DP>1, PP>1 and bf16+TP>1 |
+| Only `float16` is validated | `TorchSpyrePlatform` sets `float16` for every model (overriding an explicit `--dtype`); the attention backend also lists `bfloat16` in `supported_dtypes`, but no engine run reaches it |
 
-For attention-backend-specific limitations (head_size constraints, MHA/MQA compile gaps, KV alignment / query chunk numbers), see `attention-notes.md`.
+For attention-backend-specific limitations (head_size constraints, KV layouts and writes, KV alignment / query bucket numbers), see `attention-notes.md`.
 
 > **Gotcha — Spyre results vary across test selections.** The same failing test can show very different numbers when run alone vs. as part of a larger matrix (seen in practice: abs diff 2.35 in matrix run, abs diff 63616 in isolated run of the same node id, same seed, same git rev). Spyre's compile cache and device warmup state carry across tests in a worker. Do not compare magnitudes across selection scopes — re-run with the same scope you were debugging against before calling something a regression.
 
@@ -348,7 +348,7 @@ When a test fails with `Tensor-likes are not close`:
 
 2. **Bisect the pipeline.** Identify the clean stages of the failing operation (most modules in this repo have an obvious 3–6 stage shape: prep inputs → device transfer → compute → reshape/slice → return). Run each stage's inputs and outputs on CPU against a reference and diff. The first stage where the diff goes nonzero is the bug site. A diff that only appears after the compute stage points at a kernel/dispatch problem in torch-spyre; a diff before that points at our own logic.
 
-3. **Compare Spyre output to CPU output for the same kernel.** The cleanest way is a standalone repro script under `logs/<slug>/repro_cpu.py` that constructs the same module under test and runs it with `torch.device("cpu")` instead of `spyre`. If your module reads its target device from a field (e.g. `_target_device`), monkeypatch that field rather than the global default. Run the same inputs the failing parametrization uses. If the CPU variant passes, the bug is in torch-spyre's realization of the operation; if it still fails on CPU, the bug is in our own logic. (Note: pytest fixtures like `requires_spyre` will skip the real test on CPU-only hosts, so do this in a standalone script, not by editing the device and rerunning pytest.)
+3. **Compare Spyre output to CPU output for the same kernel.** The cleanest way is a standalone repro script under `logs/<slug>/repro_cpu.py` that constructs the same module under test and runs it with `torch.device("cpu")` instead of `spyre`. If your module reads its target device from a field (e.g. `_target_device`), monkeypatch that field rather than the global default. Run the same inputs the failing parametrization uses. If the CPU variant passes, the bug is in torch-spyre's realization of the operation; if it still fails on CPU, the bug is in our own logic. (Note: Spyre-only tests skip themselves on CPU-only hosts via `spyre_available()`, so do this in a standalone script, not by editing the device and rerunning pytest — unless the test already has a `device_cpu` parametrization, which is the quicker comparison.)
 
 4. **Inspect any non-data tensors.** Masks, indices, one-hot selectors, padding, alignment buffers — anything where a single bit-flip silently changes meaning. These are the most common silent-disaster bugs in torch-spyre workarounds. Print them for a small case and verify by hand.
 
@@ -374,7 +374,7 @@ When a test fails with `Tensor-likes are not close`:
 
 - Every fallback is a D2H + CPU-compute + H2D roundtrip. One fallback in a hot loop destroys performance.
 - Grep the repo for `FallbackWarning` references — some are filtered as known-accepted. If you see a new one, decide: route around it (preferred), or request a torch-spyre kernel.
-- Compile-mode gotcha: vLLM's `CompilationConfig` distinguishes between `mode = CompilationMode.NONE` (i.e. `0`) and `mode = None` (Python `None`). Modules that gate `torch.compile` on `cfg.mode == CompilationMode.NONE` will *still wrap* their kernels with `torch.compile` when `cfg.mode is None`, which is what happens under the pytest `default_vllm_config` fixture. So "compile is off in tests" is not always true — confirm before assuming eager when comparing pytest vs standalone-script behavior.
+- Compile-mode gotcha: "compile is off in tests" is not true by default. The pytest `default_vllm_config` fixture builds a `VllmConfig` without `enforce_eager`, so the platform hook resolves its mode to `STOCK_TORCH_COMPILE`, and every layer that samples the mode at construction (`CompileOutermost` / `maybe_compile` layers, `SpyreAttentionImpl`) compiles. Tests that want eager say so (`configure_compilation` = `NONE`, or `enforce_eager=True`). A `CompilationConfig` that never went through the platform hook leaves `mode = None` (Python `None`, not `CompilationMode.NONE`), which `maybe_compile` treats as compiled but `SpyreAttentionImpl` (which checks `== STOCK_TORCH_COMPILE`) treats as eager. Confirm the mode before comparing pytest vs standalone-script behavior.
 
 ## When to stop debugging locally and escalate
 
@@ -389,7 +389,7 @@ Before escalating, always re-run the same scenario on CPU to confirm the bug is 
 
 1. The failing test node id.
 2. The full traceback.
-3. torch-spyre identification — `torch_spyre.__version__` is currently pinned at `"0.0.1"` and is **not** a useful identifier on its own. Capture the actual source revision:
+3. torch-spyre identification — `torch_spyre.__version__` names the release (e.g. `0.5.0rc1`), but a locally built or git-rev install can differ from it. Capture the actual source revision too:
 
    ```bash
    # Preferred: exact git revision recorded by uv

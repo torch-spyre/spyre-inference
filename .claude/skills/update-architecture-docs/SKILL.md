@@ -41,7 +41,7 @@ base class names, inheritance relationships, and any new extension points:
 
 **Worker & model runner:**
 
-- `v1/worker/cpu_worker.py` — `CPUWorker` base class
+- `v1/worker/gpu_worker.py` — `Worker` base class (parent of `TorchSpyreWorker`)
 - `v1/worker/gpu_model_runner.py` — `GPUModelRunner` (pattern reference for model runners)
 
 **Engine & scheduling:**
@@ -49,7 +49,7 @@ base class names, inheritance relationships, and any new extension points:
 - `v1/engine/core.py` — `EngineCore`
 - `v1/engine/async_llm.py` — `AsyncLLM`
 - `v1/core/kv_cache_manager.py` — `KVCacheManager`
-- `v1/core/scheduler.py` — vLLM's `Scheduler`
+- `v1/core/sched/scheduler.py` — vLLM's `Scheduler`
 
 **Attention:**
 

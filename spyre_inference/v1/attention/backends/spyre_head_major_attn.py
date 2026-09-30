@@ -157,7 +157,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self._decode_fn = _batched_decode_compiled
         if self.alibi_slopes is not None:
             raise NotImplementedError(
-                "ALiBi is not supported on the head-major KV layout; use the default "
+                "ALiBi is not supported on the head-major KV layout; use the "
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None

@@ -18,7 +18,7 @@ Body (1D, decoder): sorted ``compile_sizes`` token counts; pad the packed batch 
 the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
 
 Pooling has one body shape, ``R`` rows, where ``R`` is the token budget (see
-``encoder_budget``). Fixing it is what reduces the encoder attention kernels'
+``encoder_budget_rows``). Fixing it is what reduces the encoder attention kernels'
 cache keys to the sequence shapes alone: both the rectangular path's rectangle and the
 ragged path's fused gather/attend/store take the body buffer as an argument, so a
 varying buffer size would multiply every attention graph.

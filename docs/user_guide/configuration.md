@@ -89,15 +89,21 @@ With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that 
 23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
 exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
 empty — no batch that narrow can miss the rectangular path — leaving five shapes.
+Those counts assume the rectangular path is opaque; traced into the block graph (see
+below), each rectangle is a block graph of its own rather than an attention kernel.
 
-Both paths go through the same opaque attention op, so the block graph is identical
-for either and the choice is made once per step from the step's metadata. The
-runner counts them in `spyre_encoder_rect_steps` /
-`spyre_encoder_ragged_steps`.
+The choice is made once per step from the step's metadata, before the forward, and the
+runner counts it in `spyre_encoder_rect_steps` / `spyre_encoder_ragged_steps`. The
+ragged path always runs behind the opaque attention op. When compiled and the head size
+fills whole 64-element sticks, the rectangular path is traced into the block graph
+instead, so each rectangle is its own block graph; otherwise (eager, or a sub-stick
+head size such as granite-30m's 32) both paths stay opaque and share one block graph.
 
-Compiled pooling warmup runs one dummy at the body shape; the first attention call
-in it traces every declared rectangle and group pair, against that call's own
-tensors (a Spyre tensor's device layout is part of its cache key). Eager pooling
+Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
+opaque, the first attention call in it traces every declared rectangle and group pair,
+against that call's own tensors (a Spyre tensor's device layout is part of its cache
+key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
+ragged path (when any group is reachable) that traces the group pairs. Eager pooling
 uses one short dummy and always takes the packed path.
 
 Example:
@@ -162,14 +168,18 @@ The `pyproject.toml` includes several key build configurations:
 ### Build Configuration
 
 ```toml
-[tool.uv]
-build-constraint-dependencies = ["torch==2.13.0"]
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
+[tool.uv.extra-build-variables.vllm]
+VLLM_TARGET_DEVICE = "empty"
+CMAKE_ARGS = "--fresh"
+
+[tool.uv.extra-build-dependencies]
+torch-spyre = ["torch==2.13.0"]
 ```
 
 These settings ensure:
 
-- All packages are built with the same PyTorch version (2.13.0)
+- torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+  C++ extension cannot drift in ABI
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`
   (whose CPU-optimized ops we don't need; Spyre provides its own)

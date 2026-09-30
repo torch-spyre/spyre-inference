@@ -62,7 +62,8 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile (whole model and attention kernel), run in eager mode",
+        help="Skip torch.compile and run in eager mode (the default head-major attention "
+        "backend still compiles its kernels)",
     )
     parser.add_argument(
         "--no-compile-sizes",

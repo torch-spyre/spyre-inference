@@ -26,8 +26,8 @@ class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
         """Project through the lm_head, then D2H the logits on the single-card path.
 
-        SpyreParallelLMHead.forward_oot returns logits on Spyre so the TP
-        all_gather in ``_gather_logits`` (which also D2Hs) can run on-device.
+        The head's ``SpyreUnquantizedLMHeadMethod.apply`` returns logits on Spyre so the
+        TP all_gather in ``_gather_logits`` (which also D2Hs) can run on-device.
         Upstream only calls ``_gather_logits`` when ``tp_size > 1``, so with a
         single card the logits would otherwise stay on Spyre and the sampler's
         ``logits.to(torch.float32)`` crashes torch-spyre's ``copy_from_d2d``.

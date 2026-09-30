@@ -128,16 +128,16 @@ print('OK', cats.most_common(5))
 "
 ```
 
-Do **not** trust `torch_spyre.profiler.is_available()` as a health
-signal — it is hardcoded to `return False` regardless of build flags
-(comment: "more to be implemented later").
+Do **not** look for a `torch_spyre.profiler.is_available()` health
+signal — `torch_spyre.profiler` exposes no availability flag, and
+`torch.spyre.is_available()` only reports whether a device is present.
 
 ---
 
 ## 2. Enabling profiling
 
-vLLM in `spyre-inference` runs the worker **in the same process** as
-user code (via `distributed_executor_backend="external_launcher"`).
+The recipe below runs the vLLM worker **in the same process** as user
+code, by passing `distributed_executor_backend="external_launcher"`.
 This lets `torch.profiler.profile(...)` wrap `llm.generate()`
 directly.
 
@@ -224,7 +224,7 @@ Contents of the script and why each entry matters:
 |---|---|---|
 | (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the venv's `python` and packages on `PATH`. This is a deployment-style path; for a local `uv sync` install use `source .venv/bin/activate`. |
 | `VLLM_PLUGINS` | `spyre_inference` | Required for vLLM to load the Spyre platform plugin |
-| (AIUPTI check) | — | Warns if `torch_spyre/_C.so` was not built with `USE_SPYRE_PROFILER=1` — verify via `ldd .../_C.so \| grep libaiupti` and presence of `AiuptiActivityProfilerSession` symbols. Do **not** inspect `torch.__version__` for a `+aiu.kineto` suffix; that flow was retired by torch-spyre PR #1856. See §1.3. |
+| (profiler check) | — | Still checks `torch.__version__` for the retired `+aiu.kineto` suffix, so it warns "stock torch detected" on every current install, profiler-enabled or not — ignore that warning. The real check is `ldd .../_C.so \| grep libaiupti` plus the `AiuptiActivityProfilerSession` symbols (§1.4); the suffix flow was retired by torch-spyre PR #1856. See §1.3. |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |
 | `OPENBLAS_NUM_THREADS` | `1` | Pin OpenBLAS thread pool (same rationale) |
 | `MKL_NUM_THREADS` | `1` | Pin MKL thread pool (same rationale) |
@@ -350,27 +350,17 @@ os.environ.setdefault("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "1800")
 
 **Cause:** the Linux kernel caps VFIO DMA mappings at **65,535
 entries per container**. Each Spyre tensor allocation that participates
-in a transfer consumes one entry. The KV cache alone consumes
-`num_blocks × num_layers × 2` mappings (K + V per layer). At
-`num_gpu_blocks_override=64` and 40 layers, that's 5,120 mappings —
-well within budget. But an unbounded `max_num_seqs` (default 256 on
-some vLLM versions) can multiply the block count and blow the budget.
+in a transfer consumes one entry. The KV cache is one dense K and one
+dense V tensor per layer, pages selected by indirect indexing, so it
+costs only `num_layers × 2` mappings whatever the block count.
 
-**Fix:** pass explicit values for `max_num_seqs` and
-`num_gpu_blocks_override` to `LLM(...)`. Sizing them so
-`num_blocks × num_layers × 2` stays well under 65,535 keeps the
-mapping table healthy. The "consider restarting Linux" text in the
-error message is misleading — pod restart does not help. This is a
-configuration issue, not an IOMMU-state issue.
-
-**Note:** the current KV cache layout — one K and one V tensor per
-block per layer — is temporary. It exists because Spyre does not yet
-support indirect addressing, so every page has to be an individually
-mappable tensor. Once indirect addressing lands, the KV cache can
-collapse to a small number of per-layer tensors indexed at runtime,
-which will drastically reduce both the total tensor count and the
-number of VFIO DMA mappings the cache consumes. The sizing guidance
-above will remain correct until then.
+**Fix:** keep the number of live Spyre allocations bounded. The platform
+already caps an unset `max_num_seqs` at 4 and sizes
+`num_gpu_blocks_override` to `max_num_seqs × ceil(max_model_len /
+block_size) + 1`; pass explicit, modest values when you override them.
+The "consider restarting Linux" text in the error message is
+misleading — pod restart does not help. This is a configuration issue,
+not an IOMMU-state issue.
 
 ### 4.4 `TimestampCalibrator` abort at exit
 

@@ -111,9 +111,10 @@ _BATCHED_DECODE_MIN_UNIFORMITY: float = 0.0
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    Each field is one dense tensor of shape
-    [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
-    matching `SpyreAttentionBackend.get_kv_cache_shape`.
+    Each field is one dense tensor on the Spyre device, in the shape its backend's
+    `get_kv_cache_shape` advertises: [num_blocks, block_size, num_kv_heads, head_size]
+    for `SpyreAttentionBackend`, [num_blocks, num_kv_heads, block_size, head_size] for
+    the head-major one.
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
@@ -350,7 +351,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
 
 class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetadata]):
-    """Builds attention metadata — only the attention mask is precomputed."""
+    """Builds attention metadata on the host: per-sequence query buckets, mask tiles and
+    page-index tables, the batched-decode precomputes, and the published slot mapping."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
@@ -1089,8 +1091,8 @@ class SpyreAttentionBackend(AttentionBackend):
     forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
-        # Only reachable through an explicit `--dtype bfloat16`; the platform's own
-        # default is float16 for every model.
+        # Not reachable from an engine run today: the platform sets float16 for every
+        # model, overwriting even an explicit `--dtype bfloat16`.
         torch.bfloat16,
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -1152,8 +1154,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     read by indirect access, indexing the dense tensor with a device-resident
     page index. No gather masks.
 
-    On Spyre, the per-page attention loop and reshape_and_cache are compiled
-    via torch.compile, with their loop counts passed as arguments.
+    reshape_and_cache is always compiled; the per-page attention loop is compiled
+    under STOCK_TORCH_COMPILE, with its page count passed as an argument, and runs
+    eagerly otherwise.
     """
 
     def __init__(
@@ -1177,9 +1180,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
-        # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
-        # treat as compiled. The platform resolves compiled runs to STOCK.
+        # `== STOCK`, not `!= NONE`: a CompilationConfig that never went through the
+        # platform hook leaves mode unset (Python None), which `!= NONE` would wrongly
+        # treat as compiled. The platform resolves compiled runs to STOCK, which is also
+        # what the `default_vllm_config` test fixture ends up with.
         _mode = get_current_vllm_config().compilation_config.mode
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
@@ -1345,7 +1349,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Mirror batched-decode precomputes to device once per step, only for
         # layers whose impl can actually use the batched kernel (skips ALiBi
-        # and soft-cap layers).
+        # layers, eager attention and, under the tiled walk, the token-major layout).
         if (
             self._batched_decode_preconditions_met(attn_metadata)
             and attn_metadata.rep_row_ids_dev is None

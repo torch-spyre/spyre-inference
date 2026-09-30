@@ -20,8 +20,10 @@ rectangle, when the batch fits one, where Q/K/V already *are* the ``[B, L]`` gri
 runner laid out; otherwise the packed buffer, with requests grouped by their own extent
 and each group a fused gather/attend/scatter. The runner picks once per step and records
 the choice as the type of ``attn_metadata.encoder_plan``, so no compiled region branches
-on it. Both paths cross the opaque ``unified_attention_with_output``, so the enclosing
-block graph is identical for either.
+on it. The ragged path always crosses the opaque ``unified_attention_with_output``. The
+rectangular path does too unless ``install_encoder`` traced it into the block graph
+(compiled, stick-aligned head size), in which case each rectangle is a block graph of its
+own and the impl below is reached only on the ragged path.
 
 Three torch-spyre constraints shape the design:
 

@@ -24,16 +24,12 @@ Data flow in the current WIP version:
 - Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
   pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
-- Hidden states flow on Spyre between decoder layers.
-- There are few exceptions where a CPU fallback is currently needed:
-  - Attention block: Spyre input → CPU (and partial Spyre) compute → Spyre output.
-  - Layers that are not yet wrapped for torch-spyre,
-    for example RotaryEmbedding
-
-As the TorchSpyreModelRunner is evolving, more layers will natively support inputs
-arriving as a Spyre tensor and perform their operations on Spyre.
-Thus, in the final state of the runner minimal D2H and H2D transfers will be necessary,
-the CPU fallbacks will be obsolete and most operations will be performed on Spyre.
+- Hidden states flow on Spyre between decoder layers; attention, RoPE and the
+  embedding gather run on-device too.
+- What stays on CPU is host-side bookkeeping: slot mapping, attention metadata
+  (index tables, mask tiles) built by the metadata builder, logits indexing and
+  sampling, plus the few model-specific workarounds that route one op through the
+  host (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
 """
 
 from __future__ import annotations
@@ -341,8 +337,9 @@ class _SpyreModelWrapper:
     Output conversion (Spyre → CPU):
         The model's final hidden_states come out on Spyre. Downstream
         operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
+        The lm_head matmul runs on Spyre via SpyreParallelLMHead: ``compute_logits``
+        below does the H2D of the sampled rows, SpyreLogitsProcessor the D2H of the
+        logits.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -409,10 +406,10 @@ class _SpyreModelWrapper:
         on CPU (no Spyre `aten::index.Tensor`; a device gather needs
         `select_rows`), so the tensor handed to compute_logits is on CPU;
         move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
+        on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
+        and scale -- in ``_apply_head`` at TP=1, right after the all_gather in
+        ``_gather_logits`` at TP>1 -- so downstream sampling gets CPU logits.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
@@ -850,9 +847,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: one dummy per body shape -- and pooling has exactly one, the
-        token budget. That single forward traces the body, the pooler, and (through
-        ``SpyreEncoderAttentionImpl.warm_kernels``, which runs on its first attention
-        call) every declared rectangle and every declared ``(width, extent)`` group.
+        token budget. That forward traces the body and the pooler. The first attention
+        call that reaches the impl runs ``SpyreEncoderAttentionImpl.warm_kernels``, which
+        traces every declared ``(width, extent)`` group, plus every declared rectangle
+        while the rectangular path is opaque. With the rectangular path traced into the
+        block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
+        forces one onto the ragged path, which is what reaches the impl.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
@@ -1637,8 +1637,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def _model_dtype(self) -> torch.dtype:
-        """The activation dtype the platform settled on (float16 unless bfloat16 was
-        asked for explicitly)."""
+        """The activation dtype the platform settled on (float16 for every engine run;
+        see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 

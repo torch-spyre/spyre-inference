@@ -40,12 +40,12 @@ granite: "Granite Decoder Layer (× N)" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ROPE: "SpyreRotaryEmbedding\n(4D rotation cache primed pre-compile;\nindex_select + 2×2 rotation in-graph)" {
+  ROPE: "SpyreRotaryEmbedding\n(rotation cache primed pre-compile;\nindex_select + 2×2 rotation in-graph)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  ATTN: "SpyreAttentionImpl\n(Spyre kernels;\nhost-side metadata & loop)" {
+  ATTN: "SpyreHeadMajorAttentionImpl\n(default; SpyreAttentionImpl for\ntoken_major) Spyre kernels;\nhost-side metadata & loop" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
@@ -81,7 +81,7 @@ granite: "Granite Decoder Layer (× N)" {
   N2 -> GATE -> ACT -> DOWN
 }
 
-attn_detail: "SpyreAttentionImpl Pipeline" {
+attn_detail: "Decoder Attention Pipeline" {
   style.fill: "#e0e0e0"
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
@@ -96,7 +96,7 @@ attn_detail: "SpyreAttentionImpl Pipeline" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  S3: "Per-sequence page attention (compiled):\ngather query rows on-device →\nQ @ Kᵀ·scale → soft-cap? → +mask →\nonline softmax → @V" {
+  S3: "Page attention (compiled): one kernel\nper sequence, or one batched kernel\nfor 4+ decode seqs; gather rows on-device →\nQ @ Kᵀ·scale → soft-cap? → +mask →\nonline softmax → @V" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
@@ -115,23 +115,24 @@ encoder_attn: "SpyreEncoderAttentionImpl (no KV cache)" {
   style.stroke: "#9e9e9e"
   style.font-color: "#212121"
 
-  E1: "Ragged→dense pack: build pack indices +\nadditive mask on CPU, then scatter Q/K/V into\nthe dense [B,H,L,Dp] batch on Spyre\n(compiled index_copy_; L-pad structural)" {
+  E1: "Plan once per step (host): rectangle if\nthe batch fits one (runner lays it out as\na [B·L] grid), else ragged groups of equal\nextent; masks + row tables → one convert" {
     style.fill: "#2e7d32"
     style.stroke: "#1b5e20"
     style.font-color: "#ffffff"
   }
-  E2: "Batched attention on Spyre\nfused F.sdpa (B=1, no live pad) OR\ncompiled QK-matmul + on-device mask-add\n+ compiled P·V (additive-mask path)" {
+  E2: "Rectangle: one F.sdpa over the grid\n(traced into the block graph when\ncompiled with a stick-aligned head size)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  E3: "Unpack (index_select) + write-back\n(output.copy_) on Spyre\n(CPU round-trip only for non-stick head\ndims, e.g. MiniLM D=32)" {
+  E3: "Ragged: per group, one fused\ngather → F.sdpa → index_copy_ kernel\n(host round-trip only for sub-stick\nhead dims, e.g. MiniLM D=32)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
 
-  E1 -> E2 -> E3
+  E1 -> E2: "fits a rectangle"
+  E1 -> E3: "too wide"
 }
 
 bookends.EMB -> granite: "hidden states"

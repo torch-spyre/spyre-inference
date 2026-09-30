@@ -19,7 +19,8 @@ OOT registrations pick up on their own. Two things are left to HF's module code:
 
 * RoPE — there is no RoPE fuser, so HF's ``rotary_emb`` survives and derives cos/sin
   inside the forward from int64 ``position_ids``, a cast torch-spyre cannot lower.
-  Replaced here with a precomputed rotation cache and a matmul-only rotation.
+  Replaced here with a precomputed rotation cache and a slice-free multiply-and-reduce
+  rotation.
 * Models shipping both ``config.json`` and ``params.json`` parse into a bare
   ``PretrainedConfig``, which HF cannot build a model from.
 """

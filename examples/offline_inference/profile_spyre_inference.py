@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""New-stack profile run — matches docs/getting_started/kineto_profiling.md §2.1.
+"""New-stack profile run — matches docs/user_guide/kineto_profiling.md §2.1.
 
 Usage:
     source ./setup_profile_env.sh          # activates venv + exports env vars

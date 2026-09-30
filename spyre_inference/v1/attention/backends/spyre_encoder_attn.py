@@ -354,9 +354,9 @@ class EncoderRectPlan:
     mask: torch.Tensor
     """``[width, 1, 1, extent]`` additive key-pad, already on the device."""
     query_lens: list[int]
-    """Real length per request. The runner needs it to lay out the grid and to
-    compact the hidden states back afterwards, and this is the one place the ragged
-    lengths were already read off the metadata."""
+    """Real length per request. The runner uses it to lay out the grid and, when
+    packed-order pooling is needed, to compact hidden states afterwards. The ragged
+    lengths were already read off the metadata here."""
 
 
 @dataclass

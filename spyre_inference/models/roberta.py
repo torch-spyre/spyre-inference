@@ -71,9 +71,9 @@ def roberta_position_delta(hf_config: Any) -> int:
 def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     """Lower ``max_model_len`` to what the offset position embedding can index.
 
-    The runner gathers ``position_ids + pad_token_id + 1``, so the
-    usable context is ``max_position_embeddings - pad_token_id - 1`` -- 512 for the
-    514-row table, not the 514 vLLM derives.
+    The runner offsets positions by ``pad_token_id + 1`` before the embedding gathers
+    them, so the usable context is ``max_position_embeddings - pad_token_id - 1`` --
+    512 for the 514-row table, not the 514 vLLM derives.
 
     Needed since the encoder grew its rectangular path, which pads every sequence out to
     the declared length: a max-length request's pad rows alone then index two past the

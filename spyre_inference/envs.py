@@ -87,7 +87,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
-    # default buckets of powers of two from 4 up to max_num_seqs.
+    # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which

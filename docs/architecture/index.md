@@ -115,8 +115,8 @@ rename fails loudly instead of silently falling through to the unadapted class.
 
 Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
 `embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
-`__init__`, same parameters, same module tree, only `forward` differs. Prefer a documented
-upstream extension point where one exists: `CustomOp.register_oot` /
+`__init__`, same parameters and module tree, but a Spyre `forward` and armed compile
+state. Prefer a documented upstream extension point where one exists: `CustomOp.register_oot` /
 `PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.
 
@@ -125,6 +125,9 @@ Two adaptations worth knowing:
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
   which Spyre cannot unpack ([torch-spyre#3509](https://github.com/torch-spyre/torch-spyre/issues/3509)).
+  Their word/segment/position gathers and layer norm can form a separate compiled
+  embedding prologue when no enclosing graph traces them; RoBERTa's position offset is
+  applied on the host before the gather.
 - **MoE** (`moe.py`) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
   for an out-of-tree platform (it selects `UnquantizedMoeBackend.OOT` — no kernel — and
   leaves `process_weights_after_loading` to the plugin). A `CustomOp.register_oot`
@@ -224,8 +227,8 @@ the write can scatter through a slot-major view of it:
 |---|---|---|
 | 1. Build metadata & masks | CPU → Spyre | The metadata builder reads `query_start_loc`/`seq_lens`, pads each `query_len` and KV block count onto their buckets, builds the per-sequence query-row index tables and the additive mask on CPU, then copies them to the device |
 | 2. Write new K/V to cache | Spyre | Compiled `index_copy_` scatter through a slot-major view of the paged cache (one per tensor, fused); only the slot-index vector is computed host-side and copied over |
-| 3. Per-sequence page attention | Spyre | A host-driven loop dispatches one compiled kernel per sequence — the query rows are gathered on-device (never copied to CPU): `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
-| 4. Write-back | Spyre | Each sequence's result is written into the Spyre output buffer with a device-to-device copy |
+| 3. Page attention | Spyre | Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
+| 4. Write-back | Spyre | Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy |
 
 The compiled kernels themselves — the per-sequence page attention, the batched decode
 path, the KV store, and the cache's device layout — live under
@@ -234,11 +237,14 @@ the host-side orchestration that calls them.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
-variant `SpyreAttnBucketer` can produce — the product of the KV-length and query-length
-buckets below — so a served request always lands on an already-compiled kernel. When the
+per-sequence variant `SpyreAttnBucketer` can produce — the product of the KV-length and
+query-length buckets below — so a served request normally lands on an already-compiled
+kernel. When the
 batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
-default tiled walk means the head-major layout) warmup also records its variants, the
-product of the KV-length (`num_blocks`) and num-sequences buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
+default tiled walk means the head-major layout) warmup enumerates its variants, the
+product of the KV-length (`num_blocks`) and num-sequences buckets; combinations that
+reach or exceed the allocated page count are skipped and declined at dispatch. A single
+step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 `SPYRE_ATTN_RECORD=0` restores lazy per-variant compilation.
 
@@ -314,8 +320,8 @@ Key constraints:
   (consistent tensor shapes for compilation)
 - **Num-sequences bucketing** (batched-decode kernel only, `SPYRE_BATCHED_DECODE=1`, the
   default; under the default tiled walk, the head-major layout only):
-  powers of two from 4 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
-  kernel is recorded over the `(num_blocks, num_seqs)` grid
+  powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); eligible
+  `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a
   user-supplied `block_size` is rounded up to the next multiple of 64, and one that is then
@@ -354,8 +360,9 @@ exactly the extents a request can be assigned):
    (host-side integer tensors for `input_ids`; multimodal `inputs_embeds` are copied to
    CPU, padded there and copied back), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
-   inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
-   fixed row count so the gather does not specialise per token total.
+   inside the layer. For packed-order pooling, `_unpad_encoder_hidden` compacts the grid
+   at a fixed row count so the gather does not specialise per token total. Homogeneous
+   CLS pooling instead reads each sequence's first grid row and skips the gather.
 2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
    are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
    scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
@@ -461,8 +468,9 @@ applies the keep mask, and `all_reduce`s — all on Spyre, no per-step CPU round
 Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
 work that stays host-side: logits indexing for sampling, and the attention metadata the
 builder prepares on CPU (slot mapping, the per-sequence index tables and additive mask).
-The per-sequence attention loop is host-driven control flow, but its query-row gather and
-kernels run on Spyre; the KV-cache write and the write-back are device-to-device. RoPE's
+Eligible decode prefixes use batched attention, even at one sequence; otherwise the
+per-sequence loop is host-driven control flow, but its query-row gather and kernels run
+on Spyre. KV-cache writes and any separate write-back copy stay on-device. RoPE's
 rotation-cache gather and the embedding gather also run on-device.
 
 ## Transformers backend

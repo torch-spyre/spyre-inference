@@ -96,7 +96,7 @@ attn_detail: "Decoder Attention Pipeline" {
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"
   }
-  S3: "Page attention (compiled by default):\none kernel per sequence, or one batched\nkernel for 4+ decode seqs; gather rows →\nQ @ Kᵀ·scale → soft-cap? → +mask →\nonline softmax → @V" {
+  S3: "Page attention (compiled by default):\none kernel per prefill / fallback seq,\nor batched decode (eligible from 1 seq);\nQ @ Kᵀ·scale → soft-cap? → +mask →\nonline softmax → @V" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"

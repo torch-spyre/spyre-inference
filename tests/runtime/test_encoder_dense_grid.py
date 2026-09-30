@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The rectangular path's grid layout is a contract between two places in the runner:
-``_preprocess`` scatters the packed tokens into ``[B*L]``, and ``_unpad_encoder_hidden``
-gathers them back for the pooler. They share one row-index table, so a round trip is
-the thing worth testing.
+"""Test the rectangular grid layout and its pooling row selections.
+
+``_preprocess`` expands packed tokens into ``[B*L]``; packed-order pooling
+re-compacts the grid, while CLS can select its first rows directly.
 """
 
 import numpy as np

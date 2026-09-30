@@ -120,9 +120,10 @@ vllm serve ibm-granite/granite-embedding-125m-english \
 Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Attention is recorded as the **product** of its KV-length and
-query-length buckets (and, when the batched-decode kernel is enabled, a second KV-length ×
-num-sequences product), so extra attention buckets cost multiplicatively — keep those
+compile at warmup. Per-sequence attention is recorded as the **product** of its KV-length
+and query-length buckets (and, when batched decode is enabled, a second KV-length ×
+num-sequences product, excluding combinations that reach the allocated page count), so
+extra attention buckets cost multiplicatively — keep those
 lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
@@ -159,9 +160,9 @@ variants from warmup at no serving cost.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup also records it over the KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
-(default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
-keep-it-short advice applies.
+the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+`SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
+extra lever there, and the same keep-it-short advice applies.
 
 ## pyproject.toml Reference
 

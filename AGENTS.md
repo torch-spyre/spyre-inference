@@ -16,7 +16,7 @@
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — PyTorch-native paged-KV attention
 - `spyre_inference/custom_ops/` — device-specific layer implementations (linear, gemma_rms_norm, rotary_embedding, vocab_parallel_embedding, parallel_lm_head, logits_processor, …)
 
-**Attention notes:** FlashAttention-style online softmax walking the pages of dense per-layer K and V tensors (indirect page gather, no compact copy), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, a batched multi-sequence decode kernel for decode batches of 4+ sequences.
+**Attention notes:** FlashAttention-style online softmax walking the pages of dense per-layer K and V tensors (indirect page gather, no compact copy), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, a batched decode kernel eligible even for one sequence when its other dispatch conditions hold.
 
 ## Development Commands
 
@@ -28,6 +28,11 @@ uv run pytest --upstream       # local + upstream
 bash format.sh                 # format (prek via uvx)
 uv run ty                      # type check
 ```
+
+`uv sync` does not install the RPMs in `spyre-rpms.lock`. On a pod whose image runtime
+differs from the lock, use `scripts/install-pinned-rpms.sh --rebuild` and source the
+generated `env.sh` first; the rebuild avoids reusing a torch-spyre wheel compiled
+against the old RPM set. See [Installation](docs/getting_started/installation.md).
 
 Runs are slow (~3 min) due to vLLM startup — prefer single-test invocations while iterating. Parametrize IDs contain `()`, `=`, `,`, which break `pytest -k`; list node IDs first, then quote the full ID:
 

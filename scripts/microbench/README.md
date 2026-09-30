@@ -36,7 +36,8 @@ uv run --no-sync vllm bench latency \
 ```
 
 Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
-`SPYRE_BATCHED_DECODE=1` is the default, so it already takes the batched decode path.
+`SPYRE_BATCHED_DECODE=1` is the default; the batched decode path also depends on
+layout, compilation, bucket coverage and allocated KV-cache pages.
 
 ### Which scope to measure
 
@@ -126,8 +127,10 @@ is reported as a row with `error` set rather than an assertion mid-sweep.
 
 The batched decode kernel needs the `batched_decode_compiled` variant, which sets
 `SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
-variant in one run). It also needs `num_decode_seqs >= 4`, a compiled build, and a
-resolvable sequence/blocks bucket pair. Under the default tiled walk the kernel is
+variant in one run). Even one decode sequence can use it, provided the build is
+compiled, the sequence/blocks bucket pair resolves, and the padded sequence count
+times blocks per chunk is strictly less than the allocated KV-cache page count. Under
+the default tiled walk the kernel is
 reached on the head-major layout only, which is `--attn-kv-layout`'s default; pairing
 the batched variant with `token_major` is refused up front rather than measured as a
 silent per-seq fallback.

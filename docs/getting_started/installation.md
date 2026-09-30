@@ -8,6 +8,20 @@ This guide covers the installation of `spyre-inference` using `uv`, a fast Pytho
 - [`uv`](https://docs.astral.sh/uv/) package manager
 - Access to IBM Spyre hardware with the Spyre Runtime Stack (required for torch-spyre compilation)
 
+CI provisions the RPM versions in `spyre-rpms.lock` before building the Python environment.
+On a development pod whose image-baked runtime does not match that lock, install and
+activate the pinned RPMs first (requires access to the configured RPM repository):
+
+```bash
+bash scripts/install-pinned-rpms.sh --rebuild
+source ~/spyre-libs/env.sh
+```
+
+The `--rebuild` option rebuilds torch-spyre against those libraries, clearing uv's
+revision-keyed wheel cache first. After an RPM-only update, `uv sync` by itself can
+reuse a wheel built against the old libraries. The installer leaves the system
+`/opt/ibm/spyre` tree unchanged; source its `env.sh` in each new shell.
+
 ## Install
 
 From the repository root, run:
@@ -20,7 +34,7 @@ This command will:
 
 1. Install all project dependencies
 2. Build vLLM from source with the empty backend (`VLLM_TARGET_DEVICE=empty`, no device-specific C kernels)
-3. Build torch-spyre from source
+3. Install or reuse the torch-spyre wheel for the pinned source revision (RPMs are provisioned separately)
 4. Install PyTorch 2.13.0 from the CPU-specific index
 
 ## Verification

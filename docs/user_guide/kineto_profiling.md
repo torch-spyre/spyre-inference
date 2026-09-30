@@ -38,12 +38,16 @@ present, the device row is empty, and no error is raised.
 1. **`libaiupti.so` and its headers are present:**
 
    ```bash
-   ls /opt/ibm/spyre/runtime/lib/libaiupti.so
-   ls /opt/ibm/spyre/runtime/include/libaiupti/*.h
+   RUNTIME_DIR="${SENTIENT_BASE_INSTALL_DIR:-/opt/ibm/spyre}/runtime"
+   ls "$RUNTIME_DIR/lib/libaiupti.so"
+   ls "$RUNTIME_DIR"/include/libaiupti/*.h
    ```
 
    The runtime library and its headers ship with the Spyre runtime.
-   Both are needed at build time; the `.so` is needed at run time.
+   Both are needed at build time; the `.so` is needed at run time. When using
+   `spyre-rpms.lock`, source the installer-generated `env.sh` first so
+   `SENTIENT_BASE_INSTALL_DIR` selects the pinned libraries instead of the
+   image-baked `/opt/ibm/spyre` tree.
 
 2. **The Spyre device is accessible** — typically a `/dev/vfio/<N>`
    node exposed to the container.
@@ -61,8 +65,9 @@ Edit `pyproject.toml` in `spyre-inference`:
 USE_SPYRE_PROFILER = "1"   # was "0"
 ```
 
-Then `uv sync` — the resulting wheel has AIUPTI compiled in. This is
-the right path for anyone using this venv for profiling long-term.
+Then rebuild with `uv cache clean torch-spyre && uv sync --reinstall-package torch-spyre`
+to avoid reusing a wheel built with the old flag. The resulting wheel has AIUPTI compiled
+in. This is the right path for anyone using this venv for profiling long-term.
 Because the flag was originally set to `"0"` to work around long Z
 model-load times, flipping it in-tree is a project-level decision, not
 a silent local edit.
@@ -73,9 +78,10 @@ If you want to leave `pyproject.toml` alone, force-reinstall
 torch-spyre with the flag set:
 
 ```bash
+RUNTIME_DIR="${SENTIENT_BASE_INSTALL_DIR:-/opt/ibm/spyre}/runtime"
 USE_SPYRE_PROFILER=1 \
-  LIBAIUPTI_INSTALL_DIR=/opt/ibm/spyre/runtime \
-  LD_LIBRARY_PATH="/opt/ibm/spyre/runtime/lib:$LD_LIBRARY_PATH" \
+  LIBAIUPTI_INSTALL_DIR="$RUNTIME_DIR" \
+  LD_LIBRARY_PATH="$RUNTIME_DIR/lib:${LD_LIBRARY_PATH:-}" \
   /path/to/your-venv/bin/python -m pip install \
     --no-deps --force-reinstall --no-cache-dir \
     "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@<rev>"
@@ -113,7 +119,7 @@ ls -la "$SO"
 
 # 2. libaiupti actually linked.
 ldd "$SO" | grep libaiupti
-# → libaiupti.so => /opt/ibm/spyre/runtime/lib/libaiupti.so
+# → libaiupti.so => <active Spyre runtime>/lib/libaiupti.so
 
 # 3. AIUPTI symbols present in the shared object.
 nm -CD "$SO" | grep -i AiuptiActivityProfilerSession | head -3
@@ -320,9 +326,9 @@ LD_PRELOAD=/path/to/libflex_patched.so:/path/to/libflexhdma_patched.so \
     python -u your_profile_script.py
 ```
 
-The system `libflex.so` typically lives at
-`/opt/ibm/spyre/runtime/lib/libflex.so`; `LD_PRELOAD` is used because
-that directory is often read-only.
+The active `libflex.so` lives under
+`${SENTIENT_BASE_INSTALL_DIR:-/opt/ibm/spyre}/runtime/lib/`; `LD_PRELOAD` lets you
+select a patched build without replacing that library.
 
 ### 4.2 60-second D2H stall
 

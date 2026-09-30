@@ -1381,8 +1381,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Compile the rectangular path's re-compaction gather.
 
         ``_unpad_encoder_hidden`` runs in ``_pool``, which no dummy run reaches, so
-        without this the first rectangular-path request pays its compile. One shape only: the
-        gather deliberately keeps the buffer's row count.
+        without this the first request needing packed-order re-compaction pays its compile.
+        One shape only: the gather deliberately keeps the buffer's row count.
         """
         if not self._pooling_on_spyre or not self._encoder_rectangles:
             return
@@ -1393,8 +1393,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         """Re-compact a rectangular-path grid to the packed order the poolers address.
 
-        The poolers index rows by ``cumsum(num_scheduled_tokens)``, so on the rectangular
-        path the inter-sequence pad rows have to go. Reporting padded lengths instead
+        LAST/MEAN and mixed-task poolers need packed-order rows, so on the rectangular
+        path their inter-sequence pad rows have to go. Homogeneous CLS instead reads
+        grid rows directly and skips this gather. Reporting padded lengths instead
         makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
         The gather keeps its input's row count: sizing it to the real token count adds
@@ -1421,7 +1422,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
 
     def _preprocess(self, *args, **kwargs):
-        """Expand the ragged body into the dense grid, on the rectangular path only.
+        """Expand the ragged body into the dense grid on the rectangular path.
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
@@ -1430,8 +1431,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         `inputs_embeds` instead copies the floating-point embeddings to CPU,
         expands them there and converts the grid back to the original device.
 
-        ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths, which
-        attention's mask needs.
+        On the packed path, absolute-position RoBERTa still offsets positions here
+        before the embedding gather. ``query_start_loc`` and ``seq_lens`` keep the
+        real ragged lengths, which attention's mask needs.
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
@@ -1651,8 +1653,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         hidden_states = convert(hidden_states, self._spyre_device)
-        # CLS on a rectangle already has its row at ``seq_idx * extent``. Skipping
-        # the unpad gather leaves LAST/MEAN on the packed layout they index.
+        # CLS reads its rectangle's grid row at ``seq_idx * extent`` directly;
+        # LAST/MEAN still require re-compaction to the packed order they index.
         # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):

@@ -153,7 +153,8 @@ Two adaptations worth knowing:
 
 Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
 the model's block `ModuleList` in place via `block.compile(backend="inductor",
-fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
+fullgraph=not uses_fp8, dynamic=False)`. FP8 linears need graph breaks, so their blocks
+use `fullgraph=False`. In place matters: rebinding the list entry to the
 `OptimizedModule` that `torch.compile` returns would re-parent the block under an
 `_orig_mod` child and rename every parameter, breaking weight save/reload.
 
@@ -180,10 +181,11 @@ backend compile count is independent of depth, but it is not 1: layer 0 speciali
 separately because `residual is None` there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
 and full attention, giving four. A fresh `num_tokens` bucket then costs one block recompile
-rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
-dependence: kv-cache length and its block-count buckets live inside
+rather than a whole-model one. For decoder attention, `num_tokens` is the block graph's
+only shape dependence: kv-cache length and its block-count buckets live inside
 `unified_attention_with_output`, which is opaque to this graph and compiles its own
-kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+kernels. Inline rectangular encoder attention also specializes the block graph by
+rectangle (see [Kineto profiling](../user_guide/kineto_profiling.md)).
 
 Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
 which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bakes in its
@@ -207,7 +209,8 @@ Decoder attention has two backends, which differ only in how a page is laid out;
 default is the head-major one described below. `SpyreAttentionBackend` is the token-major
 layout (`SPYRE_ATTN_KV_LAYOUT=token_major`) and the structure both share, so it is
 described first. It implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+(no custom CUDA kernels). The KV cache holds two dense tensors per layer on Spyre, one
+each for K and V, both shaped
 `[num_blocks, block_size, num_kv_heads, head_size]` — the shape
 `SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
 online softmax that iterates over pages without any compact-gather step, reading each
@@ -264,7 +267,8 @@ single store of one contiguous run per token.
 Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
 warmup recording and dispatch — is shared with the token-major backend. What differs is
 duplicated rather than parameterised: the advertised shape, the allocation
-(`head_major_kv_layout`), and the three kernels that touch a page. The worker follows the
+(`head_major_kv_layout`), the KV-store kernel and the three attention kernels that
+read a page. The worker follows the
 layer's impl (`allocate_pages`) rather than a hardcoded shape, so the two cannot disagree.
 
 #### LX-resident pages
@@ -347,7 +351,8 @@ exactly the extents a request can be assigned):
 
 1. **Rectangular path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
    body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`
-   (host-side, integer tensors only), so Q/K/V *are* the grid: `_encoder_rect_kernel`
+   (host-side integer tensors for `input_ids`; multimodal `inputs_embeds` are copied to
+   CPU, padded there and copied back), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
    inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
    fixed row count so the gather does not specialise per token total.
@@ -361,7 +366,7 @@ exactly the extents a request can be assigned):
 The runner picks between them once per step in `_build_attention_metadata` and records the
 choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
 `EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
-read and an H2D convert, which inside a traced region become graph nodes.
+read and H2D conversions, which inside a traced region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on
@@ -371,8 +376,9 @@ sticks (`install_encoder` is the only gate). The runner publishes the rectangle'
 (`publish_encoder_grid`), and the layer's forward reads `(width, extent)` off that mask's
 shape, so inductor fuses attention with the projections and the FFN. The rectangle then is
 part of the block graph's shape: one block graph per declared rectangle, plus the
-opaque-attention one the ragged path runs. A `head_size=32` model (granite-30m, MiniLM) and
-any eager run keep both paths opaque. Either way path selection is never a branch inside a
+opaque-attention one the ragged path runs. An unpadded 32-wide encoder layer and any eager
+run keep both paths opaque; pooling models such as granite-30m and MiniLM pad their original
+32-wide heads to 64 before construction. Either way path selection is never a branch inside a
 compiled region: it is decided before the forward, and the traced graph only sees the shape
 it was handed.
 
@@ -380,7 +386,8 @@ Three torch-spyre constraints shape the rest: a compile input's `storage_offset`
 Dynamo guard (torch-spyre#4449, which closed #3770) and for int32 is still dropped
 outright, so rows are gathered with `index_select` rather than sliced — a slice would
 either recompile per offset or read the wrong rows; there is no on-device `arange` or `full`, so every index and mask
-tensor is host-built and reaches the device in one `convert` per plan; and SDPA's
+tensor is host-built and converted separately (one mask for a rectangle, a row table and
+a mask per ragged group); and SDPA's
 decomposition does `amax` then `exp(scores - max)`, which NaNs a fully masked row — hence
 the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane gets.
 

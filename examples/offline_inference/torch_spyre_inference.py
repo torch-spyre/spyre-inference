@@ -62,8 +62,8 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile and run in eager mode (the default head-major attention "
-        "backend still compiles its kernels)",
+        help="Run the model eagerly; required kernels (including head-major attention "
+        "and Gemma RMSNorm) still compile",
     )
     parser.add_argument(
         "--no-compile-sizes",

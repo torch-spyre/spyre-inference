@@ -8,13 +8,9 @@ Thank you for your interest in contributing to the Spyre plugin for vLLM! There 
 
 ## Developing
 
-Follow the [Installation Guide](../getting_started/installation.md) to get the base package installed, then install the dev dependency group:
-
-```bash
-uv sync --group dev
-```
-
-This includes `pytest`, `pyyaml`, and the `spyre-testing-plugin` for running the test suite.
+Follow the [Installation Guide](../getting_started/installation.md). Its `uv sync --frozen`
+already installs the default dev dependency group, including `pytest`, `pyyaml`, and the
+`spyre-testing-plugin` for running the test suite.
 
 If you already have a local `torch-spyre` checkout installed (e.g. editable, for `torch-spyre` development), a plain `uv sync` will rebuild and reinstall the pinned git rev from `pyproject.toml`, discarding it. To keep your local install instead:
 
@@ -138,8 +134,9 @@ with every token still exact — a tight per-step bound buys flakiness, not cove
 prints `mean=`/`max=` per prompt, so a failure is readable without a rerun.
 `SPYRE_TEST_TIE_ABS_TOL` holds token disagreements to a tighter bound, since picking a
 different token is a stronger signal than drift. The FP8 decoder checkpoints are
-load-and-decode cases with no reference of their own — their unquantized siblings gate the
-numerics.
+load-and-decode cases with no numerical comparison: they borrow prompts from their
+unquantized siblings' references, but only check that decoding produces the requested
+number of tokens.
 
 A greedy path that diverges from HF on a near-tie cannot be compared past the split, so how
 much of the reference a case compares depends on the prompts. That is **reported, not

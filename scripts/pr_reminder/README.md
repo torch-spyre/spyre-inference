@@ -35,9 +35,9 @@ later in local terms during summer time.
 
 ## Setup
 
-Pick one of the two Slack paths. The webhook is simpler; the bot token is worth it if
-you ever want to retarget the channel without minting a new hook, or to post to several
-channels. When both are configured the webhook wins.
+The scheduled workflow currently passes only the webhook credential. The script also
+supports a bot token for local runs, or if the workflow is updated to pass its token
+and channel ID. When both are configured the webhook wins.
 
 **Incoming webhook (simplest).** Create the hook in Slack (*Your apps → Incoming
 Webhooks → Add New Webhook to Workspace*), pick the channel, and add the resulting URL
@@ -45,23 +45,26 @@ as the repository secret `SLACK_WEBHOOK_URL`. The channel is baked into the hook
 `SLACK_CHANNEL_ID` is ignored on this path. Treat the URL as a credential — anyone
 holding it can post to that channel.
 
-**Bot token.** Create a Slack app with the `chat:write` bot scope, install it, and
-invite it to the channel (`/invite @your-app`). Add the bot token as the repository
-secret `SLACK_BOT_TOKEN` and the channel ID (e.g. `C0123456789`, from the channel's
-*View channel details*) as the repository variable `SLACK_CHANNEL_ID`.
+**Bot token (not wired into the scheduled workflow).** Create a Slack app with the
+`chat:write` bot scope, install it, and invite it to the channel (`/invite @your-app`).
+For a local run, set `SLACK_BOT_TOKEN` and `SLACK_CHANNEL_ID` (e.g. `C0123456789`, from
+the channel's *View channel details*). To use this path in CI, also pass the token from
+a repository secret and the channel ID from a repository variable in the workflow's
+`env` block; setting them in repository settings alone is not enough.
 
 The workflow's `GITHUB_TOKEN` covers the GitHub side; no PAT is needed.
 
 ## Configuration
 
-Everything is read from the environment, so it can be changed either in the workflow
-file or from **Settings → Secrets and variables → Actions** without a commit.
+Everything is read from the environment. Values already passed by the workflow can be
+changed under **Settings → Secrets and variables → Actions**; other values first need
+to be wired into the workflow.
 
 | Env var | Repo variable | Default | Meaning |
 |---|---|---|---|
 | `SLACK_WEBHOOK_URL` | secret of the same name | — | Incoming-webhook URL; takes precedence |
-| `SLACK_BOT_TOKEN` | secret of the same name | — | Slack bot token (`chat:write`) |
-| `SLACK_CHANNEL_ID` | `SLACK_CHANNEL_ID` | — | Channel to post into (bot-token path only) |
+| `SLACK_BOT_TOKEN` | not wired; add a secret reference to the workflow | — | Slack bot token (`chat:write`) |
+| `SLACK_CHANNEL_ID` | not wired; add a variable reference to the workflow | — | Channel to post into (bot-token path only) |
 | `SLACK_MENTION_GROUP_ID` | `PR_REMINDER_SLACK_GROUP_ID` | see workflow | Who to ping: a user group ID, or `here`/`channel`/`everyone`; empty pings nobody |
 | `MAX_PRS` | `PR_REMINDER_MAX_PRS` | `10` | How many PRs to list |
 | `STALE_HOURS` | `PR_REMINDER_STALE_HOURS` | `24` | Inactivity threshold, in hours |

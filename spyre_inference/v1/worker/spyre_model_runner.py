@@ -1421,9 +1421,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
-        happen here. Integer tensors only, tens of KB -- which is why this
-        once-per-step pack is cheap where a per-layer gather of the activations is
-        not.
+        happen here. The `input_ids` path packs only integer tensors (tens of KB),
+        avoiding a per-layer activation gather. Multimodal pooling with only
+        `inputs_embeds` instead copies the floating-point embeddings to CPU,
+        expands them there and converts the grid back to the original device.
 
         ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths, which
         attention's mask needs.

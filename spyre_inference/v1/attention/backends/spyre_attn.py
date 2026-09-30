@@ -1154,9 +1154,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     read by indirect access, indexing the dense tensor with a device-resident
     page index. No gather masks.
 
-    reshape_and_cache is always compiled; the per-page attention loop is compiled
-    under STOCK_TORCH_COMPILE, with its page count passed as an argument, and runs
-    eagerly otherwise.
+    reshape_and_cache is always compiled; this token-major backend compiles the
+    per-page attention loop under STOCK_TORCH_COMPILE, with its page count passed
+    as an argument, and runs it eagerly otherwise. The head-major subclass always
+    compiles its attention kernels, including under --enforce-eager.
     """
 
     def __init__(

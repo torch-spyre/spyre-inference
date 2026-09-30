@@ -16,7 +16,7 @@
 Post a daily Slack reminder listing the stalest open pull requests.
 
 Open PRs with no activity within STALE_HOURS are sorted oldest-activity-first and
-the top MAX_PRS are posted to SLACK_CHANNEL_ID.
+the top MAX_PRS are posted to the configured Slack destination.
 
 Posting needs either SLACK_WEBHOOK_URL, or SLACK_BOT_TOKEN plus SLACK_CHANNEL_ID.
 

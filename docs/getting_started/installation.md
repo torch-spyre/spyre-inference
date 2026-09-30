@@ -28,7 +28,7 @@ This command will:
 After installation, verify the plugin is correctly installed:
 
 ```bash
-python -c "import spyre_inference; print(spyre_inference.__version__)"
+uv run --no-sync python -c "import spyre_inference; print(spyre_inference.__version__)"
 ```
 
 ## Troubleshooting

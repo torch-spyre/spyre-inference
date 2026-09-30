@@ -39,10 +39,10 @@ jobs:
 
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Posting needs EITHER the SLACK_WEBHOOK_URL secret (channel is fixed by
-      # the hook) OR the SLACK_BOT_TOKEN secret plus the SLACK_CHANNEL_ID
-      # variable. The webhook wins when both are set. Everything below is
-      # optional and falls back to the defaults shown.
+      # This workflow uses the SLACK_WEBHOOK_URL secret (channel fixed by the hook).
+      # The script's bot-token path also needs SLACK_BOT_TOKEN and SLACK_CHANNEL_ID,
+      # which are not passed here. The tuning variables below are optional and
+      # fall back to the defaults shown.
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SLACK_MENTION_GROUP_ID: ${{ vars.PR_REMINDER_SLACK_GROUP_ID || 'S0BKBNPFP0W' }}
       MAX_PRS: ${{ vars.PR_REMINDER_MAX_PRS || '10' }}

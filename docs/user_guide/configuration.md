@@ -96,8 +96,10 @@ The choice is made once per step from the step's metadata, before the forward, a
 runner counts it in `spyre_encoder_rect_steps` / `spyre_encoder_ragged_steps`. The
 ragged path always runs behind the opaque attention op. When compiled and the head size
 fills whole 64-element sticks, the rectangular path is traced into the block graph
-instead, so each rectangle is its own block graph; otherwise (eager, or a sub-stick
-head size such as granite-30m's 32) both paths stay opaque and share one block graph.
+instead, so each rectangle is its own block graph. In eager mode both paths stay
+opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
+both paths opaque, sharing one block graph. Pooling models such as granite-30m
+pad their native 32-wide heads to 64 before construction.
 
 Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
 opaque, the first attention call in it traces every declared rectangle and group pair,

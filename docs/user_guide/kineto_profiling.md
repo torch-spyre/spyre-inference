@@ -102,12 +102,13 @@ python -c "import torch; print(torch.__version__)"
 ```
 
 The real signal is that the AIUPTI backend is linked into
-`torch_spyre/_C.so`. Four checks — all four must pass:
+`torch_spyre/_C.so`. Check the link, symbols, and a produced trace; wheel size
+is historical context, not a reliable pass/fail check:
 
 ```bash
 SO=$(python -c "import torch_spyre, os; print(os.path.join(os.path.dirname(torch_spyre.__file__), '_C.so'))")
 
-# 1. Wheel size — profiler-enabled build is ~5× bigger (~77 MB vs ~15 MB).
+# 1. Size only for context: these historical sizes no longer distinguish builds.
 ls -la "$SO"
 
 # 2. libaiupti actually linked.

@@ -42,7 +42,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
-    _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
@@ -160,8 +159,8 @@ def _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len):
 def _dispatch_batched(impl, builder, kv_cache, bucket):
     """``_dispatch`` for the batched decode kernel.
 
-    The page budget is unbounded: real dispatch has no such check, so this traces
-    whatever the bucket realizes onto, the way a request would.
+    The recorder's page budget is unbounded so this traces whatever the bucket realizes
+    onto, the way a request would; ``forward`` still applies dispatch's own page bound.
     """
     impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
@@ -466,6 +465,18 @@ class TestRecordGraphs:
         assert "every shape will compile on first use" in caplog.text
 
 
+@pytest.mark.parametrize("num_blocks", [1, 2, 4])
+def test_one_token_variant_records_the_per_seq_kernel(builder, monkeypatch, num_blocks):
+    """Per-seq variants are built with the batched path off, so recording the one-token
+    variant runs the per-seq loop rather than the batched decode kernel."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+
+    metadata = builder.build_for_variant(SpyreAttnBucket(num_blocks, 1))
+
+    assert metadata.padded_num_seqs is None
+
+
 class TestRecompileLimit:
     def test_limit_is_raised_during_recording_and_restored(self, impl, kv_cache, builder):
         """Dynamo's accumulated limit is global, so more buckets than it allows would
@@ -722,7 +733,7 @@ class TestRecordBatchedDecode:
             for v in bucketer.batched_decode_variants()
         }
 
-        for num_seqs in (_MIN_BATCHED_SEQS, _MIN_BATCHED_SEQS + 1):
+        for num_seqs in (1, 2):
             for kv_len in (65, 200):
                 metadata = _padded_mask_metadata(
                     [(1, kv_len)] * num_seqs,

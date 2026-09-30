@@ -33,8 +33,9 @@ class _Embedding(SpyreTokenTypeEmbedding):
 
 
 def _segment_ids(embedding: _Embedding, input_ids: torch.Tensor) -> torch.Tensor:
-    """The segment ids the embedding actually consumes for ``input_ids``."""
-    return embedding.spyre_token_type_embeddings(input_ids)[:, 0].to(torch.int64)
+    """The segment ids the embedding forward resolves, then gathers."""
+    token_type_ids = embedding.spyre_token_type_ids_for(input_ids)
+    return embedding.token_type_embeddings(token_type_ids)[:, 0].to(torch.int64)
 
 
 def test_padded_segment_ids_are_zero_extended():

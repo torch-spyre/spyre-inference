@@ -51,11 +51,6 @@ logger = init_logger(__name__)
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
 
-# Batches below this fall back to the per-seq loop: the batched matmul's
-# padded-row overhead exceeds the per-seq cost at small N. So the num_seqs ladder
-# starts here -- smaller batches never dispatch to a batched variant.
-_MIN_BATCHED_SEQS = 4
-
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
 
@@ -212,18 +207,14 @@ class SpyreAttnBucketer:
                 block_size,
             )
 
-        # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
-        # batch sizes the batched decode kernel can be asked for.
+        # Default: powers of two up to max_num_seqs, the batch sizes the batched
+        # decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = (
-            _resolve_buckets(
-                envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-                max_num_seqs,
-                "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
-            )
-            if max_num_seqs >= _MIN_BATCHED_SEQS
-            else []
+        self._num_seqs_buckets: list[int] = _resolve_buckets(
+            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+            max_num_seqs,
+            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+            lambda: list(_powers_of_two_up_to(max_num_seqs)),
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by

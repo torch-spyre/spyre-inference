@@ -52,11 +52,25 @@ class CompileOutermost:
     false positive, so it opts out instead of being allowlisted from the outside.
     """
 
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.arm_outer_compile()
+
+    def arm_outer_compile(self) -> None:
+        """Sample compile mode while the vLLM config context is live.
+
+        Idempotent. ``SpyreTokenTypeModel`` retypes an already-built embedding,
+        so this ``__init__`` never ran for that instance; the model constructor
+        calls this after the class swap, which is still inside construction.
+        """
+        if "spyre_compile_enabled" in self.__dict__:
+            return
         mode = get_cached_compilation_config().mode
         self.spyre_compile_enabled = mode is not CompilationMode.NONE
-        self.spyre_compiled_kernel: Callable | None = None
+        self.spyre_compiled_kernel = None
 
 
 def maybe_compile(method: F | None = None, *, force: bool = False) -> F:

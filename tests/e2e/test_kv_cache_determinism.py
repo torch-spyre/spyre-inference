@@ -219,8 +219,8 @@ def test_logprobs_do_not_depend_on_the_padded_blocks(monkeypatch: pytest.MonkeyP
         )
 
 
-# _MIN_BATCHED_SEQS is 4, and prefills serialise (SPYRE_MAX_NUM_PARTIAL_PREFILLS defaults to
-# 1), so the batch only fills up once every prompt has prefilled -- hence more tokens here.
+# Prefills serialise (SPYRE_MAX_NUM_PARTIAL_PREFILLS defaults to 1), so the batch only fills
+# up once every prompt has prefilled -- hence more tokens here.
 _BATCH_NUM_SEQS = 4
 _BATCH_MAX_TOKENS = 8
 # Short like `_PROBE_PROMPT`, and distinct so a leak carries a neighbour's KV rather than a
@@ -237,11 +237,7 @@ def test_logprobs_do_not_depend_on_earlier_requests_in_a_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The same batch twice, with other requests in between, while decode is batched."""
-    from spyre_inference.v1.attention.spyre_attn_bucketer import _MIN_BATCHED_SEQS
-
     assert len(_BATCH_PROBE_PROMPTS) == _BATCH_NUM_SEQS
-    # Below the threshold the batch takes the per-seq loop, and this tests nothing batched.
-    assert _BATCH_NUM_SEQS >= _MIN_BATCHED_SEQS
     _assert_fits_prefill([*_BATCH_PROBE_PROMPTS, _DIRTY_PROMPT])
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")

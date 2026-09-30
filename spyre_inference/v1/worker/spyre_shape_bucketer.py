@@ -313,6 +313,11 @@ def encoder_dense_row_indices(query_lens: Sequence[int], len_bucket: int) -> tor
     return packed + torch.repeat_interleave(shifts, lens)
 
 
+def encoder_cls_rows(num_seqs: int, extent: int) -> list[int]:
+    """CLS row of each sequence in a rectangular grid: sequence ``i`` starts at ``i * extent``."""
+    return [seq_idx * extent for seq_idx in range(num_seqs)]
+
+
 def expand_packed_to_encoder_grid(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
@@ -320,11 +325,14 @@ def expand_packed_to_encoder_grid(
     batch_bucket: int,
     len_bucket: int,
     pad_token_id: int = 0,
+    position_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad each sequence to ``L`` and the batch to ``B``; return two ``[B*L]`` tensors.
 
     Real pad tokens continue positions from the true length. Batch-pad sequences are
-    ``pad_token_id`` with positions ``0 .. L-1``.
+    ``pad_token_id`` with positions ``0 .. L-1``. ``position_offset`` is RoBERTa's
+    ``padding_idx + 1``, added here while the values are still a Python list so the
+    embedding gather never round-trips them through the host.
     """
     if len(query_lens) > batch_bucket:
         raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
@@ -340,14 +348,16 @@ def expand_packed_to_encoder_grid(
     for seq_idx, length in enumerate(query_lens):
         dst = seq_idx * len_bucket
         padded_ids[dst : dst + length] = id_list[src : src + length]
-        padded_pos[dst : dst + length] = pos_list[src : src + length]
+        padded_pos[dst : dst + length] = [
+            int(pos) + position_offset for pos in pos_list[src : src + length]
+        ]
         for offset in range(length, len_bucket):
-            padded_pos[dst + offset] = offset
+            padded_pos[dst + offset] = offset + position_offset
         src += length
     for seq_idx in range(len(query_lens), batch_bucket):
         dst = seq_idx * len_bucket
         for offset in range(len_bucket):
-            padded_pos[dst + offset] = offset
+            padded_pos[dst + offset] = offset + position_offset
     return (
         torch.tensor(padded_ids, dtype=input_ids.dtype),
         torch.tensor(padded_pos, dtype=positions.dtype),
@@ -365,7 +375,7 @@ def expand_packed_token_types(
     One value per packed token, so it takes the same layout as ``input_ids``. Left packed
     it would pair each sequence's segment ids with another sequence's tokens, and
     silently: the buffer still matches ``input_ids`` in shape, so the all-zeros fallback
-    in ``spyre_token_type_embeddings`` never fires.
+    in ``spyre_token_type_ids_for`` never fires.
     """
     values = token_type_ids.tolist()
     grid = [0] * (batch_bucket * len_bucket)

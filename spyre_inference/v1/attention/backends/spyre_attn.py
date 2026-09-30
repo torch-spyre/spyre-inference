@@ -51,7 +51,6 @@ from spyre_inference.v1.attention.ops.layout import (
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
-    _MIN_BATCHED_SEQS,
     SpyreAttnBatchedDecodeBucket,
     SpyreAttnBucket,
     SpyreAttnBucketer,
@@ -712,6 +711,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         common_prefix_len: int,
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
+        per_seq_only: bool = False,
     ) -> SpyreAttentionMetadata:
         """Build attention metadata from common metadata."""
 
@@ -917,7 +917,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
         decode_uniformity = 0.0
-        if envs.SPYRE_BATCHED_DECODE and num_decode_seqs >= _MIN_BATCHED_SEQS:
+        if not per_seq_only and envs.SPYRE_BATCHED_DECODE and num_decode_seqs > 0:
             # Real counts for the decode prefix only — same reasoning as before.
             blocks_per_seq = real_num_blocks if active_block_indices is None else num_active
 
@@ -1023,7 +1023,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         )
 
     def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
-        """Metadata for the one-sequence batch that dispatches to ``bucket``."""
+        """Metadata for the one-sequence batch that runs ``bucket`` through the per-seq loop.
+
+        A variant stands for every request of its shape, prefill or decode alike: the loop
+        picks its kernel by query width and block count alone.
+        """
         query_len = self._attn_bucketer.min_real_query_len(bucket.padded_query_len)
         kv_len = bucket.num_blocks * self.block_size
         assert query_len <= kv_len, f"{bucket} pairs a query length no sequence can reach"
@@ -1042,8 +1046,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
                 slot_mapping=torch.zeros(query_len, dtype=torch.int64),
                 causal=True,
-                is_prefilling=torch.tensor([query_len > 1]),
             ),
+            per_seq_only=True,
         )
 
     def build_for_batched_decode_variant(
@@ -1289,9 +1293,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _batched_decode_supported(self) -> bool:
         """The batch-independent preconditions, so the warmup recorder can share them."""
-        # Batches below _MIN_BATCHED_SEQS take the per-seq loop regardless: the
-        # num_seqs ladder starts there, so they have no batched variant to
-        # dispatch to. Set SPYRE_BATCHED_DECODE=0 to force the loop for all sizes.
+        # Set SPYRE_BATCHED_DECODE=0 to force the per-seq loop for all sizes.
         if not envs.SPYRE_BATCHED_DECODE:
             return False
         # Under the tiled walk, batched decode is validated only where the backend
@@ -1309,11 +1311,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Whether batched decode may run under the tiled walk; overridable."""
         return False
 
-    def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
+    def _batched_decode_preconditions_met(
+        self, attn_metadata: "SpyreAttentionMetadata", num_pages: int
+    ) -> bool:
         if not self._batched_decode_supported():
             return False
         # Layer 0's builder gates on the decode count and the bucket lattice.
         if attn_metadata.padded_num_seqs is None:
+            return False
+        assert attn_metadata.blocks_per_chunk is not None
+        # The recorder's bound: a gather of the whole cache faults the device
+        # (torch-spyre#4033), so warmup skips these variants and the per-seq loop serves them.
+        if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
             return False
         return attn_metadata.decode_uniformity >= _BATCHED_DECODE_MIN_UNIFORMITY
 
@@ -1352,7 +1361,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # layers whose impl can actually use the batched kernel (skips ALiBi
         # layers, eager attention and, under the tiled walk, the token-major layout).
         if (
-            self._batched_decode_preconditions_met(attn_metadata)
+            self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and attn_metadata.rep_row_ids_dev is None
         ):
             self._mirror_batched_decode_indices(attn_metadata, _target_device)
@@ -1860,7 +1869,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
-        if self._batched_decode_preconditions_met(attn_metadata):
+        if self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
             self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
             if num_decode_seqs == num_seqs:
                 return output

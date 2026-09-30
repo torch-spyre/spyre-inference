@@ -32,6 +32,7 @@ from vllm.model_executor.models.bert import (
     BertSpladeSparseEmbeddingModel,
 )
 
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
@@ -42,8 +43,12 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-class SpyreBertEmbedding(SpyreTokenTypeEmbedding, BertEmbedding):
-    """``BertEmbedding`` reading segment ids from the side buffer."""
+class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbedding):
+    """``BertEmbedding`` reading segment ids from the side buffer.
+
+    One compiled forward: the word, segment, and position tables and the
+    layer norm inline into it.
+    """
 
     def forward(
         self,
@@ -51,11 +56,27 @@ class SpyreBertEmbedding(SpyreTokenTypeEmbedding, BertEmbedding):
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # Copy segment ids out of the side buffer and pass that tensor into the compiled gather.
+        return self._compiled_forward(
+            input_ids,
+            position_ids,
+            self.spyre_token_type_ids_for(input_ids),
+            inputs_embeds,
+        )
+
+    @maybe_compile
+    def _compiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         embeddings = (
             inputs_embeds
-            + self.spyre_token_type_embeddings(input_ids)
+            + self.token_type_embeddings(token_type_ids)
             + self.position_embeddings(position_ids)
         )
         return self.LayerNorm(embeddings)

@@ -100,9 +100,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
-    # When "1" (default), enables the batched multi-sequence decode kernel for
-    # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
-    # per-seq loop either way. Under the default tiled walk it applies only to the
+    # When "1" (default), enables the batched multi-sequence decode kernel.
+    # Under the default tiled walk it applies only to the
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),

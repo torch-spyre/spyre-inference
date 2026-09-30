@@ -1653,8 +1653,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):
             extent, _width, query_lens = grid
-            # SpyreCLSPool.forward reads these rows off this step's metadata.
-            cast(Any, pooling_metadata).spyre_cls_rows = torch.tensor(
+            pooling_metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(
                 encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
             )
         else:

@@ -292,7 +292,7 @@ def test_rectangular_cls_matches_unpad_then_gather():
     packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
     cls = SpyreCLSPool()
     from_unpad = cls(packed, metadata)
-    metadata.spyre_cls_rows = torch.tensor(
+    metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(
         encoder_cls_rows(len(query_lens), extent), dtype=torch.int64
     )
     from_grid = cls(hidden, metadata)

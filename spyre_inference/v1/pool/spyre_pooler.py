@@ -161,19 +161,16 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
 class SpyreCLSPool(CLSPool):
     """CLS via ``index_select`` (keeps upstream ``isinstance`` checks).
 
-    On a rectangle the runner sets ``pooling_metadata.spyre_cls_rows``
-    (sequence ``i`` at row ``i * extent``) and skips the unpad gather.
-    Packed steps leave it unset and this reads the cursor.
+    Reads ``first_token_indices_gpu``, which the runner builds on the host. On a
+    rectangle the runner sets it to the grid rows (sequence ``i`` at row
+    ``i * extent``) and skips the unpad gather.
     """
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         if cursor.is_partial_prefill():
             raise RuntimeError("partial prefill is not supported with CLS pooling")
-        base = getattr(pooling_metadata, "spyre_cls_rows", None)
-        if not isinstance(base, torch.Tensor):
-            base = cursor_row_indices_cpu(cursor, last=False)
-        idx, n_rows = pad_row_count_to_bucket(base)
+        idx, n_rows = pad_row_count_to_bucket(cursor.first_token_indices_gpu.cpu())
         pooled = select_rows(hidden_states, idx)
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 

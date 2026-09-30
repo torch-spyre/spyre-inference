@@ -75,6 +75,27 @@ git status --short
 git diff origin/main...HEAD --stat
 ```
 
+### Environment files
+
+`uv.lock`, `pyproject.toml` and `spyre-rpms.lock` define the environment everyone
+builds. Leave them out of the PR unless changing the environment is the point of it
+(a dependency bump, a new dependency the code actually imports). They mostly change by
+accident: a plain `uv lock` / `uv sync` / `uv add` re-resolves the lockfile, and local
+pin experiments leak into `pyproject.toml`.
+
+```bash
+git diff origin/main...HEAD --stat -- uv.lock pyproject.toml spyre-rpms.lock
+```
+
+If that lists anything the change does not need, restore it from main:
+
+```bash
+git checkout origin/main -- uv.lock   # likewise for the other two
+```
+
+If the change does need one of them, keep that diff minimal (no unrelated transitive
+bumps from a re-resolve) and say in the PR body why it changed.
+
 ## 4. Format and verify
 
 ```bash

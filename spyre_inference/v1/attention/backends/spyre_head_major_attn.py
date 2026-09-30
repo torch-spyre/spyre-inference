@@ -89,6 +89,7 @@ compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kern
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
+_INLINE_DECODE_MAX_SEQS = 4
 
 
 def _lx_max_cores(output_units: int) -> int:
@@ -242,6 +243,16 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _tiled_batched_decode_supported(self) -> bool:
         # The split index below uploads one page ID per stick.
         return True
+
+    inline_decode_kernel = staticmethod(batched_decode_head_major_kernel)
+
+    def inline_batched_decode(self, b_seqs: int, blocks_per_chunk: int) -> bool:
+        # Larger batches plan no better fused than apart (torch-spyre#4990). A sencores
+        # cap would also cap the block's matmuls, so capped variants stay opaque.
+        return (
+            b_seqs <= _INLINE_DECODE_MAX_SEQS
+            and _lx_max_cores(b_seqs * blocks_per_chunk * self.num_kv_heads) == 0
+        )
 
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device

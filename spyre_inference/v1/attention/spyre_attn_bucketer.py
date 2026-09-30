@@ -54,7 +54,7 @@ _DEFAULT_QUERY_BUCKET_STEP = 512
 # Batches below this fall back to the per-seq loop: the batched matmul's
 # padded-row overhead exceeds the per-seq cost at small N. So the num_seqs ladder
 # starts here -- smaller batches never dispatch to a batched variant.
-_MIN_BATCHED_SEQS = 4
+_MIN_BATCHED_SEQS = 1
 
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32

@@ -740,3 +740,18 @@ class TestRecordBatchedDecode:
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+
+
+def test_one_token_variant_is_recorded_on_the_per_seq_path(builder, monkeypatch):
+    """With batched decode on at every batch size, a one-token decode never reaches the
+    per-seq kernel; a prefill's one-token tail does, so that is the batch to record."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+    bucketer = builder._attn_bucketer = make_bucketer()
+    num_blocks = bucketer.num_blocks_buckets[0]
+
+    metadata = builder.build_for_variant(SpyreAttnBucket(num_blocks, 1))
+
+    assert metadata.aligned_query_lens == [1]
+    assert metadata.num_decode_seqs == 0
+    assert metadata.padded_num_seqs is None

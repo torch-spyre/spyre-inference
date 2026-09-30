@@ -269,23 +269,15 @@ class TestVariants:
         assert len(b.variants()) < 500
 
     def test_num_seqs_buckets_ladder_from_min_batched_to_max_num_seqs(self):
-        """Below _MIN_BATCHED_SEQS a batch takes the per-seq loop, so the ladder
-        starts there rather than at 1, and tops out at max_num_seqs."""
-        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [4, 8]
-        assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [4, 6]
+        """The ladder starts at _MIN_BATCHED_SEQS and tops out at max_num_seqs."""
+        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [1, 2, 4, 8]
+        assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [1, 2, 4, 6]
 
-    @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
-    def test_num_seqs_buckets_empty_below_min_batched(self, max_num_seqs, monkeypatch):
-        """Clamping down to max_num_seqs would enumerate a variant build() declines,
-        so the axis stays empty -- an explicit override included."""
+    @pytest.mark.parametrize("max_num_seqs, expected", [(1, [1]), (2, [1, 2]), (3, [1, 2, 3])])
+    def test_num_seqs_buckets_at_small_max_num_seqs(self, max_num_seqs, expected):
         b = SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs))
-        assert b.num_seqs_buckets == []
-        assert b.batched_decode_variants() == []
-        assert b.find_sequence_bucket(max_num_seqs) is None
-
-        monkeypatch.setenv("SPYRE_ATTN_NUM_SEQS_BUCKETS", str(max_num_seqs))
-        envs.clear_env_cache()
-        assert SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs)).num_seqs_buckets == []
+        assert b.num_seqs_buckets == expected
+        assert b.find_sequence_bucket(max_num_seqs) == max_num_seqs
 
     def test_num_blocks_buckets_follow_the_kv_buckets(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")

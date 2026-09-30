@@ -182,10 +182,10 @@ def _rows_reaching_gemm(gate_up, x, monkeypatch):
 @pytest.mark.mlp
 @pytest.mark.parametrize(
     ("num_tokens", "expected_rows"),
-    [(1, 8), (4, 8), (7, 8), (8, 8), (9, 9), (64, 64)],
+    [(1, 8), (2, 2), (4, 4), (7, 7), (8, 8), (64, 64)],
 )
 def test_short_rows_padded_on_gate_up(tp_group, monkeypatch, num_tokens, expected_rows):
-    """A partial row block reaches the GEMM padded to `_PAD_ROWS`; a full one is untouched."""
+    """Only a single row reaches the GEMM padded to `_PAD_ROWS`; wider blocks are untouched."""
     from spyre_inference.custom_ops.linear import (
         SpyrePaddedRowsLinearMethod,
         SpyreUnquantizedLinearMethod,

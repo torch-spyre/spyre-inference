@@ -410,7 +410,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         static_ctx = vllm_config.compilation_config.static_forward_context
         own_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
-        self._slot_mapping = attn_layer.install(own_layers)
+        self._slot_mapping, self._decode_grid = attn_layer.install(own_layers)
         # Imported here, not at module scope: spyre_encoder_attn imports this module.
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import install_encoder
 
@@ -991,7 +991,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     .contiguous()
                 )
 
-        return SpyreAttentionMetadata(
+        metadata = SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_seqs=common_attn_metadata.num_reqs,
             max_query_len=max_query_len,
@@ -1019,6 +1019,8 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
         )
+        self._decode_grid.publish(metadata)
+        return metadata
 
     def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
         """Metadata for the one-sequence batch that dispatches to ``bucket``."""
@@ -1040,7 +1042,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
                 slot_mapping=torch.zeros(query_len, dtype=torch.int64),
                 causal=True,
-                is_prefilling=torch.tensor([query_len > 1]),
+                # Even at one token: a one-token decode takes the batched kernel, so the
+                # per-seq loop sees that width only as a prefill's one-token tail.
+                is_prefilling=torch.tensor([True]),
             ),
         )
 
@@ -1078,6 +1082,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             "not be the one dispatch reaches"
         )
         return metadata
+
+    @property
+    def inlines_decode(self) -> bool:
+        return self._decode_grid.inline
+
+    def publish_decode_warmup_variant(
+        self, bucket: SpyreAttnBatchedDecodeBucket
+    ) -> tuple[int, int, int] | None:
+        """The key a pure-decode step at ``bucket`` publishes via build(), or None if opaque."""
+        metadata = self.build_for_batched_decode_variant(bucket)
+        if self._decode_grid.mask is None:
+            return None
+        assert metadata.padded_num_seqs is not None and metadata.blocks_per_chunk is not None
+        assert metadata.chunk_page_ids_cpu is not None
+        return (
+            metadata.padded_num_seqs,
+            metadata.blocks_per_chunk,
+            metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
+        )
 
 
 class SpyreAttentionBackend(AttentionBackend):
@@ -1304,6 +1327,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Whether batched decode may run under the tiled walk; overridable."""
         return False
 
+    inline_decode_kernel = None
+
+    def inline_batched_decode(self, b_seqs: int, blocks_per_chunk: int) -> bool:
+        return False
+
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
         if not self._batched_decode_supported():
             return False
@@ -1343,9 +1371,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
         # and upstream's own unified_kv_cache_update op covers the rest.
 
-        # Mirror batched-decode precomputes to device once per step, only for
-        # layers whose impl can actually use the batched kernel (skips ALiBi
-        # and soft-cap layers).
+        # build() mirrors these for the layers attn_layer splits; this covers the rest.
         if (
             self._batched_decode_preconditions_met(attn_metadata)
             and attn_metadata.rep_row_ids_dev is None

@@ -38,8 +38,8 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
-# torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
-# full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
+# torch-spyre#4032: on some weight shapes a single row runs well below the rate a full
+# 8 PT rows sustain. Two or more rows run faster unpadded, so only one row is padded.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
@@ -55,17 +55,17 @@ def spyre_linear_t(
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
 
-    ``pad_rows`` pads a short 2-D row block up to ``_PAD_ROWS`` and slices it
+    ``pad_rows`` pads a single-row 2-D block up to ``_PAD_ROWS`` and slices it
     back (torch-spyre#4032). Callers that must not pad leave it off.
     """
-    rows = x.shape[0] if pad_rows and x.dim() == 2 else 0
-    if 0 < rows < _PAD_ROWS:
-        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    one_row = pad_rows and x.dim() == 2 and x.shape[0] == 1
+    if one_row:
+        x = F.pad(x, (0, 0, 0, _PAD_ROWS - 1))
     out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
-    if 0 < rows < _PAD_ROWS:
-        out = out[:rows]
+    if one_row:
+        out = out[:1]
     return out
 
 
@@ -146,7 +146,7 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
 
 
 class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
-    """Pads a partial row block to `_PAD_ROWS`; set on every merged-column layer."""
+    """Pads a single-row block to `_PAD_ROWS`; set on every merged-column layer."""
 
     def _pads(self, layer: torch.nn.Module) -> bool:
         return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT
@@ -158,7 +158,7 @@ class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
         super().process_weights_after_loading(layer)
         if self._pads(layer):
             logger.warning_once(
-                "%s: short row blocks padded to %d rows (torch-spyre#4032) "
+                "%s: single-row blocks padded to %d rows (torch-spyre#4032) "
                 "expect numerical differences to upstream vLLM.",
                 layer.__class__.__name__,
                 _PAD_ROWS,

@@ -1637,8 +1637,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Build the cursor on CPU: upstream does ``cumsum[1:] - 1`` for
         # last_token_indices; that offset-1 view is not stick-aligned on
-        # Spyre (copy_from_d2d fails). SpyreCLS/Last only read host
-        # ``num_scheduled_tokens_cpu`` via cursor_row_indices_cpu.
+        # Spyre (copy_from_d2d fails). So the ``*_gpu`` fields here are host
+        # tensors, despite the name, and the Spyre pools read them as such.
+        # A Spyre-specific PoolingMetadata (like SpyreAttentionMetadata) would
+        # make that explicit.
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs]
         pooling_metadata = self.input_batch.get_pooling_metadata()
         pooling_metadata.build_pooling_cursor(
@@ -1650,6 +1652,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         hidden_states = convert(hidden_states, self._spyre_device)
         # CLS on a rectangle already has its row at ``seq_idx * extent``. Skipping
         # the unpad gather leaves LAST/MEAN on the packed layout they index.
+        # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):
             extent, _width, query_lens = grid

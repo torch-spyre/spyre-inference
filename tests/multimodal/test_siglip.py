@@ -16,7 +16,7 @@
 
 
 `patch_siglip_vision_embeddings` uses class-level patching for consistency with
-the other granite vision modules (patch_blip2_qformer_attention, etc.).  It
+the other granite vision modules (see granite4_vision.py).  It
 replaces `SiglipVisionEmbeddings.forward` once and pins position buffers to CPU
 per-instance.  The staleness tripwire, embedding-buffer CPU-pin, and
 output-equivalence checks cover the three distinct failure modes:

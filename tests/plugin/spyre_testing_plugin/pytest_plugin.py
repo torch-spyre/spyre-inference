@@ -1110,6 +1110,19 @@ def register_ministral_14b(request, monkeypatch):
 
 
 @pytest.fixture()
+def register_granite_models(request, monkeypatch):
+    """Add our injected granite models to test_granite's MODELS dict.
+
+    0.29 turned test_granite's MODELS into a dict (model -> min transformers version)
+    and the test does MODELS[model]; models we inject via param override aren't keys,
+    so add them as unconstrained (None).
+    """
+    models = request.node.module.MODELS
+    for model in ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", "ibm-granite/granite-4.1-3b"):
+        monkeypatch.setitem(models, model, None)
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 
@@ -1137,10 +1150,11 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
-    # layout underneath is token-major, which upstream expresses separately via
-    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view; the physical layout underneath is token-major, which 0.29
+    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
+    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
+    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
+    # physical layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -1158,6 +1172,7 @@ def patch_backend_list(request, monkeypatch):
         sliding_window=None,
         kv_cache_dtype="auto",
         sinks=None,
+        use_cuda_graph=False,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
 
@@ -1194,6 +1209,7 @@ def patch_backend_list(request, monkeypatch):
             sliding_window,
             kv_cache_dtype,
             sinks,
+            use_cuda_graph=use_cuda_graph,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)

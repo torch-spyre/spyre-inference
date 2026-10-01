@@ -42,7 +42,10 @@ def _padded_attn_mask(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`.
+    """Additive `[b, 1, seq_pad, seq_pad]` mask on `device`, from a bool keep-mask.
+
+    `mask` is bool and `True` means "attend"; an additive float mask read as
+    keep/drop would invert the masking, so it is rejected rather than coerced.
 
     O(L²) and shared by every layer, so it is cached on the source mask: one upload
     per image, released with its source.
@@ -57,12 +60,11 @@ def _padded_attn_mask(
     m = torch.zeros(b, 1, seq_pad, seq_pad, dtype=dtype)
     m[:, :, :, seq:] = neg_inf  # padded keys never attended
     mc = convert(mask, "cpu")
-    if mc.dtype == torch.bool:
-        m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
-            ~mc.reshape(seq, seq), neg_inf
-        )
-    else:
-        m[:, :, :seq, :seq] = mc.to(dtype).reshape(seq, seq)
+    if mc.dtype != torch.bool:
+        raise TypeError(f"_padded_attn_mask expects a bool keep-mask, got {mc.dtype}")
+    m[:, :, :seq, :seq] = torch.zeros(seq, seq, dtype=dtype).masked_fill(
+        ~mc.reshape(seq, seq), neg_inf
+    )
 
     m = convert(m, device)
     setattr(mask, _MASK_ATTR, (key, m))

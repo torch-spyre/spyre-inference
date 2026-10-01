@@ -22,7 +22,6 @@ implementations by layer class.
 import torch
 
 from . import (
-    blip2,
     clip,
     gemma4_vision,
     granite4_vision,
@@ -51,11 +50,10 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
         if tower_cls == "Gemma4VisionModel":
             gemma4_vision.apply(model, device)
         elif tower_cls == "SiglipVisionModel":
-            # Granite4Vision uses a SigLIP tower. All three patches are
-            # needed together and none apply to any other architecture.
+            # Granite4Vision uses a SigLIP tower. Both patches are needed
+            # together and neither applies to any other architecture.
             siglip.apply(model, device)
             granite4_vision.apply(model, device)
-            blip2.apply(model, device)
         else:
             # Pixtral (mistral-format, VisionTransformer) and Mistral3 HF-format
             # (PixtralHFVisionModel) both need the Pixtral patches. Any tower that

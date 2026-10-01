@@ -21,9 +21,9 @@ Q-Former projector → Granite decoder) runs and produces non-empty text.
 
 Both `enforce_eager` modes are covered:
 - eager: every `maybe_compile` kernel falls through to eager;
-  the three CPU-offload patches (InterpolateDownsampler,
-  _pack_and_unpad_image_features, Blip2QFormerMultiHeadAttention) are the
-  only non-trivial code paths exercised.
+  the two CPU-offload patches (InterpolateDownsampler,
+  _pack_and_unpad_image_features) are the only non-trivial code paths
+  exercised.
 - compiled: the compiled graph is built once per shape and the patches
   must survive the compilation boundary intact.
 """

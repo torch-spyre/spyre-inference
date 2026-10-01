@@ -19,15 +19,28 @@ a typo would leave the architecture resolving to the unadapted vLLM class. These
 tests fail instead: every key is a real vLLM architecture, every value names a
 class that exists and subclasses the one it replaces, and the derivation that
 covers the encoders still finds them.
+
+``_ALIASED_ARCHS`` is checked the other way round. Its keys are architectures vLLM
+does *not* serve, so the assertion is that they stay absent from vLLM's table: one
+appearing there means upstream has landed the mapping and the local entry is now
+shadowing it.
 """
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.registry import _VLLM_MODELS
 
-from spyre_inference.models import _ADAPTED_ARCHS, _ADAPTED_MODULES, register_models
+from spyre_inference.models import (
+    _ADAPTED_ARCHS,
+    _ADAPTED_MODULES,
+    _ALIASED_ARCHS,
+    apply_prelaunch_overrides,
+    register_models,
+)
 from spyre_inference.models import spyre_models as _spyre_models
 
 SPYRE_MODELS = _spyre_models()
@@ -89,3 +102,72 @@ def test_register_models_rejects_an_unknown_arch(monkeypatch):
     monkeypatch.setitem(_ADAPTED_ARCHS, "NotAnArchitecture", "spyre_inference.models.bert:Nope")
     with pytest.raises(RuntimeError, match="NotAnArchitecture"):
         register_models()
+
+
+@pytest.mark.parametrize("arch", sorted(_ALIASED_ARCHS))
+def test_aliased_arch_is_not_one_vllm_already_serves(arch):
+    """An alias vLLM has since added upstream is redundant, and worse than redundant.
+
+    Registering over it would shadow upstream's own mapping with this one, so the
+    entry should be deleted when the vLLM pin advances past its landing.
+    """
+    assert arch not in _VLLM_MODELS, (
+        f"vLLM now registers {arch} itself; drop it from _ALIASED_ARCHS"
+    )
+
+
+@pytest.mark.parametrize("arch", sorted(_ALIASED_ARCHS))
+def test_aliased_arch_resolves_to_a_real_model_class(arch):
+    """The lazy ``"module:Class"`` half is unvalidated until vLLM resolves it."""
+    cls = _load(_ALIASED_ARCHS[arch])
+    assert issubclass(cls, torch.nn.Module), f"{cls.__name__} is not an nn.Module"
+
+
+def test_aliased_archs_are_exempt_from_the_subclass_check():
+    """They subclass nothing of ours, so spyre_models() must not claim them.
+
+    The subclass test above is parametrized over SPYRE_MODELS and would KeyError on
+    _VLLM_MODELS for an architecture vLLM does not know.
+    """
+    assert not set(_ALIASED_ARCHS) & set(SPYRE_MODELS)
+
+
+def test_register_models_installs_the_aliases():
+    register_models()
+    for arch, target in _ALIASED_ARCHS.items():
+        model = ModelRegistry.models[arch]
+        assert f"{model.module_name}:{model.class_name}" == target
+
+
+@pytest.mark.parametrize("arch", sorted(_ALIASED_ARCHS))
+def test_prelaunch_overrides_register_the_aliases_before_modelconfig(arch, monkeypatch):
+    """The registry has to know the arch before ModelConfig validates it.
+
+    ModelConfig checks architectures against the registry while it is built and raises
+    ValidationError ("are not supported for now") on a miss, so registering from the
+    register_ops entry point is too late: that runs after create_model_config. Deleting
+    the register_aliased_archs() call in apply_prelaunch_overrides fails here, which is
+    what the unit tests missed the first time (they called register_models() by hand,
+    proving the table was well-formed but not that anything installs it in time).
+    """
+    monkeypatch.delitem(ModelRegistry.models, arch, raising=False)
+    assert arch not in ModelRegistry.get_supported_archs()
+
+    engine_args = SimpleNamespace(
+        hf_overrides=None,
+        model="unrelated-model",
+        hf_config_path=None,
+        trust_remote_code=False,
+        revision=None,
+        code_revision=None,
+        config_format="auto",
+        hf_token=None,
+        model_impl="auto",
+    )
+    # Non-Param config: the alias registration must not depend on which model is loading.
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_config",
+        lambda *a, **k: SimpleNamespace(model_type="llama"),
+    )
+    apply_prelaunch_overrides(engine_args)
+    assert arch in ModelRegistry.get_supported_archs()

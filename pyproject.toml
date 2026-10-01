@@ -296,6 +296,11 @@ markers = [
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
+    "mlp: Spyre linear-layer tests: merged-column, QKV, row-parallel and replicated layers, and the transposed-weight linear method (tests/custom_ops/test_mlp.py, tests/custom_ops/test_linear.py)",
+    "parallel_lm_head: SpyreParallelLMHead custom-op tests (tests/custom_ops/test_parallel_lm_head.py)",
+    "padding_workaround: LM-head vocab-padding tests for a torch-spyre work-division shape limit (tests/custom_ops/test_parallel_lm_head.py); remove with the workaround",
+    "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
+    "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
     "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
@@ -304,6 +309,7 @@ markers = [
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
     "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
+    "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
 ]
 # --8<-- [end:test-markers-definition]
 

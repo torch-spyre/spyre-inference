@@ -18,20 +18,54 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
+import spyre_inference.v1.sample.sampling_kernels  # noqa: F401
+
+
+def apply_top_k_top_p_sort_free(
+    logits: torch.Tensor, k: torch.Tensor, p: torch.Tensor
+) -> torch.Tensor:
+    """``apply_top_k_top_p_pytorch`` without the full-vocab sort.
+
+    Top-p only ever keeps top-k survivors, so it runs on a ``topk`` window.
+    vllm keeps every token tied with a row's k-th value, and fp16 logits tie
+    there often, so the window carries slack and widens to the exact tie count
+    when ties run past it.
+
+    The logits tensor is updated in-place."""
+    max_k = int(k.max())
+    vocab = logits.shape[1]
+    if max_k >= vocab:
+        return apply_top_k_top_p_pytorch(logits, k, p)
+    vals, idx = logits.topk(min(2 * max_k, vocab), dim=-1)
+    kth = vals.gather(1, k.long().unsqueeze(1) - 1)
+    if (vals[:, -1:] == kth).any():
+        vals, idx = logits.topk(int((logits >= kth).sum(dim=-1).max()), dim=-1)
+    vals.masked_fill_(vals < kth, -float("inf"))
+    # Upstream's top-p, on the ascending order it sorts into.
+    vals, idx = vals.flip(-1), idx.flip(-1)
+    probs_sum = vals.softmax(dim=-1).cumsum_(dim=-1)
+    top_p_mask = probs_sum <= 1 - p.unsqueeze(dim=1)
+    top_p_mask[:, -1] = False
+    vals.masked_fill_(top_p_mask, -float("inf"))
+    return logits.fill_(-float("inf")).scatter_(1, idx, vals)
+
 
 class SpyreTopKTopPSampler(TopKTopPSampler):
-    """Sort-free top-k plus a log-space Gumbel draw for random sampling.
+    """Sort-free top-k plus a fused Gumbel-max draw for random sampling.
 
     Upstream only takes the sort-free top-k path under ``allow_cpu_sync`` (CPU
     platform only); Spyre D2Hs logits before sampling, so that host-device sync
-    is free and the full-vocab sort it otherwise runs is pure waste. We also
-    draw in log space -- ``argmax(softmax(x)/q) == argmax(x - log q)`` for
-    ``q ~ Exp(1)`` -- which skips the softmax on the hot path. That draw is why
-    ``forward_native`` reimplements upstream's tail rather than delegating to
-    ``super()`` (which would softmax + ``random_sample``). Top-p still sorts.
+    is free and the full-vocab sort it otherwise runs is pure waste. Top-p
+    combined with top-k skips the sort too (``apply_top_k_top_p_sort_free``);
+    top-p alone sorts.
 
-    The two draws are equal in exact arithmetic; in fp32 they can select a
-    different token only on rare near-ties."""
+    The draw runs in vLLM's fused Gumbel-max kernel, reading its noise from a
+    fixed 2^20-entry table at a per-row random offset rather than generating a
+    fresh ``[B, V]`` noise tensor. That draw is why ``forward_native``
+    reimplements upstream's tail rather than delegating to ``super()`` (which
+    would softmax + ``random_sample``). ``use_fp64_gumbel`` keeps fresh fp64
+    noise, drawn in log space: ``argmax(softmax(x)/q) == argmax(x - log q)`` for
+    ``q ~ Exp(1)``, which skips the softmax."""
 
     def forward_native(
         self,
@@ -41,19 +75,31 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.28.0) with two
-        # Spyre changes: the sort-free top-k path (allow_cpu_sync=True) and a
-        # log-space Gumbel draw. Re-sync with upstream on a vLLM bump.
-        logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+        # Spyre changes: sort-free top-k (and top-k + top-p) and the fused
+        # Gumbel-max kernel. Re-sync with upstream on a vLLM bump.
+        if k is not None and p is not None:
+            logits = apply_top_k_top_p_sort_free(logits, k, p)
+        else:
+            logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        # Exp(1) noise, generated like upstream random_sample but pinned to fp32
-        # (fp64 under use_fp64_gumbel) independent of the logits dtype, so the
-        # log never runs in fp16 (where small q underflows to 0 -> log = -inf).
-        noise_dtype = torch.float64 if self.use_fp64_gumbel else torch.float32
-        q = torch.empty(logits.shape, dtype=noise_dtype, device=logits.device)
+        if not self.use_fp64_gumbel:
+            # Per-row seeds offset into a precomputed Gumbel table, so the draw
+            # is one pass with no noise tensor; seeded requests stay reproducible.
+            seeds = torch.randint(0, 2**31, (logits.shape[0],), dtype=torch.long)
+            for i, generator in generators.items():
+                seeds[i] = torch.randint(0, 2**31, (1,), generator=generator)
+            return (
+                torch.ops._spyre_C.fused_gumbel_argmax(
+                    logits.float(),  # ty: ignore[invalid-argument-type]
+                    seeds,  # ty: ignore[invalid-argument-type]
+                ),
+                logits_to_return,
+            )
+        q = torch.empty(logits.shape, dtype=torch.float64, device=logits.device)
         if len(generators) != logits.shape[0]:
             q.exponential_()
         for i, generator in generators.items():

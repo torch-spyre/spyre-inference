@@ -2,6 +2,10 @@
 requires = [
   "setuptools>=82",
   "setuptools_scm>=10",
+  # csrc/ host kernels (setup.py). torch must match the runtime pin below: the
+  # extension links libtorch, so an ABI drift fails at import.
+  "cmake>=3.26",
+  "torch==2.13.0",
 ]
 build-backend = "build_backend"
 backend-path  = ["."]
@@ -65,6 +69,18 @@ local_scheme   = "_versioning:ci_local_scheme"
 
 [tool.uv]
 default-groups = ["dev"]
+
+# Rebuild the csrc/ extension when its sources change, not just the metadata files.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/**/*.cmake" },
+    { file = "csrc/**/*.cpp" },
+    { file = "csrc/**/*.hpp" },
+    { file = "csrc/**/*.h" },
+    { git = { commit = true } },
+]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs
 required-environments = [

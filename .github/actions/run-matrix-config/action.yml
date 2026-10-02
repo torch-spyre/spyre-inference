@@ -234,8 +234,18 @@ runs:
         # the declared set.
         export SPYRE_TEST_TIERS="${RAW_TEST_TYPES}"
         echo "Declared SPYRE_TEST_TIERS=${SPYRE_TEST_TIERS:-<unset, falling back to ${SPYRE_TEST_TIER}>}"
-        timeout --signal=TERM --kill-after=1m 90m \
-          make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+        # Tee the test output to PID 1's stdout so the Cloud Logs fluent-bit DaemonSet
+        # (which only reads pod stdout via /var/log/containers) captures it; a plain run:
+        # step's output is intercepted by the runner agent and never reaches pod stdout.
+        # pipefail keeps the make exit code; the guard falls back to file-only in local dev.
+        set -o pipefail
+        if [[ -w /proc/1/fd/1 ]]; then
+          timeout --signal=TERM --kill-after=1m 90m \
+            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml 2>&1 | tee /proc/1/fd/1
+        else
+          timeout --signal=TERM --kill-after=1m 90m \
+            make ${{ inputs.test_target }} COVERAGE=1 JUNIT_XML=junit-${{ inputs.test_target }}.xml
+        fi
         echo "tests done"
 
     # Raw per-process data files; their host/pid suffixes are unique across jobs, so the fan-in's `make coverage` combines them without a per-job step. if-no-files-found=ignore covers configs that measured nothing.

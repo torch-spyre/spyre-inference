@@ -218,7 +218,15 @@ def _assert_prompts_fit_prefill_bucket(model: str, revision: str, prompts: list[
     generate(), so an over-long prompt fails here instead."""
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    except OSError as e:
+        if "gated repo" in str(e).lower():
+            pytest.skip(
+                f"Skipping test: Access to gated repository '{model}' requires an "
+                f"authorized Hugging Face token."
+            )
+        raise
     limit = MAX_NUM_BATCHED_TOKENS - PROMPT_TOKEN_MARGIN
     for prompt in prompts:
         num_tokens = len(tokenizer(prompt).input_ids)

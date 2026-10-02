@@ -23,7 +23,8 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
-from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+from spyre_inference import envs
+from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer, install_traced_moe
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -187,6 +188,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
                 prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
             ),
         )
+        if envs.SPYRE_MOE_TRACED:
+            install_traced_moe(moe.experts)
         configured += 1
     if configured:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)

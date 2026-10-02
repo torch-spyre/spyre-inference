@@ -17,11 +17,17 @@ Test SpyreParallelLMHead custom op correctness against a reference implementatio
 """
 
 import sys
+import warnings
 
 import pytest
 import torch
 import torch.nn.functional as F
 from spyre_testing_plugin.pytest_plugin import spyre_available
+
+# FP8 ``_scaled_mm`` fails to compile for K < 256
+# (``No system in place for splatting of data formats with <16b``).
+_FP8_LM_HEAD_HIDDEN = 256
+_FP8_LM_HEAD_HIDDEN_MM = 4096
 
 
 def reference_lm_head(
@@ -164,27 +170,33 @@ def test_lm_head_oot_dispatch(tp_group):
 
 
 @pytest.mark.parallel_lm_head
+@pytest.mark.fp8
 def test_lm_head_fp8_config_accepted(tp_group):
     """SpyreParallelLMHead accepts Fp8Config without raising.
 
-    Fp8Config.get_quant_method returns None for ParallelLMHead (it only
-    handles LinearBase/Attention), so upstream falls back to
-    UnquantizedEmbeddingMethod, which we then replace with
-    SpyreUnquantizedLMHeadMethod. The LM head always runs FP16 regardless
-    of the checkpoint's quantization config.
+    At construction time ``quant_method`` is always ``SpyreUnquantizedLMHeadMethod``;
+    ``initialize_fp8()`` upgrades it to ``SpyreFp8LMHeadMethod``.
     """
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
     from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
         SpyreParallelLMHead,
         SpyreUnquantizedLMHeadMethod,
     )
 
-    layer = ParallelLMHead(128, 64, params_dtype=torch.float16, quant_config=Fp8Config())
+    layer = ParallelLMHead(
+        128, _FP8_LM_HEAD_HIDDEN, params_dtype=torch.float16, quant_config=Fp8Config()
+    )
 
     assert isinstance(layer, SpyreParallelLMHead)
     assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+
+    layer.quant_method.process_weights_after_loading(layer)
+    layer.initialize_fp8()
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    assert hasattr(layer, "weight_scale")
 
 
 def _apply_tracked(layer):
@@ -591,6 +603,224 @@ def spyre_or_cpu_device():
         return torch.device("spyre")
     except Exception:
         return torch.device("cpu")
+
+
+@pytest.mark.parallel_lm_head
+def test_fp8_lm_head_method_not_installed_without_fp8_config(tp_group):
+    """Without Fp8Config, SpyreUnquantizedLMHeadMethod is installed (no FP8)."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
+
+    layer = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+    assert not isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("vocab_size", [64, 128, 51200])
+def test_fp8_process_weights_creates_padded_weight_t(tp_group, vocab_size):
+    """process_weights_after_loading builds padded_weight_t; initialize_fp8 adds weight_scale."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    embedding_dim = _FP8_LM_HEAD_HIDDEN
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+
+    layer.quant_method.process_weights_after_loading(layer)
+    assert hasattr(layer, "padded_weight_t")
+    assert not hasattr(layer, "weight_scale")
+
+    layer.initialize_fp8()
+    assert hasattr(layer, "weight_scale")
+    assert layer.weight_scale.dtype == torch.float16
+    assert layer.weight_scale.numel() == 1
+    assert layer.weight_scale.item() > 0
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_weight_scale_on_device_after_to(tp_group):
+    """weight_scale moves to device alongside padded_weight_t."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    layer = ParallelLMHead(128, _FP8_LM_HEAD_HIDDEN, params_dtype=torch.float16)
+    layer.quant_method.process_weights_after_loading(layer)
+    layer.initialize_fp8()
+
+    assert layer.weight_scale.device.type == "cpu"
+    assert layer.padded_weight_t.device.type == "cpu"
+
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    layer.to("spyre")
+    assert layer.padded_weight_t.device.type == "spyre"
+    assert layer.weight_scale.device.type == "spyre"
+    assert layer.weight.device.type == "cpu"
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_initialize_fp8_and_apply(tp_group):
+    """initialize_fp8() enables FP8 projection; apply matches F.linear on CPU."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreFp8LMHeadMethod,
+        SpyreUnquantizedLMHeadMethod,
+    )
+
+    vocab_size, hidden = 128, _FP8_LM_HEAD_HIDDEN
+    torch.manual_seed(0)
+    layer = ParallelLMHead(vocab_size, hidden, params_dtype=torch.float16)
+    assert isinstance(layer.quant_method, SpyreUnquantizedLMHeadMethod)
+
+    layer.weight.data.copy_(torch.randn(layer.weight.shape, dtype=torch.float16) * 0.01)
+    layer.quant_method.process_weights_after_loading(layer)  # builds padded_weight_t
+    layer.initialize_fp8()  # sets weight_scale, swaps method
+
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    assert hasattr(layer, "weight_scale")
+    assert layer.weight_scale.numel() == 1
+    assert layer.weight_scale.item() > 0
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_padded_weight_reflects_loaded_weight(tp_group):
+    """FP8 padded_weight_t holds the loaded checkpoint values (not uninitialized)."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    vocab_size, embedding_dim = 49216, _FP8_LM_HEAD_HIDDEN
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16)
+    layer.weight.data.copy_(loaded)
+
+    layer.quant_method.process_weights_after_loading(layer)
+
+    vocab = layer.weight.shape[0]
+    torch.testing.assert_close(
+        layer.padded_weight_t[:, :vocab],
+        layer.weight.t(),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+def _build_fp8_lm_head(vocab_size: int, embedding_dim: int, *, seed: int = 42):
+    """FP8 LM head with known weights and materialized padded_weight_t + weight_scale.
+
+    Mirrors the production path in ``TorchSpyreModelRunner.load_model``:
+    ``process_weights_after_loading`` (builds ``padded_weight_t``) then
+    ``initialize_fp8`` (reads ``padded_weight_t``, sets ``weight_scale``,
+    swaps in ``SpyreFp8LMHeadMethod``).
+    """
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreFp8LMHeadMethod
+
+    torch.manual_seed(seed)
+    layer = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    loaded = torch.randn(layer.weight.shape, dtype=torch.float16) * 0.01
+    layer.weight.data.copy_(loaded)
+    layer.quant_method.process_weights_after_loading(layer)  # builds padded_weight_t
+    layer.initialize_fp8()  # sets weight_scale, swaps method
+    assert isinstance(layer.quant_method, SpyreFp8LMHeadMethod)
+    assert hasattr(layer, "weight_scale")
+    return layer
+
+
+def _fp8_lm_head_apply(layer, x):
+    """Call SpyreFp8LMHeadMethod.apply on Spyre; error on silent CPU fallback."""
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", FallbackWarning)
+        actual = layer.quant_method.apply(layer, x)
+    assert actual.device.type == "spyre", actual.device
+    return actual
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+def test_fp8_lm_head_apply_rejects_bias(tp_group):
+    """bias is not supported; raise before any Spyre GEMM."""
+    layer = _build_fp8_lm_head(128, _FP8_LM_HEAD_HIDDEN)
+    x = torch.randn(2, _FP8_LM_HEAD_HIDDEN, dtype=torch.float16)
+    bias = torch.zeros(128, dtype=torch.float16)
+    with pytest.raises(NotImplementedError, match="embedding_bias"):
+        layer.quant_method.apply(layer, x, bias)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize("num_tokens", [1, 4, 7])
+@pytest.mark.parametrize("vocab_size", [49216, 51200])
+def test_fp8_lm_head_apply_matches_reference(tp_group, num_tokens, vocab_size):
+    """SpyreFp8LMHeadMethod.apply matches F.linear after FP8 round-trip.
+
+    Hidden=4096 so torch-spyre can compile FP8 ``_scaled_mm``. Vocab 49216/51200
+    hits ``spyre_row_padding`` unpad and SuperDSC N-tiles ``{4096,1024,128}``.
+    Tighter than the fp16 LM-head test (atol=1e-1 / rtol=5e-2): both operands
+    quantize to FP8, but logits stay in a small range (weights/acts ``* 0.01``).
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer = _build_fp8_lm_head(vocab_size, embedding_dim)
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, layer.weight.data)
+
+    layer = layer.to("spyre")
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+
+    assert actual.dtype == torch.float16
+    assert actual.shape == (num_tokens, vocab_size)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.fp8
+@pytest.mark.parametrize(
+    "batch, seq",
+    [
+        (2, 3),  # M=6: M-padded and vocab-padded — reshape used to return garbage
+        (3, 2),  # M=6: same token count, different 3-D layout
+        (2, 4),  # M=8: no M-padding, still vocab-padded
+    ],
+)
+def test_fp8_lm_head_apply_3d_matches_reference(tp_group, batch, seq):
+    """3-D ``(B, S, K)`` reshape in apply matches F.linear on the same 3-D input.
+
+    Vocab 49216 so ``spyre_row_padding`` is nonzero. ``(2, 3)`` flattens to 6
+    tokens (M-padded to 8). The unpad and reshape run on the host: an on-device
+    column slice keeps the padded vocab width, and reshape reads that storage
+    as ``(B, S, vocab)``.
+    """
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
+    vocab_size = 49216
+    embedding_dim = _FP8_LM_HEAD_HIDDEN_MM
+    layer = _build_fp8_lm_head(vocab_size, embedding_dim, seed=7)
+    x = torch.randn(batch, seq, embedding_dim, dtype=torch.float16) * 0.01
+    expected = reference_lm_head(x, layer.weight.data)
+
+    layer = layer.to("spyre")
+    actual = _fp8_lm_head_apply(layer, x.to("spyre"))
+
+    assert actual.dtype == torch.float16
+    assert actual.shape == (batch, seq, vocab_size)
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=0.01, rtol=0.01)
 
 
 if __name__ == "__main__":

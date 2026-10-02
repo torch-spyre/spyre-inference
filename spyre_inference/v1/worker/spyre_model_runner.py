@@ -662,6 +662,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Upgrade the LM head to FP8.
+        self._initialize_fp8_lm_head(cast(nn.Module, self.model))
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
         for module in self.model.modules():
@@ -706,7 +709,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linears.
+        """True if the model has Spyre FP8 linear layers in its blocks.
 
         ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
         Granite ``compressed-tensors`` stores it on the scheme
@@ -733,6 +736,35 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if _is_fp8_kernel(getattr(module, "scheme", None)):
                 return True
         return False
+
+    @staticmethod
+    def _initialize_fp8_lm_head(model: nn.Module) -> None:
+        """Upgrade SpyreParallelLMHead to FP8 when the model uses SpyreFp8LinearKernel.
+
+        SpyreParallelLMHead.__init__ cannot detect compressed-tensors FP8 at
+        construction time because get_quant_method returns UnquantizedEmbeddingMethod
+        for VocabParallelEmbedding regardless of the FP8 config.  We detect it here
+        after load — mirroring _model_has_spyre_fp8 — and swap in SpyreFp8LMHeadMethod
+        the same way _SpyreTransposedLinearMixin swaps in the transposed-weight method.
+
+        Note: every SpyreParallelLMHead in the model is unconditionally upgraded when
+        any body layer uses SpyreFp8LinearKernel.  The ``ignored_layers`` /
+        ``ignore`` opt-out in the checkpoint quant config is not consulted — a
+        checkpoint that deliberately keeps lm_head in FP16 via those lists will
+        still have its head quantized here.  The accuracy impact is small (head
+        weight is FP16 in the checkpoint regardless) but the escape hatch is gone.
+        If an opt-out is required in the future, thread ``vllm_config.model_config``
+        into this method and check ``Fp8Config.ignored_layers`` /
+        ``CompressedTensorsConfig.ignore`` before calling ``module.initialize_fp8()``.
+        """
+        if not TorchSpyreModelRunner._model_has_spyre_fp8(model):
+            return
+        from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+
+        for module in model.modules():
+            if isinstance(module, SpyreParallelLMHead):
+                module.initialize_fp8()
+                logger.info("Initialized SpyreFp8LMHeadMethod")
 
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create SpyreShapeBucketer for 1D body token sizes.

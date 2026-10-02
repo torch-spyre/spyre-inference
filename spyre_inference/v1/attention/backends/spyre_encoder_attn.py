@@ -72,6 +72,12 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 # cache and so no block walk -- this is alignment, not a block size.
 ENCODER_LEN_ALIGNMENT = 64
 
+# Score-tensor size (``B * H * Lq * Lk`` elements, in bytes) at which compiled SDPA
+# falls off a cliff on Spyre: 4 x 512 x 16 heads (exactly 32 MiB in fp16) runs ~6x the
+# 3 x 512 time, while 24 MiB and below scale linearly. The explicit matmul-softmax-matmul
+# form does not, so shapes at or past this take it (#1054, torch-spyre#4912).
+_SDPA_SCORE_WALL_BYTES = 32 << 20
+
 logger = init_logger(__name__)
 
 
@@ -190,6 +196,28 @@ def _narrow_head_dim_into(padded: torch.Tensor, output: torch.Tensor) -> torch.T
     return output
 
 
+def _attend(q, k, v, mask, scale, enable_gqa):
+    """Bidirectional masked attention over ``[B, H, L, D]`` operands.
+
+    SDPA below ``_SDPA_SCORE_WALL_BYTES``; above it, the same math spelled out. Below
+    the wall the explicit form is slightly slower, so it is not used everywhere. GQA
+    keeps SDPA: the explicit form would need the rank-5 KV expand that
+    ``insert_restickify_padding`` rejects.
+    """
+    batch, heads, q_len, head_size = q.shape
+    score_bytes = batch * heads * q_len * k.shape[-2] * q.element_size()
+    if enable_gqa or score_bytes < _SDPA_SCORE_WALL_BYTES:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, scale=scale, is_causal=False, enable_gqa=enable_gqa
+        )
+    if scale is None:
+        scale = head_size**-0.5
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scale
+    if mask is not None:
+        scores = scores + mask
+    return torch.matmul(torch.softmax(scores, dim=-1), v)
+
+
 def _encoder_rect_kernel(
     query,
     key,
@@ -215,15 +243,7 @@ def _encoder_rect_kernel(
     q = query.view(width, extent, num_heads, head_size).transpose(1, 2)
     k = key.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
     v = value.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        scale=scale,
-        is_causal=False,
-        enable_gqa=(num_heads != num_kv_heads),
-    )
+    attn = _attend(q, k, v, mask, scale, enable_gqa=(num_heads != num_kv_heads))
     return attn.transpose(1, 2).reshape(width * extent, num_heads, head_size)
 
 
@@ -281,15 +301,7 @@ def _encoder_sdpa_kernel(
     q = q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2)
     k = k_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
     v = v_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        scale=scale,
-        is_causal=False,
-        enable_gqa=(num_heads != num_kv_heads),
-    )
+    attn = _attend(q, k, v, mask, scale, enable_gqa=(num_heads != num_kv_heads))
     return attn.transpose(1, 2).reshape(group * extent, num_heads, head_size)
 
 

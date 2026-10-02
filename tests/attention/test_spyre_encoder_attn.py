@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
+import spyre_inference.v1.attention.backends.spyre_encoder_attn as encoder_attn
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
@@ -451,6 +452,39 @@ def test_dense_kernel_matches_dense_sdpa_reference(
     value = torch.randn(total, num_kv_heads, head_size, dtype=torch.float32)
 
     got = _dense_attn(query, key, value, query_lens, scale)
+    ref = dense_sdpa_reference(query, key, value, query_lens, scale)
+    torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        pytest.param([32], id="single_32"),
+        pytest.param([9, 70, 5], id="batch_unaligned"),
+    ],
+)
+def test_explicit_attention_past_the_score_wall_matches_sdpa(monkeypatch, query_lens) -> None:
+    """With the wall at zero every MHA call takes the explicit form, which must match."""
+    monkeypatch.setattr(encoder_attn, "_SDPA_SCORE_WALL_BYTES", 0)
+    sdpa_calls = {"n": 0}
+    real_sdpa = F.scaled_dot_product_attention
+
+    def counting_sdpa(*args, **kwargs):
+        sdpa_calls["n"] += 1
+        return real_sdpa(*args, **kwargs)
+
+    monkeypatch.setattr(encoder_attn.F, "scaled_dot_product_attention", counting_sdpa)
+    num_heads, head_size = 4, 64
+    scale = head_size**-0.5
+    torch.manual_seed(0)
+    total = sum(query_lens)
+    query = torch.randn(total, num_heads, head_size, dtype=torch.float32)
+    key = torch.randn(total, num_heads, head_size, dtype=torch.float32)
+    value = torch.randn(total, num_heads, head_size, dtype=torch.float32)
+
+    got = _dense_attn(query, key, value, query_lens, scale)
+    assert sdpa_calls["n"] == 0, "past the wall the kernel must not call SDPA"
+    monkeypatch.setattr(encoder_attn.F, "scaled_dot_product_attention", real_sdpa)
     ref = dense_sdpa_reference(query, key, value, query_lens, scale)
     torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 

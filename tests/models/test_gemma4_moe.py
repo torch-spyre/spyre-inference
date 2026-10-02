@@ -667,6 +667,25 @@ def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
     assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
 
 
+def test_persistent_expert_loop_matches_dense_on_host():
+    from spyre_inference.moe import _moe_persistent
+
+    torch.manual_seed(0)
+    tokens, experts, hidden, inter = 24, 6, 16, 24
+    x = torch.randn(tokens, hidden)
+    gate = torch.randn(experts, hidden, inter)
+    up = torch.randn(experts, hidden, inter)
+    down = torch.randn(experts, inter, hidden)
+    route = torch.rand(tokens, experts, 1)
+
+    per_expert = torch.matmul(x.unsqueeze(0), gate)
+    activated = F.gelu(per_expert, approximate="tanh") * torch.matmul(x.unsqueeze(0), up)
+    expected = (torch.matmul(activated, down) * route.permute(1, 0, 2)).sum(dim=0)
+
+    actual = _moe_persistent(x, route, gate, up, down, "gelu_tanh")
+    torch.testing.assert_close(actual, expected)
+
+
 class _RoutedExperts(torch.nn.Module):
     """Stands in for vLLM's, which needs a whole FusedMoEConfig to build."""
 

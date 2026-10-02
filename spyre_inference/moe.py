@@ -286,14 +286,25 @@ def _moe_persistent(
     activation: str,
 ) -> torch.Tensor:
     from torch_spyre._inductor.propagate_hints import spyre_hint
+    from torch_spyre._inductor.wsr import for_each_tile
 
-    experts = gate.shape[0]
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
-    with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": _token_cores(x.shape[0])}):
-        h = x.unsqueeze(0)
-        activated = _activation(torch.matmul(h, gate), torch.matmul(h, up), activation)
-        return (torch.matmul(activated, down) * route).sum(dim=0)
+
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
+        return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
+
+    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
+        result, _ = for_each_tile(
+            expert_body,
+            (x, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=1,
+            init=torch.zeros_like(x),
+        )
+    return result
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:

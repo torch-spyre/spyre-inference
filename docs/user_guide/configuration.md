@@ -141,13 +141,16 @@ lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 every schedulable length keeps a bucket.
 
 ```bash
-export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size
+export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two unioned with an 8/5 series
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) precisely because the recorded set
-is a product. If your context never exceeds 2048, dropping the higher powers removes
-variants from warmup at no serving cost.
+The default KV buckets union the powers of two with an 8/5 geometric series on a 64-token
+grain. Keeping every power of two is what makes the union safe: a KV length can only round
+down relative to a pure power-of-two ladder, never up. The ladder stays geometric rather
+than uniform because the recorded set is a product of the KV and num-sequences axes, so
+each extra entry costs warmup time. If your context never exceeds 2048, dropping the
+higher entries removes variants from warmup at no serving cost.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps

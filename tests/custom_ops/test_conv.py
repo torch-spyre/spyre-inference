@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for `SpyreConv2d` (custom_ops/conv.py), the Pixtral patch-embed conv.
+"""Tests for `SpyreConv2d` (custom_ops/conv.py), the vision patch-embed conv.
 
 `SpyreConv2d` is registered OOT for every `Conv2dLayer`, but its tiled layouts only
-suit a patch embed, so `_layouts_supported` — the gate keeping other convs on the
-stock path — is the test that matters most. The layout and numeric tests need a card.
+suit a patch embed (Pixtral, Ministral, SigLIP), so `_layouts_supported` — the gate
+keeping other convs on the stock path — is the test that matters most.  The layout and
+numeric tests need a card.
 """
 
 import sys
@@ -80,10 +81,20 @@ def test_layouts_supported_accepts_a_patch_embed():
 
 
 @pytest.mark.conv
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_layouts_supported_accepts_multi_batch(batch):
+    """`_layouts_supported` no longer requires batch == 1 (SigLIP batches images)."""
+    from spyre_inference.custom_ops.conv import _layouts_supported
+
+    x = torch.randn(batch, 3, 64, 64, dtype=torch.float16)
+    weight = torch.randn(OUT_CHANNELS, 3, PATCH, PATCH, dtype=torch.float16)
+    assert _layouts_supported(x, weight) is True
+
+
+@pytest.mark.conv
 @pytest.mark.parametrize(
     "x_shape,w_shape,reason",
     [
-        ((2, 3, 64, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "batch > 1"),
         ((1, 65, 64, 64), (OUT_CHANNELS, 65, PATCH, PATCH), "in_channels > 64"),
         ((1, 3, 64, 64), (100, 3, PATCH, PATCH), "out_channels not a multiple of 64"),
         ((1, 3, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "input not 4-D"),
@@ -144,14 +155,16 @@ def test_unsupported_patch_shape_falls_back_to_conv_not_mulmat():
 @pytest.mark.conv
 @pytest.mark.parametrize("out_ch", [64, 128, OUT_CHANNELS])
 @pytest.mark.parametrize("hw", [(64, 64), (48, 80)])
-def test_layouts_build_for_valid_shapes(out_ch, hw):
+@pytest.mark.parametrize("batch", [1, 2])
+def test_layouts_build_for_valid_shapes(out_ch, hw, batch):
     """Layouts are derived from tensor shape, not hardcoded: any 64-aligned
-    out-channel count and any image size must build without raising."""
+    out-channel count, any image size, and any batch size must build without
+    raising."""
     pytest.importorskip("torch_spyre")
     from spyre_inference.custom_ops.conv import _input_layout, _weight_layout
 
     assert _weight_layout(torch.randn(out_ch, 3, PATCH, PATCH, dtype=torch.float16)) is not None
-    assert _input_layout(torch.randn(1, 3, *hw, dtype=torch.float16)) is not None
+    assert _input_layout(torch.randn(batch, 3, *hw, dtype=torch.float16)) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +173,7 @@ def test_layouts_build_for_valid_shapes(out_ch, hw):
 
 
 @pytest.mark.conv
+@pytest.mark.parametrize("batch", [1, 2, 4])
 @pytest.mark.parametrize(
     "patch,height,width",
     [
@@ -171,15 +185,20 @@ def test_layouts_build_for_valid_shapes(out_ch, hw):
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
-    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`."""
+def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias, batch):
+    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`.
+
+    batch > 1 covers the SigLIP use-case where multiple images are conv'd in a
+    single forward pass.  The `_input_layout` batch dim (device dim 3, host
+    stride C*H*W) must produce the same result as independent per-image convolutions.
+    """
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     layer = _layer(kernel=patch, stride=patch, bias=use_bias)
 
     torch.manual_seed(3)
-    x = torch.randn(1, 3, height, width, dtype=torch.float16)
+    x = torch.randn(batch, 3, height, width, dtype=torch.float16)
     expected = F.conv2d(
         x,
         layer.weight.data,

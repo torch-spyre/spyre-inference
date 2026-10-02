@@ -106,11 +106,11 @@ else ifeq ($(TEST_TYPE),integration)
 # own test-probes job and must not gate integration on strict-xfail flips), and
 # the model-quality gate likewise has its own job: every case compiles a product
 # model, up to the 31B decoders.
-MARK_EXPR := -m "not (distributed or upstream or attention or probe or model_quality)"
+MARK_EXPR := -m "not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
 # model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
-# out of the unit tier as well.
-MARK_EXPR := -m "not (upstream or model_quality)"
+# out of the unit tier as well. distributed_tp4 has its own 4-card job.
+MARK_EXPR := -m "not (upstream or model_quality or distributed_tp4)"
 else
 # The validation above already rejected any type outside VALID_TEST_TYPES, so
 # a value that reaches here IS valid but has no marker mapping above -- i.e. a
@@ -126,7 +126,8 @@ RESULTS_DIR ?= .
         test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
         test-attention test-attention-shard \
-        test-distributed test-distributed-shard test-upstream test-upstream-shard \
+        test-distributed test-distributed-shard test-distributed-tp4 \
+        test-upstream test-upstream-shard \
         test-upstream-distributed \
         tests-single-card tests-multi-card
 
@@ -179,7 +180,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe, non-model-quality). Carries the compiled e2e cases.
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' JUNIT_XML=$(JUNIT_XML)
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' JUNIT_XML=$(JUNIT_XML)
 
 # The smoke suite is dominated by a handful of e2e model tests (including the
 # compiled enforce_eager=False cases in tests/e2e/test_compile.py), so CI fans it
@@ -190,7 +191,7 @@ test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-at
 SMOKE_SHARDS ?= 8
 SMOKE_SHARD_ID ?= 0
 test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' \
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or distributed_tp4 or upstream or attention or probe or model_quality)' \
 	  PYTEST_ARGS='$(PYTEST_ARGS) --smoke-shards=$(SMOKE_SHARDS) --smoke-shard-id=$(SMOKE_SHARD_ID)' \
 	  JUNIT_XML=$(JUNIT_XML)
 
@@ -289,6 +290,9 @@ test-distributed-shard: ## Run one distributed shard (DIST_SHARDS=N DIST_SHARD_I
 test-distributed-shard-%:
 	$(MAKE) test-distributed-shard DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
+test-distributed-tp4: ## Run the TP=4 distributed marker combo (distributed_tp4). Needs 4 cards.
+	$(MAKE) run-one MARK_OVERRIDE='distributed_tp4 and not upstream' JUNIT_XML=$(JUNIT_XML)
+
 # `not gsm8k` carves the GSM8K accuracy gate out of the upstream suite: the gsm8k evals
 # carry the `upstream` marker but belong to the quality suite (test-quality above).
 test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (local full run).
@@ -335,7 +339,7 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shard
 	done; \
 	exit $$rc
 
-tests-multi-card: ## Run the 2-card marker combos (distributed shards/upstream-distributed/probes). Needs 2 cards.
+tests-multi-card: ## Run the multi-card marker combos (distributed shards/upstream-distributed/probes/tp4). Needs 2 cards minimum; TP=4 tests skip gracefully on hosts with fewer than 4 cards.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	for i in $$(seq 0 $$(( $(DIST_SHARDS) - 1 ))); do \
@@ -345,6 +349,7 @@ tests-multi-card: ## Run the 2-card marker combos (distributed shards/upstream-d
 	for i in $$(seq 0 $$(( $(PROBE_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-probes-shard-$$i" && $(MAKE) test-probes-shard PROBE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-probes-shard-$$i/junit-test-probes-shard-$$i.xml" || rc=1; \
 	done; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-distributed-tp4" && $(MAKE) test-distributed-tp4 JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-tp4/junit-test-distributed-tp4.xml" || rc=1; \
 	exit $$rc
 
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same

@@ -51,11 +51,11 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         if input_.device.type == "cpu" or self._group_name is None:
             return super().all_reduce(input_)
 
-        # Workaround: deeptools' L3 scheduler asserts "Expect valid lower and upper
-        # bound parameters" chunking the sum kernel for some rank-3 shapes
-        # ([1, 528, 1024] dies, [1, 3120, 1024] builds); a flat view has one dim to chunk.
+        # libspyre_comms only supports 1-D all_reduce: rank-2 [3, 4096] aborts in
+        # SplitEnvelope (spyre-comms#463), and deeptools' L3 scheduler fails some rank-3
+        # shapes ([1, 528, 1024]). A flat view has one dim to split and chunk.
         orig_shape = input_.shape
-        flattened = input_.dim() > 2
+        flattened = input_.dim() > 1
         if flattened:
             input_ = input_.reshape(-1)
 

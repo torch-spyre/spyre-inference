@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
-from torch._dynamo.utils import counters
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
@@ -185,41 +184,6 @@ _batched_decode_compiled = torch.compile(
 compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
-
-_warmup_complete = False
-
-
-def mark_warmup_complete() -> None:
-    """Arm the late-compile warning, once warmup has claimed full variant coverage."""
-    global _warmup_complete
-    _warmup_complete = True
-
-
-def is_warmup_complete() -> bool:
-    """Whether ``mark_warmup_complete`` has run. For diagnostics, not control flow."""
-    return _warmup_complete
-
-
-def _call_kernel(label: str, fn, *args):
-    """Dispatch a kernel, warning if it compiles once warmup has claimed coverage.
-
-    Dynamo's counter is process-wide but attributable across just this call: a
-    compiled region runs no eager ops, and torch-spyre compiles every eager aten op.
-    That assumes nothing else compiles concurrently on another thread, which holds for
-    a single-tenant serving process; if it ever stops holding, the cost is a spurious
-    warning, not a wrong result.
-    """
-    if not _warmup_complete:
-        return fn(*args)
-    before = counters["stats"]["unique_graphs"]
-    result = fn(*args)
-    if counters["stats"]["unique_graphs"] != before:
-        logger.warning_once(
-            "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
-            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
-            label,
-        )
-    return result
 
 
 @dataclass
@@ -1750,9 +1714,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Run the batch's decode attention. The point where a subclass swaps kernels."""
-        return _call_kernel(
-            "batched decode attention",
-            self._decode_fn,
+        return self._decode_fn(
             query_dev,
             rep_row_ids,
             k_pages,
@@ -1805,9 +1767,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert row_table.shape == (padded_query_len,), (
             f"row table {tuple(row_table.shape)} must be 1D of padded_query_len {padded_query_len}"
         )
-        return _call_kernel(
-            "page attention",
-            self._attn_fn,
+        return self._attn_fn(
             query,
             row_table,
             k_pages,

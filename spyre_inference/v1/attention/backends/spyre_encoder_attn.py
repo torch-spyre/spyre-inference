@@ -55,7 +55,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    _call_kernel,
 )
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -504,9 +503,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def _run_rect(self, out, query, key, value, plan_mask, width, extent, heads, kv_heads, dim):
         if out is None:
-            return _call_kernel(
-                "encoder_rect",
-                self._rect_fn,
+            return self._rect_fn(
                 query,
                 key,
                 value,
@@ -518,9 +515,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 kv_heads,
                 dim,
             )
-        return _call_kernel(
-            "encoder_rect_out",
-            self._rect_out_fn,
+        return self._rect_out_fn(
             out,
             query,
             key,
@@ -535,12 +530,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         )
 
     def _run_gather(self, query, key, value, row_index):
-        return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
+        return self._gather_fn(query, key, value, row_index)
 
     def _run_attn(self, q_rows, k_rows, v_rows, mask, group, heads, kv_heads, dim):
-        return _call_kernel(
-            "encoder_sdpa",
-            self._attn_fn,
+        return self._attn_fn(
             q_rows,
             k_rows,
             v_rows,
@@ -553,9 +546,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         )
 
     def _run_fused(self, out, row_index, query, key, value, mask, group, heads, kv_heads, dim):
-        return _call_kernel(
-            "encoder_fused",
-            self._fused_fn,
+        return self._fused_fn(
             out,
             row_index,
             query,
@@ -833,9 +824,8 @@ def _spyre_encoder_attention_forward(
     """Trace the rectangular path into the caller's graph; anything else falls through.
 
     Deliberately bypasses the impl: going through it would re-enter ``torch.compile`` for
-    the already-compiled kernel and run ``_call_kernel``'s host-side counters inside a
-    traced region. The fallthrough is upstream's own ``forward`` rather than a copy, so the
-    ragged path is untouched.
+    the already-compiled kernel inside a traced region. The fallthrough is upstream's own
+    ``forward`` rather than a copy, so the ragged path is untouched.
     """
     mask = _encoder_grid.mask
     # The inline path returns [tokens, num_heads * head_size], so a caller asking for any

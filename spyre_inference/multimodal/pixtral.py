@@ -28,7 +28,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import _padded_attn_mask, align_up, padded_sdpa
 
 logger = init_logger(__name__)
 
@@ -53,6 +53,26 @@ def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Te
 def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
     """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
     return x * cos + torch.matmul(x, m) * sin
+
+
+_ROPE_PERM_BUFFER = "spyre_rope_perm"
+
+
+def install_rope_perm(model: nn.Module, device: torch.device) -> None:
+    """Attach the rope permutation to each vision `Attention` as a device buffer.
+
+    Built inside a compiled block, its CPU index writes land in the graph and fail with
+    "does not have FixedTiledLayout". Non-persistent, so weight loading never sees it.
+    """
+    try:
+        from vllm.model_executor.models import pixtral
+    except ImportError:
+        return
+
+    for module in model.modules():
+        if isinstance(module, pixtral.Attention) and not hasattr(module, _ROPE_PERM_BUFFER):
+            perm = rope_perm_matrix("pair", module.head_dim, device)
+            module.register_buffer(_ROPE_PERM_BUFFER, perm, persistent=False)
 
 
 def patch_vision_attention() -> None:
@@ -80,12 +100,15 @@ def patch_vision_attention() -> None:
         q = q.reshape(batch, patches, self.n_heads, self.head_dim)
         k = k.reshape(batch, patches, self.n_heads, self.head_dim)
         v = v.reshape(batch, patches, self.n_heads, self.head_dim)
-        q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
+        # Resolves to the `patch_vision_rope_vit` replacement, which takes `perm`.
+        perm = getattr(self, _ROPE_PERM_BUFFER, None)
+        q, k = pixtral.apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis, perm=perm)  # ty: ignore[unknown-argument]
         # [B, H, L, D] for SDPA.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = padded_sdpa(q, k, v, mask)
+        # A Spyre mask was already padded by `patch_transformer_mask`.
+        out = padded_sdpa(q, k, v, mask, mask_is_padded=mask.device.type == "spyre")
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
         return out
@@ -152,9 +175,9 @@ def patch_vision_rope_vit() -> None:
             self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
         return _OnCardFreqsTable(self._freqs_cis, self.max_patches_per_side)
 
-    def _apply_rotary_emb_vit(xq, xk, freqs_cis):
+    def _apply_rotary_emb_vit(xq, xk, freqs_cis, perm=None):
         # xq, xk: [batch, patches, n_heads, head_dim]; freqs_cis: [patches, 2, head_dim].
-        p = rope_perm_matrix("pair", xq.shape[-1], xq.device)
+        p = perm if perm is not None else rope_perm_matrix("pair", xq.shape[-1], xq.device)
         cos = freqs_cis[:, 0, :][None, :, None, :]  # [1, patches, 1, head_dim]
         sin = freqs_cis[:, 1, :][None, :, None, :]
 
@@ -201,6 +224,34 @@ def patch_block_attention_mask() -> None:
     # attribute is picked up at call time.
     modeling_pixtral.generate_block_attention_mask = _cpu_mask  # ty: ignore[invalid-assignment]
     logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
+
+
+def patch_transformer_mask() -> None:
+    """Pad and upload the vision attention mask once per image, ahead of the blocks.
+
+    `_padded_attn_mask`'s attribute cache does not survive a compiled block, so inside
+    one every layer would re-upload the O(L²) mask.
+    """
+    try:
+        from vllm.model_executor.models import pixtral
+    except ImportError:
+        return
+
+    tr_cls = getattr(pixtral, "Transformer", None)
+    if tr_cls is None or getattr(tr_cls.forward, "_spyre_patched", False):
+        return
+
+    def _forward(self, x, mask, freqs_cis):
+        if x.device.type == "spyre":
+            batch, seq, _ = x.shape
+            mask = _padded_attn_mask(mask, batch, seq, align_up(seq), x.dtype, x.device)
+        for layer in self.layers:
+            x = layer(x, mask=mask, freqs_cis=freqs_cis)
+        return x
+
+    _forward._spyre_patched = True
+    tr_cls.forward = _forward
+    logger.info("Spyre: Pixtral vision mask padded and uploaded once per image.")
 
 
 def patch_patch_merger() -> None:
@@ -266,9 +317,8 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
     `custom_ops/conv.py` handles it through OOT dispatch.
 
-    `model` and `device` are unused: every remaining patch rewrites upstream module
-    attributes rather than a loaded instance. They stay for the `apply(model, device)`
-    contract the sibling architecture modules share.
+    Must run after the weights reach `device` and before blocks compile
+    (`install_rope_perm`).
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -285,6 +335,8 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
+    install_rope_perm(model, device)
+    patch_transformer_mask()
     patch_block_attention_mask()
     patch_patch_merger()
     patch_pre_transformer_norm(model)

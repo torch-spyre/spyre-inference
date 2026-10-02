@@ -76,6 +76,7 @@ def padded_sdpa(
     mask: torch.Tensor,
     scale: float | None = None,
     enable_gqa: bool = False,
+    mask_is_padded: bool = False,
 ) -> torch.Tensor:
     """SDPA over `[B, H, L, D]` with L and D padded to the stick, then cropped.
 
@@ -87,6 +88,8 @@ def padded_sdpa(
     `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
     so the padding cannot change it. Pass it explicitly when the head dim is already
     padded, or when the model carries its own scale.
+
+    `mask_is_padded=True` takes `mask` as `_padded_attn_mask`'s output, already on device.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -109,11 +112,13 @@ def padded_sdpa(
         k = k.contiguous()
         v = v.contiguous()
 
+    if not mask_is_padded:
+        mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(
         q,
         k,
         v,
-        attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
+        attn_mask=mask,
         scale=scale,
         enable_gqa=enable_gqa,
     )

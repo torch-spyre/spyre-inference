@@ -145,6 +145,8 @@ def test_rope_rotate_matmul_matches_rotation_formula(head_dim):
         "apply_rotary_emb_vit",
         "precompute_freqs_cis_2d",
         "VisionTransformer",
+        "Transformer",
+        "TransformerBlock",
         "Attention",
         "PatchMerger",
     ],
@@ -183,6 +185,61 @@ def test_vision_attention_patch_is_applied_and_idempotent():
 
     patch_vision_attention()
     assert pixtral.Attention.forward is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_transformer_mask_patch_is_applied_and_idempotent():
+    from spyre_inference.multimodal.pixtral import patch_transformer_mask
+
+    patch_transformer_mask()
+    patched = pixtral.Transformer.forward
+    assert getattr(patched, "_spyre_patched", False) is True
+
+    patch_transformer_mask()
+    assert pixtral.Transformer.forward is patched, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_install_rope_perm_registers_a_non_persistent_buffer():
+    from spyre_inference.multimodal.pixtral import install_rope_perm, rope_perm_matrix
+
+    attn = pixtral.Attention.__new__(pixtral.Attention)
+    torch.nn.Module.__init__(attn)
+    attn.head_dim = 64
+    model = torch.nn.Module()
+    model.attention = attn
+
+    install_rope_perm(model, torch.device("cpu"))
+    perm = attn.spyre_rope_perm
+    assert torch.equal(perm, rope_perm_matrix("pair", 64, torch.device("cpu")))
+    assert "attention.spyre_rope_perm" not in model.state_dict()
+
+    install_rope_perm(model, torch.device("cpu"))
+    assert attn.spyre_rope_perm is perm, "second call must be a no-op"
+
+
+@pytest.mark.pixtral
+def test_transformer_mask_patch_passes_cpu_mask_through():
+    from spyre_inference.multimodal.pixtral import patch_transformer_mask
+
+    patch_transformer_mask()
+    seen = []
+
+    class _Block(torch.nn.Module):
+        def forward(self, x, mask, freqs_cis):
+            seen.append(mask)
+            return x + 1
+
+    tr = pixtral.Transformer.__new__(pixtral.Transformer)
+    torch.nn.Module.__init__(tr)
+    tr.layers = torch.nn.ModuleList([_Block(), _Block()])
+    x = torch.zeros(1, 3, 4)
+    mask = torch.ones(3, 3, dtype=torch.bool)
+
+    out = pixtral.Transformer.forward(tr, x, mask, None)
+
+    assert torch.equal(out, x + 2)
+    assert all(m is mask for m in seen)
 
 
 @pytest.mark.pixtral
@@ -308,6 +365,7 @@ def test_apply_installs_rope_vit_before_attention():
 
     assert getattr(pixtral.apply_rotary_emb_vit, "_spyre_patched", False) is True
     assert getattr(pixtral.Attention.forward, "_spyre_patched", False) is True
+    assert getattr(pixtral.Transformer.forward, "_spyre_patched", False) is True
 
 
 def test_apply_rejects_an_xformers_install(monkeypatch):

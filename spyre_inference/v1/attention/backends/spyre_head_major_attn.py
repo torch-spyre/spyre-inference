@@ -143,6 +143,8 @@ class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
 class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache."""
 
+    _jagged_head_major = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # At construction: forward() runs past a custom-op boundary that loses the config.

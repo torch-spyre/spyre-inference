@@ -1,10 +1,90 @@
 # Spyre attention micro-benchmark
 
-Measures the Spyre paged-attention kernel with the torch profiler. Spyre has no
-CUDA-graph equivalent for excluding host overhead, so device time attributed to a
-`record_function` span is the signal.
+`spyre_attn_microbench.py` measures the Spyre paged-attention kernel with the torch
+profiler. Spyre has no CUDA-graph equivalent for excluding host overhead, so device
+time attributed to a `record_function` span is the signal for that harness.
 
 > **Notation:** `bs=64` / `bs=128` mean **`block_size`**, not batch size.
+
+## Jagged latency comparison
+
+`jagged_attn_latency.py` compares the real head-major backend with jagged attention
+using resident Q/KV and metadata. It times backend dispatch, output stores/copies
+and synchronization. It excludes compilation, metadata construction/transfers,
+Q staging, KV insertion and the surrounding model. Use an idle card and a
+profiler-free torch-spyre build; the harness rejects extensions linked to libaiupti.
+
+```bash
+SPYRE_DEVICES=0 SPYRE_NUM_CPUS=8 DXP_LOOP_UNROLL=0 \
+uv run --no-sync python scripts/microbench/jagged_attn_latency.py \
+    --contexts 1024 2048 4096 8192 16384 32768 --warmup 3 --samples 15 \
+    --output microbench_results/jagged-attention.json
+```
+
+The default geometry is H32/KV8/D128, 128-token pages and a 512-token scheduler
+budget. The two paths use identical Q/KV, shuffled physical pages and alternating
+sample order. `L` denotes the maximum total sequence length, including new tokens:
+
+| Scenario | Query lengths | KV sequence lengths |
+| --- | --- | --- |
+| `decode1` | `[1]` | `[L]` |
+| `decode4` | `[1,1,1,1]` | `[L, 7L/8-13, 3L/4+7, 5L/8+17]` |
+| `prefill512` | `[512]` | `[L]` |
+| `mixed512` | `[1,511]` | `[L, 3L/4+17]` |
+| `jagged69` | `[1,65,3]` | `[L, 3L/4+17, L/2+33]` |
+
+`--jagged-schedule serving` is the default. It uses the integrated mixed-width
+schedule, 64 parallel decode entries and shared output staging. Compare matching
+output-buffer modes: `--output-buffer model` uses model-sized outputs for pure
+decode, while the default uses paired staging. Pre-staged prefill/mixed calls
+require paired staging and cannot use a separate model-sized output.
+
+The experimental schedules are `flat`, `nested`, `page_parallel`, `split` and
+`mixed`. They permit common query widths, alternative parallel-entry budgets and
+two-kernel decode. `--split-pages-per-partition` controls partial-state size;
+`--mixed-decode-schedule split` also uses it for the short-query group of a mixed
+batch. `--help` lists supported values. These overrides do not change serving.
+
+Every result is checked against independent float32 attention before and after
+timing, with `atol=0.002`, `rtol=0.02` and relative L2 at most 2%. At most five
+outliers may use twice the elementwise tolerances; counts are reported.
+`--reference-device-values` computes the reference from device-roundtripped
+inputs. Failed checks receive no latency result, and any new graph during timing
+invalidates the samples. JSON retains raw samples, correctness results, sample
+spread, preparation time, compiler counts, source hashes and environment.
+
+## Complete model step replay
+
+`jagged_model_step_latency.py` loads a model through vLLM and measures prepared
+CPU inputs through CPU logits: common metadata, slot publication, transfers, KV
+writes, transformer layers and the LM head. Scheduler work, tokenization,
+sampling and history construction are excluded.
+
+The harness runs offline using your Hugging Face cache. Set `HF_HOME` if your
+cached weights are outside the default location.
+
+```bash
+SPYRE_DEVICES=0 SPYRE_NUM_CPUS=8 DXP_LOOP_UNROLL=0 \
+uv run --no-sync python scripts/microbench/jagged_model_step_latency.py \
+    --model ibm-ai-platform/micro-g3.3-8b-instruct-1b --backend baseline \
+    --prefill-history --contexts 1024 32768 --warmup 3 --samples 15 \
+    --output microbench_results/model-baseline.json
+```
+
+After the process exits, repeat with `--backend jagged` and a different output
+file on the same card. Use the same ordered cases. `--prefill-history` fills KV
+with model-prefilled repeated text; its preparation is reported separately.
+Without it, caches start at zero. Both modes retain preceding cases' replay
+writes. This measures controlled model steps, not server or whole-generation
+latency. `--generation-only --generation-smoke` exercises the normal generation
+path separately.
+
+Saved logits, token IDs and positions allow numerical comparisons. Fresh compiler
+plans and independently built history can change DL16 results even within one
+backend, so cross-backend logits alone do not isolate attention error. The
+[architecture note](../../docs/architecture/jagged-attention.md#validation-and-remaining-limits)
+records the current numerical limitations. Use common compiled model math and
+history for attribution and independent references for accuracy.
 
 ## Run
 

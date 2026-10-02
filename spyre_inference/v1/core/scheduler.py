@@ -23,7 +23,7 @@ from spyre_inference import envs
 class TorchSpyreScheduler(Scheduler):
     """V1 scheduler that caps how many sequences may prefill in one batch.
 
-    Attention runs one kernel per sequence, padding each to its own query bucket, so
+    Prefill attention runs one kernel per sequence, padding each to its own query bucket, so
     the short leftover chunk upstream uses to top up a batch costs a full-width
     prefill however few tokens it carries.
     """

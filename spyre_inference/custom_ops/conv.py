@@ -82,10 +82,10 @@ def _input_layout(x: torch.Tensor):
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
     """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
 
-    Spyre needs static shapes, so the kernel recompiles per distinct (H, W). Past
-    ``torch._dynamo.config.cache_size_limit`` (default 8) dynamo falls back to
-    eager, which is unvalidated for pre-laid-out tensors — bucket or resize images
-    if a workload uses many resolutions.
+    Spyre needs static shapes, so the kernel recompiles per distinct (H, W). The
+    platform lifts dynamo's recompile limits, so there is no eager fallback, but every
+    new resolution costs a full compile mid-request — bucket or resize images if a
+    workload uses many resolutions.
     """
 
     # Per-(H, W) recompiles are this layer's contract, so the compile guard must not

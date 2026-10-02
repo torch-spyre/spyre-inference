@@ -197,8 +197,9 @@ class SpyreAttnBucketer:
 
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
-            # two, just coarser at the bottom. Reachable because the platform
-            # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
+            # two, just coarser at the bottom. The platform rejects such a block size
+            # (TorchSpyrePlatform._align_block_size), so only a config built without
+            # it gets here.
             logger.warning(
                 "block_size=%d is not a power of two; the smallest KV bucket is the next "
                 "power of two instead, making it larger than one block. Prefer a "

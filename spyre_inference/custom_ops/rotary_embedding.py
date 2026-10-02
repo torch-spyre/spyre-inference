@@ -17,7 +17,7 @@
 Applies neox RoPE on Spyre via a 2x2 rotation-matrix formulation (ported from
 foundation-model-stack). The rotation cache is device-resident; ``forward_oot`` gathers
 this pass's per-token slice with ``index_select`` and applies it with ``_rotate_neox_2x2``,
-both directly in the full-model compile graph.
+both directly in the enclosing compile graph (the transformer block, by default).
 
 The cache must be materialized on-device *before* compile: building it inside the traced
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
@@ -69,11 +69,12 @@ def _rotate_neox_2x2(
 
 
 class _SpyreRotaryMixin:
-    """Spyre RoPE wiring shared by the base and llama3 OOT classes.
+    """Spyre RoPE wiring shared by the OOT rotary classes.
 
     Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
-    ``NotImplementedError`` at construction. The rotation cache is derived lazily from
-    the base ``cos_sin_cache`` (inheriting all rope-scaling variants) and kept on CPU.
+    ``NotImplementedError`` at construction. The rotation cache is derived lazily on CPU
+    from the base ``cos_sin_cache`` (inheriting all rope-scaling variants), and ``_apply``
+    places a copy on the device when the module moves there.
     """
 
     def __init__(self, *args, **kwargs):

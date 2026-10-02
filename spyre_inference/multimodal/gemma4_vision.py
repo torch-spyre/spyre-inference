@@ -521,8 +521,9 @@ def patch_vision_encoder() -> None:
 
 
 def patch_rms_norm() -> None:
-    """Give ``Gemma4RMSNorm`` the treatment ``SpyreGemmaRMSNorm`` gives vLLM's: no fp32
-    promotion, and ``rsqrt`` instead of ``pow(x, -0.5)``, which has no lowering here.
+    """Run ``Gemma4RMSNorm`` without fp32 promotion, and with ``rsqrt`` instead of
+    ``pow(x, -0.5)``, which has no lowering here. (Unlike ``SpyreGemmaRMSNorm``, which keeps
+    upstream's fp32 path by compiling it; see ``_padded_rms_norm`` for why this tower cannot.)
 
     ``forward`` is the patch point, not ``_norm``: stock casts to fp32 in both, and both
     casts have to go.

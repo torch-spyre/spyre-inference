@@ -36,7 +36,8 @@ uv run --no-sync vllm bench latency \
 ```
 
 Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace;
-`SPYRE_BATCHED_DECODE=1` is the default, so it already takes the batched decode path.
+`SPYRE_BATCHED_DECODE=1` is the default; the batched decode path also depends on
+layout, compilation, bucket coverage and allocated KV-cache pages.
 
 ### Which scope to measure
 
@@ -113,8 +114,9 @@ which it has to be, since `spyre_inference.envs` caches on first read.
 
 ### Prefill is always chunked
 
-`check_and_update_config` caps `max_num_batched_tokens` at
-`min(max_num_batched_tokens, 512)` for decoder models, so a query longer than
+`apply_config_platform_defaults` caps `max_num_batched_tokens` at
+`min(max_num_batched_tokens, 512)` for compiled decoder models (the largest default
+`compile_sizes` bucket), so a query longer than
 that is unschedulable at **any** `max_model_len`: production chunks its prefills.
 A prefill capture is therefore `query_len <= 512` against a growing `seq_len`, not
 `query_len == seq_len`. The cap is checked against the declared batch, since the
@@ -125,8 +127,10 @@ is reported as a row with `error` set rather than an assertion mid-sweep.
 
 The batched decode kernel needs the `batched_decode_compiled` variant, which sets
 `SPYRE_BATCHED_DECODE` for the process (so it cannot be mixed with a per-seq
-variant in one run). It also needs `num_decode_seqs >= 4`, a compiled build, and a
-resolvable sequence/blocks bucket pair. Under the default tiled walk the kernel is
+variant in one run). Even one decode sequence can use it, provided the build is
+compiled, the sequence/blocks bucket pair resolves, and the padded sequence count
+times blocks per chunk is strictly less than the allocated KV-cache page count. Under
+the default tiled walk the kernel is
 reached on the head-major layout only, which is `--attn-kv-layout`'s default; pairing
 the batched variant with `token_major` is refused up front rather than measured as a
 silent per-seq fallback.
@@ -214,8 +218,8 @@ when a row is padded.
 The KV cache is `num_blocks * block_size * num_kv_heads * head_size * 2 B` per
 tensor, so holding `num_blocks` fixed while doubling `block_size` doubles the
 footprint and allocations can fail with `RAS::FLEXALLOCATOR::OutOfMemory`. Device
-memory is not fully returned between configs (`kineto_profiling.md` §4.3) despite
-the runner's `gc.collect()`, so it accumulates across a sweep; affected rows get
+memory is not fully returned between configs despite the runner's `gc.collect()`,
+so it accumulates across a sweep; affected rows get
 `error` set and empty `ms`.
 
 - Pin `num_blocks` constant across runs you intend to compare.
@@ -276,8 +280,9 @@ windows, i.e. whether an Inductor compile landed inside a measurement.
 
 ## Notes
 
-- `block_size` 128 is what you get in practice: vLLM CPU platform defaults to 128
-  which is compatible with %64 by `platform.py`
+- `block_size` 128 is what you get in practice: `platform.py` sets it whenever the user
+  does not pass one (and requires a user-supplied one to be a power of two, rounded up to
+  a multiple of 64)
 - Compiled and eager variants need separate runs, as do batched and per-seq decode
   variants — both are fixed per process.
 - The kernel specializes per `(num_blocks, aligned_max_query_len)`, so a sweep

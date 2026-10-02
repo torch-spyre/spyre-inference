@@ -14,8 +14,8 @@
 
 """Spyre adaptations for vLLM BERT-family pooling models.
 
-Every class here exists only to route ``token_type_ids`` around vLLM's
-bit-pack transport; see ``spyre_inference.models._token_type``.
+These classes route ``token_type_ids`` around vLLM's bit-pack transport;
+the embedding subclass also fuses its prologue. See ``spyre_inference.models._token_type``.
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbeddin
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Copy segment ids out of the side buffer and pass that tensor into the compiled gather.
+        # Pass side-buffer segment ids, or zeros, into the compiled gather.
         return self._compiled_forward(
             input_ids,
             position_ids,

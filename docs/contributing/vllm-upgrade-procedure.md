@@ -217,6 +217,6 @@ Don't split the rev itself across commits — `pyproject.toml` and `uv.lock` nee
 
 ## Scope Guardrails
 
-- Do not bump the **lower bound** during a vLLM upgrade without explicit discussion. Lower-bound bumps require deleting compat code and pruning the test matrix.
+- Do not widen the supported vLLM range without explicit discussion. For a normal upgrade, bump the lower bound and upper cap together with the pinned rev, as in Step 1.
 - Do not "improve" code outside the compat surface. A vLLM upgrade PR should be reviewable as one focused change.
 - If a transitive dep moves in a surprising way (`uv sync` output shows e.g. transformers/torch shifting unexpectedly), surface it to the user before continuing — don't silently accept.

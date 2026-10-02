@@ -216,7 +216,7 @@ Do **not** commit or push on behalf of the user. The human decides when to commi
 If it fails, triage:
 
 - **`TypeError: ...__init__() got an unexpected keyword argument ...`** during model load → stale inductor cache (you forgot §5). Clear it and re-run.
-- **`ImportError` or `RuntimeError` referencing a missing symbol** → the bump pulled in a commit that needs newer RPMs than are installed. Bisect back.
+- **`ImportError` or `RuntimeError` referencing a missing symbol** → first verify which RPM set is active and rebuild torch-spyre against it. For an RPM-only change after updating the lock, use `scripts/install-pinned-rpms.sh --rebuild` on a dev pod: uv's wheel cache keys on the git revision, so the old wheel can survive a library change. Only bisect back if a fresh build against the intended RPMs still fails.
 - Numerical mismatches, fallback-warning storms, compile errors on `spyre` → real regressions introduced by the bump. Hand to [[debug-spyre]].
 
 ### 7. Update `spyre-rpms.lock`

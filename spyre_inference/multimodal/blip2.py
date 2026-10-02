@@ -20,9 +20,9 @@ Spyre's restickify and bmm_padding passes cannot reconcile, so the entire
 module is run on CPU.
 
 vllm-project/vllm@a1541f5 replaces that chain with a single
-F.scaled_dot_product_attention call, which SpyreMMEncoderAttention already
-handles natively.  Once we upgrade, the Q-Former attention runs on-card and
-this entire workaround becomes dead code.
+F.scaled_dot_product_attention call, which Spyre's SDPA path already handles. Once we upgrade
+past it (v0.28.0 still carries the chain), the Q-Former attention runs on-card
+and this entire workaround becomes dead code.
 
 When that vLLM version is in use, test_vllm_blip2_qformer_uses_sdpa in
 tests/probes/test_spyre_fallback_probes.py will flip to XPASS, signalling that

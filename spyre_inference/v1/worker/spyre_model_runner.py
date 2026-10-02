@@ -24,16 +24,12 @@ Data flow in the current WIP version:
 - Generative: D2H hidden_states for logits/sampling. Pooling: keep on Spyre;
   pooler D2Hs only the final pooled vectors in ``_pool``.
 - Embedding: Spyre int64 input → Spyre compute → float16 output on Spyre.
-- Hidden states flow on Spyre between decoder layers.
-- There are few exceptions where a CPU fallback is currently needed:
-  - Attention block: Spyre input → CPU (and partial Spyre) compute → Spyre output.
-  - Layers that are not yet wrapped for torch-spyre,
-    for example RotaryEmbedding
-
-As the TorchSpyreModelRunner is evolving, more layers will natively support inputs
-arriving as a Spyre tensor and perform their operations on Spyre.
-Thus, in the final state of the runner minimal D2H and H2D transfers will be necessary,
-the CPU fallbacks will be obsolete and most operations will be performed on Spyre.
+- Hidden states flow on Spyre between decoder layers; attention, RoPE and the
+  embedding gather run on-device too.
+- What stays on CPU is host-side bookkeeping: slot mapping, attention metadata
+  (index tables, mask tiles) built by the metadata builder, logits indexing and
+  sampling, plus the few model-specific workarounds that route one op through the
+  host (see ``spyre_inference.multimodal`` and ``spyre_inference.models``).
 """
 
 from __future__ import annotations
@@ -345,8 +341,9 @@ class _SpyreModelWrapper:
     Output conversion (Spyre → CPU):
         The model's final hidden_states come out on Spyre. Downstream
         operations (indexing via logits_indices, sampling) run on CPU.
-        The lm_head matmul runs on Spyre via SpyreParallelLMHead,
-        which handles H2D/D2H for the sample_hidden_states subset.
+        The lm_head matmul runs on Spyre via SpyreParallelLMHead: ``compute_logits``
+        below does the H2D of the sampled rows, SpyreLogitsProcessor the D2H of the
+        logits.
 
     Wrapping at the model level ensures ALL call sites get the right
     device — both execute_model (via _model_forward) and _dummy_run
@@ -413,10 +410,10 @@ class _SpyreModelWrapper:
         on CPU (no Spyre `aten::index.Tensor`; a device gather needs
         `select_rows`), so the tensor handed to compute_logits is on CPU;
         move it onto Spyre for the lm_head matmul. The logits are
-        returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
-        for the TP all_gather, and SpyreLogitsProcessor._gather_logits
-        converts back to CPU right after the gather (before the vocab slice
-        and scale), so downstream sampling gets CPU logits.
+        returned on CPU: the head's ``SpyreUnquantizedLMHeadMethod.apply`` keeps them
+        on Spyre, and SpyreLogitsProcessor converts them to CPU before the vocab slice
+        and scale -- in ``_apply_head`` at TP=1, right after the all_gather in
+        ``_gather_logits`` at TP>1 -- so downstream sampling gets CPU logits.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
@@ -854,9 +851,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: one dummy per body shape -- and pooling has exactly one, the
-        token budget. That single forward traces the body, the pooler, and (through
-        ``SpyreEncoderAttentionImpl.warm_kernels``, which runs on its first attention
-        call) every declared rectangle and every declared ``(width, extent)`` group.
+        token budget. That forward traces the body and the pooler. The first attention
+        call that reaches the impl runs ``SpyreEncoderAttentionImpl.warm_kernels``, which
+        traces every declared ``(width, extent)`` group, plus every declared rectangle
+        while the rectangular path is opaque. With the rectangular path traced into the
+        block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
+        forces one onto the ragged path, which is what reaches the impl.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
@@ -1381,8 +1381,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Compile the rectangular path's re-compaction gather.
 
         ``_unpad_encoder_hidden`` runs in ``_pool``, which no dummy run reaches, so
-        without this the first rectangular-path request pays its compile. One shape only: the
-        gather deliberately keeps the buffer's row count.
+        without this the first request needing packed-order re-compaction pays its compile.
+        One shape only: the gather deliberately keeps the buffer's row count.
         """
         if not self._pooling_on_spyre or not self._encoder_rectangles:
             return
@@ -1393,9 +1393,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         """Re-compact a rectangular-path grid to the packed order the poolers address.
 
-        The poolers index rows by ``cumsum(num_scheduled_tokens)``, so on the rectangular
-        path the inter-sequence pad rows have to go. Reporting padded lengths instead
-        makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
+        Except for eligible homogeneous Spyre CLS batches, poolers need packed-order
+        rows, including token-level poolers. Reporting padded lengths instead makes
+        ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
         The gather keeps its input's row count: sizing it to the real token count adds
         a ``torch.compile`` specialisation per distinct total, recompiling nearly every
@@ -1421,16 +1421,18 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
 
     def _preprocess(self, *args, **kwargs):
-        """Expand the ragged body into the dense grid, on the rectangular path only.
+        """Expand the ragged body into the dense grid on the rectangular path.
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
-        happen here. Integer tensors only, tens of KB -- which is why this
-        once-per-step pack is cheap where a per-layer gather of the activations is
-        not.
+        happen here. The `input_ids` path packs only integer tensors (tens of KB),
+        avoiding a per-layer activation gather. Multimodal pooling with only
+        `inputs_embeds` instead copies the floating-point embeddings to CPU,
+        expands them there and converts the grid back to the original device.
 
-        ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths, which
-        attention's mask needs.
+        On the packed path, absolute-position RoBERTa still offsets positions here
+        before the embedding gather. ``query_start_loc`` and ``seq_lens`` keep the
+        real ragged lengths, which attention's mask needs.
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
@@ -1526,9 +1528,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _rectangular_cls(self, pooling_metadata: PoolingMetadata) -> bool:
         """True when this rectangular step's only task gathers the CLS row.
 
-        LAST and MEAN address packed rows, so they still take the unpad gather.
-        A mixed-task batch does too: one hidden-state layout has to serve every
-        task in the step.
+        Other poolers, including token-level ones, need packed rows. Mixed-task
+        batches also take the unpad gather so one layout serves every task.
         """
         grid = self._encoder_grid
         if grid is None:
@@ -1650,8 +1651,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         hidden_states = convert(hidden_states, self._spyre_device)
-        # CLS on a rectangle already has its row at ``seq_idx * extent``. Skipping
-        # the unpad gather leaves LAST/MEAN on the packed layout they index.
+        # Eligible homogeneous CLS reads grid rows directly; all other poolers
+        # need packed order, including token-level poolers.
         # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):
@@ -1701,8 +1702,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     # --- KV cache allocation ---
 
     def _model_dtype(self) -> torch.dtype:
-        """The activation dtype the platform settled on (float16 unless bfloat16 was
-        asked for explicitly)."""
+        """The activation dtype the platform settled on (float16 for every engine run;
+        see ``TorchSpyrePlatform.apply_config_platform_defaults``)."""
         dtype = self.model_config.dtype
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 

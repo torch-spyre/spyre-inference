@@ -13,7 +13,8 @@ permissions:
   checks: write
   contents: read
   issues: write
-  pull-requests: read
+  # PR comments use the issues API but require pull-request write permission.
+  pull-requests: write
 
 # queue: max so a newer run (even a skipped ordinary comment) cannot evict a
 # pending one.

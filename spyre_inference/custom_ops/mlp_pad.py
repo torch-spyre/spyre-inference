@@ -37,6 +37,12 @@ import torch
 import torch.nn.functional as F
 from vllm.logger import init_logger
 
+from spyre_inference.custom_ops.text_backbone import (
+    is_text_weight,
+    text_modules,
+    text_weight_prefix,
+)
+
 logger = init_logger(__name__)
 
 BLOCK_SIZE = 64
@@ -104,8 +110,11 @@ def _pad_weight(
     orig: int,
     padded: int,
     multipliers: tuple[int, ...] = (1,),
+    text_prefix: str | None = None,
 ) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right end-padding by its name."""
+    if not is_text_weight(name, text_prefix):
+        return w
     # Must precede the up_proj test: "gate_up_proj.*" also ends with "up_proj.*".
     if name.endswith(("gate_up_proj.weight", "gate_up_proj.bias")):
         for multiplier in multipliers:
@@ -133,14 +142,15 @@ def _pad_weight(
     return w
 
 
-def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
+def install_mlp_pad_weight_loader(model_loader, hf_config, model_config=None) -> None:
     """Wrap ``model_loader.get_all_weights`` to zero-pad the MLP tensors to ``padded``.
 
     Runs on the raw ``(name, tensor)`` stream before vLLM's ``WeightsMapper`` and
     ``weight_loader`` (which narrow/assert against the now-padded params). Full
     unsharded tensors are end-padded, so TP narrowing downstream still selects
     clean partitions (primary target is TP=1). Composes with the head-pad loader:
-    the two transforms touch disjoint tensor names.
+    the two transforms touch disjoint tensor names. Only text-backbone weights are
+    padded.
     """
     if not intermediate_padding_active(hf_config):
         return
@@ -157,18 +167,19 @@ def install_mlp_pad_weight_loader(model_loader, hf_config) -> None:
     orig = getattr(hf_config, _ORIG_ATTR)
     padded = hf_config.intermediate_size
     multipliers = width_multipliers(hf_config)
+    text_prefix = text_weight_prefix(model_config)
 
     original_get_all_weights = model_loader.get_all_weights
 
     def padded_get_all_weights(model_config, model) -> Iterable[tuple[str, torch.Tensor]]:
         for name, weight in original_get_all_weights(model_config, model):
-            yield name, _pad_weight(name, weight, orig, padded, multipliers)
+            yield name, _pad_weight(name, weight, orig, padded, multipliers, text_prefix)
 
     model_loader.get_all_weights = padded_get_all_weights
 
 
-def verify_padded_intermediate_size(model, hf_config) -> None:
-    """Fail loudly if any gated MLP was still built at the unpadded width.
+def verify_padded_intermediate_size(model, hf_config, model_config=None) -> None:
+    """Fail loudly if any text-backbone gated MLP was still built at the unpadded width.
 
     Guards the silent-corruption path: the linear weight loader narrows an
     over-wide tensor to the param width without raising, so a module the config
@@ -181,8 +192,9 @@ def verify_padded_intermediate_size(model, hf_config) -> None:
     widths = {multiplier * padded for multiplier in width_multipliers(hf_config)}
     found = [
         (name, getattr(module, "input_size", None))
-        for name, module in model.named_modules()
-        if name.endswith("down_proj")
+        for name, module in text_modules(
+            model, model_config, lambda name, _: name.endswith("down_proj"), "MLPs"
+        )
     ]
     if not found:
         raise RuntimeError(

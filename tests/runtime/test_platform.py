@@ -452,6 +452,20 @@ def test_pad_head_dim_skips_an_already_aligned_pooling_model():
     assert not hasattr(hf, "_spyre_orig_head_dim")
 
 
+def test_pad_head_dim_pads_hf_text_config_under_any_sub_config_name():
+    """The platform pads the config the runner passes read: ``hf_text_config``, which
+    ``get_text_config()`` may resolve from e.g. ``llm_config``, not only ``text_config``."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, text, mc = _fake_pad_config(rope_parameters={"rope_type": "default"})
+    mc.hf_config = SimpleNamespace(llm_config=text)
+
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert text.head_dim == 128
+    assert text._spyre_orig_head_dim == 64
+
+
 def _defaults_config(enforce_eager: bool, mode) -> VllmConfig:
     """Minimal VllmConfig for exercising apply_config_platform_defaults."""
     from vllm.config.compilation import CompilationMode

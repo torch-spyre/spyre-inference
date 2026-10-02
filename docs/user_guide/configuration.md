@@ -152,7 +152,7 @@ variants from warmup at no serving cost.
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
 the per-sequence loop), warmup also records it over the KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
-(default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
+(default: powers of two from 1 to `--max-num-seqs`) is the extra lever there, and the same
 keep-it-short advice applies.
 
 ## pyproject.toml Reference

@@ -688,7 +688,7 @@ def record_padding(row, attn_metadata, query_lens, seq_lens, block_size, builder
         print(f"    -> {row['error']}", flush=True)
 
 
-def record_attn_path(row, impl, attn_metadata, batched_variant):
+def record_attn_path(row, impl, attn_metadata, batched_variant, num_pages):
     """Record which read path the impl took, and flag a declined batched gate."""
     row["num_decode_seqs"] = attn_metadata.num_decode_seqs
     row["padded_num_seqs"] = (
@@ -698,7 +698,7 @@ def record_attn_path(row, impl, attn_metadata, batched_variant):
     row["blocks_per_chunk"] = (
         -1 if attn_metadata.blocks_per_chunk is None else attn_metadata.blocks_per_chunk
     )
-    batched = impl._batched_decode_preconditions_met(attn_metadata)
+    batched = impl._batched_decode_preconditions_met(attn_metadata, num_pages)
     if not batched:
         row["attn_path"] = "per_seq"
         if batched_variant:
@@ -856,7 +856,9 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             run()  # first call: compile + populate metadata device mirrors
             row["fallback_clean"] = not any("fallback" in str(w.message).lower() for w in caught)
 
-        record_attn_path(row, impl, inputs["attn_metadata"], meta["batched"])
+        record_attn_path(
+            row, impl, inputs["attn_metadata"], meta["batched"], inputs["k_pages"].shape[0]
+        )
 
         # Correctness gate before timing, same semantics as
         # tests/attention/test_spyre_attn.py. The reference reads KV pages back

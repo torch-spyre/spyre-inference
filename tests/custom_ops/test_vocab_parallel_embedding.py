@@ -130,38 +130,14 @@ def test_fake_tp2_forward_matches_reference(
     torch.testing.assert_close(summed.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
 
 
-# --- int64 comparison tripwire ---------------------------------------------
+# --- integer ops behind upstream `get_masked_input_and_mask` ----------------
 #
-# SpyreVocabParallelEmbedding.forward currently bounces TP-mask compute to
-# CPU because the upstream `get_masked_input_and_mask` does
-# `input_ >= org_vocab_start_index` under @torch.compile, and Spyre's
-# inductor backend rejects the int64 Python-int constant:
-#
-#     Spyre backend does not support: unexpected argument
-#     Constant(value=N, dtype=torch.int64) to greaterequal
-#
-# A 0-D tensor workaround compiles but produces silently-wrong values, so
-# CPU bounce is the only correct path today. This tripwire is
-# xfail(strict=True): when it flips to passing, delete the custom
-# SpyreVocabParallelEmbedding and check that the upstream code correctly runs
-# on TP > 1.
+# Upstream masks TP shards with `input_ >= org_vocab_start_index` and
+# `input_ - valid_offset` under @torch.compile. The comparison lowers since
+# torch-spyre#3802; the subtraction does not, so SpyreVocabParallelEmbedding
+# keeps its lookup tables until the int32 subtract test below passes.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Spyre's inductor backend rejects int64 comparisons: `Spyre backend "
-        "does not support: torch.bool result of operand with device format "
-        "DataFormats.IEEE_INT32`. This is the load-bearing limitation behind "
-        "SpyreVocabParallelEmbedding's CPU bounce — upstream "
-        "`get_masked_input_and_mask` runs `input_ >= org_vocab_start_index` "
-        "under @torch.compile. A 0-D-tensor workaround compiles but produces "
-        "silently-wrong values, so CPU bounce is the only correct path. When "
-        "this flips to passing, delete the CPU bounce in "
-        "SpyreVocabParallelEmbedding.forward and let the upstream forward path "
-        "run on-device."
-    ),
-)
 def test_int64_compiled_compare_against_python_int(tp_group) -> None:
     @torch.compile
     def cmp_ge(x, c):

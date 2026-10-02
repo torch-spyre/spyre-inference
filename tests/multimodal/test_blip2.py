@@ -15,12 +15,11 @@
 """Tests for `spyre_inference/multimodal/blip2.py`.
 
 `patch_blip2_qformer_attention` is a class-level patch with a `_spyre_patched`
-flag. The patched forward offloads the entire `Blip2QFormerMultiHeadAttention`
-to CPU for the duration of the call and moves the result back to the original
-device. The tests cover the staleness tripwire, idempotency, device restoration,
-and output equivalence.
-
-Section 4 repeats the numeric check on the card and skips without a device.
+flag. The patched forward replaces `Blip2QFormerMultiHeadAttention.forward` to
+call `F.scaled_dot_product_attention` with explicit `.contiguous()` materialization
+after each transpose so it runs fully on-device on Spyre. The tests cover the
+staleness tripwires, idempotency, apply() entry point, output equivalence with
+stock forward (self-attention and cross-attention), and on-card execution.
 """
 
 import sys
@@ -33,9 +32,11 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 blip2 = pytest.importorskip("vllm.model_executor.models.blip2")
 
 # Minimal dimensions that exercise the attention path without a full model load.
-HIDDEN_SIZE = 64
+# HEAD_DIM must be stick-aligned (a multiple of 64) on Spyre, matching Granite Vision's
+# Q-Former head_dim=64 configuration.
+HEAD_DIM = 64
 NUM_HEADS = 4
-HEAD_DIM = HIDDEN_SIZE // NUM_HEADS
+HIDDEN_SIZE = NUM_HEADS * HEAD_DIM  # 256
 
 # Capture the unpatched forward at import time, before any test can trigger
 # the process-wide class patch via patch_blip2_qformer_attention().
@@ -123,14 +124,13 @@ def test_patch_is_applied_and_idempotent():
 
 
 # ---------------------------------------------------------------------------
-# 3. CPU offload contract
+# 3. Numeric equivalence on CPU
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.blip2
 def test_patched_forward_output_matches_stock(tp_group):
-    """The CPU-offloaded forward must produce the same output as the stock
-    forward on CPU — moving to CPU and back must not change values."""
+    """The SDPA patched forward must produce the same output as the stock forward."""
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
 
     seq_len = 8
@@ -152,7 +152,7 @@ def test_patched_forward_output_matches_stock(tp_group):
 @pytest.mark.blip2
 def test_patched_forward_with_cross_attention_matches_stock(tp_group):
     """Cross-attention variant (encoder_hidden_states is not None) must also
-    produce the same output after the CPU offload."""
+    produce the same output as the stock forward."""
     from vllm.model_executor.models.blip2 import Blip2QFormerConfig
 
     from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
@@ -192,107 +192,22 @@ def test_patched_forward_with_cross_attention_matches_stock(tp_group):
 
 
 @pytest.mark.blip2
-def test_patched_forward_restores_module_device_when_inputs_on_cpu(tp_group):
-    """target_device is read from module parameters, not the input tensor.
+def test_apply_invokes_patch():
+    """`apply(model, device)` must invoke `patch_blip2_qformer_attention` and be idempotent."""
+    from spyre_inference.multimodal import blip2 as blip2_patch
 
-    Staleness guard: asserts that next(self.parameters()).device is used to
-    determine the restore target.  Uses a monkeypatched sentinel so the test
-    is meaningful on CPU: if the implementation reverts to hidden_states.device
-    the sentinel would never be consulted and the assertion fires.
-    """
-    import types
+    dummy_model = nn.Module()
+    blip2_patch.apply(dummy_model, torch.device("cpu"))
+    assert getattr(blip2.Blip2QFormerMultiHeadAttention.forward, "_spyre_patched", False) is True
 
-    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
-
-    patch_blip2_qformer_attention()
-
-    attn = _make_qformer_attention(tp_group)  # on CPU
-
-    # Replace next(self.parameters()) with a sentinel that records whether it
-    # was called.  The patched forward calls next(self.parameters()).device, so
-    # if it regresses to hidden_states.device the sentinel is never hit.
-    parameters_called = []
-    real_parameters = attn.parameters
-
-    def _spy_parameters(self):
-        parameters_called.append(True)
-        return real_parameters()
-
-    attn.parameters = types.MethodType(_spy_parameters, attn)
-
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
-    blip2.Blip2QFormerMultiHeadAttention.forward(attn, hidden_states)
-
-    assert parameters_called, (
-        "patched forward never called self.parameters() — "
-        "target_device is not being derived from module parameters"
-    )
-    for name, param in attn.named_parameters():
-        assert param.device.type == "cpu", (
-            f"parameter {name!r} is on {param.device} after patched forward — "
-            "module was not restored to its original device"
-        )
+    # Calling apply again must succeed without error
+    blip2_patch.apply(dummy_model, torch.device("cpu"))
+    assert getattr(blip2.Blip2QFormerMultiHeadAttention.forward, "_spyre_patched", False) is True
 
 
 # ---------------------------------------------------------------------------
-# 4. On-card: module restored to device after call (skipped without Spyre)
+# 4. On-card: forward on device (skipped without Spyre)
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.blip2
-def test_patched_forward_restores_module_to_spyre_with_cpu_inputs(tp_group):
-    """Module on Spyre, inputs on CPU: the module must be restored to Spyre.
-
-    This is the exact regression scenario Kevin's fix addresses.  The old code
-    read target_device from hidden_states.device (CPU), so the finally block
-    called self.to("cpu") and permanently stranded the module.  The fix reads
-    next(self.parameters()).device (Spyre) instead.
-    """
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
-
-    patch_blip2_qformer_attention()
-
-    device = torch.device("spyre")
-    attn = _make_qformer_attention(tp_group).to(device)
-
-    # Inputs deliberately on CPU — this is what triggers the bug in old code.
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16)
-    blip2.Blip2QFormerMultiHeadAttention.forward(attn, hidden_states)
-
-    for name, param in attn.named_parameters():
-        assert param.device.type == "spyre", (
-            f"parameter {name!r} is on {param.device} after patched forward with "
-            "CPU inputs — module was stranded off Spyre (target_device regression)"
-        )
-
-
-@pytest.mark.blip2
-def test_patched_forward_restores_module_to_spyre(tp_group):
-    """The patched forward moves `self` to CPU for the call and must restore
-    it to Spyre afterward — a failure here would silently strand the module
-    on CPU, causing every subsequent layer to get a CPU input on Spyre."""
-    if not spyre_available():
-        pytest.skip("Spyre device not available")
-
-    from spyre_inference.multimodal.blip2 import patch_blip2_qformer_attention
-
-    patch_blip2_qformer_attention()
-
-    device = torch.device("spyre")
-    attn = _make_qformer_attention(tp_group).to(device)
-
-    hidden_states = torch.randn(1, 8, HIDDEN_SIZE, dtype=torch.float16).to(device)
-    blip2.Blip2QFormerMultiHeadAttention.forward(attn, hidden_states)
-
-    # All parameters must be back on Spyre after the call.
-    for name, param in attn.named_parameters():
-        assert param.device.type == "spyre", (
-            f"parameter {name!r} is on {param.device} after patched forward — "
-            "module was not restored to Spyre"
-        )
 
 
 @pytest.mark.blip2

@@ -12,40 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""BLIP-2 / Q-Former workarounds for Spyre.
-
-Blip2QFormerMultiHeadAttention.forward contains an explicit
-torch.matmul / torch.softmax chain whose permute/matmul/softmax layout
-Spyre's restickify and bmm_padding passes cannot reconcile, so the entire
-module is run on CPU.
-
-vllm-project/vllm@a1541f5 replaces that chain with a single
-F.scaled_dot_product_attention call, which SpyreMMEncoderAttention already
-handles natively.  Once we upgrade, the Q-Former attention runs on-card and
-this entire workaround becomes dead code.
-
-When that vLLM version is in use, test_vllm_blip2_qformer_uses_sdpa in
-tests/probes/test_spyre_fallback_probes.py will flip to XPASS, signalling that
-this file and its call site in apply() can be removed.
-"""
+"""BLIP-2 / Q-Former workarounds for Spyre."""
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from vllm.logger import init_logger
-
-from spyre_inference.custom_ops.utils import convert
 
 logger = init_logger(__name__)
 
 
 def patch_blip2_qformer_attention() -> None:
-    """Run Blip2QFormerMultiHeadAttention.forward on CPU.
+    """Replace Blip2QFormerMultiHeadAttention.forward to run fully on Spyre.
 
-    The full forward contains permute/matmul/softmax chains that produce
-    non-contiguous layouts Spyre's restickify and bmm_padding passes cannot reconcile.
-    Run entirely on CPU. Weights (query/key/value linears) live on Spyre, so we move
-    the whole module to CPU for the call and restore it after.
+    The original forward uses transpose_for_scores (permute(0,2,1,3)) without a
+    subsequent .contiguous(), producing non-contiguous stick layouts that Spyre's
+    restickify and bmm_padding passes cannot reconcile.  Following the pattern
+    established in hf-adapters' ``make_encoder_block``, the replacement adds an
+    explicit .contiguous() call after each head-shape transpose, forcing Spyre to
+    materialise a fresh, canonically-tiled buffer before the SDPA decomposition
+    runs.
     """
     try:
         from vllm.model_executor.models.blip2 import Blip2QFormerMultiHeadAttention
@@ -55,25 +42,52 @@ def patch_blip2_qformer_attention() -> None:
     if getattr(Blip2QFormerMultiHeadAttention.forward, "_spyre_patched", False):
         return
 
-    _orig_blip2_attn_forward = Blip2QFormerMultiHeadAttention.forward
+    def _blip2_attn_forward_spyre(self, hidden_states, encoder_hidden_states=None):
+        bsz, q_len, _ = hidden_states.shape
 
-    def _blip2_attn_forward_cpu(self, hidden_states, encoder_hidden_states=None):
-        target_device = next(self.parameters()).device
-        hidden_states = convert(hidden_states, device="cpu")
-        if encoder_hidden_states is not None:
-            encoder_hidden_states = convert(encoder_hidden_states, device="cpu")
-        self.to("cpu")
-        try:
-            out = _orig_blip2_attn_forward(self, hidden_states, encoder_hidden_states)
-        finally:
-            self.to(target_device)
-        return convert(out, device=target_device)
+        # .contiguous() after the view+transpose is required on Spyre: the fused
+        # lowering of transpose -> SDPA reads non-contiguous (transposed) tensors
+        # with the wrong stick layout and returns garbage.  See hf-adapters'
+        # make_encoder_block for the same pattern.
+        q = (
+            self.query(hidden_states)
+            .view(bsz, q_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+            .contiguous()
+        )
 
-    _blip2_attn_forward_cpu._spyre_patched = True  # type: ignore[attr-defined]
-    Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_cpu  # type: ignore[method-assign]
+        kv_src = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        kv_len = kv_src.shape[1]
+        k = (
+            self.key(kv_src)
+            .view(bsz, kv_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+            .contiguous()
+        )
+        v = (
+            self.value(kv_src)
+            .view(bsz, kv_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+            .contiguous()
+        )
+
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
+        )
+
+        # [B, H, Lq, D] -> [B, Lq, H*D]
+        return attn_out.transpose(1, 2).reshape(bsz, q_len, self.all_head_size)
+
+    _blip2_attn_forward_spyre._spyre_patched = True  # type: ignore[attr-defined]
+    Blip2QFormerMultiHeadAttention.forward = _blip2_attn_forward_spyre  # type: ignore[method-assign]
     logger.info(
-        "Spyre: patched Blip2QFormerMultiHeadAttention.forward to run on CPU "
-        "(permute/matmul chains not restickifiable on Spyre)."
+        "Spyre: patched Blip2QFormerMultiHeadAttention.forward to use "
+        "F.scaled_dot_product_attention with .contiguous() (runs fully on Spyre)."
     )
 
 

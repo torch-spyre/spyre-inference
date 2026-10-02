@@ -68,10 +68,27 @@ logger = init_logger(__name__)
 # scope, and a shared artifact would guard on the page shape either way.
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
 #
-# The kernels that walk their pages tiled need fullgraph because of ``for_each_tile``.
-_page_attn_prefill_compiled = torch.compile(
-    page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
-)
+# The prefill kernel is opt-in dispatched on USE_FOR_EACH_TILE, unlike the other two kernels
+# below: SPYRE_ATTN_FOR_EACH_TILE=1 (default) keeps ``page_attn_head_major_prefill`` and its
+# ``for_each_tile`` walk unchanged; =0 instead selects ``page_attn_head_major_prefill_unroll``,
+# whose plain Python loop carries hand-tuned LX hints (see its module docstring) that only apply
+# to its own unrolled shape. Only the for_each_tile kernel needs fullgraph. The unroll module is
+# imported lazily, only on this branch: it pins layout_solver/co_optimizing_lx_planning at its
+# own module scope, which must not leak into the for_each_tile kernel's compile above.
+if USE_FOR_EACH_TILE:
+    _prefill_kernel_for_watch = page_attn_head_major_prefill_kernel
+    _page_attn_prefill_compiled = torch.compile(
+        page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=True
+    )
+else:
+    from spyre_inference.v1.attention.ops.page_attn_head_major_prefill_unroll import (
+        page_attn_head_major_prefill_unroll_kernel,
+    )
+
+    _prefill_kernel_for_watch = page_attn_head_major_prefill_unroll_kernel
+    _page_attn_prefill_compiled = torch.compile(
+        page_attn_head_major_prefill_unroll_kernel, dynamic=False
+    )
 _page_attn_decode_compiled = torch.compile(
     page_attn_head_major_decode_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
@@ -80,9 +97,7 @@ _batched_decode_compiled = torch.compile(
 )
 
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
-compile_guard.watch(
-    page_attn_head_major_prefill_kernel, "page attention prefill kernel (head-major)"
-)
+compile_guard.watch(_prefill_kernel_for_watch, "page attention prefill kernel (head-major)")
 compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel (head-major)")
 compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel (head-major)")
 compile_guard.watch(reshape_and_cache_head_major_kernel, "reshape_and_cache kernel (head-major)")

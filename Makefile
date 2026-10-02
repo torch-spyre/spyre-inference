@@ -401,9 +401,29 @@ MODELS ?=
 TPS ?=
 BENCH_TYPES ?=
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
+# The serve configs replay trace files that are not in the repo, so the fetch is
+# what makes a serve config runnable at all and is on by default. Set
+# FETCH_BENCH_DATA=0 on a host that already has the traces mounted.
+#
+# The script writes `export SPYRE_*_DATASET=...` lines to stdout and its
+# diagnostics to stderr, so capture stdout to a file and source that rather than
+# eval'ing a pipeline, which would hide the exit status. An artifact the script
+# cannot fetch is a warning and not an error, so it still exits 0 and simply
+# exports nothing for that artifact; run_vllm_benchmarks.py then fails by name
+# for the configs that actually need it and runs the rest. The `&&` still matters
+# for the case the script really does fail, e.g. a corrupt cache under `verify`.
+FETCH_BENCH_DATA ?= 1
+ifeq ($(strip $(FETCH_BENCH_DATA)),0)
+BENCH_DATA_CMD := true
+else
+BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
+endif
+
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
 	mkdir -p "$(RESULTS_DIR)"
+	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \
+	$(BENCH_DATA_CMD) && \
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
 		--configs-dir vllm-benchmarks/benchmarks/spyre \
 		--results-dir "$(RESULTS_DIR)" \

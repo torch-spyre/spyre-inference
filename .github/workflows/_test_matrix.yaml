@@ -132,6 +132,11 @@ on:
         required: false
       ARTIFACTORY_RPM_PATH:
         required: false
+      # Artifactory root that fetch_bench_datasets.py resolves artifact paths
+      # against, the vLLM benchmark traces among them. A run without it fails
+      # naming the variable rather than measuring nothing.
+      ARTIFACTORY_DATA_PATH:
+        required: false
       # ClickHouse connection for the perf job's benchmark ingest. A run without
       # them (any non-perf run, or perf with CLICKHOUSE_HOST unset) skips ingest.
       CLICKHOUSE_HOST:
@@ -1075,6 +1080,15 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
+      # The serve configs replay trace files that are not in the repo. Cache
+      # them on the same RWX volume as the HuggingFace cache above: it outlives
+      # the pod, so the first job to need a trace fetches it and every later job
+      # on any runner reads it from the volume. fetch_bench_datasets.py locks
+      # per file, so concurrent jobs fetch a given trace once.
+      SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

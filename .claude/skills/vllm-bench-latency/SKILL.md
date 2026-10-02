@@ -23,7 +23,7 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 
 - **`<model>`** (required): HF model id or locally-cached path. If omitted, default to `ibm-granite/granite-3.3-8b-instruct` and say so in the report.
 - **`--compare-main`**: after the current-branch run, run the **identical** benchmark on local `main` and print a comparison. Only when the user asks to compare.
-- Benchmark params (optional; defaults in parens): `--input-len` (64), `--output-len` (64), `--batch-size` (1), `--max-model-len` (128), `--num-iters` (10), `--num-iters-warmup` (2).
+- Benchmark params (optional; defaults in parens): `--input-len` (4096), `--output-len` (576), `--batch-size` (1), `--max-model-len` (8192), `--num-iters` (10), `--num-iters-warmup` (2). These are the checked-in `cics` shape (`vllm-benchmarks/benchmarks/spyre/latency-tests.yaml`), so an ad-hoc run is comparable to the suite's trend line by default.
 - **`--enforce-eager`**: benchmark the uncompiled path. Only pass it if the user asks — compiled (`STOCK_TORCH_COMPILE`) is the platform default.
 
 ## Steps
@@ -61,12 +61,16 @@ CSIZES='[1,2,4,512]'   # at bs=4/512 this IS the default -- pins it, saves nothi
 
 Derive the list from the config, don't copy it. `bs=1`, `in64/out64/max128`: decode schedules 1 token, the prompt prefills in one chunk, so `[1,64]` is the complete cover — and a max of 64 is safe here precisely because 64 already holds the whole prompt. `bs=4` with a 3200-token prompt: decode schedules 1–4, prefill chunks fill the budget, so `[1,2,4,512]` (`find_bucket` pads 3 up to 4).
 
+At the default `bs=1/in4096` the prompt no longer fits one chunk: 4096 > 512, so prefill arrives as 8 full 512-token chunks and decode schedules 1, making `[1,512]` the cover. Keep 512 as the max regardless — dropping it would cut `max_num_batched_tokens` and re-chunk the prefill instead of saving compile.
+
 **KV block count** — the per-block mask tile list grows by one entry every time `kv_len` crosses a `block_size` boundary (128, the platform default), and `compile_sizes` does *not* bucket that. Each crossing is a fresh runtime re-record — the expensive kind. Choose params so the block count is **constant across the timed window**:
 
 - make `--input-len` a multiple of 128, and
 - keep `--input-len + --output-len` inside the *same* block, i.e. `output-len ≤ 128`.
 
 `in3200/out128` works: 3200 = 25×128, so all 128 decode steps sit inside block 26. A long `--output-len` at high `--max-model-len` is the pathological case — `out3072` crosses 24 boundaries, and compilation then dominates wall clock.
+
+**When the crossings are the point, pay for them at warmup.** The checked-in suite deliberately breaks the second rule: it runs the trace's real decode length (`out576`, crossing 5 boundaries), because a decode capped at one block would not measure what the traces do. That is safe only because `bench latency` warms the *identical* shape, so every crossing is recorded at warmup and reused by the timed iterations — `--num-iters-warmup ≥ 2` is load-bearing there, not hygiene. Do not carry `out576` to a one-off run of a *different* shape without warming it the same way.
 
 Also pass `--no-enable-prefix-caching`: with it on, timed iterations hit the cache the warmup iterations filled, so `num_computed_tokens` differs, the prefill chunks come out a different size, and that new shape re-records *inside* the measured window.
 
@@ -79,8 +83,8 @@ Report `Warmup complete in <N>s for <M> buckets` from the log so the compile sav
 Fix the params in one block so a compare run is identical, then run and read back the JSON (source of truth):
 
 ```bash
-MODEL="<model>"; INPUT_LEN=64; OUTPUT_LEN=64; BATCH_SIZE=1
-MAX_LEN=128; ITERS=10; WARMUP=2; EAGER=""   # EAGER="--enforce-eager" only if asked
+MODEL="<model>"; INPUT_LEN=4096; OUTPUT_LEN=576; BATCH_SIZE=1
+MAX_LEN=8192; ITERS=10; WARMUP=2; EAGER=""   # EAGER="--enforce-eager" only if asked
 TAG=branch
 OUT=.claude/skills/vllm-bench-latency/logs; mkdir -p "$OUT"   # artifacts live here, not the repo root
 export SPYRE_NUM_CPUS=8

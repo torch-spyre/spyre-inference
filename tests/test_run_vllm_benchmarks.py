@@ -14,15 +14,15 @@
 
 """CPU-only tests for the benchmark runner's config layer (no hardware needed).
 
-What the serve benchmarks depend on and a typo would silently break: tests merge
-over `defaults` per section rather than replacing it, TP drives
+What the benchmarks depend on and a typo would silently break: tests merge over
+`defaults` per section rather than replacing it, TP drives
 SPYRE_DEVICES/AIU_WORLD_SIZE and server_health_timeout drives
 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, the bench side inherits the server's model,
 `dataset-path` expands from the environment, and a selected test whose dataset is
 absent aborts the run instead of being skipped.
 
-The checked-in `serve-tests.yaml` is loaded as-is at the end, so a config edit
-that breaks these invariants fails here.
+All three checked-in configs are loaded as-is at the end, so a config edit that
+breaks these invariants fails here.
 """
 
 import importlib.util
@@ -37,7 +37,10 @@ _spec = importlib.util.spec_from_file_location("run_vllm_benchmarks", _SCRIPT)
 runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(runner)
 
-SERVE_TESTS = _REPO / "vllm-benchmarks" / "benchmarks" / "spyre" / "serve-tests.yaml"
+_CONFIGS = _REPO / "vllm-benchmarks" / "benchmarks" / "spyre"
+SERVE_TESTS = _CONFIGS / "serve-tests.yaml"
+LATENCY_TESTS = _CONFIGS / "latency-tests.yaml"
+THROUGHPUT_TESTS = _CONFIGS / "throughput-tests.yaml"
 
 
 def _write(tmp_path, raw) -> Path:
@@ -117,7 +120,7 @@ def test_defaults_are_not_shared_between_tests(tmp_path):
 
 
 def test_bare_list_still_loads(tmp_path):
-    """The latency/throughput files are plain lists, with no defaults mapping."""
+    """A file with no `defaults` mapping still loads, as older configs were."""
     path = _write(
         tmp_path, [{"test_name": "t", "parameters": {"model": "m", "tensor_parallel_size": 2}}]
     )
@@ -314,3 +317,78 @@ def test_serve_tests_yaml_derives_consistently():
             assert parameters["random-input-len"] <= config["server_parameters"]["max-model-len"], (
                 config["test_name"]
             )
+
+
+# The shape each offline entry runs to approximate a trace serve replays.
+TRACE_SHAPES = {
+    "aiops": {"input_len": 1536, "output_len": 64, "max_model_len": 4096},
+    "cics": {"input_len": 4096, "output_len": 576, "max_model_len": 8192},
+}
+
+# The offline files spell input/output length under their own flag names.
+OFFLINE_LEN_KEYS = {
+    LATENCY_TESTS: ("input-len", "output-len"),
+    THROUGHPUT_TESTS: ("random-input-len", "random-output-len"),
+}
+
+
+@pytest.mark.parametrize("config_file", list(OFFLINE_LEN_KEYS))
+def test_offline_tests_yaml_derives_consistently(config_file):
+    """Every offline entry derives its devices, and names the shape it runs."""
+    input_key, output_key = OFFLINE_LEN_KEYS[config_file]
+    configs = runner._load_configs(config_file)
+    assert configs
+
+    for config in configs:
+        name = config["test_name"]
+        env = config["environment_variables"]
+        tp = runner._config_tp(config)
+        assert tp is not None, name
+        assert env["AIU_WORLD_SIZE"] == str(tp)
+        assert env["SPYRE_DEVICES"].split(",") == [str(i) for i in range(tp)]
+
+        parameters = config["parameters"]
+        # in<N>_out<N>/tp<N> in the name are the benchmark's identity downstream
+        # (ingest_vllm_benchmarks.py::_parse_input_shapes), so a name that
+        # disagrees with the flags silently mislabels a trend line.
+        assert f"_tp{tp}_" in name, name
+        assert f"_in{parameters[input_key]}_" in name, name
+        assert f"_out{parameters[output_key]}_" in name, name
+
+        # A `_smoke` entry is its own short shape; every other names a trace.
+        trace = name.rsplit("_", 1)[1]
+        if trace == "smoke":
+            continue
+        assert trace in TRACE_SHAPES, name
+        shape = TRACE_SHAPES[trace]
+        assert parameters[input_key] == shape["input_len"], name
+        assert parameters[output_key] == shape["output_len"], name
+        assert parameters["max-model-len"] == shape["max_model_len"], name
+
+
+def test_offline_configs_cover_the_serve_models():
+    """The offline suites benchmark what serve does, at the same context length."""
+    # Only the trace-replaying entries: the encoder ones generate their prompts
+    # and have no offline counterpart, since these are decode benchmarks.
+    serve_points = {
+        (
+            runner._config_model(config),
+            runner._config_tp(config),
+            config["server_parameters"]["max-model-len"],
+        )
+        for config in runner._load_configs(SERVE_TESTS)
+        if not config["parameters"]["dataset-name"].startswith("random")
+    }
+
+    for config_file in OFFLINE_LEN_KEYS:
+        offline_points = {
+            (
+                runner._config_model(config),
+                runner._config_tp(config),
+                config["parameters"]["max-model-len"],
+            )
+            for config in runner._load_configs(config_file)
+            # The smoke entry has no serve counterpart by design.
+            if not config["test_name"].endswith("_smoke")
+        }
+        assert offline_points == serve_points, config_file.name

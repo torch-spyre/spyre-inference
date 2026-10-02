@@ -1,35 +1,107 @@
-# Latency benchmarks for Spyre devices
-- test_name: latency_granite8B_tp1_in64_out64
+# Latency benchmarks for Spyre devices, at the shapes the agentic traces show.
+#
+# Each entry under `tests` is merged over `defaults` and can override any key.
+#
+# `vllm bench latency` has no dataset support: it generates one fixed
+# input-len/output-len shape, so these entries approximate the traces the serve
+# benchmarks replay instead -- same models, same max-model-len, input/output
+# lengths at the median of each trace's replayed window:
+#
+#   aiops (4k):  prompt p50 1476 -> in1536,  output p50 48  -> out64
+#   cics  (8k):  prompt p50 4053 -> in4096,  output p50 573 -> out576
+#
+# input-len is 128-aligned so the prompt fills a whole number of KV blocks.
+#
+# The trailing suffix names the trace whose shape an entry approximates, and
+# in<N>_out<N> is part of the benchmark identity downstream
+# (ingest_vllm_benchmarks.py::_parse_input_shapes), so a shape change here
+# starts a new trend line rather than bending the old one.
+
+defaults:
   environment_variables:
     VLLM_CPU_KVCACHE_SPACE: 64
     DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-  parameters:
-    model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
-    tensor_parallel_size: 1
-    dtype: float16
-    load_format: auto
-    input-len: 64
-    output-len: 64
-    batch-size: 1
-    num-iters-warmup: 1
-    num-iters: 2
-    max-model-len: 128
-- test_name: latency_granite33-8b_tp1_in64_out64
-  environment_variables:
-    VLLM_CPU_KVCACHE_SPACE: 64
-    DTLOG_LEVEL: error
-    SPYRE_DEVICES: '0'
-    # Allow long compilation
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
   parameters:
-    model: ibm-granite/granite-3.3-8b-instruct
-    tensor_parallel_size: 1
     dtype: float16
     load_format: auto
-    input-len: 64
-    output-len: 64
     batch-size: 1
     num-iters-warmup: 2
     num-iters: 10
-    max-model-len: 128
+
+tests:
+  - test_name: latency_granite8B_tp1_in64_out64_smoke
+    environment_variables:
+      VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '600'
+    parameters:
+      model: ibm-ai-platform/micro-g3.3-8b-instruct-1b
+      tensor_parallel_size: 1
+      input-len: 64
+      output-len: 64
+      max-model-len: 128
+      num-iters-warmup: 1
+      num-iters: 2
+
+  - test_name: latency_granite33-8b_tp1_in4096_out576_cics
+    parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor_parallel_size: 1
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192
+
+  - test_name: latency_granite33-8b_tp4_in4096_out576_cics
+    parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor_parallel_size: 4
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192
+
+  - test_name: latency_granite41-8b_tp1_in4096_out576_cics
+    parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor_parallel_size: 1
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192
+
+  - test_name: latency_granite41-8b_tp4_in4096_out576_cics
+    parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor_parallel_size: 4
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192
+
+  - test_name: latency_granite33-8b-fp8_tp4_in1536_out64_aiops
+    parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor_parallel_size: 4
+      input-len: 1536
+      output-len: 64
+      max-model-len: 4096
+
+  - test_name: latency_granite41-8b-fp8_tp4_in1536_out64_aiops
+    parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor_parallel_size: 4
+      input-len: 1536
+      output-len: 64
+      max-model-len: 4096
+
+  - test_name: latency_gemma4-26b-a4b_tp1_in4096_out576_cics
+    parameters:
+      model: google/gemma-4-26B-A4B
+      tensor_parallel_size: 1
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192
+
+  - test_name: latency_gemma4-26b-a4b_tp4_in4096_out576_cics
+    parameters:
+      model: google/gemma-4-26B-A4B
+      tensor_parallel_size: 4
+      input-len: 4096
+      output-len: 576
+      max-model-len: 8192

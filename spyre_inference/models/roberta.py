@@ -136,7 +136,7 @@ class SpyreRobertaEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, RobertaEm
         position_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Copy segment ids out of the side buffer and pass that tensor into the compiled gather.
+        # Pass side-buffer segment ids, or zeros, into the compiled gather.
         # ``position_ids`` already include the offset.
         return self._compiled_forward(
             input_ids,

@@ -1393,10 +1393,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         """Re-compact a rectangular-path grid to the packed order the poolers address.
 
-        LAST/MEAN and mixed-task poolers need packed-order rows, so on the rectangular
-        path their inter-sequence pad rows have to go. Homogeneous CLS instead reads
-        grid rows directly and skips this gather. Reporting padded lengths instead
-        makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
+        Except for eligible homogeneous Spyre CLS batches, poolers need packed-order
+        rows, including token-level poolers. Reporting padded lengths instead makes
+        ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
         The gather keeps its input's row count: sizing it to the real token count adds
         a ``torch.compile`` specialisation per distinct total, recompiling nearly every
@@ -1529,9 +1528,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _rectangular_cls(self, pooling_metadata: PoolingMetadata) -> bool:
         """True when this rectangular step's only task gathers the CLS row.
 
-        LAST and MEAN address packed rows, so they still take the unpad gather.
-        A mixed-task batch does too: one hidden-state layout has to serve every
-        task in the step.
+        Other poolers, including token-level ones, need packed rows. Mixed-task
+        batches also take the unpad gather so one layout serves every task.
         """
         grid = self._encoder_grid
         if grid is None:
@@ -1653,8 +1651,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         hidden_states = convert(hidden_states, self._spyre_device)
-        # CLS reads its rectangle's grid row at ``seq_idx * extent`` directly;
-        # LAST/MEAN still require re-compaction to the packed order they index.
+        # Eligible homogeneous CLS reads grid rows directly; all other poolers
+        # need packed order, including token-level poolers.
         # ``first_token_indices_gpu`` stays a host tensor, like the rest of the cursor.
         grid = self._encoder_grid
         if grid is not None and self._rectangular_cls(pooling_metadata):

@@ -56,6 +56,13 @@ present, the device row is empty, and no error is raised.
 
 ### 1.3 Enabling the AIUPTI backend
 
+For pinned-RPM installs, select matching runtime headers before either rebuild option:
+
+```bash
+source ~/spyre-libs/env.sh
+export SEN_COMMON_HEADERS="${SENTIENT_BASE_INSTALL_DIR}/runtime/include"
+```
+
 **Option A — persistent (`pyproject.toml` flip):**
 
 Edit `pyproject.toml` in `spyre-inference`:
@@ -212,25 +219,26 @@ os._exit(0)  # avoids TimestampCalibrator abort at teardown
 
 ### 2.3 Load-bearing environment variables
 
-The recommended way to set these is to source `setup_profile_env.sh`
-before launching:
+From the repository root, activate your venv, source the setup script, and explicitly
+allow both Spyre plugin entry points:
 
 ```bash
-source ./setup_profile_env.sh
-python -u profile_spyre_inference.py
+source .venv/bin/activate
+source examples/offline_inference/setup_profile_env.sh
+export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+python -u examples/offline_inference/profile_spyre_inference.py
 ```
 
-The script must be *sourced*, not executed: `export` and `source
-/opt/spyre-inference/bin/activate` only take effect in the current
-shell, so running it as `./setup_profile_env.sh` in a child shell has
-no effect on your interactive environment.
+The script must be *sourced*, not executed, so its exports affect the current shell.
+It activates `/opt/spyre-inference` only when `VIRTUAL_ENV` is empty or unset.
+Set `VLLM_PLUGINS` afterward because the script overwrites it.
 
 Contents of the script and why each entry matters:
 
 | Variable / action | Value | Purpose |
 |---|---|---|
-| (venv activation) | `source /opt/spyre-inference/bin/activate` | Puts the venv's `python` and packages on `PATH`. This is a deployment-style path; for a local `uv sync` install use `source .venv/bin/activate`. |
-| `VLLM_PLUGINS` | `spyre_inference` | Required for vLLM to load the Spyre platform plugin |
+| (venv activation) | `source /opt/spyre-inference/bin/activate` | Used only when `VIRTUAL_ENV` is empty or unset; otherwise the current venv is kept. |
+| `VLLM_PLUGINS` | `spyre_inference` | Allowlists only the platform entry point. The recipe above also allows `spyre_inference_ops`, the general-plugin callback; the worker independently registers ops and model adaptations. |
 | (profiler check) | — | Still checks `torch.__version__` for the retired `+aiu.kineto` suffix, so it warns "stock torch detected" on every current install, profiler-enabled or not — ignore that warning. The real check is `ldd .../_C.so \| grep libaiupti` plus the `AiuptiActivityProfilerSession` symbols (§1.4); the suffix flow was retired by torch-spyre PR #1856. See §1.3. |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |
 | `OPENBLAS_NUM_THREADS` | `1` | Pin OpenBLAS thread pool (same rationale) |
@@ -427,7 +435,9 @@ of a row of `-` values.
 **Terminal 1 — workload:**
 
 ```bash
+source .venv/bin/activate
 source examples/offline_inference/setup_profile_env.sh
+export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
 export DTCOMPILER_KEEP_EXPORT=true
 export SENLIB_DEVEL_CONFIG_FILE=<venv-prefix>/etc/senlib_config_aiusmi.json
 python examples/offline_inference/profile_spyre_inference.py

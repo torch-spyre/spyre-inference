@@ -17,9 +17,9 @@
 An ``intermediate_size`` that is not a multiple of the 64-element fp16 stick makes
 ``SiluAndMul`` slice the fused gate+up tensor's second half at an unaligned offset,
 which Spyre inductor cannot lower. ``TorchSpyrePlatform._maybe_pad_intermediate_size``
-rounds it up so each TP rank's shard is a 64-multiple before the model is built; the pass
-here zero-fills the
-added gate/up output rows and down_proj input columns as the checkpoint streams in.
+rounds it up before model construction so each TP rank's shard is a 64-multiple.
+This pass zero-fills the added gate/up output rows and down_proj input columns
+as the checkpoint streams in.
 
 Zero-padding is arithmetically inert for a gated MLP: each added lane has a zero
 up-projection value, so ``activation(0) * 0`` is zero. Unlike QK-norm, nothing normalizes

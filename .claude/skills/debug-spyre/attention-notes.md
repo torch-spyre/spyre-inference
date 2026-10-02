@@ -21,7 +21,7 @@ In addition to the generic table in `SKILL.md`:
 | KV alignment to bucketed length | `SpyreAttnBucketer` kv buckets: powers of two from `block_size` to `max_model_len`, consumed as a padded block count, so the same compiled kernel is reused as KV grows |
 | Query length must be bucketed | `SpyreAttnBucketer` query buckets: `[1] + multiples of min(512, max_num_batched_tokens)`; each sequence's query is padded up to its own bucket |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
-| Head-major page gather is a 2-D subscript (`aten.index`), which fails eager | The head-major backend always compiles attention, even under `--enforce-eager`; batched decode is declined whenever attention is eager |
+| Head-major page gather is a 2-D subscript (`aten.index`), which fails eager | Head-major always compiles attention, even under `--enforce-eager`; batched decode still requires `STOCK_TORCH_COMPILE` mode on either layout |
 
 MHA and MQA (`test_spyre_attn_mha` / `test_spyre_attn_mqa`, and `test_head_major_attn_head_configs`), GQA, sliding window, soft-capping and ALiBi (token-major only) all have committed parametrizations; check which layout a failure ran on before assuming a head configuration is the cause.
 

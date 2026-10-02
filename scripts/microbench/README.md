@@ -218,8 +218,8 @@ when a row is padded.
 The KV cache is `num_blocks * block_size * num_kv_heads * head_size * 2 B` per
 tensor, so holding `num_blocks` fixed while doubling `block_size` doubles the
 footprint and allocations can fail with `RAS::FLEXALLOCATOR::OutOfMemory`. Device
-memory is not fully returned between configs (`kineto_profiling.md` §4.3) despite
-the runner's `gc.collect()`, so it accumulates across a sweep; affected rows get
+memory is not fully returned between configs despite the runner's `gc.collect()`,
+so it accumulates across a sweep; affected rows get
 `error` set and empty `ms`.
 
 - Pin `num_blocks` constant across runs you intend to compare.

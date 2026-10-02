@@ -96,9 +96,9 @@ tensor and the unmodified upstream idiom `q, k, v = qkv.split(...)` slices it, e
 which slices gate/up on-device. Earlier revisions instead split the QKV weight on CPU at load
 time into three per-part GEMMs — a `SplitQKV` container built by an `analyze_and_unfuse`
 pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
-so that pass is gone. The remaining slicing constraint is narrower than it was and lives
-in the attention backend, where offset > 0 views still corrupt on transfer (see
-[Attention Backend](#attention-backend)).
+so that pass is gone. Attention gathers query rows rather than passing offset views into
+compiled kernels, and materializes fused K/V views before head-major cache writes (see
+[Head-major KV cache](#head-major-kv-cache)).
 
 ## Model adaptations
 
@@ -187,8 +187,8 @@ and full attention, giving four. A fresh `num_tokens` bucket then costs one bloc
 rather than a whole-model one. For decoder attention, `num_tokens` is the block graph's
 only shape dependence: kv-cache length and its block-count buckets live inside
 `unified_attention_with_output`, which is opaque to this graph and compiles its own
-kernels. Inline rectangular encoder attention also specializes the block graph by
-rectangle (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)). Inline rectangular
+encoder attention also specializes the block graph by rectangle.
 
 Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
 which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bakes in its
@@ -236,11 +236,11 @@ path, the KV store, and the cache's device layout — live under
 the host-side orchestration that calls them.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
-rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup traces every
-per-sequence variant `SpyreAttnBucketer` can produce — the product of the KV-length and
-query-length buckets below — so a served request normally lands on an already-compiled
-kernel. When the
-batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
+rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records
+per-sequence variants from `SpyreAttnBucketer.variants()`. A query bucket pairs only with
+block counts that fit its smallest real query length; variants exceeding the allocated
+page count are skipped. Failed recordings are logged and compile on first use instead.
+When the batched-decode kernel is enabled (`SPYRE_BATCHED_DECODE=1`, the default, which under the
 default tiled walk means the head-major layout) warmup enumerates its variants, the
 product of the KV-length (`num_blocks`) and num-sequences buckets; combinations that
 reach or exceed the allocated page count are skipped and declined at dispatch. A single
@@ -253,11 +253,11 @@ time, so a graph holds one copy of the attention body per page and compile time 
 with KV length. `SPYRE_ATTN_FOR_EACH_TILE=1` walks that axis with torch-spyre's
 `for_each_tile` instead, leaving one body plus a tile spec, and the same applies to the
 batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
-a `(tile_max, tile_sum, tile_output)` triple either way; `walk_tiles` picks the walk and
-is the only place that reads the variable. `SPYRE_ATTN_FOR_EACH_TILE=1` is the default;
-setting it to `0` runs the identical bodies under Python loops as a rollback path. The switch is
-read once at import, because it decides the `fullgraph` setting the tiled walk needs —
-setting it after `spyre_inference` is imported has no effect.
+a `(tile_max, tile_sum, tile_output)` triple either way. `walk_tiles` selects the walk;
+the same flag also controls `fullgraph`, batched-decode eligibility, and layout/kernel
+branches. `SPYRE_ATTN_FOR_EACH_TILE=1` is the default; setting it to `0` uses Python loops
+as a rollback path. The flag is read once at import, so set it before importing
+`spyre_inference`.
 
 ### Head-major KV cache
 
@@ -330,7 +330,7 @@ Key constraints:
   are all exercised, on both layouts (`tests/attention/test_spyre_attn.py`,
   `tests/attention/test_spyre_head_major_attn.py`)
 - **Supported**: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not
+  layers stay unwindowed) and logits soft-capping on both layouts; ALiBi on token-major only
 
 ### Encoder-only attention
 
@@ -525,5 +525,5 @@ signal: when a probe flips green, delete the corresponding override or workaroun
 
 The worker (`TorchSpyreWorker`) inherits directly from vLLM's `Worker` (gpu_worker), not
 `CPUWorker` — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
-profiling). Data parallelism (`data_parallel_size > 1`) is rejected in
-`check_and_update_config`.
+profiling). Data and pipeline parallelism (`data_parallel_size > 1` or
+`pipeline_parallel_size > 1`) are rejected in `check_and_update_config`.

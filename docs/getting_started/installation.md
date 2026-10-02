@@ -21,6 +21,9 @@ The `--rebuild` option rebuilds torch-spyre against those libraries, clearing uv
 revision-keyed wheel cache first. After an RPM-only update, `uv sync` by itself can
 reuse a wheel built against the old libraries. The installer leaves the system
 `/opt/ibm/spyre` tree unchanged; source its `env.sh` in each new shell.
+Unlike the Install command below, `--rebuild` runs
+`uv sync --group dev --reinstall-package torch-spyre` without `--frozen` and may update
+`uv.lock`.
 
 ## Install
 

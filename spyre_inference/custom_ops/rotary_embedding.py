@@ -69,7 +69,7 @@ def _rotate_neox_2x2(
 
 
 class _SpyreRotaryMixin:
-    """Spyre RoPE wiring shared by the base and llama3 OOT classes.
+    """Spyre RoPE wiring shared by the OOT rotary classes.
 
     Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
     ``NotImplementedError`` at construction. The rotation cache is derived lazily on CPU

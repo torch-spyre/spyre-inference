@@ -120,6 +120,108 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+_KV_LADDER_GRAIN = 64
+
+# Every preset keeps the powers of two, so a denser one only subdivides and a KV length's
+# bucket never moves up. "step" values are divisors of max_model_len, not token counts.
+_KV_LADDER_PRESETS: dict[str, tuple[str, int, int] | None] = {
+    "pow2": None,
+    "8_5": ("ratio", 8, 5),
+    "4_3": ("ratio", 4, 3),
+    "9_8": ("ratio", 9, 8),
+    "uniform": ("step", 8, 16),
+}
+
+
+def _uniform_union_up_to(
+    n: int, start: int, block_size: int, step_div: int, knee_div: int
+) -> tuple[int, ...]:
+    """Powers of two in [start, n] unioned with an evenly spaced series above a knee."""
+    if n < 1:
+        return ()
+    step = max(block_size, (n // step_div) // block_size * block_size)
+    knee = max(block_size, n // knee_div)
+    extra = []
+    v = knee
+    while True:
+        v += step
+        if v >= n:
+            break
+        if v % block_size == 0:
+            extra.append(v)
+    return tuple(sorted(set(_powers_of_two_up_to(n, start=start)) | set(extra) | {n}))
+
+
+def _kv_ladder_steps(name: str) -> tuple[str, int, int] | None:
+    """The preset's spec, or None for bare powers of two."""
+    try:
+        return _KV_LADDER_PRESETS[name]
+    except KeyError:
+        raise ValueError(
+            f"SPYRE_ATTN_KV_LADDER={name!r} is not one of "
+            f"{sorted(_KV_LADDER_PRESETS)}. SPYRE_ATTN_KV_BUCKETS overrides the ladder "
+            f"entirely if none of these fit."
+        ) from None
+
+
+def _geometric_union_up_to(
+    n: int,
+    start: int,
+    block_size: int,
+    steps: tuple[int, int] = (8, 5),
+    grain: int = _KV_LADDER_GRAIN,
+) -> tuple[int, ...]:
+    """Powers of two in [start, n] unioned with a geometric series, plus n itself.
+
+    Every power of two is kept, so a KV length's bucket can only move down relative
+    to the powers-of-two ladder, never up.
+    """
+    if n < 1:
+        return ()
+    number, denom = steps
+
+    def _series(step: int) -> list[int]:
+        out = []
+        v = step
+        while True:
+            v = v * number // denom
+            if v >= n:
+                return out
+            aligned = (v // step) * step
+            if aligned > start:
+                out.append(aligned)
+
+    # Whether a 64-token grain keeps every bucket a whole number of blocks depends on
+    # where this series lands, not on a divisibility rule: it fails from block_size 256.
+    if any(v % block_size for v in _series(grain)):
+        grain = block_size
+    return tuple(sorted(set(_powers_of_two_up_to(n, start=start)) | set(_series(grain)) | {n}))
+
+
+def _build_kv_ladder(
+    spec: tuple[str, int, int] | None, max_model_len: int, block_size: int
+) -> list[int]:
+    """The preset's bucket list."""
+    if spec is None:
+        return list(_powers_of_two_up_to(max_model_len, start=block_size))
+    kind, first, second = spec
+    if kind == "step":
+        return list(
+            _uniform_union_up_to(
+                max_model_len,
+                start=block_size,
+                block_size=block_size,
+                step_div=first,
+                knee_div=second,
+            )
+        )
+    return list(
+        _geometric_union_up_to(
+            max_model_len, start=block_size, block_size=block_size, steps=(first, second)
+        )
+    )
+
+
 def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     """The smallest KV head count any layer carries, after the TP split.
 
@@ -230,11 +332,12 @@ class SpyreAttnBucketer:
         # Default: powers of two from block_size up to max_model_len. Geometric
         # because the recorded set is a product of both axes; the extra padding
         # each bucket costs is absorbed by the mask.
+        steps = _kv_ladder_steps(envs.SPYRE_ATTN_KV_LADDER)
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: _build_kv_ladder(steps, max_model_len, block_size),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv

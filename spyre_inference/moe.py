@@ -37,6 +37,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from spyre_inference import envs
 
 if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
     )
@@ -286,14 +287,25 @@ def _moe_persistent(
     activation: str,
 ) -> torch.Tensor:
     from torch_spyre._inductor.propagate_hints import spyre_hint
+    from torch_spyre._inductor.wsr import for_each_tile
 
-    experts = gate.shape[0]
     with spyre_hint(named_dims=["E", "T", "ONE"]):
         route = route.permute(1, 0, 2).contiguous().clone()
-    with spyre_hint(num_tiles_per_dim={"E": experts}, work_div={"T": _token_cores(x.shape[0])}):
-        h = x.unsqueeze(0)
-        activated = _activation(torch.matmul(h, gate), torch.matmul(h, up), activation)
-        return (torch.matmul(activated, down) * route).sum(dim=0)
+
+    def expert_body(acc, tiles):
+        x, route_tile, gate_tile, up_tile, down_tile = tiles
+        activated = _activation(torch.matmul(x, gate_tile), torch.matmul(x, up_tile), activation)
+        return acc + (torch.matmul(activated, down_tile) * route_tile).squeeze(0), None
+
+    with spyre_hint(work_div={"T": _token_cores(x.shape[0])}):
+        result, _ = for_each_tile(
+            expert_body,
+            (x, route, gate, up, down),
+            dims=(None, 0, 0, 0, 0),
+            tile_size=1,
+            init=torch.zeros_like(x),
+        )
+    return result
 
 
 def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
@@ -384,19 +396,55 @@ def _reset_named_dims() -> None:
     reset()
 
 
-def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
-    """Move one expert stack to the device in the gather-friendly MoE layout.
+def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
+    """torch-spyre's device layout for an ``[E, C, F]`` stack in matmul-weight order.
 
-    ``dma_moe_expert_weight_to_spyre`` takes an ``[E, C, F]`` stack whose free dim spans
-    whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
+    ``dim_order=[1, 0, 2]`` gives ``[E, F // stick, C, stick]``: within each expert the free
+    dim's stick columns are outer and the contraction rows of one column are adjacent, and the
+    expert dim stays outermost, so each expert is still one contiguous block for the loop's
+    per-expert step and for the gather. It is the constructor ``_dma_to_spyre_dim_order_swapped``
+    uses for ``nn.Linear`` weights (torch-spyre #1339), on a rank-3 stack; ``F`` stays the
+    stick dim, so nothing is restickified. ``dma_moe_expert_weight_to_spyre`` gives the default.
+    Follow-up: a torch-spyre helper variant (matmul-order expert stack), not implemented here.
+    """
+    from torch_spyre._C import SpyreTensorLayout
+
+    return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
+
+
+def _to_spyre_expert_weight(
+    weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
+) -> torch.Tensor:
+    """Move one expert stack to the device.
+
+    ``weight`` is an ``[E, C, F]`` stack whose free dim spans whole sticks once ``pad`` (an
+    ``F.pad`` spec) widens it. By default it takes the gather-friendly MoE layout of
+    ``dma_moe_expert_weight_to_spyre``, ``[E, C, F // stick, stick]``: each contraction row's
+    sticks side by side.
+
+    ``kernel_order`` instead stores each expert in matmul-weight order (``_expert_kernel_layout``).
+    A matmul streams its weight from HBM in chunks, one transfer per run of adjacent sticks. With
+    rows side by side, a run is one row of the chunk's columns, so a chunk narrower than ``F``
+    cuts every transfer short; a free dim too wide to fit whole (the down stack's ``hidden``)
+    can be moved a few sticks per transfer. With columns side by side, a run is a whole column
+    of the chunk's rows, a full transfer whatever the chunk width. Same values, same shape.
+    Unlike the ``dma_*`` helpers, this move does not start the Spyre runtime, so it must not be
+    the first tensor a process moves to the device.
     """
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
     if any(pad):
         weight = F.pad(weight, pad)
-    moved = dma_moe_expert_weight_to_spyre(weight)
-    assert moved is not None
-    return moved
+    if not kernel_order:
+        moved = dma_moe_expert_weight_to_spyre(weight)
+        assert moved is not None
+        return moved
+    weight = weight.contiguous()
+    layout = _expert_kernel_layout(weight)
+    assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
+    # A host tensor given only a device layout lands on the current Spyre device, as the
+    # ``dma_*`` helpers' default does.
+    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -433,7 +481,13 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    # Down only, by role: its free dim is ``hidden``, too wide to fit one chunk whole, so its
+    # rows would stream in short transfers. Gate and up keep the gather layout because their
+    # free dim (the expert width) fits a chunk whole; that was screened only at gemma-4's TP=1
+    # and TP=2 widths. Down is moved last: ``.to(device_layout=...)`` does not start the runtime.
+    layer.spyre_moe_down = _to_spyre_expert_weight(
+        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
+    )
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype

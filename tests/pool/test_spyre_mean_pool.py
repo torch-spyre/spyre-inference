@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre MEAN pooling: packed fp16 D2H then host ``MeanPool``.
+"""Spyre MEAN pooling: on-device fp32 round-trip sum; CPU fallback is host ``MeanPool``.
 
 Destagger of a device fp32 sum is garbage; see
 ``test_spyre_fp32_reduce_d2h_with_destagger``.
@@ -76,7 +76,12 @@ def test_spyre_mean_pool_crops_trailing_pad_on_host():
 
 
 def test_spyre_mean_pool_varlen_matches_cpu_fp32(spyre_device):
-    """Two sequences of lengths 3 and 2 match a host fp32 mean."""
+    """Two sequences of lengths 3 and 2 match a host fp32 mean.
+
+    H=64: the fp32 round-trip reduce's downcast needs a whole number of
+    64-element fp16 sticks on the hidden dim (a real model's H always is,
+    e.g. e5-large/RoBERTa at 1024), so the fixture must be stick-aligned too.
+    """
     hidden_cpu = torch.tensor(
         [
             [1.0, 2.0],
@@ -86,7 +91,7 @@ def test_spyre_mean_pool_varlen_matches_cpu_fp32(spyre_device):
             [30.0, 40.0],
         ],
         dtype=torch.float16,
-    )
+    ).repeat(1, 32)
     hidden = hidden_cpu.to(spyre_device)
     out = SpyreMeanPool().forward(hidden, _mean_cursor(torch.tensor([3, 2], dtype=torch.int64)))
     expected = torch.stack(
@@ -95,12 +100,15 @@ def test_spyre_mean_pool_varlen_matches_cpu_fp32(spyre_device):
             hidden_cpu[3:].to(torch.float32).mean(0),
         ]
     )
-    assert out.dtype == torch.float32
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.cpu().to(torch.float32), expected, atol=1e-3, rtol=1e-3)
 
 
 def test_spyre_mean_pool_ignores_trailing_pad(spyre_device):
-    """Pad rows past ``sum(lens)`` must not enter the mean."""
+    """Pad rows past ``sum(lens)`` must not enter the mean.
+
+    H=64: see the stick-alignment note in test_spyre_mean_pool_varlen_matches_cpu_fp32.
+    """
     hidden_cpu = torch.tensor(
         [
             [1.0, 2.0],
@@ -110,7 +118,7 @@ def test_spyre_mean_pool_ignores_trailing_pad(spyre_device):
             [99.0, 99.0],
         ],
         dtype=torch.float16,
-    )
+    ).repeat(1, 32)
     hidden = hidden_cpu.to(spyre_device)
     out = SpyreMeanPool().forward(hidden, _mean_cursor(torch.tensor([2, 1], dtype=torch.int64)))
     expected = torch.stack(
@@ -119,17 +127,20 @@ def test_spyre_mean_pool_ignores_trailing_pad(spyre_device):
             hidden_cpu[2:3].to(torch.float32).mean(0),
         ]
     )
-    assert out.dtype == torch.float32
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.cpu().to(torch.float32), expected, atol=1e-3, rtol=1e-3)
 
 
 def test_spyre_mean_pool_accumulates_in_float32(spyre_device):
-    """Packed D2H then ``MeanPool`` must keep the fp32 accumulator (2048+1 rounds in fp16)."""
+    """Fp32 round-trip sum must not lose precision over a deep reduction (2048+1 rounds in fp16).
+
+    H=64: see the stick-alignment note in test_spyre_mean_pool_varlen_matches_cpu_fp32.
+    """
     num_small = 512
     hidden_cpu = torch.cat(
         [
-            torch.full((1, 2), 2048.0, dtype=torch.float16),
-            torch.ones((num_small, 2), dtype=torch.float16),
+            torch.full((1, 64), 2048.0, dtype=torch.float16),
+            torch.ones((num_small, 64), dtype=torch.float16),
         ]
     )
     hidden = hidden_cpu.to(spyre_device)
@@ -137,6 +148,6 @@ def test_spyre_mean_pool_accumulates_in_float32(spyre_device):
         hidden, _mean_cursor(torch.tensor([num_small + 1], dtype=torch.int64))
     )
     expected = hidden_cpu.to(torch.float32).mean(0, keepdim=True)
-    assert out.dtype == torch.float32
-    torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.cpu().to(torch.float32), expected, atol=1e-3, rtol=1e-3)
     assert out[0, 0].item() > 4.9

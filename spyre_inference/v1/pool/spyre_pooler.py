@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre pooler: CLS/LAST via index_select, MEAN via one packed D2H, L2 via rsqrt."""
+"""Spyre pooler: CLS/LAST via index_select, MEAN via a two-kernel device fp32 sum, L2 via rsqrt."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import (
@@ -38,10 +39,12 @@ from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.heads import TokenClassifierPoolerHead
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
+from vllm.model_executor.models.roberta import RobertaClassificationHead
 from vllm.v1.outputs import PoolerOutput
 
-from spyre_inference.custom_ops.linear import spyre_linear_t
+from spyre_inference.custom_ops.linear import _PAD_ROWS, spyre_linear_t
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
@@ -185,32 +188,83 @@ class SpyreLastPool(LastPool):
         return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
-class SpyreMeanPool(MeanPool):
-    """MEAN after one packed D2H; the segment sum is not on Spyre.
+@torch.compile(backend="inductor", dynamic=False)
+def _mean_pool_mask_mul(indicator: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    """``[rows, T]`` 0/1 mask times ``[T, H]`` hidden states, broadcast to ``[rows, T, H]``.
 
-    Device fp32 lives staggered (torch-spyre#2971). Raw ``convert`` of an
-    fp32 sum is garbage, and destagger via ``to(fp16)`` then convert then
-    upcast is also garbage (e5/roberta cosine ~-0.02). After cropping
-    encoder pad past ``sum(lens)``, copy the valid prefix as fp16 and let
-    ``MeanPool`` reduce — empty batch, fp32 accumulator, zero-length
-    ``nan``. ``convert`` is a no-op when the tensor is already on the host.
+    Chaining ``_mean_pool_fp32_reduce`` directly onto this op's output crashes
+    the backend compiler (``dbo-opt`` failure), even on shapes the reduce alone
+    compiles fine for -- ``.contiguous()`` forces a real materialized boundary
+    between the two kernels.
+    """
+    return (indicator.unsqueeze(-1) * hidden_states.unsqueeze(0)).contiguous()
+
+
+@torch.compile(backend="inductor", dynamic=False)
+def _mean_pool_fp32_reduce(prod: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+    """fp32 round-trip sum (torch-spyre#2619): upcast, sum, divide, downcast in one graph.
+
+    The fp32 intermediate never crosses a device-program boundary here, so it
+    never has to be read back or converted on its own -- only the upcast and
+    the downcast at the graph's edges, both fp16-facing. That is what avoids
+    torch-spyre#2971 (an addressable device fp32 tensor is staggered and
+    unsafe to ``convert``/cast directly): this kernel produces fp16 in, fp16
+    out, with the actual accumulation happening in fp32 in between.
+    """
+    total = prod.to(torch.float32).sum(dim=1)
+    return (total / lens).to(prod.dtype)
+
+
+# Flags a mid-request recompile below, which otherwise just adds latency silently.
+compile_guard.watch(_mean_pool_mask_mul, "mean-pool masked multiply")
+compile_guard.watch(_mean_pool_fp32_reduce, "mean-pool fp32 round-trip sum")
+
+
+class SpyreMeanPool(MeanPool):
+    """MEAN via a two-kernel on-device fp32 sum; CPU fallback is upstream unchanged.
+
+    A raw device fp32 sum is unsafe to move or cast directly (torch-spyre#2971:
+    fp32 lives staggered on Spyre). A fp16 mask @ hidden_states matmul avoids
+    that but loses precision over a deep reduction, since the matmul
+    accumulator is fp16. torch-spyre#2619's fp16->fp32->sum->fp16 round-trip
+    keeps the accumulation in fp32 instead, split across
+    ``_mean_pool_mask_mul`` / ``_mean_pool_fp32_reduce`` above with a real
+    ``.clone()`` between them. Only the small ``[rows, T]`` mask and
+    ``[rows, 1]`` lengths cross onto the device, and the small pooled result
+    crosses back -- no full D2H of ``hidden_states``.
     """
 
     def forward(self, hidden_states, pooling_metadata):
         cursor = pooling_metadata.get_pooling_cursor()
         prompt_lens = cursor.prompt_lens_cpu.to(torch.int64)
-        total = int(prompt_lens.sum().item()) if prompt_lens.numel() else 0
-        # Crop on the host, after the D2H: SpyreDispatchPooler leaves
-        # hidden_states at its bucketed length, so this crop now fires on every
-        # padded batch. Cropping on device would need a real-length index_select,
-        # adding a torch.compile specialization per distinct prompt length -- the
-        # defect the dispatcher exists to remove. The D2H is bucket-sized rather
-        # than the real length it used to be while upstream still sliced, so it
-        # is slightly larger; a host slice after it costs nothing.
-        hidden_states = convert(hidden_states, "cpu")
-        if hidden_states.shape[0] > total:
-            hidden_states = hidden_states[:total]
-        return super().forward(hidden_states, pooling_metadata)
+
+        if hidden_states.device.type != "spyre":
+            # Upstream MeanPool assumes hidden_states.shape[0] == sum(prompt_lens);
+            # crop trailing encoder pad on the host before delegating.
+            total = int(prompt_lens.sum().item()) if prompt_lens.numel() else 0
+            if hidden_states.shape[0] > total:
+                hidden_states = hidden_states[:total]
+            return super().forward(hidden_states, pooling_metadata)
+
+        num_seqs = prompt_lens.numel()
+        ends = torch.cumsum(prompt_lens, dim=0)
+        starts = ends - prompt_lens
+
+        row_idx, n_rows = pad_row_count_to_bucket(torch.arange(num_seqs, dtype=torch.int64))
+        bucket_starts, bucket_lens = starts[row_idx], prompt_lens[row_idx]
+
+        cols = torch.arange(hidden_states.shape[0], dtype=torch.int64)
+        indicator = (cols.unsqueeze(0) >= bucket_starts.unsqueeze(1)) & (
+            cols.unsqueeze(0) < (bucket_starts + bucket_lens).unsqueeze(1)
+        )
+        mask = convert(indicator.to(torch.float16), hidden_states.device)
+        lens = convert(
+            bucket_lens.clamp(min=1).to(torch.float32).unsqueeze(1), hidden_states.device
+        )
+
+        prod = _mean_pool_mask_mul(mask, hidden_states).clone()
+        pooled = _mean_pool_fp32_reduce(prod, lens)
+        return pooled[:n_rows] if pooled.shape[0] != n_rows else pooled
 
 
 class SpyreDispatchPooler(DispatchPooler):
@@ -455,6 +509,65 @@ class SpyreClassifierLinear(nn.Linear):
         return spyre_linear_t(input, weight, self.bias, pad_rows=True)
 
 
+@torch.compile(dynamic=False)
+def _roberta_classifier_head_kernel(
+    x: torch.Tensor,
+    dense_wt: torch.Tensor,
+    dense_b: torch.Tensor,
+    out_wt: torch.Tensor,
+    out_b: torch.Tensor,
+) -> torch.Tensor:
+    """Fused ``dense -> tanh -> out_proj`` for a RoBERTa-style classifier head.
+
+    Row count is constant across both matmuls (CLS pooling leaves one row per
+    request), so the short-row pad/slice (torch-spyre#4032) happens once here
+    instead of once per ``spyre_linear_t`` call.
+    """
+    rows = x.shape[0]
+    if 0 < rows < _PAD_ROWS:
+        x = F.pad(x, (0, 0, 0, _PAD_ROWS - rows))
+    h = torch.tanh(torch.matmul(x, dense_wt) + dense_b)
+    out = torch.matmul(h, out_wt) + out_b
+    if 0 < rows < _PAD_ROWS:
+        out = out[:rows]
+    return out
+
+
+# Flags a mid-request recompile below, which otherwise just adds latency silently.
+compile_guard.watch(_roberta_classifier_head_kernel, "roberta classifier head")
+
+
+class SpyreRobertaClassificationHead(nn.Module):
+    """Class-swap target for vLLM's ``RobertaClassificationHead``: one fused call.
+
+    ``dense``/``out_proj`` stay ``SpyreClassifierLinear`` instances (their weight
+    storage is reused directly); only this module's own ``forward`` bypasses their
+    individual ``forward`` in favor of one compiled kernel.
+    """
+
+    dense: SpyreClassifierLinear
+    out_proj: SpyreClassifierLinear
+
+    @classmethod
+    def convert(cls, head: RobertaClassificationHead) -> SpyreRobertaClassificationHead:
+        SpyreClassifierLinear.convert(head.dense)
+        SpyreClassifierLinear.convert(head.out_proj)
+        head.__class__ = cls
+        return cast(SpyreRobertaClassificationHead, head)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        dense, out_proj = self.dense, self.out_proj
+        weight = dense.weight
+        if x.device != weight.device or x.dtype != weight.dtype:
+            if weight.device.type == "spyre":
+                x = convert(x, weight.device, weight.dtype)
+            else:
+                x = x.to(device=weight.device, dtype=weight.dtype)
+        return _roberta_classifier_head_kernel(
+            x, dense.weight, dense.bias, out_proj.weight, out_proj.bias
+        )
+
+
 def _classifier_roots(model: nn.Module) -> list[nn.Module]:
     """Classifier modules even when not registered in ``_modules``.
 
@@ -470,9 +583,18 @@ def _classifier_roots(model: nn.Module) -> list[nn.Module]:
 
 
 def patch_classifier_linears_for_spyre(roots: list[nn.Module]) -> int:
-    """Convert every ``nn.Linear`` under a classifier, in place."""
+    """Convert every ``nn.Linear`` under a classifier, in place.
+
+    A ``RobertaClassificationHead`` root gets its ``dense``/``out_proj`` pair
+    fused into one compiled call instead (``SpyreRobertaClassificationHead``) --
+    see its docstring for why.
+    """
     n = 0
     for root in roots:
+        if isinstance(root, RobertaClassificationHead):
+            SpyreRobertaClassificationHead.convert(root)
+            n += 2
+            continue
         candidates = [root] if isinstance(root, nn.Linear) else list(root.modules())
         for child in candidates:
             if type(child) is nn.Linear:
@@ -619,11 +741,11 @@ def configure_pooling_for_spyre(
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
-    CLS/LAST gather on device. MEAN copies packed ``[T, H]`` as fp16 and
-    reduces with ``MeanPool`` on the host: destagger of a device fp32 sum
-    is garbage (torch-spyre#2971). Classifier / reranker heads are downcast
-    to fp16 (no native fp32 matmul, torch-spyre#1794). False if the pooling
-    method is unknown.
+    CLS/LAST gather on device. MEAN reduces on device too, via a two-kernel
+    fp32 round-trip sum (torch-spyre#2619) rather than a host reduce or a
+    fp16-accumulator matmul -- see ``SpyreMeanPool``. Classifier / reranker
+    heads are downcast to fp16 (no native fp32 matmul, torch-spyre#1794).
+    False if the pooling method is unknown.
 
     ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
     of two from one stick to ``max_model_len``), which are the only per-request widths

@@ -89,12 +89,31 @@ def test_compiled_all_reduce_padded_is_exact(run_tp_probe) -> None:
     reason=(
         "deeptools' L3 scheduler asserts 'Expect valid lower and upper bound "
         "parameters' building the collective's sum kernel for a rank-3 "
-        "[1, 528, 1024] fp16 all_reduce; [1, 3120, 1024] builds. When this passes, "
-        "drop the flatten from SpyreCommunicator.all_reduce."
+        "[1, 528, 1024] fp16 all_reduce; [1, 3120, 1024] builds. The flatten in "
+        "SpyreCommunicator.all_reduce can go once this and "
+        "test_all_reduce_rank2_works both pass."
     ),
 )
 def test_all_reduce_vision_rank3_works(run_tp_probe) -> None:
     run_tp_probe("all_reduce_vision_rank3", world_size=2)
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 native-probe test",
+)
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "spyre-comms aborts in SplitEnvelope for a rank-2 [3, 4096] fp16 eager "
+        "all_reduce (spyre-comms#463). The flatten in SpyreCommunicator.all_reduce "
+        "can go once this and test_all_reduce_vision_rank3_works both pass."
+    ),
+)
+def test_all_reduce_rank2_works(run_tp_probe) -> None:
+    run_tp_probe("all_reduce_rank2", world_size=2)
 
 
 @pytest.mark.uses_subprocess

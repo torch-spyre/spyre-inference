@@ -7,9 +7,9 @@ Companion to `SKILL.md`. Read this when the failing surface is the Spyre attenti
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — the token-major backend, `SpyreAttentionImpl`, `SpyreAttentionMetadataBuilder` (shared by every Spyre backend), and the per-sequence / batched-decode dispatch.
 - `spyre_inference/v1/attention/backends/spyre_head_major_attn.py` — the default head-major backend (`SPYRE_ATTN_KV_LAYOUT=head_major`); overrides the allocation, the KV-write index and the kernels.
 - `spyre_inference/v1/attention/backends/spyre_encoder_attn.py` — encoder-only (no KV cache) attention.
-- `spyre_inference/v1/attention/ops/` — the compiled kernels (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`), the cache device layouts (`layout.py`) and the tiled-walk driver (`tile_loop.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
+- `spyre_inference/v1/attention/ops/` — the kernel source code (`page_attn*.py`, `batched_decode*.py`, `reshape_and_cache*.py`), the cache device layouts (`layout.py`) and the tiled-walk driver (`tile_loop.py`). Kernel docstrings and inline comments name the torch-spyre limitation each shape choice routes around.
 - `spyre_inference/v1/attention/attn_layer.py` — the traced KV write and query staging that replace `Attention.forward`.
-- `tests/attention/test_spyre_head_major_attn.py` — the same checks for `SpyreHeadMajorAttentionImpl`, plus its write index, store fusion and a head-major-vs-token-major comparison.
+- `tests/attention/test_spyre_head_major_attn.py` — CPU-reference checks for `SpyreHeadMajorAttentionImpl`, plus its write index, store fusion and a head-major-vs-token-major comparison.
 - `tests/attention/test_spyre_attn.py` — builds real metadata via `SpyreAttentionMetadataBuilder`, calls the token-major `SpyreAttentionImpl.forward` on a Spyre device, compares against a CPU reference (`ref_attn`) with `assert_close_outliers` (`atol=0.3, rtol=0.2` when a query is 32+ rows, `atol=0.2, rtol=0.2` otherwise, up to 5 outliers at twice that) — if mismatch ratios are near 100 % with differences > 1.0, suspect a **structural** bug, not fp16 noise.
 
 ## Attention-specific limitations

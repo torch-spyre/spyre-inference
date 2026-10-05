@@ -768,6 +768,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
+        # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
+        # which asserts it has ≥2 attention groups.
+        if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
+            logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
+            cache_config.enable_prefix_caching = False
+
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(

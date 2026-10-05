@@ -25,6 +25,12 @@ on:
         description: Workflow name (integration-tests | test_each_commit)
         required: false
         default: integration-tests
+      display_title:
+        description: >-
+          Run-name of the run being re-ingested ("regression", "trunk" or
+          "integration-tests (<test_type>)"). The tier comes from it, and v2 skips a run without one.
+        required: false
+        default: ''
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -73,7 +79,7 @@ jobs:
       # workflow's run-name, or the bare tier ("trunk" / "regression") via
       # test_each_commit's -- the only way this job can recover which tier
       # ran without an extra API call.
-      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
@@ -151,9 +157,8 @@ jobs:
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
       # ---------------------------------------------------------------------------
-      # Download every artifact from the triggering run and unzip it — artifact
-      # *names* carry no file extension (only the file inside the zip does), so
-      # filtering has to happen post-unzip by actual filename, not by artifact name.
+      # Download and unzip only junit-* artifacts and the run-id/artifact-id
+      # sidecars, filtering by artifact name before downloading.
       #
       # `--paginate` is required: the artifacts endpoint defaults to 30 per
       # page, and a run with more jobs than that silently lost every artifact
@@ -177,6 +182,7 @@ jobs:
           echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
 
       - name: Download XML artifacts
+        id: download-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -186,7 +192,13 @@ jobs:
           import json, os, subprocess, sys
           from pathlib import Path
 
-          artifacts = json.loads(os.environ['ARTIFACTS'])
+          # Only the JUnit reports and the id sidecars are read below. Skipping the rest
+          # (coverage, durations, failed-suite) keeps one broken download from failing the ingest.
+          ID_ARTIFACTS = {"run-id", "artifact-id"}
+          artifacts = [
+              a for a in json.loads(os.environ['ARTIFACTS'])
+              if a['name'].startswith("junit-") or a['name'] in ID_ARTIFACTS
+          ]
           repo  = os.environ['GITHUB_REPOSITORY']
           for a in artifacts:
               print(f"Downloading: {a['name']} (id={a['id']})")
@@ -215,41 +227,35 @@ jobs:
       # The orchestrator's threaded run_id, uploaded as an artifact because this workflow runs on
       # workflow_run and so cannot read the triggering run's inputs. Empty on a GHA-initiated run
       # or a manual re-ingest, in which case the ingest derives its own id from the run coordinate.
-      - name: Resolve orchestrator run_id
+      - name: Resolve threaded run_id
         id: resolve-run-id
         run: |
-          # Two producers upload the same value under different names: integration-tests.yaml
-          # writes "orchestrator-run-id", and _test_matrix.yaml (used by test_each_commit) writes
-          # "run-id". Both ride in via the download-every-artifact step above, so read whichever
-          # is present rather than adding a second API round-trip for one of them.
-          RID=""
-          for f in xml_artifacts/orchestrator-run-id/run-id.txt \
-                   xml_artifacts/run-id/run-id.txt; do
-            if [[ -f "$f" ]]; then
-              RID="$(tr -d '[:space:]' < "$f")"
-              [[ -n "$RID" ]] && break
-            fi
-          done
+          # _test_matrix.yaml or integration-tests.yaml uploads "run-id", downloaded with the XML.
+          RID="$(tr -d '[:space:]' < xml_artifacts/run-id/run-id.txt 2>/dev/null || true)"
           echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
           echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+
+      # Uploaded by _test_matrix's artifact_identity job and downloaded with the XML above.
+      # Absent (unadopted run, image with no stamped id) makes the v2 ingest write cases only.
+      - name: Resolve this run's artifact_id
+        id: leg-artifact-id
+        run: |
+          REC="$(tr -d '[:space:]' < xml_artifacts/artifact-id/artifact-id.txt 2>/dev/null || true)"
+          LEG_AID="${REC%%|*}"
+          echo "Leg artifact_id: ${LEG_AID:-<none, no artifact rows>}"
+          echo "value=${REC}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve test_type for trigger_type
         id: extract-tier
         run: |
-          if [[ "${TRIGGERING_WORKFLOW}" == "test_each_commit" ]]; then
-            # test_each_commit's run-name IS the external-facing tier name
-            # itself ("trunk" on push, "regression" otherwise) -- no parens
-            # to parse out.
-            TIER="${TRIGGERING_DISPLAY_TITLE}"
-          else
-            # integration-tests' run-name is deliberately
-            # "integration-tests (<inputs.test_type>)" -- the RAW test_type
-            # value the caller passed (e.g. "integration" / "regression" /
-            # "trunk"); there is no internal alias vocabulary to resolve
-            # through (see _test_matrix.yaml's test_type description) -- so
-            # parsing it out of display_title recovers the real external-
-            # facing value without an extra API call.
+          # Keyed on the title's shape, not TRIGGERING_WORKFLOW: workflow_run.name carries the
+          # run-name, so it is never "test_each_commit".
+          if [[ "${TRIGGERING_DISPLAY_TITLE}" == *"("*")"* ]]; then
+            # integration-tests: "integration-tests (<inputs.test_type>)".
             TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          else
+            # test_each_commit: the bare tier ("trunk" on push, "regression" otherwise).
+            TIER="${TRIGGERING_DISPLAY_TITLE}"
           fi
           echo "Resolved test_type: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
@@ -353,6 +359,9 @@ jobs:
           sha: ${{ env.TRIGGERING_SHA }}
           run-id: ${{ steps.resolve-run-id.outputs.run_id }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          # x86_64 only: the record describes the x86_64 image every matrix leg runs on.
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          repository: ${{ github.repository }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}

@@ -110,19 +110,3 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
-
-
-def install_pooling_model_patches() -> None:
-    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, CLIP LayerNorm, …)."""
-    from spyre_inference.models import bert, clip, roberta
-
-    bert.install_spyre_patches()
-    roberta.install_spyre_patches()
-    clip.install_spyre_patches()
-
-
-def install_decoder_model_patches() -> None:
-    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
-    from spyre_inference.models import gemma4
-
-    gemma4.install_spyre_patches()

@@ -199,7 +199,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # Pin the test-durations artifact this run's shard jobs weight their partition
   # by: one run id resolved once, so every shard of a suite reads identical
@@ -228,6 +228,67 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
         run: python3 .github/scripts/resolve_durations_run.py
+
+  # One `artifact-id` record per run for push-to-clickhouse's v2 ingest; every matrix leg shares
+  # the image and install inputs. Must run on the image under test: the base id lives in its
+  # filesystem. The perf job links its own artifact, so it is skipped there.
+  artifact_identity:
+    name: Derive artifact identity
+    needs: resolve
+    if: ${{ needs.resolve.outputs.resolved_test_type != 'perf' }}
+    continue-on-error: true
+    runs-on: ${{ fromJSON(format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          sparse-checkout: spyre-rpms.lock
+          sparse-checkout-cone-mode: false
+
+      # At torch-spyre main, the same ref the v2 ingest action runs, so both use one id formula.
+      - name: Checkout the identity library
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: torch-spyre/torch-spyre
+          ref: main
+          path: .torch-spyre-identity
+          sparse-checkout: |
+            .github/scripts/derive_artifact_id.py
+            extensions/clickhouse-ingest
+          sparse-checkout-cone-mode: false
+
+      # Same token set as the perf ingest's leg_installed(), so a leg's functional and
+      # performance verdicts land on one artifact.
+      - name: Describe what this run installs on top of the image
+        id: delta
+        env:
+          PREBAKED: ${{ inputs.use_prebaked_image }}
+          RPM_NAMES: ${{ inputs.rpm_names }}
+          TORCH_SPYRE_REF: ${{ inputs.torch_spyre_ref }}
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          TOKENS="spyre-inference@${SHA:0:12}"
+          if [[ "${PREBAKED}" != "true" ]]; then
+            TOKENS="${TOKENS} spyre-rpms.lock@$(sha256sum spyre-rpms.lock | cut -c1-12)"
+            if [[ -n "${TORCH_SPYRE_REF}" ]]; then
+              TOKENS="${TOKENS} torch-spyre@${TORCH_SPYRE_REF}"
+            fi
+          fi
+          if [[ -n "${RPM_NAMES}" ]]; then
+            TOKENS="${TOKENS} ${RPM_NAMES}"
+          fi
+          echo "installed on top: ${TOKENS}"
+          echo "installed=${TOKENS}" >> "$GITHUB_OUTPUT"
+
+      - name: Derive and upload the artifact identity
+        uses: torch-spyre/torch-spyre/.github/actions/derive-gha-artifact-id@main
+        with:
+          component: spyre-inference
+          arch: x86_64
+          installed: ${{ steps.delta.outputs.installed }}
+          library-dir: ${{ github.workspace }}/.torch-spyre-identity
 
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
@@ -638,6 +699,7 @@ jobs:
             .github/workflows/test_each_commit.yaml
             .github/workflows/_test_matrix.yaml
             .github/actions/override-spyre-rpms/action.yml
+            .github/actions/run-matrix-config/action.yml
             .github/actions/spyre-rpm-install/action.yml
             pyproject.toml
             uv.lock

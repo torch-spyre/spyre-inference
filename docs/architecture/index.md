@@ -461,7 +461,7 @@ embedding gather runs on-device now that `aten.embedding` has a Spyre kernel
 replaces the earlier silent D2H/H2D CPU fallback that copied the full `[vocab, hidden]`
 weight on every decode step. When TP>1 the shard mask is applied **on-device**:
 `get_masked_input_and_mask` runs once at load to build per-vocab reindex/keep lookup
-tables (its int64 comparisons against Python constants cannot lower on Spyre), registered
+tables (its int32 subtraction still cannot lower on Spyre), registered
 as device buffers; `forward` then gathers through them with `index_select`/`F.embedding`,
 applies the keep mask, and `all_reduce`s — all on Spyre, no per-step CPU round-trip.
 

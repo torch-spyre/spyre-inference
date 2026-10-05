@@ -1,8 +1,12 @@
 
-# List of HF models to cache
+# Artifacts to pre-populate into the shared runner cache.
 #
 # gated_models: Cached via manual add_or_remove_artifacts_from_cache dispatch on main.
 # public_models: Auto-cached by test_each_commit.yaml.
+# artifactory_datasets: Cached via the same manual dispatch. These need an
+#   Artifactory credential, which GitHub withholds from pull_request runs on a
+#   fork, so they cannot be fetched by the job that consumes them. Populating
+#   them here instead keeps the benchmark read-only and credential-free.
 
 gated_models:
   - meta-llama/Meta-Llama-3-8B
@@ -56,3 +60,45 @@ public_models:
   - repo: google/gemma-4-26B-A4B-it
     revision: 4d7ae4984b7db7de8f8457170b3f1a419ee76d52
   - qwrt/Swedish0.1M
+
+# vLLM benchmark replay traces, fetched from Artifactory rather than HuggingFace.
+#
+# `base_url` and `root` come from the ARTIFACTORY_BASE_URL and
+# ARTIFACTORY_DATA_PATH secrets, so the internal host is not written down here.
+# Each entry is verified against its sha256 after download and skipped when a
+# correct copy is already cached, so a re-dispatch is cheap and idempotent.
+#
+# The whole prefix is mirrored: 13 files, 474MB. Only 2 have a consumer in
+# benchmarks/spyre/serve-tests.yaml today, but a fork PR cannot fetch a missing
+# one for itself, so a partial mirror would make every new trace-replaying
+# config wait on a config change plus a dispatch. Caching all 13 up front costs
+# one transfer on a 770T shared volume and makes that wait go away.
+artifactory_datasets:
+  subdir: spyre-inference/vllm-bench-data/converted_traces/2025.11.03_e2ee1b0_reordered
+  files:
+    - name: aiops_results_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: 468cf059f2ec3b14108efc09baffabf5c5a440172a25660673d5a8fa029d0637
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: 6df5d4de50a28b6ed7ad1d0b8794417899d18548627529a526bef93967906e3c
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_16k.jsonl
+      sha256: 03b9e0d4b4432e0094f84b98fa89e6bfb2b402d35fef84421558d77ea36f5197
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_1k.jsonl
+      sha256: 6ad8b08d2a600a24993a9570100e14e8d40ffe1308802ee12698f0d7b37c0b90
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_2k.jsonl
+      sha256: 9b28b894978bd940ba860187d932de86de382534f04e1b284b61af5877418adb
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_32k.jsonl
+      sha256: a9d6a8a6cf849a60b56dbc8bd1b1eb9b95babb6a2d6a7747878e167869637b5d
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_4k.jsonl
+      sha256: 8d76a859a67677a091290dad395d03acf88719688128530d7a943c4f23b1acff
+    - name: all_sequences_2025.11.03_e2ee1b0_correct_order_truncated_8k.jsonl
+      sha256: bd6579a7dbce7c80c3908e3150455eb13af940ee900c354539e7f6491512fce7
+    - name: cics_results_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: e0efa895b4a22b601748c7dda9e8a2db146773fb8735fc45ee2920c042b40fb7
+    - name: db2_results_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: b219891bee31b62d82f83ddc4b478bf75ac9039762b22b1afac5fc437cb2bac1
+    - name: db2_results_2025.11.03_e2ee1b0_correct_order_truncated_32k.jsonl
+      sha256: 9c0584930498e268b0af52adfc411c71d34a9065c16742381281ef578d911283
+    - name: ims_results_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: 49a284e3f10027bb430f168a4fba7310d7dcb3147565ffed1bb87d1fc6fe9c18
+    - name: tls_results_2025.11.03_e2ee1b0_correct_order.jsonl
+      sha256: 9b1cc4d35e3626d1a6bbe0f998caa039b70d694241f25835a2083e1854e14028

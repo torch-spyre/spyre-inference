@@ -295,7 +295,8 @@ compressed). Open them in the Perfetto UI:
 
 <https://ui.perfetto.dev> → "Open trace file"
 
-The trace shows CPU thread rows on top and one Spyre device row below.
+The trace shows CPU thread rows, per-thread Spyre runtime activity rows, and
+Spyre device activity.
 
 For a terminal summary (`acc_events=True` required):
 

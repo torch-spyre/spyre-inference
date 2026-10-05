@@ -75,6 +75,6 @@ jobs:
     - name: Run the ingest script tests
       run: |
         uv run --no-project \
-          --with pytest --with lxml --with clickhouse-connect --with requests \
+          --with pytest --with lxml --with clickhouse-connect --with requests --with pyyaml \
           --with "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest" \
           pytest .github/scripts -q -p no:cacheprovider -o addopts=""

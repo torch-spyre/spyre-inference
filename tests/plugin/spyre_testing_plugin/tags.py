@@ -12,15 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared JUnit result-tagging helpers for both the tests/conftest.py autouse
-fixture and this plugin's collection hook (which tags upstream vLLM tests,
-collected outside tests/ where the fixture never binds).
+"""Shared JUnit result-tagging helpers for the collection hooks in
+tests/conftest.py (local tests) and this plugin (upstream vLLM tests).
 
 Tags emit as JUnit `<property name="tag" value="key__value"/>`, the convention
 the ClickHouse ingest reads.
 """
 
 import os
+import platform
+import re
 
 # Parametrize argnames whose value names the model: a scalar id, a vLLM
 # model-info object (.name), or a (model_id, ...) tuple.
@@ -63,12 +64,15 @@ def declared_tiers():
     return sorted(set(raw.split()))
 
 
+def platform_tag():
+    """`platform__<arch>`, normalized like torch-spyre's oot_framework so arches match."""
+    arch = re.sub(r"[^a-zA-Z0-9_]", "_", platform.machine() or "unknown").strip("_")
+    return f"platform__{arch or 'unknown'}"
+
+
 def result_tags(params):
-    """The (name, value) JUnit property pairs for these params; empty when no
-    model param is recognized and no tier is set, so callers append
-    unconditionally.
-    """
-    tags = []
+    """JUnit (name, value) tag pairs; `platform__`/`testtype__` are run context, never hashed."""
+    tags = [("tag", platform_tag())]
     model = model_from_params(params)
     if model:
         tags.append(("tag", f"model__{model}"))

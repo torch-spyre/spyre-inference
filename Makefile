@@ -50,6 +50,8 @@ OMP_ENV := $(if $(OMP_THREADS),OMP_NUM_THREADS=$(OMP_THREADS))
 # When set, write JUnit XML here (CI callers set this to collect results
 # for artifact upload / result ingestion). Unset = no JUnit file.
 JUNIT_XML ?=
+# testtype__ tag for runs outside GHA, whose run-matrix-config action exports the declared set itself.
+export SPYRE_TEST_TIER ?= $(TEST_TYPE)
 ifneq ($(JUNIT_XML),)
 JUNIT_ARGS := --junitxml=$(JUNIT_XML)
 else

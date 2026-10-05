@@ -269,6 +269,19 @@ def probe_all_reduce_vision_rank3(device, device_group, world_size, rank):
         print(f"[rank {rank}] patches={patches} rank-3 all_reduce exact")
 
 
+def probe_all_reduce_rank2(device, device_group, world_size, rank):
+    """A rank-2 [3, 4096] reduction without flattening. Expected to abort in
+    spyre-comms' SplitEnvelope (spyre-comms#463)."""
+    gn = _group_name(device_group)
+    idx = torch.arange(3 * 4096, dtype=torch.int32)
+    base = (idx % 97).to(torch.float16).reshape(3, 4096)
+    t = (base * float(rank + 1)).to(device)
+    out = torch.ops._c10d_functional.all_reduce(t, "sum", gn)
+    out = torch.ops._c10d_functional.wait_tensor(out)
+    expected = base * float(sum(range(1, world_size + 1)))
+    torch.testing.assert_close(out.cpu(), expected, atol=0.0, rtol=0.0)
+
+
 def probe_all_reduce_hidden5120_decode(device, device_group, world_size, rank):
     """Ministral's 1-token TP row-parallel decode. Expected to fail.
 
@@ -353,6 +366,7 @@ PROBES = {
     "compiled_all_reduce_padded": probe_compiled_all_reduce_padded,
     "all_reduce_vision_flattened": probe_all_reduce_vision_flattened,
     "all_reduce_vision_rank3": probe_all_reduce_vision_rank3,
+    "all_reduce_rank2": probe_all_reduce_rank2,
     "all_reduce_hidden5120_decode": probe_all_reduce_hidden5120_decode,
     "native_all_reduce": probe_native_all_reduce,
     "native_all_gather_into_tensor": probe_native_all_gather_into_tensor,

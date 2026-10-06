@@ -481,7 +481,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        target_cfg = getattr(hf_config, "text_config", None) or hf_config
+        # The config the runner's padding passes read, so both agree on the text part.
+        target_cfg = model_config.hf_text_config
         num_heads = getattr(target_cfg, "num_attention_heads", None)
         hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:

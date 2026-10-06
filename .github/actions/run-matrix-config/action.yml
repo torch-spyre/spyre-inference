@@ -78,6 +78,10 @@ inputs:
   artifactory_rpm_path:
     required: false
     default: ''
+  hf_token:
+    description: HF token for the public-model cache step (empty on fork PRs, which then download anonymously)
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -164,6 +168,8 @@ runs:
       shell: bash
       env:
         HF_HUB_OFFLINE: '0'
+        # Scoped to this step: test steps stay offline and token-free.
+        HF_TOKEN: ${{ inputs.hf_token }}
       run: uv run .github/cache_config/manage_cache.py --public
 
     # cache_dir() defaults to one path shared by every pod on this PVC-mounted runner pool; a fixed path let one job's compile reuse (stale XPASS/wrong-output) or race another concurrent job's, so scope it per matrix job instead of clearing the shared one.

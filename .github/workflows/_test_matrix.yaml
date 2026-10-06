@@ -132,6 +132,11 @@ on:
         required: false
       ARTIFACTORY_RPM_PATH:
         required: false
+      # Artifactory root that fetch_bench_datasets.py resolves artifact paths
+      # against. Needed only for missing/corrupt traces; fetch failures warn,
+      # and selected configs fail if their required trace remains absent.
+      ARTIFACTORY_DATA_PATH:
+        required: false
       # ClickHouse connection for the perf job's benchmark ingest. A run without
       # them (any non-perf run, or perf with CLICKHOUSE_HOST unset) skips ingest.
       CLICKHOUSE_HOST:
@@ -145,6 +150,9 @@ on:
       CLICKHOUSE_DB:
         required: false
       CLICKHOUSE_DB_V2:
+        required: false
+      # Public-model cache steps only; empty on fork PRs (anonymous download).
+      HF_TOKEN:
         required: false
 
 defaults:
@@ -781,6 +789,7 @@ jobs:
           artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          hf_token: ${{ secrets.HF_TOKEN }}
 
       # Records this leg's matrix entry as a uniquely-named artifact so collect_failed_suites can rebuild a retry matrix without needing this job's own (continue-on-error-muddied) conclusion.
       - name: Save suite descriptor for pod-level retry
@@ -869,6 +878,7 @@ jobs:
           artifactory_api_key: ${{ secrets.ARTIFACTORY_TOKEN }}
           artifactory_base_url: ${{ secrets.ARTIFACTORY_BASE_URL }}
           artifactory_rpm_path: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          hf_token: ${{ secrets.HF_TOKEN }}
 
   # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
   test_result:
@@ -1076,6 +1086,15 @@ jobs:
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
       HF_HUB_OFFLINE: '1'
       RESULTS_DIR: benchmark-results
+      # The serve configs replay trace files that are not in the repo. Cache
+      # them on the same RWX volume as the HuggingFace cache above: it outlives
+      # the pod, so the first job to need a trace fetches it and every later job
+      # on any runner reads it from the volume. Per-file locks reduce duplicate
+      # fetches; cross-pod deduplication depends on NFS locking.
+      SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -1144,6 +1163,8 @@ jobs:
       - name: Ensure public HF models cached
         env:
           HF_HUB_OFFLINE: '0'
+          # Authenticated cache-miss downloads; anonymous Hub requests get rate-limited.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: uv run .github/cache_config/manage_cache.py --public
 
       - name: Run vLLM benchmarks

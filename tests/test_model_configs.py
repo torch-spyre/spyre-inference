@@ -17,9 +17,9 @@
 import pytest
 
 from spyre_inference.config import (
-    ContinuousBatchingConfig,
     DeviceConfig,
     ModelEntry,
+    ServingConfig,
     lookup_config,
     model_registry,
 )
@@ -37,17 +37,15 @@ def test_every_entry_is_a_model_entry():
         assert entry.model_id == model_id
 
 
-def test_every_entry_has_at_least_one_cb_config():
+def test_every_entry_has_at_least_one_config():
     for model_id, entry in model_registry().items():
-        assert entry.continuous_batching_configs, f"{model_id} has no continuous_batching_configs"
+        assert entry.serving_configs, f"{model_id} has no serving_configs"
 
 
-def test_all_cb_configs_are_typed():
+def test_all_configs_are_typed():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
-            assert isinstance(cfg, ContinuousBatchingConfig), (
-                f"{model_id}: unexpected type {type(cfg)}"
-            )
+        for cfg in entry.serving_configs:
+            assert isinstance(cfg, ServingConfig), f"{model_id}: unexpected type {type(cfg)}"
             assert isinstance(cfg.device_config, DeviceConfig)
 
 
@@ -61,7 +59,7 @@ def test_all_cb_configs_are_typed():
         "ibm-granite/granite-vision-4.1-4b",
         "sentence-transformers/all-MiniLM-L6-v2",
         "sentence-transformers/all-roberta-large-v1",
-        "sentence-transformers/clip-ViT-B-32",
+        "openai/clip-vit-base-patch32",
         "ibm-granite/granite-embedding-30m-english",
         "ibm-granite/granite-embedding-125m-english",
         "ibm-granite/granite-embedding-278m-multilingual",
@@ -77,24 +75,24 @@ def test_known_models_are_present(model_id):
     assert model_id in model_registry(), f"{model_id} missing from registry"
 
 
-def test_cb_config_positive_fields():
+def test_config_positive_fields():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in entry.serving_configs:
             assert cfg.tp_size >= 1, f"{model_id}: tp_size < 1"
             assert cfg.max_model_len > 0, f"{model_id}: max_model_len <= 0"
             assert cfg.max_num_seqs > 0, f"{model_id}: max_num_seqs <= 0"
 
 
-def test_cb_config_tp_size_is_power_of_two():
+def test_config_tp_size_is_power_of_two():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in entry.serving_configs:
             tp = cfg.tp_size
             assert tp & (tp - 1) == 0, f"{model_id}: tp_size={tp} is not a power of two"
 
 
 def test_device_config_env_vars_are_dict():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in entry.serving_configs:
             assert isinstance(cfg.device_config.env_vars, dict), (
                 f"{model_id}: device_config.env_vars is not a dict"
             )
@@ -102,7 +100,7 @@ def test_device_config_env_vars_are_dict():
 
 def test_num_gpu_blocks_override_is_positive_or_none():
     for model_id, entry in model_registry().items():
-        for cfg in entry.continuous_batching_configs:
+        for cfg in entry.serving_configs:
             override = cfg.device_config.num_gpu_blocks_override
             if override is not None:
                 assert override > 0, (

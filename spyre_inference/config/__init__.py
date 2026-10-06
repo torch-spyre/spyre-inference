@@ -63,14 +63,14 @@ class DeviceConfig:
 
 
 @dataclass
-class ContinuousBatchingConfig:
+class ServingConfig:
     tp_size: int
     max_model_len: int
     max_num_seqs: int
     device_config: DeviceConfig = field(default_factory=DeviceConfig)
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> ContinuousBatchingConfig:
+    def from_dict(cls, d: dict[str, Any]) -> ServingConfig:
         return cls(
             tp_size=d["tp_size"],
             max_model_len=d["max_model_len"],
@@ -83,7 +83,7 @@ class ContinuousBatchingConfig:
 class ModelEntry:
     model_id: str
     platforms: list[str] | None
-    continuous_batching_configs: list[ContinuousBatchingConfig]
+    serving_configs: list[ServingConfig]
 
     def supports_platform(self, machine: str) -> bool:
         return self.platforms is None or machine in self.platforms
@@ -91,14 +91,11 @@ class ModelEntry:
     @classmethod
     def from_dict(cls, model_id: str, d: dict[str, Any]) -> ModelEntry:
         raw_platforms = d.get("platforms")
-        cb_configs = [
-            ContinuousBatchingConfig.from_dict(c)
-            for c in (d.get("continuous_batching_configs") or [])
-        ]
+        configs = [ServingConfig.from_dict(c) for c in (d.get("serving_configs") or [])]
         return cls(
             model_id=model_id,
             platforms=list(raw_platforms) if raw_platforms is not None else None,
-            continuous_batching_configs=cb_configs,
+            serving_configs=configs,
         )
 
 
@@ -125,9 +122,9 @@ def lookup_config(
     tp_size: int,
     max_model_len: int,
     machine: str | None = None,
-) -> ContinuousBatchingConfig | None:
-    """Return the first ``ContinuousBatchingConfig`` matching ``tp_size``,
-    ``max_model_len``, and the current platform for ``model_id``.
+) -> ServingConfig | None:
+    """Return the first ``ServingConfig`` matching ``tp_size``, ``max_model_len``,
+    and the current platform for ``model_id``.
 
     Returns ``None`` when no match is found — either the model is unknown,
     the platform is not supported, or no config matches the requested
@@ -144,7 +141,7 @@ def lookup_config(
         return None
     if not entry.supports_platform(machine):
         return None
-    for cfg in entry.continuous_batching_configs:
+    for cfg in entry.serving_configs:
         if cfg.tp_size == tp_size and cfg.max_model_len == max_model_len:
             return cfg
     return None

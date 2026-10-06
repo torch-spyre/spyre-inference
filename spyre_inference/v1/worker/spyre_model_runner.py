@@ -71,10 +71,12 @@ from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
 from spyre_inference.custom_ops.conv import SpyreConv2d
 from spyre_inference.custom_ops.head_pad import (
     fix_padded_attention_scale,
+    fix_padded_qk_norm_eps,
     fix_padded_rope,
     install_head_pad_weight_loader,
     install_padded_head_dim,
     verify_padded_head_dim,
+    verify_padded_qk_norm_weights,
 )
 from spyre_inference.custom_ops.mlp_pad import (
     install_mlp_pad_weight_loader,
@@ -624,12 +626,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
         # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
         # Must run before load_model builds+loads the (now 128-wide) params.
+        text_config = self.model_config.hf_text_config
         install_padded_head_dim(self.model_config)
         install_bert_head_pad(self.model_config)
-        install_head_pad_weight_loader(
-            model_loader, self.model_config.hf_text_config, self.model_config
-        )
-        install_mlp_pad_weight_loader(model_loader, self.model_config.hf_text_config)
+        install_head_pad_weight_loader(model_loader, text_config, self.model_config)
+        install_mlp_pad_weight_loader(model_loader, text_config, self.model_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -647,12 +648,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Restore original RoPE frequencies and attention scale corrupted by the
-        # head_dim width override (no-op unless the platform padded head_dim).
-        verify_padded_head_dim(self.model, self.model_config.hf_text_config)
-        verify_padded_intermediate_size(self.model, self.model_config.hf_text_config)
-        fix_padded_rope(self.model, self.model_config.hf_text_config)
-        fix_padded_attention_scale(self.model, self.model_config.hf_text_config)
+        # Restore original RoPE frequencies and attention scale, and compensate
+        # QK-norm epsilon for the padded head_dim. All passes are scoped to the
+        # padded text backbone (see custom_ops.text_backbone).
+        verify_padded_head_dim(self.model, text_config, self.model_config)
+        verify_padded_qk_norm_weights(self.model, text_config, self.model_config)
+        verify_padded_intermediate_size(self.model, text_config, self.model_config)
+        fix_padded_rope(self.model, text_config, self.model_config)
+        fix_padded_attention_scale(self.model, text_config, self.model_config)
+        fix_padded_qk_norm_eps(self.model, text_config, self.model_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not

@@ -237,6 +237,49 @@ def test_verify_noop_without_padding():
     )
 
 
+# A composite config: only the ``language_model.`` backbone was padded.
+_COMPOSITE = SimpleNamespace(hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace())
+
+
+def test_pad_weight_leaves_a_tower_mlp_of_the_text_width_alone():
+    """A vision MLP coinciding with the text intermediate_size was never widened."""
+    w = torch.randn(_ORIG, _HIDDEN)
+
+    tower = _pad_weight(
+        "vision_tower.layers.0.mlp.up_proj.weight", w, _ORIG, _PADDED, text_prefix="language_model."
+    )
+    text = _pad_weight(
+        "language_model.layers.0.mlp.up_proj.weight",
+        w,
+        _ORIG,
+        _PADDED,
+        text_prefix="language_model.",
+    )
+
+    assert torch.equal(tower, w)
+    assert text.shape == (_PADDED, _HIDDEN)
+
+
+def test_verify_ignores_a_tower_mlp_of_another_width():
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
+    class _Composite(torch.nn.Module, SupportsMultiModal):
+        pass
+
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_encoder_only=False))
+    )
+    model = _Composite()
+    model.vision_tower = _model_with_down_proj(_ORIG)
+    with model._mark_language_model(vllm_config):
+        model.language_model = _model_with_down_proj(_PADDED)
+    hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
+
+    verify_padded_intermediate_size(model, hf_config, _COMPOSITE)
+    with pytest.raises(RuntimeError, match=r"vision_tower\.mlp\.down_proj"):
+        verify_padded_intermediate_size(model, hf_config)
+
+
 def test_install_rejects_a_loader_that_cannot_pad_weights():
     hf_config = SimpleNamespace(intermediate_size=_PADDED, _spyre_orig_intermediate_size=_ORIG)
 

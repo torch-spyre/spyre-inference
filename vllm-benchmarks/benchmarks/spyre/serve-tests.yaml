@@ -7,10 +7,10 @@
 # also always passes --skip-chat-template, since the trace prompts carry their
 # own template.
 #
-# dataset-path is an env var so each host can point at its own copy of the
-# trace: ${SPYRE_AIOPS_DATASET} and ${SPYRE_CICS_DATASET}. Both fall back to the
-# layout on the Spyre benchmark hosts; a selected entry whose file is absent
-# fails the run rather than being skipped.
+# make perf-tests resolves SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET from cache,
+# fetching missing/corrupt traces and preserving existing-file overrides.
+# FETCH_BENCH_DATA=0 bypasses resolution. Unset vars fall back to benchmark-host
+# paths; a selected entry whose file is absent fails rather than being skipped.
 #
 # The trailing suffix names the trace an entry replays. Each one needs a
 # max-model-len that fits its requests, since longer ones are rejected: the

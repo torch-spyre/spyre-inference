@@ -3,10 +3,9 @@
 #
 # gated_models: Cached via manual add_or_remove_artifacts_from_cache dispatch on main.
 # public_models: Auto-cached by test_each_commit.yaml.
-# artifactory_datasets: Cached via the same manual dispatch. These need an
-#   Artifactory credential, which GitHub withholds from pull_request runs on a
-#   fork, so they cannot be fetched by the job that consumes them. Populating
-#   them here instead keeps the benchmark read-only and credential-free.
+# artifactory_datasets: Pre-populated via the same manual dispatch so fork PR
+#   benchmarks can use cached traces without Artifactory credentials. Other
+#   runs can fetch missing or corrupt traces when credentials are available.
 
 gated_models:
   - meta-llama/Meta-Llama-3-8B

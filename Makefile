@@ -156,6 +156,9 @@ print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_
 # run-one sub-makes -- gated on a stamp file so repeat sub-makes skip it.
 # define (not a target body) so run-one/perf-tests can inline the exact same
 # setup commands via $(AIU_SETUP_CMD) without re-declaring them.
+# A from-source build leaves a project .venv; prefer it so `uv run --active` targets
+# it, not the image's baked venv that ibm-aiu-setup.sh re-activates in-shell. Prebaked
+# images have no project .venv and fall through to $VIRTUAL_ENV.
 AIU_SETUP_STAMP := /tmp/.spyre-inference-aiu-setup-done
 define AIU_SETUP_CMD
 if [ ! -f "$(AIU_SETUP_STAMP)" ]; then rm -f /tmp/etc/ibm/spyre/topo.json; touch "$(AIU_SETUP_STAMP)"; fi; \
@@ -163,15 +166,17 @@ unset _IBM_AIU_SETUP; \
 set +e; \
 source "$$HOME/.bashrc"; \
 source /etc/profile.d/ibm-aiu-setup.sh; \
-set -e
+set -e; \
+if [ -d "$(CURDIR)/.venv" ]; then export VIRTUAL_ENV="$(CURDIR)/.venv"; export PATH="$(CURDIR)/.venv/bin:$$PATH"; fi
 endef
 
 aiu-setup: ## Internal: source ibm-aiu-setup.sh and run its one-time side effects (memoized via a stamp file for this run).
 	$(AIU_SETUP_CMD)
 
-# uv invocations below pass --active --no-sync: they must use the prebaked image venv
-# ($VIRTUAL_ENV) and skip re-resolution, since the lockfile pins wheels (torch +cpu,
-# bitsandbytes) that have no ppc64le build even though the venv is already complete.
+# uv invocations below pass --active --no-sync: they must use the active venv
+# ($VIRTUAL_ENV, repointed above to the project .venv when one is present) and skip
+# re-resolution, since the lockfile pins wheels (torch +cpu, bitsandbytes) that have
+# no ppc64le build even though the venv is already complete.
 run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARGS.
 	# ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that fails on
 	# the Spyre image; env vars are already exported by then, so tolerate

@@ -17,6 +17,7 @@
 import contextlib
 import functools
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
@@ -42,8 +43,22 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert, row_outermost_layout
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.jagged_plan import (
+    QUERY_TILE_SIZE,
+    JaggedAttentionPlan,
+    JaggedMixedPlan,
+    JaggedPlanWorkspace,
+    JaggedTilePlan,
+    build_jagged_decode_plan,
+    build_jagged_mixed_plan,
+    build_jagged_tile_plan,
+    jagged_plan_variants,
+)
 from spyre_inference.v1.attention.ops import tile_loop
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.jagged_decode_attn import jagged_decode_attn_kernel
+from spyre_inference.v1.attention.ops.jagged_page_attn import jagged_page_attn_kernel
+from spyre_inference.v1.attention.ops.jagged_tile_attn import jagged_tile_attn_kernel
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
     slot_major_kv_layout,
@@ -182,9 +197,16 @@ _batched_decode_compiled = torch.compile(
     batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 
+# The flat kernel remains available for benchmark comparisons.
+_jagged_attn_compiled = torch.compile(jagged_page_attn_kernel, dynamic=False, fullgraph=True)
+_jagged_decode_compiled = torch.compile(jagged_decode_attn_kernel, dynamic=False, fullgraph=True)
+_jagged_tile_compiled = torch.compile(jagged_tile_attn_kernel, dynamic=False, fullgraph=True)
+
 compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
+compile_guard.watch(jagged_decode_attn_kernel, "jagged decode kernel")
+compile_guard.watch(jagged_tile_attn_kernel, "jagged prefill kernel")
 
 _warmup_complete = False
 
@@ -220,6 +242,36 @@ def _call_kernel(label: str, fn, *args):
             label,
         )
     return result
+
+
+class _JaggedDeviceWorkspace:
+    """Reuse device allocations; each metadata object publishes a group once."""
+
+    def __init__(self):
+        self._tables: OrderedDict[tuple, tuple[torch.Tensor, ...]] = OrderedDict()
+
+    def mirror(self, tensors, device):
+        key = (str(device), *((t.data_ptr(), tuple(t.shape), t.dtype) for t in tensors))
+        resident = self._tables.get(key)
+        if resident is None:
+            resident = tuple(
+                convert(
+                    t,
+                    device,
+                    device_layout=row_outermost_layout(t.shape, t.dtype)
+                    if device.type == "spyre"
+                    else None,
+                )
+                for t in tensors
+            )
+            self._tables[key] = resident
+            if len(self._tables) > 8:
+                self._tables.popitem(last=False)
+        else:
+            self._tables.move_to_end(key)
+            for destination, source in zip(resident, tensors, strict=True):
+                destination.copy_(source)
+        return resident
 
 
 @dataclass
@@ -342,6 +394,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # backend imports from this module, not the other way round.
     encoder_plan: "EncoderRectPlan | list[EncoderGroupPlan] | None" = None
 
+    jagged_plan: JaggedAttentionPlan | JaggedTilePlan | JaggedMixedPlan | None = None
+    jagged_tables_device: tuple[torch.Tensor, ...] | None = None
+    jagged_device_workspace: _JaggedDeviceWorkspace | None = None
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
@@ -349,7 +405,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
 
 class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetadata]):
-    """Builds attention metadata — only the attention mask is precomputed."""
+    """Build per-sequence masks or compact jagged tables, shared across layers."""
 
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
@@ -376,6 +432,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # clamps to this when a pooling model's dummy warmup batch does not.
         self._is_pooling = vllm_config.model_config.runner_type == "pooling"
         self._max_model_len = vllm_config.model_config.max_model_len
+        self._jagged_query_capacity = max(
+            QUERY_TILE_SIZE + 1, vllm_config.scheduler_config.max_num_batched_tokens + 1
+        )
+        self._jagged_workspace = JaggedPlanWorkspace()
+        self._jagged_device_workspace = _JaggedDeviceWorkspace()
+        self._jagged_parallel_entries = envs.SPYRE_JAGGED_PARALLEL_ENTRIES
+        self._jagged_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._jagged_max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
         if self.sliding_window is not None and self.sliding_window <= 0:
             raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
@@ -409,6 +473,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         static_ctx = vllm_config.compilation_config.static_forward_context
         own_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
+        self._jagged_layers = own_layers
         self._slot_mapping = attn_layer.install(own_layers)
         # Imported here, not at module scope: spyre_encoder_attn imports this module.
         from spyre_inference.v1.attention.backends.spyre_encoder_attn import install_encoder
@@ -426,6 +491,21 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     @property
     def attn_bucketer(self) -> SpyreAttnBucketer:
         return self._attn_bucketer
+
+    def jagged_parallel_entries(self) -> int:
+        entries = self._jagged_parallel_entries
+        if entries < 1 or entries & (entries - 1):
+            raise ValueError("SPYRE_JAGGED_PARALLEL_ENTRIES must be a positive power of two")
+        for layer in self._jagged_layers:
+            if len(layer.kv_cache):
+                # Indirect gathers must select fewer entries than the source.
+                pages = int(layer.kv_cache[0].shape[0])
+                if pages <= 1:
+                    raise ValueError(
+                        "jagged attention needs a cache page in addition to the null page"
+                    )
+                entries = min(entries, 1 << ((pages - 1).bit_length() - 1))
+        return entries
 
     def _get_zero_tile(self, aligned_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
@@ -756,6 +836,37 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         num_seqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc[1 : num_seqs + 1] - query_start_loc[:num_seqs]
+
+        if envs.SPYRE_JAGGED_ATTENTION and not self._is_pooling:
+            max_entries = self.jagged_parallel_entries()
+            plan = build_jagged_mixed_plan(
+                query_start_loc[: num_seqs + 1],
+                seq_lens[:num_seqs],
+                block_table,
+                self.block_size,
+                query_capacity=self._jagged_query_capacity,
+                causal=causal,
+                sliding_window=self.sliding_window,
+                max_parallel_entries=max_entries,
+                workspace=self._jagged_workspace,
+            )
+            self._slot_mapping.publish(slot_mapping)
+            return SpyreAttentionMetadata(
+                num_actual_tokens=common_attn_metadata.num_actual_tokens,
+                num_seqs=num_seqs,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                seq_lens=seq_lens,
+                query_start_loc=query_start_loc,
+                block_table=block_table,
+                block_size=self.block_size,
+                slot_mapping=slot_mapping,
+                apply_causal_mask=apply_causal_mask,
+                num_kv_heads=self.num_kv_heads,
+                num_heads=self.num_heads,
+                jagged_plan=plan,
+                jagged_device_workspace=self._jagged_device_workspace,
+            )
 
         if self._is_pooling:
             # Real requests satisfy query_len == seq_len <= max_model_len (see
@@ -1160,6 +1271,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     via torch.compile, with their loop counts passed as arguments.
     """
 
+    _jagged_head_major = False
+
     def __init__(
         self,
         num_heads: int,
@@ -1180,6 +1293,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.num_queries_per_kv = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
+        self._jagged_enabled = (
+            envs.SPYRE_JAGGED_ATTENTION
+            and attn_type == AttentionType.DECODER
+            and get_current_vllm_config().model_config.runner_type != "pooling"
+        )
+        if self._jagged_enabled and alibi_slopes is not None:
+            raise NotImplementedError("SPYRE_JAGGED_ATTENTION does not yet support ALiBi")
 
         # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
         # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
@@ -1239,6 +1359,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.staging_rows: int = (
             get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
         )
+        if self._jagged_enabled:
+            self.staging_rows = max(self.staging_rows, QUERY_TILE_SIZE + 1)
+        self._jagged_direct_output = True
+        self.staging_output_rows = self.staging_rows
+        if self._jagged_enabled:
+            self.staging_output_rows += min(512, 1 << ((self.staging_rows - 1).bit_length() - 1))
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
 
         logger.debug_once(
@@ -1262,6 +1388,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             layout = (
                 row_outermost_layout(shape, self.model_dtype) if device.type == "spyre" else None
             )
+            output_shape = (self.staging_output_rows, self.num_heads, self.head_size)
+            output_layout = (
+                row_outermost_layout(output_shape, self.model_dtype)
+                if device.type == "spyre"
+                else None
+            )
             self._staging = (
                 convert(
                     torch.zeros(shape, dtype=self.model_dtype),
@@ -1269,9 +1401,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     device_layout=layout,
                 ),
                 convert(
-                    torch.zeros(shape, dtype=self.model_dtype),
+                    torch.zeros(output_shape, dtype=self.model_dtype),
                     device,
-                    device_layout=layout,
+                    device_layout=output_layout,
                 ),
             )
         return self._staging
@@ -1345,6 +1477,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
 
+        if attn_metadata.jagged_plan is not None:
+            return self._jagged_attention(query, k_pages, v_pages, attn_metadata, output)
+
         # The mask stacks are mirrored lazily, by the only code that reads them: when
         # the batched kernel covers every decode sequence the per-sequence loop never
         # runs, and transferring for it would be pure waste.
@@ -1372,6 +1507,76 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         return output
 
+    def _jagged_attention(self, query, k_pages, v_pages, metadata, output):
+        plan = metadata.jagged_plan
+        assert plan is not None
+        if metadata.num_actual_tokens == 0:
+            return output.zero_()
+        if self.alibi_slopes is not None:
+            raise NotImplementedError("Jagged attention does not yet support ALiBi")
+        q_staging, out_staging = self._staging_buffers(k_pages.device)
+        if plan.query_capacity != q_staging.shape[0]:
+            raise ValueError("jagged metadata and query staging capacities differ")
+        if query is not q_staging:
+            if query.shape[0] > self.staging_rows:
+                raise ValueError("packed query exceeds the configured token capacity")
+            q_staging[: query.shape[0]].copy_(query)
+        if metadata.jagged_tables_device is None:
+            workspace = metadata.jagged_device_workspace or _JaggedDeviceWorkspace()
+            groups = plan.groups if isinstance(plan, JaggedMixedPlan) else (plan,)
+            metadata.jagged_tables_device = tuple(
+                tensor
+                for group in groups
+                for tensor in workspace.mirror(group.tensors, k_pages.device)
+            )
+        if self._jagged_direct_output and isinstance(plan, (JaggedMixedPlan, JaggedTilePlan)):
+            groups = plan.groups if isinstance(plan, JaggedMixedPlan) else (plan,)
+            for index, group in enumerate(groups):
+                kernel = (
+                    _jagged_decode_compiled
+                    if group.page_indices.ndim == 4
+                    else _jagged_tile_compiled
+                )
+                q_ids, out_ids, page_ids, q_bounds, k_offsets = metadata.jagged_tables_device[
+                    index * 5 : (index + 1) * 5
+                ]
+                kernel(
+                    q_staging,
+                    k_pages,
+                    v_pages,
+                    q_ids,
+                    out_ids,
+                    page_ids,
+                    q_bounds,
+                    k_offsets,
+                    self.scale,
+                    head_major=self._jagged_head_major,
+                    logits_soft_cap=self.logits_soft_cap,
+                    out=out_staging,
+                )
+            if output is not out_staging:
+                rows = min(output.shape[0], self.staging_rows)
+                output[:rows].copy_(out_staging[:rows])
+            return output
+        q_ids, out_ids, page_ids, q_bounds, k_offsets, first_page = metadata.jagged_tables_device
+        result = _jagged_attn_compiled(
+            q_staging,
+            k_pages,
+            v_pages,
+            q_ids,
+            out_ids,
+            page_ids,
+            q_bounds,
+            k_offsets,
+            first_page,
+            self.scale,
+            head_major=self._jagged_head_major,
+            logits_soft_cap=self.logits_soft_cap,
+        )
+        rows = min(output.shape[0], self.staging_rows)
+        output[:rows].copy_(result[:rows])
+        return output
+
     def record_graphs(
         self,
         layer: AttentionLayer,
@@ -1385,6 +1590,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         raised, so it cannot take down engine startup; dispatch then compiles it on
         first use.
         """
+        if self._jagged_enabled:
+            return self._record_jagged(kv_cache, builder)
         if not self._compile_attn:
             return 0
 
@@ -1434,6 +1641,68 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             time.time() - t_start,
         )
         return recorded + recorded_decode
+
+    def _record_jagged(self, kv_cache, builder):
+        variants = jagged_plan_variants(
+            builder._jagged_max_num_tokens,
+            builder._jagged_max_num_seqs,
+            builder._max_model_len,
+            builder.block_size,
+            builder._jagged_query_capacity,
+            builder.sliding_window,
+        )
+        q_staging, out_staging = self._staging_buffers(kv_cache[0].device)
+        entries = min(
+            builder.jagged_parallel_entries(),
+            1 << ((kv_cache[0].shape[0] - 1).bit_length() - 1),
+        )
+        started = time.monotonic()
+        logger.info("Recording %d jagged attention group variants...", len(variants))
+        with torch._dynamo.config.patch(
+            accumulated_recompile_limit=max(
+                torch._dynamo.config.accumulated_recompile_limit, len(variants) * 4 + 64
+            ),
+            capture_scalar_outputs=True,
+        ):
+            for variant in variants:
+                decode = variant.query_tile_size == 1
+                kv_len = min(variant.page_capacity * builder.block_size, builder._max_model_len)
+                plan_builder = build_jagged_decode_plan if decode else build_jagged_tile_plan
+                plan = plan_builder(
+                    torch.tensor([0, 1], dtype=torch.int32),
+                    torch.tensor([kv_len], dtype=torch.int32),
+                    torch.zeros((1, variant.page_capacity), dtype=torch.int32),
+                    builder.block_size,
+                    query_capacity=builder._jagged_query_capacity,
+                    query_tile_size=variant.query_tile_size,
+                    tile_capacity=variant.tile_capacity,
+                    page_capacity=variant.page_capacity,
+                    sliding_window=builder.sliding_window,
+                    workspace=builder._jagged_workspace,
+                    **({"max_parallel_entries": entries} if decode else {}),
+                )
+                q_ids, out_ids, page_ids, q_bounds, k_offsets = (
+                    builder._jagged_device_workspace.mirror(plan.tensors, kv_cache[0].device)
+                )
+                kernel = _jagged_decode_compiled if decode else _jagged_tile_compiled
+                kernel(
+                    q_staging,
+                    kv_cache[0],
+                    kv_cache[1],
+                    q_ids,
+                    out_ids,
+                    page_ids,
+                    q_bounds,
+                    k_offsets,
+                    self.scale,
+                    head_major=self._jagged_head_major,
+                    logits_soft_cap=self.logits_soft_cap,
+                    out=out_staging,
+                )
+        logger.info(
+            "Recorded %d jagged variants in %.2fs.", len(variants), time.monotonic() - started
+        )
+        return len(variants)
 
     def _record_all(
         self,

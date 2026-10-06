@@ -5190,7 +5190,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=1a56c846fcaf48efbc257dd8a975380d2c6e8f78" },
+    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=58084ae76cdcf91090a0a12368e12697c0efafb8" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
     { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
@@ -5580,8 +5580,8 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-version = "0.6.0.dev75+master.g1a56c846"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=1a56c846fcaf48efbc257dd8a975380d2c6e8f78#1a56c846fcaf48efbc257dd8a975380d2c6e8f78" }
+version = "0.6.0.dev86+master.g58084ae7"
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=58084ae76cdcf91090a0a12368e12697c0efafb8#58084ae76cdcf91090a0a12368e12697c0efafb8" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },

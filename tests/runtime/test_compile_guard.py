@@ -82,6 +82,7 @@ class TestLevelParsing:
             ("off", CompileGuardLevel.OFF),
             ("warn", CompileGuardLevel.WARN),
             ("error", CompileGuardLevel.ERROR),
+            ("error_all", CompileGuardLevel.ERROR_ALL),
             ("ERROR", CompileGuardLevel.ERROR),
             ("  warn  ", CompileGuardLevel.WARN),
         ],
@@ -265,14 +266,22 @@ class TestClassification:
         assert len(violations()) == 1
         assert "<lambda>" in violations()[0]
 
-    def test_the_eager_op_trampoline_is_ignored(self, guard):
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "/venv/lib/python3.12/site-packages/torch/_dynamo/external_utils.py",
+            "/venv/lib/python3.12/site-packages/torch_spyre/ops/eager.py",
+        ],
+    )
+    def test_the_eager_op_trampoline_is_classified(self, guard, filename):
         """torch-spyre compiles every eager aten op through one shared torch frame.
 
         Those compiles continue for the whole run by design, so they must never be
         reported. Exercised through the classifier directly because the real path
         needs a Spyre device.
         """
-        kind, label = guard._guard._classify(_fake_eager_op_code())
+        code = _fake_code(filename, "call_op")
+        kind, label = guard._guard._classify(code)
 
         assert kind is CompileKind.EAGER_OP
         assert label == "torch-spyre eager op"
@@ -285,6 +294,19 @@ class TestClassification:
 
 
 class TestErrorLevel:
+    def test_error_all_raises_for_an_eager_op_compile(self, guard, monkeypatch):
+        monkeypatch.setattr(compile_guard, "_traced_code", _fake_eager_op_code)
+        guard.arm(CompileGuardLevel.ERROR_ALL)
+
+        with pytest.raises(UnexpectedCompileError, match="torch-spyre eager op compiled"):
+            guard._guard._on_compile_start(type("Args", (), {"compile_id": "1/0"})())
+
+    def test_error_still_ignores_an_eager_op_compile(self, guard, monkeypatch):
+        monkeypatch.setattr(compile_guard, "_traced_code", _fake_eager_op_code)
+        guard.arm(CompileGuardLevel.ERROR)
+
+        guard._guard._on_compile_start(type("Args", (), {"compile_id": "1/0"})())
+
     def test_a_watched_compile_raises(self, guard):
         def fn(x):
             return x * 2
@@ -679,11 +701,14 @@ class TestGraphBreakResumeFrames:
 
 def _fake_eager_op_code():
     """A code object whose filename matches torch-spyre's eager-op trampoline."""
+    return _fake_code("/some/prefix/torch/_dynamo/external_utils.py", "inner")
+
+
+def _fake_code(path: str, name: str):
     source = "def inner(*args, **kwargs):\n    return None\n"
     namespace: dict = {}
-    path = "/some/prefix/torch/_dynamo/external_utils.py"
-    exec(compile(source, path, "exec"), namespace)
-    return namespace["inner"].__code__
+    exec(compile(source.replace("inner", name), path, "exec"), namespace)
+    return namespace[name].__code__
 
 
 def _fake_resume_code(parent: str, path: str = "/some/module.py"):

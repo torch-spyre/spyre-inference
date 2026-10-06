@@ -120,6 +120,64 @@ def test_compiled_pooling_encoder_buckets(monkeypatch: pytest.MonkeyPatch) -> No
         assert sim >= _COSINE_MIN, f"cosine {sim:.4f} < {_COSINE_MIN}"
 
 
+def test_compiled_pooling_mixed_tasks_need_no_late_compile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed embed/token_embed groups stay within the warmed gather shapes."""
+    from vllm import LLM
+    from vllm.config import PoolerConfig
+    from vllm.outputs import PoolingRequestOutput
+    from vllm.pooling_params import PoolingParams
+
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error_all")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    engine = LLM(
+        model=_POOLING_MODEL,
+        runner="pooling",
+        enforce_eager=False,
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=128,
+        pooler_config=PoolerConfig(task="embed"),
+    )
+
+    for iteration, token_len in enumerate((33, 40, 50, 64)):
+        solo_embed_id = str(iteration * 4)
+        solo_token_id = str(iteration * 4 + 1)
+        mixed_embed_id = str(iteration * 4 + 2)
+        mixed_token_id = str(iteration * 4 + 3)
+        engine.llm_engine.add_request(
+            solo_embed_id,
+            {"prompt_token_ids": [1] * 32},
+            PoolingParams(task="embed"),
+        )
+        solo_embed = engine._run_engine(PoolingRequestOutput, use_tqdm=False)[0]
+        engine.llm_engine.add_request(
+            solo_token_id,
+            {"prompt_token_ids": [1] * token_len},
+            PoolingParams(task="token_embed"),
+        )
+        solo_token = engine._run_engine(PoolingRequestOutput, use_tqdm=False)[0]
+        engine.llm_engine.add_request(
+            mixed_embed_id,
+            {"prompt_token_ids": [1] * 32},
+            PoolingParams(task="embed"),
+        )
+        engine.llm_engine.add_request(
+            mixed_token_id,
+            {"prompt_token_ids": [1] * token_len},
+            PoolingParams(task="token_embed"),
+        )
+        outputs = engine._run_engine(PoolingRequestOutput, use_tqdm=False)
+        by_id = {output.request_id: output for output in outputs}
+        mixed_embed = torch.as_tensor(by_id[mixed_embed_id].outputs.data)
+        mixed_tokens = torch.as_tensor(by_id[mixed_token_id].outputs.data)
+        assert mixed_embed.shape == (768,)
+        assert mixed_tokens.shape == (token_len, 768)
+        torch.testing.assert_close(mixed_embed, torch.as_tensor(solo_embed.outputs.data))
+        torch.testing.assert_close(mixed_tokens, torch.as_tensor(solo_token.outputs.data))
+
+
 def test_transformers_backend_compile(monkeypatch: pytest.MonkeyPatch) -> None:
     """Compile the Transformers backend and check against a known reference.
 

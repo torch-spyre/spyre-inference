@@ -29,9 +29,9 @@ kernel that owns them.
 
 torch-spyre executes eager aten ops by registering ``torch.compile(op)`` as the
 ``PrivateUse1`` kernel, so a new shape on any eager op compiles legitimately and
-keeps doing so for the whole run. Those all trace through one shared torch frame
-(``_EAGER_OP_TRACE_FILE``), which is how they are told apart from a block or kernel
-compile and dropped.
+keeps doing so for the whole run. Those trace through a small set of shared frames,
+which is how they are told apart from a block or kernel compile. Normal guard levels
+drop them; ``error_all`` makes them fatal for exhaustive warmup coverage tests.
 """
 
 from __future__ import annotations
@@ -58,6 +58,8 @@ class CompileGuardLevel(enum.Enum):
     """Log each distinct violation."""
     ERROR = "error"
     """Raise ``UnexpectedCompileError``."""
+    ERROR_ALL = "error_all"
+    """Also raise for torch-spyre eager-op compiles."""
 
 
 def parse_level(value: str) -> CompileGuardLevel:
@@ -89,10 +91,12 @@ class UnexpectedCompileError(AssertionError, RuntimeError):
     """
 
 
-# torch-spyre runs every eager aten op through its own torch.compile, and all of them
-# are traced from this one torch-internal trampoline. Matching the file rather than
-# the function name keeps this working if the function inside it is renamed.
-_EAGER_OP_TRACE_FILE = "torch/_dynamo/external_utils.py"
+# torch-spyre has traced eager aten ops from both its own call_op wrapper and a
+# torch-internal trampoline. Match both released layouts across torch-spyre versions.
+_EAGER_OP_TRACE_FILES = (
+    "torch/_dynamo/external_utils.py",
+    "torch_spyre/ops/eager.py",
+)
 
 try:
     from torch._dynamo.resume_execution import TORCH_DYNAMO_RESUME_IN_PREFIX as _RESUME_PREFIX
@@ -192,7 +196,9 @@ class _CompileGuard:
             "compile of one is %s.",
             level.value,
             watched,
-            "a hard error" if level is CompileGuardLevel.ERROR else "logged",
+            "a hard error"
+            if level in (CompileGuardLevel.ERROR, CompileGuardLevel.ERROR_ALL)
+            else "logged",
         )
 
     def disarm(self) -> None:
@@ -265,7 +271,7 @@ class _CompileGuard:
 
         compile_id = str(getattr(args, "compile_id", "?"))
         kind, label = self._classify(_traced_code())
-        if kind is CompileKind.EAGER_OP:
+        if kind is CompileKind.EAGER_OP and self._level is not CompileGuardLevel.ERROR_ALL:
             return
 
         is_recompile = _is_recompile(compile_id)
@@ -280,10 +286,17 @@ class _CompileGuard:
         # An unknown frame is never fatal: were a torch upgrade to move the eager-op
         # trampoline, every eager op would land here, and killing the engine over
         # that is far worse than a noisy log.
-        if level is CompileGuardLevel.ERROR and kind is CompileKind.WATCHED:
+        fatal = kind is CompileKind.WATCHED or (
+            kind is CompileKind.EAGER_OP and level is CompileGuardLevel.ERROR_ALL
+        )
+        if level in (CompileGuardLevel.ERROR, CompileGuardLevel.ERROR_ALL) and fatal:
+            expectation = (
+                "Every eager-op shape was expected to have been compiled already"
+                if kind is CompileKind.EAGER_OP
+                else "Every compile of this callable was expected to have happened already"
+            )
             raise UnexpectedCompileError(
-                f"{described}. Every compile of this callable was expected to have "
-                "happened already, so this costs a full Inductor compile here. "
+                f"{described}. {expectation}, so this costs a full Inductor compile here. "
                 "Re-run with TORCH_LOGS=recompiles to see which guard failed, or set "
                 "SPYRE_COMPILE_GUARD=warn to downgrade this to a log line."
             )
@@ -304,7 +317,8 @@ class _CompileGuard:
         if label is not None:
             return CompileKind.WATCHED, label
         # Normalised so the match holds on Windows-style separators too.
-        if code.co_filename.replace("\\", "/").endswith(_EAGER_OP_TRACE_FILE):
+        filename = code.co_filename.replace("\\", "/")
+        if any(filename.endswith(path) for path in _EAGER_OP_TRACE_FILES):
             return CompileKind.EAGER_OP, "torch-spyre eager op"
         return CompileKind.UNKNOWN, f"{code.co_filename}:{code.co_name}"
 

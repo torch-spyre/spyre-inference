@@ -27,9 +27,11 @@ parameterised. This layout does not carry ALiBi.
 """
 
 import contextlib
+from typing import ClassVar
 
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -37,6 +39,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    FP8_KV_CACHE_DTYPES,
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
@@ -125,6 +128,11 @@ def _capped_cores(output_units: int):
 class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
     """Head-major variant of the paged KV-cache backend."""
 
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        *SpyreAttentionBackend.supported_kv_cache_dtypes,
+        *FP8_KV_CACHE_DTYPES,
+    ]
+
     @staticmethod
     def get_impl_cls() -> type["SpyreHeadMajorAttentionImpl"]:
         return SpyreHeadMajorAttentionImpl
@@ -141,7 +149,12 @@ class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
 
 
 class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
-    """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache."""
+    """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache.
+
+    A float8 cache stores ``K / k_scale`` and ``V / v_scale``, dequantized on read.
+    """
+
+    supports_fp8_kv_cache: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -172,7 +185,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
-        dtype = spec.dtype
+        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
+        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
         layout = head_major_kv_layout(
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
         )
@@ -181,6 +195,23 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             k_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
             v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
+
+    def _kernel_kv_scales(self) -> tuple[float, ...]:
+        """Trailing (k_scale, v_scale) kernel arguments; none for a model-dtype cache."""
+        if not self.kv_cache_fp8:
+            return ()
+        assert self._kv_scales is not None, "prepare_kv_scales must run before the kernels"
+        return self._kv_scales
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs):
+        self.prepare_kv_scales(layer)
+        return super().forward(
+            layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs
+        )
+
+    def record_graphs(self, layer, kv_cache, builder) -> int:
+        self.prepare_kv_scales(layer)
+        return super().record_graphs(layer, kv_cache, builder)
 
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device
@@ -307,6 +338,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.head_size,
                 self.logits_soft_cap,
                 out,
+                *self._kernel_kv_scales(),
             )
 
     def _run_page_attn(
@@ -355,6 +387,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.block_size,
                     self.logits_soft_cap,
                     out,
+                    *self._kernel_kv_scales(),
                 )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -381,6 +414,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.block_size,
                 self.logits_soft_cap,
                 out,
+                *self._kernel_kv_scales(),
             )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
@@ -398,7 +432,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
         k_rows, v_rows = self.kv_slot_views(kv_cache)
-        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping)
+        # Already done for the layers attn_layer traces the write for; upstream's own
+        # update op reaches here eagerly for the rest.
+        self.prepare_kv_scales(layer)
+        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, *self._kernel_kv_scales())
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.
         return k_rows

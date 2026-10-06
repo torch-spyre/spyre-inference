@@ -155,6 +155,20 @@ the per-sequence loop), warmup also records it over the KV-length × num-sequenc
 (default: powers of two from 1 to `--max-num-seqs`) is the extra lever there, and the same
 keep-it-short advice applies.
 
+## FP8 KV cache
+
+Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving its memory:
+
+```bash
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+```
+
+It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
+that is a multiple of 128. Attention still computes in the model dtype: pages are
+dequantized on read with the checkpoint's per-layer KV scales, or 1.0 when it has none.
+The speedup grows with the number of cached tokens each decode step reads, so it is small
+at short contexts; check accuracy against an fp16 cache before relying on it.
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

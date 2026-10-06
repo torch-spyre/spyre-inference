@@ -58,6 +58,7 @@ class SlotMapping:
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._layers:
                 layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
+                layer.impl.prepare_kv_scales(layer)  # ty: ignore[possibly-missing-attribute]
         return self._device
 
     def _write_index(self, slot_mapping: torch.Tensor, device: torch.device):

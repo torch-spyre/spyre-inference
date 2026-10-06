@@ -1538,7 +1538,9 @@ class _StubAttentionLayer:
 
     def __init__(self, attn_type: str):
         self.attn_type = attn_type
-        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views", "kv_write_index"])
+        self.impl = Mock(
+            spec=["do_kv_cache_update", "kv_slot_views", "kv_write_index", "prepare_kv_scales"]
+        )
         self.kv_sharing_target_layer_name = None
         self.query_quant = None
         self.kv_cache: list[torch.Tensor] = []

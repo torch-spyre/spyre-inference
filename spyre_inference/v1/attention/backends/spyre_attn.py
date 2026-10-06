@@ -188,6 +188,9 @@ compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 _warmup_complete = False
 
+# Stored as float8_e4m3fn with one per-tensor (k_scale, v_scale) pair per layer.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
 
 def mark_warmup_complete() -> None:
     """Arm the late-compile warning, once warmup has claimed full variant coverage."""
@@ -1160,6 +1163,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     via torch.compile, with their loop counts passed as arguments.
     """
 
+    supports_fp8_kv_cache: ClassVar[bool] = False
+
     def __init__(
         self,
         num_heads: int,
@@ -1192,13 +1197,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        self.kv_cache_fp8 = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        if self.kv_cache_fp8:
+            if not self.supports_fp8_kv_cache:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} needs the head-major KV layout "
+                    "(unset SPYRE_ATTN_KV_LAYOUT)."
+                )
+            # A float8 stick holds 128 elements.
+            if head_size % 128:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} needs head_size % 128 == 0, got {head_size}."
+                )
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
         # the two 2-byte dtypes are not interchangeable per-cache.
-        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+        elif kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."
             )
+        # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
+        self._kv_scales: tuple[float, float] | None = None
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1637,6 +1656,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
+
+    def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
+        """Read the layer's float8 KV scales once, as floats (a [1] tensor fails
+        torch-spyre's pointwise layout pass)."""
+        if not self.kv_cache_fp8 or self._kv_scales is not None:
+            return
+        # Set by upstream after weight loading.
+        self._kv_scales = (
+            float(getattr(layer, "_k_scale_float", 1.0)),
+            float(getattr(layer, "_v_scale_float", 1.0)),
+        )
 
     def do_kv_cache_update(
         self,

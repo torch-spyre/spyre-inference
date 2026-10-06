@@ -298,6 +298,25 @@ transpose to a restickify, whose cross-frame barrier bars an LX-resident input w
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
 
+#### FP8 KV cache
+
+`--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the head-major pages as `float8_e4m3fn`,
+halving KV memory and the bytes each page read moves; the token-major layout rejects it.
+Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
+The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
+the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
+has no device lowering and falls back to CPU, which writes bytes in sequential order
+while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
+`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
+dtype and apply `k_scale` to the scores and `v_scale` to the output, so the attention
+math itself stays fp16.
+
+The scales are per-tensor and per-layer, read once from the layer's `_k_scale_float` /
+`_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) and passed to the
+kernels as Python floats, skipped entirely at 1.0. A `[1]` scale tensor would let layers
+with different scales share one compiled block, but its broadcast fails torch-spyre's
+pointwise layout pass.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
@@ -309,6 +328,7 @@ Key constraints:
   powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); the decode-batch
   kernel is recorded over the `(num_blocks, num_seqs)` grid
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
+  — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a multiple of 64. The default is 128, and a user-supplied
   `block_size` is rounded up to the next multiple of 64
 - **GQA only**: MHA (`num_queries_per_kv = 1`) currently fails in the Spyre compiler's

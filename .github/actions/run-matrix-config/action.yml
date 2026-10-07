@@ -45,7 +45,7 @@ inputs:
     description: Unique per-job-attempt slot (e.g. strategy.job-index, or retry-<index>) used to scope the inductor cache dir and the coverage-data artifact name
     required: true
   retry:
-    description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact
+    description: When 'true' (called from the pod-level retry job), adds "(pod-level retry)" to log/report names and overwrites the first attempt's JUnit artifact, keeping its failures as result.prior_* properties
     required: false
     default: 'false'
   use_prebaked_image:
@@ -274,10 +274,6 @@ runs:
         if-no-files-found: ignore
         retention-days: 14
 
-    # Consumed by the test-report fan-in (_test_matrix.yaml) and the ClickHouse
-    # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
-    # the one aggregate report. overwrite: a pod-level retry replaces its failed
-    # first attempt's file.
     # The arch this leg ran on, for the workflow_run ingest: it is pinned to x86_64, so it
     # cannot read the test host's arch, and arch is hashed into run_id -- a wrong value mints
     # an id that joins to nothing. Rides beside the XML rather than as a case tag, which
@@ -289,6 +285,53 @@ runs:
         LEG_ARCH: ${{ inputs.leg_arch }}
       run: printf '%s' "${LEG_ARCH:-$(uname -m)}" > "leg-arch-${{ inputs.test_target }}.txt"
 
+    # The overwrite below would erase the first attempt's failures, so they are kept on the
+    # retry's report as result.prior_* properties (result.retried=pod marks every case).
+    - name: Download the first attempt's JUnit results
+      if: ${{ always() && inputs.retry == 'true' }}
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: junit-${{ inputs.test_target }}
+        path: ${{ runner.temp }}/replaced-junit
+
+    - name: Mark the retry's JUnit results
+      if: ${{ always() && inputs.retry == 'true' }}
+      shell: bash
+      env:
+        CFG: ${{ inputs.cfg }}
+        NEW_XML: junit-${{ inputs.test_target }}.xml
+        REPLACED_XML: ${{ runner.temp }}/replaced-junit/junit-${{ inputs.test_target }}.xml
+        # Stdlib-only, so fetched by path rather than installed; @main, like the ingest that reads its marks.
+        MARK_RETRIED_URL: https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+      run: |
+        warn() {
+          echo "::warning::$1"
+          echo "- :warning: ${CFG}: $1" >> "$GITHUB_STEP_SUMMARY"
+        }
+        if [[ ! -f "$NEW_XML" ]]; then
+          # Without this the overwriting upload would carry only the leg-arch file.
+          if [[ -f "$REPLACED_XML" ]]; then
+            cp "$REPLACED_XML" "$NEW_XML"
+            warn "retry wrote no JUnit XML; re-uploading the first attempt's report"
+          fi
+          exit 0
+        fi
+        args=("$NEW_XML")
+        if [[ -f "$REPLACED_XML" ]]; then
+          args+=("$REPLACED_XML")
+        else
+          warn "first attempt left no JUnit XML; marking the retry without prior outcomes"
+        fi
+        helper="${RUNNER_TEMP}/mark_retried.py"
+        curl -fsSL --retry 3 -o "$helper" "$MARK_RETRIED_URL" \
+          && python3 -I "$helper" pod "${args[@]}" \
+          || warn "could not mark $NEW_XML as retried; uploading it unmarked"
+
+    # Consumed by the test-report fan-in (_test_matrix.yaml) and the ClickHouse
+    # ingest (push-to-clickhouse.yaml); no per-leg dorny publish -- the fan-in is
+    # the one aggregate report. overwrite: a pod-level retry replaces its first
+    # attempt's file.
     - name: Upload JUnit results
       if: always()
       uses: actions/upload-artifact@v4

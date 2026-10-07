@@ -108,9 +108,8 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """Smoke: the whole Granite Vision path (SigLIP encoder → InterpolateDownsampler
     → BLIP-2 Q-Former → _pack_and_unpad → Granite decoder) runs and decodes text.
 
-    Both modes are covered: under `enforce_eager` the three CPU-offload patches
-    run in eager mode; under the compiled path the patches must survive the
-    torch.compile boundary.
+    Both modes exercise the CPU-offload and on-device attention patches;
+    under the compiled path the patches must survive the torch.compile boundary.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
     # the `LLM` worker subprocess then cannot ("Device or resource busy").

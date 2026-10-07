@@ -120,11 +120,10 @@ vllm serve ibm-granite/granite-embedding-125m-english \
 Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Per-sequence attention is recorded as the **product** of its KV-length
-and query-length buckets (and, when batched decode is enabled, a second KV-length ×
-num-sequences product, excluding combinations that reach the allocated page count), so
-extra attention buckets cost multiplicatively — keep those
-lists short.
+compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
+that fit its smallest real query length. Batched decode uses KV-length/num-sequences
+pairs; both recording paths also enforce the allocated page-capacity limit. Extra
+buckets can still multiply the recorded variants, so keep those lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
 platform clamps `--max-num-batched-tokens` to the largest entry. A decode-heavy run at
@@ -154,9 +153,9 @@ export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from bloc
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) precisely because the recorded set
-is a product. If your context never exceeds 2048, dropping the higher powers removes
-variants from warmup at no serving cost.
+The default KV buckets are geometric (powers of two) because the recorded set grows
+with both axes, even after filtering. If your context never exceeds 2048, dropping the
+higher powers removes variants from warmup at no serving cost.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps

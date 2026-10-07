@@ -75,10 +75,8 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     them, so the usable context is ``max_position_embeddings - pad_token_id - 1`` --
     512 for the 514-row table, not the 514 vLLM derives.
 
-    Needed since the encoder grew its rectangular path, which pads every sequence out to
-    the declared length: a max-length request's pad rows alone then index two past the
-    table on every request. Packed-only, positions never ran past the real prompt length,
-    so a prompt had to actually be 514 tokens to notice.
+    Rectangular padding also indexes the position table. Its extent depends on the
+    selected rectangle; the largest declared extent must fit the usable context.
 
     Called from ``TorchSpyrePlatform.apply_config_platform_defaults`` rather than from
     this module's model classes, which are not imported until load: the cap has to land

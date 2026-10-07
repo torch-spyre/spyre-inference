@@ -281,8 +281,8 @@ windows, i.e. whether an Inductor compile landed inside a measurement.
 ## Notes
 
 - `block_size` 128 is what you get in practice: `platform.py` sets it whenever the user
-  does not pass one (and requires a user-supplied one to be a power of two, rounded up to
-  a multiple of 64)
+  does not pass one; a user-supplied value is rounded up to a multiple of 64, then the
+  result must be a power of two.
 - Compiled and eager variants need separate runs, as do batched and per-seq decode
   variants — both are fixed per process.
 - The kernel specializes per `(num_blocks, aligned_max_query_len)`, so a sweep

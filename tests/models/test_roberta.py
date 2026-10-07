@@ -15,9 +15,8 @@
 """``max_model_len`` has to fit the table an offset position embedding indexes into.
 
 The runner offsets RoBERTa positions by ``pad_token_id + 1`` before the embedding gather,
-so a 514-row table holds 512 usable positions. The encoder's rectangular path pads every
-sequence to the declared length, so the pad rows alone reach the top of the range on
-every request.
+so a 514-row table holds 512 usable positions. Rectangular padding also consumes
+position-table entries, so the largest declared rectangle must fit this usable range.
 """
 
 from types import SimpleNamespace

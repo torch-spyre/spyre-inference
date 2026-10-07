@@ -100,10 +100,11 @@ class TestLevelParsing:
         with pytest.raises(ValueError, match="Invalid SPYRE_COMPILE_GUARD"):
             compile_guard.parse_level("")
 
-    def test_the_env_default_is_off(self, monkeypatch):
+    def test_the_env_default_is_warn(self, monkeypatch):
+        """Late compiles are reported without opting in, as the removed warmup check did."""
         monkeypatch.delenv("SPYRE_COMPILE_GUARD", raising=False)
         envs.clear_env_cache()
-        assert compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD) is CompileGuardLevel.OFF
+        assert compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD) is CompileGuardLevel.WARN
 
     def test_the_env_var_selects_the_level(self, monkeypatch):
         monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")

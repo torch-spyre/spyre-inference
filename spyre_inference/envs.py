@@ -29,7 +29,7 @@ if TYPE_CHECKING:
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
-    SPYRE_COMPILE_GUARD: str = "off"
+    SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
@@ -59,15 +59,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_COMPILE_GRANULARITY": lambda: os.getenv("SPYRE_COMPILE_GRANULARITY") or "block",
     # What to do when a model block, attention kernel or the lm_head compiles *after*
     # warmup, which costs a full Inductor compile mid-request:
-    #  - "off": nothing (default)
-    #  - "warn": log each distinct violation
+    #  - "off": nothing
+    #  - "warn": log each distinct violation (default)
     #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing,
     #    bearing in mind it catches most but not all: torch runs its compile-start
     #    callbacks only when a process-wide pending counter goes 0 -> 1, so a compile
     #    starting while another is in flight goes unreported.
     # torch-spyre compiles every eager aten op, so those compiles continue for the
     # whole run; they are never reported.
-    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "off",
+    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "warn",
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.

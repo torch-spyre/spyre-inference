@@ -93,7 +93,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
-    mark_warmup_complete,
 )
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
@@ -893,10 +892,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
-            # Encoder-only pooling never reaches _record_attention_graphs (no KV cache
-            # to record against), so claim coverage here instead -- otherwise
-            # _call_kernel stays silent for the encoder kernels.
-            mark_warmup_complete()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -1016,8 +1011,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             total,
             time.time() - t0,
         )
-        # Past the early returns: with recording off, first-use compiles are intended.
-        mark_warmup_complete()
 
     def _attn_metadata_builders(self) -> dict[str, SpyreAttentionMetadataBuilder]:
         """Each layer's metadata builder: attention groups' specs (block size, sliding

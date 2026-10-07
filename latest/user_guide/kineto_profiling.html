@@ -2605,11 +2605,15 @@ present, the device row is empty, and no error is raised.</p>
 <ol>
 <li><strong><code>libaiupti.so</code> and its headers are present:</strong></li>
 </ol>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>ls<span class="w"> </span>/opt/ibm/spyre/runtime/lib/libaiupti.so
-</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>ls<span class="w"> </span>/opt/ibm/spyre/runtime/include/libaiupti/*.h
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nv">RUNTIME_DIR</span><span class="o">=</span><span class="s2">"</span><span class="si">${</span><span class="nv">SENTIENT_BASE_INSTALL_DIR</span><span class="k">:-</span><span class="p">/opt/ibm/spyre</span><span class="si">}</span><span class="s2">/runtime"</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>ls<span class="w"> </span><span class="s2">"</span><span class="nv">$RUNTIME_DIR</span><span class="s2">/lib/libaiupti.so"</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>ls<span class="w"> </span><span class="s2">"</span><span class="nv">$RUNTIME_DIR</span><span class="s2">"</span>/include/libaiupti/*.h
 </span></code></pre></div>
 <p>The runtime library and its headers ship with the Spyre runtime.
-   Both are needed at build time; the <code>.so</code> is needed at run time.</p>
+   Both are needed at build time; the <code>.so</code> is needed at run time. When using
+   <code>spyre-rpms.lock</code>, source the installer-generated <code>env.sh</code> first so
+   <code>SENTIENT_BASE_INSTALL_DIR</code> selects the pinned libraries instead of the
+   image-baked <code>/opt/ibm/spyre</code> tree.</p>
 <ol>
 <li>
 <p><strong>The Spyre device is accessible</strong> — typically a <code>/dev/vfio/&lt;N&gt;</code>
@@ -2620,25 +2624,31 @@ present, the device row is empty, and no error is raised.</p>
 </li>
 </ol>
 <h3 id="13-enabling-the-aiupti-backend">1.3 Enabling the AIUPTI backend<a class="headerlink" href="#13-enabling-the-aiupti-backend" title="Permanent link">&para;</a></h3>
+<p>For pinned-RPM installs, select matching runtime headers before either rebuild option:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nb">source</span><span class="w"> </span>~/spyre-libs/env.sh
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SEN_COMMON_HEADERS</span><span class="o">=</span><span class="s2">"</span><span class="si">${</span><span class="nv">SENTIENT_BASE_INSTALL_DIR</span><span class="si">}</span><span class="s2">/runtime/include"</span>
+</span></code></pre></div>
 <p><strong>Option A — persistent (<code>pyproject.toml</code> flip):</strong></p>
 <p>Edit <code>pyproject.toml</code> in <code>spyre-inference</code>:</p>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">[tool.uv.extra-build-variables.torch-spyre]</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">USE_SPYRE_PROFILER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"1"</span><span class="w">   </span><span class="c1"># was "0"</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">[tool.uv.extra-build-variables.torch-spyre]</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="n">USE_SPYRE_PROFILER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"1"</span><span class="w">   </span><span class="c1"># was "0"</span>
 </span></code></pre></div>
-<p>Then <code>uv sync</code> — the resulting wheel has AIUPTI compiled in. This is
-the right path for anyone using this venv for profiling long-term.
+<p>Then rebuild with <code>uv cache clean torch-spyre &amp;&amp; uv sync --reinstall-package torch-spyre</code>
+to avoid reusing a wheel built with the old flag. The resulting wheel has AIUPTI compiled
+in. This is the right path for anyone using this venv for profiling long-term.
 Because the flag was originally set to <code>"0"</code> to work around long Z
 model-load times, flipping it in-tree is a project-level decision, not
 a silent local edit.</p>
 <p><strong>Option B — rebuild in place after each pod recreate:</strong></p>
 <p>If you want to leave <code>pyproject.toml</code> alone, force-reinstall
 torch-spyre with the flag set:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">USE_SPYRE_PROFILER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nv">LIBAIUPTI_INSTALL_DIR</span><span class="o">=</span>/opt/ibm/spyre/runtime<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="s2">"/opt/ibm/spyre/runtime/lib:</span><span class="nv">$LD_LIBRARY_PATH</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span>/path/to/your-venv/bin/python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span>--no-deps<span class="w"> </span>--force-reinstall<span class="w"> </span>--no-cache-dir<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">    </span><span class="s2">"torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@&lt;rev&gt;"</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nv">RUNTIME_DIR</span><span class="o">=</span><span class="s2">"</span><span class="si">${</span><span class="nv">SENTIENT_BASE_INSTALL_DIR</span><span class="k">:-</span><span class="p">/opt/ibm/spyre</span><span class="si">}</span><span class="s2">/runtime"</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nv">USE_SPYRE_PROFILER</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nv">LIBAIUPTI_INSTALL_DIR</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUNTIME_DIR</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nv">LD_LIBRARY_PATH</span><span class="o">=</span><span class="s2">"</span><span class="nv">$RUNTIME_DIR</span><span class="s2">/lib:</span><span class="si">${</span><span class="nv">LD_LIBRARY_PATH</span><span class="k">:-</span><span class="si">}</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-5"><a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span>/path/to/your-venv/bin/python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-6"><a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span>--no-deps<span class="w"> </span>--force-reinstall<span class="w"> </span>--no-cache-dir<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-3-7"><a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">    </span><span class="s2">"torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@&lt;rev&gt;"</span>
 </span></code></pre></div>
 <p>Pin <code>&lt;rev&gt;</code> to whatever commit <code>[tool.uv.sources.torch-spyre]</code> in
 <code>pyproject.toml</code> resolves to. Do <strong>not</strong> pass <code>--no-build-isolation</code>:
@@ -2651,90 +2661,91 @@ wheel on top of this — invoke Python from the venv directly, or use
 <code>uv run --no-sync …</code>, when iterating.</p>
 <h3 id="14-verify-installation">1.4 Verify installation<a class="headerlink" href="#14-verify-installation" title="Permanent link">&para;</a></h3>
 <p>Stock torch is expected — the <code>+aiu.kineto</code> suffix is gone:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__)"</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="c1"># Expected: 2.13.0+cpu   (no +aiu.kineto suffix)</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch; print(torch.__version__)"</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="c1"># Expected: 2.13.0+cpu   (no +aiu.kineto suffix)</span>
 </span></code></pre></div>
 <p>The real signal is that the AIUPTI backend is linked into
-<code>torch_spyre/_C.so</code>. Four checks — all four must pass:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">SO</span><span class="o">=</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch_spyre, os; print(os.path.join(os.path.dirname(torch_spyre.__file__), '_C.so'))"</span><span class="k">)</span>
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="c1"># 1. Wheel size — profiler-enabled build is ~5× bigger (~77 MB vs ~15 MB).</span>
-</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>ls<span class="w"> </span>-la<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span>
-</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>
-</span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="c1"># 2. libaiupti actually linked.</span>
-</span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>ldd<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>libaiupti
-</span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="c1"># → libaiupti.so =&gt; /opt/ibm/spyre/runtime/lib/libaiupti.so</span>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="c1"># 3. AIUPTI symbols present in the shared object.</span>
-</span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a>nm<span class="w"> </span>-CD<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-i<span class="w"> </span>AiuptiActivityProfilerSession<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-3
-</span><span id="__span-4-12"><a id="__codelineno-4-12" name="__codelineno-4-12" href="#__codelineno-4-12"></a><span class="c1"># → several T (defined text) entries</span>
-</span><span id="__span-4-13"><a id="__codelineno-4-13" name="__codelineno-4-13" href="#__codelineno-4-13"></a>
-</span><span id="__span-4-14"><a id="__codelineno-4-14" name="__codelineno-4-14" href="#__codelineno-4-14"></a><span class="c1"># 4. A produced trace contains `kernel`-category events.</span>
-</span><span id="__span-4-15"><a id="__codelineno-4-15" name="__codelineno-4-15" href="#__codelineno-4-15"></a>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
-</span><span id="__span-4-16"><a id="__codelineno-4-16" name="__codelineno-4-16" href="#__codelineno-4-16"></a><span class="s2">import json, collections</span>
-</span><span id="__span-4-17"><a id="__codelineno-4-17" name="__codelineno-4-17" href="#__codelineno-4-17"></a><span class="s2">t = json.load(open('&lt;path&gt;.pt.trace.json'))</span>
-</span><span id="__span-4-18"><a id="__codelineno-4-18" name="__codelineno-4-18" href="#__codelineno-4-18"></a><span class="s2">cats = collections.Counter(e.get('cat','') for e in t['traceEvents'])</span>
-</span><span id="__span-4-19"><a id="__codelineno-4-19" name="__codelineno-4-19" href="#__codelineno-4-19"></a><span class="s2">assert cats.get('kernel', 0) &gt; 0, f'no kernel events: {cats}'</span>
-</span><span id="__span-4-20"><a id="__codelineno-4-20" name="__codelineno-4-20" href="#__codelineno-4-20"></a><span class="s2">print('OK', cats.most_common(5))</span>
-</span><span id="__span-4-21"><a id="__codelineno-4-21" name="__codelineno-4-21" href="#__codelineno-4-21"></a><span class="s2">"</span>
+<code>torch_spyre/_C.so</code>. Check the link, symbols, and a produced trace; wheel size
+is historical context, not a reliable pass/fail check:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">SO</span><span class="o">=</span><span class="k">$(</span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import torch_spyre, os; print(os.path.join(os.path.dirname(torch_spyre.__file__), '_C.so'))"</span><span class="k">)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="c1"># 1. Size only for context: these historical sizes no longer distinguish builds.</span>
+</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>ls<span class="w"> </span>-la<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span>
+</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="c1"># 2. libaiupti actually linked.</span>
+</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>ldd<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>libaiupti
+</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="c1"># → libaiupti.so =&gt; &lt;active Spyre runtime&gt;/lib/libaiupti.so</span>
+</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>
+</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="c1"># 3. AIUPTI symbols present in the shared object.</span>
+</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>nm<span class="w"> </span>-CD<span class="w"> </span><span class="s2">"</span><span class="nv">$SO</span><span class="s2">"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-i<span class="w"> </span>AiuptiActivityProfilerSession<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-3
+</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="c1"># → several T (defined text) entries</span>
+</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a>
+</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="c1"># 4. A produced trace contains `kernel`-category events.</span>
+</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"</span>
+</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="s2">import json, collections</span>
+</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="s2">t = json.load(open('&lt;path&gt;.pt.trace.json'))</span>
+</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="s2">cats = collections.Counter(e.get('cat','') for e in t['traceEvents'])</span>
+</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="s2">assert cats.get('kernel', 0) &gt; 0, f'no kernel events: {cats}'</span>
+</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="s2">print('OK', cats.most_common(5))</span>
+</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="s2">"</span>
 </span></code></pre></div>
-<p>Do <strong>not</strong> trust <code>torch_spyre.profiler.is_available()</code> as a health
-signal — it is hardcoded to <code>return False</code> regardless of build flags
-(comment: "more to be implemented later").</p>
+<p>Do <strong>not</strong> look for a <code>torch_spyre.profiler.is_available()</code> health
+signal — <code>torch_spyre.profiler</code> exposes no availability flag, and
+<code>torch.spyre.is_available()</code> only reports whether a device is present.</p>
 <hr />
 <h2 id="2-enabling-profiling">2. Enabling profiling<a class="headerlink" href="#2-enabling-profiling" title="Permanent link">&para;</a></h2>
-<p>vLLM in <code>spyre-inference</code> runs the worker <strong>in the same process</strong> as
-user code (via <code>distributed_executor_backend="external_launcher"</code>).
+<p>The recipe below runs the vLLM worker <strong>in the same process</strong> as user
+code, by passing <code>distributed_executor_backend="external_launcher"</code>.
 This lets <code>torch.profiler.profile(...)</code> wrap <code>llm.generate()</code>
 directly.</p>
 <h3 id="21-minimum-example">2.1 Minimum example<a class="headerlink" href="#21-minimum-example" title="Permanent link">&para;</a></h3>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="c1"># external_launcher reads these from env</span>
-</span><span id="__span-5-4"><a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"RANK"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
-</span><span id="__span-5-5"><a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"LOCAL_RANK"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
-</span><span id="__span-5-6"><a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"WORLD_SIZE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
-</span><span id="__span-5-7"><a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"LOCAL_WORLD_SIZE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
-</span><span id="__span-5-8"><a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"MASTER_ADDR"</span><span class="p">,</span> <span class="s2">"127.0.0.1"</span><span class="p">)</span>
-</span><span id="__span-5-9"><a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"MASTER_PORT"</span><span class="p">,</span> <span class="s2">"29500"</span><span class="p">)</span>
-</span><span id="__span-5-10"><a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>
-</span><span id="__span-5-11"><a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
-</span><span id="__span-5-12"><a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">ProfilerActivity</span><span class="p">,</span> <span class="n">profile</span>
-</span><span id="__span-5-13"><a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
-</span><span id="__span-5-14"><a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm.v1.attention.backends.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionBackendEnum</span>
-</span><span id="__span-5-15"><a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span>
-</span><span id="__span-5-16"><a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a>
-</span><span id="__span-5-17"><a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
-</span><span id="__span-5-18"><a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a>    <span class="n">model</span><span class="o">=</span><span class="s2">"ibm-granite/granite-3.3-8b-instruct"</span><span class="p">,</span>
-</span><span id="__span-5-19"><a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a>    <span class="n">dtype</span><span class="o">=</span><span class="s2">"float16"</span><span class="p">,</span>
-</span><span id="__span-5-20"><a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a>    <span class="n">max_model_len</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
-</span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a>    <span class="n">max_num_seqs</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-</span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a>    <span class="n">num_gpu_blocks_override</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-</span><span id="__span-5-23"><a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a>    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="n">AttentionBackendEnum</span><span class="o">.</span><span class="n">CUSTOM</span><span class="p">),</span>
-</span><span id="__span-5-24"><a id="__codelineno-5-24" name="__codelineno-5-24" href="#__codelineno-5-24"></a>    <span class="n">distributed_executor_backend</span><span class="o">=</span><span class="s2">"external_launcher"</span><span class="p">,</span>  <span class="c1"># worker in-process</span>
-</span><span id="__span-5-25"><a id="__codelineno-5-25" name="__codelineno-5-25" href="#__codelineno-5-25"></a><span class="p">)</span>
-</span><span id="__span-5-26"><a id="__codelineno-5-26" name="__codelineno-5-26" href="#__codelineno-5-26"></a>
-</span><span id="__span-5-27"><a id="__codelineno-5-27" name="__codelineno-5-27" href="#__codelineno-5-27"></a><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"What do you know about Zurich?"</span><span class="p">]</span>
-</span><span id="__span-5-28"><a id="__codelineno-5-28" name="__codelineno-5-28" href="#__codelineno-5-28"></a><span class="n">samplings</span> <span class="o">=</span> <span class="p">[</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)]</span>
-</span><span id="__span-5-29"><a id="__codelineno-5-29" name="__codelineno-5-29" href="#__codelineno-5-29"></a>
-</span><span id="__span-5-30"><a id="__codelineno-5-30" name="__codelineno-5-30" href="#__codelineno-5-30"></a><span class="c1"># Warmup</span>
-</span><span id="__span-5-31"><a id="__codelineno-5-31" name="__codelineno-5-31" href="#__codelineno-5-31"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>
-</span><span id="__span-5-32"><a id="__codelineno-5-32" name="__codelineno-5-32" href="#__codelineno-5-32"></a>    <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">samplings</span><span class="p">)</span>
-</span><span id="__span-5-33"><a id="__codelineno-5-33" name="__codelineno-5-33" href="#__codelineno-5-33"></a>
-</span><span id="__span-5-34"><a id="__codelineno-5-34" name="__codelineno-5-34" href="#__codelineno-5-34"></a><span class="c1"># Profiled generate</span>
-</span><span id="__span-5-35"><a id="__codelineno-5-35" name="__codelineno-5-35" href="#__codelineno-5-35"></a><span class="k">with</span> <span class="n">profile</span><span class="p">(</span>
-</span><span id="__span-5-36"><a id="__codelineno-5-36" name="__codelineno-5-36" href="#__codelineno-5-36"></a>    <span class="n">activities</span><span class="o">=</span><span class="p">[</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">,</span> <span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">PrivateUse1</span><span class="p">],</span>
-</span><span id="__span-5-37"><a id="__codelineno-5-37" name="__codelineno-5-37" href="#__codelineno-5-37"></a>    <span class="n">on_trace_ready</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">tensorboard_trace_handler</span><span class="p">(</span><span class="s2">"logs/"</span><span class="p">),</span>
-</span><span id="__span-5-38"><a id="__codelineno-5-38" name="__codelineno-5-38" href="#__codelineno-5-38"></a>    <span class="n">record_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-</span><span id="__span-5-39"><a id="__codelineno-5-39" name="__codelineno-5-39" href="#__codelineno-5-39"></a>    <span class="n">acc_events</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-</span><span id="__span-5-40"><a id="__codelineno-5-40" name="__codelineno-5-40" href="#__codelineno-5-40"></a><span class="p">)</span> <span class="k">as</span> <span class="n">prof</span><span class="p">:</span>
-</span><span id="__span-5-41"><a id="__codelineno-5-41" name="__codelineno-5-41" href="#__codelineno-5-41"></a>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">samplings</span><span class="p">)</span>
-</span><span id="__span-5-42"><a id="__codelineno-5-42" name="__codelineno-5-42" href="#__codelineno-5-42"></a>
-</span><span id="__span-5-43"><a id="__codelineno-5-43" name="__codelineno-5-43" href="#__codelineno-5-43"></a><span class="c1"># Optional terminal summary</span>
-</span><span id="__span-5-44"><a id="__codelineno-5-44" name="__codelineno-5-44" href="#__codelineno-5-44"></a><span class="nb">print</span><span class="p">(</span><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cpu_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
-</span><span id="__span-5-45"><a id="__codelineno-5-45" name="__codelineno-5-45" href="#__codelineno-5-45"></a>      <span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">))</span>
-</span><span id="__span-5-46"><a id="__codelineno-5-46" name="__codelineno-5-46" href="#__codelineno-5-46"></a>
-</span><span id="__span-5-47"><a id="__codelineno-5-47" name="__codelineno-5-47" href="#__codelineno-5-47"></a><span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># avoids TimestampCalibrator abort at teardown</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="c1"># external_launcher reads these from env</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"RANK"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"LOCAL_RANK"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">)</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"WORLD_SIZE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"LOCAL_WORLD_SIZE"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)</span>
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"MASTER_ADDR"</span><span class="p">,</span> <span class="s2">"127.0.0.1"</span><span class="p">)</span>
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"MASTER_PORT"</span><span class="p">,</span> <span class="s2">"29500"</span><span class="p">)</span>
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">ProfilerActivity</span><span class="p">,</span> <span class="n">profile</span>
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm.v1.attention.backends.registry</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionBackendEnum</span>
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="kn">from</span><span class="w"> </span><span class="nn">vllm.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span>
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a>
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a><span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span>
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a>    <span class="n">model</span><span class="o">=</span><span class="s2">"ibm-granite/granite-3.3-8b-instruct"</span><span class="p">,</span>
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a>    <span class="n">dtype</span><span class="o">=</span><span class="s2">"float16"</span><span class="p">,</span>
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>    <span class="n">max_model_len</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span>
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a>    <span class="n">max_num_seqs</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a>    <span class="n">num_gpu_blocks_override</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a>    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="n">AttentionBackendEnum</span><span class="o">.</span><span class="n">CUSTOM</span><span class="p">),</span>
+</span><span id="__span-6-24"><a id="__codelineno-6-24" name="__codelineno-6-24" href="#__codelineno-6-24"></a>    <span class="n">distributed_executor_backend</span><span class="o">=</span><span class="s2">"external_launcher"</span><span class="p">,</span>  <span class="c1"># worker in-process</span>
+</span><span id="__span-6-25"><a id="__codelineno-6-25" name="__codelineno-6-25" href="#__codelineno-6-25"></a><span class="p">)</span>
+</span><span id="__span-6-26"><a id="__codelineno-6-26" name="__codelineno-6-26" href="#__codelineno-6-26"></a>
+</span><span id="__span-6-27"><a id="__codelineno-6-27" name="__codelineno-6-27" href="#__codelineno-6-27"></a><span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"What do you know about Zurich?"</span><span class="p">]</span>
+</span><span id="__span-6-28"><a id="__codelineno-6-28" name="__codelineno-6-28" href="#__codelineno-6-28"></a><span class="n">samplings</span> <span class="o">=</span> <span class="p">[</span><span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">temperature</span><span class="o">=</span><span class="mf">0.0</span><span class="p">)]</span>
+</span><span id="__span-6-29"><a id="__codelineno-6-29" name="__codelineno-6-29" href="#__codelineno-6-29"></a>
+</span><span id="__span-6-30"><a id="__codelineno-6-30" name="__codelineno-6-30" href="#__codelineno-6-30"></a><span class="c1"># Warmup</span>
+</span><span id="__span-6-31"><a id="__codelineno-6-31" name="__codelineno-6-31" href="#__codelineno-6-31"></a><span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">):</span>
+</span><span id="__span-6-32"><a id="__codelineno-6-32" name="__codelineno-6-32" href="#__codelineno-6-32"></a>    <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">samplings</span><span class="p">)</span>
+</span><span id="__span-6-33"><a id="__codelineno-6-33" name="__codelineno-6-33" href="#__codelineno-6-33"></a>
+</span><span id="__span-6-34"><a id="__codelineno-6-34" name="__codelineno-6-34" href="#__codelineno-6-34"></a><span class="c1"># Profiled generate</span>
+</span><span id="__span-6-35"><a id="__codelineno-6-35" name="__codelineno-6-35" href="#__codelineno-6-35"></a><span class="k">with</span> <span class="n">profile</span><span class="p">(</span>
+</span><span id="__span-6-36"><a id="__codelineno-6-36" name="__codelineno-6-36" href="#__codelineno-6-36"></a>    <span class="n">activities</span><span class="o">=</span><span class="p">[</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">,</span> <span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">PrivateUse1</span><span class="p">],</span>
+</span><span id="__span-6-37"><a id="__codelineno-6-37" name="__codelineno-6-37" href="#__codelineno-6-37"></a>    <span class="n">on_trace_ready</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">tensorboard_trace_handler</span><span class="p">(</span><span class="s2">"logs/"</span><span class="p">),</span>
+</span><span id="__span-6-38"><a id="__codelineno-6-38" name="__codelineno-6-38" href="#__codelineno-6-38"></a>    <span class="n">record_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-6-39"><a id="__codelineno-6-39" name="__codelineno-6-39" href="#__codelineno-6-39"></a>    <span class="n">acc_events</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+</span><span id="__span-6-40"><a id="__codelineno-6-40" name="__codelineno-6-40" href="#__codelineno-6-40"></a><span class="p">)</span> <span class="k">as</span> <span class="n">prof</span><span class="p">:</span>
+</span><span id="__span-6-41"><a id="__codelineno-6-41" name="__codelineno-6-41" href="#__codelineno-6-41"></a>    <span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">samplings</span><span class="p">)</span>
+</span><span id="__span-6-42"><a id="__codelineno-6-42" name="__codelineno-6-42" href="#__codelineno-6-42"></a>
+</span><span id="__span-6-43"><a id="__codelineno-6-43" name="__codelineno-6-43" href="#__codelineno-6-43"></a><span class="c1"># Optional terminal summary</span>
+</span><span id="__span-6-44"><a id="__codelineno-6-44" name="__codelineno-6-44" href="#__codelineno-6-44"></a><span class="nb">print</span><span class="p">(</span><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cpu_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
+</span><span id="__span-6-45"><a id="__codelineno-6-45" name="__codelineno-6-45" href="#__codelineno-6-45"></a>      <span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">))</span>
+</span><span id="__span-6-46"><a id="__codelineno-6-46" name="__codelineno-6-46" href="#__codelineno-6-46"></a>
+</span><span id="__span-6-47"><a id="__codelineno-6-47" name="__codelineno-6-47" href="#__codelineno-6-47"></a><span class="n">os</span><span class="o">.</span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>  <span class="c1"># avoids TimestampCalibrator abort at teardown</span>
 </span></code></pre></div>
 <h3 id="22-profile-argument-reference">2.2 <code>profile(...)</code> argument reference<a class="headerlink" href="#22-profile-argument-reference" title="Permanent link">&para;</a></h3>
 <table>
@@ -2768,15 +2779,16 @@ directly.</p>
 </tbody>
 </table>
 <h3 id="23-load-bearing-environment-variables">2.3 Load-bearing environment variables<a class="headerlink" href="#23-load-bearing-environment-variables" title="Permanent link">&para;</a></h3>
-<p>The recommended way to set these is to source <code>setup_profile_env.sh</code>
-before launching:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">source</span><span class="w"> </span>./setup_profile_env.sh
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>python<span class="w"> </span>-u<span class="w"> </span>profile_spyre_inference.py
+<p>From the repository root, activate your venv, source the setup script, and explicitly
+allow both Spyre plugin entry points:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="nb">source</span><span class="w"> </span>examples/offline_inference/setup_profile_env.sh
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_PLUGINS</span><span class="o">=</span>spyre_inference,spyre_inference_ops
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>python<span class="w"> </span>-u<span class="w"> </span>examples/offline_inference/profile_spyre_inference.py
 </span></code></pre></div>
-<p>The script must be <em>sourced</em>, not executed: <code>export</code> and <code>source
-/opt/spyre-inference/bin/activate</code> only take effect in the current
-shell, so running it as <code>./setup_profile_env.sh</code> in a child shell has
-no effect on your interactive environment.</p>
+<p>The script must be <em>sourced</em>, not executed, so its exports affect the current shell.
+It activates <code>/opt/spyre-inference</code> only when <code>VIRTUAL_ENV</code> is empty or unset.
+Set <code>VLLM_PLUGINS</code> afterward because the script overwrites it.</p>
 <p>Contents of the script and why each entry matters:</p>
 <table>
 <thead>
@@ -2790,17 +2802,17 @@ no effect on your interactive environment.</p>
 <tr>
 <td>(venv activation)</td>
 <td><code>source /opt/spyre-inference/bin/activate</code></td>
-<td>Puts the venv's <code>python</code> and packages on <code>PATH</code>. This is a deployment-style path; for a local <code>uv sync</code> install use <code>source .venv/bin/activate</code>.</td>
+<td>Used only when <code>VIRTUAL_ENV</code> is empty or unset; otherwise the current venv is kept.</td>
 </tr>
 <tr>
 <td><code>VLLM_PLUGINS</code></td>
 <td><code>spyre_inference</code></td>
-<td>Required for vLLM to load the Spyre platform plugin</td>
+<td>Allowlists only the platform entry point. The recipe above also allows <code>spyre_inference_ops</code>, the general-plugin callback; the worker independently registers ops and model adaptations.</td>
 </tr>
 <tr>
-<td>(AIUPTI check)</td>
+<td>(profiler check)</td>
 <td>—</td>
-<td>Warns if <code>torch_spyre/_C.so</code> was not built with <code>USE_SPYRE_PROFILER=1</code> — verify via <code>ldd .../_C.so \| grep libaiupti</code> and presence of <code>AiuptiActivityProfilerSession</code> symbols. Do <strong>not</strong> inspect <code>torch.__version__</code> for a <code>+aiu.kineto</code> suffix; that flow was retired by torch-spyre PR #1856. See §1.3.</td>
+<td>Still checks <code>torch.__version__</code> for the retired <code>+aiu.kineto</code> suffix, so it warns "stock torch detected" on every current install, profiler-enabled or not — ignore that warning. The real check is <code>ldd .../_C.so \| grep libaiupti</code> plus the <code>AiuptiActivityProfilerSession</code> symbols (§1.4); the suffix flow was retired by torch-spyre PR #1856. See §1.3.</td>
 </tr>
 <tr>
 <td><code>OMP_NUM_THREADS</code></td>
@@ -2904,10 +2916,11 @@ long-prompt prefill followed by a decode).</p>
 <p>Traces are written as <code>.pt.trace.json</code> (or <code>.pt.trace.json.gz</code> if
 compressed). Open them in the Perfetto UI:</p>
 <p><a href="https://ui.perfetto.dev">https://ui.perfetto.dev</a> → "Open trace file"</p>
-<p>The trace shows CPU thread rows on top and one Spyre device row below.</p>
+<p>The trace shows CPU thread rows, per-thread Spyre runtime activity rows, and
+Spyre device activity.</p>
 <p>For a terminal summary (<code>acc_events=True</code> required):</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cpu_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">)</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cuda_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cpu_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">)</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">prof</span><span class="o">.</span><span class="n">key_averages</span><span class="p">()</span><span class="o">.</span><span class="n">table</span><span class="p">(</span><span class="n">sort_by</span><span class="o">=</span><span class="s2">"cuda_time_total"</span><span class="p">,</span> <span class="n">row_limit</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">"CUDA"</span><span class="p">,</span> <span class="s2">"AIU"</span><span class="p">)</span>
 </span></code></pre></div>
 <p>The <code>cuda_time_total</code> column contains Spyre device time despite the
 name — a PyTorch legacy naming artefact. The <code>.replace("CUDA", "AIU")</code>
@@ -2926,12 +2939,12 @@ the first H2D transfer.</p>
 <code>QueueCbs</code> and make the batch-timestamp ring race-free") resolves it.
 On systems that ship an older <code>libflex.so</code>, load a patched build via
 <code>LD_PRELOAD</code> before launching:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nv">LD_PRELOAD</span><span class="o">=</span>/path/to/libflex_patched.so:/path/to/libflexhdma_patched.so<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">    </span>python<span class="w"> </span>-u<span class="w"> </span>your_profile_script.py
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nv">LD_PRELOAD</span><span class="o">=</span>/path/to/libflex_patched.so:/path/to/libflexhdma_patched.so<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="w">    </span>python<span class="w"> </span>-u<span class="w"> </span>your_profile_script.py
 </span></code></pre></div>
-<p>The system <code>libflex.so</code> typically lives at
-<code>/opt/ibm/spyre/runtime/lib/libflex.so</code>; <code>LD_PRELOAD</code> is used because
-that directory is often read-only.</p>
+<p>The active <code>libflex.so</code> lives under
+<code>${SENTIENT_BASE_INSTALL_DIR:-/opt/ibm/spyre}/runtime/lib/</code>; <code>LD_PRELOAD</code> lets you
+select a patched build without replacing that library.</p>
 <h3 id="42-60-second-d2h-stall">4.2 60-second D2H stall<a class="headerlink" href="#42-60-second-d2h-stall" title="Permanent link">&para;</a></h3>
 <p><strong>Symptom:</strong> <code>RuntimeStream::synchronize() still waiting after 60000ms:
 in_flight_=0</code> followed by <code>completed after 60000ms</code>. Recovers on its
@@ -2944,31 +2957,22 @@ for warning messages.</p>
 come from cold-start flakes and compile-mode warmup drain.</p>
 <p><strong>Safety margin</strong> — prevents vLLM from killing the run if multiple
 60s stalls accumulate:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"</span><span class="p">,</span> <span class="s2">"1800"</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="s2">"VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"</span><span class="p">,</span> <span class="s2">"1800"</span><span class="p">)</span>
 </span></code></pre></div>
 <h3 id="43-vfio-dma-mapping-exhaustion">4.3 VFIO DMA mapping exhaustion<a class="headerlink" href="#43-vfio-dma-mapping-exhaustion" title="Permanent link">&para;</a></h3>
 <p><strong>Symptom:</strong> <code>RAS::VFIO::MapDMAFailed / "No space left on device"</code>.</p>
 <p><strong>Cause:</strong> the Linux kernel caps VFIO DMA mappings at <strong>65,535
 entries per container</strong>. Each Spyre tensor allocation that participates
-in a transfer consumes one entry. The KV cache alone consumes
-<code>num_blocks × num_layers × 2</code> mappings (K + V per layer). At
-<code>num_gpu_blocks_override=64</code> and 40 layers, that's 5,120 mappings —
-well within budget. But an unbounded <code>max_num_seqs</code> (default 256 on
-some vLLM versions) can multiply the block count and blow the budget.</p>
-<p><strong>Fix:</strong> pass explicit values for <code>max_num_seqs</code> and
-<code>num_gpu_blocks_override</code> to <code>LLM(...)</code>. Sizing them so
-<code>num_blocks × num_layers × 2</code> stays well under 65,535 keeps the
-mapping table healthy. The "consider restarting Linux" text in the
-error message is misleading — pod restart does not help. This is a
-configuration issue, not an IOMMU-state issue.</p>
-<p><strong>Note:</strong> the current KV cache layout — one K and one V tensor per
-block per layer — is temporary. It exists because Spyre does not yet
-support indirect addressing, so every page has to be an individually
-mappable tensor. Once indirect addressing lands, the KV cache can
-collapse to a small number of per-layer tensors indexed at runtime,
-which will drastically reduce both the total tensor count and the
-number of VFIO DMA mappings the cache consumes. The sizing guidance
-above will remain correct until then.</p>
+in a transfer consumes one entry. The KV cache is one dense K and one
+dense V tensor per layer, pages selected by indirect indexing, so it
+costs only <code>num_layers × 2</code> mappings whatever the block count.</p>
+<p><strong>Fix:</strong> keep the number of live Spyre allocations bounded. The platform
+already caps an unset <code>max_num_seqs</code> at 4 and sizes
+<code>num_gpu_blocks_override</code> to <code>max_num_seqs × ceil(max_model_len /
+block_size) + 1</code>; pass explicit, modest values when you override them.
+The "consider restarting Linux" text in the error message is
+misleading — pod restart does not help. This is a configuration issue,
+not an IOMMU-state issue.</p>
 <h3 id="44-timestampcalibrator-abort-at-exit">4.4 <code>TimestampCalibrator</code> abort at exit<a class="headerlink" href="#44-timestampcalibrator-abort-at-exit" title="Permanent link">&para;</a></h3>
 <p><strong>Symptom:</strong> abort message printed at process exit.</p>
 <p><strong>Cause:</strong> imperfect clock-alignment calibration between host TSC and
@@ -3012,21 +3016,23 @@ writes. <code>SENLIB_DEVEL_CONFIG_FILE</code> must be exported in <strong>both</
 terminals for them to agree on the file path — the most common source
 of a row of <code>-</code> values.</p>
 <p><strong>Terminal 1 — workload:</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="nb">source</span><span class="w"> </span>examples/offline_inference/setup_profile_env.sh
-</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">DTCOMPILER_KEEP_EXPORT</span><span class="o">=</span><span class="nb">true</span>
-</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SENLIB_DEVEL_CONFIG_FILE</span><span class="o">=</span>&lt;venv-prefix&gt;/etc/senlib_config_aiusmi.json
-</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>python<span class="w"> </span>examples/offline_inference/profile_spyre_inference.py
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="nb">source</span><span class="w"> </span>examples/offline_inference/setup_profile_env.sh
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">VLLM_PLUGINS</span><span class="o">=</span>spyre_inference,spyre_inference_ops
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="nb">export</span><span class="w"> </span><span class="nv">DTCOMPILER_KEEP_EXPORT</span><span class="o">=</span><span class="nb">true</span>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SENLIB_DEVEL_CONFIG_FILE</span><span class="o">=</span>&lt;venv-prefix&gt;/etc/senlib_config_aiusmi.json
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a>python<span class="w"> </span>examples/offline_inference/profile_spyre_inference.py
 </span></code></pre></div>
 <p><strong>Terminal 2 — monitor:</strong></p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="nv">SENLIB_DEVEL_CONFIG_FILE</span><span class="o">=</span>&lt;venv-prefix&gt;/etc/senlib_config_aiusmi.json<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span>aiu-smi
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="nv">SENLIB_DEVEL_CONFIG_FILE</span><span class="o">=</span>&lt;venv-prefix&gt;/etc/senlib_config_aiusmi.json<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="w">  </span>aiu-smi
 </span></code></pre></div>
 <p>The monitor may be started before or after the workload; it will emit
 <code>-</code> values until the workload begins writing counters.</p>
 <p>Sample output:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>#ID Date      Time      hostcpu hostmem  pwr  gtemp busy  rdmem  wrmem  rxpci  txpci  rdrdma  wrrdma  rsvmem
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>#   YYYYMMDD  HH:MM:SS        %       %    W      C    %   GB/s   GB/s   GB/s   GB/s    GB/s    GB/s      MB
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a>  0 20260715  11:45:28    828.3     5.2   75     42   87    4.2    3.1    0.8    0.2     1.2     0.9     512
+<div class="language-text highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>#ID Date      Time      hostcpu hostmem  pwr  gtemp busy  rdmem  wrmem  rxpci  txpci  rdrdma  wrrdma  rsvmem
+</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>#   YYYYMMDD  HH:MM:SS        %       %    W      C    %   GB/s   GB/s   GB/s   GB/s    GB/s    GB/s      MB
+</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>  0 20260715  11:45:28    828.3     5.2   75     42   87    4.2    3.1    0.8    0.2     1.2     0.9     512
 </span></code></pre></div>
 <h3 id="52-column-reference">5.2 Column reference<a class="headerlink" href="#52-column-reference" title="Permanent link">&para;</a></h3>
 <table>
@@ -3068,10 +3074,10 @@ of a row of <code>-</code> values.</p>
 </tbody>
 </table>
 <h3 id="53-useful-options">5.3 Useful options<a class="headerlink" href="#53-useful-options" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>aiu-smi<span class="w"> </span>-d<span class="w"> </span><span class="m">2</span><span class="w">               </span><span class="c1"># poll every 2 seconds (default 1s)</span>
-</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>aiu-smi<span class="w"> </span>-s<span class="w"> </span>-f<span class="w"> </span>run.csv<span class="w">      </span><span class="c1"># log to CSV file for offline analysis</span>
-</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>aiu-smi<span class="w"> </span>-g<span class="w"> </span>A<span class="w">               </span><span class="c1"># emit all metric groups (default: D M P)</span>
-</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>aiu-smi<span class="w"> </span>--mem-details<span class="w">      </span><span class="c1"># break down HBM reservation</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>aiu-smi<span class="w"> </span>-d<span class="w"> </span><span class="m">2</span><span class="w">               </span><span class="c1"># poll every 2 seconds (default 1s)</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>aiu-smi<span class="w"> </span>-s<span class="w"> </span>-f<span class="w"> </span>run.csv<span class="w">      </span><span class="c1"># log to CSV file for offline analysis</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>aiu-smi<span class="w"> </span>-g<span class="w"> </span>A<span class="w">               </span><span class="c1"># emit all metric groups (default: D M P)</span>
+</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>aiu-smi<span class="w"> </span>--mem-details<span class="w">      </span><span class="c1"># break down HBM reservation</span>
 </span></code></pre></div>
 <p>CSV output pairs well with a Kineto trace: run <code>aiu-smi -s -f run.csv</code>
 alongside a profiled <code>generate()</code> and the row timestamps align to the

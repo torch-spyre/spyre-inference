@@ -2193,14 +2193,22 @@ then lowered to <code>R / 64</code> if it was higher, since no batch wider than 
 <p>With <code>--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048</code> that is
 23 shapes: one body, four rectangles (<code>(64,32) (128,16) (256,8) (512,4)</code>, each
 exactly 2048 rows), and 18 group pairs. At <code>--max-num-seqs 4</code> the group family is
-empty — no batch that narrow can miss the rectangular path — leaving five shapes.</p>
-<p>Both paths go through the same opaque attention op, so the block graph is identical
-for either and the choice is made once per step from the step's metadata. The
-runner counts them in <code>spyre_encoder_rect_steps</code> /
-<code>spyre_encoder_ragged_steps</code>.</p>
-<p>Compiled pooling warmup runs one dummy at the body shape; the first attention call
-in it traces every declared rectangle and group pair, against that call's own
-tensors (a Spyre tensor's device layout is part of its cache key). Eager pooling
+empty — no batch that narrow can miss the rectangular path — leaving five shapes.
+Those counts assume the rectangular path is opaque; traced into the block graph (see
+below), each rectangle is a block graph of its own rather than an attention kernel.</p>
+<p>The choice is made once per step from the step's metadata, before the forward, and the
+runner counts it in <code>spyre_encoder_rect_steps</code> / <code>spyre_encoder_ragged_steps</code>. The
+ragged path always runs behind the opaque attention op. When compiled and the head size
+fills whole 64-element sticks, the rectangular path is traced into the block graph
+instead, so each rectangle is its own block graph. In eager mode both paths stay
+opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
+both paths opaque, sharing one block graph. Pooling models such as granite-30m
+pad their native 32-wide heads to 64 before construction.</p>
+<p>Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
+opaque, the first attention call in it traces every declared rectangle and group pair,
+against that call's own tensors (a Spyre tensor's device layout is part of its cache
+key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
+ragged path (when any group is reachable) that traces the group pairs. Eager pooling
 uses one short dummy and always takes the packed path.</p>
 <p>Example:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-embedding-125m-english<span class="w"> </span><span class="se">\</span>
@@ -2210,10 +2218,10 @@ uses one short dummy and always takes the packed path.</p>
 <p>Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Attention is recorded as the <strong>product</strong> of its KV-length and
-query-length buckets (and, when the batched-decode kernel is enabled, a second KV-length ×
-num-sequences product), so extra attention buckets cost multiplicatively — keep those
-lists short.</p>
+compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
+that fit its smallest real query length. Batched decode uses KV-length/num-sequences
+pairs; both recording paths also enforce the allocated page-capacity limit. Extra
+buckets can still multiply the recorded variants, so keep those lists short.</p>
 <p><strong>Decoder body (packed token count).</strong> Override the defaults with <code>compile_sizes</code>; the
 platform clamps <code>--max-num-batched-tokens</code> to the largest entry. A decode-heavy run at
 <code>--max-num-seqs 8</code> rarely needs the full power-of-two ladder:</p>
@@ -2235,24 +2243,28 @@ every schedulable length keeps a bucket.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: powers of two from block_size</span>
 </span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
 </span></code></pre></div>
-<p>The default KV buckets are geometric (powers of two) precisely because the recorded set
-is a product. If your context never exceeds 2048, dropping the higher powers removes
-variants from warmup at no serving cost.</p>
+<p>The default KV buckets are geometric (powers of two) because the recorded set grows
+with both axes, even after filtering. If your context never exceeds 2048, dropping the
+higher powers removes variants from warmup at no serving cost.</p>
 <p>With the batched-decode kernel enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup also records it over the KV-length × num-sequences grid. <code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>
-(default: powers of two from 1 to <code>--max-num-seqs</code>) is the extra lever there, and the same
-keep-it-short advice applies.</p>
+the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code> (default: powers of two from 1 to <code>--max-num-seqs</code>) is the
+extra lever there, and the same keep-it-short advice applies.</p>
 <h2 id="pyprojecttoml-reference">pyproject.toml Reference<a class="headerlink" href="#pyprojecttoml-reference" title="Permanent link">&para;</a></h2>
 <p>The <code>pyproject.toml</code> includes several key build configurations:</p>
 <h3 id="build-configuration">Build Configuration<a class="headerlink" href="#build-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">[tool.uv]</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="n">build-constraint-dependencies</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">extra-build-variables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">vllm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">VLLM_TARGET_DEVICE</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"empty"</span><span class="p">,</span><span class="w"> </span><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"--fresh"</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">[tool.uv.extra-build-variables.vllm]</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="n">VLLM_TARGET_DEVICE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"empty"</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"--fresh"</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="k">[tool.uv.extra-build-dependencies]</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
 </span></code></pre></div>
 <p>These settings ensure:</p>
 <ul>
-<li>All packages are built with the same PyTorch version (2.13.0)</li>
+<li>torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+  C++ extension cannot drift in ABI</li>
 <li>vLLM is built with the <strong>empty</strong> backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on <code>vllm._C</code>
   (whose CPU-optimized ops we don't need; Spyre provides its own)</li>

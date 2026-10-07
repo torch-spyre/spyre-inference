@@ -2370,10 +2370,10 @@ compiled graph (see below).</p>
 <td>A <code>maybe_compile(force=True)</code> <code>forward_native</code>, so the fp32 promotion is kept. Plain <code>RMSNorm</code> needs no replacement — upstream's fp32 <code>forward_native</code> lowers eagerly — but Gemma's trailing fp32 <code>weight</code> multiply does not: a STANDARD <code>[hidden]</code> operand that torch-spyre can neither broadcast against a staggered-EA activation nor de-stagger, so the kernel has to be compiled even under <code>enforce_eager</code>.</td>
 </tr>
 <tr>
-<td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code></td>
-<td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code></td>
+<td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code>, <code>YaRNScalingRotaryEmbedding</code>, <code>Gemma4RotaryEmbedding</code></td>
+<td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code>, <code>SpyreYaRNScalingRotaryEmbedding</code>, <code>SpyreGemma4RotaryEmbedding</code></td>
 <td>Spyre</td>
-<td>Fully on-device, no opaque op. A device-resident 4D rotation cache (<code>[max_pos, 2, 2, rotary_dim//2]</code>) is built from <code>cos_sin_cache</code> and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the full-model compile graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 inner dim <code>rotary_dim//2</code> must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below)</td>
+<td>Fully on-device, no opaque op. A <code>[max_pos, 2, 2, rotary_dim//2]</code> rotation cache is built from <code>cos_sin_cache</code>, flattened to 2-D with the position axis outermost, and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the enclosing block graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 inner dim <code>rotary_dim//2</code> must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below)</td>
 </tr>
 <tr>
 <td><code>VocabParallelEmbedding</code></td>
@@ -2403,7 +2403,7 @@ compiled graph (see below).</p>
 <td><code>ParallelLMHead</code></td>
 <td><code>SpyreParallelLMHead</code></td>
 <td>Spyre</td>
-<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; <code>apply</code> runs <code>x @ Wᵀ</code> then the un-pad slice, on Spyre — eager, no CPU detour; logits stay on Spyre for the TP <code>all_gather</code></td>
+<td>TP≥1 with vocab sharding; per-rank weight padded to a multiple of 64×32 and pre-transposed; <code>apply</code> runs <code>x @ Wᵀ</code> then the un-pad slice on Spyre, compiled as its own graph (<code>maybe_compile</code>, see <a href="../user_guide/configuration.html#decoder-compile-buckets">Decoder compile buckets</a>) unless compilation is off; logits stay on Spyre for the TP <code>all_gather</code></td>
 </tr>
 <tr>
 <td><code>LogitsProcessor</code></td>
@@ -2436,7 +2436,7 @@ in two overrides:</p>
   <code>[in, out]</code> <code>Wᵀ</code> (optionally padding the output rows first), so the transpose is paid once at
   load time rather than every forward.</li>
 <li><code>apply</code> runs <code>spyre_linear_t</code> — <code>torch.matmul(x, Wᵀ)</code> plus optional bias — instead of
-  <code>F.linear</code>, dropping any trailing pad columns with an eager on-device un-pad slice.</li>
+  <code>F.linear</code>, dropping any trailing pad columns with an on-device un-pad slice.</li>
 </ul>
 <p><code>SpyreUnquantizedLinearMethod</code> uses the base defaults (transpose in place, no padding); the five
 linear subclasses install it in <code>__init__</code>, but only when <code>quant_method</code> is an
@@ -2454,9 +2454,9 @@ tensor and the unmodified upstream idiom <code>q, k, v = qkv.split(...)</code> s
 which slices gate/up on-device. Earlier revisions instead split the QKV weight on CPU at load
 time into three per-part GEMMs — a <code>SplitQKV</code> container built by an <code>analyze_and_unfuse</code>
 pass — so that no fused output ever had to be sliced; one fused GEMM is faster than three,
-so that pass is gone. The remaining slicing constraint is narrower than it was and lives
-in the attention backend, where offset &gt; 0 views still corrupt on transfer (see
-<a href="#attention-backend">Attention Backend</a>).</p>
+so that pass is gone. Attention gathers query rows rather than passing offset views into
+compiled kernels, and materializes fused K/V views before head-major cache writes (see
+<a href="#head-major-kv-cache">Head-major KV cache</a>).</p>
 <h2 id="model-adaptations">Model adaptations<a class="headerlink" href="#model-adaptations" title="Permanent link">&para;</a></h2>
 <p>Some models need more than a swapped-out layer: a different transport for an input, a buffer
 that has to follow <code>.to("spyre")</code>, an expert dispatch Spyre can lower. Those live in
@@ -2470,15 +2470,18 @@ and <code>register_models()</code> first checks every key against vLLM's own reg
 rename fails loudly instead of silently falling through to the unadapted class.</p>
 <p>Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
 <code>embedding_class</code>), the already-built instance is <strong>retyped</strong> to its Spyre subclass — same
-<code>__init__</code>, same parameters, same module tree, only <code>forward</code> differs. Prefer a documented
-upstream extension point where one exists: <code>CustomOp.register_oot</code> /
+<code>__init__</code>, same parameters and module tree, but a Spyre <code>forward</code> and armed compile
+state. Prefer a documented upstream extension point where one exists: <code>CustomOp.register_oot</code> /
 <code>PluggableLayer.register_oot</code> for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.</p>
 <p>Two adaptations worth knowing:</p>
 <ul>
 <li><strong>BERT / RoBERTa</strong> (<code>models/_token_type.py</code>) carry <code>token_type_ids</code> in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of <code>input_ids</code>,
-  which Spyre cannot unpack (<a href="https://github.com/torch-spyre/torch-spyre/issues/3509">torch-spyre#3509</a>).</li>
+  which Spyre cannot unpack (<a href="https://github.com/torch-spyre/torch-spyre/issues/3509">torch-spyre#3509</a>).
+  Their word/segment/position gathers and layer norm can form a separate compiled
+  embedding prologue when no enclosing graph traces them; RoBERTa's position offset is
+  applied on the host before the gather.</li>
 <li><strong>MoE</strong> (<code>moe.py</code>) supplies the routed-expert backend vLLM's unquantized MoE oracle lacks
   for an out-of-tree platform (it selects <code>UnquantizedMoeBackend.OOT</code> — no kernel — and
   leaves <code>process_weights_after_loading</code> to the plugin). A <code>CustomOp.register_oot</code>
@@ -2487,9 +2490,10 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   all-expert persistent. Dispatch looks only at the packed token count: up to
   <code>SPYRE_MOE_GATHERED_MAX_TOKENS</code> — a decode batch, or a prompt that buckets that short — the
   gathered form is driven once per token, and above it the all-expert form takes the whole
-  batch in one call. A batch whose rows are not stick-addressable takes the all-expert form
-  whatever its size, since each row's storage offset has to span whole sticks for the compiled
-  loop to address it.
+  batch in one call. A multi-token batch whose rows are not stick-addressable takes the
+  all-expert form whatever its size, since each row's storage offset has to span whole sticks
+  for the compiled loop to address it; a single token is handed to the gathered form whole, so
+  it never needs that.
   In the post-load hook it also rebuilds each layer's <code>w13 [E,2M,H]</code> / <code>w2 [E,H,M]</code> stacks into
   the <code>[E,H,M]</code> / <code>[E,M,H]</code> layout those forms contract on, freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing
@@ -2505,7 +2509,8 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
 <h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
 <p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of
 the model's block <code>ModuleList</code> in place via <code>block.compile(backend="inductor",
-fullgraph=True, dynamic=False)</code>. In place matters: rebinding the list entry to the
+fullgraph=not uses_fp8, dynamic=False)</code>. FP8 linears need graph breaks, so their blocks
+use <code>fullgraph=False</code>. In place matters: rebinding the list entry to the
 <code>OptimizedModule</code> that <code>torch.compile</code> returns would re-parent the block under an
 <code>_orig_mod</code> child and rename every parameter, breaking weight save/reload.</p>
 <p>Every graph is compiled <code>dynamic=False</code> because torch-spyre's Inductor backend rejects
@@ -2519,19 +2524,21 @@ are bucketed independently: the packed <code>num_tokens</code> for the block gra
 <code>Attention</code> somewhere, and are not themselves <code>Attention</code> layers — so decoder stacks
 (<code>model.layers</code>) and encoder stacks (<code>bert.encoder.layer</code>) are both covered, as are
 hybrid Mamba+attention stacks that mix layer classes in one list. A <code>ModuleList</code> of bare
-<code>Attention</code> layers (Zamba2's shared <code>dpa_list</code>) is skipped: it is not a block stack.
-Models whose attention is not a vLLM <code>Attention</code> — MLA (DeepSeek, Kimi), vision-tower
-attention — match nothing and fall back to a whole-model graph.</p>
+<code>Attention</code> layers (Zamba2's shared <code>dpa_list</code>) is skipped: it is not a block stack. So is any list under a vision tower
+(<code>vision_encoder</code>, <code>vision_tower</code>, <code>vision_model</code>, <code>visual</code>), which stays eager. Models whose
+attention is not a vLLM <code>Attention</code> — MLA (DeepSeek, Kimi) — match nothing and fall back to a
+whole-model graph.</p>
 <p>Blocks of one class share one <code>forward</code> code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
 backend compile count is independent of depth, but it is not 1: layer 0 specializes
 separately because <code>residual is None</code> there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
 and full attention, giving four. A fresh <code>num_tokens</code> bucket then costs one block recompile
-rather than a whole-model one. Note that <code>num_tokens</code> is the block graph's <em>only</em> shape
-dependence: kv-cache length and its block-count buckets live inside
+rather than a whole-model one. For decoder attention, <code>num_tokens</code> is the block graph's
+only shape dependence: kv-cache length and its block-count buckets live inside
 <code>unified_attention_with_output</code>, which is opaque to this graph and compiles its own
-kernels (see <a href="../user_guide/kineto_profiling.html">Kineto profiling</a>).</p>
+kernels (see <a href="../user_guide/kineto_profiling.html">Kineto profiling</a>). Inline rectangular
+encoder attention also specializes the block graph by rectangle.</p>
 <p>Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
 which needs torch &gt;= 2.11 and <code>VLLM_USE_LAYERNAME=1</code>. Without it each block bakes in its
 own layer name and compiles separately, which is worse than the whole-model graph; the
@@ -2541,8 +2548,8 @@ defeats sharing the same way, by folding each block's weights into its own graph
 covers them. Both stay eager when compilation is off, except a Gemma final norm:
 <code>SpyreGemmaRMSNorm</code> passes <code>force=True</code>, so it compiles as its own one-op graph
 in every mode, including <code>enforce_eager</code>, because its fp32 weight multiply has no working
-eager form. <code>lm_head</code> was never in the compiled region; <code>compute_logits</code> is a separate
-call on the wrapper.</p>
+eager form. <code>lm_head</code> is never in a block graph either — <code>compute_logits</code> is a separate call
+on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see <a href="../user_guide/configuration.html#decoder-compile-buckets">Decoder compile buckets</a>).</p>
 <p><code>SPYRE_COMPILE_GRANULARITY=model</code> restores the whole-model fullgraph, whose compile cost
 grows with layer count.</p>
 <h2 id="attention-backend">Attention Backend<a class="headerlink" href="#attention-backend" title="Permanent link">&para;</a></h2>
@@ -2550,7 +2557,8 @@ grows with layer count.</p>
 default is the head-major one described below. <code>SpyreAttentionBackend</code> is the token-major
 layout (<code>SPYRE_ATTN_KV_LAYOUT=token_major</code>) and the structure both share, so it is
 described first. It implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+(no custom CUDA kernels). The KV cache holds two dense tensors per layer on Spyre, one
+each for K and V, both shaped
 <code>[num_blocks, block_size, num_kv_heads, head_size]</code> — the shape
 <code>SpyreAttentionBackend.get_kv_cache_shape</code> advertises. It runs a FlashAttention-style
 online softmax that iterates over pages without any compact-gather step, reading each
@@ -2579,14 +2587,14 @@ the write can scatter through a slot-major view of it:</p>
 <td>Compiled <code>index_copy_</code> scatter through a slot-major view of the paged cache (one per tensor, fused); only the slot-index vector is computed host-side and copied over</td>
 </tr>
 <tr>
-<td>3. Per-sequence page attention</td>
+<td>3. Page attention</td>
 <td>Spyre</td>
-<td>A host-driven loop dispatches one compiled kernel per sequence — the query rows are gathered on-device (never copied to CPU): <code>Q @ Kᵀ · scale</code> → optional soft-cap → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
+<td>Eligible decode rows take a batched kernel, even for one sequence; prefill and ineligible decode rows use the host-driven per-sequence loop. Query rows are gathered on-device: <code>Q @ Kᵀ · scale</code> → optional soft-cap → <code>+ tile_mask</code> → online softmax → <code>@ V</code></td>
 </tr>
 <tr>
 <td>4. Write-back</td>
 <td>Spyre</td>
-<td>Each sequence's result is written into the Spyre output buffer with a device-to-device copy</td>
+<td>Results are written into the output buffer in-kernel when possible, otherwise by a device-to-device copy</td>
 </tr>
 </tbody>
 </table>
@@ -2595,12 +2603,15 @@ path, the KV store, and the cache's device layout — live under
 <code>spyre_inference/v1/attention/ops/</code>; the backend module holds the metadata builder and
 the host-side orchestration that calls them.</p>
 <p>Because attention kernels are <code>dynamic=False</code> too, they are pre-compiled during warmup
-rather than lazily on first use: by default (<code>SPYRE_ATTN_RECORD=1</code>) warmup traces every
-variant <code>SpyreAttnBucketer</code> can produce — the product of the KV-length and query-length
-buckets below — so a served request always lands on an already-compiled kernel. When the
-batched-decode kernel is enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default, which under the
-default tiled walk means the head-major layout) warmup also records its variants, the
-product of the KV-length (<code>num_blocks</code>) and num-sequences buckets. A single step can carry a mix of prefill and decode sequences; each sequence is
+rather than lazily on first use: by default (<code>SPYRE_ATTN_RECORD=1</code>) warmup records
+per-sequence variants from <code>SpyreAttnBucketer.variants()</code>. A query bucket pairs only with
+block counts that fit its smallest real query length; variants exceeding the allocated
+page count are skipped. Failed recordings are logged and compile on first use instead.
+When the batched-decode kernel is enabled (<code>SPYRE_BATCHED_DECODE=1</code>, the default, which under the
+default tiled walk means the head-major layout) warmup enumerates its variants, the
+product of the KV-length (<code>num_blocks</code>) and num-sequences buckets; combinations that
+reach or exceed the allocated page count are skipped and declined at dispatch. A single
+step can carry a mix of prefill and decode sequences; each sequence is
 padded to its own query bucket (decodes use the length-1 bucket) before dispatch.
 <code>SPYRE_ATTN_RECORD=0</code> restores lazy per-variant compilation.</p>
 <p>Under <code>dynamic=False</code> the Python loop over a sequence's KV pages is unrolled at trace
@@ -2608,11 +2619,11 @@ time, so a graph holds one copy of the attention body per page and compile time 
 with KV length. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> walks that axis with torch-spyre's
 <code>for_each_tile</code> instead, leaving one body plus a tile spec, and the same applies to the
 batched-decode kernel's walk over block chunks. Both kernels carry the online softmax as
-a <code>(tile_max, tile_sum, tile_output)</code> triple either way; <code>walk_tiles</code> picks the walk and
-is the only place that reads the variable. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> is the default;
-setting it to <code>0</code> runs the identical bodies under Python loops as a rollback path. The switch is
-read once at import, because it decides the <code>fullgraph</code> setting the tiled walk needs —
-setting it after <code>spyre_inference</code> is imported has no effect.</p>
+a <code>(tile_max, tile_sum, tile_output)</code> triple either way. <code>walk_tiles</code> selects the walk;
+the same flag also controls <code>fullgraph</code>, batched-decode eligibility, and layout/kernel
+branches. <code>SPYRE_ATTN_FOR_EACH_TILE=1</code> is the default; setting it to <code>0</code> uses Python loops
+as a rollback path. The flag is read once at import, so set it before importing
+<code>spyre_inference</code>.</p>
 <h3 id="head-major-kv-cache">Head-major KV cache<a class="headerlink" href="#head-major-kv-cache" title="Permanent link">&para;</a></h3>
 <p><code>SpyreHeadMajorAttentionBackend</code> is the default decoder backend
 (<code>SPYRE_ATTN_KV_LAYOUT=head_major</code>). It stores a page as
@@ -2625,12 +2636,15 @@ single store of one contiguous run per token.</p>
 <p>Everything above the cache's memory — the metadata builder, the bucketer, the mask tiles,
 warmup recording and dispatch — is shared with the token-major backend. What differs is
 duplicated rather than parameterised: the advertised shape, the allocation
-(<code>head_major_kv_layout</code>), and the three kernels that touch a page. The worker follows the
+(<code>head_major_kv_layout</code>), the KV-store kernel and the three attention kernels that
+read a page. The worker follows the
 layer's impl (<code>allocate_pages</code>) rather than a hardcoded shape, so the two cannot disagree.</p>
 <h4 id="lx-resident-pages">LX-resident pages<a class="headerlink" href="#lx-resident-pages" title="Permanent link">&para;</a></h4>
-<p>The head-major per-sequence kernel keeps a gathered page in the LX scratchpad from its
-gather to its last use instead of round-tripping through HBM. Two shape choices get it
-there. The page is gathered on (page, kv_head) with a <code>[num_kv_heads, 1]</code> index, so the
+<p>The head-major per-sequence decode kernel (<code>page_attn_head_major_decode</code>, one query row)
+keeps a gathered page in the LX scratchpad from its gather to its last use instead of
+round-tripping through HBM. A query wider than one row amortises the page transfer over
+every row, so it takes <code>page_attn_head_major_prefill</code> instead: batched GQA over the unfolded
+cache, one whole page per gather. Two shape choices get the decode kernel to LX residency. The page is gathered on (page, kv_head) with a <code>[num_kv_heads, 1]</code> index, so the
 gather's split lands per KV head — an output axis of <code>probs @ V</code> the consumer can mirror;
 behind a 1-D index the entry axis instead splits in whole 32-entry sticks. And the query
 groups fold into the query's row axis — a reshape, since heads are KV-major — so each
@@ -2664,15 +2678,17 @@ way.</p>
   (consistent tensor shapes for compilation)</li>
 <li><strong>Num-sequences bucketing</strong> (batched-decode kernel only, <code>SPYRE_BATCHED_DECODE=1</code>, the
   default; under the default tiled walk, the head-major layout only):
-  powers of two from 1 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>); the decode-batch
-  kernel is recorded over the <code>(num_blocks, num_seqs)</code> grid</li>
+  powers of two from 1 to <code>max_num_seqs</code> (<code>SPYRE_ATTN_NUM_SEQS_BUCKETS</code>); eligible
+  <code>(num_blocks, num_seqs)</code> combinations are recorded during warmup</li>
 <li><strong>Head size</strong>: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)</li>
-<li><strong>Block size</strong>: Must be a multiple of 64. The default is 128, and a user-supplied
-  <code>block_size</code> is rounded up to the next multiple of 64</li>
-<li><strong>GQA only</strong>: MHA (<code>num_queries_per_kv = 1</code>) currently fails in the Spyre compiler's
-  layout-propagation pass; only GQA configurations are exercised today</li>
+<li><strong>Block size</strong>: Must be a power of two and a multiple of 64. The default is 128; a
+  user-supplied <code>block_size</code> is rounded up to the next multiple of 64, and one that is then
+  not a power of two is rejected</li>
+<li><strong>Head configurations</strong>: GQA, MHA (<code>num_queries_per_kv = 1</code>) and MQA (<code>num_kv_heads = 1</code>)
+  are all exercised, on both layouts (<code>tests/attention/test_spyre_attn.py</code>,
+  <code>tests/attention/test_spyre_head_major_attn.py</code>)</li>
 <li><strong>Supported</strong>: sliding-window masking (per layer, so a hybrid stack's full-attention
-  layers stay unwindowed) and logits soft-capping are both handled; ALiBi slopes are not</li>
+  layers stay unwindowed) and logits soft-capping on both layouts; ALiBi on token-major only</li>
 </ul>
 <h3 id="encoder-only-attention">Encoder-only attention<a class="headerlink" href="#encoder-only-attention" title="Permanent link">&para;</a></h3>
 <p>Encoder-only (embedding) models take a separate path. For <code>ENCODER</code>/<code>ENCODER_ONLY</code>
@@ -2696,10 +2712,12 @@ exactly the extents a request can be assigned):</p>
 <ol>
 <li><strong>Rectangular path</strong> — one rectangle per length, <code>B = R / L</code>, so a rectangle is exactly the
    body buffer. The runner pads each sequence to <code>L</code> and the batch to <code>B</code> in <code>_preprocess</code>
-   (host-side, integer tensors only), so Q/K/V <em>are</em> the grid: <code>_encoder_rect_kernel</code>
+   (host-side integer tensors for <code>input_ids</code>; multimodal <code>inputs_embeds</code> are copied to
+   CPU, padded there and copied back), so Q/K/V <em>are</em> the grid: <code>_encoder_rect_kernel</code>
    reshapes, runs one <code>F.scaled_dot_product_attention</code>, and stores — no data movement
-   inside the layer. <code>_unpad_encoder_hidden</code> compacts the grid back before the pooler, at a
-   fixed row count so the gather does not specialise per token total.</li>
+   inside the layer. For packed-order pooling, <code>_unpad_encoder_hidden</code> compacts the grid
+   at a fixed row count so the gather does not specialise per token total. Homogeneous
+   CLS pooling instead reads each sequence's first grid row and skips the gather.</li>
 <li><strong>Ragged path</strong> — for a batch too wide for any rectangle. Q/K/V stay packed and requests
    are grouped by their own padded extent; <code>_encoder_fused_kernel</code> does gather, attend and
    scatter for one group in a single graph, keyed on <code>(width, extent)</code>. Request boundaries
@@ -2710,25 +2728,41 @@ exactly the extents a request can be assigned):</p>
 <p>The runner picks between them once per step in <code>_build_attention_metadata</code> and records the
 choice as the <em>type</em> of <code>attn_metadata.encoder_plan</code> (<code>EncoderRectPlan</code> versus a list of
 <code>EncoderGroupPlan</code>). It has to run there rather than in <code>forward</code>: the builder does a D2H
-read and an H2D convert, which inside a traced region become graph nodes. Because both
-paths stay behind the opaque <code>unified_attention_with_output</code>, the enclosing block graph is
-identical for either — one shape, shared — so path selection is never a branch inside a
-compiled region nor a dynamo guard.</p>
+read and H2D conversions, which inside a traced region become graph nodes.</p>
+<p>The ragged path always stays behind the opaque <code>unified_attention_with_output</code>: it
+dispatches once per group, so tracing it in would make the block graph's structure depend on
+the step's group multiset. The rectangular path is traced <em>into</em> the block graph instead
+whenever every encoder layer qualifies — attention compiled, and a head size that fills whole
+sticks (<code>install_encoder</code> is the only gate). The runner publishes the rectangle's mask
+(<code>publish_encoder_grid</code>), and the layer's forward reads <code>(width, extent)</code> off that mask's
+shape, so inductor fuses attention with the projections and the FFN. The rectangle then is
+part of the block graph's shape: one block graph per declared rectangle, plus the
+opaque-attention one the ragged path runs. An unpadded 32-wide encoder layer and any eager
+run keep both paths opaque; pooling models such as granite-30m and MiniLM pad their original
+32-wide heads to 64 before construction. Either way path selection is never a branch inside a
+compiled region: it is decided before the forward, and the traced graph only sees the shape
+it was handed.</p>
 <p>Three torch-spyre constraints shape the rest: a compile input's <code>storage_offset</code> is a
 Dynamo guard (torch-spyre#4449, which closed #3770) and for int32 is still dropped
 outright, so rows are gathered with <code>index_select</code> rather than sliced — a slice would
 either recompile per offset or read the wrong rows; there is no on-device <code>arange</code> or <code>full</code>, so every index and mask
-tensor is host-built and reaches the device in one <code>convert</code> per plan; and SDPA's
+tensor is host-built and converted separately (one mask for a rectangle, a row table and
+a mask per ragged group); and SDPA's
 decomposition does <code>amax</code> then <code>exp(scores - max)</code>, which NaNs a fully masked row — hence
 the <code>finfo.min / 2</code> mask fill and the single attendable key a batch-pad lane gets.</p>
 <h2 id="encoder-embedding-models-compile-shape-axes">Encoder / embedding models: compile shape axes<a class="headerlink" href="#encoder-embedding-models-compile-shape-axes" title="Permanent link">&para;</a></h2>
-<p>The body is compiled once, at <code>R</code> rows. Attention is shape-managed separately behind the
-opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
-<code>(width, extent)</code> pair per group on the ragged one (a <em>group</em> being the requests that
-share one padded extent, attended together in one call). With <code>max_model_len=512</code>,
-<code>max_num_seqs=32</code> and a 2048-token budget that is 23 shapes — one body, four rectangles,
-18 group pairs — and at <code>max_num_seqs=4</code> only five, since no batch that narrow can miss
-the rectangular path.</p>
+<p>The body always runs at <code>R</code> rows. Attention adds one rectangle per declared length on the
+rectangular path and one <code>(width, extent)</code> pair per group on the ragged one (a <em>group</em> being
+the requests that share one padded extent, attended together in one call). With
+<code>max_model_len=512</code>, <code>max_num_seqs=32</code> and a 2048-token budget that is four rectangles and
+18 group pairs; at <code>max_num_seqs=4</code> the group family is empty, since no batch that narrow can
+miss the rectangular path.</p>
+<p>Where those shapes are compiled depends on whether the rectangular path is traced in (see
+above). Opaque, the body compiles once and each rectangle and group pair is its own attention
+kernel — 23 shapes in the example above. Traced in, each rectangle is instead its own block
+graph, warmed by one dummy run per rectangle (<code>_warm_encoder_inline_paths</code>), plus the
+opaque-attention block graph whenever a group is reachable; the 18 group pairs remain
+attention kernels.</p>
 <figure>
   <img alt="Encoder target state" src="encoder-ideal-state.svg" style="width: 140%; max-width: 1400px; margin-left: -20%" />
 <br />
@@ -2752,7 +2786,7 @@ override:</p>
 <p><code>self.device</code> stays <code>cpu</code> so that scatter, indexing, and block-table ops run on CPU, but
 float compute tensors land on Spyre via <code>self._spyre_device</code>. Because there is no
 <code>vllm._C</code> under <code>VLLM_TARGET_DEVICE=empty</code>, the runner also swaps in a pure-PyTorch
-<code>_compute_slot_mapping</code> implementation for the paged-cache slot mapping.</p>
+<code>_compute_slot_mapping_impl</code> for the paged-cache slot-mapping kernel.</p>
 <p>At load time, <code>load_model</code> moves every module except <code>Attention</code> scale buffers onto Spyre.
 The weight transposes happen before that, in each layer's
 <code>process_weights_after_loading</code>, while the weights are still on CPU.</p>
@@ -2760,7 +2794,9 @@ The weight transposes happen before that, in each layer's
 call boundary:</p>
 <ul>
 <li><strong>Input</strong>: CPU <code>int32</code>/<code>int64</code> tensors → Spyre <code>int64</code> (for embedding lookup)</li>
-<li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling)</li>
+<li><strong>Output</strong>: Spyre <code>float16</code> tensors → CPU (for logits indexing and sampling). A pooling
+  model whose pooler runs on Spyre keeps its hidden states there instead, and the pooler
+  copies back only the pooled vectors</li>
 <li><strong><code>compute_logits</code></strong>: moves the CPU-sliced <code>hidden_states[logits_indices]</code> back onto
   Spyre for the <code>SpyreParallelLMHead</code> matmul, which returns logits on Spyre</li>
 </ul>
@@ -2771,14 +2807,15 @@ embedding gather runs on-device now that <code>aten.embedding</code> has a Spyre
 replaces the earlier silent D2H/H2D CPU fallback that copied the full <code>[vocab, hidden]</code>
 weight on every decode step. When TP&gt;1 the shard mask is applied <strong>on-device</strong>:
 <code>get_masked_input_and_mask</code> runs once at load to build per-vocab reindex/keep lookup
-tables (its int64 comparisons against Python constants cannot lower on Spyre), registered
+tables (its int32 subtraction still cannot lower on Spyre), registered
 as device buffers; <code>forward</code> then gathers through them with <code>index_select</code>/<code>F.embedding</code>,
 applies the keep mask, and <code>all_reduce</code>s — all on Spyre, no per-step CPU round-trip.</p>
 <p>Hidden states flow on Spyre between decoder layers, with CPU round-trips only for
 work that stays host-side: logits indexing for sampling, and the attention metadata the
 builder prepares on CPU (slot mapping, the per-sequence index tables and additive mask).
-The per-sequence attention loop is host-driven control flow, but its query-row gather and
-kernels run on Spyre; the KV-cache write and the write-back are device-to-device. RoPE's
+Eligible decode prefixes use batched attention, even at one sequence; otherwise the
+per-sequence loop is host-driven control flow, but its query-row gather and kernels run
+on Spyre. KV-cache writes and any separate write-back copy stay on-device. RoPE's
 rotation-cache gather and the embedding gather also run on-device.</p>
 <h2 id="transformers-backend">Transformers backend<a class="headerlink" href="#transformers-backend" title="Permanent link">&para;</a></h2>
 <p>When <code>model_impl="transformers"</code>, <code>register_ops</code> swaps vLLM's <code>TransformersForCausalLM</code>
@@ -2790,8 +2827,9 @@ modules with vLLM layers — which the OOT registrations above then pick up auto
 HF's <code>rotary_emb</code> survives and would derive cos/sin inside the forward from int64
 <code>position_ids</code>, a cast torch-spyre cannot lower. It is replaced with a precomputed
 <code>[max_model_len, 2, 2, head_dim/2]</code> rotation cache — built on the host and moved to the
-device before compile, leaving only an <code>index_select</code> in the graph — plus a matmul-based
-<code>apply_rotary_pos_emb</code>. Head padding is shared with the native path: the platform widens
+device before compile, leaving only an <code>index_select</code> in the graph — plus an
+<code>apply_rotary_pos_emb</code> that applies the 2×2 rotation by multiply-and-reduce rather than
+HF's <code>rotate_half</code> slicing. Head padding is shared with the native path: the platform widens
 <code>head_dim</code> and the weight passes in <code>head_pad.py</code> pad Q/K interleaved, so this backend
 only has to rebuild the rotation cache at the pre-pad frequencies.</p>
 <p><code>RMSNorm</code> registers no OOT op: upstream <code>forward_native</code> lowers its fp16→fp32 upcast
@@ -2824,8 +2862,8 @@ backend still stubs <code>_allgather_base</code> (so <code>dist.all_gather_into_
 signal: when a probe flips green, delete the corresponding override or workaround.</p>
 <p>The worker (<code>TorchSpyreWorker</code>) inherits directly from vLLM's <code>Worker</code> (gpu_worker), not
 <code>CPUWorker</code> — Spyre needs none of the CPU-specific init (NUMA binding, host-RAM
-profiling). Data parallelism (<code>data_parallel_size &gt; 1</code>) is rejected in
-<code>check_and_update_config</code>.</p>
+profiling). Data and pipeline parallelism (<code>data_parallel_size &gt; 1</code> or
+<code>pipeline_parallel_size &gt; 1</code>) are rejected in <code>check_and_update_config</code>.</p>
 
 
 

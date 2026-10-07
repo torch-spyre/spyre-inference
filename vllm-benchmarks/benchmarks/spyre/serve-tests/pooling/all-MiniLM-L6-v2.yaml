@@ -1,0 +1,57 @@
+defaults:
+  server_health_timeout: 1800
+  environment_variables:
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 8
+    max-num-batched-tokens: 256
+    enable-prefix-caching: false
+  parameters:
+    dataset-name: random
+    num-prompts: 10000
+    random-input-len: 196
+    random-range-ratio: 0.3
+    num-warmups: 64
+    request-rate: inf
+    percentile-metrics: tpot,itl,e2el
+    metric-percentiles: 99,100
+
+tests:
+  - test_name: serve_all-MiniLM-L6-v2_tp1_ifl2_in16
+    server_parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 256
+    parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 16
+
+  - test_name: serve_all-MiniLM-L6-v2_tp1_ifl2_in32
+    server_parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 256
+    parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 32
+
+  - test_name: serve_all-MiniLM-L6-v2_tp1_ifl2_in64
+    server_parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 256
+    parameters:
+      model: sentence-transformers/all-MiniLM-L6-v2
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 64

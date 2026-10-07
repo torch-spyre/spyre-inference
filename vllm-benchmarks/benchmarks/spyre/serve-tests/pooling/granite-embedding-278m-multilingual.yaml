@@ -3,7 +3,7 @@ defaults:
   environment_variables:
   server_parameters:
     load-format: auto
-    max-num-seqs: 8
+    max-num-seqs: 4
     max-num-batched-tokens: 512
     enable-prefix-caching: false
   parameters:
@@ -11,18 +11,17 @@ defaults:
     num-prompts: 10000
     random-input-len: 512
     random-range-ratio: 0.5
-    num-warmups: 64
+    num-warmups: 100
     request-rate: inf
-    percentile-metrics: tpot,itl,e2el
+    percentile-metrics: e2el
     metric-percentiles: 99,100
 
 tests:
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in16
+  - test_name: serve_granite-embedding-278m-multilingual_mc16
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
       tensor-parallel-size: 1
       runner: pooling
-      dtype: float16
       max-model-len: 512
     parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
@@ -30,12 +29,11 @@ tests:
       endpoint: /v1/embeddings
       max-concurrency: 16
 
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in32
+  - test_name: serve_granite-embedding-278m-multilingual_mc32
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
       tensor-parallel-size: 1
       runner: pooling
-      dtype: float16
       max-model-len: 512
     parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
@@ -43,12 +41,11 @@ tests:
       endpoint: /v1/embeddings
       max-concurrency: 32
 
-  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in64
+  - test_name: serve_granite-embedding-278m-multilingual_mc64
     server_parameters:
       model: ibm-granite/granite-embedding-278m-multilingual
       tensor-parallel-size: 1
       runner: pooling
-      dtype: float16
       max-model-len: 512
     parameters:
       model: ibm-granite/granite-embedding-278m-multilingual

@@ -15,30 +15,30 @@ tree = ""
 
 # x86_64
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_157" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_159" }
 ibm-deeptools         = { version = "2.0.0-0.main.1+2628.5a2d7b4_420" }
 ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2628.5a2d7b4_420" }
-ibm-flex              = { version = "2.0.0-0.main.1+646.c7f97f1_545" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+646.c7f97f1_545" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+305.520d28d_422" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+305.520d28d_422" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+305.520d28d_422" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+191.be0037b_279" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+191.be0037b_279" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+36.5fdd6e3_72" }
+ibm-flex              = { version = "2.0.0-0.main.1+648.d80b102_549" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+648.d80b102_549" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+306.c011ed7_425" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+306.c011ed7_425" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+306.c011ed7_425" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+193.42e3736_283" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+193.42e3736_283" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+36.5fdd6e3_74" }
 
 # Power
 [overrides.ppc64le]
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_*" }
 ibm-deeptools         = { version = "2.0.0-0.main.1+2628.5a2d7b4_*" }
 ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2628.5a2d7b4_*" }
-ibm-flex              = { version = "2.0.0-0.main.1+646.c7f97f1_*" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+646.c7f97f1_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+191.be0037b_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+191.be0037b_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+648.d80b102_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+648.d80b102_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+193.42e3736_*" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+193.42e3736_*" }
 ibm-libaiupti         = { version = "2.0.0-0.main.1+36.5fdd6e3_*" }
 
 # Z
@@ -46,11 +46,11 @@ ibm-libaiupti         = { version = "2.0.0-0.main.1+36.5fdd6e3_*" }
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_*" }
 ibm-deeptools         = { version = "2.0.0-0.main.1+2628.5a2d7b4_*" }
 ibm-deeptools-devel   = { version = "2.0.0-0.main.1+2628.5a2d7b4_*" }
-ibm-flex              = { version = "2.0.0-0.main.1+646.c7f97f1_*" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+646.c7f97f1_*" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+305.520d28d_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+191.be0037b_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+191.be0037b_*" }
+ibm-flex              = { version = "2.0.0-0.main.1+648.d80b102_*" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+648.d80b102_*" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+306.c011ed7_*" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+193.42e3736_*" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+193.42e3736_*" }
 ibm-libaiupti         = { version = "2.0.0-0.main.1+36.5fdd6e3_*" }

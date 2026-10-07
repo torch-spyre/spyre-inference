@@ -109,7 +109,7 @@ on:
       skip_uv_for_benchmarking:
         description: |
           Perf job only. When true, the benchmark runner bypasses `uv run` and
-          calls the prebaked venv's python3 directly (make ... TEST_TYPE=perf
+          calls the active venv's python3 directly (make ... TEST_TYPE=perf
           SKIP_UV_FOR_BENCHMARKING=1). Needed on arches where uv re-resolves the
           project and cannot find a torch/vllm wheel (s390x: torch==2.11.0 has no
           s390x wheel), so uv builds a fresh venv without torch and every
@@ -1170,7 +1170,7 @@ jobs:
       - name: Run vLLM benchmarks
         id: bench
         env:
-          # true -> "1" (bypass uv, use the baked venv's python3 directly),
+          # true -> "1" (bypass uv, use the active venv's python3 directly),
           # false -> "" (keep the uv path). The Makefile treats empty as "use uv".
           SKIP_UV_FOR_BENCHMARKING: ${{ inputs.skip_uv_for_benchmarking && '1' || '' }}
           # Writes the sibling {test}.pytorch.json the ingest gets the model from (#679).

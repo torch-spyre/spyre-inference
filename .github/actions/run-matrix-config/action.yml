@@ -153,9 +153,8 @@ runs:
     - name: Activate the freshly-built venv
       if: ${{ inputs.use_prebaked_image != 'true' }}
       shell: bash
-      # Ephemeral -dev-image runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv (an ancestor of the checkout); repoint AND remove it so `uv run --active` (Makefile:153) can't find or use anything but the venv just built here.
+      # ibm-aiu-setup.sh re-activates the image's baked /home/senuser/.venv ($VIRTUAL_ENV) in every `make` recipe shell, so the test shell targets the project .venv the Makefile repoints to (see AIU_SETUP_CMD), not this value. This repoint still steers the non-recipe uv steps (HF cache) that don't source the profile.
       run: |
-        rm -rf /home/senuser/.venv
         echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
         echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
 

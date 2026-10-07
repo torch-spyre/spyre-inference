@@ -1,0 +1,57 @@
+defaults:
+  server_health_timeout: 1800
+  environment_variables:
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 8
+    max-num-batched-tokens: 512
+    enable-prefix-caching: false
+  parameters:
+    dataset-name: random
+    num-prompts: 10000
+    random-input-len: 512
+    random-range-ratio: 0.5
+    num-warmups: 64
+    request-rate: inf
+    percentile-metrics: tpot,itl,e2el
+    metric-percentiles: 99,100
+
+tests:
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in16
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 16
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in32
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 32
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_ifl2_in64
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      max-concurrency: 64

@@ -2351,8 +2351,8 @@ kernel in pure PyTorch.</p>
 run upstream in the compiled graph). Most replacements are pure class swaps that run
 when the ops package is imported. <code>register_all()</code> additionally registers the <code>spyre_convert</code>
 custom op — the <code>convert</code> helper keeps device transfers invisible to <code>torch.compile</code>.
-RoPE registers no op — its rotation-cache gather and 2×2 rotation run directly in the
-compiled graph (see below).</p>
+RoPE registers no op — its rotation-cache gather and rotation (2×2, or split-free for a
+sub-stick half) run directly in the compiled graph (see below).</p>
 <table>
 <thead>
 <tr>
@@ -2373,7 +2373,7 @@ compiled graph (see below).</p>
 <td><code>RotaryEmbedding</code>, <code>Llama3RotaryEmbedding</code>, <code>YaRNScalingRotaryEmbedding</code>, <code>Gemma4RotaryEmbedding</code></td>
 <td><code>SpyreRotaryEmbedding</code>, <code>SpyreLlama3RotaryEmbedding</code>, <code>SpyreYaRNScalingRotaryEmbedding</code>, <code>SpyreGemma4RotaryEmbedding</code></td>
 <td>Spyre</td>
-<td>Fully on-device, no opaque op. A <code>[max_pos, 2, 2, rotary_dim//2]</code> rotation cache is built from <code>cos_sin_cache</code>, flattened to 2-D with the position axis outermost, and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the enclosing block graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 inner dim <code>rotary_dim//2</code> must also be stick-aligned; this is not re-checked but is guaranteed by head-dim padding (see below)</td>
+<td>Fully on-device, no opaque op. A <code>[max_pos, 2, 2, rotary_dim//2]</code> rotation cache is built from <code>cos_sin_cache</code>, flattened to 2-D with the position axis outermost, and <strong>primed on-device in <code>_apply</code> before <code>torch.compile</code></strong>; <code>forward_oot</code> then gathers this pass's per-token slice with <code>index_select</code> and applies the 2×2 rotation-matrix formulation (<code>_rotate_neox_2x2</code>) — both traced directly into the enclosing block graph. Priming before compile is the requirement: building the cache lazily inside the traced forward segfaults libsenlib during warmup, whereas a cache already materialized on-device indexes cleanly. Only neox-style full rotary is supported — other configs raise <code>NotImplementedError</code> at construction. The 2×2 form views a head as two halves, so it needs a stick-aligned <code>rotary_dim//2</code>. A head whose half is sub-stick (<code>head_size=64</code>) takes <code>_rotate_neox_split_free</code> instead: <code>x * cos + rotate_half(x) * sin</code>, with <code>rotate_half</code> as a matmul by a fixed signed permutation, so every view is a whole head. Its cache is <code>[max_pos, 2 * head_size]</code>, laid out <code>[cos \| cos \| sin \| sin]</code>. Head-dim padding then only has to make a head stick-aligned, so the native path pads to the next 64-multiple</td>
 </tr>
 <tr>
 <td><code>VocabParallelEmbedding</code></td>
@@ -2829,9 +2829,10 @@ HF's <code>rotary_emb</code> survives and would derive cos/sin inside the forwar
 <code>[max_model_len, 2, 2, head_dim/2]</code> rotation cache — built on the host and moved to the
 device before compile, leaving only an <code>index_select</code> in the graph — plus an
 <code>apply_rotary_pos_emb</code> that applies the 2×2 rotation by multiply-and-reduce rather than
-HF's <code>rotate_half</code> slicing. Head padding is shared with the native path: the platform widens
-<code>head_dim</code> and the weight passes in <code>head_pad.py</code> pad Q/K interleaved, so this backend
-only has to rebuild the rotation cache at the pre-pad frequencies.</p>
+HF's <code>rotate_half</code> slicing. That rotation still views a head as two halves, so here the
+platform widens <code>head_dim</code> to the next 128-multiple, not the native path's 64-multiple. The
+weight passes in <code>head_pad.py</code> are shared with the native path and pad Q/K interleaved, so
+this backend only has to rebuild the rotation cache at the pre-pad frequencies.</p>
 <p><code>RMSNorm</code> registers no OOT op: upstream <code>forward_native</code> lowers its fp16→fp32 upcast
 into the compiled graph. <code>GemmaRMSNorm</code> still needs one, because its trailing fp32
 <code>weight</code> multiply hits a torch-spyre gap — a STANDARD <code>[hidden]</code> operand that can

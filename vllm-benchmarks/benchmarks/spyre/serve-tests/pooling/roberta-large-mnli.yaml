@@ -17,7 +17,7 @@ defaults:
     metric-percentiles: 99,100
 
 tests:
-  - test_name: serve_roberta-large-mnl_mc16
+  - test_name: serve_roberta-large-mnli_mc16
     server_parameters:
       model: FacebookAI/roberta-large-mnli
       tensor-parallel-size: 1

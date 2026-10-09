@@ -608,5 +608,156 @@ def test_patch_embed_input_ids_ds_buffers_migrated_to_correct_device():
         )
 
 
+# ---------------------------------------------------------------------------
+# 3d. Narrow-staging numeric equivalence
+# ---------------------------------------------------------------------------
+# Verifies that the optimised path — staging [N, lm_h] and copying into
+# _ds_buffers[:N] — produces the same buffer contents as the previous
+# full-buffer-copy approach, using a scattered (non-contiguous) multimodal mask.
+
+
+def _full_buffer_fill(ds_buffers, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype):
+    """Reference implementation: the old full-buffer staging path.
+
+    Allocates [buf_len, lm_h], scatters into [:N], copies the whole buffer.
+    Returns a fresh copy of _ds_buffers so callers can compare.
+    """
+    import copy
+
+    buf_len = ds_buffers[0].shape[0]
+    result = copy.deepcopy(ds_buffers)
+    for level_idx in range(len(ds_buffers)):
+        staged = torch.zeros(buf_len, lm_h, dtype=dtype)
+        staged[:N][is_multimodal_cpu] = level_features_cpu[level_idx]
+        result[level_idx].copy_(staged)
+    return result
+
+
+def _narrow_staging_fill(ds_buffers, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype):
+    """New narrow-staging path: allocates [N, lm_h], copies into [:N] only."""
+    import copy
+
+    result = copy.deepcopy(ds_buffers)
+    for level_idx in range(len(ds_buffers)):
+        staged = torch.zeros(N, lm_h, dtype=dtype)
+        staged[is_multimodal_cpu] = level_features_cpu[level_idx]
+        result[level_idx][:N].copy_(staged)
+    return result
+
+
+@pytest.mark.granite4_vision
+@pytest.mark.parametrize(
+    "img_positions",
+    [
+        [0, 3, 7],  # scattered with gaps
+        [1, 2, 5, 6],  # two contiguous pairs, separated
+        [0, 1, 2, 3],  # fully contiguous prefix
+        [4, 5, 6, 7],  # fully contiguous suffix
+    ],
+    ids=["scattered", "two_pairs", "contiguous_prefix", "contiguous_suffix"],
+)
+def test_narrow_staging_matches_full_buffer_staging(img_positions):
+    """Narrow [N, lm_h] staging must produce identical _ds_buffer[:N] contents
+    as the previous full-[buf_len, lm_h] approach, for scattered and contiguous
+    multimodal masks.
+
+    fp16 tolerance mirrors the rest of this test suite (atol=1e-2, rtol=1e-2).
+    """
+    N = 8
+    num_img = len(img_positions)
+    num_levels = _NUM_LEVELS
+    lm_h = _LM_HIDDEN
+    max_tokens = _MAX_TOKENS  # buf_len > N intentionally
+    dtype = torch.float16
+
+    is_multimodal_cpu = torch.zeros(N, dtype=torch.bool)
+    for pos in img_positions:
+        is_multimodal_cpu[pos] = True
+
+    rng = torch.Generator(device="cpu").manual_seed(42)
+    mm_emb = torch.randn(num_img, lm_h * num_levels, dtype=dtype, generator=rng)
+    level_features_cpu = mm_emb.split(lm_h, dim=-1)
+
+    ds_buffers_ref = [torch.zeros(max_tokens, lm_h, dtype=dtype) for _ in range(num_levels)]
+    ds_buffers_opt = [torch.zeros(max_tokens, lm_h, dtype=dtype) for _ in range(num_levels)]
+
+    ref = _full_buffer_fill(ds_buffers_ref, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype)
+    opt = _narrow_staging_fill(
+        ds_buffers_opt, level_features_cpu, is_multimodal_cpu, N, lm_h, dtype
+    )
+
+    for lvl in range(num_levels):
+        torch.testing.assert_close(
+            opt[lvl][:N].float(),
+            ref[lvl][:N].float(),
+            atol=1e-2,
+            rtol=1e-2,
+            msg=(
+                f"level {lvl}, img_positions={img_positions}: "
+                "narrow-staging _ds_buffers[:N] differs from full-buffer staging"
+            ),
+        )
+        # Rows beyond N in the narrow path are untouched (remain zero); the
+        # full-buffer path also leaves them zero (staged was zero-initialised).
+        torch.testing.assert_close(
+            opt[lvl][N:].float(),
+            ref[lvl][N:].float(),
+            atol=0.0,
+            rtol=0.0,
+            msg=f"level {lvl}: rows beyond N must be zero in both paths",
+        )
+
+
+@pytest.mark.granite4_vision
+def test_patch_embed_input_ids_vision_path_fills_ds_buffers_scattered():
+    """_ds_buffers[:N] filled by the patch must equal full-buffer staging for a
+    scattered multimodal mask (positions 0, 4, 7 in an 8-token sequence).
+
+    Uses fp16 tolerance (atol=1e-2, rtol=1e-2) consistent with the rest of the
+    test suite.
+    """
+    from spyre_inference.multimodal.granite4_vision import patch_embed_input_ids
+
+    patch_embed_input_ids()
+
+    N = 8
+    img_positions = [0, 4, 7]
+    num_img = len(img_positions)
+
+    is_multimodal = torch.zeros(N, dtype=torch.bool)
+    for pos in img_positions:
+        is_multimodal[pos] = True
+
+    rng = torch.Generator(device="cpu").manual_seed(55)
+    mm_emb = torch.randn(num_img, _LM_HIDDEN * _NUM_LEVELS, dtype=torch.float16, generator=rng)
+    level_features_cpu = mm_emb.split(_LM_HIDDEN, dim=-1)
+    is_multimodal_cpu = is_multimodal.clone()
+
+    # Reference: full-buffer staging on identical fresh buffers.
+    ds_buffers_ref = [
+        torch.zeros(_MAX_TOKENS, _LM_HIDDEN, dtype=torch.float16) for _ in range(_NUM_LEVELS)
+    ]
+    ref = _full_buffer_fill(
+        ds_buffers_ref, level_features_cpu, is_multimodal_cpu, N, _LM_HIDDEN, torch.float16
+    )
+
+    # Actual: run the patched embed_input_ids.
+    obj = _MinimalGranite4VisionEmbedModel(num_levels=_NUM_LEVELS)
+    input_ids = torch.arange(N)
+    obj.embed_input_ids(input_ids, [mm_emb], is_multimodal=is_multimodal)
+
+    for lvl in range(_NUM_LEVELS):
+        torch.testing.assert_close(
+            obj._ds_buffers[lvl][:N].float(),
+            ref[lvl][:N].float(),
+            atol=1e-2,
+            rtol=1e-2,
+            msg=(
+                f"level {lvl}: patch output _ds_buffers[:N] differs from "
+                "full-buffer-staging reference for scattered mask"
+            ),
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

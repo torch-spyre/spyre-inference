@@ -2501,10 +2501,10 @@ unquantized oracle leaves open for an out-of-tree platform.</p>
   narrower <code>M</code> — zero-widened to whole sticks where a shard lands mid-stick — and
   <code>MoERunner</code> all-reduces the per-rank partial sums. Each model's own adaptation module
   supplies its recipe and any model-owned scaling (<code>configure_gemma4_moe_layers</code> in
-  <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> and <code>MoERunner</code> are untouched: vLLM
-  reaches the experts through <code>torch.ops.vllm.moe_forward</code>, an opaque custom op, so the
-  dispatch runs eagerly <em>inside</em> the block's compiled graph — the same seam the attention
-  backend uses — and can drive compiled regions of its own.</li>
+  <code>models/gemma4.py</code>). <code>Gemma4DecoderLayer.forward</code> is untouched. <code>SpyreMoERunner</code>, an OOT
+  <code>MoERunner</code>, takes vLLM's direct <code>_moe_forward</code> entry — as upstream does on CPU and TPU —
+  instead of the opaque <code>torch.ops.vllm.moe_forward</code> custom op, so a compiled block traces
+  the expert forms into its own graph; an eager run dispatches them to compiled regions.</li>
 </ul>
 <h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
 <p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of

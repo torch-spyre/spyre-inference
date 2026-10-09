@@ -180,10 +180,8 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
         v = v.view(bsz, seq_len, self.num_heads_per_partition, pad_head_dim).transpose(1, 2)
 
         # padded_sdpa handles seq-alignment; scale fixed to orig head_dim.
-        # Use a full-attend mask: SigLIP is bidirectional with no real mask.
-        from spyre_inference.custom_ops.vit_attn import _full_attend_mask
-
-        attn_out = padded_sdpa(q, k, v, _full_attend_mask(seq_len), scale=scale)
+        # No mask: SigLIP is bidirectional with no real mask.
+        attn_out = padded_sdpa(q, k, v, None, scale=scale)
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         attn_output, _ = self.out_proj(attn_out)
         return attn_output, None

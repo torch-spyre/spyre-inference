@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import torch.nn.functional as F
 
@@ -69,11 +71,26 @@ def _padded_attn_mask(
     return m
 
 
+@lru_cache(maxsize=16)
+def _key_pad_mask(
+    b: int, seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Additive `[b, 1, 1, seq_pad]` mask on `device` that hides only the padded keys.
+
+    Broadcasts over heads and queries the way the encoder backend's key-pad mask does,
+    so an unmasked caller uploads `b * seq_pad` values instead of an O(L²) mask.
+    `finfo.min / 2` for the same fp16 headroom as `encoder_key_pad_mask`.
+    """
+    m = torch.zeros(b, 1, 1, seq_pad, dtype=dtype)
+    m[..., seq:] = torch.finfo(dtype).min / 2
+    return convert(m, device)
+
+
 def padded_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | None,
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
@@ -87,6 +104,8 @@ def padded_sdpa(
     `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
     so the padding cannot change it. Pass it explicitly when the head dim is already
     padded, or when the model carries its own scale.
+
+    `mask=None` attends everywhere: only the padded keys are masked.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -109,11 +128,15 @@ def padded_sdpa(
         k = k.contiguous()
         v = v.contiguous()
 
+    if mask is None:
+        attn_mask = _key_pad_mask(b, seq, seq_pad, q.dtype, device)
+    else:
+        attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(
         q,
         k,
         v,
-        attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
+        attn_mask=attn_mask,
         scale=scale,
         enable_gqa=enable_gqa,
     )

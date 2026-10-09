@@ -16,7 +16,7 @@
 
 The padding/masking math itself is `multimodal.utils.padded_sdpa`, already covered
 by `tests/multimodal/test_pixtral.py`; these tests cover this module's own surface:
-the `[B,S,H,D]` rearrange wrapper, the full-attend mask cache, and registration.
+the `[B,S,H,D]` rearrange wrapper, the unmasked key-pad mask, and registration.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ import einops
 import torch
 import torch.nn.functional as F
 
-from spyre_inference.custom_ops.vit_attn import _full_attend_mask, _padded_apply_sdpa, register
+from spyre_inference.custom_ops.vit_attn import _padded_apply_sdpa, register
+from spyre_inference.multimodal.utils import _key_pad_mask
 
 
 def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
@@ -67,18 +68,29 @@ class TestPaddedApplySdpaMatchesReference:
         actual = _padded_apply_sdpa(q, k, v, enable_gqa=True)
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
+    def test_batch_of_images_matches_reference(self):
+        q, k, v = _random_qkv(batch=3, seq=50, heads=12, head_size=64)
+        expected = _reference_apply_sdpa(q, k, v)
+        actual = _padded_apply_sdpa(q, k, v)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
-class TestFullAttendMaskCache:
-    def test_same_length_returns_the_same_object(self):
-        # padded_sdpa's own mask cache is keyed on this tensor's identity, so a
-        # stable object per length is what makes it actually hit across layers.
-        assert _full_attend_mask(50) is _full_attend_mask(50)
 
-    def test_different_lengths_return_different_objects(self):
-        assert _full_attend_mask(50) is not _full_attend_mask(64)
+class TestKeyPadMask:
+    def test_masks_only_the_padded_keys(self):
+        mask = _key_pad_mask(2, 50, 64, torch.float16, torch.device("cpu"))
+        assert mask.shape == (2, 1, 1, 64)
+        assert (mask[..., :50] == 0).all()
+        assert (mask[..., 50:] == torch.finfo(torch.float16).min / 2).all()
 
-    def test_attends_everywhere(self):
-        assert _full_attend_mask(17).all()
+    def test_same_shape_returns_the_same_object(self):
+        # One upload per shape, shared by every layer of the tower.
+        cpu = torch.device("cpu")
+        assert _key_pad_mask(1, 50, 64, torch.float16, cpu) is _key_pad_mask(
+            1, 50, 64, torch.float16, cpu
+        )
+
+    def test_unpadded_length_masks_nothing(self):
+        assert (_key_pad_mask(1, 64, 64, torch.float16, torch.device("cpu")) == 0).all()
 
 
 class TestRegister:

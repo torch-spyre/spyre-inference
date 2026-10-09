@@ -21,13 +21,11 @@ directly on whatever sequence length the image produces. torch-spyre compiles
 that op internally on every dispatch (regardless of ``--enforce-eager``) and its
 BMM-padding pass asserts when the sequence length isn't a multiple of the
 64-element fp16 stick (e.g. CLIP ViT-B/32's 50 patches). Routes through the same
-``padded_sdpa`` helper Pixtral's vision tower uses (``multimodal/utils.py``),
-with an "attend everywhere" mask since this path has no real one of its own.
+``padded_sdpa`` helper Pixtral's vision tower uses (``multimodal/utils.py``).
+This path has no real mask of its own, so only the padded keys are masked.
 """
 
 from __future__ import annotations
-
-from functools import lru_cache
 
 import torch
 from vllm.logger import init_logger
@@ -35,13 +33,6 @@ from vllm.logger import init_logger
 from spyre_inference.multimodal.utils import padded_sdpa
 
 logger = init_logger(__name__)
-
-
-@lru_cache(maxsize=8)
-def _full_attend_mask(seq: int) -> torch.Tensor:
-    """Stable per-length mask object so ``padded_sdpa``'s per-mask cache (keyed on
-    this tensor's identity) hits across layers instead of rebuilding every call."""
-    return torch.ones(seq, seq, dtype=torch.bool)
 
 
 def _padded_apply_sdpa(
@@ -55,9 +46,8 @@ def _padded_apply_sdpa(
 
     Input/output shape: ``(batch, seq, num_heads, head_size)``.
     """
-    seq = q.shape[1]
     q, k, v = (x.transpose(1, 2) for x in (q, k, v))  # -> (batch, heads, seq, head_size)
-    out = padded_sdpa(q, k, v, _full_attend_mask(seq), scale=scale, enable_gqa=enable_gqa)
+    out = padded_sdpa(q, k, v, None, scale=scale, enable_gqa=enable_gqa)
     return out.transpose(1, 2)
 
 

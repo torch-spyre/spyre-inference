@@ -670,8 +670,8 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
-            # weights included.
+            # SpyreFp8LinearKernel's scales and GEMM output are float16. The
+            # weight itself stays float8 in QFP8WT.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(

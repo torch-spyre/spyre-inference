@@ -692,6 +692,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+        # Checkpoint FP8 is already QFP8WT. fp16 weights on an FP8 linear are
+        # quantized once here, so apply_weights stays inside the block graph.
+        from spyre_inference.custom_ops.fp8_linear_kernel import (
+            install_qfp8wt_after_device_move,
+        )
+
+        install_qfp8wt_after_device_move(self.model)
         for module in self.model.modules():
             if isinstance(module, SpyreConv2d):
                 module.process_weights_after_loading()
@@ -733,36 +740,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             inputs_embeds_buffer=self.inputs_embeds.gpu,
         )
 
-    @staticmethod
-    def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linears.
-
-        ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
-        Granite ``compressed-tensors`` stores it on the scheme
-        (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
-        Checkpoint FP8 is dequanted to CPU fp16 in
-        ``process_weights_after_loading``; first Spyre forward caches ``qfp8wt``.
-        """
-        from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
-
-        def _is_fp8_kernel(obj: object) -> bool:
-            return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
-                getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
-            )
-
-        for module in model.modules():
-            weight = getattr(module, "weight", None)
-            if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
-                return True
-            quant_method = getattr(module, "quant_method", None)
-            if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
-                getattr(quant_method, "scheme", None)
-            ):
-                return True
-            if _is_fp8_kernel(getattr(module, "scheme", None)):
-                return True
-        return False
-
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create SpyreShapeBucketer for 1D body token sizes.
 
@@ -792,8 +769,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Install torch.compile wrappers; tracing happens on the first forward.
 
         `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
-        FP8 apply is dynamo-disabled, so ``fullgraph=False`` when the model has
-        Spyre FP8 linears.
+        FP8 ``apply_weights`` is plain tensor code, so the block graph stays
+        ``fullgraph=True``.
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -812,10 +789,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
-        # stays isolated. fullgraph=True cannot graph-break.
-        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
-        fullgraph = not uses_fp8
+        fullgraph = True
         model_name = type(self.model).__name__
 
         if granularity == "block":

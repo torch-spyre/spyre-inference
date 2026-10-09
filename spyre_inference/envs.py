@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
-    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
+    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -116,7 +116,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
     # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
     # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
-    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")),
+    # "8" (default) is measured on gemma-4-26B-A4B: gathered wins up to 8 at TP1 and TP4.
+    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "8")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

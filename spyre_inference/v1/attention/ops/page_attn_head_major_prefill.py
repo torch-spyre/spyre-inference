@@ -21,6 +21,7 @@ every query row, so this kernel spends it instead: batched GQA over
 """
 
 import torch
+from torch_spyre._inductor import spyre_hint
 
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
 
@@ -58,11 +59,17 @@ def page_attn_head_major_prefill_kernel(
     # layout -- test_spyre_compile_input_offset_specialises_the_graph. The builder now
     # creates this table at exactly padded_query_len rows.
     q_rows = query.index_select(0, query_row_index)
-    q = (
+    q_view = (
         q_rows.unsqueeze(0)
         .transpose(1, 2)
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
+    # named_dims is required: work_div can only split a dimension that's already
+    # named somewhere in the op's own input chain. Without it, "x"/"mb" below would
+    # only land on Hkv/Hq_kv by positional coincidence, and nothing downstream (e.g.
+    # a matmul hinted with a named `T` split) could inherit a real T-split from Q.
+    with spyre_hint(named_dims=["Hkv", "Hq_kv", "T", "D"], work_div={"T": 8, "Hkv": 4}):
+        q = q_view * 1.0
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
     # stacked on dim 0.

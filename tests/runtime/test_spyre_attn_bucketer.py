@@ -671,3 +671,48 @@ class TestSingleKvHeadBlockFloorTokenMajor:
         envs.clear_env_cache()
         b = SpyreAttnBucketer(make_config(num_kv_heads=1))
         assert min(b.num_blocks_buckets) == 1
+
+
+class TestLargeBatchLadder:
+    @pytest.fixture()
+    def hybrid(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "16")
+        envs.clear_env_cache()
+        return SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
+
+    def test_off_by_default(self, bucketer):
+        for s in bucketer.num_seqs_buckets:
+            assert bucketer.batched_blocks_buckets(s) == bucketer.num_blocks_buckets
+
+    def test_dense_only_at_and_above_the_threshold(self, hybrid):
+        base = hybrid.num_blocks_buckets
+        for s in hybrid.num_seqs_buckets:
+            buckets = hybrid.batched_blocks_buckets(s)
+            if s >= 16:
+                assert set(base) < set(buckets)
+            else:
+                assert buckets == base
+
+    def test_never_rounds_up_further_than_the_base_ladder(self, hybrid):
+        for num_blocks in range(1, hybrid.num_blocks_buckets[-1] + 1):
+            for s in hybrid.num_seqs_buckets:
+                batched = hybrid.find_batched_blocks_bucket(num_blocks, s)
+                assert batched <= hybrid.find_blocks_bucket(num_blocks)
+
+    def test_variants_follow_each_batch_size_ladder(self, hybrid):
+        assert {(v.num_seqs, v.num_blocks) for v in hybrid.batched_decode_variants()} == {
+            (s, n) for s in hybrid.num_seqs_buckets for n in hybrid.batched_blocks_buckets(s)
+        }
+
+    def test_per_seq_variants_keep_the_base_ladder(self, hybrid):
+        assert {v.num_blocks for v in hybrid.variants()} == set(hybrid.num_blocks_buckets)
+
+    def test_explicit_buckets_disable_it(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
+        assert b.batched_blocks_buckets(32) == b.num_blocks_buckets

@@ -36,6 +36,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LADDER: str = "pow2"
+    SPYRE_ATTN_KV_LADDER_LARGE_BATCH: str | None = None
+    SPYRE_ATTN_LARGE_BATCH_MIN_SEQS: int = 16
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
@@ -95,6 +97,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Named KV bucket ladder: pow2 (default), 8_5, 4_3, 9_8 or uniform.
     "SPYRE_ATTN_KV_LADDER": lambda: os.getenv("SPYRE_ATTN_KV_LADDER") or "pow2",
+    "SPYRE_ATTN_KV_LADDER_LARGE_BATCH": lambda: (
+        os.getenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH") or None
+    ),
+    "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS": lambda: int(
+        os.getenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS") or "16"
+    ),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),

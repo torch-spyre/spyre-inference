@@ -102,14 +102,20 @@ jobs:
         if: env.REVIEW_MODE == 'hardware'
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1. The review bot is a
+      # pure consumer (no save step), so it only ever reads the mount.
       - name: Set up uv
         if: env.REVIEW_MODE == 'hardware'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
+          enable-cache: false
+
+      - name: uv cache (NFS)
+        if: env.REVIEW_MODE == 'hardware'
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          save: 'false'
 
       - name: Install spyre-inference
         if: env.REVIEW_MODE == 'hardware'
@@ -209,7 +215,7 @@ jobs:
           # The agent posts its own PR-level summary comment (see the prompt);
           # the completion signal is the outcome reaction in the next step.
           claude -p "$prompt" \
-            --model claude-opus-4-8 \
+            --model 'claude-opus-5-5[1m]' \
             --max-turns 60 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \

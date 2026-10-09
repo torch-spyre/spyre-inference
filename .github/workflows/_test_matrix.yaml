@@ -162,7 +162,6 @@ defaults:
 
 permissions:
   contents: read
-  checks: write
   actions: read
 
 jobs:
@@ -793,7 +792,7 @@ jobs:
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
@@ -882,7 +881,7 @@ jobs:
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
@@ -1120,16 +1119,20 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          prune-cache: false
-          save-cache: ${{ github.event_name != 'merge_group' }}
+          enable-cache: false
+
+      # Restore now; the post step ships it back at job end (writers only). No
+      # use_prebaked_image gate here, unlike run-matrix-config: the perf build
+      # below runs `uv sync` unconditionally, so it needs the cache either way.
+      - name: uv cache (NFS)
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}

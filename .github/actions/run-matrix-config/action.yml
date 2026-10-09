@@ -51,8 +51,8 @@ inputs:
   use_prebaked_image:
     description: When 'true', skip the RPM install + spyre-inference build and use the runner image's stack as-is
     required: true
-  is_merge_group:
-    description: "'true' on a merge_group event -- skips the uv cache save/prune (ephemeral branch, never worth caching)"
+  storage_root:
+    description: Repo-scoped uv-cache root on the shared mount, forwarded to the uv-nfs-cache action (e.g. $STORAGE_1_DIR/.cache/uv)
     required: true
   torch_spyre_ref:
     description: Branch, tag, or SHA of torch-spyre to build from source (empty = use the pinned rev)
@@ -91,20 +91,23 @@ runs:
       if: ${{ inputs.use_prebaked_image != 'true' }}
       uses: ./.github/actions/spyre-rpm-install
 
+    # Install the uv binary only. The cache itself is shipped from the shared
+    # /storage-1 PVC by the uv-nfs-cache step below, not from the GHA cache
+    # service: setup-uv's cache keeps compiled wheels but prunes the ~77 PyPI
+    # registry wheels, so every job re-downloaded them and starved the uplink.
     - name: Set up uv
       uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
-        enable-cache: true
-        # Invalidate only on lock changes; setup-uv's default glob also hashes pyproject.toml, so config-only edits would needlessly bust the cache.
-        cache-dependency-glob: |
-          uv.lock
-          spyre-rpms.lock
-        # Use local runner temp to avoid ownership/permission issues on $HOME.
-        cache-local-path: ${{ runner.temp }}/setup-uv-cache
-        # See prune-uv-cache-safe
-        prune-cache: false
-        # Never save cache for ephemeral merge queue branches
-        save-cache: ${{ inputs.is_merge_group != 'true' }}
+        enable-cache: false
+
+    # Restore the uv cache from the mount now and ship it back at job end (the
+    # action's post step writes the main scope on push-to-main and an isolated
+    # pr-<N> scope on PRs). Merge queue needs no gate: it is not a writer.
+    - name: uv cache (NFS)
+      if: ${{ inputs.use_prebaked_image != 'true' }}
+      uses: ./.github/actions/uv-nfs-cache
+      with:
+        storage-root: ${{ inputs.storage_root }}
 
     # Layer override RPMs on top of the baseline only when the dispatch flow supplied some (rpm_names); the PR flow leaves rpm_names empty -> skipped.
     - name: Install override Spyre RPMs
@@ -157,11 +160,6 @@ runs:
       run: |
         echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
         echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
-
-    # Slim the cache for setup-uv's post-job save without discarding the compiled torch-spyre/vllm wheels; must run after the build's uv sync.
-    - name: Prune uv cache (safe)
-      if: ${{ inputs.is_merge_group != 'true' }}
-      uses: ./.github/actions/prune-uv-cache-safe
 
     - name: Ensure public HF models cached
       shell: bash

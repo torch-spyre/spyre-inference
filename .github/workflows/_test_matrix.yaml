@@ -712,7 +712,7 @@ jobs:
 
       - name: Get changed source files
         id: changed-src-files
-        uses: tj-actions/changed-files@v46
+        uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46
         with:
           # Avoid using single or double quotes for multiline patterns.
           files: |

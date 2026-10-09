@@ -1,0 +1,372 @@
+<title>PR XXX Serve Benchmark</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+  :root {
+    --ground:#FAFCFD; --surface:#F0F4F6; --surface-2:#E4EBEE;
+    --ink:#0F181C; --ink-2:#33454D; --muted:#61757D; --line:#CFDBE0;
+    --accent:#0B7285; --accent-2:#0E8FA6; --accent-wash:#E2F1F4;
+    --good:#1B6E47; --good-wash:#E0F0E7;
+    --bad:#9E2B2B; --bad-wash:#F7E4E4;
+    --warn:#8A5A11; --warn-wash:#F8EDDA;
+    --pop-good:#0FA34A; --pop-warn:#E87A00; --pop-bad:#E02424;
+    --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+    --cond:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:#0B1215; --surface:#131E22; --surface-2:#1B2A30;
+      --ink:#EAF2F4; --ink-2:#BDCED4; --muted:#879BA3; --line:#2A3C43;
+      --accent:#3FB6CB; --accent-2:#6BD0E0; --accent-wash:#122B31;
+      --good:#6ED49B; --good-wash:#12271C;
+      --bad:#F08B8B; --bad-wash:#2B1516;
+      --warn:#E2B269; --warn-wash:#2A1F0F;
+      --pop-good:#2EE07A; --pop-warn:#FF9F1A; --pop-bad:#FF4D4D;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:#0B1215; --surface:#131E22; --surface-2:#1B2A30;
+    --ink:#EAF2F4; --ink-2:#BDCED4; --muted:#879BA3; --line:#2A3C43;
+    --accent:#3FB6CB; --accent-2:#6BD0E0; --accent-wash:#122B31;
+    --good:#6ED49B; --good-wash:#12271C;
+    --bad:#F08B8B; --bad-wash:#2B1516;
+    --warn:#E2B269; --warn-wash:#2A1F0F;
+    --pop-good:#2EE07A; --pop-warn:#FF9F1A; --pop-bad:#FF4D4D;
+  }
+
+  body { background:var(--ground); color:var(--ink); font-family:var(--sans);
+         font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1600px; margin:0 auto; padding:40px 24px 72px;
+          display:flex; flex-direction:column; gap:38px; }
+
+  .eyebrow { font-family:var(--mono); font-size:11.5px; letter-spacing:.14em;
+             text-transform:uppercase; color:var(--accent); font-weight:500; }
+  h1 { font-family:var(--cond); font-weight:700; font-size:clamp(30px,4.6vw,46px);
+       line-height:1.06; margin:.28em 0 0; text-wrap:balance; letter-spacing:-.01em; }
+  .standfirst { color:var(--ink-2); font-size:16.5px; margin-top:.7em; }
+  h2 { font-family:var(--cond); font-weight:600; font-size:21px; margin:0;
+       letter-spacing:.005em; }
+  .sec { display:flex; flex-direction:column; gap:16px; }
+  .sec > p { margin:0; color:var(--ink-2); }
+  .rule { height:1px; background:var(--line); border:0; margin:0; }
+
+  /* run identity */
+  .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(196px,1fr));
+          gap:1px; background:var(--line); border:1px solid var(--line);
+          border-radius:3px; overflow:hidden; }
+  .meta div { background:var(--surface); padding:12px 14px; }
+  .meta dt { font-family:var(--mono); font-size:10.5px; letter-spacing:.11em;
+             text-transform:uppercase; color:var(--muted); }
+  .meta dd { margin:4px 0 0; font-family:var(--mono); font-size:13px; color:var(--ink); }
+
+  /* headline tiles */
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:14px; }
+  .tile { background:var(--surface); border:1px solid var(--line); border-radius:4px;
+          padding:16px 17px; display:flex; flex-direction:column; gap:3px; }
+  .tile .lab { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em;
+               text-transform:uppercase; color:var(--muted); }
+  .tile .big { font-family:var(--cond); font-weight:700; font-size:38px; line-height:1;
+               color:var(--accent); font-variant-numeric:tabular-nums; margin-top:3px; }
+  .tile .sub { font-family:var(--mono); font-size:11.5px; color:var(--ink-2); }
+  .tile.flat .big { color:var(--muted); }
+  .tile.warn .big { color:var(--pop-warn); }
+  .tile.bad .big { color:var(--pop-bad); }
+  .tile .sub .caveat { margin-left:0; }
+
+  /* commit sequence: order is real (main -> merge -> feedback) */
+  .seq { display:flex; flex-direction:column; gap:0; border-left:2px solid var(--line);
+         padding-left:0; }
+  .step { display:grid; grid-template-columns:34px 1fr; gap:14px; padding:13px 0 13px 16px;
+          border-bottom:1px solid var(--line); }
+  .step:last-child { border-bottom:0; }
+  .step .n { font-family:var(--mono); font-size:11px; color:var(--accent);
+             letter-spacing:.06em; padding-top:3px; }
+  .step .sha { font-family:var(--mono); font-size:13.5px; font-weight:600; color:var(--ink); }
+  .step .txt { color:var(--ink-2); font-size:14px; margin-top:2px; }
+
+  /* metric table */
+  .scroll { overflow-x:auto; border:1px solid var(--line); border-radius:4px;
+            background:var(--surface); }
+  table { border-collapse:collapse; width:100%; font-family:var(--mono);
+          font-size:12.5px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  thead th { background:var(--surface-2); color:var(--ink); font-weight:600;
+             text-align:right; padding:8px 13px; border-bottom:1px solid var(--line);
+             position:relative; }
+  thead th.k { text-align:left; }
+  thead tr.grp th { font-family:var(--cond); font-size:13px; letter-spacing:.06em;
+                    text-transform:uppercase; color:var(--accent); text-align:center;
+                    border-bottom:1px solid var(--line); padding-top:10px; }
+  thead tr.grp th.gap { color:var(--muted); }
+  th.div, td.div { border-left:2px solid var(--line); }
+  tbody td { padding:6px 13px; text-align:right; border-bottom:1px solid var(--line);
+             color:var(--ink); }
+  tbody td.k { text-align:left; color:var(--ink-2); white-space:nowrap;
+               font-family:var(--sans); font-size:13px; }
+  tbody tr.band td { background:var(--surface-2); font-family:var(--cond);
+                     font-size:12px; letter-spacing:.09em; text-transform:uppercase;
+                     color:var(--muted); padding:7px 13px; text-align:left; }
+  tbody tr:hover td:not(.k) { background:var(--accent-wash); }
+  /* delta column: better / within noise (no class) / a bit worse / much worse */
+  td.d-good { color:var(--pop-good); font-weight:800; }
+  td.d-warn { color:var(--pop-warn); font-weight:800; }
+  td.d-bad { color:var(--pop-bad); font-weight:800; }
+  tr.unreliable td, tr.unreliable td.k { color:var(--muted); }
+  .caveat { color:var(--pop-warn); font-family:var(--mono); font-size:11px; font-weight:700; margin-left:8px; }
+  td.pend { color:var(--muted); }
+
+  /* validity */
+  .legs { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:12px; }
+  .leg { border:1px solid var(--line); border-left:3px solid var(--good);
+         border-radius:3px; background:var(--surface); padding:12px 14px;
+         display:flex; flex-direction:column; gap:3px; }
+  .leg.bad { border-left-color:var(--bad); }
+  .leg.pending { border-left-color:var(--warn); }
+  .leg .who { font-family:var(--mono); font-size:12.5px; font-weight:600; }
+  .leg .st { font-family:var(--mono); font-size:11px; letter-spacing:.06em;
+             text-transform:uppercase; }
+  .leg .st.ok { color:var(--good); } .leg .st.no { color:var(--bad); }
+  .leg .st.wt { color:var(--warn); }
+  .leg .det { font-size:13px; color:var(--ink-2); }
+
+  .note { border:1px solid var(--line); border-radius:4px; background:var(--surface);
+          padding:16px 18px; display:flex; flex-direction:column; gap:9px; }
+  .note.warn { background:var(--warn-wash); border-color:var(--warn); }
+  .note.alert { background:var(--bad-wash); border-color:var(--bad); }
+  .note h3 { font-family:var(--cond); font-size:16px; margin:0; font-weight:600; }
+  .note p { margin:0; font-size:14px; color:var(--ink-2); }
+  .note p strong { color:var(--ink); }
+  pre { font-family:var(--mono); font-size:11.5px; background:var(--ground);
+        border:1px solid var(--line); border-radius:3px; padding:11px 13px;
+        overflow-x:auto; margin:0; color:var(--ink-2); line-height:1.5; }
+  code { font-family:var(--mono); font-size:.93em; }
+  ul { margin:0; padding-left:1.15em; color:var(--ink-2); font-size:14px; }
+  li { margin:.3em 0; } li::marker { color:var(--accent); }
+  footer { font-family:var(--mono); font-size:11.5px; color:var(--muted);
+           border-top:1px solid var(--line); padding-top:16px; }
+  a { color:var(--accent); }
+  :focus-visible { outline:2px solid var(--accent-2); outline-offset:2px; }
+  @media (prefers-reduced-motion:reduce) { * { transition:none!important; animation:none!important; } }
+</style>
+
+<!-- EXAMPLE REPORT. The PR, numbers and hosts are illustrative: copy the structure and level of detail, never the values. -->
+<div class="wrap">
+
+  <header>
+    <div class="eyebrow">spyre-inference &middot; PR #XXX</div>
+    <h1>PR #XXX vs main: decode optimization</h1>
+    <p class="standfirst">PR #XXX optimizes decode by batching the per-sequence KV gathers into one kernel. On granite-3.3-8b at TP4 with the 8k cics trace, output throughput rises <strong>27%</strong> and mean ITL falls <strong>22%</strong>. Median and P99 TTFT are flat, but mean TTFT is slightly worse (+4%) and P100 TTFT regresses <strong>18%</strong>.</p>
+  </header>
+
+  <dl class="meta">
+    <div><dt>Date</dt><dd>2026-10-08</dd></div>
+    <div><dt>Model</dt><dd>ibm-granite/granite-3.3-8b-instruct</dd></div>
+    <div><dt>Workload</dt><dd>cics &middot; 100 prompts</dd></div>
+    <div><dt>TP / max-model-len</dt><dd>4 / 8192</dd></div>
+    <div><dt>max-num-seqs / concurrency</dt><dd>4 / 4</dd></div>
+    <div><dt>Host</dt><dd>spyre-dev-pod-1</dd></div>
+  </dl>
+
+  <section class="sec">
+    <h2>Headline</h2>
+    <div class="tiles">
+      <div class="tile">
+        <span class="lab">Output throughput</span>
+        <span class="big">+27.4%</span>
+        <span class="sub">xx &rarr; xx tok/s</span>
+      </div>
+      <div class="tile">
+        <span class="lab">Mean ITL</span>
+        <span class="big">&minus;22.4%</span>
+        <span class="sub">xx &rarr; xx ms</span>
+      </div>
+      <div class="tile warn">
+        <span class="lab">Mean TTFT</span>
+        <span class="big">+4.2%</span>
+        <span class="sub">xx &rarr; xx ms</span>
+      </div>
+      <div class="tile bad">
+        <span class="lab">P100 TTFT</span>
+        <span class="big">+18.4%</span>
+        <span class="sub">xx &rarr; xx ms</span>
+      </div>
+      <div class="tile flat">
+        <span class="lab">Server startup</span>
+        <span class="big">+1.2%</span>
+        <span class="sub"><span class="caveat">unreliable: kernel cache on</span></span>
+      </div>
+    </div>
+    <p>Throughput and ITL move by about the same amount, as expected when each decode step gets shorter at fixed concurrency. P100 ITL hardly changes (&minus;1.3%), and the TTFT regression is confined to the tail: the slowest prefill is 18% slower while the median and P99 are unchanged. Worth checking whether the PR's decode path delays a prefill that lands in a busy batch.</p>
+  </section>
+
+  <hr class="rule">
+
+  <section class="sec">
+    <h2>What was compared</h2>
+    <div class="seq">
+      <div class="step">
+        <span class="n">01</span>
+        <div><div class="sha">2a11d3b &middot; PR #XXX (target)</div>
+        <div class="txt">Decode optimization. Ran first.</div></div>
+      </div>
+      <div class="step">
+        <span class="n">02</span>
+        <div><div class="sha">022255a &middot; main (baseline)</div>
+        <div class="txt">Merge base of the PR with upstream/main.</div></div>
+      </div>
+    </div>
+    <p>Both legs pin the same torch-spyre (<code>8744437</code>), vLLM (<code>v0.28.0</code>) and <code>spyre-rpms.lock</code>, so only the spyre-inference code changed between them. Both ran from one harness checkout and one venv, with the editable install switched to each leg's worktree.</p>
+  </section>
+
+  <section class="sec">
+    <h2>Serving benchmark results</h2>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr class="grp"><th class="k"></th><th colspan="3">granite-3.3-8b &middot; tp4 &middot; cics 8k &middot; bs4</th></tr>
+          <tr><th class="k">Metric</th><th>main</th><th>PR #XXX</th><th>&Delta;</th></tr>
+        </thead>
+        <tbody>
+          <tr class="unreliable"><td class="k">Server startup (s)<span class="caveat">unreliable: kernel cache on</span></td><td>xx</td><td>xx</td><td>+1.2%</td></tr>
+          <tr class="band"><td colspan="4">Startup and compilation</td></tr>
+          <tr class="unreliable"><td class="k">Init engine (s)<span class="caveat">unreliable: kernel cache on</span></td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
+          <tr class="unreliable"><td class="k">Total compilation (s)<span class="caveat">unreliable: kernel cache on</span></td><td>xx</td><td>xx</td><td>+1.1%</td></tr>
+          <tr class="unreliable"><td class="k">Model graph warmup (s)<span class="caveat">unreliable: kernel cache on</span></td><td>xx</td><td>xx</td><td>−0.4%</td></tr>
+          <tr><td class="k">Model graph buckets</td><td>5</td><td>5</td><td></td></tr>
+          <tr class="unreliable"><td class="k">Attention graph recording (s)<span class="caveat">unreliable: kernel cache on</span></td><td>xx</td><td>xx</td><td>+1.5%</td></tr>
+          <tr><td class="k">Attention graphs</td><td>1440</td><td>1440</td><td></td></tr>
+          <tr><td class="k">Per layer: per-seq + batched-decode</td><td>12 + 24</td><td>12 + 24</td><td></td></tr>
+          <tr class="band"><td colspan="4">Request summary</td></tr>
+          <tr><td class="k">Successful requests</td><td>100</td><td>100</td><td></td></tr>
+          <tr><td class="k">Failed requests</td><td>0</td><td>0</td><td></td></tr>
+          <tr><td class="k">Max request concurrency</td><td>4</td><td>4</td><td></td></tr>
+          <tr><td class="k">Benchmark duration (s)</td><td>xx</td><td>xx</td><td class="d-good">−21.5%</td></tr>
+          <tr><td class="k">Total input tokens</td><td>410566</td><td>410566</td><td></td></tr>
+          <tr><td class="k">Total generated tokens</td><td>51203</td><td>51203</td><td></td></tr>
+          <tr><td class="k">Request throughput (req/s)</td><td>xx</td><td>xx</td><td></td></tr>
+          <tr><td class="k">Output token throughput (tok/s)</td><td>xx</td><td>xx</td><td class="d-good">+27.4%</td></tr>
+          <tr><td class="k">Peak output token throughput (tok/s)</td><td>xx</td><td>xx</td><td></td></tr>
+          <tr><td class="k">Peak concurrent requests</td><td>5.00</td><td>5.00</td><td></td></tr>
+          <tr><td class="k">Total token throughput (tok/s)</td><td>xx</td><td>xx</td><td class="d-good">+27.4%</td></tr>
+          <tr class="band"><td colspan="4">Time to first token</td></tr>
+          <tr><td class="k">Mean TTFT (ms)</td><td>xx</td><td>xx</td><td class="d-warn">+4.2%</td></tr>
+          <tr><td class="k">Median TTFT (ms)</td><td>xx</td><td>xx</td><td>+0.3%</td></tr>
+          <tr><td class="k">P99 TTFT (ms)</td><td>xx</td><td>xx</td><td>−0.4%</td></tr>
+          <tr><td class="k">P100 TTFT (ms)</td><td>xx</td><td>xx</td><td class="d-bad">+18.4%</td></tr>
+          <tr class="band"><td colspan="4">Time per output token (excl. first)</td></tr>
+          <tr><td class="k">Mean TPOT (ms)</td><td>xx</td><td>xx</td><td class="d-good">−22.5%</td></tr>
+          <tr><td class="k">Median TPOT (ms)</td><td>xx</td><td>xx</td><td class="d-good">−22.5%</td></tr>
+          <tr><td class="k">P99 TPOT (ms)</td><td>xx</td><td>xx</td><td class="d-good">−21.8%</td></tr>
+          <tr><td class="k">P100 TPOT (ms)</td><td>xx</td><td>xx</td><td class="d-good">−21.5%</td></tr>
+          <tr class="band"><td colspan="4">Inter-token latency</td></tr>
+          <tr><td class="k">Mean ITL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−22.4%</td></tr>
+          <tr><td class="k">Median ITL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−22.6%</td></tr>
+          <tr><td class="k">P99 ITL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−13.3%</td></tr>
+          <tr><td class="k">P100 ITL (ms)</td><td>xx</td><td>xx</td><td>−1.3%</td></tr>
+          <tr class="band"><td colspan="4">End-to-end latency</td></tr>
+          <tr><td class="k">Mean E2EL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−21.6%</td></tr>
+          <tr><td class="k">Median E2EL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−21.6%</td></tr>
+          <tr><td class="k">P99 E2EL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−21.1%</td></tr>
+          <tr><td class="k">P100 E2EL (ms)</td><td>xx</td><td>xx</td><td class="d-good">−20.7%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Server startup is measured from the first timestamp in <code>_server.log</code> to the last timestamp before <code>Application startup complete</code>. With <code>SPYRE_KERNEL_CACHE=1</code> it depends on how much of the cache was already populated, which is unknown, so it is not comparable between legs. Rerun with <code>SPYRE_KERNEL_CACHE=0</code> to measure it. The startup and compilation rows come from <code>_server.log</code>, as the max across TP workers. Total compilation is the wall time of the whole Spyre warmup, which covers model graph warmup and attention graph recording. &Delta; colours: green better, black within &plusmn;2%, orange 2&ndash;10% worse, red more than 10% worse.</p>
+  </section>
+
+  <hr class="rule">
+
+  <section class="sec">
+    <h2>Leg validity</h2>
+    <div class="legs">
+      <div class="leg"><span class="who">PR #XXX &middot; tp4 cics 8k</span><span class="st ok">valid</span><span class="det">100/100 &middot; 0 failed &middot; ITL mean/median 1.04</span></div>
+      <div class="leg"><span class="who">main &middot; tp4 cics 8k</span><span class="st ok">valid</span><span class="det">100/100 &middot; 0 failed &middot; ITL mean/median 1.03</span></div>
+    </div>
+    <div class="note">
+      <h3>Caveats</h3>
+      <ul>
+        <li>One run per leg (n=1). The deltas are well beyond the p50&rarr;p99 TPOT spread, but they were not repeated.</li>
+        <li>No ITL mean/median ratio is above 1.1, so there is no sign of compilation inside the measured window.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="sec">
+    <h2>Environment</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th class="k">Component</th><th class="k">PR #XXX</th><th class="k">main</th></tr></thead>
+        <tbody>
+          <tr><td class="k">spyre-inference</td><td class="k"><code>2a11d3b</code></td><td class="k"><code>022255a</code></td></tr>
+          <tr><td class="k">torch-spyre</td><td class="k" colspan="2"><code>874443706c575fc9d711b1898b7a0a34d52cc28a</code></td></tr>
+          <tr><td class="k">torch</td><td class="k" colspan="2">2.13.0+cpu</td></tr>
+          <tr><td class="k">vLLM</td><td class="k" colspan="2">0.28.0</td></tr>
+          <tr><td class="k">ibm-aiu-toolbox-e2e</td><td class="k" colspan="2">2.0.0-0.main.1+33.a2b6d58_157</td></tr>
+          <tr><td class="k">ibm-deeptools</td><td class="k" colspan="2">2.0.0-0.main.1+2628.5a2d7b4_420</td></tr>
+          <tr><td class="k">ibm-flex</td><td class="k" colspan="2">2.0.0-0.main.1+646.c7f97f1_545</td></tr>
+          <tr><td class="k">ibm-senlib-core</td><td class="k" colspan="2">2.0.0-0.main.1+305.520d28d_422</td></tr>
+          <tr><td class="k">ibm-senlib-dd2</td><td class="k" colspan="2">2.0.0-0.main.1+305.520d28d_422</td></tr>
+          <tr><td class="k">ibm-spyre-comms</td><td class="k" colspan="2">2.0.0-0.main.1+191.be0037b_279</td></tr>
+          <tr><td class="k">ibm-libaiupti</td><td class="k" colspan="2">2.0.0-0.main.1+36.5fdd6e3_72</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>RPM source: <code>~/spyre-libs</code>, installed from <code>spyre-rpms.lock</code> (<code>[packages]</code>, x86_64). Both legs used the same env:</p>
+    <pre>SPYRE_KERNEL_CACHE=1
+SPYRE_DEVICES=0,1,2,3            # derived from tensor-parallel-size</pre>
+  </section>
+
+  <section class="sec">
+    <h2>Reproduction</h2>
+    <p><code>bench-prXXX/serve-tests.yaml</code></p>
+    <pre>defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 100
+    custom-output-len: -1
+    ignore-eos: true
+    disable-shuffle: true
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 4
+
+tests:
+  - test_name: serve_granite33-8b_tp4_cics8k_bs4
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}</pre>
+    <p>Run, once per leg (target first), with the editable install pointing at that leg's commit:</p>
+    <pre>[ -f ~/spyre-libs/env.sh ] &amp;&amp; source ~/spyre-libs/env.sh
+source spyre-inference/.venv/bin/activate
+export SPYRE_KERNEL_CACHE=1
+cd spyre-inference &amp;&amp; make perf-tests BENCH_TYPES=serve \
+  BENCH_CONFIGS_DIR=../bench-prXXX RESULTS_DIR=../bench-prXXX/&lt;leg&gt;/results</pre>
+    <p>Server command (from <code>_server.cmd</code>):</p>
+    <pre>AIU_WORLD_SIZE=4 DTLOG_LEVEL=error SPYRE_DEVICES=0,1,2,3 VLLM_CPU_KVCACHE_SPACE=64 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600 \
+  python -m vllm.entrypoints.cli.main serve ibm-granite/granite-3.3-8b-instruct \
+  --load-format auto --max-num-seqs 4 --max-num-batched-tokens 512 --enable-prefix-caching \
+  --tensor-parallel-size 4 --max-model-len 8192</pre>
+    <p>Bench command (from <code>_bench.cmd</code>):</p>
+    <pre>python -m vllm.entrypoints.cli.main bench serve \
+  --dataset-name custom --num-prompts 100 --custom-output-len -1 --ignore-eos --disable-shuffle \
+  --endpoint /v1/completions --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 99,100 \
+  --max-concurrency 4 --dataset-path /models/online_benchmarking_data_reordered/cics_results_2025.11.03_e2ee1b0_correct_order.jsonl \
+  --model ibm-granite/granite-3.3-8b-instruct --skip-chat-template \
+  --save-result --result-dir bench-prXXX/&lt;leg&gt;/results --result-filename serve_granite33-8b_tp4_cics8k_bs4.json</pre>
+  </section>
+
+  <footer> 2 legs, both valid &middot; 2 serve runs over ~xx h &middot; spyre-dev-pod-1 &middot; raw logs and JSON under <code>bench-prXXX/</code> </footer>
+
+</div>

@@ -19,15 +19,9 @@ Each test exercises a single primitive that spyre-inference needs on-device
 primitives so their workarounds can be removed. The one-row matmul timing probe
 is non-strict: an XPASS calls for remeasurement before removing its workaround.
 
-Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
-probes need no device and inspect vLLM instead.
-
 All device tests run against the real Spyre device when available; otherwise
 they skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
-
-import inspect
-import re
 
 import pytest
 import torch
@@ -1161,42 +1155,7 @@ def test_spyre_fp32_linear_for_pooling_heads(spyre_device, mode):
 
 
 # ---------------------------------------------------------------------------
-# 12. Upstream vLLM workarounds (no device needed)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Gemma4SelfDecoderLayers re-stores four scalar buffers owned by "
-        "Gemma4Model as plain attributes, so model.to('spyre') leaves them on "
-        "CPU and the compiled embed_input_ids gets a 0-d CPU graph input. "
-        "Fixed upstream by vllm-project/vllm#54213; when that lands, drop "
-        "models/gemma4.py::register_aliased_scalars and its call site."
-    ),
-)
-def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
-    """The aliased scalars must be buffers, so ``.to(device)`` moves them.
-
-    Source inspection rather than construction: ``Gemma4SelfDecoderLayers`` is a
-    ``support_torch_compile`` wrapper whose ``__init__`` wants a built parent
-    model, and what the fix changes is exactly these four assignments.
-    """
-    from spyre_inference.models.gemma4 import _ALIASED_SCALARS
-
-    gemma4 = pytest.importorskip("vllm.model_executor.models.gemma4")
-    src = inspect.getsource(gemma4.Gemma4SelfDecoderLayers.__init__)
-
-    plain = [
-        name
-        for name in _ALIASED_SCALARS
-        if not re.search(rf"""register_buffer\(\s*["']{name}["']""", src)
-    ]
-    assert not plain, f"still plain attributes upstream: {plain}"
-
-
-# ---------------------------------------------------------------------------
-# 13. Short-row matmul scheduling
+# 12. Short-row matmul scheduling
 # ---------------------------------------------------------------------------
 
 
@@ -1244,7 +1203,7 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 14. Compiled Pixtral vision attention (coarse-tile hint split)
+# 13. Compiled Pixtral vision attention (coarse-tile hint split)
 # ---------------------------------------------------------------------------
 
 
@@ -1337,7 +1296,7 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
 
 
 # ---------------------------------------------------------------------------
-# 15. Eager GemmaRMSNorm
+# 14. Eager GemmaRMSNorm
 # ---------------------------------------------------------------------------
 
 

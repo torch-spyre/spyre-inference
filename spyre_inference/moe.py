@@ -532,8 +532,11 @@ class SpyreMoERunner(MoERunner):
 class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
     """OOT bridge from vLLM's unquantized MoE method to ``SpyreMoERecipe``."""
 
-    # The source expert parameters are replaced with device-specific stacks.
-    supports_pre_processed_weights = False
+    def __init__(self, moe) -> None:
+        super().__init__(moe)
+        # The source expert parameters are replaced with device-specific stacks. Set
+        # after super().__init__, which since 0.31 assigns this per instance.
+        self.supports_pre_processed_weights = False
 
     @property
     def is_monolithic(self) -> bool:

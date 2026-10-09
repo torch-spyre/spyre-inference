@@ -34,16 +34,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-# Scalar buffers that ``Gemma4Model`` owns and ``Gemma4SelfDecoderLayers``
-# re-exposes as plain attributes.
-_ALIASED_SCALARS = (
-    "normalizer",
-    "embed_scale_per_layer",
-    "per_layer_input_scale",
-    "per_layer_projection_scale",
-)
-
-
 # Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
 # mapped to the per-layer attribute of the same role it is rebuilt from.
 _GEMMA4_FULL_ATTENTION_ATTRS = {
@@ -155,17 +145,6 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
-def register_aliased_scalars(decoder: nn.Module) -> None:
-    """Turn the self-decoder's aliased scalar attributes into buffers."""
-    buffers = dict(decoder.named_buffers(recurse=False))
-    for name in _ALIASED_SCALARS:
-        scalar = getattr(decoder, name, None)
-        if scalar is None or name in buffers:
-            continue
-        delattr(decoder, name)
-        decoder.register_buffer(name, scalar, persistent=False)
-
-
 def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Fold Gemma's output scale into the source down-projection stack."""
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
@@ -176,15 +155,19 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
 
     configured = 0
     for decoder in layers:
-        moe = getattr(decoder, "moe", None)
-        if moe is None:
+        # 0.31 dropped the Gemma4MoE wrapper: the decoder holds the experts directly,
+        # and per_expert_scale moved to its router.
+        experts = getattr(decoder, "experts", None)
+        if experts is None:
             continue
         configure_spyre_moe_layer(
-            moe.experts.routed_experts,
+            experts.routed_experts,
             SpyreMoERecipe(
                 activation="gelu_tanh",
                 routing="full_softmax",
-                prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
+                prepare_down_weight=partial(
+                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                ),
             ),
         )
         configured += 1
@@ -193,18 +176,8 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
 
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
-
-    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
-    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
-    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
-    CPU tensor into Inductor, which has no notion of a live CPU graph input.
-    Re-registering the aliases restores the parent's stated intent (move with the
-    model, interact with torch.compile) and needs no change to the embedding math:
-    a device-side 0-d scalar lowers fine.
-    """
+    """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        register_aliased_scalars(self.model.self_decoder)
         configure_gemma4_moe_layers(self.model.layers)

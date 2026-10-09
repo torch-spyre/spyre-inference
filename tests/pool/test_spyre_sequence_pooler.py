@@ -39,6 +39,8 @@ def _metadata(lens: list[int], task: str) -> PoolingMetadata:
         prompt_lens_cpu=lens_t,
         seq_lens_cpu=lens_t,
         num_scheduled_tokens_cpu=lens_t,
+        partial_prefill=False,
+        finished_mask=[True] * len(lens),
     )
     return PoolingMetadata(
         prompt_lens=lens_t,

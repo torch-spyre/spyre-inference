@@ -5193,7 +5193,7 @@ requires-dist = [
     { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=58c36f517f226f8a0d10ee4e7f02b98490399950" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
-    { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.28.0" },
+    { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.31.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -5878,8 +5878,8 @@ wheels = [
 
 [[package]]
 name = "vllm"
-version = "0.28.0+empty"
-source = { git = "https://github.com/vllm-project/vllm?rev=v0.28.0#2cf0a6915ce544dc493a0990f2ea38d81601128a" }
+version = "0.31.0+empty"
+source = { git = "https://github.com/vllm-project/vllm?rev=v0.31.0#db9527a46873454610df6dbedf79a36d6bf1a7f6" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },

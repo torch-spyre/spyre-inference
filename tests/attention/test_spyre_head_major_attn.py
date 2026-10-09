@@ -1266,3 +1266,167 @@ def test_head_major_warmup_records_a_batched_decode_variant(
 
     del kv_cache
     gc.collect()
+
+
+@pytest.mark.parametrize(
+    "num_seqs,context_blocks",
+    [
+        pytest.param(1, 4, id="bs1"),
+        pytest.param(2, 1, id="bs2_short"),
+        # 21 blocks round up to 32 = two 16-block chunks at bs2, so the merge is traced too.
+        pytest.param(2, 20, id="bs2_two_chunks"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+@torch.inference_mode()
+def test_head_major_inline_decode_reads_its_own_write(
+    default_vllm_config,
+    monkeypatch,
+    num_seqs,
+    context_blocks,
+    configure_compilation,
+    configure_device,
+):
+    """KV write and traced attention in one graph: the gather must see the scatter.
+
+    Each sequence's new token is the only key in its last page and aligned with its own
+    query, so it dominates the softmax: a gather ordered before the scatter, or a read of
+    a stale copy, would be far off rather than slightly so.
+    """
+    from types import SimpleNamespace
+
+    from spyre_testing_plugin.attn_helpers import (
+        _build_metadata,
+        _fused_qkv_kv_views,
+        assert_close_outliers,
+        ref_attn,
+    )
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention import attn_layer
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    heads, kv_heads, head_size, block_size, num_blocks = 32, 8, 128, 128, 128
+    qpk = heads // kv_heads
+    kv_len = context_blocks * block_size + 1
+    device = torch.device(configure_device)
+
+    from vllm.config import get_current_vllm_config
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.cache_config.block_size = block_size
+    vllm_config.model_config.max_model_len = 32 * block_size
+    width = SpyreAttnBucketer._round_up(
+        context_blocks + 1, SpyreAttnBucketer(vllm_config).num_blocks_buckets
+    )
+    assert width is not None, "the default config's KV buckets stop short of this context"
+    # Distinct real pages, never the null block.
+    block_tables = (torch.randperm(num_blocks - 1)[: num_seqs * width] + 1).reshape(num_seqs, width)
+    block_tables = block_tables.to(torch.int32)
+
+    query = torch.randn(num_seqs, heads, head_size, dtype=DTYPE)
+    key = (query.float().view(num_seqs, kv_heads, qpk, head_size).mean(2) * 3).to(DTYPE)
+    value = torch.randn(num_seqs, kv_heads, head_size, dtype=DTYPE) * 4
+
+    k_expected = torch.zeros(num_blocks, kv_heads, block_size, head_size, dtype=DTYPE)
+    v_expected = torch.zeros_like(k_expected)
+    hist_k = torch.randn(num_seqs, kv_len - 1, kv_heads, head_size, dtype=DTYPE)
+    hist_v = torch.randn_like(hist_k)
+    hist_slots, new_slots = [], []
+    for s in range(num_seqs):
+        for t in range(kv_len):
+            blk, off = int(block_tables[s, t // block_size]), t % block_size
+            k_src = key[s] if t == kv_len - 1 else hist_k[s, t]
+            v_src = value[s] if t == kv_len - 1 else hist_v[s, t]
+            k_expected[blk, :, off], v_expected[blk, :, off] = k_src, v_src
+            (new_slots if t == kv_len - 1 else hist_slots).append(blk * block_size + off)
+    slot_mapping = torch.tensor(new_slots, dtype=torch.int64)
+
+    metadata = _build_metadata(
+        num_query_heads=heads,
+        num_kv_heads=kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.full((num_seqs,), kv_len, dtype=torch.int32),
+        query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+        block_table=block_tables,
+        slot_mapping=slot_mapping,
+    )
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=heads, head_size=head_size, scale=head_size**-0.5, num_kv_heads=kv_heads
+    )
+    k_pages, v_pages = _fresh_pages(num_blocks, kv_heads, block_size, head_size, device)
+    kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+    _write(
+        impl,
+        kv_cache,
+        convert(hist_k.reshape(-1, kv_heads, head_size), device),
+        convert(hist_v.reshape(-1, kv_heads, head_size), device),
+        torch.tensor(hist_slots, dtype=torch.int64),
+        device,
+    )
+
+    layer = SimpleNamespace(
+        attn_type=AttentionType.DECODER,
+        impl=impl,
+        kv_sharing_target_layer_name=None,
+        query_quant=None,
+        kv_cache=kv_cache,
+    )
+    # The runner sets this; `step` below really does compile with fullgraph=True.
+    monkeypatch.setattr(attn_layer, "outer_graph_fullgraph", True)
+    slots, grid = attn_layer.install([layer])
+    assert grid.inline
+    slots.publish(slot_mapping)
+    grid.publish(metadata)
+    assert grid.mask is not None, "the step did not take the inline path"
+    # Allocated before the first trace, as warmup does (allocate_staging_buffers).
+    impl.staging_buffers(device)
+
+    def step(q, k, v):
+        impl.do_kv_cache_update(layer, k, v, layer.kv_cache, slots.slots)
+        return attn_layer._inline_batched_decode(layer, grid, q)
+
+    key_src, value_src = _fused_qkv_kv_views(query, key, value, device)
+    out = torch.compile(step, fullgraph=True, dynamic=False)(
+        convert(query, device), key_src, value_src
+    )
+
+    ref_kwargs = dict(
+        query=query,
+        query_lens=[1] * num_seqs,
+        block_tables=block_tables,
+        block_size=block_size,
+        scale=head_size**-0.5,
+        sliding_window=None,
+        soft_cap=None,
+        alibi_slopes=None,
+    )
+    ref = ref_attn(
+        key_cache=k_expected.permute(0, 2, 1, 3),
+        value_cache=v_expected.permute(0, 2, 1, 3),
+        kv_lens=[kv_len] * num_seqs,
+        **ref_kwargs,
+    )
+    stale = ref_attn(
+        key_cache=k_expected.permute(0, 2, 1, 3),
+        value_cache=v_expected.permute(0, 2, 1, 3),
+        kv_lens=[kv_len - 1] * num_seqs,
+        **ref_kwargs,
+    )
+    # Otherwise the test could not tell a stale read from a correct one.
+    assert (ref - stale).abs().max() > 1.0
+    assert_close_outliers(
+        out.cpu(), ref, max_outliers=5, atol=0.2, rtol=0.2, outlier_atol=0.4, outlier_rtol=0.4
+    )
+
+    del k_pages, v_pages, kv_cache
+    gc.collect()

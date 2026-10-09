@@ -568,6 +568,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     the dual-buffer device placement pattern.
     """
 
+    # Set only inside _warm_inline_decode, so its dummies keep the grids it publishes.
+    _warming_inline_decode = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Store the real Spyre device before super().__init__ so that
         # _make_buffer can place .gpu tensors on Spyre directly.
@@ -808,6 +811,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # so the backend compiles one block rather than a program that grows with depth.
         granularity = _compile_granularity()
 
+        # Reset before the eager short-circuit: module-global, so a previous runner in this
+        # process must not leave it set for an eager one.
+        attn_layer.outer_graph_fullgraph = False
+
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
@@ -816,6 +823,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # stays isolated. fullgraph=True cannot graph-break.
         uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
         fullgraph = not uses_fp8
+        attn_layer.outer_graph_fullgraph = fullgraph
         model_name = type(self.model).__name__
 
         if granularity == "block":
@@ -963,6 +971,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
+            self._warm_inline_decode()
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
@@ -970,6 +979,47 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+
+    @torch.inference_mode()
+    def _warm_inline_decode(self) -> None:
+        """Compile each inline decode block graph, its grid published as serving does."""
+        # Nothing traces in eagerly, and a grid needs a bound cache to mirror onto.
+        if self.compilation_config.mode is CompilationMode.NONE or not self._spyre_kv_caches:
+            return
+        builders = [
+            b for b in dict.fromkeys(self._attn_metadata_builders().values()) if b.inlines_decode
+        ]
+        bucketer = self.spyre_shape_bucketer
+        if not builders or bucketer is None:
+            return
+        attn_bucketer = builders[0].attn_bucketer
+        # A decode step of n sequences runs n body tokens but n's sequence bucket of
+        # attention rows; custom compile_sizes can pair one bucket with several T.
+        body_buckets: dict[int, set[int]] = {}
+        for n in range(1, self.max_num_reqs + 1):
+            b_seqs, body = attn_bucketer.find_sequence_bucket(n), bucketer.find_bucket(n)
+            if b_seqs is not None and body is not None:
+                body_buckets.setdefault(b_seqs, set()).add(body)
+
+        t0 = time.time()
+        warmed: set[tuple] = set()
+        self._warming_inline_decode = True
+        try:
+            for bucket in attn_bucketer.batched_decode_variants():
+                for num_tokens in sorted(body_buckets.get(bucket.num_seqs, ()), reverse=True):
+                    keys = tuple(b.publish_decode_warmup_variant(bucket) for b in builders)
+                    if all(k is None for k in keys) or (num_tokens, keys) in warmed:
+                        continue
+                    warmed.add((num_tokens, keys))
+                    self._dummy_run(num_tokens)
+        finally:
+            self._warming_inline_decode = False
+            attn_layer.clear_decode_grids()
+        logger.info(
+            "Warmed %d inline decode block graph shape(s) in %.3fs.",
+            len(warmed),
+            time.time() - t0,
+        )
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
@@ -1322,7 +1372,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # pin this override to upstream's parameter order across vLLM bumps.
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
-            attn_layer.publish_null_slots(num_tokens)
+            attn_layer.publish_null_slots(num_tokens, keep_decode_grids=self._warming_inline_decode)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

@@ -1556,7 +1556,7 @@ def test_install_patches_layers_not_the_attention_class():
     decoder = _StubAttentionLayer(AttentionType.DECODER)
     encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
 
-    holder = attn_layer.install([decoder, encoder])
+    holder, _ = attn_layer.install([decoder, encoder])
 
     assert Attention.forward is class_forward
     assert decoder.spyre_slots is holder

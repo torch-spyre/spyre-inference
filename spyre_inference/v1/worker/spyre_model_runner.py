@@ -890,6 +890,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         block graph, ``_warm_encoder_inline_paths`` gives each rectangle its own dummy and
         forces one onto the ragged path, which is what reaches the impl.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
+        A pooling model with a vision tower also runs ``embed_multimodal`` at every
+        image-batch width up to ``mm_max_items_per_batch``; profile_run only traces
+        the widest one, and the tower stays eager.
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
@@ -921,6 +924,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     # the dummy-batch seq_lens bug. No-op for encoder-only pooling
                     # models (BERT/RoBERTa), which never get a KV cache.
                     self._record_attention_graphs()
+                # CLIP's vision tower is eager and profile_run only traces the widest
+                # image batch, so every narrower width would compile on the first request.
+                self._warmup_multimodal_encoder()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
             return
 
@@ -934,6 +940,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             with _set_spyre_compilation_settings(self.vllm_config):
                 self._dummy_run(num_tokens)
                 self._warmup_input_embedding(num_tokens)
+                if is_pooling:
+                    self._warmup_multimodal_encoder()
             if is_pooling and self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             logger.info("Warmup done in %.3fs.", time.time() - t0)
@@ -991,6 +999,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # int32 to match upstream's `input_ids` buffer; 0 is an id every vocab holds.
         model.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
         logger.info_once("Warming the input embedding through embed_input_ids.")
+
+    @torch.inference_mode()
+    def _warmup_multimodal_encoder(self) -> None:
+        """Compile an eager vision tower at every image-batch width it can see.
+
+        Pooling warmup traces the text body only. ``profile_run`` calls
+        ``embed_multimodal`` once, at ``mm_max_items_per_batch``, so the first
+        real request at each narrower width pays a full compile. CLIP's
+        ``vision_model`` stays out of block compile, and ``SpyreConv2d`` is a
+        separate graph per batch, so each width has to run here
+        (spyre-inference#1182).
+
+        Generative VLMs are left alone: enumerating their tower would dominate
+        startup, and this is the pooling-encoder gap the tail latency comes from.
+        """
+        if self.model_config.runner_type != "pooling" or not self.supports_mm_inputs:
+            return
+        mm_budget = getattr(self, "mm_budget", None)
+        max_items = getattr(mm_budget, "mm_max_items_per_batch", None)
+        model = cast(_SpyreModelWrapper, self.model)
+        if not max_items or not hasattr(model, "embed_multimodal"):
+            return
+
+        widths = [(modality, int(n)) for modality, n in max_items.items() if int(n) >= 1]
+        if not widths:
+            return
+        logger.info(
+            "Warming multimodal encoder batch widths: %s.",
+            ", ".join(f"{modality} 1..{n}" for modality, n in widths),
+        )
+        t0 = time.time()
+        for modality, n_max in widths:
+            for n in range(1, n_max + 1):
+                model.embed_multimodal(**self._get_mm_dummy_batch(modality, n))
+        logger.info("Multimodal encoder warmup done in %.3fs.", time.time() - t0)
 
     @torch.inference_mode()
     def _record_attention_graphs(self) -> None:

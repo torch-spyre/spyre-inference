@@ -854,6 +854,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transformers-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1752,6 +1763,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transformers-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2251,6 +2273,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#host-side-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Host-side sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transformers-backend" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2335,7 +2368,9 @@ ops injected via OOT registration.</p>
 <p><code>vLLM</code> is built from source with <code>VLLM_TARGET_DEVICE=empty</code> (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: <code>import_kernels()</code> is
 a no-op (there is no <code>vllm._C</code>), and the model runner reimplements the slot-mapping
-kernel in pure PyTorch.</p>
+kernel in pure PyTorch. The host-side sampling kernels vLLM's CPU backend would supply
+are built by the plugin itself, as <code>spyre_inference._C</code> (see
+<a href="#host-side-sampling">Host-side sampling</a>).</p>
 <h2 id="component-view-of-a-granite-model">Component view of a Granite model<a class="headerlink" href="#component-view-of-a-granite-model" title="Permanent link">&para;</a></h2>
 <figure>
   <img alt="Plugin Architecture" src="plugin-architecture.svg" style="width: 140%; max-width: 1000px; margin-left: -20%" />
@@ -2817,6 +2852,52 @@ Eligible decode prefixes use batched attention, even at one sequence; otherwise 
 per-sequence loop is host-driven control flow, but its query-row gather and kernels run
 on Spyre. KV-cache writes and any separate write-back copy stay on-device. RoPE's
 rotation-cache gather and the embedding gather also run on-device.</p>
+<h2 id="host-side-sampling">Host-side sampling<a class="headerlink" href="#host-side-sampling" title="Permanent link">&para;</a></h2>
+<p><code>SpyreLogitsProcessor</code> hands the sampler CPU logits, so every sampling step runs on the
+host, serially between device forwards. vLLM picks its sampler path by platform:
+<code>TorchSpyrePlatform</code> is <code>PlatformEnum.OOT</code>, so <code>is_cpu()</code> is <code>False</code>, and
+<code>TopKTopPSampler</code> falls through to <code>forward_native</code> — eager PyTorch, with none of the
+fused kernels upstream reserves for <code>forward_cpu</code>. Left as is, that path sorts the full
+<code>[batch, vocab]</code> logits for top-k/top-p and generates a fresh <code>[batch, vocab]</code> noise tensor
+for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
+large share of each decode step.</p>
+<p><code>SpyreModelRunner</code> patches upstream's <code>Sampler</code> in place after construction, pointing its
+greedy draw at <code>greedy_sample</code> (<code>v1/sample/sampler.py</code>) and its random draw at
+<code>SpyreTopKTopPSampler</code>, so every holder of it, the rejection sampler included, samples the
+same way. That brings back the CPU kernels and drops the full-vocabulary sort:</p>
+<ul>
+<li><strong>Random draw</strong> — <code>SpyreTopKTopPSampler.forward_native</code> calls
+  <code>torch.ops._spyre_C.fused_gumbel_argmax</code>: one pass of <code>argmax(logits + g)</code>, with the
+  Gumbel noise <code>g</code> hashed per element from a per-row seed (splitmix64 of <code>(seed, i)</code>), so
+  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
+  running best (including every <code>-inf</code> left by top-k/top-p) are skipped exactly, and most
+  others are rejected with one <code>exp</code> before the two <code>log</code>s of the Gumbel transform. A
+  seeded request draws its row seed from its own <code>torch.Generator</code>, so it stays
+  reproducible. <code>use_fp64_gumbel</code> keeps fresh fp64 noise, drawn in log space
+  (<code>argmax(x - log q)</code>, <code>q ~ Exp(1)</code>). vLLM's kernel reads its noise from a fixed 2^20-entry
+  table instead, which limits each row to 2^20 noise windows and leaves much of a large
+  vocabulary unreachable.</li>
+<li><strong>Greedy</strong> — <code>greedy_sample</code> calls <code>torch.ops._spyre_C.greedy_argmax</code>, a
+  vectorized max followed by a first-match scan, so ties break like <code>torch.argmax</code>. A
+  single row falls back to <code>torch.argmax</code>, where OpenMP fork/join would cost more than the
+  scan.</li>
+<li><strong>Top-k + top-p</strong> — <code>apply_top_k_top_p_sort_free</code> takes a <code>topk</code> window of <code>2 × max_k</code>
+  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
+  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
+  exact tie count when ties run past it. Top-p without top-k still sorts.</li>
+</ul>
+<p>The kernels live in <code>csrc/cpu/sampling_kernels.cpp</code> and are built with CMake from
+<code>setup.py</code>, over the <code>cpu_types_{x86,vsx,vxe}.hpp</code> SIMD headers copied unchanged from vLLM,
+so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (<code>_C</code>) and an
+AVX2 fallback (<code>_C_AVX2</code>), and <code>v1/sample/sampling_kernels.py</code> imports whichever the host
+supports, as vLLM's CPU backend does. The ops register under the fixed <code>_spyre_C</code>
+namespace rather than <code>TORCH_EXTENSION_NAME</code>, so the two builds share one op name and
+cannot collide with a vLLM <code>_C</code> in the same environment. If the extension
+is missing or fails to import (a failed build, or a dev checkout that never built it), the
+import logs a warning and the samplers fall back to <code>torch.argmax</code> and a fresh-noise
+log-space draw. Because the sampler reimplements
+the tail of upstream <code>TopKTopPSampler.forward_native</code>, it has to be re-synced on a vLLM
+bump.</p>
 <h2 id="transformers-backend">Transformers backend<a class="headerlink" href="#transformers-backend" title="Permanent link">&para;</a></h2>
 <p>When <code>model_impl="transformers"</code>, <code>register_ops</code> swaps vLLM's <code>TransformersForCausalLM</code>
 for <code>SpyreTransformersForCausalLM</code> (<code>spyre_inference/transformers_backend.py</code>). vLLM's

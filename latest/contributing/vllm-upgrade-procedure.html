@@ -1238,6 +1238,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#step-2b-re-sync-the-vendored-host-sampling-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2b: Re-sync the Vendored Host-Sampling Code
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#step-3-triage-in-this-order" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1917,6 +1928,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#step-2b-re-sync-the-vendored-host-sampling-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2b: Re-sync the Vendored Host-Sampling Code
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#step-3-triage-in-this-order" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2112,6 +2134,17 @@
     <span class="md-ellipsis">
       
         Step 2: Rebuild &amp; Re-sync
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#step-2b-re-sync-the-vendored-host-sampling-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Step 2b: Re-sync the Vendored Host-Sampling Code
       
     </span>
   </a>
@@ -2331,17 +2364,84 @@
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>python<span class="w"> </span>-c<span class="w"> </span><span class="s2">"import spyre_inference; print('ok')"</span>
 </span></code></pre></div>
 <p>If this fails with <code>ImportError</code> from inside vLLM, the upstream API moved out from under one of our imports — <code>grep -rn "&lt;missing-symbol&gt;" .venv/lib64/python3.12/site-packages/vllm/</code> to find where it went, then update our import.</p>
+<h2 id="step-2b-re-sync-the-vendored-host-sampling-code">Step 2b: Re-sync the Vendored Host-Sampling Code<a class="headerlink" href="#step-2b-re-sync-the-vendored-host-sampling-code" title="Permanent link">&para;</a></h2>
+<p>Spyre copies logits to the host for sampling, and spyre-inference vendors vLLM's CPU
+sampling code to do it fast. Every bump must re-check that code against the new upstream,
+even when nothing fails: the build and the tests only catch breakage, not upstream fixes we
+are missing.</p>
+<table>
+<thead>
+<tr>
+<th>Ours</th>
+<th>Upstream (vLLM)</th>
+<th>How ours differs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>csrc/cpu/cpu_types.hpp</code>, <code>cpu_types_{x86,vsx,vxe}.hpp</code></td>
+<td>same paths</td>
+<td>Trimmed to <code>FP32Vec8</code>/<code>FP32Vec16</code>; every kept line is unchanged. Port fixes to those two types only.</td>
+</tr>
+<tr>
+<td><code>csrc/cpu/sampling_kernels.cpp</code></td>
+<td>same path (added in vllm#53913, after v0.28.0)</td>
+<td>Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); <code>greedy_argmax</code> matches <code>torch.argmax</code> on NaN; inputs are checked. Port performance and correctness changes, never the table.</td>
+</tr>
+<tr>
+<td><code>csrc/core/registration.h</code>, <code>cmake/utils.cmake</code>, <code>cmake/cpu_extension.cmake</code></td>
+<td>same paths</td>
+<td>Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of <code>-march=native</code>, so wheels are portable.</td>
+</tr>
+<tr>
+<td><code>SpyreTopKTopPSampler.forward_native</code> (<code>spyre_inference/v1/sample/topk_topp_sampler.py</code>)</td>
+<td><code>TopKTopPSampler.forward_native</code> (<code>vllm/v1/sample/ops/topk_topp_sampler.py</code>)</td>
+<td>Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors.</td>
+</tr>
+<tr>
+<td>The sampler patch in <code>TorchSpyreModelRunner.__init__</code></td>
+<td><code>Sampler</code> (<code>vllm/v1/sample/sampler.py</code>), its construction and <code>RejectionSampler(self.sampler)</code> (<code>vllm/v1/worker/gpu_model_runner.py</code>)</td>
+<td>Relies on <code>Sampler</code> calling <code>self.greedy_sample</code> and <code>self.topk_topp_sampler</code>, and on the rejection sampler holding the same <code>Sampler</code> object.</td>
+</tr>
+</tbody>
+</table>
+<p>Diff the upstream side between the current pin and the target:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">cd</span><span class="w"> </span>&lt;vllm<span class="w"> </span>checkout&gt;<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>fetch<span class="w"> </span>--tags
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>git<span class="w"> </span>diff<span class="w"> </span>v&lt;current&gt;<span class="w"> </span>v<span class="o">{</span>VERSION<span class="o">}</span><span class="w"> </span>--stat<span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>csrc/cpu/cpu_types.hpp<span class="w"> </span>csrc/cpu/cpu_types_x86.hpp<span class="w"> </span>csrc/cpu/cpu_types_vsx.hpp<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="w">  </span>csrc/cpu/cpu_types_vxe.hpp<span class="w"> </span>csrc/cpu/sampling_kernels.cpp<span class="w"> </span>csrc/core/registration.h<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="w">  </span>cmake/cpu_extension.cmake<span class="w"> </span>cmake/utils.cmake<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="w">  </span>vllm/v1/sample/ops/topk_topp_sampler.py<span class="w"> </span>vllm/v1/sample/sampler.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">  </span>vllm/v1/sample/rejection_sampler.py<span class="w"> </span>vllm/v1/worker/gpu_model_runner.py
+</span></code></pre></div>
+<p>For each changed file, port what applies and update the version in the <code>forward_native</code>
+comment. If the new vLLM pins a different torch, move every torch pin in <code>pyproject.toml</code>
+together: the extension links libtorch, so a mismatch fails at import. The list (six
+places, including the ppc64le source build) is in §3b of the <code>upgrade-torch-spyre</code> skill,
+and torch-spyre must support the new torch as well.
+<code>uv sync</code> rebuilds the extension because <code>csrc/</code> and <code>pyproject.toml</code> are in its cache keys.</p>
+<p>Then check the kernels and the PyTorch fallback (CPU only, no card needed):</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/runtime/test_sampling_kernels.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">  </span>tests/runtime/test_sampling_fallback.py<span class="w"> </span>tests/runtime/test_spyre_topk_sampler.py<span class="w"> </span>--no-header
+</span></code></pre></div>
+<ul>
+<li><code>test_sampling_kernels.py</code> checks the kernels against PyTorch baselines token for token:
+  <code>torch.argmax</code> for greedy, and a PyTorch implementation of the same hashed Gumbel draw.</li>
+<li><code>test_sampling_fallback.py</code> forces the fallback and checks it picks the same tokens as
+  upstream's stock <code>Sampler</code>, which catches upstream sampler changes we haven't mirrored.</li>
+<li><code>test_spyre_topk_sampler.py</code> checks the sort-free top-k/top-p against upstream's sort.</li>
+</ul>
 <h2 id="step-3-triage-in-this-order">Step 3: Triage in This Order<a class="headerlink" href="#step-3-triage-in-this-order" title="Permanent link">&para;</a></h2>
 <p>Don't run the full <code>pytest</code> first — vLLM startup is ~30s per test file, and the failures cluster by category. Run the cheapest categories first so you can fix-and-rerun quickly.</p>
 <p><strong>Always use <code>uv run --no-sync</code></strong> for every test invocation — without <code>--no-sync</code>, uv re-resolves dependencies on every call and reverts any local <code>torch-spyre</code> install you may have done.</p>
 <h3 id="3a-custom-ops-no-vllm-engine">3a. Custom Ops (No vLLM Engine)<a class="headerlink" href="#3a-custom-ops-no-vllm-engine" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/runtime/test_platform.py<span class="w"> </span>tests/custom_ops/test_mlp.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">  </span>tests/custom_ops/test_silu_and_mul.py<span class="w"> </span>tests/custom_ops/test_parallel_lm_head.py<span class="w"> </span><span class="se">\</span>
-</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">  </span>tests/custom_ops/test_vocab_parallel_embedding.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/runtime/test_platform.py<span class="w"> </span>tests/custom_ops/test_mlp.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span>tests/custom_ops/test_silu_and_mul.py<span class="w"> </span>tests/custom_ops/test_parallel_lm_head.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span>tests/custom_ops/test_vocab_parallel_embedding.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>These exercise the linear/embedding/silu_and_mul ops against a CPU reference. Failures here usually mean a vLLM layer's constructor signature changed (new kwarg, renamed parameter) or a <code>vocab_parallel_embedding</code>-style helper was moved. Fix in <code>spyre_inference/custom_ops/</code>.</p>
 <h3 id="3b-attention-backend">3b. Attention Backend<a class="headerlink" href="#3b-attention-backend" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/attention/test_spyre_attn.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/attention/test_spyre_attn.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>~10 minutes. If this fails, likely culprits:</p>
 <ul>
@@ -2350,16 +2450,16 @@
 <li><code>bind_kv_cache</code> layout flipped (see 3e for the upstream KV cache layout note — same change, exposed twice).</li>
 </ul>
 <h3 id="3c-end-to-end-vllm-single-process">3c. End-to-End vLLM (Single-Process)<a class="headerlink" href="#3c-end-to-end-vllm-single-process" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_vllm_spyre_next.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>tests/e2e/test_vllm_spyre_next.py<span class="w"> </span>-m<span class="w"> </span><span class="s2">"not upstream"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>This is the most common place to hit OOT platform traps (see above). Fix those with surgical <code>TorchSpyreWorker</code> overrides as described.</p>
 <p>Not all failures here are OOT traps — also watch for constructor or method signature changes on classes we instantiate or inherit from, new abstract methods on base classes, and import path moves (symbol relocated to a different vLLM module).</p>
 <h3 id="3d-distributed">3d. Distributed<a class="headerlink" href="#3d-distributed" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"distributed"</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"distributed"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>~5 minutes. Failures usually point to changes in <code>vllm.distributed.parallel_state</code> (group construction, device_communicator dispatch). The OOT branches in <code>_platform_device_type</code> and <code>parallel_state.py:~448</code> use <code>current_platform.device_name</code> — if those branches moved to a different predicate, our <code>device_name = "cpu"</code> may stop being routed correctly.</p>
 <h3 id="3e-upstream-tests">3e. Upstream Tests<a class="headerlink" href="#3e-upstream-tests" title="Permanent link">&para;</a></h3>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"upstream"</span><span class="w"> </span>--no-header
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>-m<span class="w"> </span><span class="s2">"upstream"</span><span class="w"> </span>--no-header
 </span></code></pre></div>
 <p>These run upstream vLLM test files against our backend, filtered by <code>tests/plugin/spyre_testing_plugin/upstream_tests.yaml</code>. The most common failure mode is <strong>upstream test infra refactoring</strong> — the test file changes shape, our <code>patch_backend_list</code> fixture (in <code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code>) no longer matches. Read the upstream test file — check <code>upstream_tests.yaml</code> for the canonical path, or find it under <code>~/.cache/vllm-upstream-tests/worktree-&lt;rev&gt;/</code> (the subpath like <code>tests/v1/attention/test_attention_backends.py</code> may have moved between releases) — and diff its assumptions against what <code>patch_backend_list</code> does. The recurring trap is the <strong>KV-cache tensor layout</strong>: upstream has flipped between <code>(2, num_blocks, …)</code> and <code>(num_blocks, 2, …)</code> layouts more than once. Our fixture has to turn this tensor into <code>(k_pages, v_pages)</code> for <code>SpyreAttentionImpl.forward</code>, each a dense token-major <code>[num_blocks, block_size, num_kv_heads, head_size]</code> tensor with the slot axis pinned outermost by <code>slot_major_kv_layout</code> (the KV write scatters through a slot-major view, and the default layout silently writes the wrong rows) — which currently also means undoing the head-major transpose the upstream helper applies on the way out. Check the slicing dim against wherever the upstream test constructs the KV cache (e.g. a function like <code>create_and_prepopulate_kv_cache</code> — name may differ in the new rev).</p>
 <p>Other upstream-side patterns to watch for:</p>
@@ -2371,20 +2471,21 @@
 <p>If a test legitimately doesn't make sense for Spyre (e.g. it asserts triton-kernel-specific behaviour), block-list it in <code>upstream_tests.yaml</code> rather than papering over with a tolerance bump.</p>
 <h2 id="step-4-full-sweep-format">Step 4: Full Sweep + Format<a class="headerlink" href="#step-4-full-sweep-format" title="Permanent link">&para;</a></h2>
 <p>Once each category is green individually, run the full suite to catch any cross-test interactions:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header<span class="w"> </span>--upstream
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>uv<span class="w"> </span>run<span class="w"> </span>--no-sync<span class="w"> </span>pytest<span class="w"> </span>--no-header<span class="w"> </span>--upstream
 </span></code></pre></div>
 <p>Roughly 16 minutes on a Spyre host. Then format:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>bash<span class="w"> </span>format.sh
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>bash<span class="w"> </span>format.sh
 </span></code></pre></div>
 <p><code>format.sh</code> runs prek (ruff, ruff-format, ty, codespell, markdownlint, actionlint) and exits non-zero if anything needs to be added/committed. Do <strong>not</strong> auto-add <code>.hypothesis/</code> — that directory is a per-run cache, gitignored.</p>
 <h2 id="what-to-commit">What to Commit<a class="headerlink" href="#what-to-commit" title="Permanent link">&para;</a></h2>
-<p>Five files typically change for a vLLM bump:</p>
+<p>Five files typically change for a vLLM bump, plus the vendored sampling code when upstream touched it:</p>
 <ol>
 <li><code>pyproject.toml</code> — two things: the <code>rev</code> in the <code>[tool.uv.sources]</code> vllm entry, and the <code>vllm&gt;=X.Y.Z,&lt;X.(Y+1)</code> constraint in <code>[project] dependencies</code>.</li>
 <li><code>uv.lock</code> — auto-regenerated by <code>uv sync</code>. Don't hand-edit.</li>
 <li><code>tests/plugin/pyproject.toml</code> — auto-regenerated by <code>sync-upstream-test-deps</code> from the allow-list. Review the diff but don't hand-edit; to add or drop a dep, edit <code>ALLOW_LIST</code>/<code>EXCLUDED</code> in <code>sync_upstream_test_deps.py</code> and re-run. The allow-list edit itself is the fourth file that may change on a bump.</li>
 <li><code>spyre_inference/v1/worker/spyre_worker.py</code> (sometimes) or <code>spyre_inference/platform.py</code> — surgical overrides for new upstream wrappers.</li>
 <li><code>tests/plugin/spyre_testing_plugin/pytest_plugin.py</code> (sometimes) — fixture updates for upstream test-infra churn.</li>
+<li><code>csrc/cpu/</code>, <code>cmake/</code> and <code>spyre_inference/v1/sample/</code> (when upstream changed them) — the Step 2b re-sync of the vendored sampling code.</li>
 </ol>
 <p>If your bump touched custom ops, attention, or distributed code in <code>spyre_inference/</code>, that's a sign the upstream API changed — make sure the change is <em>necessary</em>, not just "looked easier than figuring out the new contract."</p>
 <p>The commit message convention in this repo uses gitmoji prefixes: <code>:arrow_up: support vllm X.Y.Z</code> is the standard form.</p>

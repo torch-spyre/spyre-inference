@@ -276,10 +276,11 @@ def test_model_filter_is_case_insensitive(tmp_path):
 
 # Each trace is replayed at the one max-model-len that fits its requests, and is
 # reached through its own env var.
-DATASET_CONTEXT_LEN = {"aiops": 4096, "cics": 8192}
+DATASET_CONTEXT_LEN = {"aiops": 4096, "cics": 8192, "all": 32768}
 DATASET_PATH_VARS = {
     "aiops": "${SPYRE_AIOPS_DATASET}",
     "cics": "${SPYRE_CICS_DATASET}",
+    "all": "${SPYRE_ALL_SEQUENCES_DATASET}",
 }
 
 

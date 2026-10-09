@@ -162,7 +162,6 @@ defaults:
 
 permissions:
   contents: read
-  checks: write
   actions: read
 
 jobs:

@@ -387,23 +387,28 @@ def expand_packed_token_types(
     return torch.tensor(grid, dtype=token_type_ids.dtype)
 
 
-def expand_packed_embeds_to_encoder_grid(
-    inputs_embeds: torch.Tensor,
-    query_lens: Sequence[int],
-    batch_bucket: int,
-    len_bucket: int,
-) -> torch.Tensor:
-    """Scatter packed input embeddings into the ``[B*L, hidden]`` grid; every pad row is zero.
+def encoder_grid_source_rows(
+    query_lens: Sequence[int], batch_bucket: int, len_bucket: int
+) -> list[int]:
+    """Packed row each ``[B*L]`` grid row reads from; every pad row reads row 0.
 
-    ``expand_packed_to_encoder_grid``'s counterpart for a multimodal pooling model (e.g.
-    CLIP) whose preprocessing produces embeddings rather than ids. Pad rows are zero, same
-    as ``expand_packed_token_types``: always masked out of attention before being read.
+    The inverse of ``encoder_dense_row_indices``, as a gather index rather than a
+    scatter, so a multimodal pooling model (e.g. CLIP) whose preprocessing produces
+    embeddings can build its grid with one ``index_select`` on the device. Pad rows
+    carry a real token's embedding rather than zeros: they are masked out of attention
+    and never pooled, so only finiteness matters.
     """
-    grid = torch.zeros(
-        batch_bucket * len_bucket, inputs_embeds.shape[-1], dtype=inputs_embeds.dtype
-    )
-    grid[encoder_dense_row_indices(query_lens, len_bucket)] = inputs_embeds
-    return grid
+    if len(query_lens) > batch_bucket:
+        raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
+    rows = [0] * (batch_bucket * len_bucket)
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        if length > len_bucket:
+            raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {list(query_lens)}")
+        dst = seq_idx * len_bucket
+        rows[dst : dst + length] = range(src, src + length)
+        src += length
+    return rows
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:

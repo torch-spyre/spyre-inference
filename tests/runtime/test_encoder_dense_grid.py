@@ -34,6 +34,7 @@ from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
     encoder_dense_row_indices,
+    encoder_grid_source_rows,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
 )
@@ -63,6 +64,37 @@ def test_expand_then_gather_round_trips(query_lens):
     rows = encoder_dense_row_indices(query_lens, extent)
     assert torch.equal(grid_ids[rows], ids)
     assert torch.equal(grid_pos[rows], positions)
+
+
+@pytest.mark.parametrize("query_lens", [[64, 64], [1, 64, 32], [10], [7, 1, 63, 64]])
+def test_embeds_gather_lands_every_token_on_its_grid_row(query_lens):
+    """The embeddings gather must put each packed row where the ids expansion puts
+    its id, and read nothing past the packed tokens."""
+    extent, width = 64, len(query_lens) + 2
+    total = sum(query_lens)
+    embeds = torch.arange(1, total + 1, dtype=torch.float16).unsqueeze(1).expand(-1, 8)
+    ids = torch.arange(1, total + 1, dtype=torch.int64)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens])
+
+    source_rows = encoder_grid_source_rows(query_lens, width, extent)
+    grid = embeds[torch.tensor(source_rows)]
+    grid_ids, _ = expand_packed_to_encoder_grid(ids, positions, query_lens, width, extent)
+
+    assert grid.shape == (width * extent, 8)
+    rows = encoder_dense_row_indices(query_lens, extent)
+    assert torch.equal(grid[rows], embeds)
+    assert torch.equal(grid[rows, 0].long(), grid_ids[rows])
+    assert max(source_rows) == total - 1
+
+
+def test_embeds_gather_rejects_a_batch_wider_than_the_rectangle():
+    with pytest.raises(ValueError, match="exceeds batch_bucket"):
+        encoder_grid_source_rows([1, 1, 1], 2, 64)
+
+
+def test_embeds_gather_rejects_a_length_past_the_extent():
+    with pytest.raises(ValueError, match="exceeds len_bucket"):
+        encoder_grid_source_rows([65], 1, 64)
 
 
 def test_real_pad_continues_positions_and_batch_pad_restarts():

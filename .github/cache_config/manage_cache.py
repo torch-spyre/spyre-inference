@@ -72,6 +72,26 @@ def _parse_entry(entry):
     return entry["repo"], entry.get("revision")
 
 
+# Duplicate pytorch dumps. Kept out of the cache when a safetensors copy exists.
+# A repo whose only weights are ``pytorch_model.bin`` (CLIP ViT-B/32) cannot use
+# this ignore: the offline jobs then open a snapshot that has no weights at all.
+_DUPLICATE_WEIGHTS = ["*.pt", "*.pth", "*.bin"]
+
+
+def _has_pytorch_weights(snapshot: str) -> bool:
+    """True when ``snapshot`` contains safetensors or a ``pytorch_model`` bin."""
+    root = Path(snapshot)
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.endswith(".safetensors") or name.endswith(".safetensors.index.json"):
+            return True
+        if name.startswith("pytorch_model") and name.endswith(".bin"):
+            return True
+    return False
+
+
 def _run_public(config, config_file):
     """Cache public_models entries."""
     models = config.get("public_models", [])
@@ -90,23 +110,35 @@ def _run_public(config, config_file):
         repo_id, revision = _parse_entry(entry)
         print(f"\n🚀 Processing: {repo_id}...")
         try:
-            snapshot_download(
+            cached = snapshot_download(
                 repo_id,
                 revision=revision,
                 local_files_only=True,
-                ignore_patterns=["*.pt", "*.pth", "*.bin"],
+                ignore_patterns=_DUPLICATE_WEIGHTS,
             )
+        except LocalEntryNotFoundError:
+            cached = None
+        if cached is not None and _has_pytorch_weights(cached):
             print(f"✅ {repo_id}: already cached")
             continue
-        except LocalEntryNotFoundError:
-            pass
         try:
-            snapshot_download(
+            snapshot = snapshot_download(
                 repo_id,
                 revision=revision,
                 local_files_only=False,
-                ignore_patterns=["*.pt", "*.pth", "*.bin"],
+                ignore_patterns=_DUPLICATE_WEIGHTS,
             )
+            # Prefer safetensors. Fall back to the bin only when that left no weights,
+            # so models that ship both do not also store the duplicate ``.bin``.
+            if not _has_pytorch_weights(snapshot):
+                snapshot = snapshot_download(
+                    repo_id,
+                    revision=revision,
+                    local_files_only=False,
+                    ignore_patterns=["*.pt", "*.pth"],
+                )
+            if not _has_pytorch_weights(snapshot):
+                raise OSError(f"{repo_id} snapshot has no pytorch weights")
             print(f"✅ {repo_id}: downloaded and cached")
         except Exception as e:
             print(f"⚠️ Warning: failed to cache {repo_id}: {e}")

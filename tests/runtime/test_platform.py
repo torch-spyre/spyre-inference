@@ -637,6 +637,34 @@ def test_raise_dynamo_recompile_limits_survives_a_clobber():
         ) = saved
 
 
+def test_set_compile_threads_overrides_vllm_pin(monkeypatch):
+    """vLLM's TORCHINDUCTOR_COMPILE_THREADS=1 gives way to the Spyre default of 8."""
+    import torch._inductor.config as inductor_config
+
+    from spyre_inference.platform import _set_compile_threads
+
+    monkeypatch.delenv("SPYRE_COMPILE_THREADS", raising=False)
+    monkeypatch.setattr(inductor_config, "compile_threads", 1)
+
+    _set_compile_threads()
+
+    assert inductor_config.compile_threads == 8
+
+
+def test_set_compile_threads_explicit_value_wins(monkeypatch):
+    """SPYRE_COMPILE_THREADS=1 keeps compiles inline, e.g. under a debugger."""
+    import torch._inductor.config as inductor_config
+
+    from spyre_inference.platform import _set_compile_threads
+
+    monkeypatch.setenv("SPYRE_COMPILE_THREADS", "1")
+    monkeypatch.setattr(inductor_config, "compile_threads", 32)
+
+    _set_compile_threads()
+
+    assert inductor_config.compile_threads == 1
+
+
 def test_worker_reasserts_recompile_limits_after_autoload():
     """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
     import inspect

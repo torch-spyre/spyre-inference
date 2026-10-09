@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     SPYRE_DEVICES: str | None = None
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
+    SPYRE_COMPILE_THREADS: int = 8
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
@@ -68,6 +69,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # torch-spyre compiles every eager aten op, so those compiles continue for the
     # whole run; they are never reported.
     "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "warn",
+    # Size of each worker's Inductor compile pool, which runs the backend compiler for a
+    # graph's kernels in parallel. Replaces TORCHINDUCTOR_COMPILE_THREADS, which vLLM
+    # forces to 1 in every process it starts. "1" compiles inline, e.g. under a debugger.
+    "SPYRE_COMPILE_THREADS": lambda: int(os.getenv("SPYRE_COMPILE_THREADS", "8")),
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.

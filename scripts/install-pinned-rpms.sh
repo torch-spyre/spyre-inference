@@ -77,7 +77,10 @@ ARCH="$(arch)"
 STAMP="${PREFIX}/.lock-sha256"
 LOCK_SHA="$({ cat "$LOCK"; echo "$ARCH"; echo "$LOCATION"; } | sha256sum | cut -d' ' -f1)"
 
-if [[ $FORCE -eq 0 && -f "$STAMP" && "$(cat "$STAMP")" == "$LOCK_SHA" ]]; then
+BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
+COMPONENTS="${BASE_INSTALL_DIR}/components.txt"
+
+if [[ $FORCE -eq 0 && -f "$STAMP" && "$(cat "$STAMP")" == "$LOCK_SHA" && -f "$COMPONENTS" ]]; then
     echo "${PREFIX} already matches ${LOCK}; pass --force to redo"
     COUNT="$(python3 "$RESOLVER" --lock "$LOCK" names | wc -l)"
 else
@@ -115,10 +118,19 @@ else
     for relpath in "${RPMS[@]}"; do
         rpm2cpio "${CACHE}/$(basename "$relpath")" | (cd "$PREFIX" && cpio -idm 2>/dev/null)
     done
+
+    # The image's LIB_VERSION_FILE describes /opt/ibm/spyre, so the kernel cache key
+    # would ignore the lock. CACHE holds other locks' RPMs too: pass only the resolved ones.
+    RESOLVED_DIR="$(mktemp -d)"
+    for relpath in "${RPMS[@]}"; do
+        ln -s "${CACHE}/$(basename "$relpath")" "$RESOLVED_DIR/"
+    done
+    python3 "${REPO_ROOT}/.github/scripts/write_components_file.py" \
+        --lock "$LOCK" --rpm-dir "$RESOLVED_DIR" --arch "$ARCH" --output "$COMPONENTS"
+    rm -rf "$RESOLVED_DIR"
     echo "$LOCK_SHA" > "$STAMP"
 fi
 
-BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
 [[ -d "$BASE_INSTALL_DIR" ]] || { echo "unpacked tree has no opt/ibm/spyre: $PREFIX" >&2; exit 1; }
 
 # Clearing _IBM_AIU_SETUP makes ibm-aiu-setup.sh re-derive PATH,
@@ -128,6 +140,7 @@ BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
 cat > "${PREFIX}/env.sh" <<EOF
 export SENTIENT_BASE_INSTALL_DIR="${BASE_INSTALL_DIR}"
 export _IBM_AIU_SETUP=
+export LIB_VERSION_FILE="${COMPONENTS}"
 _aiu_nounset="\$(shopt -po nounset || true)"
 set +u
 source /etc/profile.d/ibm-aiu-setup.sh

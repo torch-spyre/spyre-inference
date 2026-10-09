@@ -15,17 +15,17 @@ tree = ""
 
 # x86_64
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_162" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_163" }
 ibm-deeptools         = { version = "2.0.0-0.release_2_0.1+2644.3f91855_5" }
 ibm-deeptools-devel   = { version = "2.0.0-0.release_2_0.1+2644.3f91855_5" }
 ibm-flex              = { version = "2.0.0-0.main.1+654.66c3c08_558" }
 ibm-flex-devel        = { version = "2.0.0-0.main.1+654.66c3c08_558" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+308.a6d8f22_430" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_430" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_430" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+196.ce6672d_290" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+196.ce6672d_290" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+37.fb1bb3e_78" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+198.534a949_292" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+198.534a949_292" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+39.ffb7877_81" }
 
 # Power
 # ppc64le is held on an older set: no prod ibm-deeptools build that ships
@@ -45,7 +45,7 @@ ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_*" }
 ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_*" }
 ibm-spyre-comms       = { version = "2.0.0-0.main.1+193.42e3736_*" }
 ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+193.42e3736_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+37.fb1bb3e_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+39.ffb7877_*" }
 
 # Z
 [overrides.s390x]
@@ -57,6 +57,6 @@ ibm-flex-devel        = { version = "2.0.0-0.main.1+654.66c3c08_*" }
 ibm-senlib-core       = { version = "2.0.0-0.main.1+308.a6d8f22_*" }
 ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_*" }
 ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_*" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+196.ce6672d_*" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+196.ce6672d_*" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+37.fb1bb3e_*" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+198.534a949_*" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+198.534a949_*" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+39.ffb7877_*" }

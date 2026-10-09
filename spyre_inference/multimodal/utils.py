@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 import torch.nn.functional as F
 
@@ -71,7 +69,29 @@ def _padded_attn_mask(
     return m
 
 
-@lru_cache(maxsize=16)
+# `(b, seq, seq_pad, dtype, device)` -> additive `[b, 1, 1, seq_pad]` row on `device`.
+_KEY_PAD_MASKS: dict[tuple, torch.Tensor] = {}
+
+
+@torch.compiler.assume_constant_result
+def _key_pad_mask_key(
+    b: int, seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device
+) -> tuple:
+    """Build the row for this key if it is missing, then return the key.
+
+    Runs once at trace time: Dynamo traces through `lru_cache` (pytorch/pytorch#152994)
+    and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
+    tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
+    read in `_key_pad_mask` makes the row a guarded graph input. Needs `dynamic=False`.
+    """
+    key = (b, seq, seq_pad, dtype, device)
+    if key not in _KEY_PAD_MASKS:
+        m = torch.zeros(b, 1, 1, seq_pad, dtype=dtype)
+        m[..., seq:] = torch.finfo(dtype).min / 2
+        _KEY_PAD_MASKS[key] = convert(m, device)
+    return key
+
+
 def _key_pad_mask(
     b: int, seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
@@ -81,9 +101,7 @@ def _key_pad_mask(
     so an unmasked caller uploads `b * seq_pad` values instead of an O(L²) mask.
     `finfo.min / 2` for the same fp16 headroom as `encoder_key_pad_mask`.
     """
-    m = torch.zeros(b, 1, 1, seq_pad, dtype=dtype)
-    m[..., seq:] = torch.finfo(dtype).min / 2
-    return convert(m, device)
+    return _KEY_PAD_MASKS[_key_pad_mask_key(b, seq, seq_pad, dtype, device)]
 
 
 def padded_sdpa(
@@ -105,7 +123,8 @@ def padded_sdpa(
     so the padding cannot change it. Pass it explicitly when the head dim is already
     padded, or when the model carries its own scale.
 
-    `mask=None` attends everywhere: only the padded keys are masked.
+    `mask=None` attends everywhere: only the padded keys are masked, and that path
+    is safe inside a compiled block.
     """
     b, _, seq, d = q.shape
     if scale is None:

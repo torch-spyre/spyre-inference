@@ -180,6 +180,16 @@ hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList`
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
+A vision tower is the one exception, and it is opt-in. A block cannot assemble a constant
+on the host: a CPU-resident buffer has no device layout, and layout propagation rejects
+the graph. So a tower qualifies only once a multimodal patch has moved its rope
+permutations and attention masks out of the layer body and into the encoder forward,
+built once per image and read from a cache inside the loop; reading an entry nobody
+warmed raises a message naming the warm call rather than failing later inside Inductor.
+A patch that has done that marks its layers `_spyre_block_compilable` and they are
+discovered like any other block stack. Only gemma 4's tower does today
+(`multimodal/gemma4_vision.py`); every other tower stays eager.
+
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
 backend compile count is independent of depth, but it is not 1: layer 0 specializes

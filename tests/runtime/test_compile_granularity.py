@@ -328,6 +328,70 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
     assert _repeated_block_lists(PixtralHF()) == []
 
 
+def test_a_marked_vision_tower_opts_into_block_compile() -> None:
+    """A tower whose block body builds no host constants marks its layers and compiles.
+
+    Only gemma 4's does today (`multimodal/gemma4_vision.mark_blocks_compilable`). The
+    mark sits on the blocks themselves, so it is independent of where discovery starts
+    and of whether the tower sits under a recognised ``vision_*`` path.
+    """
+
+    class VisionAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = VisionAttention()
+
+    class Tower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Module()
+            self.encoder.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_tower = Tower()
+
+    unmarked = VLM()
+    assert _repeated_block_lists(unmarked) == []
+
+    marked = VLM()
+    for block in marked.vision_tower.encoder.layers:
+        block._spyre_block_compilable = True
+    assert _repeated_block_lists(marked) == [marked.vision_tower.encoder.layers]
+    # Discovery starts wherever the caller points it; the mark travels with the blocks.
+    assert _repeated_block_lists(marked.vision_tower) == [marked.vision_tower.encoder.layers]
+
+
+def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
+    """The mark is read off the blocks, not off anything they contain, so an outer
+    ``ModuleList`` that merely holds a marked tower is not itself a compile unit."""
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = nn.Linear(4, 4)
+            self._spyre_block_compilable = True
+
+    class Tower(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+
+    class Visual(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.towers = nn.ModuleList([Tower() for _ in range(2)])
+
+    model = Visual()
+    assert _repeated_block_lists(model) == [t.layers for t in model.towers]
+
+
 def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
 

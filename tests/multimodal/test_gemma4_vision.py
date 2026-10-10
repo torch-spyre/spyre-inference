@@ -39,6 +39,7 @@ STOCK_ENCODER_FORWARD = modeling_gemma4.Gemma4VisionEncoder.forward
 # test changes every later one in the process.
 _PATCHED_ATTRS = [
     (modeling_gemma4.Gemma4RMSNorm, "forward"),
+    (modeling_gemma4.Gemma4VisionAttention, "forward"),
     (modeling_gemma4.Gemma4VisionEncoder, "forward"),
     (modeling_gemma4.Gemma4VisionPooler, "forward"),
     (modeling_gemma4.Gemma4VisionPatchEmbedder, "_position_embeddings"),
@@ -313,7 +314,11 @@ def test_padded_rope_matches_transformers_reference():
     on the real channels. Catches an off-by-a-quarter interleave, a swapped axis, or a
     sin sign error -- each of which still produces plausible magnitudes.
     """
-    from spyre_inference.multimodal.gemma4_vision import _apply_rope, _gemma4_rope_cos_sin
+    from spyre_inference.multimodal.gemma4_vision import (
+        _apply_rope,
+        _gemma4_rope_cos_sin,
+        _rope_swap_matrix,
+    )
 
     torch.manual_seed(0)
     config = _vision_config()
@@ -328,7 +333,8 @@ def test_padded_rope_matches_transformers_reference():
     cos_full, sin_full = _gemma4_rope_cos_sin(
         rope.inv_freq, position_ids, PADDED_HEAD_DIM, torch.float32
     )
-    got_padded = _apply_rope(x_padded, cos_full, sin_full)
+    swap = _rope_swap_matrix(PADDED_HEAD_DIM, torch.float32, torch.device("cpu"))
+    got_padded = _apply_rope(x_padded, cos_full, sin_full, swap)
     got = _unpad_activation_quarters(got_padded, ORIG_HEAD_DIM, PADDED_HEAD_DIM)
 
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
@@ -355,14 +361,14 @@ def test_rope_cos_sin_padding_lanes_are_the_identity_rotation():
 
 def test_apply_rope_swaps_halves_and_keeps_each_half_stick_aligned():
     """cos=0, sin=1 isolates the swap term, so this pins the half-swap itself."""
-    from spyre_inference.multimodal.gemma4_vision import _apply_rope
+    from spyre_inference.multimodal.gemma4_vision import _apply_rope, _rope_swap_matrix
 
     head_dim = 8
     x = torch.arange(head_dim, dtype=torch.float32).view(1, 1, 1, head_dim)
     cos = torch.zeros(1, 1, 1, head_dim)
     sin = torch.ones(1, 1, 1, head_dim)
     # cos=0, sin=1 isolates the swap term.
-    got = _apply_rope(x, cos, sin)
+    got = _apply_rope(x, cos, sin, _rope_swap_matrix(head_dim, torch.float32, x.device))
     want = torch.cat([x[..., head_dim // 2 :], x[..., : head_dim // 2]], dim=-1)
     torch.testing.assert_close(got, want)
 
@@ -380,6 +386,11 @@ def test_patches_are_idempotent():
     first = modeling_gemma4.Gemma4RMSNorm.forward
     gemma4_vision.patch_rms_norm()
     assert modeling_gemma4.Gemma4RMSNorm.forward is first
+
+    gemma4_vision.patch_vision_attention()
+    first_attention = modeling_gemma4.Gemma4VisionAttention.forward
+    gemma4_vision.patch_vision_attention()
+    assert modeling_gemma4.Gemma4VisionAttention.forward is first_attention
 
     gemma4_vision.patch_vision_encoder()
     first_encoder = modeling_gemma4.Gemma4VisionEncoder.forward
@@ -838,10 +849,12 @@ def _encoder(num_layers: int = 2, num_patches: int = NUM_PATCHES):
 
 
 def _pad(encoder) -> None:
-    """`pad_vision_weights` walks a model down to its encoder, the way `apply()` does."""
+    """The load-time pair `apply()` runs, walking a model down to its encoder."""
     from spyre_inference.multimodal import gemma4_vision
 
-    gemma4_vision.pad_vision_weights(SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder)))
+    model = SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder))
+    gemma4_vision.pad_vision_weights(model)
+    gemma4_vision.install_rope_swap(model)
 
 
 def _encoder_inputs(batch: int = 1, num_patches: int = NUM_PATCHES, valid: int | None = None):
@@ -867,6 +880,7 @@ def test_patched_encoder_forward_matches_stock(valid):
             copy.deepcopy(encoder), embeds, mask, pixel_position_ids=pos
         ).last_hidden_state
 
+    gemma4_vision.patch_vision_attention()
     gemma4_vision.patch_vision_encoder()
     gemma4_vision.patch_rms_norm()
     _pad(encoder)
@@ -878,6 +892,38 @@ def test_patched_encoder_forward_matches_stock(valid):
         actual.flatten(), expected.flatten(), dim=0
     ).item()
     assert cosine > 0.999, f"cosine {cosine}"
+
+
+def test_layers_stay_the_per_block_compile_unit():
+    """`_compile_blocks` wraps each layer in place, which only bites if the patched
+    encoder still goes through `layer.__call__` instead of inlining the layer body.
+
+    The runner keeps every tower eager until a patch marks it, so discovery is asserted
+    on both sides of the mark: this is the whole of the Gemma-only scoping.
+    """
+    from spyre_inference.multimodal import gemma4_vision
+    from spyre_inference.v1.worker.spyre_model_runner import _repeated_block_lists
+
+    encoder = _encoder()
+    assert _repeated_block_lists(encoder) == []
+
+    gemma4_vision.patch_vision_attention()
+    gemma4_vision.patch_vision_encoder()
+    _pad(encoder)
+    gemma4_vision.mark_blocks_compilable(
+        SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder))
+    )
+    assert _repeated_block_lists(encoder) == [encoder.layers]
+
+    called: list[int] = []
+    for i, layer in enumerate(encoder.layers):
+        layer.register_forward_hook(lambda *_, i=i: called.append(i))
+
+    embeds, mask, pos = _encoder_inputs()
+    with torch.inference_mode():
+        encoder(embeds, mask, pixel_position_ids=pos)
+
+    assert called == list(range(len(encoder.layers)))
 
 
 def test_patched_encoder_rejects_a_batch_mixing_valid_patch_counts():
@@ -918,3 +964,97 @@ def test_pad_vision_weights_pads_every_layer():
     for layer in encoder.layers:
         assert layer.self_attn.q_proj.linear.out_features == NUM_HEADS * PADDED_HEAD_DIM
         assert layer.mlp.gate_proj.linear.out_features == align_up(encoder.config.intermediate_size)
+
+
+def test_marking_is_a_no_op_without_a_vision_tower():
+    """A text-only gemma 4 run loads the decoder alone. Marking must not reach for an
+    encoder that is not there, and must not opt anything into per-block compile."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    gemma4_vision.mark_blocks_compilable(SimpleNamespace())
+    gemma4_vision.mark_blocks_compilable(SimpleNamespace(vision_tower=SimpleNamespace()))
+
+
+def _stub_tower(encoder_patched: bool, attn_patched: bool, rope_installed: bool):
+    """A tower whose encoder and attention claim the install state asked for."""
+
+    def _cls(patched: bool) -> type:
+        def forward(self):
+            raise AssertionError("not called")
+
+        forward._spyre_patched = patched
+        return type("Stub", (torch.nn.Module,), {"forward": forward})
+
+    layer = torch.nn.Module()
+    layer.self_attn = _cls(attn_patched)()
+    if rope_installed:
+        layer.self_attn.register_buffer("spyre_rope_swap", torch.eye(8), persistent=False)
+    encoder = _cls(encoder_patched)()
+    encoder.layers = torch.nn.ModuleList([layer])
+    return SimpleNamespace(vision_tower=SimpleNamespace(encoder=encoder))
+
+
+@pytest.mark.parametrize(
+    ("encoder_patched", "attn_patched", "rope_installed", "marked"),
+    [
+        (True, True, True, True),
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+    ],
+)
+def test_marking_follows_the_patches_it_depends_on(
+    encoder_patched, attn_patched, rope_installed, marked
+):
+    """An upstream rename makes a patch return early. Marking has to read that off the
+    patches: compiling a stock layer body would trace the host constants they hoist."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    model = _stub_tower(encoder_patched, attn_patched, rope_installed)
+    gemma4_vision.mark_blocks_compilable(model)
+
+    layers = model.vision_tower.encoder.layers
+    assert all(getattr(b, "_spyre_block_compilable", False) for b in layers) is marked
+
+
+def test_rope_swap_matmul_matches_the_slice_it_replaces():
+    """`_apply_rope` rotates by a full-width matmul because the `cat`/slice form returns
+    uncorrelated data on device and cannot be laid out at head_dim=64."""
+    from spyre_inference.multimodal import gemma4_vision
+
+    dim = 64
+    x = torch.randn(3, dim, dtype=torch.float16)
+    half = dim // 2
+    expected = torch.cat([x[..., half:], x[..., :half]], dim=-1)
+    swap = gemma4_vision._rope_swap_matrix(dim, torch.float16, torch.device("cpu"))
+    torch.testing.assert_close(x @ swap, expected)
+
+
+def test_install_rope_swap_registers_a_non_persistent_buffer():
+    """A buffer, not a per-call build: assembling the permutation inside a compiled
+    layer leaves CPU index writes in the graph, which have no device layout. Keeping it
+    out of `state_dict` is what stops weight loading from seeing it."""
+
+    encoder = _encoder(num_layers=2)
+    _pad(encoder)
+
+    for layer in encoder.layers:
+        swap = layer.self_attn.spyre_rope_swap
+        assert swap.shape == (PADDED_HEAD_DIM, PADDED_HEAD_DIM)
+        assert "spyre_rope_swap" not in layer.self_attn.state_dict()
+
+
+def test_rope_swap_takes_the_activation_dtype_not_the_norm_dtype():
+    """Transformers builds RMSNorm weights at the default dtype, so a tower running
+    fp16 still carries fp32 norms. An fp32 swap promotes every rope matmul and the
+    whole tower with it, which only surfaces much later as a `while_loop` operand/body
+    dtype assert inside Inductor rather than anywhere near the rope.
+    """
+    encoder = _encoder(num_layers=1).half()
+    attn = encoder.layers[0].self_attn
+    for norm in (attn.q_norm, attn.k_norm):
+        norm.weight = torch.nn.Parameter(norm.weight.float(), requires_grad=False)
+    _pad(encoder)
+
+    assert attn.q_norm.weight.dtype == torch.float32  # the trap is still there
+    assert attn.spyre_rope_swap.dtype == torch.float16

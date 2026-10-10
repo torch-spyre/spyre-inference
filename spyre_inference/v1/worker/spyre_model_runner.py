@@ -327,12 +327,17 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
     for qualname, module in model.named_modules():
         if not isinstance(module, nn.ModuleList):
             continue
-        # Encoder-only towers stay eager even if a block's class name looks like
-        # attention (Qwen2_5_VLVisionAttention). Decoder lists are never named these.
-        if _is_vision_tower_path(qualname):
-            continue
         blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
         if not blocks:
+            continue
+        # A multimodal patch marks the blocks whose body it made traceable; reading the
+        # mark off the blocks keeps an outer list that merely nests a marked tower out.
+        if all(getattr(b, "_spyre_block_compilable", False) for b in blocks):
+            block_lists.append(module)
+            continue
+        # Every other tower stays eager: its block body builds constants on the host,
+        # which have no device layout. Decoder lists are never named these.
+        if _is_vision_tower_path(qualname):
             continue
         # nn.Module.modules() yields the module itself, so a list of bare Attention
         # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
@@ -463,12 +468,12 @@ class _SpyreModelWrapper:
             return t
 
         kwargs = tree_map(_to_spyre_float, kwargs)
-        # Vision towers run eager, so each Spyre op with a decomposition reaches it
-        # through torch-spyre's lazily-compiled PrivateUse1 kernel, which compiles
-        # without fullgraph. Decompositions built on for_each_tile (SDPA since
-        # torch-spyre#4550) emit a scan whose while_loop lowering reads the loop index
-        # with .item(); without fullgraph that needs capture_scalar_outputs, or the
-        # trace dies with DataDependentOutputException.
+        # The parts of a vision tower outside a compiled block run eager, so each Spyre
+        # op with a decomposition there reaches it through torch-spyre's lazily-compiled
+        # PrivateUse1 kernel, which compiles without fullgraph. Decompositions built on
+        # for_each_tile (SDPA since torch-spyre#4550) emit a scan whose while_loop
+        # lowering reads the loop index with .item(); without fullgraph that needs
+        # capture_scalar_outputs, or the trace dies with DataDependentOutputException.
         with torch._dynamo.config.patch(capture_scalar_outputs=True):
             return self._model.embed_multimodal(**kwargs)
 

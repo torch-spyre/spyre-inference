@@ -18,6 +18,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from decode_helpers import _decode_reference_fp32
 from spyre_testing_plugin.attn_helpers import (
     _build_metadata,
     _fused_qkv_kv_views,
@@ -1891,34 +1892,6 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     )
     masked = scores + md.mask_by_chunk_cpu.narrow(0, 0, md.blocks_per_chunk)
     assert masked.shape == scores.shape
-
-
-def _decode_reference_fp32(
-    query: torch.Tensor,
-    k_pages: torch.Tensor,
-    v_pages: torch.Tensor,
-    page_ids: torch.Tensor,
-    mask: torch.Tensor,
-    scale: float,
-    num_kv_heads: int,
-    qpk: int,
-    head_size: int,
-) -> torch.Tensor:
-    """Per-sequence softmax over each sequence's own blocks, no chunking.
-
-    page_ids: [num_seqs, num_blocks]. mask: [num_seqs, num_blocks, block_size].
-    """
-    num_seqs, num_blocks = page_ids.shape
-    out = torch.zeros(num_seqs, num_kv_heads * qpk, head_size, dtype=torch.float32)
-    for s in range(num_seqs):
-        q = query[s].reshape(num_kv_heads, qpk, head_size)
-        k = torch.cat([k_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
-        v = torch.cat([v_pages[page_ids[s, b]] for b in range(num_blocks)], dim=0)
-        # [KV, qpk, kv_len]
-        scores = torch.einsum("hqd,thd->hqt", q, k) * scale + mask[s].reshape(-1)
-        probs = torch.softmax(scores, dim=-1)
-        out[s] = torch.einsum("hqt,thd->hqd", probs, v).reshape(num_kv_heads * qpk, head_size)
-    return out.reshape(num_seqs, num_kv_heads * qpk, head_size)
 
 
 @pytest.mark.parametrize(

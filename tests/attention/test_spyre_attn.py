@@ -1352,6 +1352,51 @@ def test_mask_stacks_are_mirrored_lazily_per_sequence(default_vllm_config, monke
         assert stack_device.storage_offset() == 0
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "builds_tables"),
+    [
+        pytest.param([(1, 256)] * 4, False, id="all_decode"),
+        pytest.param([(1, 256), (1, 256), (7, 256)], True, id="mixed"),
+    ],
+)
+def test_page_index_tables_skipped_on_a_fully_batched_step(
+    default_vllm_config, monkeypatch, seq_lens, builds_tables
+):
+    """A step the batched kernel fully serves uploads no per-sequence index table."""
+    torch.set_default_device("cpu")
+    # Not the enable_batched_decode fixture: conftest skips its users, and no kernel runs here.
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    metadata = _padded_mask_metadata(seq_lens, block_size=64)
+    assert metadata.padded_num_seqs is not None
+    assert metadata.num_decode_seqs == sum(q == 1 for q, _ in seq_lens)
+
+    attn_impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+    dispatched: list[int] = []
+    monkeypatch.setattr(attn_impl, "_batched_decode_preconditions_met", lambda *a: True)
+    monkeypatch.setattr(attn_impl, "_run_batched_decode_dispatch", lambda *a: dispatched.append(1))
+
+    class _TablesBuilt(Exception):
+        pass
+
+    def built(*args):
+        # Stop before the per-sequence kernels, which this CPU test cannot run.
+        raise _TablesBuilt
+
+    monkeypatch.setattr(attn_impl, "build_index_tables", built)
+
+    query = torch.zeros(len(seq_lens), 32, 128, dtype=torch.float16)
+    output = torch.empty_like(query)
+    pages = torch.empty(0)
+    args = (query, pages, pages, metadata, output, torch.device("cpu"))
+    if builds_tables:
+        with pytest.raises(_TablesBuilt):
+            attn_impl._online_softmax_attention(*args)
+    else:
+        assert attn_impl._online_softmax_attention(*args) is output
+        assert metadata.kernel_index_tables is None
+    assert dispatched == [1]
+
+
 def test_empty_mask_stack_cannot_be_mirrored(default_vllm_config):
     torch.set_default_device("cpu")
     metadata = _padded_mask_metadata([(1, 0), (1, 65)], max_num_blocks=4)

@@ -1823,7 +1823,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
 
@@ -1834,6 +1833,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
+
+        # Past the early return: only the per-sequence loop reads these tables.
+        index_tables = self.index_tables(attn_metadata, _target_device)
 
         # Past the early return, so a step the batched kernel fully served pays nothing.
         # Entries are filled at their read site below: in a mixed batch, the decode

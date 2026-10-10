@@ -87,6 +87,9 @@ def padded_sdpa(
     `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
     so the padding cannot change it. Pass it explicitly when the head dim is already
     padded, or when the model carries its own scale.
+
+    A `mask` already in `_padded_attn_mask`'s form is used as is, so a caller can pad it
+    outside a compiled block, where that function's cache cannot live.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -109,11 +112,13 @@ def padded_sdpa(
         k = k.contiguous()
         v = v.contiguous()
 
+    if mask.shape != (b, 1, seq_pad, seq_pad) or mask.dtype != q.dtype or mask.device != device:
+        mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(
         q,
         k,
         v,
-        attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
+        attn_mask=mask,
         scale=scale,
         enable_gqa=enable_gqa,
     )

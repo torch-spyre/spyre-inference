@@ -276,8 +276,7 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
     """Pixtral's tower uses a local ``class Attention`` and ``MMEncoderAttention``.
 
     Those keep HF ``sdpa`` (or no vLLM dispatch at all), so they are not decoder
-    KV-cache attention. Wrapping them traces RoPE+SDPA graphs that coarse-tile
-    cannot lower (``hint_id`` split across nests).
+    KV-cache attention.
     """
 
     class Attention(nn.Module):
@@ -372,6 +371,48 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     assert _runner(model)._compile_blocks() == 3
     assert all(block._compiled_call_impl is None for block in originals)
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
+
+
+def test_vlm_compiles_pixtral_vision_blocks_but_not_other_towers() -> None:
+    from vllm.model_executor.models import pixtral
+
+    def pixtral_block() -> nn.Module:
+        # Skips ``__init__``, which needs a vision config and a TP group.
+        block = pixtral.TransformerBlock.__new__(pixtral.TransformerBlock)
+        nn.Module.__init__(block)
+        return block
+
+    class OtherVisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(4, 4)
+
+    class DecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _hf_decoder_attention()
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = nn.Module()
+            self.vision_encoder.transformer = nn.Module()
+            self.vision_encoder.transformer.layers = nn.ModuleList(
+                [pixtral_block() for _ in range(2)]
+            )
+            self.vision_model = nn.Module()
+            self.vision_model.layers = nn.ModuleList([OtherVisionBlock() for _ in range(2)])
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList([DecoderLayer() for _ in range(3)])
+
+    model = VLM()
+    pixtral_layers = model.vision_encoder.transformer.layers
+    decoder_layers = model.language_model.layers
+    assert _repeated_block_lists(model) == [pixtral_layers, decoder_layers]
+
+    assert _runner(model)._compile_blocks() == 5
+    assert all(block._compiled_call_impl is not None for block in pixtral_layers)
+    assert all(block._compiled_call_impl is None for block in model.vision_model.layers)
 
 
 def test_compile_blocks_wraps_every_block_in_place() -> None:

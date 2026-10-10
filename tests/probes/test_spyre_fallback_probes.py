@@ -1244,33 +1244,21 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 14. Compiled Pixtral vision attention (coarse-tile hint split)
+# 14. Compiled Pixtral vision attention
 # ---------------------------------------------------------------------------
 
 
-_VISION_ATTN_COMPILE_REASON = (
-    "torch.compile of Pixtral vision Attention (RoPE + padded SDPA) dies in "
-    "coarse-tile: `hint_id=N appears in both group 0 and group 1` — ops from "
-    "the same spyre_hint were split across two loop nests. That is why "
-    "`_is_decoder_attention_like` refuses vision towers. When this XPASS-es, "
-    "vision blocks can compile and the decoder-only restriction can be dropped."
-)
-
-
-@pytest.mark.xfail(strict=True, reason=_VISION_ATTN_COMPILE_REASON)
 def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_group, monkeypatch):
-    """A compiled vision-attention block must match the eager patched forward.
-
-    `_compile_blocks` wraps each TransformerBlock the same way. First
-    ``embed_multimodal`` then traces that graph and coarse-tile raises.
-    """
+    """A compiled vision-attention block must match the eager patched forward."""
     pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
     from vllm.model_executor.layers.linear import LinearBase
 
     from spyre_inference.multimodal.pixtral import (
+        install_rope_perm,
         patch_vision_attention,
         patch_vision_rope_vit,
     )
+    from spyre_inference.multimodal.utils import _padded_attn_mask
 
     monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
     monkeypatch.setattr(
@@ -1330,7 +1318,10 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
     expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
 
     layer = layer.to(spyre_device)
+    install_rope_perm(layer, spyre_device)
     layer.compile(backend="inductor", fullgraph=True, dynamic=False)
+    # Padded and uploaded outside the graph, as `patch_transformer_mask` does.
+    mask = _padded_attn_mask(mask, 1, num_patches, num_patches, torch.float16, spyre_device)
     out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
 
     torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)

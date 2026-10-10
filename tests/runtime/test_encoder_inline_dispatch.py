@@ -316,6 +316,7 @@ class TestForcedWarmupPlan:
 
         runner = SimpleNamespace(
             _forced_encoder_rect=rect,
+            _encoder_causal=False,
             _model_dtype=lambda: torch.float16,
             _spyre_device=torch.device("cpu"),
         )

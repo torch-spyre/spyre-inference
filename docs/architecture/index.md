@@ -143,7 +143,8 @@ Two adaptations worth knowing:
   for the compiled loop to address it; a single token is handed to the gathered form whole, so
   it never needs that.
   In the post-load hook it also rebuilds each layer's `w13 [E,2M,H]` / `w2 [E,H,M]` stacks into
-  the `[E,H,M]` / `[E,M,H]` layout those forms contract on, freeing each source stack as it goes,
+  the `[E,H,M]` / `[E,M,H]` stacks those forms contract on (see
+  [MoE expert weights](#moe-expert-weights)), freeing each source stack as it goes,
   since the device cannot hold both layouts at once. Tensor parallelism needs nothing
   further: upstream shards each expert's intermediate dim, so the forms just see a
   narrower `M` — zero-widened to whole sticks where a shard lands mid-stick — and
@@ -153,6 +154,47 @@ Two adaptations worth knowing:
   `MoERunner`, takes vLLM's direct `_moe_forward` entry — as upstream does on CPU and TPU —
   instead of the opaque `torch.ops.vllm.moe_forward` custom op, so a compiled block traces
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
+
+### MoE expert weights
+
+`_prepare_layer` moves each layer's experts to the device once, as three stacks, and hands
+the gathered form its own view of each: a `reinterpret_tensor_with_layout` alias over the
+same storage. Prefill and decode therefore share every byte of expert memory; there is no
+second weight pool.
+
+| Attribute | Shape | Device layout | Read by |
+|---|---|---|---|
+| `spyre_moe_gate`, `spyre_moe_up` | `[E, H, M]` | `[E, H, M/s, s]` (gather) | persistent |
+| `spyre_moe_gate_alias`, `spyre_moe_up_alias` | `[E·C, H/C, M]` | `[E·C, H/C, M/s, s]` | gathered |
+| `spyre_moe_down` | `[E, M, H]` | `[E, H/s, M, s]` (`nn.Linear` order) | persistent |
+| `spyre_moe_down_alias` | `[E·C, M, H/C]` | `[E·C, H/(C·s), M, s]` | gathered |
+
+`s` is the stick (64 fp16 elements), `M` the intermediate dim zero-widened to whole sticks,
+and `C` is selected once during load by `_derive_moe_chunks`, using `top_k`, the configured
+core count, legal divisors of `H/s`, and a 1.5 MB per-core gathered-weight budget. For Gemma 4
+with `top_k=8` and 32 cores this selects `C=4`. `SPYRE_MOE_CHUNKS` overrides the derived
+value; the override must still split `H` into whole-stick chunks and bypasses the budget check,
+so it can cause extra spills or make compilation fail. Alias entry `e·C + c` is chunk `c` of
+expert `e`. TP narrows only `M`, so the slicing is unchanged at every TP degree.
+
+The gathered form slices the hidden dim because a gather divides work only along its entries.
+Gate/up slice their contraction dim (rows of `H`); down slices its output dim (columns of `H`).
+If no automatic chunk count fits the weight budget, preparation uses C=1: the gather still
+selects only routed experts, though its working set may exceed the estimate. Persistent
+dispatch remains available for token batches above the gathered bound.
+
+An alias is only valid when the sliced axis sits directly inside the expert axis in device
+order, so that each slice is one contiguous block and slicing merely relabels the flat order.
+That is what fixes each stack's layout. Gate/up keep `H` outer to the `M` sticks (the gather
+layout); down keeps the `H` sticks outer to `M` (the `nn.Linear` order its persistent matmul
+wants anyway — in the gather layout its long `H` rows would stream in short transfers). The
+other layout would not alias for either stack. The selected `C` guarantees `H % (C·s) == 0`
+before any weights move, and each alias checks the pool's actual device layout before
+reinterpreting it.
+
+The two forms differ numerically in one place: the gathered form sums gate/up over `C` fp16
+partial products before the activation, so decode rounds up to three more times there than the
+persistent form. Down's output slices are concatenated, not summed.
 
 ## Compilation Granularity
 

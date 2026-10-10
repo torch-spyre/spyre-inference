@@ -289,3 +289,30 @@ windows, i.e. whether an Inductor compile landed inside a measurement.
   legitimately triggers many recompiles; the dynamo recompile limit is raised to
   4096. Warmup runs before the profiled windows so no compile lands inside a
   measured window.
+
+## Gemma 4 MoE decode micro-benchmark
+
+`gemma4_decode_moe_microbench.py` compiles the production `_gathered_tokens` path
+with Gemma 4 26B A4B expert dimensions (128 experts, hidden 2816, intermediate 704,
+top-k 8). By default it sweeps batch sizes 1, 2, 4, 8, 16, and 32. It compares
+each result against a dense CPU reference and aborts on `FallbackWarning` or when
+the AIUPTI profile has no Spyre device events.
+
+```bash
+SPYRE_NUM_CPUS=8 uv run --no-sync python scripts/microbench/gemma4_decode_moe_microbench.py \
+    --output /tmp/gemma4-decode-moe.json
+```
+
+Gate, up, and down are each stored once. Decode reads `C` expert-major hidden slices of each
+through reinterpret views, where `C` is derived from the expert top-k, core count, stick
+alignment, and per-core weight budget; `SPYRE_MOE_CHUNKS` can override the selection. See
+[MoE expert weights](../../docs/architecture/index.md#moe-expert-weights).
+
+`latency_ms` is synchronized wall latency without an active Kineto profile.
+`profiled_cpu_span_ms` and device-event samples are collected separately.
+`profiled_device_events` keeps every profiled device event name and duration;
+`compute_device_event_sum_ms` excludes event names containing `memcpy` or `memset`,
+which are reported separately as `memcpy_memset_event_sum_ms`. Device-event sums are
+not critical-path wall time. The profiler-enabled torch-spyre build is required for
+device events. Compilation and warmup are outside timed samples, and results are
+written after every batch size when `--output` is supplied.

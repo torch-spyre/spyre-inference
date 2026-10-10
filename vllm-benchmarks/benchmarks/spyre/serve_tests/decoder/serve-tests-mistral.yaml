@@ -1,0 +1,82 @@
+# Serve benchmarks for Mistral models on Spyre devices.
+#
+# Text entries use SPYRE_AIOPS_DATASET (4k).
+# Vision entries use SPYRE_VISION_DATASET (32k, openai-chat backend).
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 100
+    custom-output-len: -1
+    ignore-eos: true
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Ministral 3 14B Instruct — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_ministral3-14b_tp4_aiops
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 200
+      max-concurrency: 5
+
+  # ---------------------------------------------------------------------------
+  # Ministral 3 14B Instruct — vision
+  # ---------------------------------------------------------------------------
+  - test_name: serve_ministral3-14b_tp4_vision
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_VISION_DATASET}
+      dataset-name: custom_image
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4
+
+  # ---------------------------------------------------------------------------
+  # Mistral Small 3.2 24B Instruct — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_mistral-small32-24b_tp4_aiops
+    server_parameters:
+      model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 200
+      max-concurrency: 5
+
+  # ---------------------------------------------------------------------------
+  # Mistral Small 3.2 24B Instruct — vision
+  # ---------------------------------------------------------------------------
+  - test_name: serve_mistral-small32-24b_tp4_vision
+    server_parameters:
+      model: mistralai/Mistral-Small-3.2-24B-Instruct-2506
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_VISION_DATASET}
+      dataset-name: custom_image
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4

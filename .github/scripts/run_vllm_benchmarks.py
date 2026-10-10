@@ -54,6 +54,10 @@ DATASET_PATH_DEFAULTS = {
         "/models/online_benchmarking_data_reordered/"
         "cics_results_2025.11.03_e2ee1b0_correct_order.jsonl"
     ),
+    "SPYRE_VISION_DATASET": (
+        "/models/online_benchmarking_data_reordered/"
+        "wdu_combined_article_payload_fixed.jsonl"
+    ),
 }
 
 
@@ -186,8 +190,8 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
         for test_name, path in missing_datasets:
             log.error("%s needs dataset %s, which is not present on this host", test_name, path)
         log.error(
-            "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET at this host's copies "
-            "of the trace files, or mount them at the paths above."
+            "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET / SPYRE_VISION_DATASET "
+            "at this host's copies of the trace files, or mount them at the paths above."
         )
         sys.exit(2)
     return selected

@@ -1,0 +1,78 @@
+# Serve benchmarks for Granite models on Spyre devices.
+#
+# Granite 4.1 8B (FP16, FP8) and Granite 4.2 8B FP8 use SPYRE_AIOPS_DATASET (4k).
+# Granite Vision 4.1 4B uses SPYRE_VISION_DATASET (32k, openai-chat backend).
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 100
+    custom-output-len: -1
+    ignore-eos: true
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Granite 4.1 8B FP16 — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite41-8b_tp4_aiops
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 200
+      max-concurrency: 5
+
+  # ---------------------------------------------------------------------------
+  # Granite 4.1 8B FP8 — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite41-8b-fp8_tp4_aiops
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 200
+      max-concurrency: 5
+
+  # ---------------------------------------------------------------------------
+  # Granite 4.2 8B FP8 — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite42-8b-fp8_tp4_aiops
+    server_parameters:
+      model: ibm-granite/granite-4.2-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 200
+      max-concurrency: 5
+
+  # ---------------------------------------------------------------------------
+  # Granite Vision 4.1 4B — vision
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-vision41-4b_tp4_vision
+    server_parameters:
+      model: ibm-granite/granite-vision-4.1-4b
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_VISION_DATASET}
+      dataset-name: custom_image
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4

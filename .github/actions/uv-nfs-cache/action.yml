@@ -1,0 +1,55 @@
+name: uv cache (NFS)
+description: >-
+  Ship the uv cache to and from the shared /storage-1 PVC, actions/cache style:
+  one step, called once after setup-uv and before `uv sync`. On the way in it
+  restores into a local UV_CACHE_DIR; at job end its post step ships the warmed
+  cache back as one tar per content-addressed key. Caches are scoped like
+  GitHub's own service -- push-to-main writes the shared `main` scope every job
+  reads, and each PR writes an isolated `pr-<N>` scope only that PR reads -- so a
+  PR can never poison main. uv itself only ever sees the plain local dir, so
+  `uv sync` never takes a lock on NFS. See .github/scripts/nfs_uv_cache.py.
+
+inputs:
+  storage-root:
+    description: >-
+      Repo-scoped cache root on the shared mount; tars live under
+      <storage-root>/<scope>/<arch>. Pass it explicitly, e.g.
+      /storage-1/spyre-inference/.cache/uv -- the /storage-1 mount is shared
+      across org repos, so the caller owns the scoping.
+    required: true
+  local-dir:
+    description: Local dir exposed as UV_CACHE_DIR. Defaults to $RUNNER_TEMP/uv-cache.
+    required: false
+    default: ''
+  key-files:
+    description: Newline-separated lockfiles (relative to the checkout) hashed into the cache key.
+    required: false
+    default: |
+      uv.lock
+      spyre-rpms.lock
+  save:
+    description: "Set 'false' to never write (a pure consumer, e.g. the review bot)."
+    required: false
+    default: 'true'
+  compress:
+    description: "Tar compression: none (default; cache is mostly precompressed wheels), zstd, or gzip."
+    required: false
+    default: none
+  keep:
+    description: Tars to retain per arch (older are evicted after a successful save).
+    required: false
+    default: '5'
+
+outputs:
+  cache-hit:
+    description: "'true' when the exact key was found on the mount (written by the restore)."
+  cache-key:
+    description: The content-addressed key computed for this checkout.
+
+runs:
+  using: node20
+  main: main.js
+  # Save only when the job is still green: never ship a cache from a run whose
+  # build (or tests) failed, which could leave a partial tree under the key.
+  post: post.js
+  post-if: success()

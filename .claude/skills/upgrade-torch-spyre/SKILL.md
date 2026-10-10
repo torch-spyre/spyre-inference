@@ -1,6 +1,6 @@
 ---
 name: upgrade-torch-spyre
-description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, refresh the full `uv.lock` (all transitive deps except `vllm`, which is held by its git-tag pin), update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the full lockfile refresh happens once on the settled commit (not inside the bisect loop, which must isolate the build-viability signal), that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
+description: Bump the pinned `torch-spyre` git rev in `pyproject.toml`, refresh the full `uv.lock` (all transitive deps except `vllm`, which is held by its git-tag pin), move the exact `torch==` pins in lockstep when the new rev needs another torch, update `spyre-rpms.lock` to match artifactory, binary-search to the latest commit that actually compiles against this host's `ibm-*` RPMs, clear the stale inductor cache, run a smoke test, and write a reviewer-ready PR description. Use whenever the user asks to "bump", "upgrade", "update", or "pull up" torch-spyre — typically after new `ibm-deeptools` / `ibm-flex` / `ibm-senlib` packages land that unblock previously-failing torch-spyre commits. Encodes that build failures are the expected signal that supporting libs need a matching bump, that the full lockfile refresh happens once on the settled commit (not inside the bisect loop, which must isolate the build-viability signal), that the torchinductor cache must be wiped after the bump to avoid `TypeError: ...__init__() got an unexpected keyword argument ...` red herrings, and the curated PR-description shape (notable upstream PRs + bisect table + installed `ibm-*` RPM versions).
 ---
 
 # Upgrade torch-spyre
@@ -149,6 +149,44 @@ target = commits[low]   # latest building commit
 This takes ≤ `log2(N)` iterations, ~5–7 builds for typical ranges (50–100 commits). Each build is ~50s plus a few seconds of lock + small package syncs.
 
 **State the bounds in chat after each iteration** ("Range [27, 55]. Next: index 41 = `a14b29e`.") so the user can interrupt early if they spot something off.
+
+### 3b. Move the torch pins if the new torch-spyre needs another torch
+
+torch-spyre governs which torch this repo runs on, and the csrc/ sampling extension links
+libtorch, so torch is pinned exactly in several places that must move together. Check the
+target commit's requirement:
+
+```bash
+gh api "repos/torch-spyre/torch-spyre/contents/pyproject.toml?ref=<target-sha>" \
+  --jq .content | base64 -d | grep -n "torch"
+```
+
+If the current pin still satisfies it, nothing to do. A bisect step that exits 2 (lock
+failed) on a torch resolution conflict is this case too. Otherwise, update every one of
+these in `pyproject.toml` in the same commit:
+
+1. `[build-system].requires`: `torch==X.Y.Z` (what the extension compiles against)
+2. `[project.dependencies]`: `torch==X.Y.Z` (what wheel consumers install)
+3. `[tool.uv] override-dependencies`: `torch==X.Y.Z`
+4. `[tool.uv.extra-build-dependencies]`: `torch-spyre = ["torch==X.Y.Z"]`
+5. `[tool.uv.sources]` ppc64le torch: `tag = "vX.Y.Z"`
+6. `[[tool.uv.dependency-metadata]]` for torch: the `version` (and `requires-dist`, from the
+   new tag's metadata) of the ppc64le source build
+
+The vLLM pin must allow the new torch too. If it pins torch exactly and doesn't, the torch
+bump needs a vLLM bump first ([[upgrade-vllm]]); stop and say so rather than overriding it.
+
+After the lock refresh and `uv sync` in §4 (which rebuilds the extension, since
+`pyproject.toml` is one of its cache keys), confirm the kernels still load and match their
+PyTorch baselines:
+
+```bash
+uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
+  tests/runtime/test_sampling_fallback.py --no-header
+```
+
+`test_sampling_kernels.py` skips when the extension didn't load, so check it ran rather
+than skipped.
 
 ### 4. Refresh the full lockfile
 

@@ -30,7 +30,9 @@ The plugin registers via two entry points:
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
 a no-op (there is no `vllm._C`), and the model runner reimplements the slot-mapping
-kernel in pure PyTorch.
+kernel in pure PyTorch. The host-side sampling kernels vLLM's CPU backend would supply
+are built by the plugin itself, as `spyre_inference._C` (see
+[Host-side sampling](#host-side-sampling)).
 
 ## Component view of a Granite model
 
@@ -433,6 +435,55 @@ builder prepares on CPU (slot mapping, the per-sequence index tables and additiv
 The per-sequence attention loop is host-driven control flow, but its query-row gather and
 kernels run on Spyre; the KV-cache write and the write-back are device-to-device. RoPE's
 rotation-cache gather and the embedding gather also run on-device.
+
+## Host-side sampling
+
+`SpyreLogitsProcessor` hands the sampler CPU logits, so every sampling step runs on the
+host, serially between device forwards. vLLM picks its sampler path by platform:
+`TorchSpyrePlatform` is `PlatformEnum.OOT`, so `is_cpu()` is `False`, and
+`TopKTopPSampler` falls through to `forward_native` — eager PyTorch, with none of the
+fused kernels upstream reserves for `forward_cpu`. Left as is, that path sorts the full
+`[batch, vocab]` logits for top-k/top-p and generates a fresh `[batch, vocab]` noise tensor
+for every random draw, each a separate pass over memory. At a 262k vocabulary that is a
+large share of each decode step.
+
+`SpyreModelRunner` patches upstream's `Sampler` in place after construction, pointing its
+greedy draw at `greedy_sample` (`v1/sample/sampler.py`) and its random draw at
+`SpyreTopKTopPSampler`, so every holder of it, the rejection sampler included, samples the
+same way. That brings back the CPU kernels and drops the full-vocabulary sort:
+
+- **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
+  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
+  Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
+  there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
+  running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
+  others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
+  seeded request draws its row seed from its own `torch.Generator`, so it stays
+  reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
+  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
+  table instead, which limits each row to 2^20 noise windows and leaves much of a large
+  vocabulary unreachable.
+- **Greedy** — `greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
+  vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
+  single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
+  scan.
+- **Top-k + top-p** — `apply_top_k_top_p_sort_free` takes a `topk` window of `2 × max_k`
+  instead of sorting the vocabulary, and runs top-p's softmax and cumsum over that window
+  only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
+  exact tie count when ties run past it. Top-p without top-k still sorts.
+
+The kernels live in `csrc/cpu/sampling_kernels.cpp` and are built with CMake from
+`setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
+so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
+AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
+supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
+namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
+cannot collide with a vLLM `_C` in the same environment. If the extension
+is missing or fails to import (a failed build, or a dev checkout that never built it), the
+import logs a warning and the samplers fall back to `torch.argmax` and a fresh-noise
+log-space draw. Because the sampler reimplements
+the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
+bump.
 
 ## Transformers backend
 

@@ -229,9 +229,165 @@ jobs:
           BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
         run: python3 .github/scripts/resolve_durations_run.py
 
+  # Builds the csrc/ sampling kernels once, before any test job: a broken build fails CI here
+  # instead of every test job silently falling back to PyTorch sampling, and the test jobs
+  # (and their pod-level retries) download this build instead of compiling their own copy.
+  # It also owns the changed-files detection the test jobs gate on.
+  build_kernels:
+    name: Build csrc/ sampling kernels
+    # Same image as the x86_64 test configs, so compiler, glibc and Python match. A compile needs
+    # no card, so it takes the card-less pool, which only carries the standing image label.
+    runs-on: ${{ fromJSON(format('["x86_64","{0}","linux","{1}"]', (inputs.runner_label || github.event_name == 'merge_group') && 'spyre_pf_x1' || 'spyre_pf_x0', inputs.runner_label || (github.event_name == 'merge_group' && 'image_torch_spyre_mq') || 'image_torch_spyre')) }}
+    timeout-minutes: 30
+    env:
+      STORAGE_1_DIR: /storage-1/spyre-inference
+    outputs:
+      src_changed: ${{ steps.changed-src-files.outputs.any_changed }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Get changed source files
+        id: changed-src-files
+        uses: tj-actions/changed-files@v46
+        with:
+          # Avoid using single or double quotes for multiline patterns.
+          files: |
+            .github/workflows/test_each_commit.yaml
+            .github/workflows/_test_matrix.yaml
+            .github/actions/override-spyre-rpms/action.yml
+            .github/actions/run-matrix-config/action.yml
+            .github/actions/spyre-rpm-install/action.yml
+            pyproject.toml
+            uv.lock
+            spyre-rpms.lock
+            tests/**/*.py
+            tests/**/*.yaml
+            tests/data/**
+            spyre_inference/**/*.py
+            spyre_inference/**/*.yaml
+            csrc/**
+            cmake/**
+            CMakeLists.txt
+            setup.py
+
+      # Build whenever any test job may run: skipped only for a prebaked image (no workspace build)
+      # or a PR that changed no source files (every test job skips too).
+      - name: Decide whether to build
+        id: gate
+        run: |
+          if [[ "${{ inputs.use_prebaked_image }}" != "true" ]] \
+             && [[ "${{ inputs.skip_if_no_changes }}" == "false" \
+                   || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Key the kernels ccache on this machine's arch
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: arch
+        run: echo "arch=$(uname -m)" >> "$GITHUB_OUTPUT"
+
+      # As torch-spyre does: the wheel is rebuilt every run, so it always carries this commit's
+      # Python, and a cross-run ccache makes the compile near-free when csrc/ is unchanged. The
+      # run-unique key never exact-matches, so the prefix restores the newest entry and the save
+      # below can publish a refreshed one (cache entries are immutable).
+      - name: Restore kernels ccache
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: ccache-restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: spyre-kernels-ccache-${{ steps.arch.outputs.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            spyre-kernels-ccache-${{ steps.arch.outputs.arch }}-
+
+      - name: Set up uv
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          enable-cache: false
+
+      # Own root, keyed on pyproject.toml ([build-system] requires): this job runs before every
+      # test job, so saving into .cache/uv would publish its slimmer cache under their key first.
+      - name: uv cache (NFS)
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv-kernels
+          key-files: pyproject.toml
+
+      # setup.py only warns on a failed build (the samplers fall back to PyTorch), so check
+      # the wheel actually carries the extensions and fail here.
+      - name: Build kernels wheel
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        id: build
+        shell: bash
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+
+          # A fixed venv holding only the [build-system] requires, built without isolation: an
+          # isolated build gets a fresh temp env (and torch include path) every run, which ccache
+          # would hash as a different compile.
+          uv venv .venv-kernels
+          mapfile -t reqs < <(.venv-kernels/bin/python -c 'import tomllib; print("\n".join(tomllib.load(open("pyproject.toml", "rb"))["build-system"]["requires"]))')
+          # torch from the pytorch-cpu index, its own deps (setuptools>=82 etc.) from PyPI.
+          uv pip install --python .venv-kernels --torch-backend cpu "${reqs[@]}"
+
+          if command -v ccache >/dev/null; then
+            export CCACHE_DIR="$GITHUB_WORKSPACE/.ccache" CCACHE_BASEDIR="$GITHUB_WORKSPACE" \
+              CCACHE_NOHASHDIR=1 CCACHE_COMPILERCHECK=content \
+              CCACHE_SLOPPINESS=time_macros,include_file_ctime,include_file_mtime,locale
+            mkdir -p "$CCACHE_DIR"
+            # Skip the launcher when the image's compiler is already a ccache wrapper.
+            if [[ "$(readlink -f "$(command -v c++)")" != */ccache ]]; then
+              export CMAKE_ARGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+            fi
+            ccache --zero-stats
+          else
+            echo "::warning::ccache not found on the runner; building the kernels uncached."
+          fi
+
+          rm -rf "$RUNNER_TEMP/kernels-wheel"
+          uv build --wheel --no-build-isolation --python .venv-kernels/bin/python \
+            --out-dir "$RUNNER_TEMP/kernels-wheel"
+          if ! unzip -l "$RUNNER_TEMP"/kernels-wheel/spyre_inference-*.whl | grep -q 'spyre_inference/_C'; then
+            echo "::error::The csrc/ sampling kernels failed to build; see the output above."
+            exit 1
+          fi
+
+          # Save only when something compiled: a full hit has nothing new, and re-uploading it
+          # every run churns the repo's 10 GB cache quota. Unparsable stats count as dirty.
+          if command -v ccache >/dev/null; then
+            ccache --show-stats || true
+            misses="$({ ccache --print-stats 2>/dev/null || true; } | awk '$1 == "cache_miss" { print $2; exit }')"
+            echo "ccache misses this build: ${misses:-unknown}"
+            [[ "$misses" == "0" ]] || echo "ccache_dirty=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save kernels ccache
+        if: ${{ steps.build.outputs.ccache_dirty == 'true' && github.event_name != 'merge_group' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ${{ steps.ccache-restore.outputs.cache-primary-key }}
+
+      - name: Upload kernels wheel
+        if: ${{ steps.gate.outputs.run == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sampling-kernels-wheel
+          path: ${{ runner.temp }}/kernels-wheel
+          if-no-files-found: error
+          retention-days: 1
+
   test:
     name: 'build and run tests (${{ matrix.cfg }})'
-    needs: resolve_durations
+    needs: [resolve_durations, build_kernels]
     strategy:
       fail-fast: false
       matrix:
@@ -629,25 +785,6 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Get changed source files
-        id: changed-src-files
-        uses: tj-actions/changed-files@v46
-        with:
-          # Avoid using single or double quotes for multiline patterns.
-          files: |
-            .github/workflows/test_each_commit.yaml
-            .github/workflows/_test_matrix.yaml
-            .github/actions/override-spyre-rpms/action.yml
-            .github/actions/spyre-rpm-install/action.yml
-            pyproject.toml
-            uv.lock
-            spyre-rpms.lock
-            tests/**/*.py
-            tests/**/*.yaml
-            tests/data/**
-            spyre_inference/**/*.py
-            spyre_inference/**/*.yaml
-
       # Single run/skip decision for every build+test step below. A job runs
       # only when BOTH hold:
       #   1. the dispatch flow (skip_if_no_changes=false) always passes; the PR
@@ -675,7 +812,7 @@ jobs:
           # sibling torch-spyre workflow's generate_matrix.resolved_test_type.
           echo "resolved_test_type=${RESOLVED_TEST_TYPE}" >> "$GITHUB_OUTPUT"
           if [[ "${{ inputs.skip_if_no_changes }}" == "false" \
-             || "${{ steps.changed-src-files.outputs.any_changed }}" == "true" ]]; then
+             || "${{ needs.build_kernels.outputs.src_changed }}" == "true" ]]; then
             changed=true
           else
             changed=false
@@ -711,7 +848,7 @@ jobs:
           runner_labels: ${{ format('["{0}","{1}"]', join(matrix.runs_on, '","'), inputs.runner_label || (github.event_name == 'merge_group' && format('{0}_mq', matrix.image_label)) || matrix.image_label) }}
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
@@ -799,7 +936,7 @@ jobs:
           job_slot: retry-${{ strategy.job-index }}
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
-          is_merge_group: ${{ github.event_name == 'merge_group' }}
+          storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
@@ -811,12 +948,17 @@ jobs:
   # Test matrix result: decides pass/fail for the `test` matrix (continue-on-error, so always reports "success" itself) by inspecting the pod-level retry outcome; this job's own result is what determines the reusable workflow's overall conclusion.
   test_result:
     name: Test matrix result
-    needs: [collect_failed_suites, test_retry]
+    needs: [build_kernels, collect_failed_suites, test_retry]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Evaluate combined result
         run: |
+          # A failed kernel build skips every test job, which would otherwise read as a pass.
+          if [[ "${{ needs.build_kernels.result }}" != "success" ]]; then
+            echo "::error::Building the csrc/ sampling kernels failed (result: ${{ needs.build_kernels.result }})."
+            exit 1
+          fi
           echo "Suites retried: ${{ needs.collect_failed_suites.outputs.has_failed }}"
           echo "test_retry result: ${{ needs.test_retry.result }}"
           if [[ "${{ needs.collect_failed_suites.outputs.has_failed }}" == "true" && \
@@ -1027,16 +1169,20 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          prune-cache: false
-          save-cache: ${{ github.event_name != 'merge_group' }}
+          enable-cache: false
+
+      # Restore now; the post step ships it back at job end (writers only). No
+      # use_prebaked_image gate here, unlike run-matrix-config: the perf build
+      # below runs `uv sync` unconditionally, so it needs the cache either way.
+      - name: uv cache (NFS)
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
 
       - name: Install override Spyre RPMs
         if: ${{ inputs.rpm_names != '' }}

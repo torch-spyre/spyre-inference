@@ -132,18 +132,26 @@ def spyre_available() -> bool:
 def spyre_device_count() -> int:
     """Return the number of visible Spyre cards, or 0 if unavailable.
 
-    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
-    cards are visible) instead of touching the Spyre runtime, so
-    `uses_subprocess` tests don't import torch_spyre in the main
-    pytest process.
+    Reads SPYRE_DEVICES (if set) and AIU_WORLD_SIZE (set by the Spyre runtime
+    environment when cards are visible) without touching the Spyre runtime, so
+    `uses_subprocess` tests don't import torch_spyre in the main pytest process.
 
     Returns:
         Number of visible Spyre devices, or 0 if unavailable.
     """
     try:
-        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
+        aiu_world_size = int(os.environ.get("AIU_WORLD_SIZE", "0"))
     except ValueError:
-        return 0
+        aiu_world_size = 0
+
+    spyre_devices = os.environ.get("SPYRE_DEVICES")
+    if spyre_devices is not None:
+        devices = [d.strip() for d in spyre_devices.split(",") if d.strip()]
+        if aiu_world_size > 0:
+            return min(len(devices), aiu_world_size)
+        return len(devices)
+
+    return aiu_world_size
 
 
 # ---------------------------------------------------------------------------

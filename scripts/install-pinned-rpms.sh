@@ -37,6 +37,7 @@ To install another revision's set, extract its lock file first:
   git show origin/main:spyre-rpms.lock > /tmp/main.lock
   bash $0 --lock /tmp/main.lock
 EOF
+    return 0
 }
 
 # Not `git rev-parse`: --lock has to work from outside any repo.
@@ -47,7 +48,11 @@ CACHE="${RPM_CACHE_DIR:-${HOME}/.cache/spyre-rpms}"
 FORCE=0
 REBUILD=0
 
-needs_value() { [[ $2 -ge 2 ]] || { echo "$1 requires a value" >&2; usage >&2; exit 1; }; }
+needs_value() {
+    local flag=$1 nargs=$2
+    [[ $nargs -ge 2 ]] || { echo "$flag requires a value" >&2; usage >&2; exit 1; }
+    return 0
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

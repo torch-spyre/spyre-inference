@@ -387,7 +387,7 @@ def write_step_summary(text: str) -> None:
         handle.write(f"### PR reminder\n\n{text}\n")
 
 
-def report_failure(error: BaseException) -> int:
+def report_failure(error: BaseException) -> None:
     """Escalate a pre-Slack failure: Slack, else a GitHub issue, else just fail."""
     log.error("PR reminder failed:\n%s", format_error(error))
     failure_text = FAILURE_TEMPLATE.format(
@@ -395,14 +395,13 @@ def report_failure(error: BaseException) -> int:
     )
     try:
         post_to_slack(failure_text)
-        return 1
+        return
     except (SlackClientError, RuntimeError, OSError) as slack_error:
         log.error("Could not report the failure to Slack: %s", redact(str(slack_error)))
     try:
         open_failure_issue(github_session(), error)
     except Exception as issue_error:  # last rung of the ladder
         log.error("Could not open a failure issue either: %s", redact(str(issue_error)))
-    return 1
 
 
 def main() -> int:
@@ -418,7 +417,8 @@ def main() -> int:
             return 0
         text = render_message(top, total, now)
     except Exception as error:  # any failure before the post must escalate
-        return report_failure(error)
+        report_failure(error)
+        return 1
 
     write_step_summary(text)
     if args.dry_run:

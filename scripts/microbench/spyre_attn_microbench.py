@@ -885,7 +885,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         n_outliers = int((diff > atol + rtol * ref.abs()).sum().item())
         row["max_abs_diff"] = diff.max().item()
         row["ref_abs_max"] = ref.abs().max().item()
-        if row["ref_abs_max"] == 0.0:
+        if not ref.any():
             print(
                 "    -> WARNING: reference is all zeros, so this comparison is vacuous "
                 "(the cache the kernel read holds no data)",

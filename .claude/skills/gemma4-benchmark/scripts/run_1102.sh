@@ -55,9 +55,13 @@ RECOMPILES=0
 OUT=""
 ARGS=("$@")
 
-die() { echo "run_1102.sh: $1" >&2; exit "${2:-2}"; }
+die() {
+  local msg=$1 code=${2:-2}
+  echo "run_1102.sh: $msg" >&2
+  exit "$code"
+}
 
-while [ $# -gt 0 ]; do
+while [[ $# -gt 0 ]]; do
   case "$1" in
     --python) PY=$2; shift 2 ;;
     --hf-python) HF_PY=$2; shift 2 ;;
@@ -79,30 +83,30 @@ while [ $# -gt 0 ]; do
 done
 [[ "$REPEAT" =~ ^[1-9][0-9]*$ ]] || die "--repeat takes a positive integer, got '$REPEAT'"
 [[ "$TP" =~ ^[1-9][0-9]*$ ]] || die "--tp takes one positive integer, got '$TP' (several: run_suite.sh)"
-ARMS=$(for arm in $ARMS; do [ "$arm" = vllm ] && echo branch || echo "$arm"; done | xargs)
+ARMS=$(for arm in $ARMS; do [[ "$arm" = vllm ]] && echo branch || echo "$arm"; done | xargs)
 for arm in $ARMS; do
   case "$arm" in hf|main|branch) ;; *) die "unknown arm '$arm' (hf, main, branch)" ;; esac
 done
-VLLM_ARMS=$(for arm in $ARMS; do [ "$arm" = hf ] || echo "$arm"; done | paste -sd, -)
+VLLM_ARMS=$(for arm in $ARMS; do [[ "$arm" = hf ]] || echo "$arm"; done | paste -sd, -)
 
-if [ -n "$ENV_SCRIPT" ]; then
-  [ -r "$ENV_SCRIPT" ] || die "cannot read --env-script $ENV_SCRIPT"
+if [[ -n "$ENV_SCRIPT" ]]; then
+  [[ -r "$ENV_SCRIPT" ]] || die "cannot read --env-script $ENV_SCRIPT"
   set +u
   # shellcheck disable=SC1090
   source "$ENV_SCRIPT"
   set -u
 fi
 # After --env-script, which may be what sets VIRTUAL_ENV.
-if [ -z "$PY" ]; then
-  if [ -n "${VIRTUAL_ENV:-}" ]; then PY=$VIRTUAL_ENV/bin/python
-  elif [ -n "${UV_PROJECT_ENVIRONMENT:-}" ]; then PY=$UV_PROJECT_ENVIRONMENT/bin/python
+if [[ -z "$PY" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" ]]; then PY=$VIRTUAL_ENV/bin/python
+  elif [[ -n "${UV_PROJECT_ENVIRONMENT:-}" ]]; then PY=$UV_PROJECT_ENVIRONMENT/bin/python
   else die "no environment: pass --python, or --env-script <venv>/bin/activate"; fi
 fi
-[ -n "$HF_PY" ] || HF_PY=$PY
-for p in "$PY" "$HF_PY"; do [ -x "$p" ] || die "no interpreter at $p"; done
+[[ -n "$HF_PY" ]] || HF_PY=$PY
+for p in "$PY" "$HF_PY"; do [[ -x "$p" ]] || die "no interpreter at $p"; done
 
 # The issue's workload, or the ITL report's on the same prompt.
-if [ "$ITL" = 1 ]; then
+if [[ "$ITL" = 1 ]]; then
   OUTPUT_LENS=(1 64); ITERS=10; HF_ITERS=10
   VLLM_ENV=(OMP_WAIT_POLICY=PASSIVE SPYRE_NUM_CPUS=8)
 else
@@ -111,12 +115,12 @@ else
 fi
 # ttft.py is the issue's single-card script; hf_latency.py times the same way and shards.
 HF_SCRIPT=hf_latency.py
-[ "$ITL" = 1 ] || [ "$TP" != 1 ] || HF_SCRIPT=ttft.py
+[[ "$ITL" = 1 ]] || [[ "$TP" != 1 ]] || HF_SCRIPT=ttft.py
 
 # Spyre cards: $SPYRE_DEVICES if pinned, else the numbered IOMMU-group nodes under /dev/vfio
 # (the `vfio` container node is not one). hf ranks take the first TP of them, as hf-adapters'
 # multicard script does.
-if [ -n "${SPYRE_DEVICES:-}" ]; then
+if [[ -n "${SPYRE_DEVICES:-}" ]]; then
   CARDS=$(echo "${SPYRE_DEVICES//,/ }" | wc -w)
   HF_DEVICES=$(echo "${SPYRE_DEVICES//,/ }" | xargs -n1 | head -n "$TP" | paste -sd, -)
 else
@@ -124,18 +128,22 @@ else
   HF_DEVICES=$(seq -s, 0 $((TP - 1)))
 fi
 HF_LAUNCH=("$HF_PY")
-[ "$TP" = 1 ] || HF_LAUNCH=(env "SPYRE_DEVICES=$HF_DEVICES" "$HF_PY" -m torch.distributed.run
+[[ "$TP" = 1 ]] || HF_LAUNCH=(env "SPYRE_DEVICES=$HF_DEVICES" "$HF_PY" -m torch.distributed.run
                             --nproc-per-node "$TP" --master-port 29500)
 hf_args() {  # hf_args <output-len> <latency.json>
+  local output_len=$1 latency_json=$2
   HF_ARGS=(--model "$MODEL" --input-len "$INPUT_LEN")
-  [ "$HF_SCRIPT" = ttft.py ] || HF_ARGS+=(--output-len "$1" --iters "$HF_ITERS" --output-json "$2")
+  [[ "$HF_SCRIPT" = ttft.py ]] || HF_ARGS+=(--output-len "$output_len" --iters "$HF_ITERS" --output-json "$latency_json")
+  return 0
 }
 vllm_args() {  # vllm_args <output-len>
-  VLLM_ARGS=(--input-len "$INPUT_LEN" --output-len "$1" --batch-size 1 --num-iters-warmup 2
+  local output_len=$1
+  VLLM_ARGS=(--input-len "$INPUT_LEN" --output-len "$output_len" --batch-size 1 --num-iters-warmup 2
              --num-iters "$ITERS" --max-model-len 2048 --max-num-seqs 1)
-  [ "$TP" = 1 ] || VLLM_ARGS+=(--tensor-parallel-size "$TP")
+  [[ "$TP" = 1 ]] || VLLM_ARGS+=(--tensor-parallel-size "$TP")
+  return 0
 }
-[ -n "$OUT" ] || OUT=${GEMMA4_BENCH_OUT:-$HOME/gemma4-benchmark}/$(date +%Y-%m-%d_%H%M%S)
+[[ -n "$OUT" ]] || OUT=${GEMMA4_BENCH_OUT:-$HOME/gemma4-benchmark}/$(date +%Y-%m-%d_%H%M%S)
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 
@@ -143,20 +151,25 @@ trap 'rm -rf "$STAGE"' EXIT
 # One check per interpreter, from a neutral cwd so a checkout in the cwd cannot shadow
 # what the benchmark itself imports.
 check() {  # check <label> <python> <arms,comma-separated>
+  local label=$1 python=$2 arms=$3
   local extra=()
-  [ "$ALLOW_PROFILER" = 0 ] || extra=(--allow-profiler)
-  (cd "$STAGE" && "$2" -I -B "$SKILL_DIR/scripts/check_env.py" --out "$STAGE/env_$1.json" \
-    --arms "$3" --model "$MODEL" --main-ref "$MAIN_REF" "${extra[@]+"${extra[@]}"}") > "$STAGE/check_$1.log" 2>&1
-  [ -s "$STAGE/env_$1.json" ] || { echo "!! $1: check_env.py failed:"; tail -5 "$STAGE/check_$1.log"; return 1; }
+  [[ "$ALLOW_PROFILER" = 0 ]] || extra=(--allow-profiler)
+  (cd "$STAGE" && "$python" -I -B "$SKILL_DIR/scripts/check_env.py" --out "$STAGE/env_$label.json" \
+    --arms "$arms" --model "$MODEL" --main-ref "$MAIN_REF" "${extra[@]+"${extra[@]}"}") > "$STAGE/check_$label.log" 2>&1
+  [[ -s "$STAGE/env_$label.json" ]] || { echo "!! $label: check_env.py failed:"; tail -5 "$STAGE/check_$label.log"; return 1; }
 }
-jq_py() { "$PY" -I -B -c "$1" "${@:2}"; }
+jq_py() {  # jq_py <code> [args...]
+  local code=$1
+  "$PY" -I -B -c "$code" "${@:2}"
+  return $?
+}
 
-if [ "$HF_PY" = "$PY" ]; then
+if [[ "$HF_PY" = "$PY" ]]; then
   check env "$PY" "$(echo "$ARMS" | tr ' ' ',')" || die "environment check could not run"
   for arm in $ARMS; do cp "$STAGE/env_env.json" "$STAGE/env_$arm.json"; done
 else
   if [[ " $ARMS " == *" hf "* ]]; then check hf "$HF_PY" hf || die "environment check could not run"; fi
-  if [ -n "$VLLM_ARMS" ]; then
+  if [[ -n "$VLLM_ARMS" ]]; then
     check vllm "$PY" "$VLLM_ARMS" || die "environment check could not run"
     for arm in ${VLLM_ARMS//,/ }; do cp "$STAGE/env_vllm.json" "$STAGE/env_$arm.json"; done
   fi
@@ -175,21 +188,21 @@ print("COUNTS", sum(1 for k in seen if k[0] == "ERROR"), sum(1 for k in seen if 
 ' $(for arm in $ARMS; do echo "$STAGE/env_$arm.json"; done))
 echo "$counts" | grep -v '^COUNTS '
 read -r _ N_ERR N_WARN <<< "$(echo "$counts" | grep '^COUNTS ')"
-[ "${N_ERR:-0}" = 0 ] && [ "${N_WARN:-0}" = 0 ] && echo "  (none)"
+[[ "${N_ERR:-0}" = 0 ]] && [[ "${N_WARN:-0}" = 0 ]] && echo "  (none)"
 
 SI_DIR=""
 MAIN_SHA=""
 MAIN_SRC=""
-if [ -n "$VLLM_ARMS" ]; then
+if [[ -n "$VLLM_ARMS" ]]; then
   VLLM_ENV_JSON=$STAGE/env_${VLLM_ARMS%%,*}.json
   SI_DIR=$(jq_py 'import json, sys; print((json.load(open(sys.argv[1])).get("spyre-inference") or {}).get("checkout") or "")' "$VLLM_ENV_JSON")
   MAIN_SHA=$(jq_py 'import json, sys; print((json.load(open(sys.argv[1])).get("spyre-inference-main") or {}).get("commit") or "")' "$VLLM_ENV_JSON")
-  [ -z "$MAIN_SHA" ] || MAIN_SRC=${GEMMA4_BENCH_CACHE:-$HOME/.cache/gemma4-benchmark}/spyre-inference-${MAIN_SHA:0:12}
+  [[ -z "$MAIN_SHA" ]] || MAIN_SRC=${GEMMA4_BENCH_CACHE:-$HOME/.cache/gemma4-benchmark}/spyre-inference-${MAIN_SHA:0:12}
 fi
 VLLM_CMD=("$(dirname "$PY")/vllm")
-[ -x "${VLLM_CMD[0]}" ] || VLLM_CMD=("$PY" -m vllm.entrypoints.cli.main)
+[[ -x "${VLLM_CMD[0]}" ]] || VLLM_CMD=("$PY" -m vllm.entrypoints.cli.main)
 LENS=$(IFS=,; echo "${OUTPUT_LENS[*]}")
-[ "${#OUTPUT_LENS[@]}" = 1 ] || LENS="{$LENS}"
+[[ "${#OUTPUT_LENS[@]}" = 1 ]] || LENS="{$LENS}"
 vllm_args "$LENS"
 hf_args "$LENS" "<run dir>/latency.json"
 VLLM_LINE="${VLLM_ENV[*]+${VLLM_ENV[*]} }${VLLM_CMD[*]} bench latency --model $MODEL ${VLLM_ARGS[*]}"
@@ -205,24 +218,27 @@ PLAN=$(
 echo "=== plan"
 echo "$PLAN"
 
-if [ "${N_ERR:-0}" != 0 ]; then
+if [[ "${N_ERR:-0}" != 0 ]]; then
   die "$N_ERR ERROR finding(s): this environment cannot be benchmarked as is; fix it yourself and re-run" 1
 fi
-if [ "$TP" -gt 1 ] && [ "$CARDS" -lt "$TP" ]; then
+if [[ "$TP" -gt 1 ]] && [[ "$CARDS" -lt "$TP" ]]; then
   die "ERROR: --tp $TP needs $TP Spyre cards, this host has $CARDS (\$SPYRE_DEVICES, else /dev/vfio); adjust --tp" 1
 fi
-if [ "${N_WARN:-0}" != 0 ] && [ "$ACCEPT_WARNINGS" = 0 ]; then
-  [ "$CHECK_ONLY" = 1 ] && exit 3
+if [[ "${N_WARN:-0}" != 0 ]] && [[ "$ACCEPT_WARNINGS" = 0 ]]; then
+  [[ "$CHECK_ONLY" = 1 ]] && exit 3
   die "$N_WARN WARN finding(s) deviate from the issue's recipe; review them, then re-run with --accept-warnings" 3
 fi
-[ "$CHECK_ONLY" = 1 ] && exit 0
-card_busy() { [ -e /dev/vfio/vfio ] && fuser /dev/vfio/vfio >/dev/null 2>&1; }
+[[ "$CHECK_ONLY" = 1 ]] && exit 0
+card_busy() {
+  [[ -e /dev/vfio/vfio ]] && fuser /dev/vfio/vfio >/dev/null 2>&1
+  return $?
+}
 card_busy && die "/dev/vfio/vfio is held by another process; the cards serve one process at a time"
 
 # The main arm's source: an export of --main-ref (the checkout and its refs stay untouched),
 # shadowing the editable install through PYTHONPATH. Gate on what that actually imports.
-if [ -n "$MAIN_SRC" ]; then
-  if [ ! -d "$MAIN_SRC" ]; then
+if [[ -n "$MAIN_SRC" ]]; then
+  if [[ ! -d "$MAIN_SRC" ]]; then
     mkdir -p "$MAIN_SRC.tmp.$$" && git -C "$SI_DIR" archive --format=tar "$MAIN_SHA" | tar -x -C "$MAIN_SRC.tmp.$$" \
       && mv "$MAIN_SRC.tmp.$$" "$MAIN_SRC" || die "could not export $MAIN_SHA from $SI_DIR into $MAIN_SRC"
   fi
@@ -240,7 +256,7 @@ printf '%s\n' "${ARGS[@]+"${ARGS[@]}"}" > "$OUT/args.txt"
 echo "$PLAN" > "$OUT/plan.txt"
 echo "{\"input_len\": $INPUT_LEN, \"output_lens\": [$(IFS=,; echo "${OUTPUT_LENS[*]}")], \"tp\": $TP," \
   "\"iters\": $ITERS, \"hf_iters\": $HF_ITERS, \"hf_script\": \"$HF_SCRIPT\"," \
-  "\"hf_devices\": \"$([ "$TP" = 1 ] || echo "$HF_DEVICES")\", \"itl\": $([ "$ITL" = 1 ] && echo true || echo false)," \
+  "\"hf_devices\": \"$([[ "$TP" = 1 ]] || echo "$HF_DEVICES")\", \"itl\": $([[ "$ITL" = 1 ]] && echo true || echo false)," \
   "\"vllm_env\": \"${VLLM_ENV[*]+${VLLM_ENV[*]}}\", \"arms\": \"$ARMS\", \"repeat\": $REPEAT}" > "$OUT/workload.json"
 {
   echo "host ${HOSTNAME:-$(uname -n)}  date $(date -Is)"
@@ -260,21 +276,21 @@ run_arm() {  # run_arm <arm> <rep> <output-len>
     return
   fi
   echo "=== $arm #$rep output_len=$len tp=$TP  $(date -Is)" | tee "$log"
-  if [ "$arm" = hf ]; then
+  if [[ "$arm" = hf ]]; then
     hf_args "$len" "$dir/latency.json"
     (cd "$dir" && PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=8 "${HF_LAUNCH[@]}" "$SKILL_DIR/scripts/$HF_SCRIPT" \
       "${HF_ARGS[@]}") >> "$log" 2>&1
   else
     local extra=("${VLLM_ENV[@]+"${VLLM_ENV[@]}"}") cwd=$SI_DIR
-    [ "$RECOMPILES" = 0 ] || extra+=(TORCH_LOGS=recompiles)
-    [ "$arm" = branch ] || { cwd=$MAIN_SRC; extra+=("PYTHONPATH=$MAIN_PYTHONPATH"); }
+    [[ "$RECOMPILES" = 0 ]] || extra+=(TORCH_LOGS=recompiles)
+    [[ "$arm" = branch ]] || { cwd=$MAIN_SRC; extra+=("PYTHONPATH=$MAIN_PYTHONPATH"); }
     vllm_args "$len"
     (cd "${cwd:-$dir}" && env PYTHONDONTWRITEBYTECODE=1 "${extra[@]+"${extra[@]}"}" "${VLLM_CMD[@]}" bench latency \
       --model "$MODEL" "${VLLM_ARGS[@]}" --output-json "$dir/latency.json") >> "$log" 2>&1
   fi
   rc=$?
   echo "=== $arm #$rep output_len=$len tp=$TP finished rc=$rc $(date -Is)" | tee -a "$log"
-  [ "$rc" = 0 ] || tail -20 "$log" | sed 's/^/    /'
+  [[ "$rc" = 0 ]] || tail -20 "$log" | sed 's/^/    /'
   echo "{\"arm\": \"$arm\", \"rep\": $rep, \"output_len\": $len, \"tp\": $TP, \"rc\": $rc}" > "$dir/meta.json"
 }
 
@@ -287,4 +303,4 @@ for rep in $(seq 1 "$REPEAT"); do
 done
 
 "$PY" -I -B "$SKILL_DIR/scripts/report.py" "$OUT" | tee "$OUT/report.md"
-[ "${PIPESTATUS[0]}" = 0 ] || exit 4
+[[ "${PIPESTATUS[0]}" = 0 ]] || exit 4

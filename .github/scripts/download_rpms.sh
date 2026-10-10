@@ -7,6 +7,7 @@ function check_env_var() {
         echo "please set the environment variable: $var_name"
         exit 1
     fi
+    return 0
 }
 
 function check_command_exists() {
@@ -15,6 +16,7 @@ function check_command_exists() {
         echo "${command_name}: command not found"
         exit 1
     fi
+    return 0
 }
 
 # Artifactory subdirectory the RPMs live under, between <repo> and <arch>:

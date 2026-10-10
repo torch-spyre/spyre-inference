@@ -347,7 +347,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.num_heads,
                     self.num_kv_heads,
                     self.head_size,
-                    self.block_size,
                     self.logits_soft_cap,
                     out,
                 )

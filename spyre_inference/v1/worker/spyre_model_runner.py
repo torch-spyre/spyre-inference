@@ -1696,7 +1696,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             prompt_token_ids=dummy_token_ids,
             prompt_token_ids_cpu=dummy_token_ids.cpu(),
             pooling_params=[dummy_pooling_params] * num_reqs,
-            pooling_states=[PoolingStates() for i in range(num_reqs)],
+            pooling_states=[PoolingStates() for _ in range(num_reqs)],
         )
         dummy_metadata.build_pooling_cursor(
             num_scheduled_tokens_np,

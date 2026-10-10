@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Activate the spyre-inference venv
-if [ -z "$VIRTUAL_ENV" ]; then source /opt/spyre-inference/bin/activate; fi
+if [[ -z "$VIRTUAL_ENV" ]]; then source /opt/spyre-inference/bin/activate; fi
 
 # Required for Spyre backend
 export VLLM_PLUGINS=spyre_inference

@@ -200,9 +200,11 @@ class TorchSpyreWorker(Worker):
         )
 
     def sleep(self, level: int = 1) -> None:
+        # No sleep mode on Spyre: the GPU worker's CuMemAllocator offload does not apply.
         pass
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        # Nothing to restore, since sleep() keeps everything resident.
         pass
 
     @override

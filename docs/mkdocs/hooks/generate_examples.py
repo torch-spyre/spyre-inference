@@ -76,7 +76,7 @@ class Example:
     """  # noqa: E501
 
     path: Path
-    category: str = None
+    category: str | None = None
     main_file: Path = field(init=False)
     other_files: list[Path] = field(init=False)
     title: str = field(init=False)

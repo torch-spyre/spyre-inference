@@ -562,8 +562,8 @@ class SpyreClassifierLinear(nn.Linear):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         weight = self.weight
-        input = _match_weight(input, weight)
-        return spyre_linear_t(input, weight, self.bias, pad_rows=True)
+        x = _match_weight(input, weight)
+        return spyre_linear_t(x, weight, self.bias, pad_rows=True)
 
 
 @torch.compile(backend="inductor", dynamic=False)

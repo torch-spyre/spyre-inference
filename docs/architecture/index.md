@@ -309,10 +309,18 @@ what the tiled walk needs, so the batched kernel is reached on this layout and d
 token-major until that port lands.
 
 Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
+planner's own verdicts. Read those from the allocation — `LifetimeBoundBuffer.address`, where
+`None` means HBM — and not from the allocator's `lx_pinning:` debug log, whose `→ lx` is the
+default for any op the spill-reason dict does not mention, including every op that never
+reached the solver. K's residency needs torch-spyre#4153: `q @ Kᵀ` lowers the
 transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
+
+Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
+per-sequence kernel's `(page, kv_head)` fold has nothing to buy there: measured against the
+shipped kernel it only divides `blocks_per_chunk` by `num_kv_heads` and multiplies the chunk
+trips 4–8x, for 1.26–2.11x more kernel time across batch 1–8 and context 2048–8192.
 
 Key constraints:
 

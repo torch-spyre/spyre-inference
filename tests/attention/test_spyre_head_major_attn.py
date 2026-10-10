@@ -1047,6 +1047,10 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
 
     Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
     with num_kv_heads times the gather entries, which measured ~2x the kernel time.
+
+    The fold's premise is that it buys LX residency, as it does for the per-sequence kernel.
+    It does not here: the whole-page gather is already LX-resident, so the fold is a dead end
+    rather than a tuning gap.
     """
     from spyre_testing_plugin.attn_helpers import _build_metadata
 

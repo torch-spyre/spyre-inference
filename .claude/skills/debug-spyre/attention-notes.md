@@ -37,6 +37,63 @@ These appear in current parametrize IDs. They're for reading collected node IDs;
 - `swa_4` / `swa_16`, `soft_cap(50)`
 - `device_cpu` / `device_spyre`, `compilation_NONE` / `compilation_STOCK`
 
+## Reading LX residency: `lx_pinning: ... → lx` is a DEFAULT, not a verdict
+
+When a hypothesis is "this buffer spills to HBM", do not trust the planner's debug log. With
+`SPYRE_INDUCTOR_LOG=1 SPYRE_INDUCTOR_LOG_LEVEL=DEBUG` (note: `TORCH_LOGS='+spyre.inductor...'`
+crashes torch — it rejects the non-module name) the allocator prints one `lx_pinning:` line per
+op, and `→ lx` looks like "resident". It is not:
+
+- `_log_lx_pinning` (`torch_spyre/_inductor/scratchpad/allocator.py:1430`) prints
+  `reasons.get(op.name, "lx")` and only runs at DEBUG (`:1433`). Anything missing from the
+  dict is labelled `lx`.
+- `CoOptimizingAllocator._get_spill_reasons` (`:2588`) returns `solver.spill_reasons`
+  verbatim; the base class (`:477`) also synthesizes a `no room on scratchpad` entry for
+  every buffer with `address is None`. This is **not** a coverage loss for `cpsat` or
+  `simulated_annealing`: both write `_SOLVER_CHOSE_SPILL` for every spilled buffer
+  (`sa_cooptimizer.py:837`, `ilp_solver_ortools.py:1292`), i.e. the same bucket under a
+  different string.
+- It **is** a coverage loss under `ExhaustiveSearchSolver` (`ALLOW_EXHAUSTIVE_SEARCH=1`, or
+  `cpsat` without ortools — `_make_cpsat_solver` silently degrades to greedy, `:3748`): it
+  copies a placement-only solver's `spill_reasons` (`exhaustive_search.py:220`), and
+  `record_exclusions` (`plan_solver.py:903`) records only declared/capacity exclusions, so
+  buffers that merely did not fit show up as `lx`.
+- After a `SolveError`, `scratchpad_planning` falls back to a base
+  `ScratchpadAllocator(GreedyLayoutSolver)` (`:3926`), so the `no room on scratchpad`
+  strings come back.
+- Independently of spill reasons, `_log_lx_pinning` walks `graph.operations` while `reasons`
+  is keyed by solver-buffer name, and `_build_bound_buffers` skips buffers with no lifetime
+  (`:982`). Those ops are reported `lx` despite never having been offered to the solver.
+
+So `→ lx` is only trustworthy on the native co-opt solvers, and even there only for ops that
+reached the solver. Read residency from the allocation instead — `LifetimeBoundBuffer.address`,
+where `None` means HBM:
+
+```python
+from torch_spyre._inductor.scratchpad import allocator as alloc
+
+orig = alloc.ScratchpadAllocator._push_allocation
+
+def push(self, graph, buffers, accepted):
+    for b in buffers:
+        where = "LX " if b.address is not None else "HBM"
+        print(f"{where} {b.name:50} addr={b.address} {b.size / 1024:.1f} KiB")
+    return orig(self, graph, buffers, accepted)
+
+alloc.ScratchpadAllocator._push_allocation = push
+```
+
+Sizes printed there are **logical**; LX is per-core private memory, so divide by the core
+count before comparing against capacity. The printed address deltas between two same-sized
+buffers confirm the per-core figure. Take the capacity itself from `_lx_planning_size()`
+(`torch_spyre/_inductor/scratchpad/allocator.py`) rather than from the physical LX size or
+the tracker constant: the frontend reserves `1 - DXP_LX_FRAC_AVAIL` of the tracker capacity
+for the backend, so the solver's limit is materially smaller than either.
+
+This mattered concretely: it is what made an experiment aimed at giving the batched decode
+kernel LX-resident page gathers look like it had found the shipped kernel *not* resident, when
+both paths were resident all along, and the whole premise was void.
+
 ## Attention-specific hypotheses to add to the queue
 
 When the failing surface is attention, in addition to the generic starter set, also consider:

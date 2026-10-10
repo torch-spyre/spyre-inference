@@ -19,7 +19,8 @@ token-major kernels do before the matmuls, and pays for it in the KV write, whos
 per-token destinations are one head apart rather than contiguous. The cache is decomposed
 so a gathered page stays LX-resident; see ``page_attn_head_major_decode``. Past one query
 token that residency stops paying, and ``page_attn_head_major_prefill`` runs instead; across
-sequences at decode, ``batched_decode_head_major`` gathers whole pages for the same reason.
+sequences at decode, ``batched_decode_head_major`` gathers whole pages, which are LX-resident
+too, so it needs none of the per-sequence kernel's ``(page, kv_head)`` fold.
 
 Everything above the cache's memory is shared with ``spyre_attn``; the places that touch
 it — advertised shape, allocation, kernels, index tables — are duplicated rather than

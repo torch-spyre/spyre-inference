@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import time
 
@@ -338,6 +339,69 @@ def test_key_is_path_independent(tmp_path):
     ka = _write(tmp_path / "a" / "uv.lock", "same-bytes")
     kb = _write(tmp_path / "b" / "uv.lock", "same-bytes")
     assert nuc.compute_key([ka]) == nuc.compute_key([kb])
+
+
+def _fake_uv(tmp_path, version, stale=""):
+    """A uv stand-in that prints `version`; `cache prune` logs UV_CACHE_DIR, drops `stale`."""
+    log = tmp_path / f"prune-{version}.log"
+    uv = tmp_path / f"uv-{version}"
+    drop = f'rm -rf "$UV_CACHE_DIR/{stale}"; ' if stale else ""
+    uv.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = --version ]; then echo "uv {version} (x86_64-linux)"; exit 0; fi\n'
+        f'if [ "$1 $2" = "cache prune" ]; then echo "$UV_CACHE_DIR" >> "{log}"; {drop}exit 0; fi\n'
+        "exit 2\n"
+    )
+    uv.chmod(0o755)
+    return str(uv), log
+
+
+def test_key_tracks_uv_version(lockfiles):
+    base = nuc.compute_key(lockfiles)
+    assert nuc.compute_key(lockfiles, uv_version="0.12.24") != base
+    assert nuc.compute_key(lockfiles, uv_version="0.12.24") != nuc.compute_key(
+        lockfiles, uv_version="0.13.0"
+    )
+
+
+def test_uv_version_parses_and_tolerates_missing(tmp_path):
+    uv, _ = _fake_uv(tmp_path, "0.13.0")
+    assert nuc.uv_version(uv) == "0.13.0"
+    assert nuc.uv_version("") == ""
+    assert nuc.uv_version(str(tmp_path / "no-such-uv")) == ""
+
+
+def test_uv_upgrade_misses_then_resaves_pruned(tmp_path, lockfiles):
+    """A uv upgrade must not hit the old version's tar; the save prunes old buckets first."""
+    nfs = tmp_path / "nfs"
+    local = tmp_path / "uvcache"
+    old_uv, _ = _fake_uv(tmp_path, "0.12.24")
+    new_uv, new_log = _fake_uv(tmp_path, "0.13.0", stale="old-bucket")
+    _populate(local)
+    (local / "old-bucket").mkdir()
+    assert nuc.main(_args("save", nfs, local, lockfiles, uv=old_uv, **_push_main())) == 0
+
+    shutil.rmtree(local)
+    gh_out = tmp_path / "out"
+    assert (
+        nuc.main(
+            _args("restore", nfs, local, lockfiles, uv=new_uv, github_output=gh_out, **_push_main())
+        )
+        == 0
+    )
+    assert "cache-hit=false" in gh_out.read_text()
+    assert (local / "old-bucket").is_dir()
+
+    assert nuc.main(_args("save", nfs, local, lockfiles, uv=new_uv, **_push_main())) == 0
+    new_tar = nfs / "main" / "x86_64" / f"{nuc.compute_key(lockfiles, uv_version='0.13.0')}.tar"
+    assert new_tar.is_file()
+    assert new_log.read_text().strip() == str(local)
+    assert (
+        "old-bucket"
+        not in subprocess.run(
+            ["tar", "-tf", str(new_tar)], capture_output=True, text=True, check=True
+        ).stdout
+    )
 
 
 if __name__ == "__main__":

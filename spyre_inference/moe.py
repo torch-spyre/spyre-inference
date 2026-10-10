@@ -42,6 +42,7 @@ from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
 from spyre_inference import envs
 
 if TYPE_CHECKING:
+    from torch_spyre._C import SpyreTensorLayout
     from vllm.model_executor.layers.fused_moe.routed_experts import (
         RoutedExperts as _RoutedExperts,
     )
@@ -434,19 +435,32 @@ def _reset_named_dims() -> None:
     reset()
 
 
-def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
-    """Move one expert stack to the device in the gather-friendly MoE layout.
+def _expert_kernel_layout(weight: torch.Tensor) -> SpyreTensorLayout:
+    """``[E, C, F]`` as ``[E, F // stick, C, stick]``, the nn.Linear order (torch-spyre #1339)."""
+    from torch_spyre._C import SpyreTensorLayout
 
-    ``dma_moe_expert_weight_to_spyre`` takes an ``[E, C, F]`` stack whose free dim spans
-    whole sticks; ``pad`` is the ``F.pad`` spec that widens it to one.
-    """
+    return SpyreTensorLayout(list(weight.shape), list(weight.stride()), weight.dtype, [1, 0, 2])
+
+
+def _to_spyre_expert_weight(
+    weight: torch.Tensor, pad: tuple[int, ...], *, kernel_order: bool = False
+) -> torch.Tensor:
+    """Move an ``[E, C, F]`` expert stack, widened by the ``F.pad`` spec ``pad``, to the device."""
     from torch_spyre.model_utils import dma_moe_expert_weight_to_spyre
 
     if any(pad):
         weight = F.pad(weight, pad)
-    moved = dma_moe_expert_weight_to_spyre(weight)
-    assert moved is not None
-    return moved
+    if not kernel_order:
+        moved = dma_moe_expert_weight_to_spyre(weight)
+        assert moved is not None
+        return moved
+    if not torch.spyre.is_initialized():
+        torch.empty(0, dtype=weight.dtype, device="spyre")
+    weight = weight.contiguous()
+    layout = _expert_kernel_layout(weight)
+    assert weight.shape[-1] % layout.elems_per_stick() == 0, "the free dim must span whole sticks"
+    # Lands on the current Spyre device, as the ``dma_*`` helpers do.
+    return weight.to(device_layout=layout)  # ty: ignore[no-matching-overload]
 
 
 def _prepare_layer(layer: RoutedExperts) -> None:
@@ -483,7 +497,11 @@ def _prepare_layer(layer: RoutedExperts) -> None:
     transform_down = layer.spyre_moe_recipe.prepare_down_weight
     if transform_down is not None:
         w2 = transform_down(w2)
-    layer.spyre_moe_down = _to_spyre_expert_weight(w2.transpose(1, 2), (0, 0, 0, pad))
+    # Down's free dim (hidden) is too wide for one weight chunk; in the gather layout its rows
+    # would stream in short transfers.
+    layer.spyre_moe_down = _to_spyre_expert_weight(
+        w2.transpose(1, 2), (0, 0, 0, pad), kernel_order=True
+    )
     del layer.w2_weight, w2
 
     dtype = layer.spyre_moe_gate.dtype

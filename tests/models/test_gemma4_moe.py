@@ -459,6 +459,7 @@ def test_above_the_gathered_bound_the_all_expert_form_takes_the_batch(monkeypatc
 )
 def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, routing_fn, route_fn):
     """The persistent form runs routing -> route -> experts for the selected recipe."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch)
     _apply(_dispatch_layer(routing), tokens=8)
     assert calls == [
@@ -471,6 +472,7 @@ def test_multi_token_dispatch_picks_the_recipe_routing(monkeypatch, routing, rou
 
 def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
     """Unconditional reset: on an Inductor cache hit stale names leak into the next graph."""
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
     calls, resets = _dispatch_recorder(monkeypatch, fail_on="experts")
     with pytest.raises(RuntimeError, match="region blew up"):
         _apply(_dispatch_layer("topk_softmax"), tokens=8)

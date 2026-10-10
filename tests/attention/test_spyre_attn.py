@@ -2563,18 +2563,15 @@ def _num_blocks_buckets(block_size: int = 64) -> list[int]:
     return SpyreAttnBucketer(vllm_config).num_blocks_buckets
 
 
-@pytest.mark.parametrize(
-    ("kv_len", "expected"),
-    [
-        pytest.param(65, 2, id="kv65_to_2"),
-        pytest.param(300, 8, id="kv300_to_8"),
-        pytest.param(256, 4, id="kv256_exact_noop"),
-        pytest.param(1025, 32, id="kv1025_to_32"),
-    ],
-)
-def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expected):
+@pytest.mark.parametrize("kv_len", [65, 256, 300, 1025], ids=lambda v: f"kv{v}")
+def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len):
     torch.set_default_device("cpu")
     buckets = _num_blocks_buckets()
+    # Derived from the ladder rather than hard-coded: which bucket a kv_len rounds up
+    # to depends on the ladder in force. Shared with _padded_mask_metadata.
+    block_size = 64
+    needed = (kv_len + block_size - 1) // block_size
+    expected = next(b for b in buckets if needed <= b)
     assert expected in buckets
 
     metadata = _padded_mask_metadata([(1, kv_len)], max_num_blocks=buckets[-1])

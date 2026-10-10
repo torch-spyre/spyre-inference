@@ -696,3 +696,22 @@ class TestRecordBatchedDecode:
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+
+
+def test_large_batch_ladder_variants_build_onto_their_own_kernel(builder, monkeypatch):
+    """Warmup builds a large-batch bucket below the base bucket build() pads each sequence onto."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+    monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "4")
+    envs.clear_env_cache()
+    bucketer = builder._attn_bucketer = make_bucketer(max_model_len=1024)
+    assert set(bucketer.batched_blocks_buckets(8)) > set(bucketer.num_blocks_buckets)
+    for v in bucketer.batched_decode_variants():
+        md = builder.build_for_batched_decode_variant(v)
+        realized = (
+            md.padded_num_seqs,
+            md.blocks_per_chunk,
+            md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
+        )
+        assert realized == (v.num_seqs, v.blocks_per_chunk, v.num_chunks), v

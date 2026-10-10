@@ -887,7 +887,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
             decode_blocks = blocks_per_seq[:num_decode_seqs]
             b_seqs = self._attn_bucketer.find_sequence_bucket(num_decode_seqs)
-            b_blocks = self._attn_bucketer.find_blocks_bucket(max(decode_blocks))
+            b_blocks = (
+                self._attn_bucketer.find_batched_blocks_bucket(max(decode_blocks), b_seqs)
+                if b_seqs is not None
+                else None
+            )
 
             if b_seqs is not None and b_blocks is not None:
                 # Mean/max block count: how uniform the contexts are, independent of
@@ -1020,7 +1024,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Metadata for the all-decode batch that dispatches to ``bucket``.
 
         ``num_seqs`` sequences of one query token each, all at the same length, so
-        ``find_sequence_bucket`` and ``find_blocks_bucket`` return the bucket's own
+        ``find_sequence_bucket`` and ``find_batched_blocks_bucket`` return the bucket's own
         values and ``decode_uniformity`` is 1.
         """
         num_seqs = bucket.num_seqs
@@ -1037,7 +1041,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 max_query_len=1,
                 max_seq_len=kv_len,
                 # Every block points at page 0, vLLM's null block: nothing real is read.
-                block_table_tensor=torch.zeros(num_seqs, bucket.num_blocks, dtype=torch.int32),
+                # As wide as build()'s per-seq padding, which a large-batch bucket can sit below.
+                block_table_tensor=torch.zeros(
+                    num_seqs, self._pad_num_blocks(bucket.num_blocks), dtype=torch.int32
+                ),
                 slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
                 causal=True,
                 is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),

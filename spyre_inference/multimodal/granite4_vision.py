@@ -25,12 +25,21 @@ logger = init_logger(__name__)
 
 
 def patch_interpolate_downsampler() -> None:
-    """Run InterpolateDownsampler on CPU.
+    """Patch InterpolateDownsampler.__call__ for Spyre.
 
     InterpolateDownsampler uses F.interpolate(mode="area") which lowers to
     aten::_adaptive_avg_pool2d — not supported on Spyre.
-    The permute/view/mean involves non-contiguous strides that copy_from_d2d
-    cannot restickify on-device, so run on CPU.
+
+    When the downsample ratio is an exact integer (orig_image_side %
+    new_image_side == 0), "area" interpolation reduces to non-overlapping
+    block averaging.  For a block size k = orig // new, the output is:
+
+        x.view(B, new, k, new, k, D).mean(dim=(2, 4)).flatten(1, 2)
+
+    This stays on-device and eliminates both convert() round-trips.
+
+    When the ratio is non-integer the formula is not valid, so fall back to
+    the original CPU-offloaded path.
     """
     try:
         from vllm.model_executor.models.granite4_vision import InterpolateDownsampler
@@ -44,6 +53,18 @@ def patch_interpolate_downsampler() -> None:
         self: InterpolateDownsampler,
         image_features: torch.Tensor,
     ) -> torch.Tensor:
+        if self.orig_image_side % self.new_image_side == 0:
+            # Integer block size: on-device non-overlapping average pooling.
+            # Equivalent to F.interpolate(mode="area") at an exact 1/k ratio,
+            # without aten::_adaptive_avg_pool2d or channel-first permutes.
+            k = self.orig_image_side // self.new_image_side
+            batch_size, _, dim = image_features.size()
+            x = image_features.view(
+                batch_size, self.new_image_side, k, self.new_image_side, k, dim
+            )
+            return x.mean(dim=(2, 4)).flatten(1, 2)
+
+        # Non-integer ratio: fall back to the original CPU-offloaded path.
         dev = image_features.device
         image_features_cpu = convert(image_features, device="cpu")
         batch_size, _, dim = image_features_cpu.size()
@@ -60,8 +81,8 @@ def patch_interpolate_downsampler() -> None:
     _interpolate_downsampler_call._spyre_patched = True  # type: ignore[attr-defined]
     InterpolateDownsampler.__call__ = _interpolate_downsampler_call  # type: ignore[method-assign]
     logger.info(
-        "Spyre: patched InterpolateDownsampler to run on CPU"
-        " (permute/mean not restickifiable on Spyre)."
+        "Spyre: patched InterpolateDownsampler"
+        " (integer ratio: on-device block mean; non-integer ratio: CPU fallback)."
     )
 
 

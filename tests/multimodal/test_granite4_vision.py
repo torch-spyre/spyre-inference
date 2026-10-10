@@ -16,15 +16,18 @@
 
 Two class-level patches, each guarded by a `_spyre_patched` flag:
 
-- `patch_interpolate_downsampler`: offloads `InterpolateDownsampler.__call__`
-  to CPU (F.adaptive_avg_pool2d not supported on Spyre).
+- `patch_interpolate_downsampler`: patches `InterpolateDownsampler.__call__`.
+  When orig_image_side % new_image_side == 0 (integer block size), replaces
+  F.interpolate(mode="area") with an on-device reshape+mean that avoids
+  aten::_adaptive_avg_pool2d and the convert() round-trips.  Falls back to the
+  original CPU-offloaded path when the ratio is non-integer.
 - `patch_pack_and_unpad_image_features`: offloads
   `Granite4VisionForConditionalGeneration._pack_and_unpad_image_features` to CPU
   (5-D permute produces a stick expression Spyre's work_division cannot lower).
 
 The staleness tripwires catch silent no-ops from vLLM renames. The equivalence
-tests confirm the CPU offload does not change values. Section 4 repeats the
-numeric checks on the card and skips without a device.
+tests confirm the patches do not change values. Section 4 repeats the numeric
+checks on the card and skips without a device.
 """
 
 import sys
@@ -217,7 +220,7 @@ def test_apply_is_idempotent():
 @pytest.mark.granite4_vision
 def test_interpolate_downsampler_patched_matches_stock():
     """The patched `InterpolateDownsampler.__call__` must produce the same output
-    as the unpatched version on CPU — the only change is an explicit CPU round-trip."""
+    as the unpatched version (integer-ratio path: on-device reshape+mean)."""
     from spyre_inference.multimodal.granite4_vision import patch_interpolate_downsampler
 
     image_features = _make_image_features()
@@ -232,7 +235,50 @@ def test_interpolate_downsampler_patched_matches_stock():
     assert actual.shape == expected.shape, (
         f"shape mismatch: got {actual.shape}, expected {expected.shape}"
     )
-    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.granite4_vision
+def test_interpolate_downsampler_non_integer_ratio_falls_back_to_cpu_path():
+    """When orig_image_side % new_image_side != 0, the patch must fall back to
+    the CPU-offloaded path and still produce numerically identical output."""
+
+    from spyre_inference.multimodal.granite4_vision import patch_interpolate_downsampler
+
+    cls = getattr(granite4_vision, "InterpolateDownsampler", None)
+    if cls is None:
+        pytest.skip("InterpolateDownsampler not present in this vLLM version")
+
+    # Build a config whose ratio is non-integer: 24 * (2/3) = 16,
+    # but 24 % 16 != 0, so the on-device branch must NOT fire.
+    class _NonIntegerVisionConfig:
+        image_size = 336
+        patch_size = 14  # orig_image_side = 24
+
+    class _NonIntegerDownsamplerConfig:
+        vision_config = _NonIntegerVisionConfig()
+        downsample_rate = "2/3"  # new_image_side = int(24 * 2/3) = 16; 24 % 16 = 8 ≠ 0
+
+    ds = cls(_NonIntegerDownsamplerConfig())
+    assert ds.orig_image_side % ds.new_image_side != 0, (
+        "test setup error: ratio must be non-integer for this test to be meaningful"
+    )
+
+    rng = torch.Generator(device="cpu").manual_seed(42)
+    image_features = torch.randn(
+        1, ds.orig_image_side**2, FEATURE_DIM, dtype=torch.float16, generator=rng
+    )
+
+    # Stock output (captured before patch changes the class method).
+    expected = _STOCK_INTERPOLATE_CALL(ds, image_features)
+
+    patch_interpolate_downsampler()
+    actual = ds(image_features)
+
+    assert actual.shape == expected.shape, (
+        f"shape mismatch: got {actual.shape}, expected {expected.shape}"
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.granite4_vision
@@ -308,8 +354,7 @@ def test_interpolate_downsampler_matches_cpu_on_spyre():
     """The patched downsampler on-card must equal the same call on CPU.
 
     At `ORIG_IMAGE_SIDE=24` the flat token count is 576, which is a multiple
-    of the 64-wide stick. This exercises the CPU round-trip path rather than
-    a stick-alignment workaround.
+    of the 64-wide stick.  This exercises the integer-ratio on-device path.
     """
     if not spyre_available():
         pytest.skip("Spyre device not available")

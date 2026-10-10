@@ -1372,3 +1372,33 @@ def test_spyre_eager_gemma_rms_norm(spyre_device):
         x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
     ).half()
     torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# 17. InterpolateDownsampler: aten::_adaptive_avg_pool2d on Spyre
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "aten::_adaptive_avg_pool2d has no Spyre kernel. "
+        "patch_interpolate_downsampler works around this with an on-device "
+        "reshape+mean for integer downsample ratios and a CPU round-trip for "
+        "non-integer ratios. When this XPASS-es, the workaround can be replaced "
+        "by the original F.interpolate(mode='area') call running on-device."
+    ),
+)
+def test_spyre_adaptive_avg_pool2d(spyre_device):
+    """F.interpolate(mode='area') lowers to aten::_adaptive_avg_pool2d.
+
+    This probe uses the exact shape produced by InterpolateDownsampler for
+    granite-vision-4.1-4b: orig_image_side=24, new_image_side=12, dim=1152.
+    """
+    orig, new, dim = 24, 12, 1152
+    batch = 2
+    # Channel-first layout as produced by InterpolateDownsampler's permute
+    x = torch.randn(batch, dim, orig, orig, dtype=torch.float16, device=spyre_device)
+    out = F.interpolate(x, size=(new, new), mode="area")
+    expected = F.interpolate(x.cpu(), size=(new, new), mode="area")
+    torch.testing.assert_close(out.cpu(), expected, atol=1e-2, rtol=1e-2)

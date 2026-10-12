@@ -78,10 +78,14 @@ _KEY_PAD_MASKS: dict[tuple, torch.Tensor] = {}
 def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device) -> tuple:
     """Build the row for this key if it is missing, then return the key.
 
+    The row is `[1, 1, 1, seq_pad]` and broadcasts over batch, heads, and queries.
+    `finfo.min / 2` matches `encoder_key_pad_mask`: a full `finfo.min` saturates to
+    `-inf` in fp16 and NaNs SDPA.
+
     Runs once at trace time: Dynamo traces through `lru_cache` (pytorch/pytorch#152994)
     and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
     tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
-    read in `_key_pad_mask` makes the row a guarded graph input. Needs `dynamic=False`,
+    read in `padded_sdpa` makes the row a guarded graph input. Needs `dynamic=False`,
     which `_compile_blocks` passes because Spyre rejects SymInt shapes.
     """
     key = (seq, seq_pad, dtype, device)
@@ -90,16 +94,6 @@ def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.
         m[..., seq:] = torch.finfo(dtype).min / 2
         _KEY_PAD_MASKS[key] = convert(m, device)
     return key
-
-
-def _key_pad_mask(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Additive `[1, 1, 1, seq_pad]` mask on `device` that hides only the padded keys.
-
-    Broadcasts over batch, heads, and queries. One row per sequence length, so a new
-    batch size does not upload another copy. `finfo.min / 2` for the same fp16 headroom
-    as `encoder_key_pad_mask`.
-    """
-    return _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, dtype, device)]
 
 
 def padded_sdpa(
@@ -147,7 +141,11 @@ def padded_sdpa(
 
     if mask is None:
         # An aligned length has no padded keys, so SDPA runs unmasked.
-        attn_mask = None if seq == seq_pad else _key_pad_mask(seq, seq_pad, q.dtype, device)
+        attn_mask = (
+            None
+            if seq == seq_pad
+            else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
+        )
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

@@ -37,7 +37,7 @@ from spyre_inference.multimodal.utils import padded_sdpa
 def test_padded_sdpa_without_mask_matches_cpu_on_spyre(batch, seq, mode):
     """`padded_sdpa(..., None)` on card must equal the same call on CPU.
 
-    `_key_pad_mask` is built on the host because writing `-inf` into the tail of a
+    The key-pad row is built on the host because writing `-inf` into the tail of a
     stick is a sub-stick offset write, which has no offset-free alternative stick dim.
     Doing it on device instead fails to lower rather than returning wrong values.
 

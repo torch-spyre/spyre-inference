@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from spyre_inference.custom_ops.vit_attn import _padded_apply_sdpa, register
-from spyre_inference.multimodal.utils import _key_pad_mask
+from spyre_inference.multimodal.utils import _KEY_PAD_MASKS, _key_pad_mask_key
 
 
 def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
@@ -77,7 +77,7 @@ class TestPaddedApplySdpaMatchesReference:
 
 class TestKeyPadMask:
     def test_masks_only_the_padded_keys(self):
-        mask = _key_pad_mask(50, 64, torch.float16, torch.device("cpu"))
+        mask = _KEY_PAD_MASKS[_key_pad_mask_key(50, 64, torch.float16, torch.device("cpu"))]
         assert mask.shape == (1, 1, 1, 64)
         assert (mask[..., :50] == 0).all()
         assert (mask[..., 50:] == torch.finfo(torch.float16).min / 2).all()
@@ -85,12 +85,14 @@ class TestKeyPadMask:
     def test_same_shape_returns_the_same_object(self):
         # One upload per sequence length, shared by every layer and every batch size.
         cpu = torch.device("cpu")
-        assert _key_pad_mask(50, 64, torch.float16, cpu) is _key_pad_mask(
-            50, 64, torch.float16, cpu
+        assert (
+            _KEY_PAD_MASKS[_key_pad_mask_key(50, 64, torch.float16, cpu)]
+            is _KEY_PAD_MASKS[_key_pad_mask_key(50, 64, torch.float16, cpu)]
         )
 
     def test_unpadded_length_masks_nothing(self):
-        assert (_key_pad_mask(64, 64, torch.float16, torch.device("cpu")) == 0).all()
+        row = _KEY_PAD_MASKS[_key_pad_mask_key(64, 64, torch.float16, torch.device("cpu"))]
+        assert (row == 0).all()
 
 
 class TestRegister:

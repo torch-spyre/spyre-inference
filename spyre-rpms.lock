@@ -15,17 +15,17 @@ tree = ""
 
 # x86_64
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_163" }
-ibm-deeptools         = { version = "2.0.0-0.release_2_0.1+2644.3f91855_5" }
-ibm-deeptools-devel   = { version = "2.0.0-0.release_2_0.1+2644.3f91855_5" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+33.a2b6d58_165" }
+ibm-deeptools         = { version = "2.0.0-0.release_2_0.1+2644.3f91855_6" }
+ibm-deeptools-devel   = { version = "2.0.0-0.release_2_0.1+2644.3f91855_6" }
 ibm-flex              = { version = "2.0.0-0.main.1+654.66c3c08_558" }
 ibm-flex-devel        = { version = "2.0.0-0.main.1+654.66c3c08_558" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_432" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+308.a6d8f22_435" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+308.a6d8f22_435" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+308.a6d8f22_435" }
 ibm-spyre-comms       = { version = "2.0.0-0.main.1+199.ca51a2b_293" }
 ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+199.ca51a2b_293" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+40.bcdd0af_82" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+40.bcdd0af_84" }
 
 # Power
 # ppc64le is held on an older set: no prod ibm-deeptools build that ships

@@ -24,11 +24,13 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 
 import pytest
 import yaml
 
 _WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / "workflows" / "push-to-clickhouse.yaml"
+_DOWNLOAD_SCRIPT = pathlib.Path(__file__).resolve().parent / "download_xml_artifacts.py"
 
 
 def _tier_script() -> str:
@@ -59,11 +61,6 @@ def test_tier_from_display_title(tmp_path, workflow, title, tier):
     assert out.read_text().splitlines() == [f"tier={tier}"]
 
 
-def _download_script() -> str:
-    steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"]["ingest"]["steps"]
-    return next(s["run"] for s in steps if s.get("id") == "download-artifacts")
-
-
 def test_download_skips_non_ingest_artifacts(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -84,12 +81,18 @@ def test_download_skips_non_ingest_artifacts(tmp_path):
         {"id": 4, "name": "durations-data-2"},
         {"id": 5, "name": "artifact-id"},
     ]
-    script = _download_script().replace(
-        "${{ steps.list-artifacts.outputs.artifacts }}", json.dumps(artifacts)
-    )
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REPOSITORY": "o/r"}
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "GITHUB_REPOSITORY": "o/r",
+        "ARTIFACTS": json.dumps(artifacts),
+    }
     subprocess.run(
-        ["bash", "-e", "-c", script], env=env, check=True, capture_output=True, cwd=tmp_path
+        [sys.executable, str(_DOWNLOAD_SCRIPT)],
+        env=env,
+        check=True,
+        capture_output=True,
+        cwd=tmp_path,
     )
     fetched = [line.split("/")[-2] for line in log.read_text().splitlines()]
     assert fetched == ["1", "2", "5"]

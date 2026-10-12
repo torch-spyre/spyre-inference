@@ -139,18 +139,19 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps below. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
-          enable-cache: true
-          # Invalidate only on lock changes; setup-uv's default glob also hashes
-          # pyproject.toml, so config-only edits would needlessly bust the cache.
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # See prune-uv-cache-safe
-          prune-cache: false
+          enable-cache: false
+
+      # Restore now; the post step ships the cache back at job end (writers only).
+      - name: uv cache (NFS)
+        if: ${{ !inputs.use_prebaked_image }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
 
       - name: Install spyre-inference
         run: |
@@ -169,11 +170,6 @@ jobs:
         run: |
           echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
           echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
-
-      # Slim the cache for setup-uv's post-job save without discarding the
-      # compiled torch-spyre/vllm wheels. Must run after the uv sync above.
-      - name: Prune uv cache (safe)
-        uses: ./.github/actions/prune-uv-cache-safe
 
       - name: Resolve vLLM commit
         env:

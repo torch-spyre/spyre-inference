@@ -29,10 +29,12 @@ from spyre_inference.multimodal.utils import padded_sdpa
 
 
 # CLIP ViT-B/32's 50 patches and SigLIP's 729, the stick-coprime lengths in use, and
-# an aligned 64, which needs no mask at all.
+# an aligned 64, which needs no mask at all. Batch 3 is a multi-image step: the
+# key-pad row is [1, 1, 1, seq_pad] and must broadcast.
+@pytest.mark.parametrize("batch", [1, 3])
 @pytest.mark.parametrize("seq", [50, 64, 729])
 @pytest.mark.parametrize("mode", ["eager", "compile"])
-def test_padded_sdpa_without_mask_matches_cpu_on_spyre(seq, mode):
+def test_padded_sdpa_without_mask_matches_cpu_on_spyre(batch, seq, mode):
     """`padded_sdpa(..., None)` on card must equal the same call on CPU.
 
     `_key_pad_mask` is built on the host because writing `-inf` into the tail of a
@@ -45,7 +47,7 @@ def test_padded_sdpa_without_mask_matches_cpu_on_spyre(seq, mode):
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
-    q, k, v = (torch.randn(1, 2, seq, 64, dtype=torch.float16) for _ in range(3))
+    q, k, v = (torch.randn(batch, 2, seq, 64, dtype=torch.float16) for _ in range(3))
     expected = padded_sdpa(q, k, v, None)
 
     device = torch.device("spyre")

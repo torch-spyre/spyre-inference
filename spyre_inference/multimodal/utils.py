@@ -146,7 +146,8 @@ def padded_sdpa(
         v = v.contiguous()
 
     if mask is None:
-        attn_mask = _key_pad_mask(seq, seq_pad, q.dtype, device)
+        # An aligned length has no padded keys, so SDPA runs unmasked.
+        attn_mask = None if seq == seq_pad else _key_pad_mask(seq, seq_pad, q.dtype, device)
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

@@ -29,7 +29,7 @@ from spyre_inference.multimodal.utils import padded_sdpa
 
 
 # CLIP ViT-B/32's 50 patches and SigLIP's 729, the stick-coprime lengths in use, and
-# an aligned 64. This branch still builds that row; it is all zeros.
+# an aligned 64, which needs no mask at all.
 @pytest.mark.parametrize("seq", [50, 64, 729])
 @pytest.mark.parametrize("mode", ["eager", "compile"])
 def test_padded_sdpa_without_mask_matches_cpu_on_spyre(seq, mode):
@@ -63,8 +63,9 @@ def test_padded_sdpa_without_mask_matches_cpu_on_spyre(seq, mode):
     torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
 
     if mode == "compile":
-        (row,) = utils._KEY_PAD_MASKS.values()  # built once, at trace time
         if seq % 64 == 0:
-            assert (row == 0).all()
-        fn(q, k, v, None)
-        assert next(iter(utils._KEY_PAD_MASKS.values())) is row  # graph input, not rebuilt
+            assert not utils._KEY_PAD_MASKS  # nothing to mask, nothing built
+        else:
+            (row,) = utils._KEY_PAD_MASKS.values()  # built once, at trace time
+            fn(q, k, v, None)
+            assert next(iter(utils._KEY_PAD_MASKS.values())) is row  # graph input, not rebuilt

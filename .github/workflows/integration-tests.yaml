@@ -139,7 +139,6 @@ concurrency:
 
 permissions:
   contents: read
-  checks: write
   # Must cover every permission _test_matrix.yaml requests: a reusable workflow
   # cannot widen its caller's grant, and asking for more fails the run at startup.
   actions: read

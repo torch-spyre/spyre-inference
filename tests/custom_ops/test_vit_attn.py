@@ -77,20 +77,20 @@ class TestPaddedApplySdpaMatchesReference:
 
 class TestKeyPadMask:
     def test_masks_only_the_padded_keys(self):
-        mask = _key_pad_mask(2, 50, 64, torch.float16, torch.device("cpu"))
-        assert mask.shape == (2, 1, 1, 64)
+        mask = _key_pad_mask(50, 64, torch.float16, torch.device("cpu"))
+        assert mask.shape == (1, 1, 1, 64)
         assert (mask[..., :50] == 0).all()
         assert (mask[..., 50:] == torch.finfo(torch.float16).min / 2).all()
 
     def test_same_shape_returns_the_same_object(self):
-        # One upload per shape, shared by every layer of the tower.
+        # One upload per sequence length, shared by every layer and every batch size.
         cpu = torch.device("cpu")
-        assert _key_pad_mask(1, 50, 64, torch.float16, cpu) is _key_pad_mask(
-            1, 50, 64, torch.float16, cpu
+        assert _key_pad_mask(50, 64, torch.float16, cpu) is _key_pad_mask(
+            50, 64, torch.float16, cpu
         )
 
     def test_unpadded_length_masks_nothing(self):
-        assert (_key_pad_mask(1, 64, 64, torch.float16, torch.device("cpu")) == 0).all()
+        assert (_key_pad_mask(64, 64, torch.float16, torch.device("cpu")) == 0).all()
 
 
 class TestRegister:

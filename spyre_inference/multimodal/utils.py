@@ -69,39 +69,37 @@ def _padded_attn_mask(
     return m
 
 
-# `(b, seq, seq_pad, dtype, device)` -> additive `[b, 1, 1, seq_pad]` row on `device`.
+# `(seq, seq_pad, dtype, device)` -> additive `[1, 1, 1, seq_pad]` row on `device`.
+# Batch is not in the key: every image in the step shares this row, and SDPA broadcasts it.
 _KEY_PAD_MASKS: dict[tuple, torch.Tensor] = {}
 
 
 @torch.compiler.assume_constant_result
-def _key_pad_mask_key(
-    b: int, seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device
-) -> tuple:
+def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device) -> tuple:
     """Build the row for this key if it is missing, then return the key.
 
     Runs once at trace time: Dynamo traces through `lru_cache` (pytorch/pytorch#152994)
     and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
     tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
-    read in `_key_pad_mask` makes the row a guarded graph input. Needs `dynamic=False`.
+    read in `_key_pad_mask` makes the row a guarded graph input. Needs `dynamic=False`,
+    which `_compile_blocks` passes because Spyre rejects SymInt shapes.
     """
-    key = (b, seq, seq_pad, dtype, device)
+    key = (seq, seq_pad, dtype, device)
     if key not in _KEY_PAD_MASKS:
-        m = torch.zeros(b, 1, 1, seq_pad, dtype=dtype)
+        m = torch.zeros(1, 1, 1, seq_pad, dtype=dtype)
         m[..., seq:] = torch.finfo(dtype).min / 2
         _KEY_PAD_MASKS[key] = convert(m, device)
     return key
 
 
-def _key_pad_mask(
-    b: int, seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device
-) -> torch.Tensor:
-    """Additive `[b, 1, 1, seq_pad]` mask on `device` that hides only the padded keys.
+def _key_pad_mask(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Additive `[1, 1, 1, seq_pad]` mask on `device` that hides only the padded keys.
 
-    Broadcasts over heads and queries the way the encoder backend's key-pad mask does,
-    so an unmasked caller uploads `b * seq_pad` values instead of an O(L²) mask.
-    `finfo.min / 2` for the same fp16 headroom as `encoder_key_pad_mask`.
+    Broadcasts over batch, heads, and queries. One row per sequence length, so a new
+    batch size does not upload another copy. `finfo.min / 2` for the same fp16 headroom
+    as `encoder_key_pad_mask`.
     """
-    return _KEY_PAD_MASKS[_key_pad_mask_key(b, seq, seq_pad, dtype, device)]
+    return _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, dtype, device)]
 
 
 def padded_sdpa(
@@ -148,7 +146,7 @@ def padded_sdpa(
         v = v.contiguous()
 
     if mask is None:
-        attn_mask = _key_pad_mask(b, seq, seq_pad, q.dtype, device)
+        attn_mask = _key_pad_mask(seq, seq_pad, q.dtype, device)
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

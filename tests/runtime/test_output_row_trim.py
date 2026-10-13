@@ -48,6 +48,8 @@ def _wrapper(monkeypatch, *, buckets, copied):
         return t
 
     monkeypatch.setattr(mr, "convert", fake_convert)
+    # The full-copy fallback converts through convert_tensor_tree, which calls utils.convert.
+    monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", fake_convert)
     model = _Body()
     return _SpyreModelWrapper(
         model,

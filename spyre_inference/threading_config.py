@@ -21,6 +21,7 @@ oversubscribes the container and causes contention that slows inference.
 ``configure_threading`` clamps these to the detected CPU budget.
 """
 
+import ctypes
 import math
 import os
 
@@ -79,6 +80,19 @@ def get_cpu_count(use_logical_cpus: bool = False) -> tuple[float | None, str]:
     return cpu_count, detection_message
 
 
+def _stop_running_openmp_spin() -> None:
+    """Make an Intel OpenMP runtime that already started in this process sleep when idle.
+
+    It reads its wait policy once, when torch loads it, so the environment variable only
+    reaches processes started afterwards; libgomp has no such call and is left alone.
+    """
+    try:
+        set_blocktime = ctypes.CDLL(None).kmp_set_blocktime
+    except (OSError, AttributeError):
+        return
+    set_blocktime(ctypes.c_int(0))
+
+
 def configure_threading(worker_count: int) -> None:
     """Clamp the CPU threading env vars to the per-worker CPU budget.
 
@@ -116,6 +130,12 @@ def configure_threading(worker_count: int) -> None:
             )
         for env in THREADING_ENVS:
             os.environ[env] = str(cpus_per_worker)
+        # Idle OpenMP workers otherwise spin after each parallel region (200 ms under the
+        # Intel runtime the dev image preloads), which uses up a container's CPU quota while
+        # the step's host thread waits on the device.
+        os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+        if os.environ["OMP_WAIT_POLICY"].upper() == "PASSIVE":
+            _stop_running_openmp_spin()
         logger.info(
             "%s. Setting each threading configuration to %d for %d worker(s) "
             "(SPYRE_UPDATE_THREAD_CONFIG enabled).",

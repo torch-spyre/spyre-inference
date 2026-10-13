@@ -793,6 +793,69 @@ def test_configure_threading_warn_only_leaves_envs_untouched(monkeypatch):
     assert os.environ["OMP_NUM_THREADS"] == "128"
 
 
+def _unset_env(monkeypatch, name):
+    """Remove ``name`` for this test only; code under test may set it, and undo removes it."""
+    monkeypatch.setenv(name, "")
+    monkeypatch.delenv(name)
+
+
+def test_configure_threading_sets_passive_wait_policy(monkeypatch):
+    """Enabled → idle OpenMP workers sleep instead of spinning on the CPU quota."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    _unset_env(monkeypatch, "OMP_WAIT_POLICY")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=4)
+
+    assert os.environ["OMP_WAIT_POLICY"] == "PASSIVE"
+
+
+@pytest.mark.parametrize(
+    ("policy", "calls"), [(None, [0]), ("ACTIVE", [])], ids=["default", "active"]
+)
+def test_configure_threading_stops_a_running_intel_openmp_spin(monkeypatch, policy, calls):
+    """The process's own, already-started runtime goes passive unless the user chose ACTIVE."""
+    import spyre_inference.threading_config as tc
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    if policy is None:
+        _unset_env(monkeypatch, "OMP_WAIT_POLICY")
+    else:
+        monkeypatch.setenv("OMP_WAIT_POLICY", policy)
+    _force_cpu_count(monkeypatch, 8.0)
+    seen = []
+    fake = type("Lib", (), {"kmp_set_blocktime": staticmethod(lambda v: seen.append(v.value))})
+    monkeypatch.setattr(tc.ctypes, "CDLL", lambda name: fake())
+
+    tc.configure_threading(worker_count=4)
+
+    assert seen == calls
+
+
+def test_stop_running_openmp_spin_without_intel_runtime(monkeypatch):
+    """libgomp-only processes have no kmp_set_blocktime; the call is skipped."""
+    import spyre_inference.threading_config as tc
+
+    monkeypatch.setattr(tc.ctypes, "CDLL", lambda name: object())
+
+    tc._stop_running_openmp_spin()
+
+
+def test_configure_threading_keeps_an_explicit_wait_policy(monkeypatch):
+    """A wait policy the user set wins over the default."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    monkeypatch.setenv("OMP_WAIT_POLICY", "ACTIVE")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=4)
+
+    assert os.environ["OMP_WAIT_POLICY"] == "ACTIVE"
+
+
 def test_configure_threading_raises_when_undetectable(monkeypatch):
     """Enabled but no CPU count detectable → fail loudly rather than guess."""
     from spyre_inference.threading_config import configure_threading

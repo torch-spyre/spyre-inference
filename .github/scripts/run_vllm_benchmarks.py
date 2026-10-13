@@ -528,7 +528,7 @@ def run_serve_benchmark(
         return False
 
     # `vllm bench serve` only measures the request phase. A local artifact:
-    # not in ingest_vllm_benchmarks.py's `_SERVE_METRICS`, so it does not
+    # not in spyre_clickhouse_ingest.vllm's `_SERVE_METRICS`, so it does not
     # reach ClickHouse.
     result_file = results_dir / f"{test_name}.json"
     try:

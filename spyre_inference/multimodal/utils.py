@@ -69,11 +69,38 @@ def _padded_attn_mask(
     return m
 
 
+# `(seq, seq_pad, dtype, device)` -> additive `[1, 1, 1, seq_pad]` row on `device`.
+# Batch is not in the key: every image in the step shares this row, and SDPA broadcasts it.
+_KEY_PAD_MASKS: dict[tuple, torch.Tensor] = {}
+
+
+@torch.compiler.assume_constant_result
+def _key_pad_mask_key(seq: int, seq_pad: int, dtype: torch.dtype, device: torch.device) -> tuple:
+    """Build the row for this key if it is missing, then return the key.
+
+    The row is `[1, 1, 1, seq_pad]` and broadcasts over batch, heads, and queries.
+    `finfo.min / 2` matches `encoder_key_pad_mask`: a full `finfo.min` saturates to
+    `-inf` in fp16 and NaNs SDPA.
+
+    Runs once at trace time: Dynamo traces through `lru_cache` (pytorch/pytorch#152994)
+    and the tail write cannot lower on Spyre. The key, not the row, is the constant: a
+    tensor constant becomes a graph attribute torch-spyre cannot lay out, while the dict
+    read in `padded_sdpa` makes the row a guarded graph input. Needs `dynamic=False`,
+    which `_compile_blocks` passes because Spyre rejects SymInt shapes.
+    """
+    key = (seq, seq_pad, dtype, device)
+    if key not in _KEY_PAD_MASKS:
+        m = torch.zeros(1, 1, 1, seq_pad, dtype=dtype)
+        m[..., seq:] = torch.finfo(dtype).min / 2
+        _KEY_PAD_MASKS[key] = convert(m, device)
+    return key
+
+
 def padded_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    mask: torch.Tensor,
+    mask: torch.Tensor | None,
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> torch.Tensor:
@@ -87,6 +114,9 @@ def padded_sdpa(
     `scale` defaults to the head dim seen here, which assumes `q`/`k`/`v` arrive unpadded
     so the padding cannot change it. Pass it explicitly when the head dim is already
     padded, or when the model carries its own scale.
+
+    `mask=None` attends everywhere: only the padded keys are masked, and that path
+    is safe inside a compiled block.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -109,11 +139,20 @@ def padded_sdpa(
         k = k.contiguous()
         v = v.contiguous()
 
+    if mask is None:
+        # An aligned length has no padded keys, so SDPA runs unmasked.
+        attn_mask = (
+            None
+            if seq == seq_pad
+            else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
+        )
+    else:
+        attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(
         q,
         k,
         v,
-        attn_mask=_padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device),
+        attn_mask=attn_mask,
         scale=scale,
         enable_gqa=enable_gqa,
     )

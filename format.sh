@@ -5,7 +5,7 @@
 # Cause the script to exit if a single command fails
 set -eo pipefail
 
-if [ -z "$*" ]; then
+if [[ -z "$*" ]]; then
   # Run all files by default if no args are passed to format.sh
   args=( "--all-files" )
 else

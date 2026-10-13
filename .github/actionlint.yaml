@@ -15,3 +15,8 @@ self-hosted-runner:
     - image_spyre_inference_mq
     # cardless ClickHouse-ingest set (spyre-frameworks #1235/#1236)
     - image_ingest
+paths:
+  .github/workflows/environment-file-confirmation.yml:
+    ignore:
+      # actionlint does not know concurrency.queue yet (rhysd/actionlint#657)
+      - 'unexpected key "queue" for "concurrency" section'

@@ -70,25 +70,38 @@ _ROUND = 8
 OUT_PATH = Path(__file__).parent / "rerank_score_refs.json"
 
 
-def generate_reference(model_id: str, revision: str) -> dict[str, Any]:
+def score_pairs(
+    model_id: str, revision: str, query: str, documents: list[str]
+) -> tuple[list[float], list[int]]:
+    """CPU fp32 sigmoid score and token count of each ``(query, document)`` pair.
+
+    Also called by the e2e reranker tests that score their own pairs inline, so the
+    encoding convention lives in one place.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_id, revision=revision)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_id, revision=revision, dtype=torch.float32
     )
     model.eval()
 
-    documents = MODEL_DOCUMENTS.get(model_id, DOCUMENTS)
     scores = []
+    token_counts = []
     for document in documents:
         # vLLM's cross-encoder io_processor call, one pair at a time so nothing is padded.
-        inputs = tokenizer(text=QUERY, text_pair=document, return_tensors="pt")
+        inputs = tokenizer(text=query, text_pair=document, return_tensors="pt")
+        token_counts.append(int(inputs["input_ids"].shape[1]))
         with torch.inference_mode():
             logit = model(**inputs).logits.reshape(-1)
         assert logit.numel() == 1, f"{model_id}: expected num_labels=1, got {logit.numel()}"
         # vLLM's PoolerClassify sigmoids a single-label head, so this is a probability.
         scores.append(round(float(torch.sigmoid(logit)[0]), _ROUND))
-        print(f"  {document!r}\n    -> {scores[-1]:.6f}", flush=True)
+        print(f"  {document[:80]!r}\n    -> {scores[-1]:.6f}", flush=True)
+    return scores, token_counts
 
+
+def generate_reference(model_id: str, revision: str) -> dict[str, Any]:
+    documents = MODEL_DOCUMENTS.get(model_id, DOCUMENTS)
+    scores, _ = score_pairs(model_id, revision, QUERY, documents)
     return {
         "revision": revision,
         "query": QUERY,

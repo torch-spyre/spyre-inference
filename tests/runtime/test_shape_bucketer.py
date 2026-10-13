@@ -20,19 +20,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    EncoderBucketDescriptor,
     SpyreShapeBucketer,
-    batch_buckets,
-    default_encoder_len_buckets,
-    encoder_batch_bucket,
-    encoder_bucket_valid_row_indices,
-    encoder_len_bucket,
-    expand_packed_to_encoder_bucket,
-    len_buckets,
+    encoder_budget_rows,
+    encoder_group_shapes,
+    encoder_group_width_caps,
+    encoder_len_ladder,
+    encoder_rectangle_for_batch,
+    encoder_rectangles,
+    encoder_shape_tables,
+    encoder_width_for,
     logits_row_buckets,
     next_bucket,
-    pick_encoder_attention_shape,
-    pooling_warmup_shapes,
 )
 
 
@@ -147,132 +145,28 @@ def _pooling_vllm_config(
     return config
 
 
-class TestEncoderDispatch:
-    def test_for_pooling_loads_warmup_shapes(self):
-        cfg = _pooling_vllm_config()
-        cfg.compilation_config.compile_sizes = [64, 128]
-        b = SpyreShapeBucketer.for_pooling(cfg)
-        assert b is not None
-        assert b.encoder_shapes == [
-            (1, 64),
-            (1, 128),
-            (2, 64),
-            (2, 128),
-            (4, 64),
-            (4, 128),
-        ]
-        assert b.bucket_sizes == [64, 128]
+class TestForPooling:
+    """Pooling gets the same 1D bucketer as decode, with a single entry."""
 
-    def test_for_pooling_skips_non_pooling(self):
+    def test_skips_non_pooling(self):
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
 
-    def test_for_pooling_none_when_no_shapes(self):
-        # 16 * ENCODER_CELL_BUDGET_SLACK < 64, so not even (1, 64) survives.
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=16)
+    def test_none_when_no_compile_sizes(self):
+        cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = []
         assert SpyreShapeBucketer.for_pooling(cfg) is None
 
-    def test_for_pooling_1d_only_when_no_attention_shapes(self):
-        cfg = _pooling_vllm_config(max_model_len=64, max_num_seqs=1, max_num_batched_tokens=16)
-        cfg.compilation_config.compile_sizes = [256]
-        b = SpyreShapeBucketer.for_pooling(cfg)
-        assert b is not None
-        assert b.encoder_shapes == []
-        assert b.bucket_sizes == [256]
-
-    def test_dispatch_encoder_pads_to_warmed_cell(self):
+    def test_uses_1d_compile_sizes(self):
         cfg = _pooling_vllm_config()
         cfg.compilation_config.compile_sizes = [64, 128]
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
-        desc = b.dispatch_encoder(
-            num_seqs=3,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert desc is not None
-        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
-        assert desc.padded_num_tokens == 256
-        assert desc.actual_num_seqs == 3
-        assert desc.actual_max_len == 30
-
-    def test_pooling_2d_not_1d_token_buckets(self):
-        """Body 1D pad and attention (B, L) are independent.
-
-        3 seqs × 30 tokens is 90 packed tokens. Body picks T=128; SDPA
-        still gathers to (4, 64).
-        """
-        cfg = _pooling_vllm_config()
-        cfg.compilation_config.compile_sizes = [64, 128]
-        b = SpyreShapeBucketer.for_pooling(cfg)
-        assert b is not None
-        one_d = b.dispatch(90)
-        assert one_d is not None
-        assert one_d.padded_num_tokens == 128
-        two_d = b.dispatch_encoder(
-            num_seqs=3,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert two_d is not None
-        assert (two_d.batch_bucket, two_d.len_bucket) == (4, 64)
-        assert two_d.padded_num_tokens == 256
-
-    def test_dispatch_encoder_stays_on_warmed_shapes(self):
-        config = MagicMock()
-        config.compilation_config.compile_sizes = []
-        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
-        desc = b.dispatch_encoder(
-            num_seqs=1,
-            max_query_len=30,
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        )
-        assert desc is not None
-        assert (desc.batch_bucket, desc.len_bucket) == (4, 64)
-
-    def test_dispatch_encoder_none_when_over_cell_budget(self):
-        # 4 * 64 = 256 exceeds 100 * ENCODER_CELL_BUDGET_SLACK = 200.
-        config = MagicMock()
-        config.compilation_config.compile_sizes = []
-        b = SpyreShapeBucketer(config, encoder_shapes=[(4, 64)])
-        assert (
-            b.dispatch_encoder(
-                num_seqs=3,
-                max_query_len=30,
-                max_num_seqs=4,
-                max_model_len=2048,
-                max_num_batched_tokens=100,
-            )
-            is None
-        )
-
-    def test_dispatch_encoder_none_on_1d_bucketer(self, bucketer):
-        assert (
-            bucketer.dispatch_encoder(
-                num_seqs=1,
-                max_query_len=8,
-                max_num_seqs=4,
-                max_model_len=128,
-                max_num_batched_tokens=512,
-            )
-            is None
-        )
-
-    def test_encoder_descriptor_is_frozen(self):
-        desc = EncoderBucketDescriptor(
-            batch_bucket=4, len_bucket=64, actual_num_seqs=3, actual_max_len=30
-        )
-        with pytest.raises(FrozenInstanceError):
-            desc.batch_bucket = 1
+        assert b.bucket_sizes == [64, 128]
 
 
-class TestEncoderBuckets:
+class TestNextBucket:
+    """Still shared with the pooler's own bucketed-row trimming (``spyre_pooler.py``)."""
+
     def test_next_bucket_picks_smallest_fit(self):
         assert next_bucket(30, [64, 128, 256]) == 64
         assert next_bucket(64, [64, 128, 256]) == 64
@@ -281,168 +175,168 @@ class TestEncoderBuckets:
     def test_next_bucket_overflow_stick_aligns(self):
         assert next_bucket(3000, [64, 128]) == 3008  # 3000 → 47*64 = 3008
 
-    def test_len_bucket_stick_aligns_when_override_unset(self):
-        assert encoder_len_bucket(1) == 64
-        assert encoder_len_bucket(32) == 64
-        assert encoder_len_bucket(65) == 128
 
-    def test_len_buckets_from_max_model_len(self):
-        assert len_buckets(512) == [64, 128, 256, 512]
-        assert default_encoder_len_buckets(2048) == [64, 128, 256, 512, 1024, 2048]
-        assert len_buckets(100) == [64]
-        assert len_buckets(768) == [64, 128, 256, 512, 768]
+class TestEncoderLenLadder:
+    def test_powers_of_two_up_to_max_model_len(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
 
-    def test_len_buckets_prefer_compile_sizes(self):
-        assert len_buckets(512, compile_sizes=[128, 512]) == [128, 512]
-        assert encoder_len_bucket(30, [128, 512]) == 128
-        assert encoder_len_bucket(200, [128, 512]) == 512
+    def test_top_entry_is_the_power_of_two_stick_count_above_max_model_len(self):
+        """Rounded *up*: an extent is a matmul dimension, and rounding down would
+        leave the longest requests with no covering bucket. To a power-of-two stick
+        count, not just a whole stick, so every entry divides the budget."""
+        cfg = _pooling_vllm_config(max_model_len=500, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
+        # 320 is a whole number of sticks (64*5) but not a power-of-two count.
+        cfg = _pooling_vllm_config(max_model_len=320, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
 
-    def test_len_buckets_stick_align_compile_sizes(self):
-        assert len_buckets(512, compile_sizes=[100, 200]) == [128, 256]
+    def test_override_entries_are_power_of_two_stick_counts(self, monkeypatch):
+        """Same rounding as the derived ladder, or the documented knob would put the
+        non-dividing entry back."""
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "320")
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [512]
 
-    def test_default_batch_buckets_are_powers_of_two(self):
-        assert batch_buckets(4) == [1, 2, 4]
-        assert batch_buckets(3) == [1, 2, 3]
+    def test_short_model_gets_one_bucket(self):
+        cfg = _pooling_vllm_config(max_model_len=100, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128]
 
-    def test_batch_bucket_pads_to_next_power(self):
-        assert encoder_batch_bucket(1, 4) == 1
-        assert encoder_batch_bucket(3, 4) == 4
-        assert encoder_batch_bucket(4, 4) == 4
+    def test_query_bucket_override_is_clamped_and_appended(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "100,4096")
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        # 100 aligns up to 128; 4096 is unreachable and dropped; 512 is appended.
+        assert encoder_len_ladder(cfg) == [128, 512]
 
-    def test_warmup_shapes_use_max_model_len(self):
-        assert pooling_warmup_shapes(
-            max_num_seqs=4,
-            max_model_len=128,
-            max_num_batched_tokens=512,
-        ) == [
-            (1, 64),
-            (1, 128),
-            (2, 64),
-            (2, 128),
-            (4, 64),
-            (4, 128),
-        ]
 
-    def test_warmup_shapes_fair_ab_max_model_len_64(self):
-        """``--max-num-seqs 1 --max-model-len 64`` warms only ``(1, 64)``.
+class TestEncoderBudget:
+    def test_floored_at_the_top_of_the_ladder(self):
+        """Encoder prefill cannot be chunked, so a budget under max_model_len would
+        head-of-line block forever -- and no rectangle would hold one sequence."""
+        assert encoder_budget_rows(512, 256, 32) == 512
+        assert encoder_budget_rows(500, 256, 32) == 512
+        assert encoder_budget_rows(512, 2048, 32) == 2048
 
-        Same 64-token prompts on ``--max-model-len 128`` still pick ``(1, 64)``
-        at runtime when that cell exists. Capping ``L`` isolates pad-up from
-        the sendnn stack gap.
+    def test_floored_to_a_multiple_of_the_longest_length(self):
+        """Every declared length divides the budget, so no rectangle truncates. An
+        awkward --max-num-batched-tokens costs rows, not correctness."""
+        assert encoder_budget_rows(512, 1000, 32) == 512  # 1000 -> 1 * 512
+        assert encoder_budget_rows(512, 1600, 32) == 1536  # 1600 -> 3 * 512
+        assert encoder_budget_rows(320, 2048, 32) == 2048  # longest 512, 2048 = 4 * 512
+
+    def test_capped_at_what_max_num_seqs_can_carry(self):
+        """A rectangle is always the whole buffer, so a narrow engine would otherwise
+        run the body on budget rows for one short request."""
+        assert encoder_budget_rows(64, 2048, 1) == 64
+        assert encoder_budget_rows(512, 2048, 2) == 1024
+        assert encoder_budget_rows(512, 2048, 4) == 2048
+
+
+class TestEncoderRectangles:
+    def test_worked_example(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        assert encoder_rectangles(cfg) == [(64, 32), (128, 16), (256, 8), (512, 4)]
+
+    @pytest.mark.parametrize("max_num_seqs", [1, 4, 32])
+    @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024, 4096])
+    @pytest.mark.parametrize("max_num_batched_tokens", [512, 1000, 2048, 8192])
+    def test_every_rectangle_is_exactly_the_budget(
+        self, max_num_seqs, max_model_len, max_num_batched_tokens
+    ):
+        """The single body shape depends on it: a rectangle reinterprets the body buffer
+        with ``view``, so a ``budget // length`` that truncates would not cover it.
+
+        Parametrised past the power-of-two cases on purpose. A ``max_model_len`` that is
+        not a power-of-two stick count, or a ``max_num_batched_tokens`` that is not a
+        multiple of the longest length, both used to leave rectangles short of the body.
         """
-        assert pooling_warmup_shapes(
-            max_num_seqs=1,
-            max_model_len=64,
-            max_num_batched_tokens=512,
-        ) == [(1, 64)]
-
-    def test_warmup_shapes_skip_over_cell_budget(self):
-        # The limit is the cell budget, 300 * ENCODER_CELL_BUDGET_SLACK = 600, not
-        # the token budget: 2*256 = 512 is kept, 4*256 = 1024 is dropped.
-        assert pooling_warmup_shapes(
-            max_num_seqs=4,
-            max_model_len=2048,
-            max_num_batched_tokens=300,
-            len_bucket=[64, 256],
-        ) == [(1, 64), (1, 256), (2, 64), (2, 256), (4, 64)]
-
-    def test_warmup_shapes_batch_bucket_can_lose_every_cell(self):
-        """A batch bucket whose minimum row already exceeds the cell budget
-        is dropped entirely, not just narrowed (spyre-inference#775).
-
-        32 * 64 = 2048 > 1024, and 64 is the smallest possible row, so batch
-        bucket 32 has no surviving cell at any prompt length — unlike bucket 16
-        (16*64=1024, exactly at the cell budget), which keeps one. Such a batch
-        falls back to an unwarmed exact-num_seqs shape at request time
-        (``_ladder_encoder_shape``), one bounded compile per distinct shape.
-        """
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=32,
-            max_model_len=512,
-            max_num_batched_tokens=512,
-        )
-        covered_batches = {batch for batch, _length in shapes}
-        assert covered_batches == {1, 2, 4, 8, 16}
-        assert 32 not in covered_batches
-
-    def test_slack_rescues_the_bucket_the_raw_budget_would_lose(self):
-        """ENCODER_CELL_BUDGET_SLACK narrows #775's starvation by one bucket.
-
-        16 * 64 = 1024 busts a 512 token budget, yet sixteen 32-token prompts are
-        admitted by token sum, so the cell budget keeps bucket 16.
-        """
-        covered = {
-            batch
-            for batch, _length in pooling_warmup_shapes(
-                max_num_seqs=16,
-                max_model_len=512,
-                max_num_batched_tokens=512,
-            )
-        }
-        assert covered == {1, 2, 4, 8, 16}
-
-    def test_warmup_shapes_add_exact_widths_above_the_budget(self):
-        """The overflow band is exact widths at the longest length, not powers of two.
-
-        See ``ENCODER_CELL_BUDGET_SLACK``. The wide low-``L`` cells a power-of-two band
-        would add are deliberately absent: a step wide enough to need them has a shorter
-        max length, so it lands a bucket down.
-        """
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=64,
-            max_model_len=512,
-            max_num_batched_tokens=2048,
-        )
-        assert {(5, 512), (6, 512), (7, 512), (8, 512)} <= set(shapes)
-        assert (16, 256) not in shapes
-        assert (32, 128) not in shapes
-
-    def test_exact_overflow_width_wins_over_the_next_power_of_two(self):
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=64,
-            max_model_len=512,
-            max_num_batched_tokens=2048,
-        )
-        assert pick_encoder_attention_shape(
-            num_seqs=5,
-            max_query_len=512,
-            encoder_shapes=shapes,
-            max_num_seqs=64,
-            max_model_len=512,
-            max_num_batched_tokens=2048,
-        ) == (5, 512)
-
-    def test_warmup_shapes_cover_every_batch_bucket_within_budget(self):
-        """Once max_num_seqs * ENCODER_SEQ_ALIGNMENT <= max_num_batched_tokens,
-        every batch bucket keeps at least one warmed cell.
-        """
-        max_num_batched_tokens = 512
-        max_num_seqs = max_num_batched_tokens // 64  # == 8
-
-        shapes = pooling_warmup_shapes(
+        cfg = _pooling_vllm_config(
+            max_model_len=max_model_len,
             max_num_seqs=max_num_seqs,
-            max_model_len=512,
             max_num_batched_tokens=max_num_batched_tokens,
         )
-        covered_batches = {batch for batch, _length in shapes}
-        assert covered_batches == set(batch_buckets(max_num_seqs))
+        budget = encoder_shape_tables(cfg).budget
+        assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
 
-    def test_expand_packed_to_encoder_bucket_pads_seq_and_batch(self):
-        padded_ids, padded_pos = expand_packed_to_encoder_bucket(
-            input_ids=[1, 2, 3, 4, 5],
-            positions=[0, 1, 2, 0, 1],
-            query_lens=[3, 2],
-            batch_bucket=4,
-            len_bucket=4,
-            pad_token_id=9,
+    @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024])
+    def test_ladder_declares_every_extent_a_request_can_take(self, max_model_len):
+        """``_alignment_units_for`` rounds a request's extent to a power-of-two stick
+        count, so the ladder has to contain exactly those -- an extent it omits is a
+        group width of 1 that warmup never traced, and one it adds is warmed for nothing.
+        """
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            ENCODER_LEN_ALIGNMENT,
+            _alignment_units_for,
         )
-        # seq0, seq1, then two dummy rows
-        assert padded_ids == [1, 2, 3, 9, 4, 5, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]
-        assert padded_pos == list(range(4)) * 4
 
-    def test_encoder_bucket_valid_row_indices_skips_pads(self):
-        indices = encoder_bucket_valid_row_indices([3, 2], len_bucket=4)
-        assert indices == [0, 1, 2, 4, 5]
+        cfg = _pooling_vllm_config(max_model_len=max_model_len, max_num_batched_tokens=2048)
+        ladder = set(encoder_len_ladder(cfg))
+        assignable = {
+            _alignment_units_for(n) * ENCODER_LEN_ALIGNMENT for n in range(1, max_model_len + 1)
+        }
+        assert assignable <= ladder, f"undeclared extents: {sorted(assignable - ladder)}"
+
+    def test_width_for_is_capped_by_max_num_seqs(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
+        assert encoder_width_for(64, cfg) == 4  # 2048 // 64 = 32, capped
+        assert encoder_width_for(512, cfg) == 4
+
+
+class TestEncoderGroupShapes:
+    def test_worked_example_is_eighteen_pairs(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        groups = encoder_group_shapes(cfg)
+        assert len(groups) == 18
+        assert encoder_group_width_caps(cfg) == {64: 32, 128: 16, 256: 8, 512: 4}
+        # Powers of two only, never wider than the cap.
+        for width, extent in groups:
+            assert width & (width - 1) == 0
+            assert width <= encoder_width_for(extent, cfg)
+
+    def test_empty_when_the_rectangle_cannot_miss(self):
+        """``max_num_seqs`` at or below ``R // longest length`` means every batch fits a
+        rectangle, so the group family is unreachable and warming it is pure cost."""
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
+        assert encoder_group_shapes(cfg) == []
+
+    def test_declared_shape_count_matches_the_plan(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        assert 1 + len(encoder_rectangles(cfg)) + len(encoder_group_shapes(cfg)) == 23
+
+
+class TestEncoderDispatch:
+    @pytest.fixture()
+    def rectangles(self):
+        return encoder_rectangles(
+            _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
+        )
+
+    @pytest.mark.parametrize(
+        ("num_seqs", "max_len", "expected"),
+        [
+            (1, 10, (64, 32)),
+            (32, 64, (64, 32)),
+            (16, 128, (128, 16)),
+            (8, 256, (256, 8)),
+            (4, 512, (512, 4)),
+            # One too wide for the length it needs: ragged path, not an error.
+            (33, 64, None),
+            (17, 128, None),
+            (9, 256, None),
+            (5, 512, None),
+            # The plan's go/no-go case: ~100-token prompts fill to num_seqs 20 while
+            # B(128) is 16.
+            (20, 100, None),
+        ],
+    )
+    def test_selection(self, rectangles, num_seqs, max_len, expected):
+        assert encoder_rectangle_for_batch(num_seqs, max_len, rectangles) == expected
+
+    def test_empty_batch_returns_none(self, rectangles):
+        assert encoder_rectangle_for_batch(0, 0, rectangles) is None
+
+    def test_no_rectangles_is_the_ragged_path(self):
+        assert encoder_rectangle_for_batch(1, 64, []) is None
 
 
 class TestLogitsRowBuckets:

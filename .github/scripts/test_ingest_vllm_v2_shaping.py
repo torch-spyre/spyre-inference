@@ -25,20 +25,18 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-import sys
 import types
 
 import pytest
 
 _SCRIPT = pathlib.Path(__file__).resolve().parent / "ingest_vllm_benchmarks.py"
+# The shaping lives in the ingest library, shared with offline results bundles.
+vllm = pytest.importorskip("spyre_clickhouse_ingest.vllm")
 _RUN = "dab2a67f-14bf-53be-b6e4-fc9642086e47"
 
 
 @pytest.fixture(scope="module")
 def mod():
-    stub = types.ModuleType("utils")
-    stub.read_benchmark_results = lambda *a, **k: []
-    sys.modules.setdefault("utils", stub)
     spec = importlib.util.spec_from_file_location("ingest_vllm_benchmarks", _SCRIPT)
     m = importlib.util.module_from_spec(spec)
     try:
@@ -95,7 +93,7 @@ def _write(mod, rows):
 
     client = _Client()
     insert_benchmarks(
-        client, "v2", mod.BENCH_COMPONENT, _RUN, mod._bench_entries(rows), report_kind="vllm"
+        client, "v2", mod.BENCH_COMPONENT, _RUN, vllm.bench_entries(rows), report_kind="vllm"
     )
     return client.inserted.get("benchmarks", []), client.inserted.get("benchmark_runs", [])
 
@@ -104,7 +102,7 @@ def _write(mod, rows):
 
 
 def test_parse_input_shapes_reads_all_three_discriminators(mod):
-    assert mod._parse_input_shapes("latency_tp4_in128_out256") == {
+    assert vllm.parse_input_shapes("latency_tp4_in128_out256") == {
         "tensor_parallel": "4",
         "input_len": "128",
         "output_len": "256",
@@ -115,7 +113,7 @@ def test_parse_input_shapes_reads_all_three_discriminators(mod):
 def test_parse_input_shapes_ignores_non_numeric_tokens(mod, name):
     # A bare prefix with no digits is not a shape; emitting one would fabricate a
     # discriminator and split one benchmark's history in two.
-    assert mod._parse_input_shapes(name) == {}
+    assert vllm.parse_input_shapes(name) == {}
 
 
 def test_shapes_discriminate_two_runs_of_one_benchmark(mod):
@@ -129,7 +127,7 @@ def test_shapes_discriminate_two_runs_of_one_benchmark(mod):
 
 
 def test_entries_carry_what_the_flat_write_dropped(mod):
-    (entry,) = mod._bench_entries([_flat()])
+    (entry,) = vllm.bench_entries([_flat()])
     assert entry["name"] == "latency_tp1_in64_out64", "the flat write hardcodes one constant"
     assert entry["backend"] == "spyre", "backend is the HUD's pivot axis"
     assert entry["props"]["model"] == "granite"
@@ -139,7 +137,7 @@ def test_entries_carry_what_the_flat_write_dropped(mod):
 def test_run_props_carry_the_ci_coordinates_the_hud_view_reads(mod):
     # oss_ci_benchmark_v3_mv reads these off benchmark_runs.props; it cannot see them
     # otherwise, and a guess would put a wrong commit on a chart.
-    (entry,) = mod._bench_entries([_flat()])
+    (entry,) = vllm.bench_entries([_flat()])
     assert entry["run_props"] == {
         "repo": "torch-spyre/spyre-inference",
         "head_branch": "main",
@@ -149,25 +147,26 @@ def test_run_props_carry_the_ci_coordinates_the_hud_view_reads(mod):
         "head_sha": "abc123",
         "arch": "x86_64",
         "hardware_type": "IBM_Spyre",
+        "unit.latency": "s",
     }
 
 
 def test_metric_samples_stay_floats(mod):
-    (entry,) = mod._bench_entries([_flat(actual="2.5")])
+    (entry,) = vllm.bench_entries([_flat(actual="2.5")])
     (samples,) = entry["measurements"].values()
     assert samples == [2.5] and all(isinstance(s, float) for s in samples)
 
 
 def test_run_mode_comes_from_the_test_name_prefix(mod):
     for name, mode in (("serve_tp1", "serve"), ("throughput_tp1", "throughput")):
-        (entry,) = mod._bench_entries([_flat(test_name=name)])
+        (entry,) = vllm.bench_entries([_flat(test_name=name)])
         assert entry["props"]["run_mode"] == mode
 
 
 def test_which_file_reported_it_does_not_split_the_benchmark(mod):
-    # The writer reads both the native json and the .pytorch.json copy, and a benchmark_id is
+    # Both the native json and the .pytorch.json feed one benchmark, and a benchmark_id is
     # a content hash of the name -- so the two must converge before they reach the hash.
-    assert mod._test_name("latency_tp1.json") == mod._test_name("latency_tp1.pytorch.json")
+    assert vllm.bench_name("latency_tp1.json") == vllm.bench_name("latency_tp1.pytorch.json")
     a = _flat(test_name="latency_tp1")
     b = _flat(test_name="latency_tp1", metric="p90")
     idents, _facts = _write(mod, [a, b])
@@ -176,16 +175,149 @@ def test_which_file_reported_it_does_not_split_the_benchmark(mod):
 
 def test_unnamed_benchmarks_are_skipped_not_merged(mod):
     # An id over a blank name would collide every unidentifiable benchmark onto one identity.
-    assert mod._bench_entries([_flat(test_name="")]) == []
+    assert vllm.bench_entries([_flat(test_name="")]) == []
 
 
-def test_iterations_stays_zero(mod):
-    # 0 is the column's "the producer did not say": vLLM reports a pre-averaged value per
-    # metric and never the n behind it. insert_benchmarks SUMS iterations across the merged
-    # entries, so any per-metric placeholder would add up to the metric count.
+def test_iterations_stays_zero_when_unreported(mod):
     flat = [_flat(metric=m) for m in ("p50", "p90", "p99")]
     _idents, (fact,) = _write(mod, flat)
     assert fact["iterations"] == 0
+
+
+def test_iterations_is_counted_once_per_benchmark(mod):
+    # insert_benchmarks SUMS iterations across merged entries; per-metric copies would
+    # report 3 metrics x 10 iterations as 30.
+    flat = [_flat(metric=m, iterations=10) for m in ("avg_latency", "p50_latency", "p99_latency")]
+    _idents, (fact,) = _write(mod, flat)
+    assert fact["iterations"] == 10
+
+
+@pytest.mark.parametrize(
+    "record, n",
+    [
+        ({"avg_latency": 1.0, "latencies": [1.0] * 10, "percentiles": {}}, 10),
+        ({"requests_per_second": 2.0, "tokens_per_second": 3.0, "num_requests": 16}, 1),
+        # serve also carries a `latencies` list; its n is the completed request count.
+        ({"request_throughput": 1.0, "completed": 32, "latencies": [1.0] * 40}, 32),
+        ({"benchmark": {}, "metric": {}}, 0),
+    ],
+)
+def test_sample_count_per_vllm_schema(mod, record, n):
+    assert vllm.sample_count(record) == n
+
+
+def test_units_ride_run_props_per_metric(mod):
+    flat = [
+        _flat(metric=m) for m in ("latency", "p99_latency", "mean_ttft_ms", "tokens_per_second")
+    ]
+    _idents, (fact,) = _write(mod, flat)
+    assert {k: v for k, v in fact["props"].items() if k.startswith("unit.")} == {
+        "unit.latency": "s",
+        "unit.p99_latency": "s",
+        "unit.mean_ttft_ms": "ms",
+        "unit.tokens_per_second": "tok/s",
+    }
+
+
+# --- extract_rows: one source per metric -----------------------------------------------
+
+
+def _extract(mod, monkeypatch, tmp_path, files):
+    for name, record in files.items():
+        (tmp_path / name).write_text(json.dumps(record), encoding="utf-8")
+
+    return vllm.extract_rows(str(tmp_path), "main", "abc", "7", "0", "wf", 0)
+
+
+def _pytorch(name, values, model="granite"):
+    return {
+        "benchmark": {"name": "vLLM benchmark"},
+        "model": {"name": model},
+        "metric": {"name": name, "benchmark_values": values},
+    }
+
+
+def test_a_metric_in_both_files_is_stored_once(mod, monkeypatch, tmp_path):
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {
+            "throughput_x.pytorch.json": [
+                _pytorch("requests_per_second", [2.0]),
+                _pytorch("tokens_per_second", [280.0]),
+            ],
+            "throughput_x.json": {
+                "elapsed_time": 7.3,
+                "num_requests": 16,
+                "requests_per_second": 2.0,
+                "tokens_per_second": 280.0,
+            },
+        },
+    )
+    _idents, (fact,) = _write(mod, rows)
+    assert fact["measurements"] == {
+        "requests_per_second": [2.0],
+        "tokens_per_second": [280.0],
+        "elapsed_time": [7.3],
+    }
+    assert fact["iterations"] == 1
+
+
+def test_iterations_survive_when_every_native_metric_dedups_away(mod, monkeypatch, tmp_path):
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {
+            "throughput_x.pytorch.json": [
+                _pytorch("requests_per_second", [2.0]),
+                _pytorch("tokens_per_second", [280.0]),
+            ],
+            "throughput_x.json": {
+                "num_requests": 16,
+                "requests_per_second": 2.0,
+                "tokens_per_second": 280.0,
+            },
+        },
+    )
+    _idents, (fact,) = _write(mod, rows)
+    assert set(fact["measurements"]) == {"requests_per_second", "tokens_per_second"}
+    assert fact["iterations"] == 1
+
+
+def test_native_adds_only_what_pytorch_lacks(mod, monkeypatch, tmp_path):
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {
+            "latency_x.pytorch.json": [_pytorch("latency", [1.5, 1.6])],
+            "latency_x.json": {
+                "avg_latency": 1.55,
+                "latencies": [1.5, 1.6],
+                "percentiles": {"50": 1.55},
+            },
+        },
+    )
+    _idents, (fact,) = _write(mod, rows)
+    assert fact["measurements"] == {
+        "latency": [1.5, 1.6],
+        "avg_latency": [1.55],
+        "p50_latency": [1.55],
+    }
+    assert fact["iterations"] == 2
+
+
+def test_native_alone_is_ingested_whole(mod, monkeypatch, tmp_path):
+    # SAVE_TO_PYTORCH_BENCHMARK_FORMAT unset: the native file is the only source.
+    rows = _extract(
+        mod,
+        monkeypatch,
+        tmp_path,
+        {"throughput_x.json": {"elapsed_time": 7.3, "requests_per_second": 2.0}},
+    )
+    assert {r["metric"] for r in rows} == {"elapsed_time", "requests_per_second"}
 
 
 # --- what the shared writer makes of them ----------------------------------------------
@@ -235,22 +367,71 @@ def test_run_id_and_report_kind_are_stamped_on_every_fact_row(mod):
     assert all(f["props"]["report_kind"] == "vllm" for f in facts)
 
 
-# --- _write_artifact_results: duration_s (was hardcoded 0.0 for every GHA perf leg) ----
+# --- _write_artifact_results: the leg's artifact and its verdict ------------------------
+
+_BASE = "6ecddb3f-1809-533f-9552-fafdba8a331d"
 
 
-def _artifact_write(
-    mod, rows, monkeypatch, lock_lines=("ibm-flex-1.2.3-0.next.abc123def456.el10.x86_64.rpm",)
-):
-    """Run the real _write_artifact_results over these flat rows; return its inserted rows."""
-    import tempfile
-
-    monkeypatch.setattr(mod, "tables_present", lambda *a, **k: True)
+def _artifact_write(mod, rows, monkeypatch, base=_BASE, tables=True, **leg):
+    """Run the real _write_artifact_results over these flat rows; return what it inserted."""
+    monkeypatch.setattr(mod, "base_artifact_id", lambda *a, **k: base)
+    monkeypatch.setattr(mod, "tables_present", lambda *a, **k: tables)
+    fields = dict(
+        sha="abc123def4567890",
+        rpm_lock="",
+        installed="",
+        arch="amd64",
+        test_type="perf",
+        state="passed",
+        repository="torch-spyre/spyre-inference",
+        gha_run_id="36128188844",
+        branch="main",
+    )
+    fields.update(leg)
     client = _Client()
-    with tempfile.TemporaryDirectory() as d:
-        lock_path = pathlib.Path(d) / "spyre-rpms.lock"
-        lock_path.write_text("\n".join(lock_lines) + "\n", encoding="utf-8")
-        mod._write_artifact_results(client, "v2", rows, _RUN, str(lock_path), "amd64")
-    return client.inserted.get("artifact_results", [])
+    mod._write_artifact_results(client, "v2", rows, _RUN, types.SimpleNamespace(**fields))
+    return client.inserted
+
+
+def test_leg_writes_its_artifact_and_a_performance_verdict(mod, monkeypatch):
+    got = _artifact_write(mod, [_flat()], monkeypatch, state="failed")
+    (artifact,) = got["artifacts"]
+    (result,) = got["artifact_results"]
+    assert artifact["component"] == "spyre-inference"
+    assert artifact["props"]["base_artifact_id"] == _BASE
+    assert artifact["props"]["installed"] == "spyre-inference@abc123def456"
+    assert (artifact["identity_deps"], artifact["props"]["source"]) == ([f"base={_BASE}"], "gha")
+    assert result["artifact_id"] == artifact["artifact_id"] != _BASE
+    assert (result["run_id"], result["result_kind"], result["test_type"]) == (
+        _RUN,
+        "performance",
+        "perf",
+    )
+    assert result["state"] == "failed"
+    assert result["props"]["run_url"].endswith(
+        "/torch-spyre/spyre-inference/actions/runs/36128188844"
+    )
+
+
+def test_a_refused_record_skips_the_link_not_the_ingest(mod, monkeypatch, caplog):
+    def refuse(*_a, **_k):
+        raise ValueError("gha record: its inputs hash to another id")
+
+    monkeypatch.setattr(mod, "ensure", refuse)
+    with caplog.at_level("WARNING"):
+        assert _artifact_write(mod, [_flat()], monkeypatch) == {}
+    assert "benchmark rows unaffected" in caplog.text
+
+
+def test_no_base_id_means_no_link(mod, monkeypatch):
+    assert _artifact_write(mod, [_flat()], monkeypatch, base="") == {}
+
+
+def test_missing_artifact_tables_skip_the_link_quietly(mod, monkeypatch, caplog):
+    with caplog.at_level("INFO"):
+        assert _artifact_write(mod, [_flat()], monkeypatch, tables=False) == {}
+    assert "artifact link skipped" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_artifact_results_duration_sums_elapsed_time_rows(mod, monkeypatch):
@@ -259,13 +440,29 @@ def test_artifact_results_duration_sums_elapsed_time_rows(mod, monkeypatch):
         _flat(metric="elapsed_time", actual=7.5, test_name="throughput_b"),
         _flat(metric="requests_per_second", actual=42.0, test_name="throughput_a"),
     ]
-    written = _artifact_write(mod, rows, monkeypatch)
-    assert written, "expected an artifact_results row"
-    assert all(w["duration_s"] == pytest.approx(20.0) for w in written)
+    (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
+    assert result["duration_s"] == pytest.approx(20.0)
 
 
 def test_artifact_results_duration_is_zero_without_elapsed_time(mod, monkeypatch):
     # A latency/serve-only leg reports no elapsed_time metric, so duration_s stays 0.0.
     rows = [_flat(metric="avg_latency", actual=0.42, test_name="latency_a")]
-    written = _artifact_write(mod, rows, monkeypatch)
-    assert written and all(w["duration_s"] == 0.0 for w in written)
+    (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
+    assert result["duration_s"] == 0.0
+
+
+def test_the_leg_artifact_carries_the_ci_tags(mod, monkeypatch):
+    import spyre_clickhouse_ingest as lib
+
+    seen = {}
+
+    def ci_tags(event, repo, branch, sha, pr, day=None):
+        seen.update(event=event, repo=repo, branch=branch, sha=sha, day=day)
+        return [("spyre-inference@abc123def456", "main")]
+
+    monkeypatch.setattr(lib, "ci_tags", ci_tags, raising=False)
+    got = _artifact_write(mod, [_flat()], monkeypatch, ci_event="push", pr_number="0")
+    assert [(t["tag"], t["tag_family"]) for t in got["artifact_tags"]] == [
+        ("spyre-inference@abc123def456", "main")
+    ]
+    assert (seen["event"], seen["branch"], seen["sha"]) == ("push", "main", "abc123def4567890")

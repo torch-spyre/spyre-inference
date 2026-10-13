@@ -11,7 +11,7 @@ test entries; one entry per `(model, shape)`:
 
 Serve entries replay a recorded agentic trace: real router prompts, each request keeping the output length it actually produced, in recorded order. A trace rather than a fixed prompt shape is what makes prefill chunking, prefix reuse, and KV-block pressure visible. A serve entry's trailing suffix names the trace it replays.
 
-Trace paths come from `SPYRE_AIOPS_DATASET` (`*_aiops`, run at 4k) and `SPYRE_CICS_DATASET` (`*_cics`, run at 8k), so each host can point at its own copy; unset, each falls back to its location on the Spyre benchmark hosts. A selected entry whose file is absent fails the run, so a serve-only job cannot go green without measuring anything.
+Trace paths come from `SPYRE_AIOPS_DATASET` (`*_aiops`, run at 4k) and `SPYRE_CICS_DATASET` (`*_cics`, run at 8k). By default, `make perf-tests` resolves them from the cache and fetches missing or corrupt copies, preserving overrides that point to existing files. `FETCH_BENCH_DATA=0` bypasses this step. Variables left unset fall back to the Spyre benchmark hosts' paths; a selected entry whose file is absent fails the run.
 
 ## Running locally
 

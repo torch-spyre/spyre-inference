@@ -47,9 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
-# accepted only when asked for explicitly. Both are 2 bytes wide, so every
-# stick-alignment constant in this plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the validated one; bfloat16 passes this check, but
+# apply_config_platform_defaults overwrites every model's dtype with float16, an explicit
+# --dtype bfloat16 included, so only a config edited after construction reaches it. Both are
+# 2 bytes wide, so every stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -135,6 +136,9 @@ class TorchSpyrePlatform(CpuPlatform):
     # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
+
+    # Measured throughput argmax across pooling models; they regress above it.
+    _POOLING_MAX_BATCHED_TOKENS = 2048
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
@@ -271,6 +275,14 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.model_config is None:
             return
 
+        # Eager pads to the declared length just like the compiled path, so the cap has
+        # to land before the split below -- and before anything derives from
+        # max_model_len.
+        if vllm_config.model_config.runner_type == "pooling":
+            from spyre_inference.models.roberta import cap_max_model_len_for_position_offset
+
+            cap_max_model_len_for_position_offset(vllm_config.model_config)
+
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
         # subprocess), while enforce_eager persists, so it's the only stable signal.
@@ -294,60 +306,27 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
-            # is independent — see SpyreEncoderAttentionImpl gather-pack.
-            # Honor a user-set list (#638), including an empty one to opt out
-            # of bucketing; otherwise generate defaults.
-            if vllm_config.compilation_config.compile_sizes is not None:
-                # None only reaches us because this hook runs before
-                # post_init_cudagraph_sizes(), which rewrites None to [].
-                # Reorder those and defaults are never generated again.
+            # Body: 1D compile_sizes (packed token counts). Honor a user-set list
+            # (#638), including an empty one to opt out of bucketing; otherwise
+            # generate defaults. None only reaches us because this hook runs before
+            # post_init_cudagraph_sizes(), which rewrites None to [].
+            if vllm_config.model_config.runner_type == "pooling":
+                cls._apply_pooling_shape_defaults(vllm_config)
+                compile_sizes = vllm_config.compilation_config.compile_sizes
+            elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
                 # Largest default bucket: scheduler limit and 512 (Spyre max).
-                # Pooling has no 512 limit -- encoder attention compiles (B, L) cells,
-                # not a 512-token body. 2048 is the measured throughput argmax across
-                # pooling models; they regress above it.
-                is_pooling = vllm_config.model_config.runner_type == "pooling"
-                max_capture_size = min(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    2048 if is_pooling else 512,
-                )
-                if is_pooling:
-                    # A max-length request must fit the budget or it is never admitted:
-                    # encoder prefill cannot be chunked, so the scheduler head-of-line
-                    # blocks forever. vLLM's verify_max_model_len checks this in
-                    # SchedulerConfig.__post_init__, before this hook, so the cap below
-                    # would slip past it.
-                    model_len = vllm_config.model_config.max_model_len
-                    if max_capture_size < model_len:
-                        logger.warning(
-                            "Raising pooling token budget %d -> %d to fit max_model_len; "
-                            "encoder prefill cannot be chunked.",
-                            max_capture_size,
-                            model_len,
-                        )
-                        max_capture_size = model_len
-
-                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
-                        default_encoder_len_buckets,
-                    )
-
-                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
-                    logger.info(
-                        "Pooling body token buckets (1D compile_sizes): %s",
-                        compile_sizes,
-                    )
-                else:
-                    # Decode packs one token per running sequence; prefill lands on
-                    # the single largest bucket. Denser sizes only cost warmup time.
-                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                    sizes = {max_capture_size, num_seqs}
-                    size = 1
-                    while size < num_seqs:
-                        sizes.add(size)
-                        size *= 2
-                    compile_sizes = sorted(sizes)
+                # Decode packs one token per running sequence; prefill lands on
+                # the single largest bucket. Denser sizes only cost warmup time.
+                max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
+                num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                sizes = {max_capture_size, num_seqs}
+                size = 1
+                while size < num_seqs:
+                    sizes.add(size)
+                    size *= 2
+                compile_sizes = sorted(sizes)
                 vllm_config.compilation_config.compile_sizes = compile_sizes
 
             if compile_sizes:
@@ -360,9 +339,78 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
-        # This must be set here as the default, otherwise all usage (including test fixtures) would
-        # require setting the dtype.
+        # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
+        # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+
+    @classmethod
+    def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Normalise the pooling limits onto the declared encoder shapes.
+
+        The token budget ``R`` is the only input. Both other limits are written back
+        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
+        shape every encoder path runs on.
+
+        The scheduler is left alone -- the ragged path means no batch upstream can form
+        has to be refused.
+        """
+        from spyre_inference.v1.worker.spyre_shape_bucketer import (
+            ENCODER_SEQ_ALIGNMENT,
+            encoder_budget_rows,
+            encoder_group_shapes,
+            encoder_rectangles,
+            encoder_shape_tables,
+        )
+
+        scheduler_config = vllm_config.scheduler_config
+        max_model_len = vllm_config.model_config.max_model_len
+        prev_budget = scheduler_config.max_num_batched_tokens
+        prev_num_seqs = scheduler_config.max_num_seqs
+
+        # vLLM's verify_max_model_len runs before this hook, so the floor
+        # `encoder_budget_rows` applies is not checked for us.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+
+        # The shortest length carries the widest rectangle, so no batch ever needs more
+        # width than the ladder offers.
+        widest = max(
+            1,
+            encoder_budget_rows(
+                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+            )
+            // ENCODER_SEQ_ALIGNMENT,
+        )
+        if prev_num_seqs > widest:
+            logger.warning(
+                "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
+                "that many sequences even at the shortest declared length. Raise "
+                "--max-num-batched-tokens to widen it.",
+                prev_num_seqs,
+                widest,
+            )
+            scheduler_config.max_num_seqs = widest
+
+        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
+        budget = encoder_shape_tables(vllm_config).budget
+        scheduler_config.max_num_batched_tokens = budget
+
+        # One body shape: every rectangle is exactly `budget` rows and the ragged path
+        # packs into the same buffer, so the attention kernels key on sequence shapes
+        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        if vllm_config.compilation_config.compile_sizes is None:
+            vllm_config.compilation_config.compile_sizes = [budget]
+
+        logger.info(
+            "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
+            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
+            "(L, B) %s; ragged groups (width, extent) %s.",
+            max_model_len,
+            scheduler_config.max_num_seqs,
+            budget,
+            budget,
+            encoder_rectangles(vllm_config),
+            encoder_group_shapes(vllm_config) or "none reachable",
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
@@ -411,41 +459,59 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
-        """Override hf_config.head_dim to a 128-multiple when the native head_dim
-        is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
+        """Override hf_config.head_dim to a stick-aligned size when the native
+        head_dim isn't one, stashing the original as ``_spyre_orig_head_dim``.
 
         Applies to the Transformers backend too: padding only the RoPE rotation leaves
         the KV cache allocated at the native ``get_head_size()``, which the device copy
         requires to be stick-aligned.
 
-        No-op for models whose head_dim is already a multiple of 128 (e.g.
-        head_size=128 Granite) and for models without RoPE. The restickify failure
-        this works around is RoPE-induced, so non-RoPE models (OPT, GPT-2,
-        GPT-BigCode) lower fine at head=64; padding them is both unnecessary and
-        unsupported by the port, which assumes a RoPE model that sizes attention from
-        ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
-        ``config.head_dim`` and uses ``out_proj``).
+        RoPE and pooling models pad to the next 64-multiple: a sub-stick head (e.g.
+        head_size=32 sharing a stick between two heads) cannot lower, while
+        SpyreRotaryEmbedding handles a sub-stick half (head_size=64). The Transformers
+        backend's RoPE views a head as two halves, so there RoPE models pad to the next
+        128-multiple. Non-RoPE generative decoders (OPT/GPT-2) are skipped; pooling
+        models also go through the construction patch in
+        ``spyre_inference.custom_ops.bert_head_pad`` (the generic property-shim doesn't
+        work on BertSelfAttention's own assert).
+
+        No-op for models whose head_dim is already a multiple of the applicable size.
         """
         from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        num_heads = getattr(hf_config, "num_attention_heads", None)
-        hidden_size = getattr(hf_config, "hidden_size", None)
+        # The config the runner's padding passes read, so both agree on the text part.
+        target_cfg = model_config.hf_text_config
+        num_heads = getattr(target_cfg, "num_attention_heads", None)
+        hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
             return
 
         # transformers 5.x unifies all RoPE config under `rope_parameters`
-        cfgs = (hf_config, model_config.hf_text_config)
-        if not any(getattr(c, "rope_parameters", None) for c in cfgs):
+        cfgs = tuple(
+            c
+            for c in (
+                hf_config,
+                getattr(hf_config, "text_config", None),
+                model_config.hf_text_config,
+            )
+            if c is not None
+        )
+        has_rope = any(getattr(c, "rope_parameters", None) for c in cfgs)
+        if has_rope:
+            multiple = 128 if model_config.using_transformers_backend() else 64
+        elif cls._is_pooling_model(vllm_config):
+            multiple = 64
+        else:
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
+        orig = getattr(target_cfg, "head_dim", None) or hidden_size // num_heads
+        if orig % multiple == 0:
             return
 
-        padded = ((orig + 127) // 128) * 128
-        for cfg in (hf_config, model_config.hf_text_config):
+        padded = ((orig + multiple - 1) // multiple) * multiple
+        for cfg in cfgs:
             reason = reduced_rotary_dim_reason(cfg)
             if reason is not None:
                 raise NotImplementedError(
@@ -453,7 +519,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"alignment, but this model reduces the rotary dimension below "
                     f"head_dim ({reason})."
                 )
-        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+        for cfg in {id(c): c for c in cfgs}.values():
             cfg._spyre_orig_head_dim = orig
             cfg.head_dim = padded
         # ModelConfig snapshots head_size into model_arch_config in __post_init__,
@@ -556,12 +622,40 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _warn_if_not_in_registry(cls, vllm_config: VllmConfig) -> None:
+        """Warn when the requested model/tp/max_model_len/platform is not in the registry.
+
+        The registry is not exhaustive — unknown models may still work — so this
+        is a warning, not an error.
+        """
+        from spyre_inference.config import current_platform, lookup_config
+
+        model_id = vllm_config.model_config.model
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        max_model_len = vllm_config.model_config.max_model_len
+        machine = current_platform()
+
+        cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len, machine=machine)
+        if cfg is None:
+            logger.warning(
+                "Model %r with tp_size=%d max_model_len=%d platform=%s is not in the "
+                "Spyre model registry. The run may still succeed, but this "
+                "configuration has not been validated.",
+                model_id,
+                tp_size,
+                max_model_len,
+                machine,
+            )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
+            cls._warn_if_not_in_registry(vllm_config)
+
             # From here, not from `hf_overrides`, so a user-supplied override does not skip
             # it; no-op for every other model. Runs again for the nested text config a
             # multimodal model builds its decoder from.
@@ -675,6 +769,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
+        # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
+        # which asserts it has ≥2 attention groups.
+        if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
+            logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
+            cache_config.enable_prefix_caching = False
+
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(

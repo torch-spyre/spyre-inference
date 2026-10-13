@@ -15,8 +15,9 @@
 """Model-specific Spyre adaptations, per architecture.
 
 Every architecture ``spyre_models()`` names is replaced by a subclass that lives
-in the matching module here; ``_``-prefixed modules hold machinery shared between
-them. Registration is lazy: nothing is imported until vLLM resolves the
+in the matching module here (the Transformers backend's lives in
+``spyre_inference.transformers_backend``); ``_``-prefixed modules hold machinery shared
+between them. Registration is lazy: nothing is imported until vLLM resolves the
 architecture, so an architecture this deployment never serves costs nothing.
 """
 
@@ -37,8 +38,9 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
-    # apply_prelaunch_overrides rewrites it to this text-only backbone first.
+    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
+    # its language model through the registry as Gemma4ForCausalLM, which resolves here,
+    # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
@@ -108,19 +110,3 @@ def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
 
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
-
-
-def install_pooling_model_patches() -> None:
-    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, CLIP LayerNorm, …)."""
-    from spyre_inference.models import bert, clip, roberta
-
-    bert.install_spyre_patches()
-    roberta.install_spyre_patches()
-    clip.install_spyre_patches()
-
-
-def install_decoder_model_patches() -> None:
-    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
-    from spyre_inference.models import gemma4
-
-    gemma4.install_spyre_patches()

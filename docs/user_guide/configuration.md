@@ -69,24 +69,54 @@ sampled-row indices and that rewrite cannot be undone later.
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
-`--enforce-eager` to disable it. Body and attention are bucketed independently:
+`--enforce-eager` to disable it.
 
-- **Body** (Linear / LN): pad the packed token count to the next 1D
-  `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention** (SDPA): gather into a dense `(B, L)` grid. This is the Spyre
-  workaround until flash-style attention lands; the body is not rewritten to
-  `T = B × L`.
+Everything derives from one number, `R` — the token budget. It is
+`--max-num-batched-tokens`, capped at 2048 (the measured throughput argmax across
+pooling models), floored at `--max-model-len` rounded up to a power-of-two multiple of
+64, and capped again at what `--max-num-seqs` sequences of that length could carry, then
+floored to a whole multiple of it so that every length divides `R`. `--max-num-seqs` is
+then lowered to `R / 64` if it was higher, since no batch wider than that fits.
 
-`compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
-token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
-Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
+- **Body** (Linear / LN): one shape, `R` rows. Every pooling step pads to it.
+  Fixing it is what keeps the attention kernels keyed on sequence shapes alone.
+- **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`, rounded
+  up to a power-of-two multiple of 64. Every length is then `64 * 2^k`, so each divides
+  `R` and each rectangle covers the body exactly. `SPYRE_ATTN_QUERY_BUCKETS` overrides the
+  ladder, rounded the same way.
+- **Attention, rectangular path**: for each length `L`, one rectangle `B = R / L`. The
+  runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
+  one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
+  inside the layer. Taken whenever `num_seqs <= B`.
+- **Attention, ragged path**: for a batch too wide for any rectangle, Q/K/V stay
+  packed and requests are split into *groups* — the requests sharing one padded
+  length. Each group is one fused gather/attend/scatter keyed on `(group width,
+  extent)`, so a ragged step makes one kernel call per group rather than per
+  request. Widths are powers of two up to `B`; a wider group is chunked into
+  descending powers of two.
 
-A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
-and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
+With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that is
+23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
+exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
+empty — no batch that narrow can miss the rectangular path — leaving five shapes.
+Those counts assume the rectangular path is opaque; traced into the block graph (see
+below), each rectangle is a block graph of its own rather than an attention kernel.
 
-Compiled pooling warmup dummies 1D body sizes, then each attention `(B, L)`
-at full size. Eager pooling uses one short dummy, then runtime still
-1D-pads the body.
+The choice is made once per step from the step's metadata, before the forward, and the
+runner counts it in `spyre_encoder_rect_steps` / `spyre_encoder_ragged_steps`. The
+ragged path always runs behind the opaque attention op. When compiled and the head size
+fills whole 64-element sticks, the rectangular path is traced into the block graph
+instead, so each rectangle is its own block graph. In eager mode both paths stay
+opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
+both paths opaque, sharing one block graph. Pooling models such as granite-30m
+pad their native 32-wide heads to 64 before construction.
+
+Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
+opaque, the first attention call in it traces every declared rectangle and group pair,
+against that call's own tensors (a Spyre tensor's device layout is part of its cache
+key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
+ragged path (when any group is reachable) that traces the group pairs. Eager pooling
+uses one short dummy and always takes the packed path.
 
 Example:
 
@@ -100,10 +130,10 @@ vllm serve ibm-granite/granite-embedding-125m-english \
 Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Attention is recorded as the **product** of its KV-length and
-query-length buckets (and, when the batched-decode kernel is enabled, a second KV-length ×
-num-sequences product), so extra attention buckets cost multiplicatively — keep those
-lists short.
+compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
+that fit its smallest real query length. Batched decode uses KV-length/num-sequences
+pairs; both recording paths also enforce the allocated page-capacity limit. Extra
+buckets can still multiply the recorded variants, so keep those lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
 platform clamps `--max-num-batched-tokens` to the largest entry. A decode-heavy run at
@@ -133,15 +163,15 @@ export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from bloc
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) precisely because the recorded set
-is a product. If your context never exceeds 2048, dropping the higher powers removes
-variants from warmup at no serving cost.
+The default KV buckets are geometric (powers of two) because the recorded set grows
+with both axes, even after filtering. If your context never exceeds 2048, dropping the
+higher powers removes variants from warmup at no serving cost.
 
-With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; the
-head-major layout has no batched kernel and ignores it), warmup also records it over the
-KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
-(default: powers of two from 4 to `--max-num-seqs`) is the extra lever there, and the same
-keep-it-short advice applies.
+With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
+default tiled walk it is reached on the head-major layout only, and a token-major run keeps
+the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+`SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
+extra lever there, and the same keep-it-short advice applies.
 
 ## pyproject.toml Reference
 
@@ -150,14 +180,18 @@ The `pyproject.toml` includes several key build configurations:
 ### Build Configuration
 
 ```toml
-[tool.uv]
-build-constraint-dependencies = ["torch==2.13.0"]
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
+[tool.uv.extra-build-variables.vllm]
+VLLM_TARGET_DEVICE = "empty"
+CMAKE_ARGS = "--fresh"
+
+[tool.uv.extra-build-dependencies]
+torch-spyre = ["torch==2.13.0"]
 ```
 
 These settings ensure:
 
-- All packages are built with the same PyTorch version (2.13.0)
+- torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+  C++ extension cannot drift in ABI
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`
   (whose CPU-optimized ops we don't need; Spyre provides its own)

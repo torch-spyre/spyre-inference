@@ -19,10 +19,12 @@ Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py`
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -35,6 +37,10 @@ EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
     "sentence-transformers/all-roberta-large-v1",
+    # head_size=32 (below one stick): the models the encoder attention host
+    # round-trip / bert_head_pad load-time padding exist for.
+    "ibm-granite/granite-embedding-30m-english",
+    "sentence-transformers/all-MiniLM-L6-v2",
 ]
 
 # MEAN product models. The default embed e2e uses max_num_seqs=1; batched MEAN
@@ -59,9 +65,19 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
-# Token classification: the model applies its own classifier after casting to
-# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
-# runs on Spyre instead of detouring through SpyreCpuClassifier.
+# Pairs of 513-1024 tokens at the default-derived max_model_len (2048) batch onto the
+# (1024, 2) rectangle, whose fused-QKV attention needs torch-spyre#5069 (#4893).
+LONG_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+LONG_RERANK_QUERY = "What is the performance of the Spyre accelerator for reranking tasks?"
+LONG_RERANK_DOCUMENTS = [
+    ("the spyre accelerator delivers fast reranking throughput on ibm hardware " * 45).strip(),
+    (
+        "reranking vllm spyre inference benchmark token test document paragraph context " * 45
+    ).strip(),
+]
+
+# Token classification applies its own classifier after a head_dtype cast.
+# Same path as sequence-classify: fp16 x @ Wᵀ and bias on Spyre.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",
@@ -71,10 +87,13 @@ TOKEN_CLASSIFY_PROMPTS = [
 # Match upstream check_embeddings_close(tol=1e-2).
 COSINE_MIN = 0.99
 
-# Sigmoid probabilities, most just above zero where an absolute bound permits an arbitrary
-# relative error, so the stricter of the two applies.
+# Sigmoid probabilities. An absolute bound of 0.03 permits an arbitrary relative
+# error on a near-zero score, so the relative bound applies there. fp16 still
+# moves a ~1e-5 probability by about that much, so the relative bound has a
+# floor; below it the document is already not relevant.
 SCORE_ABS_TOL = float(os.environ.get("SPYRE_TEST_SCORE_ABS_TOL", "0.03"))
 SCORE_REL_TOL = float(os.environ.get("SPYRE_TEST_SCORE_REL_TOL", "0.5"))
+SCORE_REL_FLOOR = float(os.environ.get("SPYRE_TEST_SCORE_REL_FLOOR", "2e-5"))
 
 _REF_PATH = Path(__file__).parent.parent / "data" / "encoder_embed_refs.json"
 _REFERENCES: dict = json.loads(_REF_PATH.read_text()) if _REF_PATH.exists() else {}
@@ -83,6 +102,19 @@ _RERANK_REF_PATH = Path(__file__).parent.parent / "data" / "rerank_score_refs.js
 _RERANK_REFERENCES: dict = (
     json.loads(_RERANK_REF_PATH.read_text()) if _RERANK_REF_PATH.exists() else {}
 )
+_RERANK_GENERATOR_PATH = _RERANK_REF_PATH.with_name("generate_rerank_score_refs.py")
+
+
+def _rerank_generator() -> ModuleType:
+    """The reference generator, loaded by path: ``tests`` is a namespace package, so
+    importing it as ``tests.data...`` breaks whenever another ``tests`` package wins."""
+    spec = importlib.util.spec_from_file_location(
+        "generate_rerank_score_refs", _RERANK_GENERATOR_PATH
+    )
+    assert spec is not None and spec.loader is not None, _RERANK_GENERATOR_PATH
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -259,8 +291,7 @@ def test_encoder_rerank_models_compiled(model: str) -> None:
 
 
 def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
-    """Only the encoder body runs on Spyre: the fp32 classifier head has no FP32 batchmatmul
-    (torch-spyre#1794), so the pooling tail stays on CPU even when compiled."""
+    """Classifier GEMM runs on Spyre in fp16 (no fp32 matmul, torch-spyre#1794)."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_rerank_score_refs.py")
@@ -278,8 +309,47 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     )
     outputs = llm.score(ref["query"], documents)
     assert len(outputs) == len(documents)
+    _assert_scores_match(model, documents, [out.outputs.score for out in outputs], ref_scores)
 
-    scores = [out.outputs.score for out in outputs]
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+def test_encoder_rerank_default_max_model_len_compiled() -> None:
+    """Warmup at the default max_model_len survives, and a (1024, 2) batch matches HF."""
+    ref = _RERANK_REFERENCES.get(LONG_RERANK_MODEL)
+    if ref is None:
+        pytest.skip(
+            f"No HF ref for {LONG_RERANK_MODEL}; run tests/data/generate_rerank_score_refs.py"
+        )
+    revision = ref["revision"]
+
+    ref_scores, token_counts = _rerank_generator().score_pairs(
+        LONG_RERANK_MODEL, revision, LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS
+    )
+    for count in token_counts:
+        assert 512 < count <= 1024, f"pair of {count} tokens no longer pads to L=1024"
+
+    llm = LLM(
+        model=LONG_RERANK_MODEL,
+        revision=revision,
+        tokenizer_revision=revision,
+        runner="pooling",
+        enforce_eager=False,
+    )
+    assert llm.llm_engine.model_config.max_model_len == 2048
+    outputs = llm.score(LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS)
+    assert len(outputs) == len(LONG_RERANK_DOCUMENTS)
+    _assert_scores_match(
+        LONG_RERANK_MODEL,
+        LONG_RERANK_DOCUMENTS,
+        [out.outputs.score for out in outputs],
+        ref_scores,
+    )
+
+
+def _assert_scores_match(
+    model: str, documents: list[str], scores: list[float], ref_scores: list[float]
+) -> None:
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
     # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
@@ -292,10 +362,10 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     )
 
     for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
-        tol = min(SCORE_ABS_TOL, SCORE_REL_TOL * ref_score)
+        tol = min(SCORE_ABS_TOL, max(SCORE_REL_TOL * ref_score, SCORE_REL_FLOOR))
         assert abs(score - ref_score) <= tol, (
-            f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
-            f"for {document!r}"
+            f"{model}: score {score:.6f} vs HF {ref_score:.6f} (tol {tol:.6f}) "
+            f"for {document[:80]!r}"
         )
 
 

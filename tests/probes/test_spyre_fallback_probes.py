@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Strict-xfail probes for torch-spyre primitives blocking CPU fallbacks.
+"""Probes for torch-spyre primitives blocking CPU fallbacks.
 
 Each test exercises a single primitive that spyre-inference needs on-device
-(decoder forward, encoder pack, pooling). They are intentionally strict
-xfail: when a primitive starts working in torch-spyre, the corresponding
-probe flips to XPASS and we can remove the associated workaround here.
+(decoder forward, encoder pack, pooling). Strict xfails flag newly working
+primitives so their workarounds can be removed. The one-row matmul timing probe
+is non-strict: an XPASS calls for remeasurement before removing its workaround.
 
 Section 10 applies the same idea to workarounds for upstream vLLM bugs: those
 probes need no device and inspect vLLM instead.
@@ -685,9 +685,9 @@ def test_spyre_compile_input_honors_row_offset_off_stick(spyre_device):
     """A row view whose width is not a whole number of sticks.
 
     test_spyre_compile_input_honors_storage_offset slices rows that are a whole number of
-    sticks wide, so its offsets are stick multiples. ``_rows_start_on_sticks`` in the MoE
-    gates the per-token row clones on exactly that property, so the off-stick width is the
-    case that decides whether the gate can go.
+    sticks wide, so its offsets are stick multiples. ``_rows_are_stick_addressable`` in the MoE
+    gates the per-token row clones on the same property, so an off-stick row stride is the case
+    that decides whether the gate can go.
     """
     rows, width = 2, 40
     assert (rows * width) % _FP16_ELEMS_PER_STICK != 0, "row stride must not be a stick multiple"
@@ -836,6 +836,46 @@ def test_spyre_transfer_lands_a_host_view_at_offset_zero(spyre_device):
         assert stack.is_contiguous() and stack.storage_offset() == 0
         for i in (0, blocks - 4):
             torch.testing.assert_close(fn(stack, i).cpu(), view[i] * 2.0, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("query_len", [1, 64])
+def test_spyre_for_each_tile_consumes_transferred_mask_stack(spyre_device, dtype, query_len):
+    """The tiled attention mask layout survives transfer, broadcast, and reduction."""
+    from torch_spyre._inductor.wsr import for_each_tile
+
+    rows, blocks, kv_heads, qpk, block_size = 3, 4, 2, 2, 128
+    base = torch.zeros(rows, blocks, query_len, block_size, dtype=dtype)
+    for b in range(blocks):
+        base[:, b] = b / 8
+    host_view = base[1]
+    assert host_view.storage_offset() > 0
+    stack = host_view.to(spyre_device)
+    assert stack.storage_offset() == 0
+
+    @torch.compile(dynamic=False, fullgraph=True)
+    def fn(mask_stack):
+        scores = mask_stack.new_zeros(kv_heads, qpk, query_len, block_size)
+        init = mask_stack.new_zeros(kv_heads, qpk, query_len)
+
+        def body(total, operands):
+            (mask_tile,) = operands
+            probs = torch.exp(scores + mask_tile[0])
+            return total + probs.sum(dim=-1), None
+
+        total, _ = for_each_tile(
+            body,
+            (mask_stack,),
+            dims=(0,),
+            tile_size=1,
+            init=init,
+        )
+        return total
+
+    expected = sum(
+        torch.exp(host_view[b]).sum(dim=-1).expand(kv_heads, qpk, query_len) for b in range(blocks)
+    )
+    torch.testing.assert_close(fn(stack).cpu(), expected, atol=0.02, rtol=0.02)
 
 
 def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
@@ -1086,16 +1126,14 @@ def test_spyre_fp32_reduce_d2h_with_destagger(spyre_device):
 # ---------------------------------------------------------------------------
 #
 # torch-spyre SPYRE_FP32_OPS includes add/mul/sum/mean but not batchmatmul
-# (torch-spyre#1794), so F.linear on float32 classifier / reranker heads
-# stays on CPU (configure_pooling_for_spyre). When this XPASS-es, drop that
-# fallback.
+# (torch-spyre#1794). Heads downcast to fp16 (#868); this probe tracks native
+# fp32 linear.
 
 
 _FP32_BMM_REASON = (
     "torch-spyre has FP32 for add/mul/sum/mean (SPYRE_FP32_OPS) but not for "
-    "batchmatmul / F.linear (torch-spyre#1794). Pooling classifier heads stay "
-    "float32, so configure_pooling_for_spyre keeps them on CPU. When this "
-    "XPASS-es, drop the FP32-head CPU fallback in configure_pooling_for_spyre."
+    "batchmatmul / F.linear (torch-spyre#1794). Classifier heads downcast to "
+    "fp16 instead. When this XPASS-es, native fp32 linear is available."
 )
 
 
@@ -1162,13 +1200,14 @@ def test_vllm_gemma4_self_decoder_registers_aliased_scalars():
 # ---------------------------------------------------------------------------
 
 
+# Non-strict: a wall-clock ratio varies by CI host, so an XPASS reports rather than fails.
 @pytest.mark.xfail(
-    strict=True,
+    strict=False,
     reason=(
-        "A 1-row matmul against a fused gate/up weight runs far below the rate the "
-        "same weight sustains with a full 8-row block, so padding the activation out "
-        "to the 8 PT rows is faster despite the extra rows. When this passes, drop "
-        "custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
+        "A 1-row matmul against a fused gate/up weight is slower than the same weight "
+        "against a full 8-row block, so padding the activation out to the 8 PT rows "
+        "is faster despite the extra rows. When this XPASSes, re-measure decode and "
+        "drop custom_ops/linear.py::SpyrePaddedRowsLinearMethod and the `_PAD_ROWS` "
         "constants it reads. Tracked by torch-spyre#4032."
     ),
 )
@@ -1197,8 +1236,8 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         best_of(rows, reps=3)
     one_row, full_block = best_of(1), best_of(8)
 
-    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
-    assert one_row <= 1.10 * full_block, (
+    # Padding stops paying off exactly when 1 row is no slower than the 8 rows it pads to.
+    assert one_row <= full_block, (
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
     )
@@ -1295,3 +1334,41 @@ def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_gr
     out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
 
     torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# 15. Eager GemmaRMSNorm
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#2971: eager GemmaRMSNorm cannot multiply its staggered-EA "
+        "FP32 activation by a STANDARD [hidden] FP32 weight. When this XPASS-es, "
+        "remove force=True from SpyreGemmaRMSNorm."
+    ),
+)
+def test_spyre_eager_gemma_rms_norm(spyre_device):
+    """Upstream FP32 GemmaRMSNorm should run without a surrounding compiled graph."""
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 256, dtype=torch.float16)
+    weight = torch.randn(256, dtype=torch.float16)
+    norm = GemmaRMSNorm(256, eps=1e-6).to(torch.float16)
+    norm.weight.data.copy_(weight)
+
+    x_device = x.to(spyre_device)
+    norm.to(spyre_device)
+
+    # Bypass the Spyre OOT wrapper: this probe asks whether torch-spyre can lower
+    # the unchanged upstream implementation eagerly, not whether the workaround works.
+    actual = GemmaRMSNorm.forward_native(norm, x_device).cpu().float()
+
+    x_fp32 = x.float()
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    expected = (
+        x_fp32 * torch.rsqrt(variance + norm.variance_epsilon) * (weight.float() + 1.0)
+    ).half()
+    torch.testing.assert_close(actual, expected.float(), atol=1e-2, rtol=2e-3)

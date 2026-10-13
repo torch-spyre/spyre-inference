@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, 'release-*']
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ on:
         type: string
       skip_uv_for_benchmarking:
         description: >
-          Bypass `uv run` and use the prebaked venv's python3 directly. Needed
+          Bypass `uv run` and use the active venv's python3 directly. Needed
           on s390x, where uv cannot resolve a torch/vllm wheel and otherwise
           builds a torch-less venv. Leave false on amd64/ppc64le.
         required: false
@@ -118,6 +118,17 @@ jobs:
       DEVICE_NAME: spyre
       DEVICE_TYPE: IBM_Spyre
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      # The trace files the serve configs replay are cached on the 1Ti RWX PVC
+      # that is mounted into every runner pod at /storage-1, alongside the uv and
+      # HuggingFace caches this repo already keeps there. It survives the pod, so
+      # the first job to need a trace fetches it and every later job on any runner
+      # reads it straight off the PVC. Per-file locks reduce duplicate fetches;
+      # cross-pod deduplication depends on NFS locking.
+      STORAGE_1_DIR: /storage-1/spyre-inference
+      SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
+      ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+      ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+      ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
 
     steps:
       - name: Checkout repository
@@ -128,18 +139,19 @@ jobs:
         if: ${{ !inputs.use_prebaked_image }}
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1 by the uv-nfs-cache
+      # steps below. See .github/scripts/nfs_uv_cache.py.
       - name: Set up uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
-          enable-cache: true
-          # Invalidate only on lock changes; setup-uv's default glob also hashes
-          # pyproject.toml, so config-only edits would needlessly bust the cache.
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
-          cache-local-path: ${{ runner.temp }}/setup-uv-cache
-          # See prune-uv-cache-safe
-          prune-cache: false
+          enable-cache: false
+
+      # Restore now; the post step ships the cache back at job end (writers only).
+      - name: uv cache (NFS)
+        if: ${{ !inputs.use_prebaked_image }}
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
 
       - name: Install spyre-inference
         run: |
@@ -149,20 +161,15 @@ jobs:
           echo "=== Installed versions ==="
           uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
 
-      # Ephemeral runners inherit a stale $VIRTUAL_ENV at /home/senuser/.venv that
-      # the sync above ignored; repoint and remove it so `uv run --active` in
-      # perf-tests finds the workspace venv. Mirrors run-matrix-config.
+      # ibm-aiu-setup.sh re-activates the image's baked /home/senuser/.venv
+      # ($VIRTUAL_ENV) in every perf-tests recipe shell, so the run targets the
+      # project .venv the Makefile repoints to (see AIU_SETUP_CMD), not this value.
+      # This repoint still steers non-recipe uv steps that don't source the profile.
       - name: Activate the freshly-built venv
         if: ${{ !inputs.use_prebaked_image }}
         run: |
-          rm -rf /home/senuser/.venv
           echo "VIRTUAL_ENV=${GITHUB_WORKSPACE}/.venv" >> "$GITHUB_ENV"
           echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"
-
-      # Slim the cache for setup-uv's post-job save without discarding the
-      # compiled torch-spyre/vllm wheels. Must run after the uv sync above.
-      - name: Prune uv cache (safe)
-        uses: ./.github/actions/prune-uv-cache-safe
 
       - name: Resolve vLLM commit
         env:
@@ -183,6 +190,7 @@ jobs:
           echo "### Benchmarking vLLM [${HEAD_SHA}](https://github.com/vllm-project/vllm/commit/${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run vLLM benchmarks
+        id: bench
         # aiu-setup + the benchmark invocation both live in the Makefile's
         # perf-tests target now -- the single entrypoint, so this doesn't
         # hand-duplicate ibm-aiu-setup.sh sourcing.
@@ -195,14 +203,15 @@ jobs:
             MODELS="${MATRIX_MODELS}" \
             SKIP_UV_FOR_BENCHMARKING="${SKIP_UV_FOR_BENCHMARKING}"
 
+      # !cancelled(): a later benchmark failing must not discard the ones that completed.
       - name: Install ClickHouse ingest dependencies
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         run: |
           set -eux
           uv pip install -r .github/scripts/requirements-benchmark.txt
 
       - name: Ingest benchmark results into ClickHouse
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
         env:
           # A push to main has no clickhouse_env input, so the selector resolves
           # to prod. A manual dispatch can pick dev with the *_DEV secret set.
@@ -215,6 +224,9 @@ jobs:
           BENCHMARK_BRANCH: ${{ github.ref_name }}
           BENCHMARK_SHA: ${{ github.sha }}
           PR_NUMBER: "0"
+          BENCH_STATE: ${{ steps.bench.outcome == 'success' && 'passed' || 'failed' }}
+          # The baked stack ran unchanged, so the lock is not part of what was measured.
+          RPM_LOCK: ${{ !inputs.use_prebaked_image && 'spyre-rpms.lock' || '' }}
         run: |
           set -eux
 
@@ -222,6 +234,10 @@ jobs:
           echo "PyTorch JSON result files found: ${JSON_COUNT}"
 
           if [[ "${JSON_COUNT}" -eq 0 ]]; then
+            if [[ "${BENCH_STATE}" == "failed" ]]; then
+              echo "No benchmark completed; nothing to ingest."
+              exit 0
+            fi
             echo "No PyTorch benchmark result files found; failing ClickHouse ingest."
             exit 1
           fi
@@ -236,7 +252,9 @@ jobs:
             --pr-number "${PR_NUMBER}" \
             --arch "${BENCHMARK_ARCH:-x86_64}" \
             --test-type perf \
-            --rpm-lock spyre-rpms.lock
+            --rpm-lock "${RPM_LOCK}" \
+            --state "${BENCH_STATE}" \
+            --repository "${{ github.repository }}"
 
       - name: Job Summary
         if: always()

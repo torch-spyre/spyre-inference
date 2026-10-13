@@ -57,7 +57,7 @@ def test_long_context_model_load():
 
 
 # On-device counterpart to the CPU pad-shim unit tests: qwrt/Swedish0.1M is the
-# smallest public model that trips BOTH pads at once — head_dim 16 -> 128 (QK-norm)
+# smallest public model that trips BOTH pads at once — head_dim 16 -> 64 (QK-norm)
 # and intermediate_size 160 -> 192 (SwiGLU) — and must still decode correctly.
 # Its tokenizer stub is broken (returns [] for everything); the model is byte-level
 # (vocab 256), so the prompt is fed as raw UTF-8 byte ids, not through the tokenizer.
@@ -69,20 +69,22 @@ _PADDED_REFERENCE_TOKEN_IDS = [32, 111, 99, 104, 32]
 
 
 @pytest.mark.uses_subprocess
-def test_padded_head_dim_and_intermediate_size_generate() -> None:
+@pytest.mark.parametrize("enforce_eager", [True, False], ids=["eager", "compiled"])
+def test_padded_head_dim_and_intermediate_size_generate(enforce_eager: bool) -> None:
     """Loading the model fires both pads; greedy decode matches the unpadded
-    reference token ids."""
+    reference token ids. head_dim 64 takes the split-free RoPE path, so the compiled
+    case traces it into a block graph."""
     llm = LLM(
         model="qwrt/Swedish0.1M",
         dtype="float16",
-        enforce_eager=True,
+        enforce_eager=enforce_eager,
         max_model_len=128,
         max_num_seqs=1,
     )
 
     # Both padding passes must have run during check_and_update_config.
     hf_config = llm.llm_engine.model_config.hf_config
-    assert hf_config.head_dim == 128
+    assert hf_config.head_dim == 64
     assert hf_config._spyre_orig_head_dim == 16
     assert hf_config.intermediate_size == 192
     assert hf_config._spyre_orig_intermediate_size == 160

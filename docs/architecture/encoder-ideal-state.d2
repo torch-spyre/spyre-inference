@@ -199,7 +199,7 @@ upper: " " {
       grid-columns: 1
       grid-gap: 10
 
-      attn_note: "dense-grid strategy, compared with the planned flash variant below\nrounds up its own grid: S to a power of two, L already 64-aligned" {
+      attn_note: "per-extent groups: requests sharing a padded length are served by one batched SDPA\ngather, attend and store are one compiled graph, so a plan costs one launch per layer" {
         style.fill: "#1565c0"
         style.stroke: "#1565c0"
         style.font-color: "#D6E4F7"
@@ -209,7 +209,7 @@ upper: " " {
         width: 870
       }
 
-      tables: "Batch-shape tables, built once per step and carried on the attention metadata" {
+      tables: "Row tables and masks, built once per step and carried on the attention metadata" {
         style.fill: "#E3E9FD"
         style.stroke: "#0d47a1"
         style.font-color: "#0A0F25"
@@ -222,7 +222,7 @@ upper: " " {
         grid-gap: 0
         width: 870
 
-        tables_d: "additive mask + three gather index lists · derived from S and the per-request lengths, so identical for every layer" {
+        tables_d: "one int32 row table and one [group, 1, 1, extent] mask per plan · derived from the per-request lengths, so identical for every layer" {
           style.fill: "#E3E9FD"
           style.stroke: "#E3E9FD"
           style.font-color: "#37474f"
@@ -233,88 +233,31 @@ upper: " " {
         }
       }
 
-      gathers: " " {
-        style.fill: "#1565c0"
-        style.stroke: "#1565c0"
+      fused: "Fused kernel: gather → SDPA → store, one compiled graph" {
+        style.fill: "#E3E9FD"
+        style.stroke: "#0d47a1"
+        style.font-color: "#0A0F25"
+        style.font-size: 14
+        style.bold: true
+        style.border-radius: 6
+        label.near: top-center
         grid-rows: 1
-        grid-columns: 3
-        grid-gap: 15
+        grid-columns: 1
+        grid-gap: 0
+        width: 870
 
-        pack: "gather_pack" {
+        fused_d: "index_select the plan's rows into [group * extent, H, D] · batched SDPA · index_copy_ the result back\nkeyed on (buffer_rows, group, extent) · pad lanes clamp to the sequence's last real row, so no zero row is needed" {
           style.fill: "#E3E9FD"
-          style.stroke: "#0d47a1"
-          style.font-color: "#0A0F25"
-          style.font-size: 14
-          style.bold: true
-          style.border-radius: 6
-          label.near: top-center
-          grid-rows: 1
-          grid-columns: 1
-          grid-gap: 0
-          width: 280
-
-          pack_d: "[T, H, D] → [S, H, L, D]\npad slots point at a zero row" {
-            style.fill: "#E3E9FD"
-            style.stroke: "#E3E9FD"
-            style.font-color: "#37474f"
-            style.font-size: 12
-            style.bold: false
-            width: 210
-            height: 56
-          }
+          style.stroke: "#E3E9FD"
+          style.font-color: "#37474f"
+          style.font-size: 12
+          style.bold: false
+          width: 740
+          height: 56
         }
-
-        sdpa: "SDPA on device" {
-          style.fill: "#E3E9FD"
-          style.stroke: "#0d47a1"
-          style.font-color: "#0A0F25"
-          style.font-size: 14
-          style.bold: true
-          style.border-radius: 6
-          label.near: top-center
-          grid-rows: 1
-          grid-columns: 1
-          grid-gap: 0
-          width: 280
-
-          sdpa_d: "bidirectional, additive mask\none fused kernel per (S, L)" {
-            style.fill: "#E3E9FD"
-            style.stroke: "#E3E9FD"
-            style.font-color: "#37474f"
-            style.font-size: 12
-            style.bold: false
-            width: 210
-            height: 56
-          }
-        }
-
-        unpack: "gather_unpack" {
-          style.fill: "#E3E9FD"
-          style.stroke: "#0d47a1"
-          style.font-color: "#0A0F25"
-          style.font-size: 14
-          style.bold: true
-          style.border-radius: 6
-          label.near: top-center
-          grid-rows: 1
-          grid-columns: 1
-          grid-gap: 0
-          width: 280
-
-          unpack_d: "[S, H, L, D] → [T, H, D]\nsingle bulk output copy" {
-            style.fill: "#E3E9FD"
-            style.stroke: "#E3E9FD"
-            style.font-color: "#37474f"
-            style.font-size: 12
-            style.bold: false
-            width: 210
-            height: 56
-          }
-        }
-
       }
 
-      barriers: "tables on the metadata instead of rebuilt per layer ⇒ roughly 4 host/device barriers per pass, not one set per layer" {
+      barriers: "tables on the metadata instead of rebuilt per layer · one launch per plan per layer, where the three-stage split cost three" {
         style.fill: "#1565c0"
         style.stroke: "#1565c0"
         style.font-color: "#D6E4F7"
@@ -418,18 +361,18 @@ upper: " " {
         grid-gap: 0
         width: 580
 
-        T_tokens_d: "sum of the batched prompt lengths · bucketed to 64 / 128 / 256 / 512 tokens" {
+        T_tokens_d: "sum of the batched prompt lengths · bucketed to 256 / 512 / 1024 / 2048 tokens\nthe floor sits above one stick because each body bucket multiplies the attention sweep" {
           style.fill: "#E3E9FD"
           style.stroke: "#E3E9FD"
           style.font-color: "#37474f"
           style.font-size: 12
           style.bold: false
           width: 450
-          height: 38
+          height: 56
         }
       }
 
-      S_reqs: "S · requests in the step" {
+      S_reqs: "group · requests in one attention call" {
         style.fill: "#E3E9FD"
         style.stroke: "#0d47a1"
         style.font-color: "#0A0F25"
@@ -442,18 +385,18 @@ upper: " " {
         grid-gap: 0
         width: 580
 
-        S_reqs_d: "how many prompts are batched together · bucketed to 1 / 2 / 4 / 8 …" {
+        S_reqs_d: "requests that share an extent, in powers of two, capped by max_num_seqs\na remainder becomes its own smaller plan rather than padding up to phantom sequences" {
           style.fill: "#E3E9FD"
           style.stroke: "#E3E9FD"
           style.font-color: "#37474f"
           style.font-size: 12
           style.bold: false
           width: 450
-          height: 38
+          height: 56
         }
       }
 
-      L_width: "L · the width of attention's grid" {
+      L_width: "extent · one request's padded length" {
         style.fill: "#E3E9FD"
         style.stroke: "#0d47a1"
         style.font-color: "#0A0F25"
@@ -466,7 +409,7 @@ upper: " " {
         grid-gap: 0
         width: 580
 
-        L_width_d: "every request gets one row of L columns; L = align_up(longest prompt, 64)\nshort requests leave their remaining columns as padding" {
+        L_width_d: "per request, not per step: its own length in 64-token units, rounded to a power of two\nso a 260-token request attends over 512 · requests sharing an extent can be grouped" {
           style.fill: "#E3E9FD"
           style.stroke: "#E3E9FD"
           style.font-color: "#37474f"
@@ -490,14 +433,14 @@ upper: " " {
         grid-gap: 0
         width: 580
 
-        example_d: "T = 110 → T_padded = 128 · S = 3 → 4 · L = 64 · grid = 4 × 64. Note S × L ≠ T." {
+        example_d: "T = 110 → T_padded = 256 · every extent = 64, so all three share one · group 3 chunks to 2 + 1,\ngiving two plans and two launches per layer. Note group × extent ≠ T." {
           style.fill: "#FFF8E1"
           style.stroke: "#FFF8E1"
           style.font-color: "#5d4037"
           style.font-size: 12
           style.bold: false
           width: 450
-          height: 38
+          height: 56
         }
       }
     }
@@ -552,7 +495,7 @@ static_shapes: |md
 }
     }
 
-    warmup: "Startup: warmup walks both sets of buckets" {
+    warmup: "Startup: warmup walks every bucket set" {
       style.fill: "#EEF1F8"
       style.stroke: "#CFD2DD"
       style.font-color: "#212121"
@@ -588,7 +531,7 @@ static_shapes: |md
         }
       }
 
-      attn: "for (S, L): _dummy_run(force_attention=True)" {
+      attn: "_warm_kernels, called from forward" {
         style.fill: "#1565c0"
         style.stroke: "#0d47a1"
         style.font-color: "#ffffff"
@@ -601,7 +544,7 @@ static_shapes: |md
         grid-gap: 0
         width: 580
 
-        attn_d: "without the flag no attention metadata is built,\nso the attention path is never traced or compiled" {
+        attn_d: "sweeps (extent, group) on the first call per buffer_rows\nthe dummy runs cannot span it: a request's extent follows its own length, not the body bucket" {
           style.fill: "#1565c0"
           style.stroke: "#1565c0"
           style.font-color: "#D6E4F7"
@@ -612,7 +555,7 @@ static_shapes: |md
         }
       }
 
-      pool: "_dummy_pooler_run(hidden_states)" {
+      pool: "_dummy_pooler_run + _warm_pooler_row_widths" {
         style.fill: "#1565c0"
         style.stroke: "#0d47a1"
         style.font-color: "#ffffff"
@@ -625,14 +568,14 @@ static_shapes: |md
         grid-gap: 0
         width: 580
 
-        pool_d: "warms pooler shapes · upstream's version is only a memory probe" {
+        pool_d: "pooler cost follows the request count, so row widths are swept too\nupstream's dummy pooler run is only a memory probe" {
           style.fill: "#1565c0"
           style.stroke: "#1565c0"
           style.font-color: "#D6E4F7"
           style.font-size: 12
           style.bold: false
           width: 450
-          height: 38
+          height: 56
         }
       }
 
@@ -664,7 +607,7 @@ rules: |md
   }
 }
 
-lower: "Attention shape strategy: dense grid today, and planned flash attention" {
+lower: "Attention shape strategy: per-extent groups today, and planned flash attention" {
   style.fill: "#EEF1F8"
   style.stroke: "#CFD2DD"
   style.font-color: "#212121"
@@ -686,7 +629,7 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
     # A markdown-labelled shape gets neither a border nor a width from D2, so the
     # border and the width live on a wrapping container and the prose sits inside
     # it as a blended child.
-    dense: "A · Dense grid, the strategy shown above" {
+    dense: "A · Per-extent groups, the strategy shown above" {
       style.fill: "#E3E9FD"
       style.stroke: "#0d47a1"
       style.stroke-width: 2
@@ -701,26 +644,27 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
       width: 700
 
       dense_body: |md
-        Pack the ragged flat list into a rectangle, so every  
-        shape is fixed at compile time.  
+        Gather each group's rows out of the flat list into a  
+        dense batch, so every shape is fixed at compile time.  
         Needed because an offset computed from data does not  
         lower under compilation (torch-spyre#3508) — exactly  
-        the arithmetic that flash relies on.  
-        Eager tolerates it; compiled mode, our target, does not.
+        the arithmetic that flash relies on.
 
-        · build an additive mask [S, 1, L, L] marking padding  
-        and cross-request slots  
-        · build three index lists, then gather Q / K / V into  
-        [S, H, L, D]  
-        · one fused SDPA kernel per (S, L), then gather the  
-        results back out
+        · group the step's requests by padded length (extent)  
+        · one compiled graph per plan does gather, SDPA and  
+        store together  
+        · the mask is [group, 1, 1, extent]: head and query axes  
+        broadcast, since an encoder mask depends only on the  
+        KV column
 
-        **Shape axes: T for the body, (S, L) for attention.  
-        Two sets of buckets to warm.**
+        **Shape axes: T for the body, (buffer_rows, group, extent)  
+        for attention.**
 
-        Costs: the mask grows with L², plus index lists and a  
-        barrier per gather.  
-        Works today. This is the current implementation.
+        Costs: the pack is still paid, and fusion put buffer_rows  
+        into the attention key, so warmup covers more variants.  
+        Cheaper than a block-diagonal mask over the flat list,  
+        which would compute every cross-request block and then  
+        throw it away.
       | {
         style.fill: "#E3E9FD"
         style.stroke: "#E3E9FD"
@@ -745,26 +689,26 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
       width: 700
 
       flash_body: |md
-        Never materialise the rectangle.  
+        Never materialise the batch.  
         Each block of queries reads its request's offset from  
-        the metadata at runtime, and works directly on the flat  
-        list, carrying a running softmax maximum and sum.  
-        That is the online-softmax structure the Spyre decoder  
-        already uses over KV pages.
+        the metadata at runtime and works on the flat list,  
+        carrying a running softmax maximum and sum — the  
+        online-softmax structure the decoder already uses over  
+        KV pages.
 
-        · no [S, 1, L, L] mask; request boundaries are the offsets  
-        · no gather_pack / gather_unpack; the kernel reads the  
-        flat list directly  
-        · no per-layer index lists, so no per-gather barriers
+        · no [group, 1, 1, extent] mask; boundaries are offsets  
+        · no gather or store; the kernel reads the flat list  
+        · extent disappears, replaced by a block count
 
-        **Shape axis: block count, bucketed like the decoder's  
-        page loop. L disappears.**
+        **Two separate prerequisites, often conflated:**  
+        · torch-spyre#3508, data-dependent offsets → flat-list  
+        attention, extent becomes a coarse block count  
+        · symbolic shapes (the backend rejects SymInt today) →  
+        no bucketing on any axis
 
-        Both upstream backends already work this way, neither  
-        padding into a rectangle.  
-        Flash attention consumes the flat list with  
-        cu_seqlens_q = query_start_loc, and the CPU backend  
-        passes query[:num_actual_tokens] to a C++ kernel.
+        With #3508 alone the block count is still bucketed, as  
+        the decoder's page loop is. buffer_rows also survives:  
+        attention still writes into the body-sized output buffer.
       | {
         style.fill: "#E8F5E9"
         style.stroke: "#E8F5E9"
@@ -782,7 +726,7 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
     grid-columns: 2
     grid-gap: 26
 
-    simplifies: "If flash attention lands, the design converges on upstream" {
+    simplifies: "If flash attention lands, what changes and what fusion already changed" {
       style.fill: "#FFF8E1"
       style.stroke: "#F9A825"
       style.stroke-width: 2
@@ -797,20 +741,21 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
       width: 1000
 
       simplifies_body: |md
-        · the second shape axis collapses; bucket T and a block count,  
-        much closer to upstream's single axis  
-        · the batch-shape tables box disappears, and with it the  
-        per-layer rebuild problem and its barriers  
-        · gather_pack / SDPA / gather_unpack collapse into one  
-        blocked-attention kernel  
-        · the mask's L² growth at long prompts disappears, today's  
-        largest untested risk
+        · attention stops gathering, so the pack and its launch go away  
+        · extent collapses to a block count, coarser and cheaper to warm  
+        · the mask disappears entirely; boundaries become offsets
 
-        **Open question:** whether a Spyre kernel can do the runtime  
-        offset arithmetic this depends on. If it cannot, the block  
-        count stays bucketed.  
-        Everything else holds either way: padding seam, unpadded  
-        metadata, warmup, compilation mode.
+        **What fusion already did, and what it cost:** collapsing gather,  
+        SDPA and store into one graph removed two launches per plan per  
+        layer, but pulled buffer_rows into the attention key. So the branch  
+        moved toward flash's shape while moving away from its single axis.  
+        Flash would not remove buffer_rows either — that needs attention to  
+        stop writing into the body-sized buffer, or the body to stop being  
+        bucketed.
+
+        **Unchanged either way:** the padding seam, metadata that always  
+        describes the real batch, warmup covering every reachable shape,  
+        and the compilation mode.
       | {
         style.fill: "#FFF8E1"
         style.stroke: "#FFF8E1"
@@ -852,7 +797,7 @@ lower: "Attention shape strategy: dense grid today, and planned flash attention"
         width: 340
       }
 
-      L3: "Internal step · dense-grid path" {
+      L3: "Internal step · current path" {
         style.fill: "#E3E9FD"
         style.stroke: "#0d47a1"
         style.font-color: "#0A0F25"

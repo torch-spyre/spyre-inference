@@ -117,7 +117,8 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     SDPA -> patch merger -> projector norm -> decoder) runs and decodes text.
 
     Both modes: `CompileOutermost` samples the mode at construction, so under
-    `enforce_eager` every `compile_when_outermost` kernel falls through to eager and the
+    `enforce_eager` the `maybe_compile` kernels fall through to eager — except the
+    norms, which pass `force=True` and compile in either mode — and the
     compiled path — the repo default — goes uncovered.
     """
     # Not `spyre_available()`: it allocates on the card, opening /dev/vfio here, and
@@ -132,6 +133,25 @@ def test_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     (text,) = _generate([_conversation(uri)], enforce_eager=enforce_eager)
 
     assert text.strip(), "empty generation from the multimodal path"
+
+
+@pytest.mark.multimodal
+@pytest.mark.uses_subprocess
+def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch):
+    """Serve with ``SPYRE_COMPILE_GUARD=error`` so a late embedding compile is fatal.
+
+    A text-only request on a multimodal model still reaches ``embed_input_ids`` while
+    avoiding unrelated first-use compiles in the vision tower.
+    """
+    if spyre_device_count() == 0:
+        pytest.skip("Spyre device not available")
+
+    monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+
+    (text,) = _generate([_conversation()], enforce_eager=False)
+
+    assert text.strip(), "empty text-only generation from the multimodal model"
 
 
 @pytest.mark.multimodal

@@ -53,9 +53,9 @@ class CompileGuardLevel(enum.Enum):
     """How to react to a compile of a watched callable while armed."""
 
     OFF = "off"
-    """Do not install the callback at all. Default."""
+    """Do not install the callback at all."""
     WARN = "warn"
-    """Log each distinct violation."""
+    """Log each distinct violation. Default."""
     ERROR = "error"
     """Raise ``UnexpectedCompileError``."""
 

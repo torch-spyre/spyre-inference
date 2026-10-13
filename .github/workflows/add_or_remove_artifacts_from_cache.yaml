@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         default: '.github/cache_config/hf_models_and_datasets.yaml'
+      include_datasets:
+        description: 'Also fetch artifactory_datasets (needs the ARTIFACTORY_* secrets)?'
+        required: true
+        type: boolean
+        default: true
       force_download:
         description: 'Force re-download even if files exist?'
         # set required to true for the JSON payload to never be null
@@ -44,6 +49,7 @@ jobs:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       STORAGE_1_DIR: /storage-1/spyre-inference
       HF_HOME: /storage-1/spyre-inference/.cache/huggingface
+      SPYRE_BENCH_DATA_DIR: /storage-1/spyre-inference/.cache/artifacts
 
     steps:
       - name: Checkout Code
@@ -58,3 +64,19 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           uv run .github/cache_config/manage_cache.py
+
+      # Separate step so a missing ARTIFACTORY_* secret cannot mask a model
+      # caching failure, and so the model cache still updates without it.
+      # !cancelled(): one failing gated model must not block the dataset cache,
+      # since a re-dispatch would hit the same model failure and never reach here.
+      - name: Cache Artifactory datasets
+        if: ${{ !cancelled() && inputs.include_datasets }}
+        working-directory: 'spyre-inference-repo'
+        env:
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          ARTIFACTORY_DATA_PATH: ${{ secrets.ARTIFACTORY_DATA_PATH }}
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          uv run .github/cache_config/manage_cache.py --datasets

@@ -31,9 +31,11 @@ whose embeddings differ only in position handling.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost
 
 if TYPE_CHECKING:
     from torch import nn
@@ -80,14 +82,18 @@ class SpyreTokenTypeEmbedding:
             n = token_type_ids.shape[0]
             buffer[:n].copy_(token_type_ids[:n])
 
-    def spyre_token_type_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def spyre_token_type_ids_for(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Segment ids matching ``input_ids``, or zeros for a single-segment model.
+
+        The embedding forward calls this and passes the tensor into the compiled gather.
+        """
         token_type_ids = self.spyre_token_type_ids
         if token_type_ids is None or token_type_ids.shape != input_ids.shape:
             # No buffer: single-segment model, every token is segment 0. A
             # mismatched one is unreachable via set_spyre_token_type_ids, and
             # all-zeros beats failing to lower the add.
-            token_type_ids = torch.zeros_like(input_ids)
-        return self.token_type_embeddings(token_type_ids)
+            return torch.zeros_like(input_ids)
+        return token_type_ids
 
 
 class SpyreTokenTypeModel:
@@ -95,8 +101,8 @@ class SpyreTokenTypeModel:
 
     The wrapper classes (``*ForSequenceClassification`` and friends) hardcode
     ``embedding_class``, so the already-built embedding is retyped to its Spyre
-    subclass: same ``__init__``, same parameters, same module tree — only
-    ``forward`` differs. ``super().forward`` is then called with no
+    subclass: same ``__init__``, parameters and module tree, but a Spyre
+    ``forward`` and armed compile state. ``super().forward`` is then called with no
     ``token_type_ids`` so upstream skips the bit-pack.
     """
 
@@ -114,6 +120,8 @@ class SpyreTokenTypeModel:
                 "needs updating for this vLLM version."
             )
         embeddings.__class__ = self.spyre_embedding_class
+        # The swap does not rerun ``__init__``. This is that constructor hook.
+        CompileOutermost.arm_outer_compile(cast(CompileOutermost, embeddings))
 
     def spyre_embeddings(self) -> SpyreTokenTypeEmbedding:
         return getattr(self, self.spyre_encoder_attr).embeddings

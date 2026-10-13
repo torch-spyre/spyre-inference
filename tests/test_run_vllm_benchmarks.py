@@ -295,12 +295,22 @@ def test_serve_tests_yaml_derives_consistently():
         assert env["SPYRE_DEVICES"].split(",") == [str(i) for i in range(tp)]
         # The bench client must target the server's model, not a stale copy.
         assert config["parameters"]["model"] == config["server_parameters"]["model"]
-        # The name's suffix has to say which trace the entry replays, and each
-        # trace needs a max-model-len that fits its requests: longer ones are
-        # rejected.
-        trace = config["test_name"].rsplit("_", 1)[1]
-        assert trace in DATASET_CONTEXT_LEN, config["test_name"]
-        # _select_configs expands the env var, so at load time it is still the
-        # literal the entry names.
-        assert config["parameters"]["dataset-path"] == DATASET_PATH_VARS[trace]
-        assert config["server_parameters"]["max-model-len"] == DATASET_CONTEXT_LEN[trace]
+
+        parameters = config["parameters"]
+        if not parameters["dataset-name"].startswith("random"):
+            # The name's suffix has to say which trace the entry replays, and
+            # each trace needs a max-model-len that fits its requests: longer
+            # ones are rejected.
+            trace = config["test_name"].rsplit("_", 1)[1]
+            assert trace in DATASET_CONTEXT_LEN, config["test_name"]
+            # _select_configs expands the env var, so at load time it is still
+            # the literal the entry names.
+            assert parameters["dataset-path"] == DATASET_PATH_VARS[trace]
+            assert config["server_parameters"]["max-model-len"] == DATASET_CONTEXT_LEN[trace]
+        else:
+            # Generated prompts need no staged file, and a request over the
+            # server's context is rejected.
+            assert "dataset-path" not in parameters, config["test_name"]
+            assert parameters["random-input-len"] <= config["server_parameters"]["max-model-len"], (
+                config["test_name"]
+            )

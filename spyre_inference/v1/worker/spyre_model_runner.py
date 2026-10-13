@@ -461,7 +461,7 @@ class _SpyreModelWrapper:
                     "rows cannot be recovered here."
                 )
             return self._d2h_sampled_rows(result, sample_rows)
-        return convert_tensor_tree(result, device="cpu")
+        return tree_map(self._to_cpu, result)
 
     def _padded_row_width(self, num_rows: int) -> int:
         """Smallest warmed row bucket >= ``num_rows`` (``num_rows`` if none fits)."""
@@ -1058,6 +1058,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs()
 
+    @torch.inference_mode()
     def _warmup_output_row_gather(
         self,
         bucket_sizes: list[int],

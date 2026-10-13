@@ -1139,6 +1139,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """
 
     supports_fp8_kv_cache: ClassVar[bool] = False
+    # False for layers that keep no KV cache (encoder self-attention).
+    keeps_kv_cache: ClassVar[bool] = True
 
     def __init__(
         self,
@@ -1178,11 +1180,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
-        self.kv_cache_fp8 = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        fp8_requested = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        self.kv_cache_fp8 = fp8_requested and self.keeps_kv_cache
         if self.kv_cache_fp8:
             if not self.supports_fp8_kv_cache:
                 raise ValueError(
-                    f"kv_cache_dtype={kv_cache_dtype} needs the head-major KV layout "
+                    f"kv_cache_dtype={kv_cache_dtype} is not supported by "
+                    f"{type(self).__name__}; it needs the head-major KV layout "
                     "(unset SPYRE_ATTN_KV_LAYOUT)."
                 )
             # A float8 stick holds 128 elements.
@@ -1191,8 +1195,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     f"kv_cache_dtype={kv_cache_dtype} needs head_size % 128 == 0, got {head_size}."
                 )
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
-        # the two 2-byte dtypes are not interchangeable per-cache.
-        elif kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+        # the two 2-byte dtypes are not interchangeable per-cache. A layer without a cache
+        # has nothing to apply an fp8 dtype to; upstream passes the engine-wide one.
+        elif not fp8_requested and kv_cache_dtype not in (
+            "auto",
+            str(self.model_dtype).removeprefix("torch."),
+        ):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."

@@ -179,6 +179,11 @@ dequantized on read with the checkpoint's per-layer KV scales, or 1.0 when it ha
 The speedup grows with the number of cached tokens each decode step reads, so it is small
 at short contexts; check accuracy against an fp16 cache before relying on it.
 
+The scales are compiled into the graphs as constants. A checkpoint whose layers carry
+different KV scales therefore compiles the transformer block and each recorded attention
+kernel once per distinct pair of scales, which lengthens warmup; one without scales
+compiles them once, as an fp16 cache does.
+
 ## pyproject.toml Reference
 
 The `pyproject.toml` includes several key build configurations:

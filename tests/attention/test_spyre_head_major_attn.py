@@ -384,6 +384,25 @@ def test_fp8_kv_cache_is_head_major_only(default_vllm_config):
         )
 
 
+def test_encoder_layers_ignore_an_fp8_cache_dtype(default_vllm_config):
+    """Upstream hands encoder layers the engine's cache dtype, but they keep no cache."""
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        SpyreEncoderAttentionImpl,
+    )
+
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=8,
+        head_size=64,
+        scale=1.0,
+        num_kv_heads=2,
+        kv_cache_dtype="fp8",
+        attn_type=AttentionType.ENCODER_ONLY,
+    )
+    assert not impl.kv_cache_fp8
+
+
 def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
     impl = SpyreHeadMajorAttentionImpl(
         num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
@@ -420,6 +439,79 @@ def _fp8_pages(num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale)
     )
 
 
+def _runner_with_fp8_layer(monkeypatch):
+    """A runner whose model is one fp8-cache attention layer at scales (0.25, 0.5)."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    layer = Mock(spec=Attention)
+    layer.impl, layer._k_scale_float, layer._v_scale_float = impl, 0.25, 0.5
+    runner = object.__new__(TorchSpyreModelRunner)
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=[layer])))
+    return runner, layer, impl
+
+
+def test_fp8_kv_scales_follow_a_weight_reload(default_vllm_config, monkeypatch):
+    """The runner reads the scales before any trace, and again when a reload changes them."""
+    runner, layer, impl = _runner_with_fp8_layer(monkeypatch)
+
+    assert not runner._resolve_kv_scales()
+    assert impl._kernel_kv_scales() == (0.25, 0.5)
+    assert not runner._resolve_kv_scales(), "unchanged scales must not report a change"
+    layer._k_scale_float = 0.125
+    assert runner._resolve_kv_scales()
+    assert impl._kernel_kv_scales() == (0.125, 0.5)
+
+
+def test_distinct_kv_scales_warn_about_warmup(default_vllm_config, monkeypatch):
+    """Each distinct (k_scale, v_scale) pair is its own compile, so startup says so."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    from spyre_inference.v1.worker import spyre_model_runner
+
+    runner, layer, _ = _runner_with_fp8_layer(monkeypatch)
+    other = Mock(spec=Attention)
+    other.impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    other._k_scale_float, other._v_scale_float = 0.25, 0.5
+    layers = [layer, other]
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=layers)))
+    warnings = []
+    monkeypatch.setattr(
+        spyre_model_runner.logger, "warning_once", lambda msg, *args: warnings.append(args)
+    )
+
+    runner._resolve_kv_scales()
+    assert warnings == [], "one shared pair compiles once"
+    other._k_scale_float = 0.125
+    runner._resolve_kv_scales()
+    assert warnings == [(2,)]
+
+
+def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch):
+    """The override passes its arguments through, then picks up the reprocessed scales."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    runner, layer, impl = _runner_with_fp8_layer(monkeypatch)
+    runner._resolve_kv_scales()
+    calls = []
+
+    def reprocess(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        layer._k_scale_float = 0.125
+
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", reprocess)
+    runner.reload_weights(weights_path="/ckpt", is_checkpoint_format=False)
+
+    assert calls == [((), {"weights_path": "/ckpt", "is_checkpoint_format": False})]
+    assert impl._kernel_kv_scales() == (0.125, 0.5)
+
+
 def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     """A float8 cache read through the scales equals the model-dtype read of its values."""
     from spyre_inference.v1.attention.ops import tile_loop
@@ -437,7 +529,7 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     index_table[:, 0] = torch.tensor([4, 1, 3])
     mask = torch.zeros(num_blocks, padded_q, block_size, dtype=DTYPE)
     mask[-1, :, 40:] = float("-inf")
-    args = (num_blocks, padded_q, num_heads, num_kv_heads, head_size, block_size)
+    args = (num_blocks, padded_q, num_heads, num_kv_heads, head_size)
     scale = head_size**-0.5
 
     got = page_attn_head_major_prefill_kernel(

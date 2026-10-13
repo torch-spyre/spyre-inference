@@ -752,6 +752,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
+        # Before any trace: resolved lazily inside the block graph, the scales become a
+        # guard on their unset value and the first real prefill recompiles the block.
+        self._resolve_kv_scales()
+
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
         for module in self.model.modules():
@@ -824,6 +828,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if _is_fp8_kernel(getattr(module, "scheme", None)):
                 return True
         return False
+
+    def _resolve_kv_scales(self) -> bool:
+        """Read each float8-cache layer's KV scales into its impl; True when any changed."""
+        changed = False
+        pairs = set()
+        for module in self.get_model().modules():
+            impl = getattr(module, "impl", None)
+            if not (isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl)):
+                continue
+            if not impl.kv_cache_fp8:
+                continue
+            old = impl._kv_scales
+            impl._kv_scales = None
+            impl.prepare_kv_scales(module)
+            changed |= old is not None and impl._kv_scales != old
+            pairs.add(impl._kv_scales)
+        if len(pairs) > 1:
+            # The scales are graph constants, so each distinct pair is its own compile.
+            logger.warning_once(
+                "The fp8 KV cache has %d distinct per-layer (k_scale, v_scale) pairs; the "
+                "transformer block and every recorded attention kernel compile once per "
+                "pair, which lengthens warmup.",
+                len(pairs),
+            )
+        return changed
+
+    def reload_weights(self, *args, **kwargs) -> None:
+        super().reload_weights(*args, **kwargs)
+        # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
+        # The graphs that read them guard on their values, so only those retrace.
+        if self._resolve_kv_scales():
+            logger.warning(
+                "KV cache scales changed on weight reload; the graphs that depend on them "
+                "recompile on first use."
+            )
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.

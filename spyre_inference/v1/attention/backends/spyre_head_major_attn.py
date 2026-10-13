@@ -199,7 +199,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """Trailing (k_scale, v_scale) store arguments; none for a model-dtype cache."""
         if not self.kv_cache_fp8:
             return ()
-        assert self._kv_scales is not None, "prepare_kv_scales must run before the kernels"
+        assert self._kv_scales is not None, (
+            "KV scales unresolved: the runner reads them at load (_resolve_kv_scales)"
+        )
         return self._kv_scales
 
     def _read_scales(self) -> tuple[float, tuple[float, ...]]:
@@ -208,16 +210,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             return self.scale, ()
         k_scale, v_scale = self._kernel_kv_scales()
         return self.scale * k_scale, (v_scale,)
-
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs):
-        self.prepare_kv_scales(layer)
-        return super().forward(
-            layer, query, key, value, kv_cache, attn_metadata, output, *args, **kwargs
-        )
-
-    def record_graphs(self, layer, kv_cache, builder) -> int:
-        self.prepare_kv_scales(layer)
-        return super().record_graphs(layer, kv_cache, builder)
 
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device
@@ -428,7 +420,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
         k_rows, v_rows = self.kv_slot_views(kv_cache)
-        self.prepare_kv_scales(layer)
         self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, *self._kernel_kv_scales())
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.

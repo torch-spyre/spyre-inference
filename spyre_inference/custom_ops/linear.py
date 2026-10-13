@@ -94,6 +94,24 @@ class SpyreTransposedWeightMethod:
     def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
         """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
         a tied lm-head builds from a host copy, after the device move."""
+        # Fast path: weight already on Spyre, no row-alignment padding required.
+        #
+        # _dma_to_spyre_dim_order_swapped (called by safe_open(device="spyre")) already
+        # stickified the weight along out_features via dim_order=[1,0] — the matmul-
+        # optimal layout for `x @ Wᵀ`.  A CPU round-trip (.t().contiguous()) would
+        # undo that layout and trigger an unnecessary device-side restickify.
+        #
+        # ROW_ALIGN layers (e.g. SpyreUnquantizedLMHeadMethod) are excluded: their
+        # weights are host-loaded (VocabParallelEmbedding / ParallelLMHead are in
+        # _get_host_loaded_param_names), so they arrive here on CPU, not Spyre.
+        # Guarding on ROW_ALIGN is None is an extra safety net for future subclasses.
+        if w.device.type == "spyre" and self.ROW_ALIGN is None:
+            layer.spyre_row_padding = 0
+            # .t() flips the logical shape (out, in) → (in, out) as spyre_linear_t
+            # expects, without calling .contiguous() so the dim_order layout is kept.
+            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t(), requires_grad=False))
+            return
+
         padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
         layer.spyre_row_padding = padding
         if padding:

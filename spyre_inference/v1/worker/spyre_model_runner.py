@@ -39,6 +39,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 from __future__ import annotations
 
 import bisect
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, cast
@@ -662,8 +663,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
-        # Move layer weights to Spyre device.
+        # Move layer weights to Spyre device. Parameters SpyreModelLoader already
+        # streamed to the device are no-ops here; this still places what stayed on
+        # CPU (vocab tables via their _apply, RoPE caches) after the fix_padded_* passes.
         self.model.to(device=self._spyre_device)
+
+        # Debug hook for scripts/diff_loaded_weights.py: when set, save every
+        # state_dict entry and buffer (on CPU) so two load formats can be diffed.
+        dump_dir = os.environ.get("SPYRE_DUMP_WEIGHTS_DIR")
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+            tensors = dict(self.model.state_dict())
+            tensors.update(self.model.named_buffers())
+            torch.save(
+                {k: v.detach().to("cpu").contiguous() for k, v in tensors.items()},
+                os.path.join(dump_dir, "weights.pt"),
+            )
+            logger.info("Dumped %d tensors to %s", len(tensors), dump_dir)
+
         for module in self.model.modules():
             if isinstance(module, SpyreConv2d):
                 module.process_weights_after_loading()

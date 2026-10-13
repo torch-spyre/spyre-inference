@@ -110,6 +110,33 @@ def _raise_dynamo_recompile_limits() -> None:
 _raise_dynamo_recompile_limits()
 
 
+def _hf_config_has_moe(hf_config) -> bool:
+    """Return True when the HF config describes a MoE model.
+
+    Checks the standard attributes used across HF model families
+    (Mixtral, Qwen MoE, Gemma 4, DeepSeek, etc.) to detect a non-trivial
+    number of routed experts.  A missing attribute or a value of 0 / 1 is
+    treated as a dense model.
+    """
+    if hf_config is None:
+        return False
+    moe_attrs = (
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+        "num_experts_per_tok",  # some configs store total, not per-layer
+    )
+    for attr in moe_attrs:
+        val = getattr(hf_config, attr, None)
+        # Also check nested text_config (multimodal models)
+        if val is None:
+            text_cfg = getattr(hf_config, "text_config", None)
+            val = getattr(text_cfg, attr, None) if text_cfg is not None else None
+        if val is not None and int(val) > 1:
+            return True
+    return False
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -341,6 +368,18 @@ class TorchSpyrePlatform(CpuPlatform):
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
+
+        # Use SpyreModelLoader by default for direct-to-device streaming on
+        # dense models.  MoE models require CPU-side layout transforms for
+        # expert weights (dma_moe_expert_weight_to_spyre) that make per-tensor
+        # DMA streaming far slower than the bulk model.to(spyre) path; keep
+        # them on the stock safetensors loader until Option 1 (teach
+        # _SpyreSafeOpen the [E,C,F//eps,eps] MoE layout) lands in torch-spyre.
+        if getattr(vllm_config, "load_config", None) is not None:
+            if vllm_config.load_config.load_format == "auto":
+                hf_config = getattr(vllm_config.model_config, "hf_config", None)
+                if not _hf_config_has_moe(hf_config):
+                    vllm_config.load_config.load_format = "spyre"
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:

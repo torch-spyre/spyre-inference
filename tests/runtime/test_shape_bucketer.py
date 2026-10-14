@@ -255,8 +255,12 @@ class TestEncoderRectangles:
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,
         )
-        budget = encoder_shape_tables(cfg).budget
-        assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
+        tables = encoder_shape_tables(cfg)
+        # Each rectangle reinterprets one body via ``view``, so its area is that body.
+        # A long context has several bodies; a short one still has exactly one.
+        areas = {length * batch for length, batch in encoder_rectangles(cfg)}
+        assert areas == set(tables.budgets)
+        assert tables.budget == tables.budgets[-1]
 
     @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024])
     def test_ladder_declares_every_extent_a_request_can_take(self, max_model_len):
@@ -280,6 +284,58 @@ class TestEncoderRectangles:
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
         assert encoder_width_for(64, cfg) == 4  # 2048 // 64 = 32, capped
         assert encoder_width_for(512, cfg) == 4
+
+
+class TestLongContextBodyTiers:
+    """bge-reranker-v2-m3 is an 8K model. The fast rectangle stays at 2048 rows;
+    longer documents step up one tier instead of dragging every request to 8K."""
+
+    def _tables(self):
+        return encoder_shape_tables(
+            _pooling_vllm_config(max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192)
+        )
+
+    def _rects(self, rows: int) -> list[tuple[int, int]]:
+        return [
+            (length, batch) for length, batch in self._tables().rectangles if length * batch == rows
+        ]
+
+    def test_bodies_step_from_the_fast_budget_up_to_max_model_len(self):
+        assert self._tables().budgets == (2048, 4096, 8192)
+
+    def test_capping_batched_tokens_at_2k_does_not_change_the_8k_tables(self):
+        """The platform caps ``max_num_batched_tokens`` at 2048, then writes the
+        largest body back. Both reads have to describe the same rectangles."""
+        capped = encoder_shape_tables(
+            _pooling_vllm_config(max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=2048)
+        )
+        assert capped.budgets == self._tables().budgets
+        assert capped.rectangles == self._tables().rectangles
+
+    def test_a_short_request_stays_on_the_fast_rectangle(self):
+        assert encoder_rectangle_for_batch(1, 100, self._rects(2048)) == (128, 16)
+
+    def test_one_document_past_2k_uses_a_4k_rectangle(self):
+        """(4096, 1), not an 8192-row body with a padded twin sequence."""
+        assert encoder_rectangle_for_batch(1, 3000, self._rects(4096)) == (4096, 1)
+
+    def test_one_8k_document_and_two_4k_documents_stay_rectangular(self):
+        long = self._rects(8192)
+        assert encoder_rectangle_for_batch(1, 5000, long) == (8192, 1)
+        assert encoder_rectangle_for_batch(2, 3000, long) == (4096, 2)
+
+    def test_width_for_uses_the_largest_body(self):
+        """A short length can be packed up to the scheduler cap, not just the 2048 body."""
+        cfg = _pooling_vllm_config(
+            max_model_len=8192, max_num_seqs=128, max_num_batched_tokens=8192
+        )
+        assert encoder_width_for(100, cfg) == 8192 // 100
+        assert encoder_width_for(100, cfg) != 2048 // 100
+
+    def test_three_long_documents_still_miss_the_rectangle(self):
+        """B(4096) on the 8192 body is 2. A wider batch stays ragged; a 16K body
+        is the regression the 2048 cap exists to avoid."""
+        assert encoder_rectangle_for_batch(3, 3000, self._rects(8192)) is None
 
 
 class TestEncoderGroupShapes:

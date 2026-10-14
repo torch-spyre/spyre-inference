@@ -304,3 +304,11 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         )
         assert [p.group for p in plan] == [16, 1]
         assert set(encoder_group_shapes(config)) >= {(16, 64), (1, 64)}
+
+
+def test_fallback_width_caps_follow_the_query_body():
+    """A buffer's group cap is that body's, not the largest body's."""
+    impl = _make_impl(_config(8192, 128, 8192))
+    assert impl._width_caps_by_rows[2048][64] == 32
+    assert impl._width_caps_by_rows[8192][64] == 128
+    assert impl._width_caps == impl._width_caps_by_rows[8192]

@@ -80,6 +80,7 @@ def _runner(
     runner._spyre_device = torch.device("cpu")
     runner._encoder_budget = 8
     runner._encoder_rectangles = []
+    runner._encoder_groups_by_rows = {}
     runner._spyre_kv_caches = []
     # load_model sets this. The fake runner skips load_model, and the compiled
     # pooling path reads it before deciding whether to warm the embed gather.
@@ -116,11 +117,7 @@ def test_eager_pooling_does_not_run_the_vision_tower():
     assert runner.spyre_shape_bucketer.warmed_up
 
 
-def test_pooling_warmup_runs_every_image_batch_width(monkeypatch):
-    monkeypatch.setattr(
-        "spyre_inference.v1.worker.spyre_model_runner.encoder_group_shapes",
-        lambda config: [],
-    )
+def test_pooling_warmup_runs_every_image_batch_width():
     runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
 
     runner.warming_up_model()

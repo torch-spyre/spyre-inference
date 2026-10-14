@@ -4,8 +4,11 @@ defaults:
   server_parameters:
     load-format: auto
     max-num-seqs: 4
-    max-num-batched-tokens: 512
     enable-prefix-caching: false
+    tensor-parallel-size: 1
+    runner: pooling
+    model: dslim/bert-base-NER
+    max-model-len: 512
   parameters:
     dataset-name: random
     num-prompts: 10000
@@ -15,40 +18,23 @@ defaults:
     request-rate: inf
     percentile-metrics: e2el
     metric-percentiles: 99,100
+    model: dslim/bert-base-NER
+    backend: vllm-pooling
+    endpoint: /pooling
+    extra-body: '{"task":"token_classify"}'
+  container_parameters:
+    container_shm_size: 1G
+    container_memory: 16g
 
 tests:
   - test_name: serve_bert-base-NER_mc16
-    server_parameters:
-      model: dslim/bert-base-NER
-      tensor-parallel-size: 1
-      runner: pooling
-      max-model-len: 512
     parameters:
-      model: dslim/bert-base-NER
-      backend: openai-embeddings
-      endpoint: /v1/embeddings
       max-concurrency: 16
 
   - test_name: serve_bert-base-NER_mc32
-    server_parameters:
-      model: dslim/bert-base-NER
-      tensor-parallel-size: 1
-      runner: pooling
-      max-model-len: 512
     parameters:
-      model: dslim/bert-base-NER
-      backend: openai-embeddings
-      endpoint: /v1/embeddings
       max-concurrency: 32
 
   - test_name: serve_bert-base-NER_mc64
-    server_parameters:
-      model: dslim/bert-base-NER
-      tensor-parallel-size: 1
-      runner: pooling
-      max-model-len: 512
     parameters:
-      model: dslim/bert-base-NER
-      backend: openai-embeddings
-      endpoint: /v1/embeddings
       max-concurrency: 64

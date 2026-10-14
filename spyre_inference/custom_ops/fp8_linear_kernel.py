@@ -340,7 +340,9 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
             m_parts = _m_tiles(orig_m, k, n)
             x2d = _pad_m(x2d, sum(m_parts))
         else:
-            # 128-wide: pad M to a torch-spyre-tested size (1–4 or 128).
+            # Narrow path (N < _WIDE, single tile): M must be in _SMALL_M={1–4}
+            # or a multiple of _M_ALIGN=128.  Other sizes are not tested on Spyre;
+            # round up to the next 128 boundary so every call lands on a safe size.
             if orig_m not in _SMALL_M and orig_m % _M_ALIGN:
                 x2d = _pad_m(x2d, ((orig_m + _M_ALIGN - 1) // _M_ALIGN) * _M_ALIGN)
             m_parts = [x2d.shape[0]]

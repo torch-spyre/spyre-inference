@@ -78,6 +78,9 @@ def test_fp8_kv_cache_tracks_the_fp16_cache(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
     ref = _greedy("auto")
     fp8 = _greedy("fp8")
+    # e4m3 rounds every stored K and V, so bit-identical logprobs mean the fp8 cache
+    # never reached the attention impl and the checks below would pass vacuously.
+    assert fp8 != ref, "fp8 run matches the fp16 cache exactly; was the fp8 cache used?"
 
     for prompt, ref_steps, fp8_steps in zip(_PROMPTS, ref, fp8):
         ref_first = max(ref_steps[0], key=ref_steps[0].get)

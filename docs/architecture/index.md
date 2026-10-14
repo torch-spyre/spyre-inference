@@ -474,9 +474,10 @@ while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `Q
 dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
 impl passes them. The attention math itself stays fp16.
 
-The scales are per-tensor and per-layer, read once from the layer's `_k_scale_float` /
-`_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) and passed to the
-kernels as Python floats, skipped entirely at 1.0. A `[1]` scale tensor would let layers
+The scales are per-tensor and per-layer, read from the layer's `_k_scale_float` /
+`_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) at model load and
+again after `reload_weights`, which re-warms when they change, and passed to the kernels
+as Python floats, skipped entirely at 1.0. A KV-sharing layer takes its target's scales. A `[1]` scale tensor would let layers
 with different scales share one compiled block, but its broadcast fails torch-spyre's
 pointwise layout pass. Baking them in costs one attention variant set per distinct scale
 pair at warmup, and one block compile per distinct pair in the model graph: free for a

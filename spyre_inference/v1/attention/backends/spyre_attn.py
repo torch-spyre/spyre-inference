@@ -1647,9 +1647,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return self._kv_slots
 
     def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
-        """Read the layer's float8 KV scales once, as floats (a [1] tensor fails
-        torch-spyre's pointwise layout pass)."""
-        if not self.kv_cache_fp8 or self._kv_scales is not None:
+        """Read the layer's float8 KV scales as floats (a [1] tensor fails torch-spyre's
+        pointwise layout pass). The runner calls it at load and after a reload."""
+        if not self.kv_cache_fp8:
             return
         # Set by upstream after weight loading.
         self._kv_scales = (

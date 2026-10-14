@@ -833,17 +833,45 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Read each float8-cache layer's KV scales into its impl; True when any changed."""
         changed = False
         pairs = set()
+        shared = []
         for module in self.get_model().modules():
             impl = getattr(module, "impl", None)
             if not (isinstance(module, Attention) and isinstance(impl, SpyreAttentionImpl)):
                 continue
+            if getattr(module, "kv_sharing_target_layer_name", None) is not None:
+                shared.append(module)
+                continue
             if not impl.kv_cache_fp8:
                 continue
+            k_scale = getattr(module, "_k_scale", None)
+            if isinstance(k_scale, torch.Tensor) and k_scale.numel() > 1:
+                # Upstream's per-head scheme reduces the heads to their max scale, so a head
+                # with a much smaller one keeps only a few e4m3 steps of its range.
+                logger.warning_once(
+                    "The checkpoint carries per-head KV cache scales; the fp8 KV cache uses "
+                    "one scale per layer, the largest head's, which coarsens the others."
+                )
             old = impl._kv_scales
-            impl._kv_scales = None
             impl.prepare_kv_scales(module)
             changed |= old is not None and impl._kv_scales != old
             pairs.add(impl._kv_scales)
+        # A sharing layer reads the cache its target wrote, so it dequantizes with the
+        # target's scales; its own usually default to 1.0, as it stores nothing.
+        static_ctx = self.compilation_config.static_forward_context if shared else {}
+        for module in shared:
+            target = static_ctx[module.kv_sharing_target_layer_name]
+            if module.impl.kv_cache_fp8 != target.impl.kv_cache_fp8:
+                # It reads the target's pages, so it must decode them in the dtype they hold.
+                raise ValueError(
+                    f"KV-sharing layer {module.layer_name} and its target "
+                    f"{module.kv_sharing_target_layer_name} disagree on the fp8 KV cache; "
+                    "list both or neither in kv_cache_dtype_skip_layers."
+                )
+            if not module.impl.kv_cache_fp8:
+                continue
+            old = module.impl._kv_scales
+            module.impl._kv_scales = target.impl._kv_scales
+            changed |= old is not None and module.impl._kv_scales != old
         if len(pairs) > 1:
             # The scales are graph constants, so each distinct pair is its own compile.
             logger.warning_once(
@@ -857,12 +885,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
         # Upstream's reload reprocesses the weights, which rewrites the layers' KV scales.
-        # The graphs that read them guard on their values, so only those retrace.
+        # The graphs that read them guard on their values, so only those retrace; warming
+        # here does that before the next request, which an armed compile guard would fail.
         if self._resolve_kv_scales():
             logger.warning(
-                "KV cache scales changed on weight reload; the graphs that depend on them "
-                "recompile on first use."
+                "KV cache scales changed on weight reload; re-warming the graphs that "
+                "depend on them."
             )
+            with compile_guard.allow_compile("KV cache scales changed on weight reload"):
+                self.warming_up_model()
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.

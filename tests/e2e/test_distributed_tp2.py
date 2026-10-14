@@ -85,6 +85,43 @@ def _generate(
     return result
 
 
+def _generate_image_prompt(tp: int) -> list[list[int]]:
+    """Greedy token ids for one Pixtral image prompt, compiled, at `tp` cards."""
+    from vllm import LLM, SamplingParams
+
+    from tests.e2e.test_multimodal import (
+        MAX_MODEL_LEN,
+        MODEL,
+        _conversation,
+        _synthetic_image_data_uri,
+    )
+
+    llm = LLM(
+        model=MODEL,
+        tokenizer=MODEL,
+        config_format="mistral",
+        tensor_parallel_size=tp,
+        dtype="float16",
+        enforce_eager=False,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=1,
+        limit_mm_per_prompt={"image": 1},
+    )
+    try:
+        outs = llm.chat(
+            [_conversation(_synthetic_image_data_uri())],
+            SamplingParams(max_tokens=8, temperature=0.0),
+        )
+        result = [list(o.outputs[0].token_ids) for o in outs]
+    finally:
+        llm.llm_engine.engine_core.shutdown(timeout=60)
+        del llm
+        gc.collect()
+        freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
+    assert freed, "Spyre devices were not released after LLM shutdown"
+    return result
+
+
 def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:
     """Each TP=2 sequence must share a >=2-token prefix with its TP=1 twin.
 
@@ -152,3 +189,21 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides) -> None
             model, tp=2, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
         ),
     )
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.multimodal
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+def test_tp2_compiled_pixtral_image_prompt_matches_tp1(monkeypatch) -> None:
+    """TP=1 vs TP=2 greedy-decode prefix match on an image prompt, compiled.
+
+    At TP=2 the compiled Pixtral blocks carry their `RowParallelLinear` all_reduces
+    in-graph. The 176px image is 121 patches, so `padded_sdpa` pads inside the graph.
+    """
+    # Building the graphs for a 14B two-tower model outruns the default timeout.
+    monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    _assert_matches_tp1(_generate_image_prompt(tp=1), _generate_image_prompt(tp=2))

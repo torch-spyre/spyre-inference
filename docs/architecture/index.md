@@ -223,7 +223,8 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 (`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
-(`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager. Models whose
+(`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager, except a
+list of Pixtral `TransformerBlock`s (see below). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
@@ -251,6 +252,15 @@ covers them. Both stay eager when compilation is off, except a Gemma final norm:
 in every mode, including `enforce_eager`, because its fp32 weight multiply has no working
 eager form. `lm_head` is never in a block graph either — `compute_logits` is a separate call
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)).
+
+Vision towers stay eager, except block classes in `_compilable_vision_block_classes`
+(Pixtral's `TransformerBlock`). At TP>1 their all_reduces then build the comms plan once
+instead of on every eager call. The compile key is the encoder batch's total patch count:
+`VisionTransformer.forward` concatenates every image in one `embed_multimodal` call into a
+single sequence, and blocks compile with `dynamic=False`. Each new total compiles on the
+first request that brings it, after the compile guard has armed, since warmup runs no image.
+The recompile limits are raised for torch-spyre's per-op compiles, so the number of keys is
+unbounded until image lengths are padded onto a fixed set and warmed.
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.

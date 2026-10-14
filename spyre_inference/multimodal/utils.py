@@ -117,6 +117,9 @@ def padded_sdpa(
 
     `mask=None` attends everywhere: only the padded keys are masked, and that path
     is safe inside a compiled block.
+
+    A `mask` already in `_padded_attn_mask`'s form is used as is, so a caller can pad it
+    outside a compiled block, where that function's cache cannot live.
     """
     b, _, seq, d = q.shape
     if scale is None:
@@ -146,6 +149,8 @@ def padded_sdpa(
             if seq == seq_pad
             else _KEY_PAD_MASKS[_key_pad_mask_key(seq, seq_pad, q.dtype, device)]
         )
+    elif mask.shape == (b, 1, seq_pad, seq_pad) and mask.dtype == q.dtype and mask.device == device:
+        attn_mask = mask
     else:
         attn_mask = _padded_attn_mask(mask, b, seq, seq_pad, q.dtype, device)
     out = F.scaled_dot_product_attention(

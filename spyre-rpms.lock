@@ -1,10 +1,9 @@
 # Pinned Spyre RPM baseline for CI. Regenerate with `upgrade-torch-spyre`.
 #
-# All packages are published in the "prod" (base) tree, except ibm-flex on
-# x86_64 and ppc64le: torch-spyre needs flex::FillAsyncParams (commit 3b15b6f or
-# later), which prod only ships on s390x so far, so those two arches take the
-# same commit from the `next` dev-preview tree. Move them back to prod once it
-# publishes 3b15b6f or later there.
+# All packages are published in the "prod" (base) tree, except ibm-flex: torch-spyre
+# needs flex::ProgramCorrection (commit 5aaf490 or later), which prod does not ship
+# on any arch yet, so all three arches take that commit from the `next` dev-preview
+# tree. Move them back to prod once it publishes 5aaf490 or later there.
 #
 # x86_64 is pinned to an exact build including the trailing `_<buildnum>`.
 # Power (ppc64le) and Z (s390x) pins should use the same commit, but are
@@ -21,8 +20,8 @@ tree = ""
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+35.534c4a0_168" }
 ibm-deeptools         = { version = "2.1.0-0.main.1+2817.246fde4_483" }
 ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2817.246fde4_483" }
-ibm-flex              = { version = "2.0.0_rc.1-0.main.79+79.3b15b6f4.844df1a78b8e.3b15b6f", tree = "next" }
-ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.79+79.3b15b6f4.844df1a78b8e.3b15b6f", tree = "next" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490", tree = "next" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490", tree = "next" }
 ibm-senlib-core       = { version = "2.0.0-0.main.1+313.6bd0fca_440" }
 ibm-senlib-dd2        = { version = "2.0.0-0.main.1+313.6bd0fca_440" }
 ibm-senlib-headers    = { version = "2.0.0-0.main.1+313.6bd0fca_440" }
@@ -35,8 +34,8 @@ ibm-libaiupti         = { version = "2.0.0-0.main.1+40.bcdd0af_85" }
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+35.534c4a0_*" }
 ibm-deeptools         = { version = "2.1.0-0.main.1+2817.246fde4_*" }
 ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2817.246fde4_*" }
-ibm-flex              = { version = "2.0.0_rc.1-0.main.79+79.3b15b6f4.*", tree = "next" }
-ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.79+79.3b15b6f4.*", tree = "next" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*", tree = "next" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*", tree = "next" }
 ibm-senlib-core       = { version = "2.0.0-0.main.1+313.6bd0fca_*" }
 ibm-senlib-dd2        = { version = "2.0.0-0.main.1+313.6bd0fca_*" }
 ibm-senlib-headers    = { version = "2.0.0-0.main.1+313.6bd0fca_*" }
@@ -49,8 +48,8 @@ ibm-libaiupti         = { version = "2.0.0-0.main.1+40.bcdd0af_*" }
 ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+35.534c4a0_*" }
 ibm-deeptools         = { version = "2.1.0-0.main.1+2817.246fde4_*" }
 ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2817.246fde4_*" }
-ibm-flex              = { version = "2.0.0-0.main.1+686.3b15b6f_*", tree = "" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+686.3b15b6f_*", tree = "" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*", tree = "next" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*", tree = "next" }
 ibm-senlib-core       = { version = "2.0.0-0.main.1+313.6bd0fca_*" }
 ibm-senlib-dd2        = { version = "2.0.0-0.main.1+313.6bd0fca_*" }
 ibm-senlib-headers    = { version = "2.0.0-0.main.1+313.6bd0fca_*" }

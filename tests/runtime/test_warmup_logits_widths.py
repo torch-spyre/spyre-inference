@@ -72,6 +72,7 @@ def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
     runner.compilation_config = compilation_config
     runner._spyre_device = torch.device("cpu")
     runner.spyre_shape_bucketer = _Bucketer(list(bucket_sizes))
+    runner._output_row_spec = None
     runner.max_num_reqs = max_num_reqs
 
     body_rows: list[int] = []
@@ -157,7 +158,7 @@ class TestOutputGatherWarmup:
         hidden = self.HIDDEN
         runner.model_config = types.SimpleNamespace(
             runner_type="generate",
-            dtype=dtype,
+            dtype=torch.float16,
             get_hidden_size=lambda: hidden,
         )
 
@@ -217,10 +218,10 @@ class TestOutputGatherWarmup:
         ("dtype", "expected"),
         [(torch.float16, {64}), (torch.float32, {32, 64})],
     )
-    def test_the_savings_filter_uses_the_model_dtype_itemsize(self, monkeypatch, dtype, expected):
+    def test_the_savings_filter_uses_the_output_dtype_itemsize(self, monkeypatch, dtype, expected):
         """The warmup filter must not be stricter than the runtime's.
 
-        ``_build_attention_metadata`` arms on ``model_config.dtype.itemsize``. A
+        ``_build_attention_metadata`` arms on the observed output dtype's itemsize. A
         warmup hardcoded to 2 bytes would skip the 32-row body at fp32 -- which the
         runtime then arms, paying the mid-request compile this warmup removes.
         Body 32 trims to 4 rows of 4096: 224 KiB at fp16 (under the floor), 448 KiB
@@ -231,7 +232,7 @@ class TestOutputGatherWarmup:
         assert {body for body, _ in gathered} == expected, gathered
 
     def test_warmed_bodies_are_body_buckets_on_the_spyre_device(self, monkeypatch):
-        """Regression: the warmup must not key off ``_dummy_run``'s second value.
+        """Regression: body row counts must not come from ``_dummy_run``'s second value.
 
         That value is ``hidden_states[logit_indices]`` -- already reduced to at most
         ``max_num_reqs`` rows and left on CPU. Deriving the warmup bodies from it
@@ -270,6 +271,51 @@ class TestOutputGatherWarmup:
         # Allocated on the runner's Spyre device, not wherever the sample tensor sat.
         assert {dev for _, dev in seen} == {runner._spyre_device.type}, seen
 
+    @pytest.mark.parametrize(
+        ("dtype", "expected_bodies"),
+        [(torch.float16, {512}), (torch.float32, {256, 512})],
+    )
+    def test_projected_output_metadata_drives_warmup_and_arming(
+        self, monkeypatch, dtype, expected_bodies
+    ):
+        runner, _, _ = _runner(bucket_sizes=[1, 2, 4, 256, 512], max_num_reqs=4)
+        # OPT-350m projects hidden_size=1024 down to word_embed_proj_dim=512.
+        runner.model_config.get_hidden_size = lambda: 1024
+        runner._dummy_run = lambda size, *a, **k: (
+            None,
+            torch.zeros(min(size, 4), 512, dtype=dtype),
+        )
+        runner._spyre_device = torch.device("meta")
+        runner.model = _SpyreModelWrapper(
+            torch.nn.Identity(),
+            runner._spyre_device,
+            logits_row_buckets=[1, 2, 4],
+            model_dtype=torch.float16,
+        )
+        runner._can_trim_output_d2h = lambda: True
+        gathered = []
+
+        def recording(wrapper, hidden_states, rows):
+            gathered.append((tuple(hidden_states.shape), hidden_states.dtype, rows.numel()))
+
+        monkeypatch.setattr(_SpyreModelWrapper, "_d2h_sampled_rows", recording)
+        runner.warming_up_model()
+
+        assert runner._output_row_spec == (512, dtype)
+        assert set(gathered) == {
+            ((body, 512), dtype, rows) for body in expected_bodies for rows in (1, 2, 4)
+        }
+        for body in (256, 512):
+            rows = torch.tensor([0, body // 2, body - 1])
+            original = rows.clone()
+            runner._arm_output_row_trim(rows, (), {"num_tokens": body})
+            if body in expected_bodies:
+                torch.testing.assert_close(runner.model._sample_rows, original)
+                assert rows.tolist() == [0, 1, 2]
+            else:
+                assert runner.model._sample_rows is None
+                torch.testing.assert_close(rows, original)
+
 
 class TestArming:
     """The ``logits_indices`` rewrite happens only when the trim is certain.
@@ -294,6 +340,7 @@ class TestArming:
         runner.model_config = types.SimpleNamespace(
             runner_type="generate", dtype=torch.float16, get_hidden_size=lambda: self.HIDDEN
         )
+        runner._output_row_spec = (self.HIDDEN, torch.float16)
         runner.num_prompt_logprobs = gates.get("num_prompt_logprobs", {})
         runner.use_aux_hidden_state_outputs = gates.get("use_aux_hidden_state_outputs", False)
         runner.speculative_config = gates.get("speculative_config")
@@ -347,15 +394,24 @@ class TestArming:
         assert stashed.tolist() == rows
         assert idx.tolist() == list(range(64))
 
-    def test_uses_the_model_dtype_itemsize_for_the_savings_guard(self):
+    def test_uses_the_output_dtype_itemsize_for_the_savings_guard(self):
         runner = self._runner_for_arming(bucket_sizes=(64, 128), max_num_reqs=64)
-        runner.model_config.dtype = torch.float32
         runner.model_config.get_hidden_size = lambda: 1024
+        runner._output_row_spec = (1024, torch.float32)
 
         idx, stashed = self._build(runner, 65, list(range(64)))
 
         assert stashed.tolist() == list(range(64))
         assert idx.tolist() == list(range(64))
+
+    def test_does_not_arm_before_output_metadata_is_known(self):
+        runner = self._runner_for_arming()
+        runner._output_row_spec = None
+
+        idx, stashed = self._build(runner, 512, [0, 255, 511])
+
+        assert stashed is None
+        assert idx.tolist() == [0, 255, 511]
 
     @pytest.mark.parametrize(
         "gate",

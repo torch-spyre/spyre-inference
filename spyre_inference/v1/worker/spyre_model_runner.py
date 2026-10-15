@@ -678,6 +678,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Shape bucketer for runtime dispatch (initialized after model load)
         self.spyre_shape_bucketer: SpyreShapeBucketer | None = None
+        self._output_row_spec: tuple[int, torch.dtype] | None = None
 
         # Per-layer paged KV caches, kept so warmup can record the attention
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
@@ -936,6 +937,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
+        self._output_row_spec = None
         # Before the first trace: see allocate_staging_buffers.
         allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
@@ -1010,6 +1012,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
             if widest_hidden_states is not None:
+                # A final projection (e.g. OPT-350m) can change the output width.
+                self._output_row_spec = (
+                    widest_hidden_states.shape[-1],
+                    widest_hidden_states.dtype,
+                )
                 for rows in sorted(row_widths, reverse=True):
                     self._dummy_sampler_run(widest_hidden_states[:rows])
                 self._warmup_output_row_gather(bucket_sizes, row_widths)
@@ -1036,10 +1043,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Spyre tensors because ``_dummy_run`` returns the sampled rows, on CPU.
         """
         wrapper = getattr(self, "model", None)
-        if not isinstance(wrapper, _SpyreModelWrapper) or not self._can_trim_output_d2h():
+        output_spec = self._output_row_spec
+        if (
+            not isinstance(wrapper, _SpyreModelWrapper)
+            or output_spec is None
+            or not self._can_trim_output_d2h()
+        ):
             return
-        hidden_size = self.model_config.get_hidden_size()
-        dtype = self._model_dtype()
+        hidden_size, dtype = output_spec
         pairs = {
             (body, wrapper._padded_row_width(rows)) for body in bucket_sizes for rows in row_widths
         }
@@ -1259,22 +1270,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Rows armed for a forward that raised were never consumed.
         object.__setattr__(wrapper, "_sample_rows", None)
         bucketer = self.spyre_shape_bucketer
+        output_spec = self._output_row_spec
         # ``num_tokens`` is upstream's first parameter and may be passed positionally.
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if (
             bucketer is None
+            or output_spec is None
             or num_tokens is None
             or not self._can_trim_output_d2h()
             or rows is None
             or rows.numel() == 0
         ):
             return
+        hidden_size, dtype = output_spec
         body_rows = bucketer.find_bucket(num_tokens)
         if body_rows is None or not _worth_trimming(
             body_rows,
             wrapper._padded_row_width(rows.numel()),
-            self.model_config.get_hidden_size(),
-            self._model_dtype().itemsize,
+            hidden_size,
+            dtype.itemsize,
         ):
             return
 

@@ -294,7 +294,6 @@ class TestArming:
         runner.model_config = types.SimpleNamespace(
             runner_type="generate", dtype=torch.float16, get_hidden_size=lambda: self.HIDDEN
         )
-        runner.is_pooling_model = gates.get("is_pooling_model", False)
         runner.num_prompt_logprobs = gates.get("num_prompt_logprobs", {})
         runner.use_aux_hidden_state_outputs = gates.get("use_aux_hidden_state_outputs", False)
         runner.speculative_config = gates.get("speculative_config")
@@ -361,7 +360,6 @@ class TestArming:
     @pytest.mark.parametrize(
         "gate",
         [
-            {"is_pooling_model": True},
             {"num_prompt_logprobs": {"req": 3}},
             {"use_aux_hidden_state_outputs": True},
             {"speculative_config": object()},
@@ -375,6 +373,26 @@ class TestArming:
 
         assert stashed is None, f"must not arm with {gate}"
         assert idx.tolist() == [0, 255, 511]
+
+    def test_a_pooling_runner_never_arms(self):
+        runner = self._runner_for_arming()
+        runner.model_config.runner_type = "pooling"
+        runner._attach_encoder_plan = lambda out, kwargs: None
+
+        idx, stashed = self._build(runner, 512, [0, 255, 511])
+
+        assert stashed is None
+        assert idx.tolist() == [0, 255, 511]
+
+    def test_rows_left_by_a_failed_forward_are_dropped(self):
+        """A forward that raised never consumed its rows; the next step must not use them."""
+        runner = self._runner_for_arming()
+        object.__setattr__(runner.model, "_sample_rows", torch.tensor([255]))
+
+        idx, stashed = self._build(runner, 4, [3])
+
+        assert stashed is None
+        assert idx.tolist() == [3]
 
     def test_num_tokens_passed_positionally_arms_the_trim(self):
         """Upstream may pass its first ``num_tokens`` parameter positionally."""

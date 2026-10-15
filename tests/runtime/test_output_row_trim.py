@@ -131,18 +131,18 @@ class TestSavingsGuard:
         # Same row count either side; only the wide body moves enough bytes to
         # pay for the gather. A rows-based threshold would decide these the same
         # way and be wrong on any model with a different hidden size.
-        assert _worth_trimming(64, 4, 4096)
-        assert not _worth_trimming(64, 4, 64)
+        assert _worth_trimming(64, 4, 4096, 2)
+        assert not _worth_trimming(64, 4, 64, 2)
 
     def test_no_narrowing_is_rejected(self):
-        assert not _worth_trimming(4, 4, 4096)
-        assert not _worth_trimming(4, 8, 4096)
+        assert not _worth_trimming(4, 4, 4096, 2)
+        assert not _worth_trimming(4, 8, 4096, 2)
 
     def test_floor_is_exact(self):
         exact_rows = _OUTPUT_TRIM_MIN_BYTES // (4096 * 2)
 
-        assert _worth_trimming(1 + exact_rows, 1, 4096)
-        assert not _worth_trimming(exact_rows, 1, 4096)
+        assert _worth_trimming(1 + exact_rows, 1, 4096, 2)
+        assert not _worth_trimming(exact_rows, 1, 4096, 2)
 
     def test_itemsize_is_honoured(self):
         # fp32 halves the rows needed to clear the floor.

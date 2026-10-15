@@ -55,7 +55,7 @@ The body pads the packed token count to the next `compile_sizes` bucket, and war
 dummies every bucket. The output gather and lm_head sit outside every body graph and
 compile their own. Both use sampled-row buckets clipped to `--max-num-seqs`: the gather
 selects the required final hidden-state rows on Spyre before D2H, and the lm_head projects
-those rows, reusing the gathered device tensor rather than sending them back. The gather
+those rows after they are moved back onto Spyre. The gather
 kernel specializes on the body width as well as the row width, so warmup covers every
 reachable `(bucket, row width)` pair; padding is removed before upstream processing.
 

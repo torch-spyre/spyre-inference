@@ -16,63 +16,120 @@
 
 The padding/masking math itself is `multimodal.utils.padded_sdpa`, already covered
 by `tests/multimodal/test_pixtral.py`; these tests cover this module's own surface:
-the `[B,S,H,D]` rearrange wrapper, the unmasked key-pad mask, and registration.
+the OOT `MMEncoderAttention`'s layout handling, that it traces into one graph, the
+unmasked key-pad mask, and registration.
 """
 
 from __future__ import annotations
 
-import einops
+import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 
-from spyre_inference.custom_ops.vit_attn import _padded_apply_sdpa, register
+from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
 from spyre_inference.multimodal.utils import _KEY_PAD_MASKS, _key_pad_mask_key
 
 
-def _reference_apply_sdpa(q, k, v, scale=None, enable_gqa=False):
-    """Upstream's unpadded `apply_sdpa`, reproduced so this test has no vLLM
-    version dependency."""
-    q, k, v = (einops.rearrange(x, "b s h d -> b h s d") for x in (q, k, v))
-    out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, scale=scale, enable_gqa=enable_gqa)
-    return einops.rearrange(out, "b h s d -> b s h d")
+def _attn(num_heads: int, head_size: int, num_kv_heads: int | None = None):
+    """Skips ``MMEncoderAttention.__init__``, which needs a vLLM platform context."""
+    attn = object.__new__(SpyreMMEncoderAttention)
+    nn.Module.__init__(attn)
+    attn.num_heads = num_heads
+    attn.num_kv_heads = num_kv_heads or num_heads
+    attn.head_size = head_size
+    attn.scale = head_size**-0.5
+    return attn
 
 
-def _random_qkv(batch, seq, heads, head_size, seed=0):
+def _reference(q, k, v, attn):
+    """Unpadded SDPA over `[B, S, H*D]` inputs, as upstream's `_forward_sdpa` computes it."""
+    b, s, _ = q.shape
+    q, k, v = (x.view(b, s, -1, attn.head_size).transpose(1, 2) for x in (q, k, v))
+    out = F.scaled_dot_product_attention(
+        q, k, v, scale=attn.scale, enable_gqa=attn.num_heads > attn.num_kv_heads
+    )
+    return out.transpose(1, 2).reshape(b, s, -1)
+
+
+def _random_qkv(batch, seq, heads, head_size, kv_heads=None, seed=0):
     g = torch.Generator().manual_seed(seed)
-    q = torch.randn(batch, seq, heads, head_size, generator=g)
-    k = torch.randn(batch, seq, heads, head_size, generator=g)
-    v = torch.randn(batch, seq, heads, head_size, generator=g)
+    kv = (kv_heads or heads) * head_size
+    q = torch.randn(batch, seq, heads * head_size, generator=g)
+    k = torch.randn(batch, seq, kv, generator=g)
+    v = torch.randn(batch, seq, kv, generator=g)
     return q, k, v
 
 
-class TestPaddedApplySdpaMatchesReference:
-    def test_clip_vit_b32_shape(self):
-        # B=1, H=12, seq=50 (7x7 patches + CLS), D=64 -- the shape that crashed.
-        q, k, v = _random_qkv(batch=1, seq=50, heads=12, head_size=64)
-        expected = _reference_apply_sdpa(q, k, v)
-        actual = _padded_apply_sdpa(q, k, v)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+class TestForwardOotMatchesReference:
+    @pytest.mark.parametrize(
+        ("batch", "seq", "heads"),
+        [(1, 50, 12), (3, 50, 12), (1, 64, 8), (2, 257, 16)],
+        ids=["vit_b32", "vit_b32_batch", "aligned", "vit_l14"],
+    )
+    def test_matches_unpadded_sdpa(self, batch, seq, heads):
+        # seq=50 (7x7 patches + CLS) is the shape that crashed; 64 takes the no-pad branch.
+        attn = _attn(heads, 64)
+        q, k, v = _random_qkv(batch, seq, heads, 64)
+        torch.testing.assert_close(
+            attn.forward_oot(q, k, v), _reference(q, k, v, attn), atol=1e-5, rtol=1e-5
+        )
 
-    def test_already_aligned_shape_takes_the_no_pad_branch(self):
-        q, k, v = _random_qkv(batch=1, seq=64, heads=8, head_size=64)
-        expected = _reference_apply_sdpa(q, k, v)
-        actual = _padded_apply_sdpa(q, k, v)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    def test_grouped_query_heads(self):
+        attn = _attn(8, 64, num_kv_heads=2)
+        q, k, v = _random_qkv(1, 50, 8, 64, kv_heads=2)
+        torch.testing.assert_close(
+            attn.forward_oot(q, k, v), _reference(q, k, v, attn), atol=1e-5, rtol=1e-5
+        )
 
-    def test_enable_gqa_is_passed_through(self):
-        # 8 query heads grouped over 2 kv heads.
-        q = torch.randn(1, 50, 8, 64)
-        k = torch.randn(1, 50, 2, 64)
-        v = torch.randn(1, 50, 2, 64)
-        expected = _reference_apply_sdpa(q, k, v, enable_gqa=True)
-        actual = _padded_apply_sdpa(q, k, v, enable_gqa=True)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    def test_4d_input_keeps_its_rank(self):
+        attn = _attn(4, 64)
+        q, k, v = (x.view(2, 50, 4, 64) for x in _random_qkv(2, 50, 4, 64))
+        out = attn.forward_oot(q, k, v)
+        assert out.shape == (2, 50, 4, 64)
+        flat = [x.reshape(2, 50, -1) for x in (q, k, v)]
+        torch.testing.assert_close(
+            out.reshape(2, 50, -1), _reference(*flat, attn), atol=1e-5, rtol=1e-5
+        )
 
-    def test_batch_of_images_matches_reference(self):
-        q, k, v = _random_qkv(batch=3, seq=50, heads=12, head_size=64)
-        expected = _reference_apply_sdpa(q, k, v)
-        actual = _padded_apply_sdpa(q, k, v)
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+def test_traces_into_one_graph():
+    """A marked tower's block is compiled `fullgraph=True`; the attention must not
+    break it, and SDPA must be in the graph rather than behind an opaque op."""
+    graphs: list[torch.fx.GraphModule] = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm
+
+    attn = _attn(12, 64)
+    q, k, v = _random_qkv(2, 50, 12, 64)
+    compiled = torch.compile(attn.forward_oot, backend=backend, fullgraph=True, dynamic=False)
+    torch.testing.assert_close(compiled(q, k, v), _reference(q, k, v, attn), atol=1e-5, rtol=1e-5)
+
+    assert len(graphs) == 1
+    targets = {n.target for n in graphs[0].graph.nodes if n.op == "call_function"}
+    assert F.scaled_dot_product_attention in targets
+
+
+@pytest.mark.parametrize(
+    ("kv_seq", "cu_seqlens"),
+    [(50, torch.tensor([0, 30, 50], dtype=torch.int32)), (64, None)],
+    ids=["packed", "cross_attention"],
+)
+def test_rejects_what_padded_sdpa_cannot_express(kv_seq, cu_seqlens):
+    """Upstream would split on `cu_seqlens`, and `padded_sdpa` pads both sides to the
+    query's length; either silently computing the wrong thing is worse than raising."""
+    attn = _attn(4, 64)
+    q = torch.randn(1, 50, 4 * 64)
+    k = v = torch.randn(1, kv_seq, 4 * 64)
+    with pytest.raises(NotImplementedError):
+        attn.forward_oot(q, k, v, cu_seqlens)
+
+
+def test_mm_encoder_attention_instantiates_the_spyre_class():
+    assert type(MMEncoderAttention.__new__(MMEncoderAttention)) is SpyreMMEncoderAttention
 
 
 class TestKeyPadMask:
@@ -93,14 +150,3 @@ class TestKeyPadMask:
     def test_unpadded_length_masks_nothing(self):
         row = _KEY_PAD_MASKS[_key_pad_mask_key(64, 64, torch.float16, torch.device("cpu"))]
         assert (row == 0).all()
-
-
-class TestRegister:
-    def test_register_is_idempotent(self):
-        import vllm.v1.attention.ops.vit_attn_wrappers as vit_attn_wrappers
-
-        register()
-        patched = vit_attn_wrappers.apply_sdpa
-        register()
-
-        assert vit_attn_wrappers.apply_sdpa is patched

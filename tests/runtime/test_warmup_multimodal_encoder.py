@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pooling warmup compiles every vision-encoder batch width, not just the widest.
+"""Warmup compiles every vision-encoder batch width a tower can see.
 
-``profile_run`` traces ``embed_multimodal`` once, at ``mm_max_items_per_batch``.
-CLIP's vision tower stays eager, so each narrower image batch otherwise compiles
-on the first request (spyre-inference#1182).
+Nothing else traces the tower before the compile guard arms (``profile_run`` never
+runs on Spyre), and each image-batch width is its own graph, so a width warmup skips
+compiles on the first request that reaches it (spyre-inference#1182).
 """
 
 from __future__ import annotations
@@ -49,7 +49,13 @@ class _Vision:
         return None
 
 
-def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | None):
+def _runner(
+    runner_type: str,
+    *,
+    multimodal: bool,
+    max_items: dict[str, int] | None,
+    compiled_tower_blocks: int = 0,
+):
     compilation_config = types.SimpleNamespace(
         compile_sizes=[8],
         inductor_compile_config={},
@@ -65,6 +71,7 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner.model_config = model_config
     runner.supports_mm_inputs = multimodal
+    runner._compiled_tower_blocks = compiled_tower_blocks
     runner.vllm_config = types.SimpleNamespace(
         model_config=model_config,
         compilation_config=compilation_config,
@@ -96,11 +103,8 @@ def _runner(runner_type: str, *, multimodal: bool, max_items: dict[str, int] | N
 
 
 def test_eager_pooling_does_not_run_the_vision_tower():
-    """An eager pooling load does not run the vision tower.
-
-    Those blocks crash, and a text-only load would die in the engine core
-    before the first prompt.
-    """
+    """An eager pooling load does not run the vision tower: only a compiled tower is
+    warmed, and an eager one compiles per op on first use regardless."""
     runner, vision = _runner("pooling", multimodal=True, max_items={"image": 4})
     runner.model_config.enforce_eager = True
     runner.max_num_reqs = 4
@@ -133,12 +137,27 @@ def test_pooling_warmup_covers_each_modality():
     assert vision.batches == [("image", 1), ("image", 2), ("audio", 1)]
 
 
-def test_generative_vlm_is_not_enumerated():
+def test_generative_vlm_with_an_eager_tower_is_not_enumerated():
     runner, vision = _runner("generate", multimodal=True, max_items={"image": 4})
 
     runner._warmup_multimodal_encoder()
 
     assert vision.batches == []
+
+
+def test_generative_warmup_runs_a_compiled_tower_at_every_width():
+    """The compile guard watches a marked tower, so the bucketed decoder warmup has to
+    reach it too, not only pooling's."""
+    runner, vision = _runner(
+        "generate", multimodal=True, max_items={"image": 3}, compiled_tower_blocks=2
+    )
+    runner.max_num_reqs = 4
+    runner._dummy_sampler_run = lambda hidden_states: None
+    runner._record_attention_graphs = lambda: None
+
+    runner.warming_up_model()
+
+    assert vision.batches == [("image", n) for n in range(1, 4)]
 
 
 def test_text_only_pooling_skips_the_vision_tower():

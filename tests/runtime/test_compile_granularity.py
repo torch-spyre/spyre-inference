@@ -30,6 +30,8 @@ from vllm.config import CompilationMode
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from spyre_inference.multimodal.utils import mark_blocks_compilable
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
     _is_decoder_attention_like,
@@ -80,6 +82,11 @@ def _hf_decoder_stack(implementation: str = "vllm") -> nn.Module:
         def __init__(self):
             super().__init__()
             self.self_attn = _hf_decoder_attention(implementation)
+
+        # The compile guard registers a block's own `forward`; nn.Module's placeholder
+        # is skipped.
+        def forward(self, x):
+            return x
 
     class GraniteModel(nn.Module):
         def __init__(self):
@@ -181,8 +188,7 @@ def _runner(model: nn.Module, enforce_eager: bool = False) -> TorchSpyreModelRun
 def test_finds_the_transformer_block_list() -> None:
     model = _Model(num_layers=4)
     found = _repeated_block_lists(model)
-    assert len(found) == 1
-    assert found[0] is model.model.layers
+    assert found == [(model.model.layers, False)]
 
 
 def test_ignores_module_lists_without_attention() -> None:
@@ -196,7 +202,7 @@ def test_ignores_module_lists_without_attention() -> None:
 
 def test_pp_missing_layers_do_not_break_discovery() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _repeated_block_lists(model) == [model.model.layers]
+    assert _repeated_block_lists(model) == [(model.model.layers, False)]
 
 
 def test_ignores_a_module_list_of_bare_attention_layers() -> None:
@@ -214,7 +220,7 @@ def test_finds_heterogeneous_hybrid_stacks() -> None:
     """Hybrid Mamba+attention stacks (Granite 4.0, Jamba, Nemotron-H) mix classes."""
     model = _Model(num_layers=4, hybrid=True)
     assert len({type(b) for b in model.model.layers}) == 2
-    assert _repeated_block_lists(model) == [model.model.layers]
+    assert _repeated_block_lists(model) == [(model.model.layers, False)]
 
 
 def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
@@ -246,7 +252,7 @@ def test_finds_blocks_with_hf_decoder_kv_cache_attention(implementation: str) ->
     """
     model = _hf_decoder_stack(implementation)
     assert not isinstance(model.layers[0].self_attn, Attention)
-    assert _repeated_block_lists(model) == [model.layers]
+    assert _repeated_block_lists(model) == [(model.layers, False)]
 
 
 def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
@@ -328,6 +334,51 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
     assert _repeated_block_lists(PixtralHF()) == []
 
 
+def _marked_tower(marked: bool = True) -> nn.Module:
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    tower = nn.Module()
+    tower.encoder = nn.Module()
+    tower.encoder.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+    if marked:
+        mark_blocks_compilable(tower.encoder.layers)
+    return tower
+
+
+class _VLM(nn.Module):
+    def __init__(self, marked: bool = True, decoder: bool = False):
+        super().__init__()
+        self.vision_tower = _marked_tower(marked)
+        if decoder:
+            self.language_model = _hf_decoder_stack()
+
+
+def test_a_marked_vision_tower_opts_into_block_compile() -> None:
+    """The mark sits on the blocks, so it is independent of where discovery starts and
+    of whether the tower sits under a recognised ``vision_*`` path."""
+    assert _repeated_block_lists(_VLM(marked=False)) == []
+
+    marked = _VLM()
+    assert _repeated_block_lists(marked) == [(marked.vision_tower.encoder.layers, True)]
+    assert _repeated_block_lists(marked.vision_tower) == [
+        (marked.vision_tower.encoder.layers, True)
+    ]
+
+
+def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
+    """The mark is read off the blocks, not off anything they contain, so an outer
+    ``ModuleList`` that merely holds a marked tower is not itself a compile unit."""
+    model = nn.Module()
+    model.towers = nn.ModuleList([_marked_tower().encoder for _ in range(2)])
+    assert _repeated_block_lists(model) == [(t.layers, True) for t in model.towers]
+
+
 def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
 
@@ -366,12 +417,37 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     model = VLM()
     vision_layers = model.vision_encoder.transformer.layers
     decoder_layers = model.language_model.layers
-    assert _repeated_block_lists(model) == [decoder_layers]
+    assert _repeated_block_lists(model) == [(decoder_layers, False)]
 
     originals = list(vision_layers)
     assert _runner(model)._compile_blocks() == 3
     assert all(block._compiled_call_impl is None for block in originals)
     assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
+
+
+def test_a_marked_tower_alone_falls_back_to_the_whole_model_graph() -> None:
+    """Only decoder blocks are counted, so a tower alone still sends the decoder to the
+    whole-model graph; the tower compiles beside it."""
+    model = _VLM()
+    runner = _runner(model)
+    assert runner._compile_blocks() == 0
+    assert all(b._compiled_call_impl is not None for b in model.vision_tower.encoder.layers)
+    assert runner._compiled_tower_blocks == 2
+
+
+def test_a_marked_tower_compiles_beside_the_decoder_and_is_watched() -> None:
+    """Tower blocks compile with the decoder's and the compile guard watches both: warmup
+    runs the tower at every image-batch width, so a later compile is a missed shape."""
+    model = _VLM(decoder=True)
+    compile_guard.reset()
+    runner = _runner(model)
+    assert runner._compile_blocks() == 3
+    assert runner._compiled_tower_blocks == 2
+    tower_blocks = model.vision_tower.encoder.layers
+    assert all(b._compiled_call_impl is not None for b in tower_blocks)
+    watched = compile_guard._guard.watched_labels().values()
+    assert "GraniteDecoderLayer (transformer block)" in watched
+    assert "VisionBlock (transformer block)" in watched
 
 
 def test_compile_blocks_wraps_every_block_in_place() -> None:

@@ -104,6 +104,22 @@ class TestBucketerState:
         assert bucketer.max_bucket_size == 16
 
 
+class TestWarmedBucket:
+    """Runtime padding only starts once warmup has compiled the buckets."""
+
+    def test_none_before_warmup(self, bucketer):
+        assert bucketer.warmed_bucket(3) is None
+
+    def test_pads_after_warmup(self, bucketer):
+        bucketer.mark_warmed_up()
+        assert bucketer.warmed_bucket(3) == 4
+        assert bucketer.warmed_bucket(16) == 16
+
+    def test_none_past_the_last_bucket(self, bucketer):
+        bucketer.mark_warmed_up()
+        assert bucketer.warmed_bucket(17) is None
+
+
 class TestEdgeCases:
     def test_empty_compile_sizes(self):
         config = MagicMock()
@@ -162,6 +178,36 @@ class TestForPooling:
         b = SpyreShapeBucketer.for_pooling(cfg)
         assert b is not None
         assert b.bucket_sizes == [64, 128]
+
+
+class TestForConfig:
+    """The runner's bucketer: pooling always, decode only when compiled with sizes."""
+
+    @staticmethod
+    def _decode_config(*, enforce_eager=False, compile_sizes=(1, 2, 4)):
+        cfg = _pooling_vllm_config(runner_type="generate")
+        cfg.model_config.enforce_eager = enforce_eager
+        cfg.compilation_config.compile_sizes = list(compile_sizes)
+        return cfg
+
+    def test_compiled_decode_gets_its_compile_sizes(self):
+        b = SpyreShapeBucketer.for_config(self._decode_config())
+        assert b is not None
+        assert b.bucket_sizes == [1, 2, 4]
+
+    def test_eager_decode_gets_none(self):
+        assert SpyreShapeBucketer.for_config(self._decode_config(enforce_eager=True)) is None
+
+    def test_decode_without_compile_sizes_gets_none(self):
+        assert SpyreShapeBucketer.for_config(self._decode_config(compile_sizes=())) is None
+
+    def test_eager_pooling_still_gets_one(self):
+        cfg = _pooling_vllm_config()
+        cfg.model_config.enforce_eager = True
+        cfg.compilation_config.compile_sizes = [512]
+        b = SpyreShapeBucketer.for_config(cfg)
+        assert b is not None
+        assert b.bucket_sizes == [512]
 
 
 class TestNextBucket:

@@ -442,6 +442,32 @@ class SpyreShapeBucketer:
         )
 
     @classmethod
+    def for_config(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
+        """The runner's bucketer for 1D body token sizes, or None when it needs none.
+
+        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
+        the token budget.
+
+        Pooling keeps a bucketer in eager *and* compile so *runtime* always
+        1D-pads the body. Warmup still differs: compile dummies each 1D size
+        (attention compiles through ``force_attention``); eager does one
+        dummy then ``mark_warmed_up()``. Decoder skips a bucketer when eager
+        because 1D pad exists only to hit compiled graphs.
+        """
+        if vllm_config.model_config.runner_type == "pooling":
+            return cls.for_pooling(vllm_config)
+
+        if vllm_config.model_config.enforce_eager:
+            logger.info("Graph Recorder disabled (enforce_eager=True)")
+            return None
+
+        if not vllm_config.compilation_config.compile_sizes:
+            logger.info("Graph Recorder disabled (no compile_sizes configured)")
+            return None
+
+        return cls(vllm_config)
+
+    @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
         """Pooling bucketer: the single body shape, ``R`` rows.
 
@@ -482,6 +508,13 @@ class SpyreShapeBucketer:
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
         return None
+
+    def warmed_bucket(self, num_tokens: int) -> int | None:
+        """The padded token count, or None before warmup or past the last bucket."""
+        if not self._is_warmed_up:
+            return None
+        desc = self.dispatch(num_tokens)
+        return None if desc is None else desc.padded_num_tokens
 
     def dispatch(self, num_tokens: int) -> SpyreBucketDescriptor | None:
         """Compute padded batch descriptor for the given token count.

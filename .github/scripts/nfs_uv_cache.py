@@ -46,6 +46,9 @@ from pathlib import Path
 KEY_SALT = "nfs-uv-cache-v1"
 KEY_LEN = 16
 
+# Bounds every uv call; `uv cache prune` waits indefinitely while the cache is in use.
+UV_TIMEOUT_S = 300
+
 # Default is plain `.tar`: the cache is mostly already-compressed wheels, and it
 # needs no compressor binary on the runner.
 TAR_SUFFIXES = (".tar.zst", ".tar.gz", ".tar")
@@ -65,14 +68,31 @@ def _warn(msg):
     print(f"::warning::{msg}", flush=True)
 
 
-def compute_key(key_files, salt=KEY_SALT):
+def uv_version(uv):
+    if not uv:
+        return ""
+    try:
+        out = subprocess.run(
+            [uv, "--version"], capture_output=True, text=True, check=True, timeout=UV_TIMEOUT_S
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        _warn(f"could not run `{uv} --version` ({type(exc).__name__}); key ignores the uv version")
+        return ""
+    parts = out.split()
+    return parts[1] if len(parts) > 1 else out.strip()
+
+
+def compute_key(key_files, salt=KEY_SALT, uv_version=""):
     """Content-address the cache on the lockfiles' basenames and bytes.
 
     Only the basename, never the absolute path, feeds the digest -- runners with
     different GITHUB_WORKSPACE must agree on the key for byte-identical lockfiles,
-    or a PR never hits the shared main scope.
+    or a PR never hits the shared main scope. The uv version is keyed too: a release
+    can move every bucket (0.13.0: wheels-v6 -> v7), leaving an exact hit uv can't read.
     """
     digest = hashlib.sha256(salt.encode())
+    if uv_version:
+        digest.update(b"\0uv\0" + uv_version.encode())
     for path in key_files:
         digest.update(b"\0")
         digest.update(os.fsencode(os.path.basename(path)))
@@ -166,7 +186,7 @@ def cmd_restore(args):
     hit = False
     restored_from = ""
     try:
-        key = compute_key(args.key_file)
+        key = compute_key(args.key_file, uv_version=args.uv_version)
         _reset_dir(local)
         # Prefer an exact-key tar in any readable scope (priority order); else
         # the newest tar there, so a lockfile change still starts warm.
@@ -273,7 +293,7 @@ def cmd_save(args):
     local = Path(args.local_dir)
 
     try:
-        key = compute_key(args.key_file)
+        key = compute_key(args.key_file, uv_version=args.uv_version)
         arch_dir = _scope_dir(args.nfs_root, scope, args.arch)
         target = arch_dir / f"{key}{ext}"
         # Skip if the key is already readable here, so an ordinary PR (key in
@@ -284,6 +304,18 @@ def cmd_save(args):
                 _log(f"uv cache key {key} already in {readable}/{args.arch}; skipping save")
                 _gc(arch_dir, args.keep, target)
                 return 0
+        # After a uv upgrade the restored tar holds the old buckets too; a plain prune (not
+        # --ci, which drops downloaded wheels) removes them.
+        if args.uv and local.is_dir():
+            try:
+                subprocess.run(
+                    [args.uv, "cache", "prune"],
+                    env={**os.environ, "UV_CACHE_DIR": str(local)},
+                    check=True,
+                    timeout=UV_TIMEOUT_S,
+                )
+            except (subprocess.SubprocessError, OSError) as exc:
+                _warn(f"uv cache prune failed ({type(exc).__name__}); saving unpruned")
         if not local.is_dir() or _is_empty(local):
             _log(f"no local uv cache at {local}; nothing to save")
             return 0
@@ -327,6 +359,7 @@ def main(argv=None):
         p.add_argument("--event-name", default=os.getenv("GITHUB_EVENT_NAME", ""))
         p.add_argument("--ref", default=os.getenv("GITHUB_REF", ""))
         p.add_argument("--pr-number", default="")
+        p.add_argument("--uv", default="", help="uv binary: keys on its version, prunes on save")
 
     r = sub.add_parser("restore")
     add_common(r)
@@ -344,6 +377,7 @@ def main(argv=None):
     s.set_defaults(func=cmd_save)
 
     args = parser.parse_args(argv)
+    args.uv_version = uv_version(args.uv)
     return args.func(args)
 
 

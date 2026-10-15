@@ -82,7 +82,10 @@ ARCH="$(arch)"
 STAMP="${PREFIX}/.lock-sha256"
 LOCK_SHA="$({ cat "$LOCK"; echo "$ARCH"; echo "$LOCATION"; } | sha256sum | cut -d' ' -f1)"
 
-if [[ $FORCE -eq 0 && -f "$STAMP" && "$(cat "$STAMP")" == "$LOCK_SHA" ]]; then
+BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
+COMPONENTS="${BASE_INSTALL_DIR}/components.txt"
+
+if [[ $FORCE -eq 0 && -f "$STAMP" && "$(cat "$STAMP")" == "$LOCK_SHA" && -f "$COMPONENTS" ]]; then
     echo "${PREFIX} already matches ${LOCK}; pass --force to redo"
     COUNT="$(python3 "$RESOLVER" --lock "$LOCK" names | wc -l)"
 else
@@ -114,17 +117,29 @@ else
         mv "${CACHE}/${filename}.part" "${CACHE}/${filename}"
     done
 
-    # Unpack into an empty tree so a previous lock's libraries cannot linger.
+    # The image's LIB_VERSION_FILE describes /opt/ibm/spyre, so the kernel cache key
+    # would ignore the lock. CACHE holds other locks' RPMs too: pass only the resolved
+    # ones. Written before the wipe so a failure here leaves PREFIX untouched.
+    RESOLVED_DIR="$(mktemp -d)"
+    trap 'rm -rf "$RESOLVED_DIR"' EXIT
+    for relpath in "${RPMS[@]}"; do
+        ln -s "${CACHE}/$(basename "$relpath")" "$RESOLVED_DIR/"
+    done
+    python3 "${REPO_ROOT}/.github/scripts/write_components_file.py" \
+        --lock "$LOCK" --rpm-dir "$RESOLVED_DIR" --arch "$ARCH" \
+        --output "${RESOLVED_DIR}/components.txt"
+
+    # Unpack into an empty tree so a previous lock's libraries cannot linger. The
+    # stamp goes in first so a failed unpack can be redone; COMPONENTS marks completion.
     rm -rf "$PREFIX"
     mkdir -p "$PREFIX"
+    echo "$LOCK_SHA" > "$STAMP"
     for relpath in "${RPMS[@]}"; do
         rpm2cpio "${CACHE}/$(basename "$relpath")" | (cd "$PREFIX" && cpio -idm 2>/dev/null)
     done
-    echo "$LOCK_SHA" > "$STAMP"
+    [[ -d "$BASE_INSTALL_DIR" ]] || { echo "unpacked tree has no opt/ibm/spyre: $PREFIX" >&2; exit 1; }
+    mv "${RESOLVED_DIR}/components.txt" "$COMPONENTS"
 fi
-
-BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
-[[ -d "$BASE_INSTALL_DIR" ]] || { echo "unpacked tree has no opt/ibm/spyre: $PREFIX" >&2; exit 1; }
 
 # Clearing _IBM_AIU_SETUP makes ibm-aiu-setup.sh re-derive PATH,
 # LD_LIBRARY_PATH and the *_INSTALL_DIR vars from SENTIENT_BASE_INSTALL_DIR
@@ -133,6 +148,7 @@ BASE_INSTALL_DIR="${PREFIX}/opt/ibm/spyre"
 cat > "${PREFIX}/env.sh" <<EOF
 export SENTIENT_BASE_INSTALL_DIR="${BASE_INSTALL_DIR}"
 export _IBM_AIU_SETUP=
+export LIB_VERSION_FILE="${COMPONENTS}"
 _aiu_nounset="\$(shopt -po nounset || true)"
 set +u
 source /etc/profile.d/ibm-aiu-setup.sh

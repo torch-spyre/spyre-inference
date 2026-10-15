@@ -96,7 +96,8 @@ def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
                     method.__name__,
                     "force is set" if force else "no enclosing graph covers it",
                 )
-                if not self.allow_inference_recompiles:
+                # Only compiled-mode warmup runs the kernel at its serving shapes.
+                if self.spyre_compile_enabled and not self.allow_inference_recompiles:
                     from spyre_inference.v1.worker import compile_guard
 
                     compile_guard.watch(method, f"{type(self).__name__}.{method.__name__}")

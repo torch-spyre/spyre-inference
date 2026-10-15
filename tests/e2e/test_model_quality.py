@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from spyre_testing_plugin.tags import record_serving_capability
 from vllm import LLM, RequestOutput, SamplingParams
 
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
@@ -102,6 +103,16 @@ def test_decoder_model_output(
 
     _assert_prompts_fit_prefill_bucket(model, revision, prompts)
 
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        MAX_NUM_SEQS,
+        task="generate",
+        enforce_eager=False,
+    )
     engine = LLM(
         model=model,
         revision=revision,
@@ -133,7 +144,11 @@ def test_decoder_model_output(
 
 
 @pytest.mark.parametrize("model", FP8_DECODER_MODELS)
-def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fp8_decoder_model_smoke(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, str], None],
+) -> None:
     """A compiled FP8 checkpoint loads and decodes; no reference (no CPU dequant)."""
     base = FP8_DECODER_MODELS[model]
     base_ref = _REFERENCES.get(base)
@@ -149,6 +164,16 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
 
     _assert_prompts_fit_prefill_bucket(model, revision, prompts)
 
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        MAX_NUM_SEQS,
+        task="generate",
+        enforce_eager=False,
+    )
     engine = LLM(
         model=model,
         revision=revision,

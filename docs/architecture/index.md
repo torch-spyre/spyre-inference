@@ -223,9 +223,30 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 (`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
-(`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager. Models whose
+(`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager unless
+marked (below). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
+
+A vision tower opts in. A block cannot assemble a constant
+on the host: a CPU-resident buffer has no device layout, and layout propagation rejects
+the graph. So a tower qualifies only once its block body builds nothing there: a
+load-time constant such as a rope permutation becomes a non-persistent buffer on the
+layer, lifted as a graph input, and a per-image one such as the attention mask is built
+once in the encoder forward and passed to each layer as an argument. A multimodal patch
+that has done that marks the layers with `mark_blocks_compilable` (`multimodal/utils.py`),
+and they are discovered like any other block stack; every other tower stays eager. CLIP's
+tower is marked (`multimodal/clip.py`): its attention is vLLM's `MMEncoderAttention`,
+which Spyre replaces out of tree (`custom_ops/vit_attn.py`) with a `padded_sdpa` call that
+traces into the block rather than running behind upstream's opaque SDPA wrapper, and its
+only mask is the key-padding row, which `padded_sdpa` keeps a graph input. Marked tower
+blocks compile beside the decoder blocks but never stand in for them, so a model with no
+decoder blocks still falls back to the whole-model graph. Warmup runs a marked tower at
+every image-batch width up to `mm_max_items_per_batch`, for pooling and generative models
+alike, and the compile guard watches its blocks like the decoder's: a tower compile after
+warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
+width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
+marked.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -419,10 +440,11 @@ exactly the extents a request can be assigned):
    offsets are data. A group wider than the widest declared width is chunked into
    descending powers of two, so every dispatch lands on a warmed pair.
 
-The runner picks between them once per step in `_build_attention_metadata` and records the
-choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
-`EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
-read and H2D conversions, which inside a traced region become graph nodes.
+The runner picks between them once per step in `_build_attention_metadata`, through
+`plan_encoder_step`, and records the choice as the *type* of `attn_metadata.encoder_plan`
+(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). It has to run there rather than
+in `forward`: the builder does a D2H read and H2D conversions, which inside a traced
+region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on

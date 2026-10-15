@@ -53,7 +53,9 @@ Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
-spyre_inference_ops = "spyre_inference:register_ops"
+# Same name as the platform plugin, so `VLLM_PLUGINS=spyre_inference` also registers the
+# model adaptations in every process, before vLLM's first model lookup.
+spyre_inference = "spyre_inference:register_ops"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -152,7 +154,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "8954568598deab56ad919d731ce1161fcfea1596" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "5c17a7fc16abad5a4973eaf6f59602cfeee06be4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

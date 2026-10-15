@@ -150,6 +150,26 @@ def test_forced_kernel_compiles_in_eager_mode(compile_calls, mode) -> None:
     assert len(compile_calls) == 1
 
 
+@pytest.mark.parametrize(
+    ("compilation_mode", "watched"),
+    [(CompilationMode.STOCK_TORCH_COMPILE, True), (CompilationMode.NONE, False)],
+)
+def test_forced_kernel_is_watched_only_when_warmup_covers_it(
+    compile_calls, mode, monkeypatch, compilation_mode, watched
+) -> None:
+    """Eager warmup never runs a forced kernel per shape, so watching it there would make
+    every first use a SPYRE_COMPILE_GUARD=error failure."""
+    from spyre_inference.v1.worker import compile_guard
+
+    labels: list[str] = []
+    monkeypatch.setattr(compile_guard, "watch", lambda target, label: labels.append(label))
+    mode(compilation_mode)
+
+    _ForcedNorm().kernel(torch.ones(2))
+
+    assert (labels == ["_ForcedNorm.kernel"]) is watched
+
+
 def test_forced_kernel_is_absorbed_by_an_enclosing_graph(compile_calls, mode, monkeypatch) -> None:
     """Forced eager-mode compilation never nests inside Dynamo tracing."""
     mode(CompilationMode.NONE)

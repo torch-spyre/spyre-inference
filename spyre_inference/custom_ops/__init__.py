@@ -31,7 +31,7 @@ from . import (
     parallel_lm_head,
     rotary_embedding,
     utils,
-    vit_attn,
+    vit_attn,  # noqa: F401
     vocab_parallel_embedding,  # noqa: F401
 )
 from .fp8_linear_kernel import register_spyre_fp8_linear_kernel
@@ -45,4 +45,3 @@ def register_all():
     register_spyre_fp8_linear_kernel()
     utils.register()
     multimodal_embeddings.register()
-    vit_attn.register()

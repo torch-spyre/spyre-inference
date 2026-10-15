@@ -76,7 +76,7 @@ models:
     platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
-        max_model_len: 512
+        max_model_len: 256
         max_num_seqs: 256
 
   sentence-transformers/all-roberta-large-v1:

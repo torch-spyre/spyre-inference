@@ -494,7 +494,8 @@ def defaults(runs: list[dict], plain: dict, ms: list[dict], top: Path) -> dict:
     itl_env = itl_runs[0]["workload"].get("vllm_env") if itl_runs else ""
     return {
         "title": "Gemma-4 Spyre Benchmark",
-        "eyebrow": "spyre-inference · gemma4-benchmark · " + spoken([f"TP{t}" for t in tps]),
+        "eyebrow": "spyre-inference · gemma4-benchmark-detailed · "
+        + spoken([f"TP{t}" for t in tps]),
         "h1": f"Gemma-4 26B-A4B on Spyre: {subject} against " + spoken([esc(o) for o in others]),
         "lede": (
             f"Batch 1, {w0['input_len']}-token prompt. Time to first token by the "

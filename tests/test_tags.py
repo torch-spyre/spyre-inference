@@ -109,6 +109,43 @@ def test_platform_tag_is_emitted_even_without_tier_or_model(monkeypatch):
     assert tags.result_tags({}) == [("tag", "platform__s390x")]
 
 
+@pytest.mark.parametrize(
+    "props, expected_props",
+    [
+        ({}, []),
+        (
+            {"task": "embed", "enforce_eager": False, "max_tokens": 8},
+            [
+                ("capability.prop.enforce_eager", "False"),
+                ("capability.prop.max_tokens", "8"),
+                ("capability.prop.task", "embed"),
+            ],
+        ),
+        ({"platforms": "", "revision": None, "task": "score"}, [("capability.prop.task", "score")]),
+    ],
+    ids=["no-props", "sorted-and-stringified", "empty-props-dropped"],
+)
+def test_serving_capability_properties_match_the_ingest_keys(props, expected_props):
+    # The ingest parses these exact keys; a rename silently stops the verdicts landing.
+    recorded = []
+    tags.record_serving_capability(
+        lambda k, v: recorded.append((k, v)), "ibm/granite", "served", 2, 128, 4, **props
+    )
+    assert (
+        recorded
+        == [
+            ("capability.test_type", "model_serving"),
+            ("capability.subject", "ibm/granite"),
+            ("capability.name", "served"),
+            ("capability.backend", "spyre"),
+            ("capability.sig.tensor_parallel", "2"),
+            ("capability.sig.max_model_len", "128"),
+            ("capability.sig.max_num_seqs", "4"),
+        ]
+        + expected_props
+    )
+
+
 def _tags_in(junit_path):
     """{testcase name: [tag property values]} from a JUnit XML file."""
     tree = ET.parse(junit_path)

@@ -356,4 +356,8 @@ plugins.md007.indent = 4
 dev = [
     "spyre-testing-plugin",
     "coverage",
+    # torch-spyre's model-ops runner (make test-model-ops): expecttest is imported by
+    # torch.testing._internal.common_utils, pytest-xdist isolates a test that crashes.
+    "expecttest>=0.3.0",
+    "pytest-xdist",
 ]

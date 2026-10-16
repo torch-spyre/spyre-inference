@@ -11,6 +11,8 @@ Located in `.github/workflows/`
 
 - There is a workflow to add or remove models, datasets, etc. to/from the cache [add_or_remove_artifacts_from_cache.yaml](.github/workflows/add_or_remove_artifacts_from_cache.yaml)
 
+- [check_spyre_rpms_lock.yaml](.github/workflows/check_spyre_rpms_lock.yaml) gates the RPM pins in `spyre-rpms.lock`. The `verify` job re-checks offline that every pinned build came from one coherent set, so it also runs on fork PRs; the `check` job regenerates the lock from `spyre-rpms.toml` and diffs it. See [scripts/SPYRE_RPMS.md](scripts/SPYRE_RPMS.md)
+
 - A weekday cron [pr_reminder_slack.yaml](.github/workflows/pr_reminder_slack.yaml) posts the stalest open PRs to Slack to keep reviews moving. Setup, configuration variables and the failure-escalation behaviour are documented in [scripts/pr_reminder/README.md](scripts/pr_reminder/README.md)
 
 - Changes to `pyproject.toml`, `uv.lock`, or `spyre-rpms.lock` ask for confirmation from the PR author or a repository maintainer with `maintain` or `admin` permission. [environment-file-confirmation.yml](.github/workflows/environment-file-confirmation.yml) posts one commit-specific prompt and reports the `Environment file confirmation` check, which passes when no open PR sharing that head commit and base branch has unconfirmed environment-file changes. The check blocks merging only once it is added as a required GitHub Actions check to the `main` branch ruleset; until then it is advisory.

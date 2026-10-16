@@ -1,0 +1,73 @@
+# Spyre RPM dependency input.
+#
+# This file is the HAND-EDITED side of the pin: it names only WHICH SOURCE each
+# component should come from. The exact RPM filenames, build numbers and the
+# per-arch identities are resolved from it into `spyre-rpms.lock.toml` by:
+#
+#   ./scripts/spyre_rpms.py resolve -i spyre-rpms.toml -o spyre-rpms.lock.toml
+#
+# Never edit the lock by hand, and never pin an RPM build number here. A git
+# commit alone does not identify an RPM: the same commit rebuilt against a newer
+# dependency is a different, ABI-incompatible binary. The resolver settles that
+# by taking every RPM from ONE orchestrator build plan and checking that each
+# component's recorded dependency shas match the other components in the set.
+
+version = 1
+
+# "next" is the dev-preview tree (<repo>/next/<arch>/); "prod" is the base tree.
+tree = "next"
+
+# The Artifactory host and the two repo names are NOT configured here: they are
+# CI secrets, supplied as ARTIFACTORY_BASE_URL, ARTIFACTORY_RPM_PATH and
+# ARTIFACTORY_PLAN_PATH. Keeping them out of this file is what lets the lock be
+# committed to a public repo.
+
+# Every arch listed must resolve from the SAME orchestrator run, or `resolve`
+# fails. Most runs are amd64-only, so asking for all three narrows the usable
+# runs sharply: unpinned, x86_64 alone reaches a far newer run than all three do.
+# Override per invocation with `--arches x86_64` (default when this key is
+# absent) without editing this file.
+arches = ["x86_64", "ppc64le", "s390x"]
+
+# Pin the ABI oracle explicitly for a reproducible lock. Comment this out to
+# track the newest orchestrator run that covers every arch above.
+#
+# orchestrator-7457 (2026-10-15T09:46:35Z) is a 3-arch run whose plan is
+# internally ABI-coherent: 251 dependency edges checked across the three
+# arches, 0 mismatched.
+orchestrator_build = 7457
+
+# Each component names exactly one of `commit`, `tag` or `branch`.
+#
+#   commit = "<full sha>"   exact source revision (preferred: reproducible)
+#   branch = "main"         newest build of that branch in the chosen plan
+#   tag    = "v1.2.3"       rejected for now, see the resolver's error text:
+#                           a build plan records commits and branches, not tags
+#
+# `packages` is optional. When omitted, every RPM the plan says that component
+# publishes is locked, which is what you usually want: it cannot silently miss a
+# new subpackage. Set it to lock a subset.
+
+[components.deeptools]
+commit = "092f4e799b2523c4d66a40185a4b55d713514d91"
+
+[components.flex]
+commit = "5aaf49028ddfe481c3740580860cbc4e0b94fbb6"
+
+[components.senlib]
+commit = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+
+[components.spyre-comms]
+commit = "748f4acefa023869696a4228247be61549771a96"
+
+[components.aiu-toolbox]
+commit = "3307e2f9ae8747787b3ae5bcec5f88aed7d83c37"
+
+[components.libaiupti]
+commit = "3c1815cb2f05cc501ff288c5cafd19806ddf9a49"
+
+# sentinyexec is built by the same plan but is NOT in the installed baseline
+# today, so it is left out to keep this lock a drop-in replacement. Add it here
+# when CI starts installing it.
+# [components.sentinyexec]
+# commit = "5df3d0c5924315fc3e169aae7318168040c0718d"

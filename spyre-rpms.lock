@@ -1,11 +1,17 @@
-# Pinned Spyre RPM baseline for CI. Regenerate with `upgrade-torch-spyre`.
+# Pinned Spyre RPM baseline for CI.
 #
-# All packages are published in the `next` tree, which the dev pipelines populate
-# for main-branch builds on all three arches.
+# GENERATED FILE -- do not edit by hand. Regenerate with:
+#   ./scripts/spyre_rpms.py resolve
+# and verify an existing one offline (no Artifactory) with:
+#   ./scripts/spyre_rpms.py verify
 #
-# x86_64 is pinned to an exact build. Power (ppc64le) and Z (s390x) pins use the
-# same commit, but leave the build hash wildcarded: the builds differ across
-# platforms.
+# Every package below comes from ONE build plan (orchestrator-7457), and each component's recorded dependency
+# shas were checked against the other components in the set, so the
+# whole set is ABI-coherent by construction.
+#
+# All three arches pin the exact build: the identity (the 12-hex field)
+# is derived from the source and dependency shas, not the platform, so it
+# is the same on x86_64, ppc64le and s390x.
 
 version = 2
 
@@ -20,37 +26,88 @@ ibm-deeptools         = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2
 ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2c83606.092f4e7" }
 ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
 ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
+ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.24d8f8a832e9.3c1815c" }
 ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
 ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
 ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
 ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
 ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
-ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.24d8f8a832e9.3c1815c" }
 
 # Power
 [overrides.ppc64le]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0_rc.5-0.main.6+6.3307e2f9.*" }
-ibm-deeptools         = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.*" }
-ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.*" }
-ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*" }
-ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*" }
-ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.*" }
-ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.*" }
-ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.*" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0_rc.5-0.main.6+6.3307e2f9.bba205429228.3307e2f" }
+ibm-deeptools         = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2c83606.092f4e7" }
+ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2c83606.092f4e7" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
+ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.24d8f8a832e9.3c1815c" }
+ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
+ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
 
 # Z
 [overrides.s390x]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0_rc.5-0.main.6+6.3307e2f9.*" }
-ibm-deeptools         = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.*" }
-ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.*" }
-ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*" }
-ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.*" }
-ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.*" }
-ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.*" }
-ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.*" }
-ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.*" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0_rc.5-0.main.6+6.3307e2f9.bba205429228.3307e2f" }
+ibm-deeptools         = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2c83606.092f4e7" }
+ibm-deeptools-devel   = { version = "2.0.0_rc.1-0.master.198+198.092f4e79.b591b2c83606.092f4e7" }
+ibm-flex              = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
+ibm-flex-devel        = { version = "2.0.0_rc.1-0.main.87+87.5aaf4902.5cefcccce4cf.5aaf490" }
+ibm-libaiupti         = { version = "2.0.0_rc.2-0.main.17+17.3c1815cb.24d8f8a832e9.3c1815c" }
+ibm-senlib-core       = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-senlib-dd2        = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-senlib-headers    = { version = "2.0.0_rc.5-0.main.25+25.15d57f06.c7bc40ab1aa0.15d57f0" }
+ibm-spyre-comms       = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
+ibm-spyre-comms-devel = { version = "2.0.0_rc.1-0.main.34+34.748f4ace.2c1372c287a5.748f4ac" }
+
+# The resolved set, for `verify` to re-check without Artifactory.
+# `source` is the component's git commit; `deps` are the dependency
+# shas it was actually built against.
+
+[abi.aiu-toolbox]
+source = "3307e2f9ae8747787b3ae5bcec5f88aed7d83c37"
+id12 = "bba205429228"
+packages = ["ibm-aiu-toolbox-e2e"]
+[abi.aiu-toolbox.deps]
+deeptools = "092f4e799b2523c4d66a40185a4b55d713514d91"
+flex = "5aaf49028ddfe481c3740580860cbc4e0b94fbb6"
+senlib = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+
+[abi.deeptools]
+source = "092f4e799b2523c4d66a40185a4b55d713514d91"
+id12 = "b591b2c83606"
+packages = ["ibm-deeptools", "ibm-deeptools-devel"]
+[abi.deeptools.deps]
+llvm = "092f4e799b2523c4d66a40185a4b55d713514d91"
+
+[abi.flex]
+source = "5aaf49028ddfe481c3740580860cbc4e0b94fbb6"
+id12 = "5cefcccce4cf"
+packages = ["ibm-flex", "ibm-flex-devel"]
+[abi.flex.deps]
+deeptools = "092f4e799b2523c4d66a40185a4b55d713514d91"
+senlib = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+
+[abi.libaiupti]
+source = "3c1815cb2f05cc501ff288c5cafd19806ddf9a49"
+id12 = "24d8f8a832e9"
+packages = ["ibm-libaiupti"]
+[abi.libaiupti.deps]
+flex = "5aaf49028ddfe481c3740580860cbc4e0b94fbb6"
+senlib = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+
+[abi.senlib]
+source = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+id12 = "c7bc40ab1aa0"
+packages = ["ibm-senlib-core", "ibm-senlib-dd2", "ibm-senlib-headers"]
+
+[abi.spyre-comms]
+source = "748f4acefa023869696a4228247be61549771a96"
+id12 = "2c1372c287a5"
+packages = ["ibm-spyre-comms", "ibm-spyre-comms-devel"]
+[abi.spyre-comms.deps]
+deeptools = "092f4e799b2523c4d66a40185a4b55d713514d91"
+flex = "5aaf49028ddfe481c3740580860cbc4e0b94fbb6"
+senlib = "15d57f061f4138609c8dc1ca31073cfdd7c2c47f"
+torch = "4acf30579fd4fd71fed533c9a743e0d01072a635"

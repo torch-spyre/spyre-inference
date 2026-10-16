@@ -1,0 +1,70 @@
+name: Check spyre-rpms lock
+
+on:
+  pull_request:
+    paths:
+      - 'spyre-rpms.toml'
+      - 'spyre-rpms.lock'
+      - 'scripts/spyre_rpms.py'
+      - 'scripts/tests/**'
+      - '.github/workflows/check_spyre_rpms_lock.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'spyre-rpms.toml'
+      - 'spyre-rpms.lock'
+      - 'scripts/spyre_rpms.py'
+      - 'scripts/tests/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Runs everywhere, including a fork PR: no secrets, no network. Re-checks the
+  # committed lock's own ABI invariant and runs the resolver's unit tests.
+  verify:
+    name: ABI invariant (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Verify the committed lock is ABI-coherent
+        run: ./scripts/spyre_rpms.py verify -o spyre-rpms.lock
+
+      - name: Resolver unit tests
+        run: |
+          uv run --isolated --no-project \
+            --with pydantic --with requests --with pytest \
+            pytest scripts/tests/ -q
+
+  # Needs an Artifactory token, so it is skipped on a fork PR rather than
+  # failing: `verify` above still gates the ABI invariant in that case.
+  check:
+    name: Lock matches input
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      # Advisory until ARTIFACTORY_PLAN_PATH is configured: a missing secret
+      # would otherwise fail every PR. Flip to a hard gate (drop this line) once
+      # it is set. `verify` above is the hard gate and needs no secrets.
+      - name: Regenerate the lock and diff it against the committed one
+        continue-on-error: true
+        env:
+          ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
+          # New secret: the Artifactory repo holding the orchestrator build
+          # plans. Until it is set, this job fails with the variable named and
+          # the offline `verify` job above still gates ABI coherence.
+          ARTIFACTORY_PLAN_PATH: ${{ secrets.ARTIFACTORY_PLAN_PATH }}
+        run: ./scripts/spyre_rpms.py check -i spyre-rpms.toml -o spyre-rpms.lock

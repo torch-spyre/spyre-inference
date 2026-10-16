@@ -43,8 +43,11 @@ jobs:
             --with pydantic --with requests --with pytest \
             pytest scripts/tests/ -q
 
-  # Needs an Artifactory token, so it is skipped on a fork PR rather than
-  # failing: `verify` above still gates the ABI invariant in that case.
+  # Reaching Artifactory needs secrets, which a fork PR does not get, so this
+  # job is skipped there; the offline `verify` above still gates ABI coherence.
+  # It is also skipped until ARTIFACTORY_PLAN_PATH exists (it is a new secret),
+  # so the gate reports "not applicable" rather than ignoring a real failure.
+  # No action is needed to enable it: adding the secret makes it a hard gate.
   check:
     name: Lock matches input
     runs-on: ubuntu-latest
@@ -54,17 +57,25 @@ jobs:
 
       - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
-      # Advisory until ARTIFACTORY_PLAN_PATH is configured: a missing secret
-      # would otherwise fail every PR. Flip to a hard gate (drop this line) once
-      # it is set. `verify` above is the hard gate and needs no secrets.
+      # `secrets` is not available in a job-level `if`, so the presence check
+      # is a step that exports a flag for the step below.
+      - name: Check whether the plan-path secret is configured
+        id: cfg
+        env:
+          ARTIFACTORY_PLAN_PATH: ${{ secrets.ARTIFACTORY_PLAN_PATH }}
+        run: |
+          if [ -n "${ARTIFACTORY_PLAN_PATH}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::ARTIFACTORY_PLAN_PATH is not set, so the lock cannot be regenerated here; skipping. The offline \`verify\` job still gates ABI coherence. Setting the secret turns this into a hard gate with no further change."
+          fi
+
       - name: Regenerate the lock and diff it against the committed one
-        continue-on-error: true
+        if: steps.cfg.outputs.configured == 'true'
         env:
           ARTIFACTORY_TOKEN: ${{ secrets.ARTIFACTORY_TOKEN }}
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_RPM_PATH: ${{ secrets.ARTIFACTORY_RPM_PATH }}
-          # New secret: the Artifactory repo holding the orchestrator build
-          # plans. Until it is set, this job fails with the variable named and
-          # the offline `verify` job above still gates ABI coherence.
           ARTIFACTORY_PLAN_PATH: ${{ secrets.ARTIFACTORY_PLAN_PATH }}
         run: ./scripts/spyre_rpms.py check -i spyre-rpms.toml -o spyre-rpms.lock

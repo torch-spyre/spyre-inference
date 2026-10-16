@@ -39,6 +39,10 @@ All four are required by `resolve`, `check` and `show-plan`; none has a default,
 and the script fails with a named variable rather than guessing. `verify` needs
 none of them, which is what keeps the committed lock checkable in a public repo
 and on a fork PR.
+
+`ARTIFACTORY_PLAN_PATH` is new. Until it is configured, the `check` CI job skips
+with a notice instead of failing, and becomes a hard gate automatically once the
+secret exists.
 `verify` needs neither, so it also gates pull requests from forks, where
 [secrets are unavailable](../CI.md).
 

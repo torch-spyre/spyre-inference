@@ -71,6 +71,7 @@ def _generate(
     enforce_eager: bool,
     compilation_config: dict | None = None,
     hf_overrides=None,
+    kv_cache_dtype: str = "auto",
 ) -> list[list[int]]:
     from vllm import LLM, SamplingParams
 
@@ -81,6 +82,7 @@ def _generate(
         enforce_eager=enforce_eager,
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
+        kv_cache_dtype=kv_cache_dtype,
         **({"compilation_config": compilation_config} if compilation_config is not None else {}),
         **({"hf_overrides": hf_overrides} if hf_overrides is not None else {}),
     )
@@ -100,7 +102,9 @@ def _generate(
     return result
 
 
-def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:
+def _assert_matches_tp1(
+    tp1: list[list[int]], tp2: list[list[int]], names: tuple[str, str] = ("tp1", "tp2")
+) -> None:
     """Each TP=2 sequence must share a >=2-token prefix with its TP=1 twin.
 
     Later divergence is expected: fp16 reduction order differs between the paths.
@@ -115,8 +119,8 @@ def _assert_matches_tp1(tp1: list[list[int]], tp2: list[list[int]]) -> None:
     for i, (a, b) in enumerate(zip(tp1, tp2)):
         n = prefix_len(a, b)
         assert n >= 2, (
-            f"prompt {i}: tp1 and tp2 diverged at token {n} "
-            f"(expected >=2 matching tokens). tp1={a} tp2={b}"
+            f"prompt {i}: {names[0]} and {names[1]} diverged at token {n} "
+            f"(expected >=2 matching tokens). {names[0]}={a} {names[1]}={b}"
         )
 
 
@@ -178,4 +182,25 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
         _generate(
             model, tp=2, enforce_eager=False, compilation_config=_cc, hf_overrides=hf_overrides
         ),
+    )
+
+
+@pytest.mark.uses_subprocess
+@pytest.mark.distributed
+@pytest.mark.skipif(
+    spyre_device_count() < 2,
+    reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
+)
+def test_tp2_fp8_kv_cache_matches_fp16_cache() -> None:
+    """TP=2 with a float8 KV cache against the fp16 cache, compiled.
+
+    Each rank holds half the KV heads, which changes the head-major page shape and the
+    per-head store index list the single-card fp8 test covers.
+    """
+    model = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
+    _cc = {"compile_sizes": [1, 2, 16]}
+    _assert_matches_tp1(
+        _generate(model, tp=2, enforce_eager=False, compilation_config=_cc),
+        _generate(model, tp=2, enforce_eager=False, compilation_config=_cc, kv_cache_dtype="fp8"),
+        names=("fp16 cache", "fp8 cache"),
     )

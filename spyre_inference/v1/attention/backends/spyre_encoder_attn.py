@@ -42,7 +42,7 @@ import types
 import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -562,6 +562,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``EncoderOnlyAttention`` layers arrive bidirectional, ``CausalEncoderOnlyAttention``
     layers (CLIP text, ``models/clip.py``) causal.
     """
+
+    keeps_kv_cache: ClassVar[bool] = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

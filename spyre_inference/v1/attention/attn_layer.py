@@ -176,3 +176,19 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
             len(split),
         )
     return slot_mapping
+
+
+def install_kv_readers(layers: Iterable[Attention]) -> None:
+    """Give layers that read another layer's KV cache the staged forward, minus the write.
+
+    ``_can_split`` excludes them, but upstream's forward hands the impl the caller's
+    query, whose row count no recorded kernel variant matches. Their holder lists no
+    layers, so it never publishes slots and the write is always skipped.
+    """
+    readers = [layer for layer in layers if layer.kv_sharing_target_layer_name is not None]
+    no_slots = SlotMapping([])
+    for layer in readers:
+        layer.spyre_slots = no_slots  # ty: ignore[invalid-assignment]
+        layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+            _spyre_attention_forward, layer
+        )

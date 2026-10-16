@@ -39,8 +39,14 @@ def make_config(
     runner_type="generate",
     num_kv_heads=8,
     per_layer_kv_heads=None,
+    num_speculative_tokens=None,
 ):
     config = MagicMock()
+    config.speculative_config = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
     config.cache_config.block_size = block_size
     config.model_config.max_model_len = max_model_len
     config.model_config.runner_type = runner_type
@@ -160,6 +166,18 @@ class TestBuckets:
     def test_query_bucket_step_capped_by_max_num_batched_tokens(self):
         b = SpyreAttnBucketer(make_config(max_num_batched_tokens=300))
         assert b.query_buckets == [1, 300]
+
+    def test_speculative_verify_gets_its_own_query_bucket(self):
+        """Three drafts plus the bonus row would otherwise pad onto the prefill bucket."""
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=3))
+        assert b.query_buckets == [1, 4, 512]
+        assert b.find_query_bucket(2) == 4
+
+    def test_speculative_verify_bucket_joins_an_override(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,128,512")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_speculative_tokens=2))
+        assert b.query_buckets == [1, 3, 128, 512]
 
     def test_buckets_include_non_power_of_two_limit(self):
         b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))

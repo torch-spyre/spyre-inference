@@ -49,6 +49,18 @@ def apply_top_k_top_p_sort_free(
     return logits.fill_(-float("inf")).scatter_(1, idx, vals)
 
 
+def apply_top_k_top_p_host(
+    logits: torch.Tensor, k: torch.Tensor | None, p: torch.Tensor | None
+) -> torch.Tensor:
+    """Top-k / top-p without a full-vocab sort unless top-p runs alone.
+
+    Upstream's dispatcher only takes the host-sync path on its own CPU platform, so on
+    Spyre it would sort the vocabulary of every row."""
+    if k is not None and p is not None:
+        return apply_top_k_top_p_sort_free(logits, k, p)
+    return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+
+
 class SpyreTopKTopPSampler(TopKTopPSampler):
     """Sort-free top-k plus a fused Gumbel-max draw for random sampling.
 
@@ -76,10 +88,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.32.0) with two
         # Spyre changes: sort-free top-k (and top-k + top-p) and a log-space
         # Gumbel draw. Re-sync with upstream on a vLLM bump.
-        if k is not None and p is not None:
-            logits = apply_top_k_top_p_sort_free(logits, k, p)
-        else:
-            logits = apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
+        logits = apply_top_k_top_p_host(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits

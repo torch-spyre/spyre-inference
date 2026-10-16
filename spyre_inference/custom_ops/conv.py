@@ -16,9 +16,10 @@
 
 vLLM lowers a patch conv to im2col + GEMM, whose on-device reshape produces a
 sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
-coprime with the 64-wide stick. So run the real `F.conv2d` on-card instead, with
-the weight and input placed into explicit `SpyreTensorLayout`s. Layout tuples are
-derived from shapes, so any out-channel count and image size work.
+coprime with the 64-wide stick. So call the real `F.conv2d` instead. torch-spyre's
+own conv2d lowering still falls back to a CPU unfold/reshape round trip for this
+shape family regardless of input layout, so only the weight is pre-staged into a
+tiled `SpyreTensorLayout` (once, at load time); the input is passed through as-is.
 """
 
 import torch
@@ -33,16 +34,19 @@ logger = init_logger(__name__)
 
 
 def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether the layout tuples below apply: one image, in-channels within a stick,
-    out-channels a whole number of sticks.
+    """Whether this call is a vision patch embed: in-channels within a stick,
+    out-channels a whole number of sticks. Batch size doesn't matter -- the
+    compiled call below takes whatever batch it's given, tiled (one image) or
+    not (e.g. a granite-vision tile batch).
 
-    True for a Pixtral patch embed, not for convs in general — and this class is
-    registered OOT for *every* `Conv2dLayer`, so fall back rather than assert.
+    True for a Pixtral/granite-vision patch embed, not for convs in general —
+    and this class is registered OOT for *every* `Conv2dLayer`, so fall back
+    rather than assert.
     """
     if x.dim() != 4 or weight.dim() != 4:
         return False
-    b, c = x.shape[0], x.shape[1]
-    return b == 1 and c <= 64 and weight.shape[0] % 64 == 0
+    c = x.shape[1]
+    return c <= 64 and weight.shape[0] % 64 == 0
 
 
 def _weight_layout(weight: torch.Tensor):
@@ -125,17 +129,14 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             return self._forward_conv(x)
         if not _layouts_supported(x, self.weight):
             logger.warning_once(
-                "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
-                "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
+                "Spyre conv2d: shape %s (weight %s) outside the patch-embed "
+                "assumptions (in_channels <= 64, out_channels %% 64 == 0); "
                 "falling back to F.conv2d without them.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
             )
             return self._forward_conv(x)
-        logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
-        # Via CPU: CPU->spyre is the tested entry path, and a device-side
-        # restickify would hit the same unsupported layout.
-        x_cpu = convert(x, device="cpu")
-        x_dev = convert(x_cpu, device="spyre", device_layout=_input_layout(x_cpu))
-        assert self._w_dev is not None, "Conv weights must be prepared after model loading."
-        return self._conv_native(x_dev, self._w_dev, self.bias)
+        logger.info_once("Spyre conv2d: on-card F.conv2d")
+        # No input staging: torch-spyre's internal unfold/reshape fallback runs
+        # regardless of layout, so the explicit tiled conversion was dead weight.
+        return self._conv_native(x, self.weight, self.bias)

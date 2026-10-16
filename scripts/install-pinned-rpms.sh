@@ -138,8 +138,27 @@ else
         rpm2cpio "${CACHE}/$(basename "$relpath")" | (cd "$PREFIX" && cpio -idm 2>/dev/null)
     done
     [[ -d "$BASE_INSTALL_DIR" ]] || { echo "unpacked tree has no opt/ibm/spyre: $PREFIX" >&2; exit 1; }
+
+    # DT_RPATH is searched before LD_LIBRARY_PATH, so /opt/ibm/spyre entries would
+    # bind the system libraries.
+    while IFS= read -r -d '' f; do
+        [[ "$(head -c4 "$f")" == $'\x7fELF' ]] || continue
+        rpath="$(uvx patchelf --print-rpath "$f" 2>/dev/null)" || continue
+        [[ ":$rpath" == *:/opt/ibm/spyre* ]] || continue
+        new_rpath="$(sed "s#\(^\|:\)/opt/ibm/spyre#\1${BASE_INSTALL_DIR}#g" <<< "$rpath")"
+        uvx patchelf --force-rpath --set-rpath "$new_rpath" "$f"
+    done < <(find "$PREFIX" -type f -print0)
     mv "${RESOLVED_DIR}/components.txt" "$COMPONENTS"
 fi
+
+# senlib ships its Python package in /usr/lib64, where aiu-assign-ranks.py does not
+# look in a prefix install.
+SENLIB_PYTHONPATH=""
+for d in "${PREFIX}"/usr/lib64/python3*/site-packages; do
+    if [[ -d "$d/senlib" ]]; then
+        SENLIB_PYTHONPATH="export PYTHONPATH=\"$d\${PYTHONPATH:+:\$PYTHONPATH}\""
+    fi
+done
 
 # Clearing _IBM_AIU_SETUP makes ibm-aiu-setup.sh re-derive PATH,
 # LD_LIBRARY_PATH and the *_INSTALL_DIR vars from SENTIENT_BASE_INSTALL_DIR
@@ -149,6 +168,7 @@ cat > "${PREFIX}/env.sh" <<EOF
 export SENTIENT_BASE_INSTALL_DIR="${BASE_INSTALL_DIR}"
 export _IBM_AIU_SETUP=
 export LIB_VERSION_FILE="${COMPONENTS}"
+${SENLIB_PYTHONPATH}
 _aiu_nounset="\$(shopt -po nounset || true)"
 set +u
 source /etc/profile.d/ibm-aiu-setup.sh

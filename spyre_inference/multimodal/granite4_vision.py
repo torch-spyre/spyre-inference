@@ -116,10 +116,12 @@ def patch_embed_input_ids() -> None:
     Fix for (1): replace with ``torch.where(mask, zeros, text_embeds)`` — a
     broadcast select that stays on Spyre.
 
-    Fix for (2): scatter on CPU into a staging tensor the same size as the
-    buffer slice, then copy back with ``target.copy_(staged)``.  The persistent
-    ``_ds_buffers`` remain full-size (``[max_tokens, lm_hidden]``) so forward's
-    ``self._ds_buffers[lvl][:n]`` slices are always valid.
+    Fix for (2): scatter on CPU into a staging tensor of size ``[N, lm_hidden]``
+    (the live prefix only), then copy it into ``self._ds_buffers[level_idx][:N]``.
+    Rows beyond ``N`` in the full-size buffer are stale by design — ``forward()``
+    only ever reads ``self._ds_buffers[lvl][:n]`` where ``n = self._ds_num_tokens``,
+    so copying the narrower slice is equivalent to what upstream already does
+    (``target = self._ds_buffers[level_idx][:N]; target.zero_(); target[...] = ...``).
 
     ``all_packed.split(lm_h, dim=-1)`` produces last-dim views of the device
     tensor; fetching each selected slice to CPU is cheap (image tokens only).
@@ -191,16 +193,15 @@ def patch_embed_input_ids() -> None:
         level_features_cpu = all_packed_cpu.split(lm_h, dim=-1)  # num_levels tensors on CPU
 
         is_multimodal_cpu = convert(is_multimodal, device="cpu")
-        buf_len = self._ds_buffers[0].shape[0]
         for level_idx in range(len(self._ds_layer_indices)):
-            # Stage the full buffer size on CPU (same shape as the on-device
-            # allocation).  Spyre's DMA validates against the physical allocation
-            # size, not the Python slice — copying a sub-slice [:N] raises
-            # "Invalid dma sizes".  Staging buf_len rows and copying the whole
-            # buffer avoids the mismatch; rows beyond N stay zero and are harmless.
-            staged = torch.zeros(buf_len, lm_h, dtype=inputs_embeds.dtype)
-            staged[:N][is_multimodal_cpu] = level_features_cpu[level_idx]
-            self._ds_buffers[level_idx].copy_(staged)
+            # Scatter into a CPU staging tensor sized to the live prefix [N, lm_h]
+            # only.  Rows beyond N in the persistent buffer are never read by
+            # forward() (it reads _ds_buffers[lvl][:n] with n = _ds_num_tokens = N),
+            # so writing only the first N rows is safe and avoids transferring the
+            # entire buf_len-row allocation on every call.
+            staged = torch.zeros(N, lm_h, dtype=inputs_embeds.dtype)
+            staged[is_multimodal_cpu] = level_features_cpu[level_idx]
+            self._ds_buffers[level_idx][:N].copy_(staged)
 
         self._ds_num_tokens = N
         return inputs_embeds

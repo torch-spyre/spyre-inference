@@ -171,7 +171,7 @@ class _SpyreTransposedLinearMixin:
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the
     layer normally; we then replace the unquantized method with the transposed
     one. Quantized layers keep their own method: FP8 uses
-    ``SpyreFp8LinearKernel`` (``aten._scaled_mm``). The transpose fast path only
+    ``SpyreFp8LinearKernel`` (``spyre.scaled_mm``). The transpose fast path only
     applies to unquantized weights.
     """
 

@@ -14,13 +14,14 @@
 
 """Guards for tests/mrv2: an autouse fixture makes vllm.LLM.__init__() raise,
 and a time budget (1s/test summed across setup+call+teardown, ~20s/directory,
-exempting tests marked ``triton_cpu`` or ``subprocess_isolated``) fails the
-run if exceeded. The budget alone catches an accidental real torch.compile()
-too (its fixed tracing/codegen overhead alone exceeds the per-test budget),
-without a dedicated torch.compile guard: monkeypatching it doesn't un-bake
-what a module-scope ``@torch.compile`` decorator already returned into
-whatever module first got imported during a tests/mrv2 run, so a naive guard
-leaks into unrelated, later tests in the same session.
+exempting tests marked ``triton_cpu``, ``subprocess_isolated`` or
+``spyre_device``) fails the run if exceeded. The budget alone catches an
+accidental real torch.compile() too (its fixed tracing/codegen overhead alone
+exceeds the per-test budget), without a dedicated torch.compile guard:
+monkeypatching it doesn't un-bake what a module-scope ``@torch.compile``
+decorator already returned into whatever module first got imported during a
+tests/mrv2 run, so a naive guard leaks into unrelated, later tests in the
+same session.
 
 Only applies to items collected under tests/mrv2, so a bare `pytest` from
 the repo root never has the budget hook constrain the rest of the suite.
@@ -51,6 +52,11 @@ def pytest_configure(config: pytest.Config) -> None:
         "subprocess_isolated: spawns a fresh interpreter so a before/after check "
         "isn't vacuous from an already-warm module cache; exempt from the budget",
     )
+    config.addinivalue_line(
+        "markers",
+        "spyre_device: allocates on a Spyre card, whose first use takes seconds; "
+        "exempt from the budget",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +83,7 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo):
     report = outcome.get_result()
     if not _is_mrv2_item(item):
         return
-    if "triton_cpu" in item.keywords or "subprocess_isolated" in item.keywords:
+    if {"triton_cpu", "subprocess_isolated", "spyre_device"} & set(item.keywords):
         return
 
     _item_elapsed[item.nodeid] = _item_elapsed.get(item.nodeid, 0.0) + report.duration

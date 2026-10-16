@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     # Declarations so type checkers and IDEs resolve the lazily-provided
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
+    SPYRE_MODEL_RUNNER: str = "v1"
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
@@ -54,6 +55,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
+    # Which model runner the worker uses:
+    #  - "v1": the V1 runner (default)
+    #  - "v2": the Model Runner V2 port (#906), in bring-up and not yet functional. On
+    #    x86 it runs MRV2's Triton kernels on triton-cpu.
+    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)
     #  - "model": compile the whole model as a single graph

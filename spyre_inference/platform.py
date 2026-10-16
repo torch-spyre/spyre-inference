@@ -779,8 +779,37 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
         # ---- worker ----
+        from vllm import envs as vllm_envs
+
+        from spyre_inference import envs
+        from spyre_inference.v1.worker.spyre import triton_gate
+
+        # Read fresh, not from the cache register() filled, so a value changed after
+        # `import vllm` is caught by the gate check below.
+        runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
+        if runner not in ("v1", "v2"):
+            raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
+        gate = "open" if runner == "v2" else "closed"
+        if triton_gate._state != gate:
+            raise ValueError(
+                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
+                f"{triton_gate._state or 'unset'}: set SPYRE_MODEL_RUNNER before vLLM is "
+                "imported, and the same in every process."
+            )
+        use_v2 = vllm_envs.VLLM_USE_V2_MODEL_RUNNER
+        if use_v2 is not None and use_v2 != (runner == "v2"):
+            raise ValueError(
+                f"VLLM_USE_V2_MODEL_RUNNER={os.environ['VLLM_USE_V2_MODEL_RUNNER']} conflicts "
+                f"with SPYRE_MODEL_RUNNER={runner}; unset it, SPYRE_MODEL_RUNNER picks the runner."
+            )
+        worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
+        if runner == "v2":
+            worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
+        # Read by VllmConfig.use_v2_model_runner right after this hook returns, and
+        # inherited by the engine core and worker processes. Pinned for v1 too, or vLLM's
+        # own heuristics (default-V2 architectures, PCP, dspark) can still pick V2.
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if runner == "v2" else "0"
         if parallel_config.worker_cls == "auto":
-            worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
 

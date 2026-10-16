@@ -50,8 +50,8 @@ def test_importing_the_package_has_no_side_effects() -> None:
         import torch
         from vllm import triton_utils
 
-        # device_shims.install() is the only thing allowed to touch these four.
-        _cuda_names = ("Stream", "Event", "stream", "current_stream")
+        # device_shims.install() is the only thing allowed to touch these.
+        _cuda_names = ("Stream", "Event", "stream", "current_stream", "set_stream")
         cuda_before = {{name: getattr(torch.cuda, name) for name in _cuda_names}}
         has_triton_before = triton_utils.HAS_TRITON
 

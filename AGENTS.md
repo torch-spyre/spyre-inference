@@ -13,7 +13,7 @@
 
 - `spyre_inference/platform.py` — platform registration and config
 - `spyre_inference/v1/worker/` — `spyre_worker.py` (device execution), `spyre_model_runner.py` (`torch.device("spyre")`)
-- `spyre_inference/v1/worker/spyre/` — Model Runner V2 (MRV2) only, not wired up yet; nothing outside this package imports it (#906)
+- `spyre_inference/v1/worker/spyre/` — Model Runner V2 (MRV2), in bring-up and opt-in via `SPYRE_MODEL_RUNNER=v2`; outside it only `__init__.py` and `platform.py` import it, for the Triton gate (#906)
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — PyTorch-native paged-KV attention
 - `spyre_inference/custom_ops/` — device-specific layer implementations (linear, gemma_rms_norm, rotary_embedding, vocab_parallel_embedding, parallel_lm_head, logits_processor, …)
 

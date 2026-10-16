@@ -28,6 +28,22 @@ __version__ = importlib.metadata.version("spyre_inference")
 
 def register():
     """Register the Spyre platform."""
+    # vLLM resolves the platform during `import vllm`, before vllm.triton_utils is
+    # imported, which is the last point the Triton gate can act.
+    from spyre_inference import envs
+    from spyre_inference.v1.worker.spyre import triton_gate
+
+    # vLLM's plugin probe swallows exceptions here and falls back to another platform,
+    # so errors are only logged; check_and_update_config rejects the resulting state.
+    try:
+        if envs.SPYRE_MODEL_RUNNER == "v2":
+            triton_gate.open()
+        else:
+            triton_gate.close()
+    except Exception:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).exception("Spyre Triton gate could not be applied")
     return "spyre_inference.platform.TorchSpyrePlatform"
 
 

@@ -12,11 +12,63 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from functools import cache
+from pathlib import Path
+
 import pytest
-from spyre_testing_plugin.tags import result_tags
+import yaml
+from spyre_testing_plugin.tags import model_from_params, result_tags
 
 from spyre_inference import envs
 from spyre_inference.v1.worker import compile_guard
+
+_CACHE_CONFIG = (
+    Path(__file__).resolve().parent.parent
+    / ".github"
+    / "cache_config"
+    / "hf_models_and_datasets.yaml"
+)
+
+
+def _has_hf_token() -> bool:
+    import huggingface_hub
+
+    return huggingface_hub.get_token() is not None
+
+
+@cache
+def _gated_models() -> set[str]:
+    if not _CACHE_CONFIG.exists():
+        return set()
+    try:
+        raw = yaml.safe_load(_CACHE_CONFIG.read_text()) or {}
+        entries = raw.get("gated_models", [])
+        return {
+            entry if isinstance(entry, str) else entry["repo"]
+            for entry in entries
+            if isinstance(entry, str) or (isinstance(entry, dict) and "repo" in entry)
+        }
+    except Exception:
+        return set()
+
+
+def _is_gated_model(model: str) -> bool:
+    return model in _gated_models()
+
+
+@cache
+def _is_model_available(model: str) -> bool:
+    if not _is_gated_model(model):
+        return True
+    if _has_hf_token():
+        return True
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(model, local_files_only=True)
+        return True
+    except Exception:
+        return False
 
 
 def pytest_collection_modifyitems(items):
@@ -46,6 +98,17 @@ def pytest_collection_modifyitems(items):
             or "batched_decode_calls" in item.fixturenames
         ):
             item.add_marker(skip)
+
+        model = model_from_params(params)
+        if model and not _is_model_available(model):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason=(
+                        f"Access to gated model '{model}' requires an authorized "
+                        "Hugging Face token or local cache."
+                    )
+                )
+            )
 
 
 @pytest.fixture(autouse=True)

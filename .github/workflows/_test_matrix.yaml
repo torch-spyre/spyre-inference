@@ -1,4 +1,7 @@
 name: Test matrix (reusable)
+# Cloud Logs stdout-capture E2E probe 2026-09-17: empty trigger, DO NOT MERGE.
+
+# legacy-image control: trivial edit to trip changed-files so the full matrix runs pytest on the legacy image_torch_spyre runner, giving per-test parity with shadow PR #498 (DO NOT MERGE).
 
 # ---------------------------------------------------------------------------
 # Reusable workflow — not triggered directly. Defines the build + the 6-config

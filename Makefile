@@ -42,9 +42,16 @@ endif
 # reproduces CI verbosity; override e.g. `make test PYTEST_ARGS="-x -q"`.
 PYTEST_ARGS ?= -s -vvv
 
+# Set before the interpreter, not in configure_threading: torch sizes its OpenMP pool
+# at import, and vLLM's per-test fork then segfaults in gomp_team_start.
+OMP_THREADS ?=
+OMP_ENV := $(if $(OMP_THREADS),OMP_NUM_THREADS=$(OMP_THREADS))
+
 # When set, write JUnit XML here (CI callers set this to collect results
 # for artifact upload / result ingestion). Unset = no JUnit file.
 JUNIT_XML ?=
+# testtype__ tag for runs outside GHA, whose run-matrix-config action exports the declared set itself.
+export SPYRE_TEST_TIER ?= $(TEST_TYPE)
 ifneq ($(JUNIT_XML),)
 JUNIT_ARGS := --junitxml=$(JUNIT_XML)
 else
@@ -72,7 +79,9 @@ COVERAGE_ENV :=
 endif
 
 # Map TEST_TYPE to a pytest -m marker expression. regression -> no filter
-# (all tests). MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
+# (all tests) plus --upstream, since upstream tests are opt-in and an empty
+# marker expression no longer selects them.
+# MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
 # need a marker expression finer than the 3 coarse tiers (e.g. CI splitting
 # the "regression"-only upstream suites into separate parallel jobs) -- set
 # MARK_OVERRIDE and the TEST_TYPE mapping below is skipped.
@@ -86,17 +95,24 @@ ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
 else ifeq ($(TEST_TYPE),regression)
 MARK_EXPR :=
+UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),trunk)
 MARK_EXPR :=
+UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
-# Single-invocation integration = the union of the CI smoke + compile jobs, so
-# `make tests TEST_TYPE=integration` locally keeps the compile coverage that CI
-# splits into its own job. (compile is not attention-marked, so it stays in.)
-MARK_EXPR := -m "not (distributed or upstream or attention)"
+# Single-invocation integration = the CI smoke suite, which now also carries the
+# compiled (enforce_eager=False) tests/e2e/test_compile.py cases. Probes are
+# excluded here just as the sharded smoke jobs exclude them (they run in their
+# own test-probes job and must not gate integration on strict-xfail flips), and
+# the model-quality gate likewise has its own job: every case compiles a product
+# model, up to the 31B decoders.
+MARK_EXPR := -m "not (distributed or upstream or attention or probe or model_quality)"
 else ifeq ($(TEST_TYPE),unit)
-MARK_EXPR := -m "not upstream"
+# model_quality is scheduled regression/trunk only (_test_matrix.yaml), so it stays
+# out of the unit tier as well.
+MARK_EXPR := -m "not (upstream or model_quality)"
 else
 # The validation above already rejected any type outside VALID_TEST_TYPES, so
 # a value that reaches here IS valid but has no marker mapping above -- i.e. a
@@ -109,8 +125,11 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-attention test-distributed \
-        test-upstream test-upstream-distributed test-upstream-model \
+        test-smoke test-smoke-shard test-quality test-quality-shard \
+        test-probes test-probes-shard \
+        test-attention test-attention-shard test-attention-smoke \
+        test-distributed test-distributed-shard test-upstream test-upstream-shard \
+        test-upstream-distributed \
         tests-single-card tests-multi-card
 
 help: ## Show this help message
@@ -137,6 +156,9 @@ print-test-type: ## Internal: print the resolved/validated TEST_TYPE. Lets CI (_
 # run-one sub-makes -- gated on a stamp file so repeat sub-makes skip it.
 # define (not a target body) so run-one/perf-tests can inline the exact same
 # setup commands via $(AIU_SETUP_CMD) without re-declaring them.
+# A from-source build leaves a project .venv; prefer it so `uv run --active` targets
+# it, not the image's baked venv that ibm-aiu-setup.sh re-activates in-shell. Prebaked
+# images have no project .venv and fall through to $VIRTUAL_ENV.
 AIU_SETUP_STAMP := /tmp/.spyre-inference-aiu-setup-done
 define AIU_SETUP_CMD
 if [ ! -f "$(AIU_SETUP_STAMP)" ]; then rm -f /tmp/etc/ibm/spyre/topo.json; touch "$(AIU_SETUP_STAMP)"; fi; \
@@ -144,65 +166,198 @@ unset _IBM_AIU_SETUP; \
 set +e; \
 source "$$HOME/.bashrc"; \
 source /etc/profile.d/ibm-aiu-setup.sh; \
-set -e
+set -e; \
+if [ -d "$(CURDIR)/.venv" ]; then export VIRTUAL_ENV="$(CURDIR)/.venv"; export PATH="$(CURDIR)/.venv/bin:$$PATH"; fi
 endef
 
 aiu-setup: ## Internal: source ibm-aiu-setup.sh and run its one-time side effects (memoized via a stamp file for this run).
 	$(AIU_SETUP_CMD)
 
-# uv invocations below pass --active --no-sync: they must use the prebaked image venv
-# ($VIRTUAL_ENV) and skip re-resolution, since the lockfile pins wheels (torch +cpu,
-# bitsandbytes) that have no ppc64le build even though the venv is already complete.
+# uv invocations below pass --active --no-sync: they must use the active venv
+# ($VIRTUAL_ENV, repointed above to the project .venv when one is present) and skip
+# re-resolution, since the lockfile pins wheels (torch +cpu, bitsandbytes) that have
+# no ppc64le build even though the venv is already complete.
 run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARGS.
 	# ibm-aiu-setup.sh ends with a chmod of root-owned /tmp/etc that fails on
 	# the Spyre image; env vars are already exported by then, so tolerate
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	$(OMP_ENV) $(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
-test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile).
-	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile)' JUNIT_XML=$(JUNIT_XML)
+test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-probe, non-model-quality). Carries the compiled e2e cases.
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' JUNIT_XML=$(JUNIT_XML)
 
-test-compile: ## Run the torch.compile marker combo (its own job; slow).
-	$(MAKE) run-one MARK_OVERRIDE='compile and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+# The smoke suite is dominated by a handful of e2e model tests (including the
+# compiled enforce_eager=False cases in tests/e2e/test_compile.py), so CI fans it
+# out across parallel shard jobs the same way as attention. The plugin owns the
+# weighted partition (--smoke-shards); it balances by recorded per-test runtime
+# when a durations file is present (SPYRE_TEST_DURATIONS), else by e2e-path weight.
+# SMOKE_SHARDS is the single source of truth for the count.
+SMOKE_SHARDS ?= 8
+SMOKE_SHARD_ID ?= 0
+test-smoke-shard: ## Run one smoke shard (SMOKE_SHARDS=N SMOKE_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or probe or model_quality)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --smoke-shards=$(SMOKE_SHARDS) --smoke-shard-id=$(SMOKE_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
 
-test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split).
+# CI runs one matrix job per shard as `test-smoke-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to SMOKE_SHARD_ID.
+test-smoke-shard-%:
+	$(MAKE) test-smoke-shard SMOKE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# The model-output quality gate. Two kinds of heavy case share it: the product-model output
+# checks (`model_quality`; local, every case compiles a product model, up to the 31B decoders)
+# and the GSM8K accuracy evals (`gsm8k`; each starts a vLLM server and runs a batched eval).
+# The gsm8k evals live in the upstream vLLM tree and carry the `upstream` marker, so the combo
+# names `upstream` on that branch: the gate detects it and clones the cached vLLM checkout (as
+# test-upstream does), no --upstream flag needed. `not (distributed or upstream)` on the
+# model_quality branch keeps those local and on one card.
+test-quality: ## Run the model-output quality gate (product-model output checks + GSM8K accuracy evals). Unsharded (local full run). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# CI fans the gate out across parallel 1-card shard jobs like smoke/attention; the plugin's
+# weighted partition (--quality-shards) balances by recorded runtime when a durations file
+# is present, else by the decoder/eval-vs-encoder path weight. No partition beats the slowest
+# single case, so that bounds the useful count. QUALITY_SHARDS is the single source of truth.
+QUALITY_SHARDS ?= 8
+QUALITY_SHARD_ID ?= 0
+test-quality-shard: ## Run one quality shard (QUALITY_SHARDS=N QUALITY_SHARD_ID=i). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='(model_quality and not (distributed or upstream)) or (gsm8k and upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --quality-shards=$(QUALITY_SHARDS) --quality-shard-id=$(QUALITY_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-quality-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to QUALITY_SHARD_ID.
+test-quality-shard-%:
+	$(MAKE) test-quality-shard QUALITY_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+test-probes: ## Run the torch-spyre backend probes (excluded from integration), unsharded (local full run).
+	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' JUNIT_XML=$(JUNIT_XML)
+
+# The 2-card probe suite is sharded across parallel 2-card CI jobs, like the
+# distributed suite; the weighted partition (--probe-shards) balances by recorded
+# runtime when a durations file is present, else evenly. PROBE_SHARDS is the count.
+PROBE_SHARDS ?= 2
+PROBE_SHARD_ID ?= 0
+test-probes-shard: ## Run one probe shard (PROBE_SHARDS=N PROBE_SHARD_ID=i). Needs 2 cards.
+	$(MAKE) run-one MARK_OVERRIDE='probe and not upstream' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --probe-shards=$(PROBE_SHARDS) --probe-shard-id=$(PROBE_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-probes-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to PROBE_SHARD_ID.
+test-probes-shard-%:
+	$(MAKE) test-probes-shard PROBE_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split), one process.
 	$(MAKE) run-one MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# Decoder attention is sharded across parallel CI jobs: the compiled
+# (STOCK on device) cases dominate runtime and grow HBM within a process, so
+# each shard runs as its own process (own card in CI, sequential locally) to
+# bound per-process growth and cut wall-clock to the slowest shard. The plugin
+# owns the partition (--attn-shards), balancing by recorded per-test runtime when
+# a durations file is present else by compiled-case weight; this only threads the
+# knobs through. ATTN_SHARDS is the single source of truth for the count.
+ATTN_SHARDS ?= 10
+ATTN_SHARD_ID ?= 0
+test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHARD_ID=i).
+	$(MAKE) run-one \
+	  MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --attn-shards=$(ATTN_SHARDS) --attn-shard-id=$(ATTN_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-attention-shard-<i>`, so each job's
+# JUnit artifact name (junit-<target>.xml) is unique; the pattern maps <i> to
+# ATTN_SHARD_ID. ATTN_SHARDS (the total) comes from its default above.
+test-attention-shard-%:
+	$(MAKE) test-attention-shard ATTN_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
-test-distributed: ## Run the distributed marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='distributed and not upstream' JUNIT_XML=$(JUNIT_XML)
+# Small decoder-attention subset; the full attention suite is excluded from the integration
+# tier, so this is the only attention the upstream dispatch exercises. Also marked `attention`,
+# so the same cases still run inside the full shards under the other tiers.
+test-attention-smoke: ## Run the small attention smoke subset (integration-tier attention coverage). Needs 1 card.
+	$(MAKE) run-one MARK_OVERRIDE='attention_smoke and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
-test-upstream: ## Run the upstream (non-distributed, non-model) marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not model' JUNIT_XML=$(JUNIT_XML)
+test-distributed: ## Run the distributed marker combo (excludes probes; they run in test-probes), unsharded.
+	$(MAKE) run-one MARK_OVERRIDE='distributed and not (upstream or probe)' JUNIT_XML=$(JUNIT_XML)
 
+# The distributed (TP=2) suite is sharded across parallel 2-card CI jobs. Each
+# case spawns a TP=2 subprocess pair, so the model-run cases dominate; the
+# weighted partition (--dist-shards) balances by recorded runtime when a
+# durations file is present, else evenly. DIST_SHARDS is the source of the count.
+DIST_SHARDS ?= 3
+DIST_SHARD_ID ?= 0
+test-distributed-shard: ## Run one distributed shard (DIST_SHARDS=N DIST_SHARD_ID=i). Needs 2 cards.
+	$(MAKE) run-one MARK_OVERRIDE='distributed and not (upstream or probe)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --dist-shards=$(DIST_SHARDS) --dist-shard-id=$(DIST_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-distributed-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to DIST_SHARD_ID.
+test-distributed-shard-%:
+	$(MAKE) test-distributed-shard DIST_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# `not gsm8k` carves the GSM8K accuracy gate out of the upstream suite: the gsm8k evals
+# carry the `upstream` marker but belong to the quality suite (test-quality above).
+test-upstream: ## Run the upstream (non-distributed) marker combo, unsharded (local full run).
+	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' JUNIT_XML=$(JUNIT_XML)
+
+# Non-distributed upstream tests are sharded across parallel CI jobs. The heavy
+# model tests (under a models/ path) used to be a separate test-upstream-model
+# job; the weighted partition (--upstream-shards) balances them automatically,
+# by recorded per-test runtime when a durations file is present else by models/
+# path weight. UPSTREAM_SHARDS is the single source of the count.
+UPSTREAM_SHARDS ?= 7
+UPSTREAM_SHARD_ID ?= 0
+test-upstream-shard: ## Run one non-distributed upstream shard (UPSTREAM_SHARDS=N UPSTREAM_SHARD_ID=i).
+	$(MAKE) run-one MARK_OVERRIDE='upstream and not distributed and not gsm8k' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --upstream-shards=$(UPSTREAM_SHARDS) --upstream-shard-id=$(UPSTREAM_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-upstream-shard-<i>` so each JUnit
+# artifact name is unique; the pattern maps <i> to UPSTREAM_SHARD_ID.
+test-upstream-shard-%:
+	$(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
+
+# The only combo that forks per test (fork_new_process_for_each_test).
 test-upstream-distributed: ## Run the upstream+distributed marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' JUNIT_XML=$(JUNIT_XML)
+	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' OMP_THREADS=1 JUNIT_XML=$(JUNIT_XML)
 
-test-upstream-model: ## Run the upstream+model (non-distributed) marker combo.
-	$(MAKE) run-one MARK_OVERRIDE='upstream and model and not distributed' JUNIT_XML=$(JUNIT_XML)
-
-# Single-card / multi-card split, grouping the 6 marker combos above by how many cards they need.
+# Single-card / multi-card split, grouping the marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the non-distributed marker combos (smoke/compile/attention/encoder-attention/upstream/upstream-model). Needs 1 card.
+tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-smoke" && $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke/junit-test-smoke.xml" || rc=1; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-compile" && $(MAKE) test-compile JUNIT_XML="$(RESULTS_DIR)/junit-test-compile/junit-test-compile.xml" || rc=1; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-attention" && $(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-attention/junit-test-attention.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-smoke-shard-$$i" && $(MAKE) test-smoke-shard SMOKE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke-shard-$$i/junit-test-smoke-shard-$$i.xml" || rc=1; \
+	done; \
+	for i in $$(seq 0 $$(( $(QUALITY_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-quality-shard-$$i" && $(MAKE) test-quality-shard QUALITY_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-quality-shard-$$i/junit-test-quality-shard-$$i.xml" || rc=1; \
+	done; \
+	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
+	done; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-upstream" && $(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream/junit-test-upstream.xml" || rc=1; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-model" && $(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-model/junit-test-upstream-model.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(UPSTREAM_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-upstream-shard-$$i" && $(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-shard-$$i/junit-test-upstream-shard-$$i.xml" || rc=1; \
+	done; \
 	exit $$rc
 
-tests-multi-card: ## Run the distributed marker combos (distributed/upstream-distributed). Needs 2 cards.
+tests-multi-card: ## Run the 2-card marker combos (distributed shards/upstream-distributed/probes). Needs 2 cards.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-distributed" && $(MAKE) test-distributed JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed/junit-test-distributed.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(DIST_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-distributed-shard-$$i" && $(MAKE) test-distributed-shard DIST_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-distributed-shard-$$i/junit-test-distributed-shard-$$i.xml" || rc=1; \
+	done; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-distributed" && $(MAKE) test-upstream-distributed JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-distributed/junit-test-upstream-distributed.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(PROBE_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-probes-shard-$$i" && $(MAKE) test-probes-shard PROBE_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-probes-shard-$$i/junit-test-probes-shard-$$i.xml" || rc=1; \
+	done; \
 	exit $$rc
 
 # When MARK_OVERRIDE is unset and TEST_TYPE=regression (or trunk, same
@@ -240,8 +395,8 @@ coverage: ## Combine COVERAGE=1 data (COVERAGE_DATA=dir) into report + coverage.
 # WITHOUT torch, so every benchmark then dies with "No module named 'torch'".
 # No combination of --active/--no-sync/--frozen/--inexact/--no-project avoids
 # this. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv entirely and invoke the
-# already-activated venv's python3 directly (the setup sourced above exports
-# $VIRTUAL_ENV, so plain python3 is the baked interpreter). Empty/unset keeps
+# active venv's python3 directly (AIU_SETUP_CMD prefers the project .venv when
+# present, otherwise keeping the profile-selected venv). Empty/unset keeps
 # the uv path, correct on arches with a resolvable lockfile (amd64, ppc64le).
 SKIP_UV_FOR_BENCHMARKING ?=
 ifeq ($(strip $(SKIP_UV_FOR_BENCHMARKING)),)
@@ -252,16 +407,46 @@ endif
 
 # Optional benchmark filters (empty = run everything). MODELS narrows to a
 # comma-separated set of model names -- CI passes the per-model matrix entry
-# here so each job benches a single model. BENCH_TYPES narrows to a subset of
-# latency,throughput,serve for quick local iteration.
+# here so each job benches a single model. TPS narrows to a comma-separated set
+# of tensor-parallel sizes, e.g. TPS=1,4. BENCH_TYPES narrows to a subset of
+# latency,throughput,serve for quick local iteration. BENCH_SUITE=dev runs the
+# *-tests-dev.yaml configs, which are too long for CI.
 MODELS ?=
+TPS ?=
 BENCH_TYPES ?=
+# Directory holding the {latency,throughput,serve}-tests.yaml files to run.
+BENCH_CONFIGS_DIR ?= vllm-benchmarks/benchmarks/spyre
+BENCH_SUITE ?=
 
-perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv> and/or BENCH_TYPES=latency,throughput,serve. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x).
+# The serve configs replay trace files that are not in the repo, so the fetch is
+# what makes a serve config runnable at all and is on by default. Set
+# FETCH_BENCH_DATA=0 on a host that already has the traces mounted. A named
+# BENCH_SUITE skips the fetch by default, since no suite has a serve config yet;
+# a suite that adds a serve-tests-<suite>.yaml must set FETCH_BENCH_DATA=1.
+#
+# The script writes `export SPYRE_*_DATASET=...` lines to stdout and its
+# diagnostics to stderr, so capture stdout to a file and source that rather than
+# eval'ing a pipeline, which would hide the exit status. An artifact the script
+# cannot fetch is a warning and not an error, so it still exits 0 and simply
+# exports nothing for that artifact; run_vllm_benchmarks.py then fails by name
+# for the configs that actually need it and runs the rest. The `&&` still matters
+# for the case the script really does fail, e.g. a corrupt cache under `verify`.
+FETCH_BENCH_DATA ?= $(if $(strip $(BENCH_SUITE)),0,1)
+ifeq ($(strip $(FETCH_BENCH_DATA)),0)
+BENCH_DATA_CMD := true
+else
+BENCH_DATA_CMD := python3 .github/scripts/fetch_bench_datasets.py > "$$_bench_env" && . "$$_bench_env"
+endif
+
+perf-tests: ## Run vLLM benchmark suite, writing JSON results under RESULTS_DIR. Filter with MODELS=<csv>, TPS=<csv of tensor-parallel sizes> and/or BENCH_TYPES=latency,throughput,serve. Set BENCH_CONFIGS_DIR=<dir> to run custom config files. Set BENCH_SUITE=dev to run the long-context *-tests-dev.yaml configs instead of the CI ones. Set SKIP_UV_FOR_BENCHMARKING=1 to bypass uv and use the active venv's python3 directly (needed on s390x). Set FETCH_BENCH_DATA=0 to use pre-mounted traces instead of fetching them.
 	mkdir -p "$(RESULTS_DIR)"
+	_bench_env="$$(mktemp)"; trap 'rm -f "$$_bench_env"' EXIT; \
 	$(AIU_SETUP_CMD); \
+	$(BENCH_DATA_CMD) && \
 	$(BENCH_PY) .github/scripts/run_vllm_benchmarks.py \
-		--configs-dir vllm-benchmarks/benchmarks/spyre \
+		--configs-dir "$(BENCH_CONFIGS_DIR)" \
 		--results-dir "$(RESULTS_DIR)" \
 		--models "$(MODELS)" \
-		--bench-types "$(BENCH_TYPES)"
+		--tps "$(TPS)" \
+		--bench-types "$(BENCH_TYPES)" \
+		--suite "$(BENCH_SUITE)"

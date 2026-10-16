@@ -13,29 +13,40 @@
 # limitations under the License.
 
 import torch
-
+from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 
+from .lazy_compile import CompileOutermost, maybe_compile
 from .utils import convert
+from .vocab_parallel_embedding import promote_tied_lm_head
 
 
 @LogitsProcessor.register_oot(name="LogitsProcessor")
-class SpyreLogitsProcessor(LogitsProcessor):
+class SpyreLogitsProcessor(CompileOutermost, LogitsProcessor):
     def _apply_head(self, lm_head, hidden_states, embedding_bias=None):
         """Project through the lm_head, then D2H the logits on the single-card path.
 
-        SpyreParallelLMHead.forward_oot returns logits on Spyre so the TP
-        all_gather in ``_gather_logits`` (which also D2Hs) can run on-device.
+        The head's ``SpyreUnquantizedLMHeadMethod.apply`` returns logits on Spyre so the
+        TP all_gather in ``_gather_logits`` (which also D2Hs) can run on-device.
         Upstream only calls ``_gather_logits`` when ``tp_size > 1``, so with a
         single card the logits would otherwise stay on Spyre and the sampler's
         ``logits.to(torch.float32)`` crashes torch-spyre's ``copy_from_d2d``.
         Move them to CPU here so downstream sampling always gets CPU logits.
         """
+        # A model may hand us its embedding table as the head; give it a padded `Wᵀ`
+        # on the first call, where the head's identity is finally unambiguous.
+        promote_tied_lm_head(lm_head)
+
         logits = super()._apply_head(lm_head, hidden_states, embedding_bias)
         if lm_head.tp_size <= 1:
             logits = convert(logits, device="cpu")
         return logits
 
+    @maybe_compile
+    def _all_gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        return tensor_model_parallel_all_gather(logits)
+
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Gather TP-sharded logits on Spyre, then move the result to CPU."""
-        return convert(super()._gather_logits(logits), device="cpu")
+        # `Platform.use_all_gather()` is constant-True on Spyre, so the gather is always the
+        # all-gather form; compiled it lowers to `spyre::all_gather_async`, then D2H for sampling.
+        return convert(self._all_gather_logits(logits), device="cpu")

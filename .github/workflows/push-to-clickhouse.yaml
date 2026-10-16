@@ -25,6 +25,12 @@ on:
         description: Workflow name (integration-tests | test_each_commit)
         required: false
         default: integration-tests
+      display_title:
+        description: >-
+          Run-name of the run being re-ingested ("regression", "trunk" or
+          "integration-tests (<test_type>)"). The tier comes from it, and v2 skips a run without one.
+        required: false
+        default: ''
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -40,8 +46,8 @@ jobs:
     name: Ingest XML -> ClickHouse
     runs-on:
       - x86_64
-      - spyre_pf_x0
       - linux
+      - image_ingest
     timeout-minutes: 15
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
@@ -73,18 +79,21 @@ jobs:
       # workflow's run-name, or the bare tier ("trunk" / "regression") via
       # test_each_commit's -- the only way this job can recover which tier
       # ran without an extra API call.
-      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
     steps:
       # workflow_run always executes this file as it exists on the default
       # branch, so a plain checkout (no ref:) here pulls the canonical copy
-      # of the ingest script regardless of which ref triggered the run.
-      - name: Checkout ingest script
+      # of the ingest scripts regardless of which ref triggered the run.
+      - name: Checkout ingest scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           sparse-checkout: |
+            .github/scripts/list_run_artifacts.py
+            .github/scripts/download_xml_artifacts.py
+            .github/scripts/group_xml_by_arch.py
             .github/scripts/ingest_xml_si.py
           sparse-checkout-cone-mode: false
 
@@ -93,23 +102,46 @@ jobs:
 
       - name: setup venv
         run: |
-          uv venv
-          source .venv/bin/activate
+          # Named .venv-v1, not .venv: the v2 ingest step below (the shared
+          # torch-spyre composite action) also runs `uv venv` in this same
+          # workspace, and `uv venv .venv` a second time fails with "A virtual
+          # environment already exists at: .venv".
+          uv venv .venv-v1
+          source .venv-v1/bin/activate
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
 
       - name: Install Python dependencies
         run: |
-          source .venv/bin/activate
+          source .venv-v1/bin/activate
           uv pip install requests clickhouse-driver clickhouse-connect lxml regex
+          # The v2 schema and write path live in torch-spyre's extensions/ so all three
+          # product repos share ONE definition of run_id and test_case_id.
+          uv pip install \
+            "git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest"
 
       - name: Install gh CLI
+        env:
+          # Offline floor only: used when api.github.com can't be reached to resolve the
+          # latest release, so a transient API failure degrades to a known-good gh instead
+          # of failing the job.
+          GH_CLI_VERSION_FLOOR: 2.98.0
         run: |
-          # curl, not wget: not every node in the spyre runner pool has wget.
-          curl -fsSL https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_amd64.tar.gz \
-            -o gh_2.92.0_linux_amd64.tar.gz
-          tar -xzf gh_2.92.0_linux_amd64.tar.gz
-          echo "$PWD/gh_2.92.0_linux_amd64/bin" >> "${GITHUB_PATH}"
-          gh_2.92.0_linux_amd64/bin/gh --version
+          set -euo pipefail
+          # Track the latest gh release rather than a pin: nothing here depends on a
+          # specific gh version, and a pin silently rots (this fleet had 2.92.0 and 2.97.0
+          # drifting apart across workflows).
+          ver="$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest \
+                   | jq -r '.tag_name // empty' | sed 's/^v//')" || ver=""
+          if [ -z "$ver" ]; then
+            echo "api.github.com unreachable; flooring to ${GH_CLI_VERSION_FLOOR}"
+            ver="${GH_CLI_VERSION_FLOOR}"
+          fi
+          # curl, not wget: the ingest runner image ships curl but no wget.
+          curl -fsSL "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_amd64.tar.gz" \
+            -o gh.tar.gz
+          tar -xzf gh.tar.gz
+          echo "$PWD/gh_${ver}_linux_amd64/bin" >> "${GITHUB_PATH}"
+          "gh_${ver}_linux_amd64/bin/gh" --version
 
       - name: Resolve PR number
         id: resolve-pr
@@ -127,85 +159,56 @@ jobs:
           echo "Resolved PR number: ${PR} (triggering event: ${TRIGGERING_EVENT:-<manual dispatch>})"
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
-      # ---------------------------------------------------------------------------
-      # Download every artifact from the triggering run and unzip it — artifact
-      # *names* carry no file extension (only the file inside the zip does), so
-      # filtering has to happen post-unzip by actual filename, not by artifact name.
-      #
-      # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that silently lost every artifact
-      # past the first page, with no error — rows just never showed up in
-      # ClickHouse. `--paginate` applies `--jq` per page and concatenates the
-      # filtered results across pages (`gh api` rejects `--slurp` combined
-      # with `--jq`), so the per-artifact objects come out as a JSON stream,
-      # not a single array; python3 slurps that stream into one array below.
-      # ---------------------------------------------------------------------------
+      # Download only the junit-* artifacts and run-id/artifact-id sidecars of the triggering run.
       - name: List artifacts from triggering run
         id: list-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | {id: .id, name: .name}' \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
-          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
-          echo "Found artifacts:"
-          echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
+          python3 .github/scripts/list_run_artifacts.py --run-id "${TRIGGERING_RUN_ID}"
 
       - name: Download XML artifacts
+        id: download-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS: ${{ steps.list-artifacts.outputs.artifacts }}
         run: |
-          mkdir -p xml_artifacts
-          export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
-          python3 <<'PYEOF'
-          import json, os, subprocess, sys
-          from pathlib import Path
-
-          artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo  = os.environ['GITHUB_REPOSITORY']
-          for a in artifacts:
-              print(f"Downloading: {a['name']} (id={a['id']})")
-              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
-                result = subprocess.run([
-                    "gh", "api",
-                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                ], check=True, env={**os.environ}, capture_output=True)
-                f.write(result.stdout)
-              # Each artifact unzips into its OWN subdirectory (named after
-              # the artifact) rather than a shared flat one, so two suites
-              # can never clobber each other even if they happen to produce
-              # a JUnit XML with the same basename. ingest_xml_si.py globs
-              # --xml-dir recursively and derives a unique filename from the
-              # path relative to it, so this nesting is exactly what it
-              # expects.
-              dest = Path("xml_artifacts") / a["name"]
-              subprocess.run(
-                  ["unzip", "-o", f"xml_artifacts/{a['name']}.zip", "-d", str(dest)],
-                  check=True,
-              )
-          PYEOF
+          python3 .github/scripts/download_xml_artifacts.py --out-dir xml_artifacts
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
+
+      # The orchestrator's threaded run_id, uploaded as an artifact because this workflow runs on
+      # workflow_run and so cannot read the triggering run's inputs. Empty on a GHA-initiated run
+      # or a manual re-ingest, in which case the ingest derives its own id from the run coordinate.
+      - name: Resolve threaded run_id
+        id: resolve-run-id
+        run: |
+          # _test_matrix.yaml or integration-tests.yaml uploads "run-id", downloaded with the XML.
+          RID="$(tr -d '[:space:]' < xml_artifacts/run-id/run-id.txt 2>/dev/null || true)"
+          echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
+          echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+
+      # Uploaded by _test_matrix's artifact_identity job and downloaded with the XML above.
+      # Absent (unadopted run, image with no stamped id) makes the v2 ingest write cases only.
+      - name: Resolve this run's artifact_id
+        id: leg-artifact-id
+        run: |
+          REC="$(tr -d '[:space:]' < xml_artifacts/artifact-id/artifact-id.txt 2>/dev/null || true)"
+          LEG_AID="${REC%%|*}"
+          echo "Leg artifact_id: ${LEG_AID:-<none, no artifact rows>}"
+          echo "value=${REC}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve test_type for trigger_type
         id: extract-tier
         run: |
-          if [[ "${TRIGGERING_WORKFLOW}" == "test_each_commit" ]]; then
-            # test_each_commit's run-name IS the external-facing tier name
-            # itself ("trunk" on push, "regression" otherwise) -- no parens
-            # to parse out.
-            TIER="${TRIGGERING_DISPLAY_TITLE}"
-          else
-            # integration-tests' run-name is deliberately
-            # "integration-tests (<inputs.test_type>)" -- the RAW test_type
-            # value the caller passed (e.g. "integration" / "regression" /
-            # "trunk"); there is no internal alias vocabulary to resolve
-            # through (see _test_matrix.yaml's test_type description) -- so
-            # parsing it out of display_title recovers the real external-
-            # facing value without an extra API call.
+          # Keyed on the title's shape, not TRIGGERING_WORKFLOW: workflow_run.name carries the
+          # run-name, so it is never "test_each_commit".
+          if [[ "${TRIGGERING_DISPLAY_TITLE}" == *"("*")"* ]]; then
+            # integration-tests: "integration-tests (<inputs.test_type>)".
             TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          else
+            # test_each_commit: the bare tier ("trunk" on push, "regression" otherwise).
+            TIER="${TRIGGERING_DISPLAY_TITLE}"
           fi
           echo "Resolved test_type: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
@@ -214,20 +217,110 @@ jobs:
       # Parse each XML file and insert rows into ClickHouse via
       # ingest_xml_si.py (checked out above), into
       # si_test_runs / si_test_cases / si_run_properties.
-      # ---------------------------------------------------------------------------
       - name: Ingest XML files into ClickHouse
+        env:
+          # Fallback only: each leg uploads its own arch beside its JUnit XML, which the
+          # ingest prefers per file. Used when that sidecar is absent (a re-ingest of an
+          # older run), since arch is hashed into run_id and this job is pinned to x86_64.
+          LEG_ARCH: x86_64
+          # Routed through env rather than interpolated into the script: this job runs on
+          # workflow_run, a privileged trigger, and the value comes from a downloaded artifact.
+          THREADED_RUN_ID: ${{ steps.resolve-run-id.outputs.run_id }}
+          PR_NUMBER: ${{ steps.resolve-pr.outputs.pr_number }}
+          TIER: ${{ steps.extract-tier.outputs.tier }}
         run: |
-          source .venv/bin/activate
+          source .venv-v1/bin/activate
           python3 .github/scripts/ingest_xml_si.py \
             --xml-dir xml_artifacts \
             --workflow "${TRIGGERING_WORKFLOW}" \
             --branch   "${TRIGGERING_BRANCH}" \
             --sha      "${TRIGGERING_SHA}" \
-            --run-id   "${TRIGGERING_RUN_ID}" \
+            --gha-run-id "${TRIGGERING_RUN_ID}" \
+            --run-id   "${THREADED_RUN_ID}" \
             --triggered-at "${TRIGGERING_AT}" \
-            --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
-            --trigger-type "${{ steps.extract-tier.outputs.tier }}" \
-            --platform "$(uname -m)"
+            --pr-number    "${PR_NUMBER}" \
+            --trigger-type "${TIER}" \
+            --platform "${LEG_ARCH}"
+
+      # Schema-v2 via torch-spyre's reusable action, grouped by leg arch first since arch is a run_id hash input and the matrix dispatches non-x86_64 legs too.
+      - name: Group XML files by leg arch
+        id: group-by-arch
+        run: |
+          python3 .github/scripts/group_xml_by_arch.py --src-dir xml_artifacts --dest-dir xml_by_arch
+
+      - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
+        if: steps.group-by-arch.outputs.has_x86_64 == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/x86_64
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          # x86_64 only: the record describes the x86_64 image every matrix leg runs on.
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          repository: ${{ github.repository }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          # Tags the artifact <repo>@<sha12> (push to main) or <repo>#<pr>[@<sha12>] (PR).
+          ci-event: ${{ env.TRIGGERING_EVENT }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: x86_64
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+
+      - name: Ingest XML into shared v2 ClickHouse tables (ppc64le)
+        if: steps.group-by-arch.outputs.has_ppc64le == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/ppc64le
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: ppc64le
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
+
+      - name: Ingest XML into shared v2 ClickHouse tables (s390x)
+        if: steps.group-by-arch.outputs.has_s390x == 'true'
+        uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
+        with:
+          xml-dir: xml_by_arch/s390x
+          workflow: ${{ env.TRIGGERING_WORKFLOW }}
+          branch: ${{ env.TRIGGERING_BRANCH }}
+          sha: ${{ env.TRIGGERING_SHA }}
+          run-id: ${{ steps.resolve-run-id.outputs.run_id }}
+          gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          triggered-at: ${{ env.TRIGGERING_AT }}
+          pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          platform: s390x
+          component: spyre-inference
+          schema: v2
+          clickhouse-host: ${{ secrets.CLICKHOUSE_HOST }}
+          clickhouse-port: ${{ secrets.CLICKHOUSE_PORT }}
+          clickhouse-user: ${{ secrets.CLICKHOUSE_USER }}
+          clickhouse-pass: ${{ secrets.CLICKHOUSE_PASS }}
+          clickhouse-db: ${{ secrets.CLICKHOUSE_DB }}
+          clickhouse-db-v2: ${{ secrets.CLICKHOUSE_DB_V2 }}
 
       - name: Summary
         if: always()

@@ -16,7 +16,7 @@
 Post a daily Slack reminder listing the stalest open pull requests.
 
 Open PRs with no activity within STALE_HOURS are sorted oldest-activity-first and
-the top MAX_PRS are posted to SLACK_CHANNEL_ID.
+the top MAX_PRS are posted to the configured Slack destination.
 
 Posting needs either SLACK_WEBHOOK_URL, or SLACK_BOT_TOKEN plus SLACK_CHANNEL_ID.
 
@@ -49,7 +49,7 @@ import re
 import sys
 import traceback
 from argparse import ArgumentParser, Namespace
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 
 import requests
 from slack_sdk import WebClient
@@ -87,10 +87,12 @@ STALE_HOURS = float(os.environ.get("STALE_HOURS") or "24")
 # backlog item any more, it is abandoned, and stale.yml already chases those.
 # Set to 0 to disable the upper bound.
 MAX_IDLE_DAYS = float(os.environ.get("MAX_IDLE_DAYS") or "30")
+# Normalized like titles so one entry covers "do-not-merge", "do not merge" and
+# "Do Not Merge" — GitHub label names carry spaces the exact string wouldn't match.
 EXEMPT_LABELS = {
-    label.strip().lower()
+    normalized
     for label in (os.environ.get("EXEMPT_LABELS") or "keep-open,stale,do-not-merge").split(",")
-    if label.strip()
+    if (normalized := normalize_title(label))
 }
 # Authors flag "not ready" in the title far more often than with a label, so the
 # title is checked too. Patterns are matched against a normalized title, which
@@ -182,7 +184,7 @@ def select_stale(prs: list[dict], now: datetime) -> tuple[list[dict], int]:
     for pr in prs:
         if pr.get("draft"):
             continue
-        labels = {label["name"].lower() for label in pr.get("labels") or []}
+        labels = {normalize_title(label["name"]) for label in pr.get("labels") or []}
         if labels & EXEMPT_LABELS:
             continue
         title_key = normalize_title(pr["title"])
@@ -385,7 +387,7 @@ def write_step_summary(text: str) -> None:
         handle.write(f"### PR reminder\n\n{text}\n")
 
 
-def report_failure(error: BaseException) -> int:
+def report_failure(error: BaseException) -> None:
     """Escalate a pre-Slack failure: Slack, else a GitHub issue, else just fail."""
     log.error("PR reminder failed:\n%s", format_error(error))
     failure_text = FAILURE_TEMPLATE.format(
@@ -393,14 +395,13 @@ def report_failure(error: BaseException) -> int:
     )
     try:
         post_to_slack(failure_text)
-        return 1
+        return
     except (SlackClientError, RuntimeError, OSError) as slack_error:
         log.error("Could not report the failure to Slack: %s", redact(str(slack_error)))
     try:
         open_failure_issue(github_session(), error)
     except Exception as issue_error:  # last rung of the ladder
         log.error("Could not open a failure issue either: %s", redact(str(issue_error)))
-    return 1
 
 
 def main() -> int:
@@ -416,7 +417,8 @@ def main() -> int:
             return 0
         text = render_message(top, total, now)
     except Exception as error:  # any failure before the post must escalate
-        return report_failure(error)
+        report_failure(error)
+        return 1
 
     write_step_summary(text)
     if args.dry_run:

@@ -41,7 +41,7 @@ base class names, inheritance relationships, and any new extension points:
 
 **Worker & model runner:**
 
-- `v1/worker/cpu_worker.py` — `CPUWorker` base class
+- `v1/worker/gpu_worker.py` — `Worker` base class (parent of `TorchSpyreWorker`)
 - `v1/worker/gpu_model_runner.py` — `GPUModelRunner` (pattern reference for model runners)
 
 **Engine & scheduling:**
@@ -49,7 +49,7 @@ base class names, inheritance relationships, and any new extension points:
 - `v1/engine/core.py` — `EngineCore`
 - `v1/engine/async_llm.py` — `AsyncLLM`
 - `v1/core/kv_cache_manager.py` — `KVCacheManager`
-- `v1/core/scheduler.py` — vLLM's `Scheduler`
+- `v1/core/sched/scheduler.py` — vLLM's `Scheduler`
 
 **Attention:**
 
@@ -233,8 +233,8 @@ Compare the current code against the diagrams and docs:
 5. **Architecture changes** — new processes, new inheritance relationships, new composition.
    E.g., if a new scheduler override is added, it should appear in the system overview.
 
-6. **Key constraints** — check alignment constants (KV_LEN_ALIGNMENT, QUERY_CHUNK_SIZE,
-   head size requirements) and update the docs if they changed.
+6. **Key constraints** — check the bucketing (`SpyreAttnBucketer`'s kv/query
+   buckets, head size requirements) and update the docs if they changed.
 
 ## index.md Image Styling
 

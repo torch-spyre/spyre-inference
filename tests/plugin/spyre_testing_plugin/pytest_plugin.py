@@ -13,15 +13,26 @@
 # limitations under the License.
 
 """
-pytest11 plugin for spyre-inference.
+pytest plugin for spyre-inference.
 
 This plugin integrates upstream vLLM tests with spyre-inference
 and filtering via a declarative YAML config (upstream_tests.yaml).
+
+Activation
+----------
+Loaded via `addopts = ["-p", "spyre_testing_plugin.pytest_plugin"]` in this repo's
+pyproject.toml rather than a pytest11 entry point, which would apply its autouse fixtures
+to every pytest session in the venv (e.g. a sibling torch-spyre checkout). Pass
+`-p spyre_testing_plugin.pytest_plugin` by hand to run it against a vLLM checkout.
+
+Upstream tests are opt-in: cloned and injected only when the `-m` expression can select
+the `upstream` marker, or `--upstream` is passed.
 
 Hook Execution Order
 ---------------------
 1. pytest_configure (tryfirst)
     - Loads Spyre plugins (custom ops, platform)
+    - Sizes this process's torch thread pool to the container's CPU budget
     - Detects local vLLM repo OR clones to ~/.cache/vllm-upstream-tests/
     - Injects test paths into pytest collection
 
@@ -31,23 +42,27 @@ Hook Execution Order
 
 3. pytest_collection_modifyitems
     - Applies skip/xfail markers based on YAML allow_list/block_list
-    - Applies tag markers for filtering (e.g., pytest -m rmsnorm)
+    - Applies tag markers for filtering (e.g., pytest -m "granite and upstream")
 
 4. pytest_fixture_setup (tryfirst)
     - Overrides default_vllm_config fixture with Spyre-specific config
 
 Environment Variables
 ---------------------
-SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning
-UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
+SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning, even when
+                        the -m expression or --upstream asks for them
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
 XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
+SPYRE_NUM_CPUS          CPU budget for the torch thread clamp (default: auto-detected)
+SPYRE_UPDATE_THREAD_CONFIG  Set to 0 to leave this process's torch thread pool alone
 """
 
 from __future__ import annotations
 
+import atexit
 import fnmatch
+import math
 import os
 import re
 import socket
@@ -56,16 +71,18 @@ import sys
 import tempfile
 import time
 import tomllib
-import torch.distributed as dist
-import torch.testing
-
+import traceback
 from pathlib import Path
 
 import pytest
 import torch
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+import torch.distributed as dist
+import torch.testing
 import yaml
+from _pytest.mark.expression import IDENT_PREFIX, Expression
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from spyre_testing_plugin import sharding
 from spyre_testing_plugin.models import (
     AllowEntry,
     BlockEntry,
@@ -76,6 +93,7 @@ from spyre_testing_plugin.models import (
     Tolerances,
     UpstreamTestConfig,
 )
+from spyre_testing_plugin.tags import result_tags
 from spyre_testing_plugin.vfio_reaper import (
     reap_vfio_holders,
     spyre_hardware_present,
@@ -144,6 +162,32 @@ def _log(msg: str):
         print(msg, file=sys.stderr)
 
 
+def _clamp_torch_threads() -> None:
+    """Size this process's torch intra-op pool to the container's CPU budget.
+
+    libgomp reads OMP_NUM_THREADS once, when torch loads it, so `configure_threading`'s
+    env-var rewrite cannot resize a pool that already exists -- only torch can.
+    """
+    from spyre_inference import envs
+    from spyre_inference.threading_config import get_cpu_count
+
+    if not envs.SPYRE_UPDATE_THREAD_CONFIG:
+        return
+
+    cpu_count, detection_message = get_cpu_count()
+    if cpu_count is None:
+        _log("[threads] No CPU budget detected, leaving torch intra-op threads alone")
+        return
+
+    # floor, unlike configure_threading's ceiling, which must not leave a worker at zero.
+    threads = max(1, math.floor(cpu_count))
+    current = torch.get_num_threads()
+    if threads >= current:
+        return
+    _log(f"[threads] {detection_message}: torch intra-op threads {current} -> {threads}")
+    torch.set_num_threads(threads)
+
+
 # ---------------------------------------------------------------------------
 # YAML Config Loading
 # ---------------------------------------------------------------------------
@@ -202,6 +246,7 @@ def _parse_config(raw_tests: dict) -> UpstreamTestConfig:
                 rel_path=file_entry["rel_path"],
                 allow_list=tuple(allow_list),
                 block_list=tuple(block_list),
+                config_list=file_entry.get("config_list"),
             )
         )
     return UpstreamTestConfig(files=tuple(files))
@@ -243,13 +288,12 @@ def _cache_root() -> Path:
     return base / "vllm-upstream-tests"
 
 
-def _extract_vllm_commit_from_pyproject() -> str:
+def _extract_vllm_commit_from_pyproject(repo_root_dir: Path) -> str:
     """
     Extract the vLLM git reference from pyproject.toml [tool.uv.sources] section.
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    repo_root_dir = Path(__file__).parent.parent.parent.parent
     pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
         raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
@@ -276,7 +320,7 @@ def _extract_vllm_commit_from_pyproject() -> str:
     raise KeyError("Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]")
 
 
-def _resolve_vllm_commit() -> str:
+def _resolve_vllm_commit(repo_root_dir: Path) -> str:
     """
     Resolve the vLLM git reference to use for cloning upstream tests.
     Priority: VLLM_COMMIT env var > pyproject.toml > error
@@ -289,7 +333,7 @@ def _resolve_vllm_commit() -> str:
         return env_commit
 
     # Extract from pyproject.toml
-    return _extract_vllm_commit_from_pyproject()
+    return _extract_vllm_commit_from_pyproject(repo_root_dir)
 
 
 def _run(cmd: list[str], cwd: Path | None = None, max_retries: int = 3) -> None:
@@ -393,9 +437,9 @@ def _ensure_repo_at_commit(repo_dir: Path, url: str, commit: str, sparse_paths: 
     return wt_dir
 
 
-def _prepare_upstream_tests_dir() -> Path:
+def _prepare_upstream_tests_dir(repo_root_dir: Path) -> Path:
     """Clone vLLM to cache and return path to tests directory."""
-    commit = _resolve_vllm_commit()
+    commit = _resolve_vllm_commit(repo_root_dir)
     cache_root = _cache_root()
     wt_dir = _ensure_repo_at_commit(
         repo_dir=cache_root,
@@ -430,8 +474,77 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Upstream Opt-In
+# ---------------------------------------------------------------------------
+
+_UPSTREAM_MARKER = "upstream"
+# Satisfiability is brute-forced over the other markers (2**N evaluations); past this, fail open.
+_MAX_FREE_MARKERS = 12
+
+
+def _markexpr_selects_upstream(markexpr: str) -> bool:
+    """True when `markexpr` names `upstream` and is satisfiable with it set. Every marker
+    combo in the Makefile mentions `upstream`, most of them negatively, so a substring check
+    would be wrong. An expression that doesn't name it (`-m attention`) is not a request even
+    where it could match upstream tests; `--upstream` is the override for those.
+    """
+    try:
+        expr = Expression.compile(markexpr)
+    except SyntaxError:
+        # Let pytest report the malformed expression itself.
+        return False
+
+    # co_names is exactly the idents the evaluator will query, hyphens and dots included.
+    names = {n.removeprefix(IDENT_PREFIX) for n in expr._code.co_names}
+    if _UPSTREAM_MARKER not in names:
+        return False
+
+    free = sorted(names - {_UPSTREAM_MARKER})
+    if len(free) > _MAX_FREE_MARKERS:
+        return True
+
+    assignment: dict[str, bool] = {}
+
+    def matcher(name: str, /, **kwargs) -> bool:
+        return assignment.get(name, False)
+
+    for bits in range(1 << len(free)):
+        assignment = {name: bool(bits >> i & 1) for i, name in enumerate(free)}
+        assignment[_UPSTREAM_MARKER] = True
+        if expr.evaluate(matcher):
+            return True
+    return False
+
+
+def _upstream_requested(config) -> bool:
+    if os.environ.get("SKIP_UPSTREAM_TESTS", "").lower() in ("1", "true", "yes"):
+        _log("[vllm-upstream] SKIP_UPSTREAM_TESTS is set, skipping upstream test collection")
+        return False
+    if config.getoption("upstream"):
+        return True
+    if _markexpr_selects_upstream(config.option.markexpr):
+        return True
+    _log(
+        "[vllm-upstream] no `upstream` in the -m expression, skipping upstream test collection"
+        " (use -m upstream, or --upstream to add them to another marker expression)"
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--upstream",
+        action="store_true",
+        default=False,
+        help="Collect upstream vLLM tests even when the -m expression doesn't name the "
+        "`upstream` marker (cloning vLLM if it isn't cached yet).",
+    )
+    sharding.add_shard_options(parser)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -441,34 +554,44 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+    # Let a shutting-down worker take longer to release the VFIO card: the default
+    # 5s can expire mid-teardown (e.g. finishing a Spyre compile), leaving the card
+    # busy for the next test. Governs both the executor worker-exit wait and the
+    # engine process-manager join.
+    os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "30")
 
     # Load plugins early to register custom ops before test modules import RMSNorm
     from vllm.plugins import load_general_plugins
 
     load_general_plugins()
 
+    _clamp_torch_threads()
+
+    # Register sharding for its own trylast pytest_collection_modifyitems, which must
+    # land after pytest's -m deselection. Registered here (not via the plugin's -p
+    # entry) and before the upstream return so it applies to `not upstream` shard jobs.
+    config.pluginmanager.register(sharding, "spyre-sharding")
+
+    config._upstream_tests_base = None
+    if not _upstream_requested(config):
+        return
+
     # Detect local vLLM repo or clone it
-    rootdir = Path(config.rootdir)
-    tests_dir = rootdir / "tests"
-    vllm_pkg = rootdir / "vllm"
+    # --rootdir can move config.rootdir off the pyproject.toml that pins the vLLM rev.
+    repo_root = Path(config.inipath).parent if config.inipath else Path(config.rootdir)
+    tests_dir = repo_root / "tests"
+    vllm_pkg = repo_root / "vllm"
 
     if tests_dir.is_dir() and vllm_pkg.is_dir():
         # Running from vLLM repo itself
         config._upstream_tests_base = tests_dir
         _log("[vllm-upstream] Using local vLLM tests")
     else:
-        # Not in vLLM repo - check if we should clone
-        skip_upstream = os.environ.get("SKIP_UPSTREAM_TESTS", "").lower() in ("1", "true", "yes")
-        if skip_upstream:
-            _log("[vllm-upstream] SKIP_UPSTREAM_TESTS is set, skipping upstream test collection")
-            config._upstream_tests_base = None
-            return
-
         try:
             # Clone vLLM to cache
-            upstream_tests_base = _prepare_upstream_tests_dir()
+            upstream_tests_base = _prepare_upstream_tests_dir(repo_root)
             _temp_upstream_code_edits(upstream_tests_base)
             config._upstream_tests_base = upstream_tests_base
 
@@ -554,67 +677,68 @@ def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Apply YAML-based filtering to upstream tests and reorder tests."""
     upstream_tests_base = getattr(config, "_upstream_tests_base", None)
-    if not upstream_tests_base:
-        # Still reorder tests even if not running upstream tests
-        _reorder_tests_by_name(items)
-        return
+    if upstream_tests_base:
+        upstream_tests_base = Path(upstream_tests_base).resolve()
+        upstream_repo_root = upstream_tests_base.parent
+        file_configs = {
+            (upstream_repo_root / fc.rel_path).resolve(): fc for fc in _UPSTREAM_CONFIG.files
+        }
 
-    upstream_tests_base = Path(upstream_tests_base).resolve()
-    upstream_repo_root = upstream_tests_base.parent
-    file_configs = {
-        (upstream_repo_root / fc.rel_path).resolve(): fc for fc in _UPSTREAM_CONFIG.files
-    }
+        upstream_marker = pytest.mark.upstream
 
-    upstream_marker = pytest.mark.upstream
+        for item in items:
+            test_path = Path(item.fspath).resolve()
+            if not test_path.is_relative_to(upstream_tests_base):
+                continue
 
-    for item in items:
-        test_path = Path(item.fspath).resolve()
-        if not test_path.is_relative_to(upstream_tests_base):
-            continue
+            item.add_marker(upstream_marker)
 
-        item.add_marker(upstream_marker)
+            # Tag upstream items before the skip/xfail branches so tags land
+            # regardless of the item's eventual disposition.
+            params = getattr(getattr(item, "callspec", None), "params", {})
+            for name, value in result_tags(params):
+                item.user_properties.append((name, value))
 
-        fc = _find_file_config(test_path, file_configs)
-        if fc is None:
-            item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
-            continue
+            fc = _find_file_config(test_path, file_configs)
+            if fc is None:
+                item.add_marker(pytest.mark.skip(reason=f"not in {_YAML_FILENAME}"))
+                continue
 
-        test_name = item.originalname or item.name
-        if _matches_block_list(test_name, fc.block_list):
-            item.add_marker(pytest.mark.skip(reason=f"blocked by {_YAML_FILENAME}"))
-            continue
+            test_name = item.originalname or item.name
+            if _matches_block_list(test_name, fc.block_list):
+                item.add_marker(pytest.mark.skip(reason=f"blocked by {_YAML_FILENAME}"))
+                continue
 
-        allow_entry = _find_allow_entry(test_name, fc.allow_list)
+            allow_entry = _find_allow_entry(test_name, fc.allow_list)
 
-        if allow_entry:
-            for tag in allow_entry.tags:
-                item.add_marker(getattr(pytest.mark, tag))
+            if allow_entry:
+                for tag in allow_entry.tags:
+                    item.add_marker(getattr(pytest.mark, tag))
 
-        if allow_entry is None:
-            item.add_marker(pytest.mark.skip(reason="not in allow_list"))
-            continue
+            if allow_entry is None:
+                item.add_marker(pytest.mark.skip(reason="not in allow_list"))
+                continue
 
-        if _should_skip_params(item, allow_entry):
-            item.add_marker(pytest.mark.skip(reason="param skipped"))
-            continue
+            if _should_skip_params(item, allow_entry):
+                item.add_marker(pytest.mark.skip(reason="param skipped"))
+                continue
 
-        if allow_entry.mode == "skip":
-            item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
-            continue
+            if allow_entry.mode == "skip":
+                item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
+                continue
 
-        if allow_entry.mode == "xfail":
-            item.add_marker(pytest.mark.xfail(strict=False))
-        elif allow_entry.mode == "xfail_strict":
-            item.add_marker(pytest.mark.xfail(strict=True))
+            if allow_entry.mode == "xfail":
+                item.add_marker(pytest.mark.xfail(strict=False))
+            elif allow_entry.mode == "xfail_strict":
+                item.add_marker(pytest.mark.xfail(strict=True))
 
-        # Store tolerances on item for fixture access
-        if allow_entry.tolerances:
-            item._spyre_tolerances = allow_entry.tolerances
-        # Inject fixtures for tests that have fixture_names defined
-        for fixture_name in allow_entry.fixture_names:
-            item.fixturenames.append(fixture_name)
+            # Store tolerances on item for fixture access
+            if allow_entry.tolerances:
+                item._spyre_tolerances = allow_entry.tolerances
+            # Inject fixtures for tests that have fixture_names defined
+            for fixture_name in allow_entry.fixture_names:
+                item.fixturenames.append(fixture_name)
 
-    # Reorder tests so that tests with "uses_subprocess" marker run first
     _reorder_tests_by_name(items)
 
 
@@ -681,6 +805,18 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if not fc:
         return
 
+    # Tests parametrized by an upstream `config_filename` fixture (e.g. gsm8k evals)
+    # aren't reachable via param_overrides, which only rewrites the test's own
+    # parametrize markers. Instead, point the upstream conftest's --config-list-file at
+    # a Spyre-owned list; its own (later-running) pytest_generate_tests then parametrizes
+    # config_filename from our configs. tryfirst here guarantees we set it first.
+    # config_list_file is session-global; this is set once and deliberately not restored,
+    # since the only config_filename consumer in the pinned upstream tree is this gsm8k file
+    # (test_gsm8k_offloading parametrizes on its own cfg), so there is nothing else to leak to.
+    if fc.config_list and "config_filename" in metafunc.fixturenames:
+        list_path = (_YAML_PATH.parent / fc.config_list).resolve()
+        metafunc.config.option.config_list_file = str(list_path)
+
     test_name = metafunc.definition.originalname or metafunc.definition.name
     allow_entry = _find_allow_entry(test_name, fc.allow_list)
     if not allow_entry or not allow_entry.param_overrides:
@@ -727,7 +863,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins
@@ -742,7 +878,7 @@ def _spyre_session_config():
 
     type(current_platform)._enum = PlatformEnum.OOT
 
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.forward_context import set_forward_context
 
@@ -756,10 +892,10 @@ def _spyre_session_config():
 
 
 def _spyre_default_vllm_config(monkeypatch):
-    from vllm.config import DeviceConfig, VllmConfig, ModelConfig, set_current_vllm_config
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
-    from vllm.platforms import PlatformEnum, current_platform
     from vllm.forward_context import set_forward_context
+    from vllm.platforms import PlatformEnum, current_platform
 
     monkeypatch.setattr(type(current_platform), "_enum", PlatformEnum.OOT)
 
@@ -841,8 +977,8 @@ def tp_group(_distributed_init):
     Tests that create vLLM linear layers should use this fixture instead of
     (or in addition to) `default_vllm_config`.
     """
-    from vllm.distributed.parallel_state import GroupCoordinator
     import vllm.distributed.parallel_state as ps
+    from vllm.distributed.parallel_state import GroupCoordinator
 
     group = GroupCoordinator(
         group_ranks=[[0]],
@@ -955,6 +1091,36 @@ def inference_mode():
 
 
 @pytest.fixture()
+def register_ministral_14b(request, monkeypatch):
+    """Make `mistralai/Ministral-3-14B-Instruct-2512-BF16` resolvable upstream.
+
+    Upstream's registry only knows the 3B, and `find_hf_info` raises for unknown ids,
+    so register the 14B as another extra on the same architecture entry. `setitem`
+    because `_HfExamplesInfo` is frozen — the `extras` dict is not.
+    """
+    hf_models = request.node.module.HF_EXAMPLE_MODELS.hf_models
+    info = hf_models["PixtralForConditionalGeneration"]
+    monkeypatch.setitem(
+        info.extras,
+        "ministral-3-14b",
+        "mistralai/Ministral-3-14B-Instruct-2512-BF16",
+    )
+
+
+@pytest.fixture()
+def register_granite_models(request, monkeypatch):
+    """Add our injected granite models to test_granite's MODELS dict.
+
+    test_granite's MODELS is a dict (model -> min transformers version) and the test
+    does MODELS[model]; models we inject via param override aren't keys,
+    so add them as unconstrained (None).
+    """
+    models = request.node.module.MODELS
+    for model in ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", "ibm-granite/granite-4.1-3b"):
+        monkeypatch.setitem(models, model, None)
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 
@@ -982,10 +1148,11 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
-    # layout underneath is token-major, which upstream expresses separately via
-    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view; the physical layout underneath is token-major, which vLLM
+    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
+    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
+    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
+    # physical layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -999,19 +1166,18 @@ def patch_backend_list(request, monkeypatch):
         key,
         value,
         kv_cache,
-        attn_type=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
+        *args,
+        **kwargs,
     ):
+        # Everything after kv_cache passes through untouched: upstream keeps appending
+        # defaulted parameters (use_cuda_graph in 0.30, layer_k/v_scale in 0.31).
         if backend == AttentionBackendEnum.CUSTOM:
 
             def pin_slot_major(blocks):
                 # The KV write needs the slot-outermost layout, not the default.
                 if blocks.device.type != "spyre":
                     return blocks
-                from spyre_inference.v1.attention.backends.spyre_attn import (
-                    slot_major_kv_layout,
-                )
+                from spyre_inference.v1.attention.ops.layout import slot_major_kv_layout
 
                 nb, bs, nkvh, hs = blocks.shape
                 return blocks.cpu().to(
@@ -1036,9 +1202,8 @@ def patch_backend_list(request, monkeypatch):
             key,
             value,
             kv_cache,
-            attn_type,
-            sliding_window,
-            kv_cache_dtype,
+            *args,
+            **kwargs,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
@@ -1065,34 +1230,80 @@ def pytest_fixture_setup(fixturedef, request):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item, call):
-    """Record whether a test failed/errored, so teardown only reaps after failures."""
-    outcome = yield
-    report = outcome.get_result()
-    if report.failed:
-        item._spyre_test_failed = True
+    """Flag every `uses_subprocess` test's teardown to reap the card, not just wait.
+
+    Only a subprocess test can orphan a worker (EngineCore, TP rank) still holding
+    the VFIO fd -- on failure, but also on a pass, when a worker outlives vLLM's
+    shutdown grace period and lingers on the card as the engine force-kills its
+    parent. `wait_until_card_free` cannot free a still-alive holder; only a SIGKILL
+    can. So reap on the marker alone, regardless of outcome -- a safe gate, since
+    subprocess tests keep the main pytest process (which the reap excludes) off the
+    card.
+    """
+    yield
+    if any(m.name == "uses_subprocess" for m in item.iter_markers()):
+        item._spyre_reap_card = True
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_runtest_teardown(item, nextitem):
     """Free the Spyre card at each test boundary on a Spyre host.
 
-    A failed test can orphan a holder outright, so after a failure we reap
-    (SIGKILL the holder, then wait for the card).
+    A `uses_subprocess` test (flagged above) can orphan a subprocess holder, so we
+    reap: SIGKILL the holder, then wait for the card. The reap excludes the main
+    pytest pid, so it cannot recover a card the main process opened in-process --
+    uses_subprocess tests must keep off the card (guard on spyre_device_count,
+    never spyre_available) so no subprocess is blocked.
 
-    A *passing* test can also leave the card transiently busy: an out-of-process
-    vLLM engine is force-killed during shutdown and the kernel's VFIO release is
-    asynchronous, so the holder is already on its way out but may not be gone by
-    the time the next test opens the device. There we only wait — killing would
-    take down a legitimately cached `LLM`, or the in-process device tests whose
-    card belongs to the still-alive pytest process.
+    Every other test only waits: the card may be transiently busy (an in-process
+    device test whose card belongs to the still-alive pytest process, or a cached
+    `LLM`), and killing there would take down a legitimate holder.
 
     `trylast` runs this after all other teardown (fixture finalizers, the tests'
     own `del llm`).
     """
     if not spyre_hardware_present():
         return
-    if getattr(item, "_spyre_test_failed", False):
+    if getattr(item, "_spyre_reap_card", False):
         reap_vfio_holders(exclude_pids={os.getpid()}, log=_log)
     else:
         # 🌶️🌶️🌶️ If we ever cache an LLM across tests, this will slow everything down
         wait_until_card_free(exclude_pids={os.getpid()}, log=_log)
+
+
+def pytest_runtest_logreport(report) -> None:
+    sharding.record_duration(report)
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:
+    sharding.write_durations(_log)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_cmdline_main(config):
+    """Hard-exit a Spyre-host run before interpreter finalization.
+
+    senlib's config singleton is torn down from a libc exit handler after
+    pytest has already reported, and that destructor intermittently aborts
+    ("corrupted double-linked list"), failing an otherwise-green job. os._exit
+    skips it. Remove once senlib no longer aborts at process exit.
+    """
+    outcome = yield
+    if not spyre_hardware_present():
+        return
+    result = outcome.get_result()
+    code = int(result) if result is not None else 0
+    _log(
+        f"Spyre host: hard-exiting (code {code}) past finalization "
+        "to skip the senlib teardown abort"
+    )
+    try:
+        # os._exit skips every atexit handler; run them now so coverage saves,
+        # logging flushes and multiprocessing reaps children. Only the libc
+        # handler where the abort lives is left to be skipped.
+        atexit._run_exitfuncs()
+    except Exception:
+        _log(f"atexit handlers failed before hard-exit:\n{traceback.format_exc()}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)

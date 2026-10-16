@@ -1,0 +1,191 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Spyre adaptations for vLLM's Gemma-4 model."""
+
+from __future__ import annotations
+
+from functools import partial
+from typing import TYPE_CHECKING, Any
+
+import torch
+from vllm.logger import init_logger
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+
+from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+    from torch import nn
+    from vllm.config import VllmConfig
+    from vllm.engine.arg_utils import EngineArgs
+
+logger = init_logger(__name__)
+
+# Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
+# mapped to the per-layer attribute of the same role it is rebuilt from.
+_GEMMA4_FULL_ATTENTION_ATTRS = {
+    "global_head_dim": "head_dim",
+    "num_global_key_value_heads": "num_key_value_heads",
+}
+
+
+def repair_head_dim_access(config: Any) -> None:
+    """Let bare reads (config.head_dim, config.num_key_value_heads) return the
+    sliding/global scalar, matching vLLM's sliding-layer path.
+
+    transformers >=5.16 reclassifies gemma-4 as heterogeneous: the bare ``config.head_dim``
+    read vLLM's gemma-4 builders do then raises ``AmbiguousGlobalPerLayerAttributeError``,
+    and the ``global_*`` head/kv-head attributes vLLM needs are consumed into
+    ``per_layer_config``. This restores the <=5.14 view in place.
+
+    Idempotent and a no-op for any other config, because it runs from
+    ``TorchSpyrePlatform.check_and_update_config`` rather than from ``hf_overrides``: the
+    repair then also reaches a config the user overrode themselves. Nothing inside config
+    creation needs it -- ``ModelConfig.get_head_size`` reads gemma-4's heterogeneous head
+    dims through its own path -- so the platform hook is early enough.
+
+    The ambiguous read lives in ``Gemma4TextConfig``, so a multimodal checkpoint's nested
+    ``text_config`` needs it just as much as a text-only top-level config.
+    """
+    if getattr(config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return
+    text_config = getattr(config, "text_config", config)
+    for cfg in {id(config): config, id(text_config): text_config}.values():
+        cfg.allow_global_per_layer_attribute_access = True
+    per_layer = getattr(text_config, "per_layer_config", None)
+    layer_types = getattr(text_config, "layer_types", None)
+    if per_layer is not None and layer_types:
+        full_idx = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+        for global_attr, src_attr in _GEMMA4_FULL_ATTENTION_ATTRS.items():
+            if hasattr(text_config, global_attr) or not full_idx:
+                continue
+            values = {getattr(per_layer[i], src_attr) for i in full_idx}
+            if len(values) == 1:
+                setattr(text_config, global_attr, values.pop())
+
+
+# The supported way to run a checkpoint that carries a vision tower as text-only: it skips
+# the tower's weights and warmup entirely. Applied by default to a checkpoint with no
+# tower; pass it as `hf_overrides` to opt a vision checkpoint in.
+GEMMA4_TEXT_BACKBONE_OVERRIDE = {"architectures": ["Gemma4ForCausalLM"]}
+
+
+# gemma-4 config model_types this fix applies to. Excludes the other gemma4_* types
+# (unified, dspark, mtp, audio, vision): they have their own vLLM builders and must
+# not be forced onto the text backbone.
+_GEMMA4_TEXT_MODEL_TYPES = {"gemma4", "gemma4_text"}
+
+
+def is_multimodal_gemma4(hf_config: Any) -> bool:
+    """True for a gemma-4 config carrying a vision tower. Audio is out of scope."""
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return False
+    return getattr(hf_config, "vision_config", None) is not None
+
+
+def force_text_backbone(engine_args: EngineArgs) -> None:
+    """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
+
+    Only a default: it is the same ``hf_overrides`` value ``GEMMA4_TEXT_BACKBONE_OVERRIDE``
+    documents, so a user override of any shape replaces it wholesale (the head-dim repair
+    they also need runs from the platform hook, not from here). A vision checkpoint keeps
+    its real ``architectures`` -- forcing ``Gemma4ForCausalLM`` there would strip the tower
+    -- while an audio-only one is rejected rather than silently reduced to text.
+    """
+    if engine_args.hf_overrides:
+        return
+    from vllm.transformers_utils.config import get_config
+
+    # Detect gemma-4 by config model_type, not the checkpoint name: derivatives such as
+    # medgemma / translategemma carry a gemma4 config under an unrelated name. On any load
+    # failure, defer to ModelConfig, which loads the same config and raises the real error.
+    try:
+        hf_config = get_config(
+            engine_args.hf_config_path or engine_args.model,
+            engine_args.trust_remote_code,
+            engine_args.revision,
+            engine_args.code_revision,
+            engine_args.config_format,
+            token=engine_args.hf_token,
+        )
+    except Exception:
+        return
+    if getattr(hf_config, "model_type", None) not in _GEMMA4_TEXT_MODEL_TYPES:
+        return
+    has_audio = getattr(hf_config, "audio_config", None) is not None
+    # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
+    if is_multimodal_gemma4(hf_config):
+        if has_audio:
+            logger.warning(
+                "gemma-4: this checkpoint has an audio tower, which is not supported on "
+                "Spyre; image and text inputs work, audio input will fail."
+            )
+        return
+    if has_audio:
+        # Falling through would force the text-only backbone and silently drop the
+        # tower, leaving a model that looks fine but ignores its audio inputs.
+        raise NotImplementedError(
+            "gemma-4 audio is not supported on Spyre, and this checkpoint has an audio "
+            "tower but no vision tower. Use a text-only or vision checkpoint."
+        )
+    engine_args.hf_overrides = dict(GEMMA4_TEXT_BACKBONE_OVERRIDE)
+    logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
+
+
+def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Fold Gemma's output scale into the source down-projection stack."""
+    return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
+
+
+def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe; returns the count."""
+
+    configured = 0
+    for decoder in layers:
+        experts = getattr(decoder, "experts", None)
+        if experts is None:
+            continue
+        configure_spyre_moe_layer(
+            experts.routed_experts,
+            SpyreMoERecipe(
+                activation="gelu_tanh",
+                routing="full_softmax",
+                prepare_down_weight=partial(
+                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                ),
+            ),
+        )
+        configured += 1
+    if configured:
+        logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
+    return configured
+
+
+class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
+    """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # Without the recipe the experts run upstream's path, which is wrong on Spyre.
+        # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
+        is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(
+            self.config, "use_second_mlp_block", False
+        )
+        if not configure_gemma4_moe_layers(self.model.layers) and is_moe_checkpoint:
+            raise RuntimeError(
+                "gemma-4 MoE checkpoint, but no decoder layer exposes `experts`: vLLM has "
+                "moved them; update configure_gemma4_moe_layers."
+            )

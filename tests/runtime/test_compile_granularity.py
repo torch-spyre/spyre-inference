@@ -1,0 +1,577 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Per-block compile granularity: block discovery, in-place wrapping, artifact reuse.
+
+Only the artifact-reuse test traces, and tracing resolves the accelerator stream,
+which opens the single contested Spyre card -- hence its ``compile`` marker. The
+rest is device-free and stays in the smoke job.
+"""
+
+from __future__ import annotations
+
+import types
+
+import pytest
+import torch
+import torch.nn as nn
+from vllm.config import CompilationMode
+from vllm.model_executor.layers.attention.attention import Attention
+from vllm.model_executor.models.utils import PPMissingLayer
+
+from spyre_inference.multimodal.utils import mark_blocks_compilable
+from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.spyre_model_runner import (
+    TorchSpyreModelRunner,
+    _is_decoder_attention_like,
+    _repeated_block_lists,
+)
+
+
+@pytest.fixture
+def isolated_dynamo_state():
+    """Bound this test's Dynamo cache churn; save and restore the global counters."""
+    import copy
+
+    import torch._dynamo as dynamo
+    from torch._dynamo.utils import counters
+
+    saved = copy.deepcopy(counters)
+    dynamo.reset()
+    try:
+        yield
+    finally:
+        dynamo.reset()
+        counters.clear()
+        counters.update(saved)
+
+
+def _fake_attention() -> Attention:
+    """Skips ``Attention.__init__``, which needs a full model config."""
+    attn = Attention.__new__(Attention)
+    nn.Module.__init__(attn)
+    return attn
+
+
+def _hf_decoder_attention(implementation: str = "vllm", layer_idx: int = 0) -> nn.Module:
+    """HF dispatcher that TransformersForCausalLM points at vLLM KV-cache attention."""
+
+    class GraniteAttention(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layer_idx = layer_idx
+            self.config = types.SimpleNamespace(_attn_implementation=implementation)
+            self.q_proj = nn.Linear(4, 4)
+
+    return GraniteAttention()
+
+
+def _hf_decoder_stack(implementation: str = "vllm") -> nn.Module:
+    class GraniteDecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _hf_decoder_attention(implementation)
+
+        # The compile guard registers a block's own `forward`; nn.Module's placeholder
+        # is skipped.
+        def forward(self, x):
+            return x
+
+    class GraniteModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([GraniteDecoderLayer() for _ in range(3)])
+
+    return GraniteModel()
+
+
+class _Block(nn.Module):
+    """Threads a residual like a real decoder layer: ``residual is None`` on layer 0
+    is a trace-time branch, so layer 0 compiles to its own graph."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(hidden)
+        self.qkv = nn.Linear(hidden, 3 * hidden)
+        self.attn = _fake_attention()
+        self.o_proj = nn.Linear(hidden, hidden)
+        self.post_attention_layernorm = nn.LayerNorm(hidden)
+        self.up = nn.Linear(hidden, 2 * hidden)
+        self.down = nn.Linear(2 * hidden, hidden)
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = x
+            h = self.input_layernorm(x)
+        else:
+            residual = x + residual
+            h = self.input_layernorm(residual)
+        q, k, v = self.qkv(h).chunk(3, dim=-1)
+        x = self.o_proj(torch.softmax(q * k, dim=-1) * v)
+        h = self.post_attention_layernorm(x)
+        return self.down(torch.relu(self.up(h))), residual
+
+
+class _MambaBlock(nn.Module):
+    """Attention-free layer, as in a hybrid Mamba+attention stack."""
+
+    def __init__(self, hidden: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden)
+        self.proj = nn.Linear(hidden, hidden)
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = x
+        else:
+            residual = x + residual
+        return self.proj(self.norm(residual)), residual
+
+
+class _Backbone(nn.Module):
+    def __init__(self, hidden: int, num_layers: int, num_missing: int = 0, hybrid: bool = False):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(16, hidden)
+        blocks: list[nn.Module] = []
+        for i in range(num_layers):
+            blocks.append(_MambaBlock(hidden) if hybrid and i % 2 else _Block(hidden))
+        self.layers = nn.ModuleList(blocks + [PPMissingLayer() for _ in range(num_missing)])
+        self.norm = nn.LayerNorm(hidden)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        x = self.embed_tokens(input_ids)
+        residual = None
+        for layer in self.layers:
+            if isinstance(layer, PPMissingLayer):
+                continue
+            x, residual = layer(x, residual)
+        return self.norm(x + residual)
+
+
+class _Model(nn.Module):
+    def __init__(
+        self, hidden: int = 32, num_layers: int = 4, num_missing: int = 0, hybrid: bool = False
+    ):
+        super().__init__()
+        self.model = _Backbone(hidden, num_layers, num_missing, hybrid)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model(input_ids)
+
+
+def _runner(model: nn.Module, enforce_eager: bool = False) -> TorchSpyreModelRunner:
+    """A runner with only the attributes _compile_for_spyre reads."""
+    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+    runner.model = model
+    runner.compilation_config = types.SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
+    runner.vllm_config = types.SimpleNamespace(
+        model_config=types.SimpleNamespace(enforce_eager=enforce_eager)
+    )
+    return runner
+
+
+def test_finds_the_transformer_block_list() -> None:
+    model = _Model(num_layers=4)
+    found = _repeated_block_lists(model)
+    assert found == [(model.model.layers, False)]
+
+
+def test_ignores_module_lists_without_attention() -> None:
+    class NoAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+
+    assert _repeated_block_lists(NoAttention()) == []
+
+
+def test_pp_missing_layers_do_not_break_discovery() -> None:
+    model = _Model(num_layers=2, num_missing=2)
+    assert _repeated_block_lists(model) == [(model.model.layers, False)]
+
+
+def test_ignores_a_module_list_of_bare_attention_layers() -> None:
+    """Zamba2's shared ``dpa_list`` holds bare Attention layers, not blocks."""
+
+    class SharedAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dpa_list = nn.ModuleList([_fake_attention() for _ in range(2)])
+
+    assert _repeated_block_lists(SharedAttention()) == []
+
+
+def test_finds_heterogeneous_hybrid_stacks() -> None:
+    """Hybrid Mamba+attention stacks (Granite 4.0, Jamba, Nemotron-H) mix classes."""
+    model = _Model(num_layers=4, hybrid=True)
+    assert len({type(b) for b in model.model.layers}) == 2
+    assert _repeated_block_lists(model) == [(model.model.layers, False)]
+
+
+def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
+    native = _fake_attention()
+    assert _is_decoder_attention_like(native)
+
+    hf = _hf_decoder_attention()
+    assert not isinstance(hf, Attention)
+    assert _is_decoder_attention_like(hf)
+    assert _is_decoder_attention_like(_hf_decoder_attention("paged|vllm"))
+
+    class GraniteAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = 0
+            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+            self.q_proj = nn.Linear(4, 4)
+
+    assert not _is_decoder_attention_like(GraniteAttention())
+
+
+@pytest.mark.parametrize("implementation", ["vllm", "paged|vllm"])
+def test_finds_blocks_with_hf_decoder_kv_cache_attention(implementation: str) -> None:
+    """TransformersForCausalLM keeps HF layers and sets ``_attn_implementation`` to vLLM.
+
+    ``test_transformers_backend_compile`` only asserts tokens. Dropping this
+    dispatch check still compiles the whole model and would pass; discovery here
+    is the signal.
+    """
+    model = _hf_decoder_stack(implementation)
+    assert not isinstance(model.layers[0].self_attn, Attention)
+    assert _repeated_block_lists(model) == [(model.layers, False)]
+
+
+def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
+    """Class name ``*Attention`` is not enough; vision towers keep ``sdpa``."""
+
+    class GraniteAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = nn.Linear(4, 4)
+
+    class GraniteDecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = GraniteAttention()
+
+    class GraniteModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([GraniteDecoderLayer() for _ in range(3)])
+
+    assert _repeated_block_lists(GraniteModel()) == []
+    sdpa = _hf_decoder_stack("sdpa")
+    assert _repeated_block_lists(sdpa) == []
+
+
+def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
+    """Pixtral's tower uses a local ``class Attention`` and ``MMEncoderAttention``.
+
+    Those keep HF ``sdpa`` (or no vLLM dispatch at all), so they are not decoder
+    KV-cache attention. Wrapping them traces RoPE+SDPA graphs that coarse-tile
+    cannot lower (``hint_id`` split across nests).
+    """
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(4, 4)
+
+    class MMEncoderAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = 1.0
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Attention()
+            self.attn = MMEncoderAttention()
+
+    class VisionTransformer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+
+    class Pixtral(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = VisionTransformer()
+
+    class PixtralHFAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_idx = 0
+            self.config = types.SimpleNamespace(_attn_implementation="sdpa")
+            self.q_proj = nn.Linear(4, 4)
+
+    class PixtralHFBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = PixtralHFAttention()
+
+    class PixtralHF(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # No vision_* path segment: decoder-attention dispatch must be enough.
+            self.layers = nn.ModuleList([PixtralHFBlock() for _ in range(2)])
+
+    assert _repeated_block_lists(Pixtral()) == []
+    assert _repeated_block_lists(PixtralHF()) == []
+
+
+def _marked_tower(marked: bool = True) -> nn.Module:
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(4, 4)
+
+        def forward(self, x):
+            return self.fc(x)
+
+    tower = nn.Module()
+    tower.encoder = nn.Module()
+    tower.encoder.layers = nn.ModuleList([VisionBlock() for _ in range(2)])
+    if marked:
+        mark_blocks_compilable(tower.encoder.layers)
+    return tower
+
+
+class _VLM(nn.Module):
+    def __init__(self, marked: bool = True, decoder: bool = False):
+        super().__init__()
+        self.vision_tower = _marked_tower(marked)
+        if decoder:
+            self.language_model = _hf_decoder_stack()
+
+
+def test_a_marked_vision_tower_opts_into_block_compile() -> None:
+    """The mark sits on the blocks, so it is independent of where discovery starts and
+    of whether the tower sits under a recognised ``vision_*`` path."""
+    assert _repeated_block_lists(_VLM(marked=False)) == []
+
+    marked = _VLM()
+    assert _repeated_block_lists(marked) == [(marked.vision_tower.encoder.layers, True)]
+    assert _repeated_block_lists(marked.vision_tower) == [
+        (marked.vision_tower.encoder.layers, True)
+    ]
+
+
+def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
+    """The mark is read off the blocks, not off anything they contain, so an outer
+    ``ModuleList`` that merely holds a marked tower is not itself a compile unit."""
+    model = nn.Module()
+    model.towers = nn.ModuleList([_marked_tower().encoder for _ in range(2)])
+    assert _repeated_block_lists(model) == [(t.layers, True) for t in model.towers]
+
+
+def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
+    """Ministral-style VLM: decoder KV-cache attention compiles; vision stays eager."""
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(4, 4)
+
+    class MMEncoderAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = 1.0
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attention = Attention()
+            self.attn = MMEncoderAttention()
+
+    class DecoderLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.self_attn = _hf_decoder_attention()
+
+    class VLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.vision_encoder = nn.Module()
+            self.vision_encoder.transformer = nn.Module()
+            self.vision_encoder.transformer.layers = nn.ModuleList(
+                [VisionBlock() for _ in range(2)]
+            )
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList([DecoderLayer() for _ in range(3)])
+
+    model = VLM()
+    vision_layers = model.vision_encoder.transformer.layers
+    decoder_layers = model.language_model.layers
+    assert _repeated_block_lists(model) == [(decoder_layers, False)]
+
+    originals = list(vision_layers)
+    assert _runner(model)._compile_blocks() == 3
+    assert all(block._compiled_call_impl is None for block in originals)
+    assert all(layer._compiled_call_impl is not None for layer in decoder_layers)
+
+
+def test_a_marked_tower_alone_falls_back_to_the_whole_model_graph() -> None:
+    """Only decoder blocks are counted, so a tower alone still sends the decoder to the
+    whole-model graph; the tower compiles beside it."""
+    model = _VLM()
+    runner = _runner(model)
+    assert runner._compile_blocks() == 0
+    assert all(b._compiled_call_impl is not None for b in model.vision_tower.encoder.layers)
+    assert runner._compiled_tower_blocks == 2
+
+
+def test_a_marked_tower_compiles_beside_the_decoder_and_is_watched() -> None:
+    """Tower blocks compile with the decoder's and the compile guard watches both: warmup
+    runs the tower at every image-batch width, so a later compile is a missed shape."""
+    model = _VLM(decoder=True)
+    compile_guard.reset()
+    runner = _runner(model)
+    assert runner._compile_blocks() == 3
+    assert runner._compiled_tower_blocks == 2
+    tower_blocks = model.vision_tower.encoder.layers
+    assert all(b._compiled_call_impl is not None for b in tower_blocks)
+    watched = compile_guard._guard.watched_labels().values()
+    assert "GraniteDecoderLayer (transformer block)" in watched
+    assert "VisionBlock (transformer block)" in watched
+
+
+def test_compile_blocks_wraps_every_block_in_place() -> None:
+    model = _Model(num_layers=4)
+    originals = list(model.model.layers)
+
+    assert _runner(model)._compile_blocks() == 4
+
+    for i, original in enumerate(originals):
+        assert model.model.layers[i] is original
+        assert isinstance(original, _Block)
+        assert original._compiled_call_impl is not None
+
+
+def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
+    """Gemma-4 slices ``layers`` into a self- and a cross-decoder, aliasing every block."""
+    model = _Model(num_layers=4)
+    model.model.self_decoder = nn.Module()
+    model.model.self_decoder.decoder_layers = model.model.layers[:2]
+    model.model.cross_decoder = nn.Module()
+    model.model.cross_decoder.decoder_layers = model.model.layers[2:]
+    assert len(_repeated_block_lists(model)) == 3
+
+    assert _runner(model)._compile_blocks() == 4
+    assert all(block._compiled_call_impl is not None for block in model.model.layers)
+
+
+def test_compile_blocks_preserves_parameter_names() -> None:
+    """An ``_orig_mod.`` segment in a parameter path breaks weight save/reload."""
+    model = _Model(num_layers=4)
+    before = [name for name, _ in model.named_parameters()]
+
+    _runner(model)._compile_blocks()
+
+    after = [name for name, _ in model.named_parameters()]
+    assert after == before
+    assert not any("_orig_mod" in name for name in after)
+
+
+def test_pp_missing_layers_are_not_compiled() -> None:
+    model = _Model(num_layers=2, num_missing=2)
+    assert _runner(model)._compile_blocks() == 2
+    assert all(isinstance(layer, PPMissingLayer) for layer in model.model.layers[2:])
+
+
+def test_rejects_an_unknown_granularity_even_when_eager(monkeypatch) -> None:
+    """Validation runs before the eager short-circuit, so typos are never silent."""
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "blocks")
+    with pytest.raises(ValueError, match="SPYRE_COMPILE_GRANULARITY"):
+        _runner(_Model(num_layers=2), enforce_eager=True)._compile_for_spyre()
+
+
+def test_empty_granularity_falls_back_to_block(monkeypatch) -> None:
+    """`export SPYRE_COMPILE_GRANULARITY=$UNSET` must mean unset, not invalid."""
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "")
+    model = _Model(num_layers=2)
+    _runner(model)._compile_for_spyre()
+    assert all(block._compiled_call_impl is not None for block in model.model.layers)
+
+
+def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
+    compiled: list[nn.Module] = []
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
+
+    model = _Model(num_layers=2)
+    runner = _runner(model)
+    runner._compile_for_spyre()
+
+    assert compiled == [model]
+    assert all(block._compiled_call_impl is None for block in model.model.layers)
+
+
+def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:
+    """The path every MLA and vision-tower model takes."""
+    compiled: list[nn.Module] = []
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
+
+    class NoBlocks(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = nn.Linear(4, 4)
+
+    model = NoBlocks()
+    _runner(model)._compile_for_spyre()
+    assert compiled == [model]
+
+
+def test_eager_compiles_nothing(monkeypatch) -> None:
+    compiled: list[nn.Module] = []
+    monkeypatch.setattr(torch, "compile", lambda m, **kw: compiled.append(m) or m)
+
+    model = _Model(num_layers=2)
+    _runner(model, enforce_eager=True)._compile_for_spyre()
+
+    assert compiled == []
+    assert all(block._compiled_call_impl is None for block in model.model.layers)
+
+
+def test_identical_blocks_share_compiled_artifacts_regardless_of_depth(
+    isolated_dynamo_state,
+) -> None:
+    """Backend compile count must not grow with layer count -- and is 2, not 1,
+    because layer 0 specializes on ``residual is None``."""
+    import torch._dynamo as dynamo
+    from torch._dynamo.utils import counters
+    from torch._inductor.utils import fresh_cache
+
+    def compile_counts(num_layers: int) -> tuple[int, int]:
+        dynamo.reset()
+        counters.clear()
+        with fresh_cache():
+            model = _Model(hidden=32, num_layers=num_layers)
+            _runner(model)._compile_blocks()
+            with torch.inference_mode():
+                model(torch.zeros(2, 4, dtype=torch.long))
+            return (
+                counters["stats"]["unique_graphs"],
+                counters["inductor"]["fxgraph_cache_miss"],
+            )
+
+    shallow_graphs, shallow_backend = compile_counts(2)
+    deep_graphs, deep_backend = compile_counts(8)
+
+    assert deep_backend == shallow_backend
+    assert deep_graphs == shallow_graphs
+    assert deep_backend < 8

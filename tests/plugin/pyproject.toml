@@ -27,10 +27,6 @@ dependencies = [
 requires-python = ">=3.11"
 dynamic = ["version"]
 
-# Register the pytest plugin
-[project.entry-points."pytest11"]
-spyre_inference_test = "spyre_testing_plugin.pytest_plugin"
-
 # Register the CLI entrypoint for syncing upstream test dependencies
 [project.scripts]
 sync-upstream-test-deps = "spyre_testing_plugin.sync_upstream_test_deps:main"

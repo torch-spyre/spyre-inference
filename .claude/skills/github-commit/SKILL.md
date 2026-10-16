@@ -83,6 +83,11 @@ git add <files>
 git commit -s -m "type: description of change"
 ```
 
+Stage files by name, not `git add -A` / `git add .`. Do not stage `uv.lock`,
+`pyproject.toml` or `spyre-rpms.lock` unless the change is meant to alter the
+environment — a plain `uv lock` / `uv sync` rewrites the lockfile as a side effect.
+Revert accidental edits with `git checkout origin/main -- <file>`.
+
 To amend the last commit with a sign-off:
 
 ```bash

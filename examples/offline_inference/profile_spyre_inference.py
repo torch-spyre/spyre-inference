@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""New-stack profile run — matches docs/getting_started/kineto_profiling.md §2.1.
+"""New-stack profile run — matches docs/user_guide/kineto_profiling.md §2.1.
 
 Usage:
     source ./setup_profile_env.sh          # activates venv + exports env vars
@@ -35,8 +35,8 @@ os.environ.setdefault("MASTER_PORT", "29500")
 import torch
 from torch.profiler import ProfilerActivity, profile
 from vllm import LLM, SamplingParams
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.config import AttentionConfig
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 llm = LLM(
     model="ibm-granite/granite-3.3-8b-instruct",

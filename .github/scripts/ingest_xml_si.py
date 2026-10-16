@@ -17,13 +17,16 @@
 Parses spyre-inference's pytest JUnit XML into si_test_runs / si_test_cases /
 si_run_properties.
 
+Schema-v2 is written by the workflow's own ingest-xml-to-clickhouse call, not this script.
+
 Usage (called by the GHA workflow):
     python3 ingest_xml_si.py \
         --xml-dir xml_artifacts \
         --workflow "test_each_commit" \
         --branch   "main" \
         --sha      "abcdef1234..." \
-        --run-id   "12345678" \
+        --run-id   "3f2b9c1e-...-uuid" \
+        --gha-run-id "12345678" \
         --triggered-at "2026-04-25T14:20:45Z" \
         --pr-number 2271 \
         --platform "x86_64"
@@ -31,14 +34,15 @@ Usage (called by the GHA workflow):
 
 import argparse
 import os
+import platform as _platform
 import sys
 import uuid
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
-import clickhouse_connect
 from lxml import etree
+from spyre_clickhouse_ingest import extract_properties, get_client, promote_xpass
 
 # ---------------------------------------------------------------------------
 # si_test_runs / si_test_cases / si_run_properties are provisioned out of
@@ -81,38 +85,6 @@ def classify_testcase(tc_el):
         return "skipped", "", msg
 
     return "passed", "", ""
-
-
-def extract_properties(tc_el):
-    props = []
-    props_el = tc_el.find("properties")
-    if props_el is None:
-        return props
-    for p in props_el.findall("property"):
-        name = p.get("name", "").strip()
-        value = p.get("value", "").strip()
-        if name:
-            props.append((name, value))
-    return props
-
-
-def promote_xpass(raw_cases, suite_attrs):
-    """Mirror torch-spyre's ingest_xml.py: pytest's plain <failures> count
-    lumps strict and non-strict xfail-passed cases together with real
-    failures, so bare-passed cases must be promoted to "xpass" to reconcile
-    the suite-level failure count."""
-    failures = int(suite_attrs.get("failures", 0))
-    true_fail_raw = sum(1 for c in raw_cases if c["status"] in ("failed", "error"))
-    strict_xpass_raw = sum(1 for c in raw_cases if c["status"] == "xpass")
-    non_strict = max(0, failures - true_fail_raw - strict_xpass_raw)
-
-    promoted = 0
-    for c in raw_cases:
-        if promoted >= non_strict:
-            break
-        if c["_is_bare"]:
-            c["status"] = "xpass"
-            promoted += 1
 
 
 def parse_test_xml(xml_path: Path):
@@ -176,17 +148,6 @@ def parse_test_xml(xml_path: Path):
 # ---------------------------------------------------------------------------
 
 
-def get_client():
-    return clickhouse_connect.get_client(
-        host=os.environ["CLICKHOUSE_HOST"],
-        port=int(os.environ.get("CLICKHOUSE_PORT", 443)),
-        user=os.environ.get("CLICKHOUSE_USER", "default"),
-        password=os.environ["CLICKHOUSE_PASS"],
-        database=os.environ.get("CLICKHOUSE_DB", "spyre"),
-        secure=True,
-    )
-
-
 def insert_run(client, run_id: str, run: dict, args):
     client.insert(
         "si_test_runs",
@@ -199,7 +160,7 @@ def insert_run(client, run_id: str, run: dict, args):
                 args.branch,
                 (args.sha or "").ljust(40)[:40],
                 int(args.pr_number) if args.pr_number.strip() else 0,
-                int(args.run_id or 0),
+                _runner_run_id(args, run_id),
                 run["triggered_at"].replace(tzinfo=None),
                 run["total_tests"],
                 run["passed"],
@@ -222,7 +183,7 @@ def insert_run(client, run_id: str, run: dict, args):
             "branch",
             "commit_sha",
             "pr_number",
-            "gha_run_id",
+            "runner_run_id",
             "triggered_at",
             "total_tests",
             "passed",
@@ -314,12 +275,23 @@ def insert_properties(client, run_id: str, cases: list[dict]):
 # ---------------------------------------------------------------------------
 
 
+def _runner_run_id(args, run_id: str) -> str:
+    """This leg's own run id: --gha-run-id when GHA-dispatched, else the same uuid as run_id."""
+    raw = (getattr(args, "gha_run_id", "") or "").strip()
+    if raw:
+        try:
+            int(raw)
+            return raw
+        except (ValueError, TypeError):
+            pass
+    return run_id
+
+
 def _threaded_run_id(args) -> str:
     """--run-id when it is a real UUID, else "" so the caller mints one.
 
-    The flag has always carried a Jenkins BUILD_NUMBER historically (see this module's usage
-    example), which is not a UUID and must not land in a UUID column. Only a well-formed
-    uuid is honoured.
+    Only a well-formed uuid is honoured: the column is a UUID join key, so any
+    other value (a build number, a GHA run id) must be ignored, not stored.
     """
     raw = (getattr(args, "run_id", "") or "").strip()
     try:
@@ -336,6 +308,7 @@ def main():
     parser.add_argument("--branch", default="")
     parser.add_argument("--sha", default="")
     parser.add_argument("--run-id", default="")
+    parser.add_argument("--gha-run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
     parser.add_argument(
@@ -345,8 +318,8 @@ def main():
     )
     parser.add_argument(
         "--platform",
-        default="",
-        help="Hardware platform the suite ran on, e.g. x86_64 | s390x | ppc64le",
+        default=_platform.machine() or "",
+        help="Hardware platform the SUITE ran on, e.g. x86_64 | s390x | ppc64le.",
     )
     parser.add_argument(
         "--img-digest",
@@ -398,19 +371,6 @@ def main():
         # `filename` actually unique for both dedup and storage.
         run["filename"] = str(xml_path.relative_to(xml_root))
 
-        # Deduplication
-        existing = client.query(
-            "SELECT count() FROM si_test_runs "
-            "WHERE gha_run_id = {gha_run_id:UInt64} AND filename = {filename:String}",
-            parameters={
-                "gha_run_id": int(args.run_id or 0),
-                "filename": run["filename"],
-            },
-        )
-        if existing.result_rows[0][0] > 0:
-            print(f"  Already ingested — skipping {run['filename']}")
-            continue
-
         # One run_id per TEST RUN, not per XML file: the dispatching orchestrator generates
         # a uuid and threads it down as --run-id, stamping the SAME value on
         # artifact_results, so the two tables join. `filename` stays the per-file
@@ -418,6 +378,28 @@ def main():
         # --run-id is absent or not a uuid (standalone / GHA-only run): the rows are still
         # valid, just not linked to an artifact.
         run_id = _threaded_run_id(args) or str(uuid.uuid4())
+
+        # Dedup on (run_id, filename): a re-ingest of the SAME test run must be idempotent,
+        # but two distinct runs must never collapse. runner_run_id mirrors run_id for a
+        # Jenkins/standalone leg, so it's only an independent signal for a GHA numeric id.
+        runner_run_id = _runner_run_id(args, run_id)
+        existing = client.query(
+            "SELECT count() FROM si_test_runs "
+            "WHERE run_id = {run_id:String} AND filename = {filename:String}",
+            parameters={"run_id": run_id, "filename": run["filename"]},
+        )
+        if existing.result_rows[0][0] == 0 and runner_run_id and runner_run_id != run_id:
+            # A GHA re-ingest mints a fresh uuid4, so fall back to the numeric
+            # run id to keep that path idempotent.
+            existing = client.query(
+                "SELECT count() FROM si_test_runs WHERE "
+                "runner_run_id = {runner_run_id:String} AND filename = {filename:String}",
+                parameters={"runner_run_id": runner_run_id, "filename": run["filename"]},
+            )
+        if existing.result_rows[0][0] > 0:
+            print(f"  Already ingested — skipping {run['filename']}")
+            continue
+
         print(
             f"  run_id={run_id}  tests={run['total_tests']}  "
             f"passed={run['passed']}  failed={run['failed']}  "

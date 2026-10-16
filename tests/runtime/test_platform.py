@@ -1,0 +1,899 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for platform.py configuration logic."""
+
+import math
+import os
+from types import SimpleNamespace
+
+import pytest
+import torch
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config.compilation import CompilationConfig
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        (None, 128),
+        (16, 64),
+        (100, 128),
+        (64, 64),
+        (128, 128),
+        (256, 256),
+    ],
+)
+def test_block_size(requested, expected):
+    """A user-supplied block size is rounded up to 64; otherwise the Spyre default wins."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    cache_config = CacheConfig(block_size=requested)
+    assert cache_config.user_specified_block_size == (requested is not None)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
+        cache_config=cache_config,
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.block_size == expected
+
+
+def test_torch_accelerator_ops_are_noop():
+    """Regression for #327: EngineCore shutdown must not crash on accelerator ops."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    # The module applies the patch at import. A live spyre accelerator would make
+    # the real empty_cache() return None too, so assert on identity here.
+    assert torch.accelerator.empty_cache.__name__ == "_noop"
+    assert torch.accelerator.synchronize.__name__ == "_noop"
+    assert torch.accelerator.empty_host_cache.__name__ == "_noop"
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("Cannot access accelerator device when none is available.")
+
+    saved_empty_cache = torch.accelerator.empty_cache
+    saved_synchronize = torch.accelerator.synchronize
+    saved_empty_host_cache = torch.accelerator.empty_host_cache
+    try:
+        torch.accelerator.empty_cache = _raise
+        torch.accelerator.synchronize = _raise
+        torch.accelerator.empty_host_cache = _raise
+
+        _disable_torch_accelerator()
+
+        assert torch.accelerator.empty_cache() is None
+        assert torch.accelerator.synchronize() is None
+        assert torch.accelerator.empty_host_cache() is None
+    finally:
+        torch.accelerator.empty_cache = saved_empty_cache
+        torch.accelerator.synchronize = saved_synchronize
+        torch.accelerator.empty_host_cache = saved_empty_host_cache
+
+
+def test_memory_info_falls_back_to_host_ram(monkeypatch):
+    """Spyre registers no accelerator memory-info hook, so the native call raises;
+    vLLM's vision-encoder chunking budget needs a real number back."""
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    def _unimplemented(*args, **kwargs):
+        raise NotImplementedError("getMemoryInfo is not implemented for this allocator yet.")
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", _unimplemented, raising=True)
+    _disable_torch_accelerator()
+
+    free, total = torch.accelerator.get_memory_info()
+    assert free > 0
+    assert total >= free
+
+
+def test_memory_info_passes_through_when_the_native_call_works(monkeypatch):
+    from spyre_inference.platform import _disable_torch_accelerator
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", lambda *a, **k: (123, 456))
+    _disable_torch_accelerator()
+
+    assert torch.accelerator.get_memory_info() == (123, 456)
+
+
+def test_num_gpu_blocks_override_homogeneous():
+    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    blocks_per_seq = math.ceil(
+        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
+    )
+    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
+
+
+def test_num_gpu_blocks_override_hybrid_matches_homogeneous():
+    """Hybrid models get the same block count: one collapsed KV cache group.
+
+    ``disable_hybrid_kv_cache_manager`` merges every layer into a single group, so the
+    single-group formula applies unchanged.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    # Simulate a hybrid model with two interleaved attention types.
+    interleaved = ["sliding_attention", "full_attention"] * 13
+    model_config.hf_config.layer_types = interleaved
+    model_config.hf_text_config.layer_types = interleaved
+
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+    blocks_per_seq = math.ceil(
+        vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
+    )
+    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
+
+
+def test_num_gpu_blocks_override_skipped_for_pooling():
+    """Encoder/pooling models have no KV cache — do not invent a block count."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    object.__setattr__(model_config, "runner_type", "pooling")
+
+    cache_config = CacheConfig(block_size=64)
+    compilation_config = CompilationConfig(custom_ops=["all"])
+
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=cache_config,
+        compilation_config=compilation_config,
+    )
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert vllm_config.cache_config.num_gpu_blocks_override is None
+
+
+def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
+    from unittest.mock import MagicMock
+
+    from vllm.config import CompilationMode
+
+    vllm_config = MagicMock()
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.model_config.runner_type = "pooling"
+    vllm_config.model_config.max_model_len = max_model_len
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    vllm_config.compilation_config.custom_ops = ["all"]
+    # None requests pooling defaults. A MagicMock here is not None and would
+    # skip that path (#638).
+    vllm_config.compilation_config.compile_sizes = None
+    return vllm_config
+
+
+def test_apply_config_gives_pooling_one_body_shape():
+    """The whole point of fixing the body at the budget: one compile size, so the
+    encoder attention kernels key on the sequence shapes alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_batched_tokens=512)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [512]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+
+
+@pytest.mark.parametrize("enforce_eager", [False, True], ids=["compiled", "eager"])
+def test_apply_config_caps_roberta_max_model_len_on_both_paths(enforce_eager):
+    """Eager pads to the declared length too, so an uncapped 514 would index two rows
+    past the position table on every full-length request."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=514)
+    vllm_config.model_config.enforce_eager = enforce_eager
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        architectures=["XLMRobertaForSequenceClassification"],
+        max_position_embeddings=514,
+        pad_token_id=1,
+        position_embedding_type="absolute",
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.model_config.max_model_len == 512
+
+
+def test_apply_config_floors_the_pooling_budget_at_max_model_len():
+    """Encoder prefill cannot be chunked, so a budget below max_model_len would
+    head-of-line block the scheduler forever."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=256)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+    assert vllm_config.compilation_config.compile_sizes == [512]
+
+
+def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=8192)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+
+
+def test_apply_config_clamps_pooling_max_num_seqs_to_the_widest_rectangle():
+    """``max_num_seqs`` above ``budget // 64`` asks for a batch no rectangle holds."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=64, max_num_batched_tokens=512)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 8  # 512 // 64
+
+
+def test_apply_config_leaves_a_fitting_pooling_max_num_seqs_alone():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=4, max_num_batched_tokens=2048)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 4
+
+
+def _fake_pad_config(
+    head_dim=64,
+    num_heads=8,
+    *,
+    transformers_backend=False,
+    runner_type="generate",
+    **rope_attrs,
+):
+    """Minimal vllm_config exposing everything _maybe_pad_head_dim touches.
+
+    hf_config and hf_text_config share one object (the common case). Returns
+    (vllm_config, hf_config, model_config) so tests can assert on mutations.
+    """
+    hf_config = SimpleNamespace(
+        num_attention_heads=num_heads,
+        hidden_size=head_dim * num_heads,
+        head_dim=head_dim,
+        **rope_attrs,
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,
+        model_arch_config=SimpleNamespace(head_size=head_dim),
+        using_transformers_backend=lambda: transformers_backend,
+        runner_type=runner_type,
+    )
+    return SimpleNamespace(model_config=model_config), hf_config, model_config
+
+
+def test_pad_head_dim_full_rotary_pads():
+    """Full neox rotary (rotary_dim == head_dim): head_dim 96 -> 128, the next 64-multiple.
+
+    transformers 5.x carries all RoPE config in ``rope_parameters``; absence of a
+    partial-rotary factor there means full rotary.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        head_dim=96, rope_parameters={"rope_type": "default", "rope_theta": 10000.0}
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 128
+    assert hf._spyre_orig_head_dim == 96
+    assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_native_rope_keeps_head_64():
+    """A native RoPE model at head_dim 64 needs no padding."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0}
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+    assert mc.model_arch_config.head_size == 64
+
+
+def test_pad_head_dim_transformers_backend_rope_pads_head_64():
+    """The Transformers backend's RoPE splits heads in half, so head_dim 64 -> 128."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        transformers_backend=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 128
+    assert hf._spyre_orig_head_dim == 64
+    assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_pads_on_the_transformers_backend():
+    """Regression for #597: this used to return early for the Transformers backend."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        head_dim=4,
+        num_heads=4,
+        transformers_backend=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 128
+    assert hf._spyre_orig_head_dim == 4
+    assert mc.model_arch_config.head_size == 128
+
+
+def test_pad_head_dim_rejects_rope_dim():
+    """An absolute rope_dim override won't scale to the padded width -> fail fast."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(
+        head_dim=96,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "rope_dim": 64},
+    )
+    with pytest.raises(NotImplementedError, match="rope_dim"):
+        TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    # Bail out before mutating anything.
+    assert hf.head_dim == 96
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+    assert mc.model_arch_config.head_size == 96
+
+
+def test_pad_head_dim_rejects_partial_rotary_factor():
+    """Partial rotary (GPTNeoX/Phi shape) lands in rope_parameters in 5.x -> fail fast."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(
+        head_dim=96,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+        },
+    )
+    with pytest.raises(NotImplementedError, match="partial_rotary_factor"):
+        TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+    assert hf.head_dim == 96
+
+
+def test_reduced_rotary_dim_reason_branches():
+    """Unit-test the detector directly. All RoPE config lives in rope_parameters (5.x)."""
+    from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
+
+    ns = SimpleNamespace
+    # Full rotary / no rope config -> not reduced.
+    assert reduced_rotary_dim_reason(ns()) is None
+    assert reduced_rotary_dim_reason(ns(rope_parameters={"rope_type": "default"})) is None
+    assert reduced_rotary_dim_reason(ns(rope_parameters={"partial_rotary_factor": 1.0})) is None
+
+    # Reductions below head_dim.
+    assert "rope_dim" in reduced_rotary_dim_reason(ns(rope_parameters={"rope_dim": 64}))
+    assert "partial_rotary_factor" in reduced_rotary_dim_reason(
+        ns(rope_parameters={"partial_rotary_factor": 0.25})
+    )
+
+
+def test_pad_head_dim_aligned_model_with_rope_dim_not_rejected():
+    """head_dim already 128-aligned (e.g. MLA rope_dim models): guard must not fire."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(
+        head_dim=128,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "rope_dim": 64},
+    )
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)  # returns early, no raise
+
+    assert hf.head_dim == 128
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_pools_a_sub_stick_non_rope_model():
+    """granite-embedding-30m-english shape: no RoPE, pooling, head_dim 32 -> 64
+    (not 128 -- the RoPE path's width doesn't apply here)."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, mc = _fake_pad_config(head_dim=32, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
+    assert hf._spyre_orig_head_dim == 32
+    assert mc.model_arch_config.head_size == 64
+
+
+def test_pad_head_dim_skips_a_non_rope_non_pooling_model():
+    """OPT/GPT-2 shape: no RoPE, not pooling -> untouched, as before."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=32, num_heads=12, runner_type="generate")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 32
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_skips_an_already_aligned_pooling_model():
+    """head_dim already a 64-multiple (e.g. granite-embedding-125m) -> no-op."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, hf, _ = _fake_pad_config(head_dim=64, num_heads=12, runner_type="pooling")
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert hf.head_dim == 64
+    assert not hasattr(hf, "_spyre_orig_head_dim")
+
+
+def test_pad_head_dim_pads_hf_text_config_under_any_sub_config_name():
+    """The platform pads the config the runner passes read: ``hf_text_config``, which
+    ``get_text_config()`` may resolve from e.g. ``llm_config``, not only ``text_config``."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config, text, mc = _fake_pad_config(head_dim=96, rope_parameters={"rope_type": "default"})
+    mc.hf_config = SimpleNamespace(llm_config=text)
+
+    TorchSpyrePlatform._maybe_pad_head_dim(vllm_config)
+
+    assert text.head_dim == 128
+    assert text._spyre_orig_head_dim == 96
+
+
+def _defaults_config(enforce_eager: bool, mode) -> VllmConfig:
+    """Minimal VllmConfig for exercising apply_config_platform_defaults."""
+    from vllm.config.compilation import CompilationMode
+
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1,
+        dtype=torch.float16,
+        trust_remote_code=True,
+        enforce_eager=enforce_eager,
+    )
+    compilation_config = CompilationConfig()
+    if mode is not None:
+        compilation_config.mode = getattr(CompilationMode, mode)
+
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(),
+        compilation_config=compilation_config,
+    )
+
+
+def test_compile_default_is_stock_when_not_eager():
+    """--enforce-eager off ⇒ default to STOCK_TORCH_COMPILE, keeping CustomOp dispatch."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+    assert "all" in vllm_config.compilation_config.custom_ops
+
+
+def test_enforce_eager_forces_none():
+    """--enforce-eager on ⇒ CompilationMode.NONE (everything eager)."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.NONE
+
+
+def test_enforce_eager_is_the_only_eager_switch():
+    """An explicit mode=NONE without --enforce-eager is still overridden to STOCK."""
+    from vllm.config.compilation import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode="NONE")
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
+
+
+def test_collectives_bypass_the_vllm_custom_op_wrappers():
+    """Collectives must reach `SpyreCommunicator` directly, not via torch.ops.vllm.*."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    assert TorchSpyrePlatform.use_custom_op_collectives() is False
+
+
+@pytest.mark.parametrize("field", ["data_parallel_size", "pipeline_parallel_size"])
+def test_only_tensor_parallelism_is_accepted(field):
+    """DP and PP are rejected: the device collectives require TP group == world."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    setattr(vllm_config.parallel_config, field, 2)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+@pytest.mark.parametrize("requested", ["1", "true", "0", None])
+def test_v1_model_runner_is_pinned(monkeypatch, requested):
+    """TorchSpyreWorker only builds the V1 runner, so the resolved config must agree
+    whatever the user asked for. An explicit VLLM_USE_V2_MODEL_RUNNER=1 short-circuits
+    upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    if requested is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert vllm_config.use_v2_model_runner is False
+
+
+@pytest.mark.parametrize("feature", ["hisparse", "watermark", "aux_output"])
+def test_v2_only_features_are_rejected(monkeypatch, feature):
+    """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
+    use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
+    watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
+    cannot catch it, and it would be accepted and never produced. Reject all three here."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    if feature == "hisparse":
+        monkeypatch.setattr(
+            vllm_config.attention_config, "hisparse_config", object(), raising=False
+        )
+    elif feature == "watermark":
+        monkeypatch.setattr(vllm_config, "watermark_config", object(), raising=False)
+    else:
+        monkeypatch.setattr(vllm_config.aux_output_config, "enable_return_routed_experts", True)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_bfloat16_is_rejected_under_tensor_parallelism():
+    """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
+    compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather
+    than minutes into warmup.
+    """
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.parallel_config.tensor_parallel_size = 2
+
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1 with"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_quantization_is_rejected_with_bfloat16():
+    """``SpyreFp8LinearKernel`` emits float16 only, so FP8 + bf16 must fail at startup."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+    vllm_config.model_config.quantization = "fp8"
+
+    with pytest.raises(ValueError, match="does not support quantization"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_bfloat16_is_accepted_at_tp1():
+    """The guard above must not reject the single-card bf16 path."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    vllm_config.model_config.dtype = torch.bfloat16
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
+def test_raise_dynamo_recompile_limits_survives_a_clobber():
+    """torch_spyre's autoload lowers cache_size_limit to 1024; re-asserting must win."""
+    import torch._dynamo
+
+    from spyre_inference.platform import _raise_dynamo_recompile_limits
+
+    saved = (
+        torch._dynamo.config.cache_size_limit,
+        torch._dynamo.config.accumulated_recompile_limit,
+    )
+    try:
+        torch._dynamo.config.cache_size_limit = 1024
+        torch._dynamo.config.accumulated_recompile_limit = 256
+
+        _raise_dynamo_recompile_limits()
+
+        assert torch._dynamo.config.cache_size_limit == 100000
+        assert torch._dynamo.config.accumulated_recompile_limit == 100000
+    finally:
+        (
+            torch._dynamo.config.cache_size_limit,
+            torch._dynamo.config.accumulated_recompile_limit,
+        ) = saved
+
+
+def test_worker_reasserts_recompile_limits_after_autoload():
+    """The re-assert must come *after* torch_spyre._autoload(), or it is undone."""
+    import inspect
+
+    from spyre_inference.v1.worker import spyre_worker
+
+    src = inspect.getsource(spyre_worker.TorchSpyreWorker.init_device)
+    assert src.index("torch_spyre._autoload()") < src.index("_raise_dynamo_recompile_limits()")
+
+
+def test_compile_sizes_default_generated():
+    """Defaults are powers of two up to max_num_seqs, plus one prefill bucket."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512]
+
+
+def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
+    """A max_num_seqs that is not a power of two still gets its own bucket."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 6
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 6, 512]
+
+
+def test_compile_sizes_user_provided_respected():
+    """User-supplied compile_sizes must not be overwritten."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    user_sizes = [32, 64, 128]
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = user_sizes
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == user_sizes
+
+
+def test_compile_sizes_user_provided_caps_scheduler():
+    """max_num_batched_tokens is capped to max(user-supplied compile_sizes)."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    user_sizes = [16, 32, 64]
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = user_sizes
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 64
+
+
+def test_compile_sizes_default_caps_at_max_num_batched_tokens():
+    """Default bucket generation respects max_num_batched_tokens as upper bound."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = 32
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+def test_compile_sizes_empty_list_opts_out():
+    """An explicit empty list disables bucketing and leaves the scheduler alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_batched_tokens = 32
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == []
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+def test_compile_sizes_not_set_when_eager():
+    """--enforce-eager should skip compile_sizes generation entirely."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert not vllm_config.compilation_config.compile_sizes
+
+
+def test_get_cpu_count_num_cpus_override(monkeypatch):
+    """SPYRE_NUM_CPUS takes precedence over any detection."""
+    from spyre_inference.threading_config import get_cpu_count
+
+    monkeypatch.setenv("SPYRE_NUM_CPUS", "6")
+    count, message = get_cpu_count()
+    assert count == 6.0
+    assert "SPYRE_NUM_CPUS" in message
+
+
+def _force_cpu_count(monkeypatch, value):
+    """Pin get_cpu_count so threading tests don't depend on the host."""
+    import spyre_inference.threading_config as tc
+
+    monkeypatch.setattr(tc, "get_cpu_count", lambda use_logical_cpus=False: (value, "forced"))
+
+
+def test_configure_threading_overrides_when_enabled(monkeypatch):
+    """Enabled (the default) → every threading env is set to cpus/worker."""
+    from spyre_inference.threading_config import THREADING_ENVS, configure_threading
+
+    monkeypatch.delenv("SPYRE_UPDATE_THREAD_CONFIG", raising=False)  # default = on
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")  # the "wildly high" k8s default
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=2)
+
+    for env in THREADING_ENVS:
+        assert os.environ[env] == "4", env  # ceil(8 / 2)
+
+
+def test_configure_threading_single_worker_uses_full_count(monkeypatch):
+    """TP=1 clamps to the detected budget, not the host core count."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=1)
+
+    assert os.environ["OMP_NUM_THREADS"] == "8"
+
+
+def test_configure_threading_warn_only_leaves_envs_untouched(monkeypatch):
+    """Disabled → the env is left as-is (only a warning is logged)."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "0")
+    monkeypatch.setenv("OMP_NUM_THREADS", "128")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=1)
+
+    assert os.environ["OMP_NUM_THREADS"] == "128"
+
+
+def test_configure_threading_raises_when_undetectable(monkeypatch):
+    """Enabled but no CPU count detectable → fail loudly rather than guess."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    _force_cpu_count(monkeypatch, None)
+
+    with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
+        configure_threading(worker_count=1)
+
+
+# ---------------------------------------------------------------------------
+# Registry check — end-to-end through check_and_update_config + platform boot
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("model", "tp_size", "max_model_len", "expect_warn"),
+    [
+        # Exact registry hit (gemma-3-1b-it, tp=1, len=32768) — no warning.
+        ("google/gemma-3-1b-it", 1, 32768, False),
+        # Same model, wrong max_model_len — not a registered config, warns.
+        ("google/gemma-3-1b-it", 1, 4096, True),
+        # Same model, wrong tp_size — not a registered config, warns.
+        ("google/gemma-3-1b-it", 2, 32768, True),
+    ],
+)
+def test_registry_check_via_platform(model, tp_size, max_model_len, expect_warn, caplog):
+    """Full platform boot: check_and_update_config fires _warn_if_not_in_registry.
+    Uses a real VllmConfig (gemma-3-1b-it, cached on CI) so the plugin activates
+    and the log line is emitted for miss cases, and is absent for hit cases."""
+    import logging
+
+    from vllm.config import ParallelConfig
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model=model,
+            max_model_len=max_model_len,
+            dtype="auto",
+            trust_remote_code=True,
+            enforce_eager=True,
+        ),
+        cache_config=CacheConfig(block_size=128),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        parallel_config=ParallelConfig(tensor_parallel_size=tp_size),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    registry_warnings = [
+        r for r in caplog.records if "not in the Spyre model registry" in r.message
+    ]
+    if expect_warn:
+        assert len(registry_warnings) >= 1
+        assert model in registry_warnings[0].message
+    else:
+        assert len(registry_warnings) == 0

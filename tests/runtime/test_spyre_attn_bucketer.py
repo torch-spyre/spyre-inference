@@ -1,0 +1,557 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for SpyreAttnBucketer. No hardware required."""
+
+from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from spyre_inference import envs
+from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    SpyreAttnBucketer,
+    _parse_buckets,
+    _powers_of_two_up_to,
+    batched_decode_chunking,
+)
+
+BLOCK_SIZE = 64
+
+
+def make_config(
+    max_model_len=2048,
+    max_num_batched_tokens=512,
+    block_size=BLOCK_SIZE,
+    max_num_seqs=8,
+    runner_type="generate",
+    num_kv_heads=8,
+    per_layer_kv_heads=None,
+):
+    config = MagicMock()
+    config.cache_config.block_size = block_size
+    config.model_config.max_model_len = max_model_len
+    config.model_config.runner_type = runner_type
+    config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    config.scheduler_config.max_num_seqs = max_num_seqs
+
+    arch = config.model_config.model_arch_config
+    if per_layer_kv_heads is None:
+        arch.per_layer_overrides = None
+        config.model_config.get_num_kv_heads.return_value = num_kv_heads
+    else:
+        # A heterogeneous config, whose model-wide number hides the smallest layer.
+        arch.per_layer_overrides = [{} for _ in per_layer_kv_heads]
+        layers = []
+        for n in per_layer_kv_heads:
+            layer = MagicMock()
+            layer.kv = n
+            layers.append(layer)
+        arch.__getitem__.side_effect = layers.__getitem__
+        config.model_config.get_num_kv_heads.side_effect = (
+            lambda _pc, arch_config=None: num_kv_heads if arch_config is None else arch_config.kv
+        )
+    return config
+
+
+def _list_pow2(limit: int, start: int = 1) -> list[int]:
+    """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
+    return list(_powers_of_two_up_to(limit, start=start))
+
+
+@pytest.fixture()
+def bucketer():
+    return SpyreAttnBucketer(make_config())
+
+
+@pytest.fixture(autouse=True)
+def _clear_env_cache(monkeypatch):
+    """envs caches on first read, so each test must start from a clean slate."""
+    envs.clear_env_cache()
+    yield
+    envs.clear_env_cache()
+
+
+class TestBuckets:
+    def test_kv_buckets_are_powers_of_two_to_max_model_len(self, bucketer):
+        assert bucketer.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE)
+        assert bucketer.kv_buckets[-1] == 2048
+
+    def test_kv_buckets_start_at_block_size(self, bucketer):
+        """Buckets below block_size all collapse to num_blocks == 1, so the
+        smallest bucket is block_size rather than 1."""
+        assert bucketer.kv_buckets[0] == BLOCK_SIZE
+
+    @pytest.mark.parametrize("block_size", [64, 128, 256])
+    def test_kv_buckets_start_tracks_block_size(self, block_size):
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=block_size))
+        assert b.kv_buckets == _list_pow2(4096, start=block_size)
+
+    def test_kv_buckets_round_non_power_of_two_block_size_up(self):
+        """The platform only forces block_size to a multiple of 64, so a
+        non-power-of-two value is reachable; buckets stay a clean doubling
+        sequence by starting at the next power of two."""
+        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=192))
+        assert b.kv_buckets == [256, 512, 1024, 2048, 4096]
+
+    def test_query_buckets_lead_with_decode_case(self, bucketer):
+        assert bucketer.query_buckets[0] == 1
+        assert bucketer.query_buckets == [1, 512]
+
+    def test_query_buckets_are_multiples_of_the_step(self):
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=2048))
+        assert b.query_buckets == [1, 512, 1024, 1536, 2048]
+
+    def test_query_bucket_step_capped_by_max_num_batched_tokens(self):
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=300))
+        assert b.query_buckets == [1, 300]
+
+    def test_buckets_include_non_power_of_two_limit(self):
+        b = SpyreAttnBucketer(make_config(max_model_len=3000, max_num_batched_tokens=100))
+        assert b.kv_buckets == _list_pow2(2048, start=BLOCK_SIZE) + [3000]
+        assert b.query_buckets == [1, 100]
+
+    def test_largest_bucket_is_always_the_limit(self):
+        for limit in (1, 2, 3, 64, 100, 4096, 32768):
+            b = SpyreAttnBucketer(make_config(max_model_len=limit, max_num_batched_tokens=limit))
+            assert b.kv_buckets[-1] == limit
+            assert b.query_buckets[-1] == limit
+
+    def test_buckets_have_no_duplicates(self):
+        for limit in (1, 2, 3, 64, 100, 512, 513, 4096, 32768):
+            b = SpyreAttnBucketer(make_config(max_model_len=limit, max_num_batched_tokens=limit))
+            assert b.kv_buckets == sorted(set(b.kv_buckets))
+            assert b.query_buckets == sorted(set(b.query_buckets))
+
+
+class TestPoolingQueryBucketCap:
+    """Pooling's query_len can't exceed max_model_len; without this cap, warmup
+    could record a query bucket with no matching num_blocks bucket, crashing
+    with "num_blocks=N exceeds the largest recorded bucket" (CLIP's text tower:
+    max_model_len=77, max_num_batched_tokens much larger).
+
+    Stick-aligned the same way the encoder shape ladder pads a request
+    (_align_up_pow2): CLIP's max_model_len=77 pads to 128, not 77."""
+
+    def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="pooling")
+        )
+        assert b.query_buckets[-1] == 128
+        # The largest recorded query bucket must round onto a real num_blocks
+        # bucket -- this is what crashed for CLIP.
+        largest_query_blocks = -(-b.query_buckets[-1] // b.block_size)
+        assert b.find_blocks_bucket(largest_query_blocks) is not None
+
+    def test_pooling_query_bucket_covers_clip_text_tower_padded_length(self):
+        """CLIP's max_model_len=77 pads to query_len=128; that must round onto a bucket."""
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.find_query_bucket(128) == 128
+
+    def test_generate_is_unaffected(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=77, max_num_batched_tokens=2048, runner_type="generate")
+        )
+        assert b.query_buckets[-1] == 2048
+
+    def test_pooling_is_a_noop_when_max_batched_is_already_smaller(self):
+        b = SpyreAttnBucketer(
+            make_config(max_model_len=2048, max_num_batched_tokens=512, runner_type="pooling")
+        )
+        assert b.query_buckets[-1] == 512
+
+
+class TestFindBucket:
+    def test_exact_match(self, bucketer):
+        assert bucketer.find_kv_bucket(512) == 512
+        assert bucketer.find_query_bucket(512) == 512
+
+    def test_rounds_up(self, bucketer):
+        assert bucketer.find_kv_bucket(257) == 512
+        assert bucketer.find_query_bucket(33) == 512
+
+    def test_query_len_one_maps_to_decode_bucket(self, bucketer):
+        assert bucketer.find_query_bucket(1) == 1
+
+    def test_query_above_decode_rounds_to_the_step(self, bucketer):
+        """Only two buckets by default, so every non-decode query pads to the step."""
+        for query_len in (2, 33, 129, 511, 512):
+            assert bucketer.find_query_bucket(query_len) == 512
+
+    def test_kv_below_block_size_rounds_to_block_size(self, bucketer):
+        assert bucketer.find_kv_bucket(1) == BLOCK_SIZE
+        assert bucketer.find_kv_bucket(BLOCK_SIZE) == BLOCK_SIZE
+
+    def test_exceeds_max_returns_none(self, bucketer):
+        assert bucketer.find_kv_bucket(2049) is None
+        assert bucketer.find_query_bucket(513) is None
+
+    def test_min_real_query_len_is_one_past_the_bucket_below(self, bucketer):
+        """The length the recorder builds its synthetic sequence at, and the one
+        ``variants()`` prunes against."""
+        assert bucketer.min_real_query_len(1) == 1
+        assert bucketer.min_real_query_len(512) == 2
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=2048))
+        assert [b.min_real_query_len(q) for q in b.query_buckets] == [1, 2, 513, 1025, 1537]
+
+    def test_min_real_query_len_rounds_back_onto_its_own_bucket(self, bucketer):
+        for bucket in bucketer.query_buckets:
+            assert bucketer.find_query_bucket(bucketer.min_real_query_len(bucket)) == bucket
+
+
+class TestVariants:
+    def test_no_duplicates(self, bucketer):
+        variants = bucketer.variants()
+        assert len(variants) == len(set(variants))
+
+    def test_stable_across_calls(self, bucketer):
+        assert bucketer.variants() == bucketer.variants()
+
+    def test_largest_first(self, bucketer):
+        variants = bucketer.variants()
+        assert variants[0].num_blocks == max(v.num_blocks for v in variants)
+
+    def test_descriptor_is_frozen(self, bucketer):
+        with pytest.raises(FrozenInstanceError):
+            bucketer.variants()[0].num_blocks = 10
+
+    def test_query_buckets_stay_narrower_than_the_query_buffer(self):
+        """``SpyreAttentionImpl`` gathers unconditionally, which faults if a
+        sequence is the whole buffer, so every bucket must fit with a row spare."""
+        max_batched = 512
+        bucketer = SpyreAttnBucketer(make_config(max_num_batched_tokens=max_batched))
+        for bucket in bucketer.query_buckets:
+            assert bucket < max_batched + 1
+
+    def test_prunes_query_buckets_no_real_query_len_can_reach(self, bucketer):
+        """Pruning bounds the *smallest real* query_len that reaches a bucket, not
+        the bucket itself: a 2-token query on a 1-block sequence still legitimately
+        pads to 512."""
+        ascending = sorted(bucketer.query_buckets)
+        min_real = {b: (ascending[i - 1] + 1 if i else 1) for i, b in enumerate(ascending)}
+        for v in bucketer.variants():
+            assert min_real[v.padded_query_len] <= v.num_blocks * BLOCK_SIZE
+
+    @pytest.mark.parametrize("kv_len", [1, 256, 257, 2048])
+    @pytest.mark.parametrize("query_len", [1, 32, 33, 512])
+    def test_every_rounded_size_lands_on_a_recorded_variant(self, bucketer, kv_len, query_len):
+        """The whole point of recording: no runtime batch may miss the cache.
+
+        Drives the two lookups production uses -- find_query_bucket, and
+        _round_up onto num_blocks_buckets (what _pad_num_blocks calls)."""
+        if query_len > kv_len:
+            pytest.skip("a sequence cannot have more new tokens than total KV")
+        padded_query_len = bucketer.find_query_bucket(query_len)
+        num_blocks = bucketer._round_up(
+            (kv_len + BLOCK_SIZE - 1) // BLOCK_SIZE, bucketer.num_blocks_buckets
+        )
+        assert padded_query_len is not None and num_blocks is not None
+        sizes = {(v.num_blocks, v.padded_query_len) for v in bucketer.variants()}
+        assert (num_blocks, padded_query_len) in sizes
+
+    def test_count_stays_tractable_at_long_context(self):
+        """Dense buckets here would be tens of thousands of Inductor compiles."""
+        b = SpyreAttnBucketer(make_config(32768, 2048))
+        assert len(b.variants()) < 500
+
+    def test_num_seqs_buckets_ladder_from_one_to_max_num_seqs(self):
+        """The ladder starts at 1 and tops out at max_num_seqs."""
+        assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [1, 2, 4, 8]
+        assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [1, 2, 4, 6]
+
+    @pytest.mark.parametrize("max_num_seqs", [1, 2, 3])
+    def test_num_seqs_buckets_cover_small_batches(self, max_num_seqs, monkeypatch):
+        """Small batches dispatch to the batched kernel too, so each has a bucket."""
+        b = SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs))
+        assert b.num_seqs_buckets == list(range(1, max_num_seqs + 1))
+        assert b.batched_decode_variants()
+        assert b.find_sequence_bucket(max_num_seqs) == max_num_seqs
+
+        monkeypatch.setenv("SPYRE_ATTN_NUM_SEQS_BUCKETS", str(max_num_seqs))
+        envs.clear_env_cache()
+        assert SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs)).num_seqs_buckets == [
+            max_num_seqs
+        ]
+
+    def test_num_blocks_buckets_follow_the_kv_buckets(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config())
+        assert b.num_blocks_buckets == [8, 16, 32]
+
+
+class TestEnvOverride:
+    def test_kv_buckets_override(self, monkeypatch):
+        """Kept verbatim: the top entry is exactly max_model_len=2048."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,512,2048")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config())
+        assert b.kv_buckets == [128, 512, 2048]
+
+    def test_query_buckets_override_is_sorted_and_deduped(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "64,1,16,64")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=64))
+        assert b.query_buckets == [1, 16, 64]
+
+    def test_truncated_kv_override_is_topped_up_to_max_model_len(self, monkeypatch):
+        """A short override would otherwise leave (512, 2048] with no bucket."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,512")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.kv_buckets == [128, 512, 2048]
+        assert b.find_kv_bucket(2048) == 2048
+
+    def test_truncated_query_override_is_topped_up_to_max_batched(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,16")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_num_batched_tokens=512))
+        assert b.query_buckets == [1, 16, 512]
+        assert b.find_query_bucket(512) == 512
+
+    def test_override_above_the_limit_is_dropped(self, monkeypatch):
+        """Entries past the limit are unreachable; drop them and cover the limit."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128,8192")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.kv_buckets == [128, 2048]
+
+    def test_override_entirely_above_the_limit_keeps_only_the_limit(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "4096,8192")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.kv_buckets == [2048]
+
+    def test_covers_every_in_contract_length_under_a_short_override(self, monkeypatch):
+        """The point of the top-up: no in-contract batch falls off either axis."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "128")
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1")
+        envs.clear_env_cache()
+        max_model_len, max_batched = 1024, 256
+        b = SpyreAttnBucketer(make_config(max_model_len, max_batched))
+        for kv_len in (1, 129, 500, max_model_len):
+            for query_len in (1, 2, 200, max_batched):
+                if query_len > kv_len:
+                    continue
+                assert b.find_kv_bucket(kv_len) is not None
+                assert b.find_query_bucket(query_len) is not None
+
+    def test_a_length_outside_the_contract_has_no_bucket(self, monkeypatch):
+        """Past max_model_len there is no bucket by design."""
+        b = SpyreAttnBucketer(make_config(max_model_len=2048))
+        assert b.find_kv_bucket(2049) is None
+
+    def test_parse_buckets_rejects_non_positive(self):
+        with pytest.raises(ValueError):
+            _parse_buckets("0,32")
+
+    def test_parse_buckets_empty_is_none(self):
+        assert _parse_buckets("") is None
+        assert _parse_buckets(None) is None
+
+
+class TestRecorderBuilders:
+    """The recorder records through the builder each layer dispatches against."""
+
+    @staticmethod
+    def _builder():
+        """A stand-in that still satisfies the runner's isinstance check."""
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            SpyreAttentionMetadataBuilder,
+        )
+
+        return MagicMock(spec=SpyreAttentionMetadataBuilder)
+
+    @staticmethod
+    def _runner(*groups):
+        """A bare runner with one ``(layer_names, builders)`` argument per attention
+        group; ``builders`` is that group's per-ubatch list."""
+        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+        runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
+        runner.attn_groups = [
+            [
+                SimpleNamespace(layer_names=list(layer_names), metadata_builders=list(builders))
+                for layer_names, builders in groups
+            ]
+        ]
+        return runner
+
+    def test_every_layer_maps_to_its_own_groups_builder(self):
+        builder = self._builder()
+        runner = self._runner((["layers.0.self_attn", "layers.1.self_attn"], [builder]))
+        assert runner._attn_metadata_builders() == {
+            "layers.0.self_attn": builder,
+            "layers.1.self_attn": builder,
+        }
+
+    def test_groups_keep_their_own_builders(self):
+        """Groups exist because their KV specs differ (block size, sliding window),
+        so one group's builder must not stand in for another's layers."""
+        first, second = self._builder(), self._builder()
+        runner = self._runner((["layers.0.self_attn"], [first]), (["layers.1.self_attn"], [second]))
+        builders = runner._attn_metadata_builders()
+        assert builders["layers.0.self_attn"] is first
+        assert builders["layers.1.self_attn"] is second
+
+    def test_first_ubatch_builder_stands_for_the_group(self):
+        """Ubatch builders share a spec, so either records the same variants."""
+        first, second = self._builder(), self._builder()
+        runner = self._runner((["layers.0.self_attn"], [first, second]))
+        assert runner._attn_metadata_builders() == {"layers.0.self_attn": first}
+
+    def test_skips_groups_without_a_spyre_builder(self):
+        """A foreign or empty group's layers are left out, so the recorder logs them
+        rather than recording against a builder that cannot enumerate variants."""
+        builder = self._builder()
+        runner = self._runner(
+            (["encoder.0.attn"], [MagicMock()]),
+            (["layers.0.self_attn"], [builder]),
+            (["layers.1.self_attn"], []),
+        )
+        assert runner._attn_metadata_builders() == {"layers.0.self_attn": builder}
+
+    def test_batched_decode_dispatches_onto_a_recorded_block_count(
+        self, monkeypatch, default_vllm_config
+    ):
+        """The regression this guards: ``build()`` and warmup must agree."""
+        from spyre_testing_plugin.attn_helpers import _padded_mask_metadata
+
+        monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "512,1024,2048")
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+
+        from vllm.config import get_current_vllm_config
+
+        # block_size pinned to match what _padded_mask_metadata builds with, so
+        # the override resolves onto the same block counts build() produces.
+        vllm_config = get_current_vllm_config()
+        vllm_config.cache_config.block_size = BLOCK_SIZE
+        bucketer = SpyreAttnBucketer(vllm_config)
+
+        # 4 blocks of real KV.
+        metadata = _padded_mask_metadata(
+            [(1, 4 * BLOCK_SIZE)] * 4, max_num_blocks=bucketer.num_blocks_buckets[-1]
+        )
+
+        assert metadata.padded_batch_blocks in bucketer.num_blocks_buckets
+        assert metadata.padded_num_seqs in bucketer.num_seqs_buckets
+
+
+class TestBatchedDecodeVariants:
+    """The batched decode enumeration, keyed on (num_seqs, blocks_per_chunk, num_chunks)."""
+
+    @pytest.fixture()
+    def enabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        return SpyreAttnBucketer(make_config())
+
+    def test_empty_when_the_path_is_disabled(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        assert SpyreAttnBucketer(make_config()).batched_decode_variants() == []
+
+    def test_covers_the_full_num_seqs_by_num_blocks_grid(self, enabled):
+        assert {(v.num_seqs, v.num_blocks) for v in enabled.batched_decode_variants()} == {
+            (s, n) for n in enabled.num_blocks_buckets for s in enabled.num_seqs_buckets
+        }
+
+    def test_no_duplicates(self, enabled):
+        variants = enabled.batched_decode_variants()
+        assert len(set(variants)) == len(variants)
+
+    def test_stable_across_calls(self, enabled):
+        assert enabled.batched_decode_variants() == enabled.batched_decode_variants()
+
+    def test_largest_first(self, enabled):
+        blocks = [v.num_blocks for v in enabled.batched_decode_variants()]
+        assert blocks == sorted(blocks, reverse=True)
+
+    def test_descriptor_is_frozen(self, enabled):
+        with pytest.raises(FrozenInstanceError):
+            enabled.batched_decode_variants()[0].num_seqs = 1  # ty: ignore[invalid-assignment]
+
+    def test_chunking_matches_the_shared_helper(self, enabled):
+        for v in enabled.batched_decode_variants():
+            assert batched_decode_chunking(v.num_seqs, v.num_blocks) == (
+                v.blocks_per_chunk,
+                v.num_chunks,
+            )
+            # The block axis pads up to a whole chunk, never truncates.
+            assert v.blocks_per_chunk * v.num_chunks >= v.num_blocks
+
+    def test_chunking_pads_when_the_ladder_is_not_a_power_of_two(self):
+        """With power-of-two buckets the padding vanishes, so a drifting copy of the
+        chunking rule would look correct."""
+        assert batched_decode_chunking(8, 8) == (4, 2)  # 4*2 == 8, no padding
+        assert batched_decode_chunking(6, 8) == (5, 2)  # 5*2 == 10, padded
+
+    def test_count_stays_tractable_at_long_context(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(32768, 2048, max_num_seqs=64))
+        assert len(b.batched_decode_variants()) < 100
+
+
+class TestSingleKvHeadBlockFloor:
+    """A lone KV head on a lone page will not compile under the head-major layout, so
+    the block ladder floors to two -- see the note at the floor."""
+
+    @pytest.fixture(autouse=True)
+    def _head_major(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "head_major")
+        envs.clear_env_cache()
+
+    def test_floors_the_ladder_at_one_kv_head(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
+        assert min(b.num_blocks_buckets) == 2
+        assert 1 not in b.num_blocks_buckets
+
+    def test_a_short_context_still_gets_a_two_block_bucket(self):
+        """max_model_len <= block_size otherwise admits only a single-page walk, which
+        is the shape both failing CI configs had."""
+        b = SpyreAttnBucketer(make_config(max_model_len=BLOCK_SIZE, num_kv_heads=1))
+        assert b.num_blocks_buckets == [2]
+
+    def test_a_single_kv_head_layer_floors_a_heterogeneous_model(self):
+        """The gemma-4 shape: the model-wide count is 8, one layer type carries 1."""
+        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 1]))
+        assert min(b.num_blocks_buckets) == 2
+
+    def test_no_floor_when_every_layer_has_several_kv_heads(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 4]))
+        assert min(b.num_blocks_buckets) == 1
+
+    def test_an_empty_override_list_falls_back_to_the_model_wide_count(self):
+        """A config reporting no per-layer overrides is homogeneous, so the model-wide
+        count decides; min() over no layers must not raise."""
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1, per_layer_kv_heads=[]))
+        assert min(b.num_blocks_buckets) == 2
+
+    def test_no_floor_above_one_kv_head(self):
+        b = SpyreAttnBucketer(make_config(num_kv_heads=2))
+        assert min(b.num_blocks_buckets) == 1
+
+
+class TestSingleKvHeadBlockFloorTokenMajor:
+    def test_token_major_keeps_the_single_block_bucket(self, monkeypatch):
+        """Only the head-major decode kernel has the constraint."""
+        monkeypatch.setenv("SPYRE_ATTN_KV_LAYOUT", "token_major")
+        envs.clear_env_cache()
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1))
+        assert min(b.num_blocks_buckets) == 1

@@ -1,0 +1,97 @@
+# CLAUDE.md
+
+## Project Overview
+
+`spyre-inference` is a vLLM platform plugin that integrates with `torch-spyre` to leverage IBM's Spyre AI accelerator hardware. It provides PyTorch-native attention implementations and custom operations optimized for Spyre devices.
+
+## Architecture
+
+- Registers as the `spyre_inference` vLLM platform plugin via entry points (`spyre_inference:register`).
+- `TorchSpyrePlatform` extends `CpuPlatform`, forcing `torch.float16`. `--enforce-eager` is the only compile switch: set → `CompilationMode.NONE`; default → `STOCK_TORCH_COMPILE` (one graph per transformer block, attention compiled in its own domain).
+
+**Key modules:**
+
+- `spyre_inference/platform.py` — platform registration and config
+- `spyre_inference/v1/worker/` — `spyre_worker.py` (device execution), `spyre_model_runner.py` (`torch.device("spyre")`)
+- `spyre_inference/v1/worker/spyre/` — Model Runner V2 (MRV2) only, not wired up yet; nothing outside this package imports it (#906)
+- `spyre_inference/v1/attention/backends/spyre_attn.py` — PyTorch-native paged-KV attention
+- `spyre_inference/custom_ops/` — device-specific layer implementations (linear, gemma_rms_norm, rotary_embedding, vocab_parallel_embedding, parallel_lm_head, logits_processor, …)
+
+**Attention notes:** FlashAttention-style online softmax walking the pages of dense per-layer K and V tensors (indirect page gather, no compact copy), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, a batched decode kernel eligible even for one sequence when its other dispatch conditions hold.
+
+## Development Commands
+
+```bash
+uv sync --group dev            # dev install with test deps
+uv run pytest                  # local tests only
+uv run pytest -m upstream      # upstream vLLM compat tests (cached in ~/.cache/vllm-upstream-tests)
+uv run pytest --upstream       # local + upstream
+bash format.sh                 # format (prek via uvx)
+uv run ty                      # type check
+```
+
+`uv sync` does not install the RPMs in `spyre-rpms.lock`. On a pod whose image runtime
+differs from the lock, use `scripts/install-pinned-rpms.sh --rebuild` and source the
+generated `env.sh` first; the rebuild avoids reusing a torch-spyre wheel compiled
+against the old RPM set. See [Installation](docs/getting_started/installation.md).
+
+Runs are slow (~3 min) due to vLLM startup — prefer single-test invocations while iterating. Parametrize IDs contain `()`, `=`, `,`, which break `pytest -k`; list node IDs first, then quote the full ID:
+
+```bash
+uv run pytest 'tests/attention/test_spyre_attn.py::test_spyre_attn[<id>]' -m "not upstream"
+```
+
+Upstream vLLM tests are opt-in: they are only cloned and collected when the `-m` expression names the `upstream` marker (a negative mention like `-m "not upstream"` doesn't count) or `--upstream` is passed, so a bare `pytest` won't pull them into a broad selector. Tests needing real hardware guard themselves with `spyre_available()` and skip on CPU-only hosts, so "all green" on a non-Spyre machine does **not** mean the change works.
+
+Upstream test config lives in `spyre-testing-plugin` (`tests/plugin/`), which is loaded by the `addopts` entry in `pyproject.toml` — not a global `pytest11` entry point — so it stays inert in sibling repos sharing the venv (e.g. a local `torch-spyre` checkout). Env vars: `SKIP_UPSTREAM_TESTS=1` (hard off-switch, overrides `--upstream`), `VLLM_COMMIT=<sha>`; the upstream test paths come from the `rel_path` entries in `upstream_tests.yaml` (`UPSTREAM_TESTS_PATHS` is not read). After a vLLM bump, resync deps with `uv run sync-upstream-test-deps`.
+
+## Spyre-Specific Constraints
+
+- **Head size** must be a multiple of 64 (128-byte stick / 2 bytes for fp16).
+- **dtype**: float16 — `apply_config_platform_defaults` sets it for every model, gemma-4's vision tower included, and it overwrites an explicit `--dtype bfloat16` too. bfloat16 is declared supported by the attention backend and accepted by `check_and_update_config`, and is the same 2 bytes on device, but no engine run reaches it, so `all_reduce` and the FP8 kernel being fp16-only costs nothing today.
+- **Tensor parallelism**: TP≥1 supported. `SpyreCommunicator` overrides `all_reduce` and `all_gather` with torch's functional collectives, which torch-spyre lowers to device collectives inside a compiled graph (`all_gather` keeps a list-form eager path). **DP>1 and PP>1 are rejected** in `TorchSpyrePlatform.check_and_update_config`: lowered collectives use the whole comms world, so TP must span it. **bfloat16 + TP>1 is rejected there too**: torch-spyre's `all_reduce` is fp16-only on both paths (eager `SpyreCCLBackend` refuses bf16; the compiled `spyre.allreduce_plan` lowering has no bf16 `add`), so a bf16 model runs at TP1 only. The dtype override above means no engine run reaches this check today; it guards a config whose dtype is set after construction. Separately, `hf_overrides=GEMMA4_TEXT_BACKBONE_OVERRIDE` (`models/gemma4.py`) loads a gemma-4 vision repo's decoder alone, skipping the tower for a text-only run.
+- **Compilation**: default is compiled (`STOCK_TORCH_COMPILE`), not eager. Attention compiles in its own domain: `SpyreAttentionImpl` reads `get_current_vllm_config().compilation_config.mode` at construction, so building it outside a `set_current_vllm_config` context raises. Tests force `enforce_eager=True` where they want eager — don't assume "eager in tests." `STOCK_TORCH_COMPILE` compiles one transformer block at a time; `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model graph. Vision towers are eager by default, because a block that assembles a constant on the host has no device layout to lower; a tower opts in once a multimodal patch has hoisted that work out of the layer body and marked its layers with `mark_blocks_compilable` (`multimodal/utils.py`). CLIP's (`multimodal/clip.py`) and gemma 4's (`multimodal/gemma4_vision.py`) do today. Warmup runs a marked tower at every image-batch width and the compile guard watches its blocks like the decoder's; gemma 4's patch count is fixed by the processor's `max_soft_tokens`, so that covers image serving, while a per-request `max_soft_tokens` or a video (frames reach the tower in memory-sized chunks at their own budget) compiles on first use and is reported at the default `SPYRE_COMPILE_GUARD=warn`; at `error` the guard refuses it like any other unwarmed watched shape, so a deployment serving video keeps `warn`. Attention kernels are recorded during warmup rather than compiled lazily in the serving path: warmup walks `SpyreAttnBucketer.variants()` and traces each one. `SPYRE_ATTN_RECORD=0` restores the lazy behaviour, and `SPYRE_ATTN_KV_BUCKETS` / `SPYRE_ATTN_QUERY_BUCKETS` override the default buckets (an override is clamped to `max_model_len` / `max_num_batched_tokens`: entries above the limit are dropped as unreachable, and the limit itself is appended when missing, so every schedulable length always has a bucket) — the KV buckets are geometric (powers of two from `block_size`) because the recorded set grows with both axes, even after unreachable pairs are filtered, so dense buckets make warmup unaffordable at a long context; the query buckets are coarse, evenly-spaced ones for the same reason. Encoder attention on the rectangular path is traced *into* the block graph rather than run behind the opaque `unified_attention_with_output`, so inductor fuses it with the projections and the FFN. That costs one block compile per declared rectangle at warmup and needs a stick-aligned head size; an unpadded `head_size=32` layer and any eager run use the opaque path — `install_encoder`'s predicate is the only gate, there is no switch. Pooling models such as granite-30m and MiniLM pad their original 32-wide heads to 64 before construction. The **ragged path is never traced in**: it dispatches once per group, so the block graph's structure would depend on the step's group multiset, which cannot be enumerated at startup.
+- **KV cache layout**: two decoder backends. Default is head-major (`SpyreHeadMajorAttentionBackend`, `[num_blocks, num_kv_heads, block_size, head_size]`), which drops the per-page permute the kernels do before the matmuls, paying for it in the KV write; `SPYRE_ATTN_KV_LAYOUT=token_major` selects `SpyreAttentionBackend` and its `[num_blocks, block_size, num_kv_heads, head_size]` page. Head-major always compiles attention (its 2-D page gather fails eager) and carries no ALiBi, so both of those need `token_major`. **Batched decode** (`SPYRE_BATCHED_DECODE`, default on) is the reverse: under the default tiled walk only head-major supplies the per-stick page index the kernel needs, so a token-major run keeps the per-sequence loop whatever the flag says. They share everything above the cache's memory and duplicate only the advertised shape, the allocation, the KV-store kernel and the three attention kernels that read a page. The head-major store is fragile in a specific way: it needs one index tensor per KV head (rows of a `[KV, T]` tensor are correct while a row fits one int32 stick and then silently corrupt every head past it, sometimes escalating to a device fault, so a short-token test passes while long prefill is wrong) and a materialized source (a single-token fused-QKV view already reports contiguous at a nonzero storage offset, so an in-graph `contiguous()` is a no-op; `clone()` does copy to offset zero but did not fix it either, so the store uses an elementwise pass).
+- **Single accelerator**: the device is contested by one process at a time. Never run two Spyre-backed commands concurrently — no `pytest -n`/xdist, no parallel `uv run pytest`, no backgrounding one Spyre test while starting another. Parallel runs hang, corrupt device state, or corrupt the compile cache.
+
+## Iterating on a Local `torch-spyre` Checkout
+
+`uv run` re-syncs deps from `pyproject.toml` (which pins `torch-spyre` to a git rev) on every invocation, silently reverting a hand-installed local build. **Always use `uv run --no-sync …`** when iterating on a locally installed dependency. Symptom of forgetting: `Uninstalled 1 package … Installed 1 package …` near the top of pytest output, and your changes appear to have no effect. The wheel build takes ~50s, so batch source edits before each rebuild.
+
+To run `uv sync` itself (e.g. to pick up other dependency changes) without touching an already-installed local `torch-spyre`, add `--no-install-package torch-spyre --inexact`: the first flag skips resolving/rebuilding the pinned git rev, the second stops uv from uninstalling the now-unreferenced local package.
+
+## Debugging
+
+Invoke the `debug-spyre` skill for numerical mismatches, `spyre` compile errors, or silent CPU fallbacks.
+
+The single most important signal is `FallbackWarning`: torch-spyre silently routes unsupported ops to CPU, which changes the numerical path (fp16 accumulation order differs) and can mask the real bug. Turn it into an error to get a traceback: `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"`. Most "Spyre is broken" bugs are torch-spyre op gaps or dtype/layout limits, not local bugs — read `site-packages/torch_spyre/ops/{eager,fallbacks}.py` before assuming otherwise. When exploring a new feature area, search torch-spyre issues/PRs (short and long forms, e.g. `FP8`/`float8`/`_scaled_mm`) before starting.
+
+## Spyre Knowledgebase
+
+For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware interfaces, query the `spyre-knowledgebase` MCP server before searching code — treat it as the authoritative map, then verify against live code. Skip it for local code bugs and questions about this repo's own tests or implementation.
+
+## Code Style
+
+- **Minimize comments** — add them only for global context or non-obvious reasoning.
+- **Avoid trivial helpers** — don't wrap 1-2 LOC used once.
+- **Prefer simplicity** and match existing patterns/architecture when uncertain.
+- Assume general vLLM familiarity in the reader.
+
+## Opening a PR
+
+Always use the `prepare-pull-request` skill to clean up the current branch and open a pull request.
+
+## DCO (Developer Certificate of Origin)
+
+All commits must include a `Signed-off-by` line. Use the `-s` flag or append manually:
+
+```bash
+# With git commit
+git commit -s -m "Your commit message"
+
+# Or amend an existing commit
+git commit --amend -s --no-edit
+```
+
+The sign-off email must match your GitHub email. If they do not match, DCO checks will fail.
+For help configuring git with your GitHub identity, invoke the `github-commit` skill.

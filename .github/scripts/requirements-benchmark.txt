@@ -1,1 +1,4 @@
 clickhouse-connect>=0.7.0
+# Shared v2 schema model, identity and write path; the same package the composite
+# ingest action installs, so both entry points run one implementation.
+spyre-clickhouse-ingest @ git+https://github.com/torch-spyre/torch-spyre@main#subdirectory=extensions/clickhouse-ingest

@@ -1,0 +1,319 @@
+# Serve benchmarks for Spyre devices, replaying agentic dataset traces.
+#
+# Not run in CI: the 32k `_all` entries are too long for it. This file holds
+# every serve-tests.yaml entry plus those, so run it on your own pod with
+# `make perf-tests BENCH_SUITE=dev`. Keep the shared entries in sync with
+# serve-tests.yaml.
+#
+# Each entry under `tests` is merged over `defaults` and can override any key.
+# run_vllm_benchmarks.py derives SPYRE_DEVICES / AIU_WORLD_SIZE from
+# tensor-parallel-size, VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS from
+# server_health_timeout, and the bench-side model from server_parameters; it
+# also always passes --skip-chat-template, since the trace prompts carry their
+# own template.
+#
+# make perf-tests resolves SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET /
+# SPYRE_ALL_SEQUENCES_DATASET from cache, fetching missing/corrupt traces and
+# preserving existing-file overrides. FETCH_BENCH_DATA=0 bypasses resolution.
+# Unset vars fall back to benchmark-host paths; a selected entry whose file is
+# absent fails rather than being skipped.
+#
+# The trailing suffix names the trace an entry replays. Each one needs a
+# max-model-len that fits its requests, since longer ones are rejected: the
+# aiops trace runs at 4k, cics at 8k, all at 32k (its first 100 records peak
+# near 26k tokens). The 32k entries get a longer health timeout for warmup.
+
+defaults:
+  server_health_timeout: 1800
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 4
+    max-num-batched-tokens: 512
+    enable-prefix-caching: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 100
+    # Keep each record's own output_tokens rather than forcing a fixed length.
+    custom-output-len: -1
+    ignore-eos: true
+    # Replay the recorded order so prefix-cache behaviour is reproducible.
+    disable-shuffle: true
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    # Match max-num-seqs: the client keeps exactly one batch in flight, so the
+    # server never queues and the measured latency is the batch's own.
+    max-concurrency: 4
+
+tests:
+  - test_name: serve_granite33-8b_tp1_cics
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite33-8b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite41-8b_tp1_cics
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite41-8b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+
+  - test_name: serve_granite33-8b-fp8_tp4_aiops
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_granite41-8b-fp8_tp4_aiops
+    server_health_timeout: 3600
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 4096
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp1_cics
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 1
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp4_cics
+    server_health_timeout: 3600
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 8192
+    parameters:
+      dataset-path: ${SPYRE_CICS_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_granite33-8b_tp1_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 1
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+
+  - test_name: serve_granite33-8b_tp4_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+
+  - test_name: serve_granite41-8b_tp1_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 1
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+
+  - test_name: serve_granite41-8b_tp4_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+
+  - test_name: serve_granite33-8b-fp8_tp4_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-3.3-8b-instruct-FP8
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_granite41-8b-fp8_tp4_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: ibm-granite/granite-4.1-8b-fp8
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp1_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 1
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_gemma4-26b-a4b_tp4_all
+    server_health_timeout: 7200
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_ALL_SEQUENCES_DATASET}
+      num-prompts: 50
+
+  - test_name: serve_granite-embedding-125m-english_tp1_in64
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-125m-english
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_granite-embedding-278m-multilingual_tp1_in64
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_multilingual-e5-large_tp1_in64
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: intfloat/multilingual-e5-large
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_all-roberta-large-v1_tp1_in64
+    server_parameters:
+      model: sentence-transformers/all-roberta-large-v1
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 256
+    parameters:
+      model: sentence-transformers/all-roberta-large-v1
+      backend: openai-embeddings
+      endpoint: /v1/embeddings
+      dataset-name: random
+      random-input-len: 256
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_bge-reranker-v2-m3_tp1_in64
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: BAAI/bge-reranker-v2-m3
+      backend: vllm-rerank
+      endpoint: /rerank
+      dataset-name: random-rerank
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf
+
+  - test_name: serve_bge-reranker-large_tp1_in64
+    server_parameters:
+      model: BAAI/bge-reranker-large
+      tensor-parallel-size: 1
+      runner: pooling
+      dtype: float16
+      max-model-len: 512
+    parameters:
+      model: BAAI/bge-reranker-large
+      backend: vllm-rerank
+      endpoint: /rerank
+      dataset-name: random-rerank
+      random-input-len: 512
+      random-range-ratio: 0.5
+      random-batch-size: 1
+      num-prompts: 200
+      num-warmups: 8
+      max-concurrency: 64
+      request-rate: inf

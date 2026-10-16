@@ -7,6 +7,7 @@ function check_env_var() {
         echo "please set the environment variable: $var_name"
         exit 1
     fi
+    return 0
 }
 
 function check_command_exists() {
@@ -15,12 +16,14 @@ function check_command_exists() {
         echo "${command_name}: command not found"
         exit 1
     fi
+    return 0
 }
 
 # Artifactory subdirectory the RPMs live under, between <repo> and <arch>:
-# <repo>/<prefix>/<arch>/<file>. Defaults to `next` — the only tree that
-# publishes every package we pin (see spyre-rpms.lock). Pass `--prefix ''` to
-# fetch straight from <repo>/<arch>/.
+# <repo>/<prefix>/<arch>/<file>. Defaults to `next`. This script now serves
+# only the dispatch-override path (override-spyre-rpms), which passes an
+# explicit RPM_NAMES list and `--prefix ''`. The pinned baseline in
+# spyre-rpms.lock is resolved separately by .github/scripts/resolve_rpms.py.
 RPM_PREFIX="${RPM_PREFIX:-next}"
 while [[ $# -gt 0 ]] ; do
     case "$1" in

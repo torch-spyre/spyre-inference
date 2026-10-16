@@ -14,33 +14,20 @@
 
 """DeviceCommunicator override for IBM Spyre devices.
 
-libspyre_comms natively implements: `barrier`, `broadcast`, `send`/`recv`,
-list-form `allgather`, `gather`, and `allreduce`. The `_allgather_base`
-entry point on the torch-spyre spyreccl backend side is still stubbed,
-so `dist.all_gather_into_tensor` does not work.
+`all_reduce` and `all_gather` use `torch.ops._c10d_functional`, which torch-spyre
+lowers to `spyre::{all_reduce,all_gather}_async` inside a compiled graph, so the
+collective compiles into the model graph as a native device op. `all_reduce`'s
+functional form also falls through to eager spyreccl, so it needs no separate
+eager path; `all_gather`'s does not (see the method), so eager keeps a list-form
+path alongside the compiled one.
 
-This class supplies:
-  - An `all_gather` that uses native list-form `dist.all_gather` because
-    the base class routes through `dist.all_gather_into_tensor` (blocked
-    by the `_allgather_base` stub).
-
-Remaining per-op blockers (REPLACE-WITH-NATIVE markers below):
-  - all_gather : torch-spyre spyreccl `_allgather_base` (so the base class
-                 can use `dist.all_gather_into_tensor` directly).
-  - reduce     : libspyre_comms native reduce (not on the TP forward path).
-
-The companion test file `tests/test_spyre_comms_native_probes.py` runs
-each native collective on a real spyreccl device_group and is xfail-strict.
-When a comms RPM lands an impl, the corresponding probe flips to passing,
-the strict-xfail fails CI, and that's the signal to delete the override
-here.
+`reduce_scatter` raises; `broadcast`, `send` and `recv` are inherited unchanged.
 """
 
 from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -48,70 +35,87 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 from spyre_inference.custom_ops.utils import convert
 
 
-def _spyre_collective_unsupported_message(
-    op_name: str, world_size: int, blocker: str | None = None
-) -> str:
-    parts = [
-        f"SpyreCommunicator: {op_name} is not natively available in the "
-        "installed libspyre_comms (the corresponding "
-        f"SpyreCommsContext::{op_name} method throws). ",
-    ]
-    if blocker is not None:
-        parts.append(f"Blocked on: {blocker}. ")
-    parts.append(
-        f"No fallback is implemented for world_size={world_size}. Either "
-        "wait for the upstream implementation to land + a comms RPM rebuild, "
-        "or extend SpyreCommunicator with an additional manual fallback."
-    )
-    return "".join(parts)
-
-
 class SpyreCommunicator(DeviceCommunicatorBase):
-    """Spyre-specific DeviceCommunicator with manual fallbacks.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Resolved once: a ProcessGroup object in dynamo's path breaks the trace.
+        self._group_name: str | None = None
+        if self.device_group is not None:
+            from torch.distributed._functional_collectives import _resolve_group_name
 
-    See the module docstring for the full picture. In short:
-      - `all_gather` is overridden to use list-form `dist.all_gather`
-        because `dist.all_gather_into_tensor` is blocked by a spyreccl stub.
-      - Other broken collectives raise NotImplementedError describing
-        what's needed to unblock them.
-    """
+            self._group_name = _resolve_group_name(self.device_group)
 
-    # libspyre_comms allgather transfers each rank's buffer in 64-element
-    # chunks along the gathered dim; a shard whose size along `dim` is not a
-    # multiple of 64 gets its tail rounded off, so every following rank's data
-    # lands shifted. Pad each rank's contribution up to a 64 multiple before
-    # the gather and strip the padding afterward. (E.g. TP=2 vocab-parallel
-    # logits with per-rank width 24608 = 384*64 + 32 previously shifted rank 1
-    # down by 32, corrupting the argmax for its half of the vocab.)
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if input_.device.type == "cpu" or self._group_name is None:
+            return super().all_reduce(input_)
+
+        # Workaround: deeptools' L3 scheduler fails to build the eager sum kernel for many
+        # rank-2 and rank-3 shapes: no valid core split for a [T, H] of ~2**17+ elements
+        # unless H is a multiple of 2048, and a bound assert for [1, 528, 1024]. A flat
+        # view has one dim to split and chunk.
+        orig_shape = input_.shape
+        flattened = input_.dim() > 1
+        if flattened:
+            input_ = input_.reshape(-1)
+
+        # Out-of-place, unlike the base class's in-place `dist.all_reduce`: vLLM's
+        # `torch.ops.vllm.all_reduce` wrapper declares no mutation, so under
+        # torch.compile functionalization misses the overwrite and the graph
+        # computes garbage. Inductor's reinplacing pass recovers the in-place op.
+        out = torch.ops._c10d_functional.all_reduce(
+            input_,  # ty: ignore[invalid-argument-type]
+            "sum",  # ty: ignore[invalid-argument-type]
+            self._group_name,  # ty: ignore[invalid-argument-type]
+        )
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        if flattened:
+            out = out.reshape(orig_shape)
+        return out
+
+    # libspyre_comms allgather transfers each rank's buffer in 64-element chunks
+    # along the gathered dim, so a shard whose size along `dim` is not a multiple
+    # of 64 has its tail rounded off and every later rank's data lands shifted.
+    # Worse, on comms build 121 such a gather faults the card and needs a device
+    # recovery, so do not drop this padding without re-checking on hardware.
     _GATHER_ALIGN = 64
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        # The base class uses dist.all_gather_into_tensor which needs
-        # _allgather_base in spyreccl is still stubbed. Use list-form
-        # dist.all_gather instead (natively supported).
-        # REPLACE-WITH-NATIVE: when torch-spyre wires up _allgather_base,
-        # delete this override and let the base class handle it.
         if self.world_size == 1:
             return input_
         if input_.device.type == "cpu":
             return super().all_gather(input_, dim)
 
+        # Compiled, the functional collective lowers to `spyre::all_gather_async`; eager
+        # can't (its entry point hits `allgather_into_tensor_coalesced`, which spyreccl
+        # rejects), so eager keeps the list-form `dist.all_gather` path below.
+        if torch.compiler.is_compiling() and self._group_name is not None:
+            return self._all_gather_compiled(input_, dim)
+
         dim = dim % input_.dim()
         orig_size = input_.shape[dim]
         pad = (-orig_size) % self._GATHER_ALIGN
         if not pad:
+            # spyreccl rejects a non-contiguous input; the logits reaching us are a
+            # sliced view from the head's unpad.
+            if not input_.is_contiguous():
+                input_ = input_.contiguous()
             output_list = [torch.empty_like(input_) for _ in range(self.world_size)]
             dist.all_gather(  # ty: ignore[possibly-missing-attribute]
                 output_list, input_, group=self.device_group
             )
             return torch.cat(output_list, dim=dim)
 
-        # Pad this rank's contribution up to a 64 multiple so the transfer does
-        # not round off its tail. Strip the padding and re-concatenate on CPU
-        # (Spyre slicing/narrow corrupts memory — see spyre_attn.py), restoring
-        # the exact per-rank shard layout the caller expects.
+        # Padded on CPU: on device the tail starts `orig_size % 64` elements into a
+        # stick, which torch-spyre's layout pass cannot express ("no offset-free
+        # alternative stick dim for mutation target"). Stripped and re-concatenated
+        # on CPU too, since Spyre narrow corrupts memory (see spyre_attn.py).
         pad_spec = [0, 0] * (input_.dim() - dim - 1) + [0, pad]
-        padded = torch.nn.functional.pad(input_, pad_spec).contiguous()
+        padded = convert(
+            torch.nn.functional.pad(convert(input_, device="cpu"), pad_spec),
+            device=input_.device,
+        )
         output_list = [torch.empty_like(padded) for _ in range(self.world_size)]
         dist.all_gather(  # ty: ignore[possibly-missing-attribute]
             output_list, padded, group=self.device_group
@@ -119,13 +123,41 @@ class SpyreCommunicator(DeviceCommunicatorBase):
         stripped = [convert(o, device="cpu").narrow(dim, 0, orig_size) for o in output_list]
         return convert(torch.cat(stripped, dim=dim), device=input_.device)
 
+    def _all_gather_compiled(self, input_: torch.Tensor, dim: int) -> torch.Tensor:
+        # `spyre::all_gather_async` narrows the output at a `rank * per_rank_numel` offset
+        # that `copy_from_d2d` requires to be 64-aligned; the vocab-parallel layers pad each
+        # shard to a 64 multiple, so per_rank_numel is aligned for the only gather on the TP
+        # path. Fail loudly for a future unaligned caller -- unaligned faults the card.
+        if input_.numel() % self._GATHER_ALIGN:
+            raise ValueError(
+                f"compiled all_gather needs a shard numel divisible by {self._GATHER_ALIGN} "
+                f"(got {input_.numel()}); pad the vocab-parallel layer to a 64 multiple."
+            )
+        # No `.contiguous()` unlike the eager path: inductor owns the graph input, and
+        # torch-spyre's all_gather kernel asserts contiguity -- a loud failure, not the
+        # silent corruption a non-contiguous eager input risks.
+        dim = dim % input_.dim()
+        input_size = input_.shape
+        out = torch.ops._c10d_functional.all_gather_into_tensor(
+            input_,  # ty: ignore[invalid-argument-type]
+            self.world_size,  # ty: ignore[invalid-argument-type]
+            self._group_name,  # ty: ignore[invalid-argument-type]
+        )
+        out = torch.ops._c10d_functional.wait_tensor(out)
+        # all_gather_into_tensor concatenates the ranks on dim 0; fold that axis out to `dim`.
+        out = out.reshape((self.world_size, *input_size))
+        out = out.movedim(0, dim)
+        return out.reshape(
+            (*input_size[:dim], self.world_size * input_size[dim], *input_size[dim + 1 :])
+        )
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         # Not on the standard TP path; raise loudly if anything tries it.
         if self.world_size == 1:
             return input_
         raise NotImplementedError(
-            _spyre_collective_unsupported_message("reduce_scatter", self.world_size)
+            f"SpyreCommunicator: reduce_scatter has no Spyre implementation and no "
+            f"fallback for world_size={self.world_size}. Either wait for the upstream "
+            f"comms implementation to land + a comms RPM rebuild, or extend "
+            f"SpyreCommunicator with a manual fallback."
         )
-
-    # `broadcast`, `send`, `recv` from DeviceCommunicatorBase route through
-    # ops that are implemented in libspyre_comms, so we leave them alone.

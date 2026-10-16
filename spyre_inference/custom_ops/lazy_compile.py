@@ -1,0 +1,117 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Compile a layer's kernel when no enclosing graph already covers it.
+
+Blocks compile one at a time, so layers inside a block are already in a graph; the
+same classes outside them (input embedding, final norm) are not. A layer running
+while nothing is tracing has no enclosing graph, so it is the outermost one --
+``torch.compiler.is_compiling()`` is that test, and Dynamo folds it while tracing.
+"""
+
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable
+from typing import TypeVar, cast
+
+import torch
+from vllm.config import CompilationMode, get_cached_compilation_config
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
+
+F = TypeVar("F", bound=Callable)
+
+
+class CompileOutermost:
+    """Base for layers with one ``@maybe_compile`` kernel.
+
+    The mode is sampled here because construction is the only point where the vLLM
+    config context is live; ``enforce_eager`` arrives as mode ``NONE``.
+    """
+
+    allow_inference_recompiles: bool = False
+    """Set on subclasses whose kernel legitimately recompiles per input shape.
+
+    ``maybe_compile`` registers its kernel with the compile guard so a
+    post-warmup compile is flagged. A layer that compiles per distinct shape *by
+    design* (``SpyreConv2d``, one graph per ``(H, W)``) would make that a permanent
+    false positive, so it opts out instead of being allowlisted from the outside.
+    """
+
+    spyre_compile_enabled: bool
+    spyre_compiled_kernel: Callable | None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.arm_outer_compile()
+
+    def arm_outer_compile(self) -> None:
+        """Sample compile mode while the vLLM config context is live.
+
+        Idempotent. ``SpyreTokenTypeModel`` retypes an already-built embedding,
+        so this ``__init__`` never ran for that instance; the model constructor
+        calls this after the class swap, which is still inside construction.
+        """
+        if "spyre_compile_enabled" in self.__dict__:
+            return
+        mode = get_cached_compilation_config().mode
+        self.spyre_compile_enabled = mode is not CompilationMode.NONE
+        self.spyre_compiled_kernel = None
+
+
+def maybe_compile(method: F | None = None, *, force: bool = False) -> F:
+    """Compile ``method`` on its first call that no other graph is already tracing.
+
+    Args:
+        method: The kernel method to wrap. Omitted when the decorator is applied
+            with keyword arguments.
+        force: When ``True``, compile the method in vLLM eager mode.
+            An enclosing Dynamo graph always absorbs the method: nested
+            ``torch.compile`` is not supported while it is tracing.
+    """
+
+    def decorator(method: F) -> F:
+        @functools.wraps(method)
+        def wrapper(self, *args, **kwargs):
+            if torch.compiler.is_compiling() or (not force and not self.spyre_compile_enabled):
+                return method(self, *args, **kwargs)
+            if self.spyre_compiled_kernel is None:
+                logger.info_once(
+                    "Compiling %s.%s as its own graph: %s.",
+                    type(self).__name__,
+                    method.__name__,
+                    "force is set" if force else "no enclosing graph covers it",
+                )
+                # Only compiled-mode warmup runs the kernel at its serving shapes.
+                if self.spyre_compile_enabled and not self.allow_inference_recompiles:
+                    from spyre_inference.v1.worker import compile_guard
+
+                    compile_guard.watch(method, f"{type(self).__name__}.{method.__name__}")
+                # dynamic=False is mandatory: the Spyre backend rejects SymInt shapes.
+                self.spyre_compiled_kernel = torch.compile(
+                    method.__get__(self),
+                    backend=current_platform.simple_compile_backend,
+                    fullgraph=True,
+                    dynamic=False,
+                )
+            return self.spyre_compiled_kernel(*args, **kwargs)
+
+        return cast(F, wrapper)
+
+    if method is not None:
+        return decorator(method)
+    return cast(F, decorator)

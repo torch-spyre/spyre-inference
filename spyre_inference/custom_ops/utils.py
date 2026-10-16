@@ -20,13 +20,38 @@ dtype conversion.
 """
 
 from functools import lru_cache
+from typing import Sequence
 
 import torch
-
+from torch.utils._pytree import tree_map
 from vllm.logger import init_logger
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+
+def row_outermost_layout(shape: Sequence[int], dtype: torch.dtype):
+    """Layout with dim 0 whole at device position 0, last dim as the stick axis.
+
+    Spyre needs an indexed dim outermost; the default tiled layout places it
+    second-innermost, so a gather or scatter relayouts the whole tensor instead.
+    None when the last dim is not a whole number of sticks, where a padded tiling
+    would not describe the tensor (32-element head sizes on some encoders).
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    *lead, width = shape
+    if width % eps:
+        return None
+    dims = [*lead, width // eps, eps]
+    strides = [1]
+    for d in reversed(dims[1:]):
+        strides.append(strides[-1] * d)
+    strides.reverse()
+    return SpyreTensorLayout(
+        device_size=dims, stride_map=strides, device_dtype=get_device_dtype(dtype)
+    )
 
 
 def _convert_op_func(
@@ -72,18 +97,21 @@ def _convert_op_fake(
     return torch.empty(tensor.shape, dtype=target_dtype, device=target_device)
 
 
-def convert(tensor, device=None, dtype=None):
+def convert(tensor, device=None, dtype=None, device_layout=None):
     """Convert tensor device and/or dtype. No-op when both are None.
 
-    Routes through the opaque custom op `torch.ops.vllm.spyre_convert` so the
-    transfer is invisible to torch.compile / Dynamo. None tensors are
-    short-circuited at the Python boundary because `infer_schema` does not
-    accept Optional[Tensor] returns.
+    Normal transfers route through the opaque custom op
+    `torch.ops.vllm.spyre_convert` so the transfer is invisible to torch.compile
+    / Dynamo. A device layout bypasses that op because ``SpyreTensorLayout`` is
+    not representable in the custom-op schema. None tensors are short-circuited
+    at the Python boundary because `infer_schema` does not accept
+    Optional[Tensor] returns.
 
     Args:
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
+        device_layout: Optional physical Spyre tensor layout to place the result in.
 
     Returns:
         Converted tensor, or None if input is None.
@@ -92,6 +120,16 @@ def convert(tensor, device=None, dtype=None):
         return None
     if isinstance(device, str):
         device = torch.device(device)
+    if device_layout is not None:
+        # `Tensor.to` is the only entry point that takes a layout, and it covers
+        # both a host->device placement and a same-device relayout (copy_from_d2d),
+        # so a layout-aware conversion must not insist on a device transfer: a
+        # cache already moved to Spyre still needs its rows placed outermost.
+        return tensor.to(  # ty: ignore[no-matching-overload]
+            tensor.device if device is None else device,
+            dtype=tensor.dtype if dtype is None else dtype,
+            device_layout=device_layout,
+        )
     # Short-circuit a true no-op at the call site so Inductor never emits a
     # same-device/dtype spyre_convert FallbackKernel into the graph.
     target_device = device if device is not None else tensor.device
@@ -103,6 +141,17 @@ def convert(tensor, device=None, dtype=None):
         device,  # ty: ignore[invalid-argument-type]
         dtype,  # ty: ignore[invalid-argument-type]
     )
+
+
+def convert_tensor_tree(value, *, device=None, dtype=None, predicate=None):
+    """Convert matching tensors throughout a nested value."""
+
+    def _convert(item):
+        if isinstance(item, torch.Tensor) and (predicate is None or predicate(item)):
+            return convert(item, device=device, dtype=dtype)
+        return item
+
+    return tree_map(_convert, value)
 
 
 @lru_cache(maxsize=1)
@@ -117,3 +166,38 @@ def register():
         dispatch_key="CompositeExplicitAutograd",
     )
     logger.debug_once("Registered custom op: spyre_convert")
+
+
+def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
+    """Move a 2D gather source to device with its rows outermost."""
+    # TODO(tdoublep): can this be moved upstream?
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    # fn cannot carry a device_layout, so probe it on one row to learn the destination.
+    probe = fn(src[:1])
+    if probe.device.type != "spyre":
+        return fn(src)
+
+    num_rows, row_width = src.shape
+    # Spyre needs a gather's indexed dim at device position 0, and a row must fill
+    # whole sticks: 64 elements for fp16 (128-byte stick / 2 bytes per element).
+    elems_per_stick = get_elem_in_stick(probe.dtype)
+    if row_width % elems_per_stick:
+        logger.warning_once(
+            "%s: row width %d is not a multiple of %d, keeping the default layout (slower gather).",
+            name,
+            row_width,
+            elems_per_stick,
+        )
+        return fn(src)
+
+    return convert(
+        src,
+        device=probe.device,
+        dtype=probe.dtype,
+        device_layout=SpyreTensorLayout(
+            device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
+            stride_map=[row_width, elems_per_stick, 1],
+            device_dtype=get_device_dtype(probe.dtype),
+        ),
+    )

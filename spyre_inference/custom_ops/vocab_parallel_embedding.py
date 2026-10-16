@@ -14,53 +14,101 @@
 
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
-from functools import lru_cache
+from typing import cast
 
 import torch
-
-from vllm.distributed import tensor_model_parallel_all_reduce
+import torch.nn.functional as F
+from torch.nn.parameter import Parameter
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
-from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .lazy_compile import CompileOutermost, maybe_compile
+from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
+from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
-class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
+class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
+        # Match SpyreParallelLMHead: a tied model shares one table, so both layers
+        # must agree on the padded vocab size.
+        kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
         if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
             raise NotImplementedError(
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # A tied embedding is identified as the LM head only at first logits use,
+        # when the vLLM config context is no longer active. Sample its compile
+        # policy now so promotion does not construct a compile-aware method later.
+        self._spyre_lm_head_method = SpyreUnquantizedLMHeadMethod()
 
+        if self.tp_size > 1:
+            reindex_table, keep_table = self._build_reindex_and_keep_tables()
+            self.register_buffer(
+                "_spyre_reindex_table",
+                reindex_table,
+                persistent=False,
+            )
+            self.register_buffer(
+                "_spyre_keep_table",
+                keep_table.to(self.weight.data.dtype),  # ty: ignore[no-matching-overload]
+                persistent=False,
+            )
+        else:
+            self._spyre_reindex_table = None
+            self._spyre_keep_table = None
+
+    def _build_reindex_and_keep_tables(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the reindex and keep lookup tables (vectorized over the vocab)."""
+        vocab_size = self.num_embeddings
+        indices = torch.arange(vocab_size, dtype=torch.int64)
+        masked_input, input_mask = get_masked_input_and_mask(
+            indices,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        reindex_table = torch.zeros(vocab_size, 2, dtype=torch.int64)
+        reindex_table[:, 0] = masked_input
+        keep_table = torch.zeros(vocab_size, 2, dtype=torch.float16)
+        keep_table[:, 0] = ~input_mask
+        return reindex_table, keep_table
+
+    def _apply(self, fn, recurse=True):
+        weight = self._parameters.get("weight")
+
+        def place(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is weight:
+                return place_row_gathered(tensor.data, fn, "vocab table")
+            return fn(tensor)
+
+        return super()._apply(place, recurse)
+
+    @maybe_compile
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
-            # The per-rank mask still runs on CPU: upstream get_masked_input_and_mask
-            # does `input_ >= start` under torch.compile, which Spyre's inductor backend
-            # rejects for int64 constants (see test_int64_compiled_compare_against_python_int).
-            # The embedding gather itself runs on-device below.
-            masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
-                convert(input_, device="cpu"),
-                self.shard_indices.org_vocab_start_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.org_vocab_end_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.num_org_vocab_padding,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.added_vocab_start_index,  # ty: ignore[invalid-argument-type]
-                self.shard_indices.added_vocab_end_index,  # ty: ignore[invalid-argument-type]
-                self.weight.data.dtype,  # ty: ignore[invalid-argument-type]
-            )
-            masked_input = convert(masked_input, device=input_.device)
-            keep = convert(keep, device=input_.device)
+            reindex_table = self._spyre_reindex_table
+            keep_table = self._spyre_keep_table
+            assert reindex_table is not None and keep_table is not None
+            keep = F.embedding(input_, keep_table)[..., 0]
+            masked_input = torch.index_select(reindex_table, 0, input_.flatten())[:, 0]
+            masked_input = masked_input.view(input_.shape)
         else:
             masked_input = input_
             keep = None
@@ -68,55 +116,39 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
         output = self.quant_method.embedding(self, masked_input.long())
 
         if keep is not None:
-            output = output * keep
+            output = output * keep.unsqueeze(-1)
             output = tensor_model_parallel_all_reduce(output)
         return output
 
 
-def _vocab_mask_op_func(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    device = input_.device
-    masked_input, input_mask = get_masked_input_and_mask(
-        input_,
-        org_vocab_start_index,
-        org_vocab_end_index,
-        num_org_vocab_padding,
-        added_vocab_start_index,
-        added_vocab_end_index,
+def promote_tied_lm_head(head: torch.nn.Module) -> None:
+    """Give a tied embedding a padded `Wᵀ` the first time it is asked for logits.
+
+    `tie_word_embeddings` does not say which table projects. Models express the tie
+    three ways: alias `lm_head = embed_tokens` (Qwen), tie a real `ParallelLMHead`
+    (Llama), or pass `embed_tokens` to the logits processor with no `lm_head` at all
+    (Gemma) -- and a model may hold gather-only tables under the same config, such as
+    Gemma 3n's per-layer embeddings. The module handed to `_apply_head` is the only
+    signal that identifies the projection in all three, so the decision is made here
+    rather than guessed at construction.
+
+    `weight` is left alone: it keeps the row-gathered layout the gather needs. The
+    gather and matmul layouts differ, so both tables stay resident -- the vocab-sized
+    saving upstream tying gets is deliberately given up to keep the transposed matmul.
+    """
+    # Exact type: SpyreParallelLMHead is a subclass and brings its own method.
+    if type(head) is not SpyreVocabParallelEmbedding:
+        return
+    if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
+        return
+
+    method = head._spyre_lm_head_method
+    # Pad and transpose on the host: this runs after the device move, and relaying
+    # out a vocab-sized table on device costs far more than the round trip.
+    weight = cast(torch.Tensor, head.weight)
+    method.build_weight_t(head, convert(weight.data, device="cpu"))
+    head.padded_weight_t = Parameter(
+        convert(head.padded_weight_t.data, device=weight.device), requires_grad=False
     )
-    keep = (~input_mask).to(dtype=dtype).unsqueeze(-1)
-    return masked_input.to(device), keep.to(device)
-
-
-def _vocab_mask_op_fake(
-    input_: torch.Tensor,
-    org_vocab_start_index: int,
-    org_vocab_end_index: int,
-    num_org_vocab_padding: int,
-    added_vocab_start_index: int,
-    added_vocab_end_index: int,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    masked_input = torch.empty(input_.shape, dtype=input_.dtype, device=input_.device)
-    keep = torch.empty((*input_.shape, 1), dtype=dtype, device=input_.device)
-    return masked_input, keep
-
-
-@lru_cache(maxsize=1)
-def register():
-    """Register the spyre_vocab_mask custom op with vLLM."""
-    direct_register_custom_op(
-        op_name="spyre_vocab_mask",
-        op_func=_vocab_mask_op_func,
-        fake_impl=_vocab_mask_op_fake,
-        mutates_args=[],
-        dispatch_key="CPU",
-    )
-    logger.debug_once("Registered custom op: spyre_vocab_mask")
+    head.quant_method = method
+    logger.debug("Tied lm_head %s projects from a padded transposed weight", tuple(weight.shape))

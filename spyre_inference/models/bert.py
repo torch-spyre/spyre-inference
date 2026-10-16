@@ -12,22 +12,98 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre adaptations for vLLM BERT-family pooling models."""
+"""Spyre adaptations for vLLM BERT-family pooling models.
+
+These classes route ``token_type_ids`` around vLLM's bit-pack transport;
+the embedding subclass also fuses its prologue. See ``spyre_inference.models._token_type``.
+"""
 
 from __future__ import annotations
 
-from vllm.logger import init_logger
+from typing import TYPE_CHECKING
 
-from spyre_inference.models.token_type_adapter import install_on
+from vllm.model_executor.models.bert import (
+    BertEmbedding,
+    BertEmbeddingModel,
+    BertForMaskedLM,
+    BertForSequenceClassification,
+    BertForTokenClassification,
+    BertModel,
+    BertSpladeSparseEmbeddingModel,
+)
 
-logger = init_logger(__name__)
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.models._token_type import (
+    SpyreTokenTypeEmbedding,
+    SpyreTokenTypeModel,
+)
+
+if TYPE_CHECKING:
+    import torch
+    from vllm.config import VllmConfig
 
 
-def install_spyre_patches() -> None:
-    """Install BERT token_type side-buffer adapter (see ``token_type_adapter``)."""
-    from vllm.model_executor.models import bert
+class SpyreBertEmbedding(CompileOutermost, SpyreTokenTypeEmbedding, BertEmbedding):
+    """``BertEmbedding`` reading segment ids from the side buffer.
 
-    install_on(bert)
-    logger.info(
-        "Spyre: BERT token_type_ids use side-buffer adapter (skip vLLM bit-pack; torch-spyre#3509)"
-    )
+    One compiled forward: the word, segment, and position tables and the
+    layer norm inline into it.
+    """
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Pass side-buffer segment ids, or zeros, into the compiled gather.
+        return self._compiled_forward(
+            input_ids,
+            position_ids,
+            self.spyre_token_type_ids_for(input_ids),
+            inputs_embeds,
+        )
+
+    @maybe_compile
+    def _compiled_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        embeddings = (
+            inputs_embeds
+            + self.token_type_embeddings(token_type_ids)
+            + self.position_embeddings(position_ids)
+        )
+        return self.LayerNorm(embeddings)
+
+
+class SpyreBertEmbeddingMixin:
+    """Inject the Spyre embedding through ``BertEmbeddingModel._build_model``."""
+
+    def _build_model(self, vllm_config: VllmConfig, prefix: str = "") -> BertModel:
+        return BertModel(vllm_config=vllm_config, prefix=prefix, embedding_class=SpyreBertEmbedding)
+
+
+class SpyreBertEmbeddingModel(SpyreBertEmbeddingMixin, BertEmbeddingModel):
+    pass
+
+
+class SpyreBertSpladeSparseEmbeddingModel(SpyreBertEmbeddingMixin, BertSpladeSparseEmbeddingModel):
+    pass
+
+
+class SpyreBertForSequenceClassification(SpyreTokenTypeModel, BertForSequenceClassification):
+    spyre_embedding_class = SpyreBertEmbedding
+
+
+class SpyreBertForTokenClassification(SpyreTokenTypeModel, BertForTokenClassification):
+    spyre_embedding_class = SpyreBertEmbedding
+
+
+class SpyreBertForMaskedLM(SpyreTokenTypeModel, BertForMaskedLM):
+    spyre_embedding_class = SpyreBertEmbedding

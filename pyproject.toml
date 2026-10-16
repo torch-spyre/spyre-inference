@@ -1,9 +1,14 @@
 [build-system]
 requires = [
   "setuptools>=82",
-  "setuptools_scm>=8"
+  "setuptools_scm>=10",
+  # csrc/ host kernels (setup.py). torch must match the `torch` pin in
+  # [project.dependencies]: the extension links libtorch, so an ABI drift fails at import.
+  "cmake>=3.26",
+  "torch==2.13.0",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_backend"
+backend-path  = ["."]
 
 [project]
 name = "spyre-inference"
@@ -11,13 +16,29 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "torch-spyre",
-    "vllm>=0.27.1,<0.28",
+    # Only reaches wheel consumers: the `[tool.uv.sources]` pin below drops this
+    # specifier from uv's own resolution. `>=0.5.0` would reject the 0.5.0rc1 release.
+    "torch-spyre[cpsat]>=0.5.0rc1",
+    "vllm[grpc]>=0.31.0,<0.32",
 
-    # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
-    # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
-    "torch",
-    "hf-adapters-spyre"
+    # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
+    # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
+    # must get the exact torch it was built against.
+    "torch==2.13.0",
+
+    # Required at runtime by vLLM's image processors (the Pixtral/Ministral vision
+    # path). Declared directly rather than relying on a transitive pull: the entry
+    # in `override-dependencies` only constrains the version if something else
+    # requests torchvision, it does not install it.
+    # Version left out: resolved against the pinned torch from the pytorch-cpu index.
+    # Excluded on Power/Z: the index has no modern wheel there, and unmarked this
+    # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
+    # satisfy the transformers import. VLM is x86_64-only for now.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
+
+    # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
+    # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
+    "transformers<5.17",
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -32,8 +53,9 @@ Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
-spyre_inference_ops = "spyre_inference:register_ops"
-spyre_inference_hf_adaptor = "spyre_inference:register_hf_adapters"
+# Same name as the platform plugin, so `VLLM_PLUGINS=spyre_inference` also registers the
+# model adaptations in every process, before vLLM's first model lookup.
+spyre_inference = "spyre_inference:register_ops"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -42,16 +64,25 @@ exclude = ["spyre_inference.testing*"]  # exclude testing module (now a separate
 namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.setuptools_scm]
-# Version files are optional, this just marginally speeds up version inspection
-# at runtime
+# _version.py is written at build time by setuptools_scm
 version_file = "spyre_inference/_version.py"
-# Version strings are formatted as `{version}+{local}`, e.g. "0.1.dev1+gb1a7032"
-# Local versioning is incompatible with pypi, so we disable it by default.
-local_scheme = "no-local-version"
+version_scheme = "semver-pep440-release-branch"
+local_scheme   = "_versioning:ci_local_scheme"
 
 
 [tool.uv]
 default-groups = ["dev"]
+
+# Rebuild the csrc/ extension when its sources change, not just the metadata files.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/**/*.cmake" },
+    { file = "csrc/**/*.cpp" },
+    { file = "csrc/**/*.hpp" },
+    { file = "csrc/**/*.h" },
+]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs
 required-environments = [
@@ -64,15 +95,22 @@ override-dependencies = [
     # No triton support yet, don't allow any dependencies to pull it in
     "triton; sys_platform == 'never'",
 
-    # Skipping torch-vision temporarily
-    # TODO: This will be required in the future for VLM support via vllm
-    "torchvision; sys_platform == 'never'",
+    # Declared in [project.dependencies] too; this entry exists to neutralise any
+    # version constraint a transitive dep (e.g. transformers) puts on torchvision,
+    # so it resolves against the pinned torch from the pytorch-cpu index. Same
+    # arch marker as the direct dep, so a transitive requester cannot pull the
+    # stale 0.2.0 wheel back in on Power/Z.
+    "torchvision; platform_machine not in 's390x, ppc64le'",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
 
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "pyarrow; platform_machine not in 's390x, ppc64le'",
+
+    # torch-spyre's [cpsat] solver needs ortools, which has no ppc64le/s390x wheels
+    # (nor aarch64 across our Python range); its own extra only drops s390x. Pin x86_64.
+    "ortools>=9.0; platform_machine == 'x86_64'",
 
     # Runtime pin here must match the `uv.extra-build-dependencies.torch-spyre` pin.
     # Compatible with torch-spyre's `~=2.13.0`
@@ -83,7 +121,20 @@ override-dependencies = [
 
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
+
+    # pyzmq (transitive vllm dep, built from sdist on ppc64le/s390x) <27.2.0 fails to build
+    # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
+    # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
+    "pyzmq>=27.2.0",
 ]
+
+constraint-dependencies = [
+    # ortools caps protobuf <6.34 on x86_64 and uv unifies that onto every platform, landing
+    # s390x on a protobuf whose upb decoder mis-handles big-endian; both fixes are in 7.36.1
+    # (protocolbuffers/protobuf#25363, #25683).
+    "protobuf>=7.36.1; platform_machine == 's390x'",
+]
+
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
@@ -101,10 +152,9 @@ USE_SPYRE_PROFILER = "0"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.31.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "f8d4f43bb3493d13c33cbb2608558dfcdf44774c" }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "5c17a7fc16abad5a4973eaf6f59602cfeee06be4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -176,6 +226,8 @@ select = [
     "E",
     # Pyflakes
     "F",
+    # isort
+    "I",
     # pyupgrade
     "UP",
     # flake8-bugbear
@@ -235,6 +287,9 @@ skip_gitignore = true
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# Scopes spyre-testing-plugin to this repo; a pytest11 entry point would also load it
+# into unrelated pytest runs sharing the venv (e.g. a sibling torch-spyre checkout).
+addopts = ["-p", "spyre_testing_plugin.pytest_plugin"]
 asyncio_default_fixture_loop_scope = "function"
 # A card acquisition that blocks in the kernel yields no output, so the test
 # must be cut off from outside. "thread" dumps every thread's stack on expiry,
@@ -249,11 +304,31 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
-    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py, tests/test_spyre_encoder_attn.py); slow, runs in its own CI job",
-    "encoder_attention: encoder-attention subset (tests/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
-    "compile: torch.compile end-to-end tests (tests/test_compile.py); slow, runs in its own CI job",
-    "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
-    "fp8: FP8 quantization tests (tests/test_fp8.py)",
+    "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
+    "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
+    "attention_smoke: small representative decoder-attention subset (also marked attention); its own 1-card job carries attention coverage into the integration tier, which the full attention suite is excluded from",
+    "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
+    "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
+    "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
+    "rotary: Spyre RoPE tests (tests/custom_ops/test_rotary_embedding.py, tests/multimodal/test_pixtral.py)",
+    "fp8: FP8 quantization tests (tests/custom_ops/test_fp8.py)",
+    "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
+    "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
+    "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
+    "mlp: Spyre linear-layer tests: merged-column, QKV, row-parallel and replicated layers, and the transposed-weight linear method (tests/custom_ops/test_mlp.py, tests/custom_ops/test_linear.py)",
+    "parallel_lm_head: SpyreParallelLMHead custom-op tests (tests/custom_ops/test_parallel_lm_head.py)",
+    "padding_workaround: LM-head vocab-padding tests for a torch-spyre work-division shape limit (tests/custom_ops/test_parallel_lm_head.py); remove with the workaround",
+    "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
+    "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
+    "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
+    "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
+    "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
+    "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
+    "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
+    "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
 ]
 # --8<-- [end:test-markers-definition]
 

@@ -35,11 +35,26 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
+from spyre_inference import envs
 from spyre_inference.custom_ops import register_all
+from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 logger = init_logger(__name__)
+
+
+def _get_spyre_pcie_address(local_rank: int) -> str:
+    requested_devices = envs.SPYRE_DEVICES
+    if not requested_devices:
+        return "unknown"
+
+    requested_indices = [index.strip() for index in requested_devices.split(",") if index.strip()]
+    if local_rank >= len(requested_indices):
+        return "unknown"
+
+    return os.environ.get(f"AIU_WORLD_RANK_{requested_indices[local_rank]}", "unknown")
 
 
 def monkey_patch_torch_profiler_activity_map():
@@ -68,6 +83,10 @@ class TorchSpyreWorker(Worker):
     provides. The distributed init, random seed, and model runner
     construction are handled here.
     """
+
+    # Resolved in init_device, before the weights load, so an invalid
+    # SPYRE_COMPILE_GUARD fails there rather than after warmup.
+    _compile_guard_level = compile_guard.CompileGuardLevel.OFF
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         # Worker.load_model wraps weight loading in a memory pool context
@@ -105,11 +124,26 @@ class TorchSpyreWorker(Worker):
         # Pin this worker to its assigned card before the spyreccl
         # backend is constructed in `init_process_group`.
         torch.spyre.set_device(self.local_rank)
+        logger.info(
+            "Spyre worker device selection: "
+            "local_rank=%d requested SPYRE_DEVICES=%r pcie_address=%s",
+            self.local_rank,
+            os.environ.get("SPYRE_DEVICES"),
+            _get_spyre_pcie_address(self.local_rank),
+        )
 
-        # Register all the custom ops here when a worker is created.
-        # This has to happen before the model is loaded, so that all the
-        # layers will be swapped out with the custom implementations for spyre.
+        # Parsed here rather than at the arm() call below: a typo raises, and after
+        # warmup that costs the minutes the model just spent compiling. init_device
+        # runs before the weights load, so an invalid value fails in seconds.
+        self._compile_guard_level = compile_guard.parse_level(envs.SPYRE_COMPILE_GUARD)
+
+        # Register all the custom ops and Spyre model architectures here when a
+        # worker is created. This has to happen before the model is loaded, so
+        # that all the layers will be swapped out with the custom
+        # implementations for spyre. Both also run from the `vllm.general_plugins`
+        # entry point, which `VLLM_PLUGINS` allowlists commonly leave out.
         register_all()
+        register_models()
 
         # Initialize the distributed environment.
         from vllm.platforms import current_platform
@@ -134,8 +168,9 @@ class TorchSpyreWorker(Worker):
     def determine_available_memory(self) -> int:
         # Spyre's KV cache lives on-device with a fixed budget set by
         # TorchSpyrePlatform.check_and_update_config (via VLLM_CPU_KVCACHE_SPACE).
-        # num_gpu_blocks_override is also set, so this value is only used as
-        # an upper bound sanity check by the engine.
+        # For decoder models num_gpu_blocks_override is also set; pooling /
+        # encoder models leave it unset (no KV cache). This return is an upper
+        # bound sanity check for the engine.
         assert self.cache_config.kv_cache_memory_bytes is not None
         return self.cache_config.kv_cache_memory_bytes
 
@@ -157,15 +192,19 @@ class TorchSpyreWorker(Worker):
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
+        # Arm right after warm-up, at the level init_device already validated.
+        compile_guard.arm(self._compile_guard_level)
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
 
     def sleep(self, level: int = 1) -> None:
+        # No sleep mode on Spyre: the GPU worker's CuMemAllocator offload does not apply.
         pass
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        # Nothing to restore, since sleep() keeps everything resident.
         pass
 
     @override
@@ -183,7 +222,7 @@ class TorchSpyreWorker(Worker):
                 self.profiler_config,
                 worker_name=trace_name,
                 local_rank=self.local_rank,
-                activities=["CPU", "PrivateUse1"],  # ty: ignore[invalid-argument-type]
+                activities=["CPU", "PrivateUse1"],
             )
             logger.debug("Starting torch profiler with trace name: %s", trace_name)
 

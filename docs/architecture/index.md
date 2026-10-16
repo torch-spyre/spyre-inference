@@ -224,7 +224,7 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
 (`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager unless
-marked (below). Models whose
+marked (below) or compiled per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
@@ -283,6 +283,77 @@ on the wrapper — so its projection compiles its own graph, over row widths war
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.
+
+## Vision encoders
+
+A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
+class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
+upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
+`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
+pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
+(`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
+compiles the encoder at that static shape during warmup, and replay uploads the padded
+inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
+kernels, so the compile guard covers the vision graphs. Upstream's
+`GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
+the embedding merge, encoder cache and decoder are unchanged.
+
+![Vision encoder](multimodal-vision-encoder.svg)
+
+Its source is `multimodal-vision-encoder.d2`; regenerate it from `docs/architecture/` with `d2 --layout elk --pad 40 multimodal-vision-encoder.d2 multimodal-vision-encoder.svg`.
+
+Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
+implements the hooks below and nothing in the runner or manager changes. The units follow
+upstream: an *image token* is one position of `vision_project`'s output, counted by upstream's token
+budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
+`patches_per_token` per image token.
+
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
+|---|---|---|---|
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
+
+Two upstream protocol methods are also the extension points for model-specific shapes, used
+as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
+differ from the encoder's image tokens (unpadding, newline tokens; its input is already on the
+host), and `get_encoder_cudagraph_budget_range` when the processor's largest item is not counted
+in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
+capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
+upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
+upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
+(`enforce_eager`) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
+placeholders and `embed_input_ids` are inherited unchanged.
+
+Constraints the layout follows:
+
+- The largest budget is the largest item the model's upstream processor can produce
+  (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
+  uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
+  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+- Patches are **offset-major**: one group per offset inside a merge group, each padded at
+  its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
+  and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
+  reshape feeding a matmul cannot be laid out.
+- The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
+  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
+  cannot lay out.
+- RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
+  `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
+  one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
+  64-wide head's 32-wide halves cannot be sliced.
+- The encoder output comes back to the host in one copy and is sliced there: device views
+  at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
+  runs on the host anyway.
+- Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 
 ## Attention Backend
 

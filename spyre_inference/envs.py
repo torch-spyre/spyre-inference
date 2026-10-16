@@ -33,6 +33,12 @@ if TYPE_CHECKING:
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
+    SPYRE_JAGGED_ATTENTION: bool = False
+    SPYRE_JAGGED_PARALLEL_ENTRIES: int = 64
+    SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS: str | None = None
+    SPYRE_JAGGED_CONTEXT_GROUPS: bool = False
+    SPYRE_JAGGED_MAX_CONTEXT_GROUPS: int = 4
+    SPYRE_JAGGED_ENTRY_GEOMETRY: str = "page_first"
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
@@ -81,6 +87,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block chunks with torch-spyre's `for_each_tile`, so each traced graph holds
     # one loop body. Enabled by default; "0" runs the same bodies under Python loops.
     "SPYRE_ATTN_FOR_EACH_TILE": lambda: bool(int(os.getenv("SPYRE_ATTN_FOR_EACH_TILE", "1"))),
+    # Experimental packed decoder attention: grouped decode and query-width groups
+    # use static for_each_tile loops and a shared output. Always compiled. No ALiBi.
+    "SPYRE_JAGGED_ATTENTION": lambda: bool(int(os.getenv("SPYRE_JAGGED_ATTENTION", "0"))),
+    "SPYRE_JAGGED_PARALLEL_ENTRIES": lambda: int(os.getenv("SPYRE_JAGGED_PARALLEL_ENTRIES", "64")),
+    # Comma-separated page-capacity buckets for jagged attention. Unset uses powers
+    # of two up to max_model_len / block_size. Governs both the recorded variants
+    # and the per-step capacity. Experimental: a denser ladder cuts page padding in
+    # the kernel but measured an end-to-end regression on a clustered workload, and
+    # multiplies warmup. Entries above max_model_len / block_size are dropped.
+    "SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS": lambda: os.getenv("SPYRE_JAGGED_PAGE_CAPACITY_BUCKETS"),
+    # Key mixed-plan decode groups by (width, context bucket) instead of width alone,
+    # so a short request stops paying for the batch's longest context. Costs one
+    # dispatch per occupied bucket, capped by SPYRE_JAGGED_MAX_CONTEXT_GROUPS.
+    "SPYRE_JAGGED_CONTEXT_GROUPS": lambda: bool(int(os.getenv("SPYRE_JAGGED_CONTEXT_GROUPS", "0"))),
+    # Upper bound on mixed-plan groups per step. Cheapest adjacent buckets merge
+    # until the count fits. 1 reproduces width-only keying.
+    "SPYRE_JAGGED_MAX_CONTEXT_GROUPS": lambda: int(
+        os.getenv("SPYRE_JAGGED_MAX_CONTEXT_GROUPS", "4")
+    ),
+    # Lane split for the grouped decode table. "page_first" derives lanes from the
+    # page capacity, starving buckets whose page capacity is below their tile count;
+    # "query_first" fills lanes with queries first. Only affects the trip/lane split,
+    # not the cell count.
+    "SPYRE_JAGGED_ENTRY_GEOMETRY": lambda: os.getenv("SPYRE_JAGGED_ENTRY_GEOMETRY", "page_first"),
     # Comma-separated kv_len buckets to record, unset uses the default buckets of
     # powers of two from block_size up to max_model_len.
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),

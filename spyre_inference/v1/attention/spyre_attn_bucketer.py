@@ -137,7 +137,7 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     )
 
 
-def _resolve_buckets(
+def resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
     """One axis's buckets: the env override clamped to ``limit``, else ``default()``.
@@ -210,7 +210,7 @@ class SpyreAttnBucketer:
         # Default: powers of two up to max_num_seqs, the batch sizes the batched
         # decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = _resolve_buckets(
+        self._num_seqs_buckets: list[int] = resolve_buckets(
             envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
             max_num_seqs,
             "SPYRE_ATTN_NUM_SEQS_BUCKETS",
@@ -221,7 +221,7 @@ class SpyreAttnBucketer:
         # build()) then multiples of a step up to max_num_batched_tokens, the
         # query lengths a prefill pads up to.
         step = min(_DEFAULT_QUERY_BUCKET_STEP, max_batched)
-        self._query_buckets: list[int] = _resolve_buckets(
+        self._query_buckets: list[int] = resolve_buckets(
             envs.SPYRE_ATTN_QUERY_BUCKETS,
             max_batched,
             "SPYRE_ATTN_QUERY_BUCKETS",
@@ -231,7 +231,7 @@ class SpyreAttnBucketer:
         # Default: powers of two from block_size up to max_model_len. Geometric
         # because the recorded set is a product of both axes; the extra padding
         # each bucket costs is absorbed by the mask.
-        self._kv_buckets: list[int] = _resolve_buckets(
+        self._kv_buckets: list[int] = resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",

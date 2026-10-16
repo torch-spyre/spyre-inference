@@ -42,6 +42,7 @@ from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
 from spyre_inference.v1.worker.spyre_worker import (  # shared with V1; moves at the flip
     TorchSpyreWorker,
     _get_spyre_pcie_address,
+    _resolve_spyre_devices,
     logger,
 )
 
@@ -61,6 +62,9 @@ class SpyreWorkerV2(TorchSpyreWorker):
         os.environ.setdefault("WORLD_SIZE", str(world_size))
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
+
+        # Normalize SPYRE_DEVICES (e.g. resolving PCIe addresses to card indices)
+        _resolve_spyre_devices()
 
         # Trigger torch_spyre's autoload manually now that the env vars
         # are set. Autoload registers the `spyre` device and the

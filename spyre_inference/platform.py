@@ -111,6 +111,19 @@ def _raise_dynamo_recompile_limits() -> None:
 _raise_dynamo_recompile_limits()
 
 
+def _set_compile_threads() -> None:
+    # vLLM pins TORCHINDUCTOR_COMPILE_THREADS=1 at import and again in
+    # CpuPlatform.check_and_update_config. This overrides it to SPYRE_COMPILE_THREADS.
+    import torch._inductor.config as inductor_config
+
+    from spyre_inference import envs
+
+    inductor_config.compile_threads = max(1, envs.SPYRE_COMPILE_THREADS)
+
+
+_set_compile_threads()
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 

@@ -39,6 +39,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_BATCHED_DECODE_GROUPING: bool = False
+    SPYRE_BATCHED_DECODE_GROUP_COST: int = 2
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
@@ -106,6 +108,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    # When "1", a decode batch spanning several KV buckets runs one batched dispatch per
+    # bucket group instead of padding every sequence to the longest. Off by default.
+    "SPYRE_BATCHED_DECODE_GROUPING": lambda: bool(
+        int(os.getenv("SPYRE_BATCHED_DECODE_GROUPING", "0"))
+    ),
+    # Cost of one extra grouped dispatch, in kernel chunks.
+    "SPYRE_BATCHED_DECODE_GROUP_COST": lambda: int(
+        os.getenv("SPYRE_BATCHED_DECODE_GROUP_COST", "2")
+    ),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

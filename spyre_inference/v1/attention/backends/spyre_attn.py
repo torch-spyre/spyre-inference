@@ -17,7 +17,7 @@
 import contextlib
 import functools
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
@@ -101,9 +101,18 @@ def _record_block(name: str):
         yield
 
 
-# mean/max decode block count: low means the batch pads short sequences up to a
-# much longer one. Calibrated from the crossover sweep; 0.0 disables.
-_BATCHED_DECODE_MIN_UNIFORMITY: float = 0.0
+@dataclass
+class BatchedDecodeGroup:
+    num_seqs: int
+    rows_cpu: torch.Tensor
+    padded_num_seqs: int
+    blocks_per_chunk: int
+    padded_batch_blocks: int
+    rep_row_ids_cpu: torch.Tensor
+    chunk_page_ids_cpu: torch.Tensor
+    mask_by_chunk_cpu: torch.Tensor
+    rows_dev: torch.Tensor | None = None
+    metadata: "SpyreAttentionMetadata | None" = None
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -182,8 +191,18 @@ _batched_decode_compiled = torch.compile(
     batched_decode_kernel, dynamic=False, fullgraph=tile_loop.USE_FOR_EACH_TILE
 )
 
+
+# Compiled: eager index_copy_ falls back to CPU and segfaults on vLLM output buffers.
+def _scatter_rows_kernel(dst: torch.Tensor, rows: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
+    dst.index_copy_(0, rows, src[: rows.shape[0]])
+    return dst
+
+
+_scatter_rows_compiled = torch.compile(_scatter_rows_kernel, dynamic=False)
+
 compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
+compile_guard.watch(_scatter_rows_kernel, "grouped decode store")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
 
@@ -302,6 +321,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # tiled walk needs it materialized (see the construction site).
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
+    decode_groups: list[BatchedDecodeGroup] | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
     # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
@@ -885,6 +905,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         rep_row_ids_cpu = None
         chunk_page_ids_cpu = None
         mask_by_chunk_cpu = None
+        decode_groups = None
         decode_uniformity = 0.0
         if not per_seq_only and envs.SPYRE_BATCHED_DECODE and num_decode_seqs > 0:
             # Real counts for the decode prefix only — same reasoning as before.
@@ -898,69 +919,35 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Mean/max block count: how uniform the contexts are, independent of
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
-                padded_num_seqs = b_seqs
-                # Padding columns gather page 0 under an all--inf mask and
-                # contribute zero; chunk 0 still holds every real row's block 0,
-                # so the running max stays finite.
-                blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
-                padded_batch_blocks = num_chunks * blocks_per_chunk
-                assert padded_batch_blocks >= b_blocks
-                query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
-                query_row_ids[:num_decode_seqs] = query_start_loc[:num_decode_seqs].to(torch.int32)
+                prefix = list(range(num_decode_seqs))
+                (
+                    padded_num_seqs,
+                    blocks_per_chunk,
+                    padded_batch_blocks,
+                    rep_row_ids_cpu,
+                    chunk_page_ids_cpu,
+                    mask_by_chunk_cpu,
+                ) = self._batched_decode_tensors(
+                    prefix,
+                    b_seqs,
+                    b_blocks,
+                    blocks_per_seq,
+                    block_table,
+                    query_start_loc,
+                    active_block_indices,
+                    attention_mask_stacks,
+                )
                 # Guards the identity scatter used by _run_batched_decode_dispatch.
-                assert query_row_ids[:num_decode_seqs].tolist() == list(range(num_decode_seqs))
-                # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
-                rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
-
-                block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
-                bt = block_table[:num_decode_seqs].to(torch.int32)
-                if active_block_indices is None:
-                    n_use_list = [min(n, b_blocks) for n in decode_blocks]
-                    w = min(b_blocks, bt.shape[1])
-                    cols = torch.arange(w)
-                    in_range = cols.unsqueeze(0) < torch.tensor(
-                        n_use_list, dtype=torch.int64
-                    ).unsqueeze(1)
-                    block_ids_padded[:w, :num_decode_seqs] = (bt[:, :w] * in_range).t()
-                else:
-                    # Position i is the i-th ACTIVE block, matching the mask tiles.
-                    for s, abs_blocks in enumerate(active_block_indices[:num_decode_seqs]):
-                        n_use = min(len(abs_blocks), b_blocks)
-                        for b, abs_b in enumerate(abs_blocks[:n_use]):
-                            block_ids_padded[b, s] = bt[s, abs_b]
-                # Kept whole at offset 0: both walks narrow the block axis in-graph, so
-                # this is one transfer per step rather than one per chunk.
-                chunk_page_ids_cpu = block_ids_padded
-
-                # -inf on padded rows/blocks and past-kv-len positions; 0 on
-                # valid positions. The kernel broadcasts the mask to KV heads.
-                mask_bs_bb = torch.full(
-                    (b_seqs, padded_batch_blocks, block_size),
-                    float("-inf"),
-                    dtype=self.model_dtype,
-                )
-                for s in range(num_decode_seqs):
-                    # Under a window n_use spans the padded slots too, so they are
-                    # filled from those tiles; correct only because they are finfo.min.
-                    n_use = min(blocks_per_seq[s], b_blocks)
-                    if n_use:
-                        mask_bs_bb[s, :n_use] = attention_mask_stacks[s][:n_use, 0]
-                # A row past the batch is -inf in every block, so its softmax is NaN and
-                # the in-graph store would publish it. A real row always has a valid
-                # block 0, so its padded blocks can stay -inf and contribute zero.
-                # Holds under a window too: first_active <= num_blocks - 1.
-                mask_bs_bb[num_decode_seqs:, 0] = torch.finfo(self.model_dtype).min
-                # Block-major, so each blocks_per_chunk tile is contiguous. The KV axis
-                # is only materialized for the tiled walk, whose body cannot propagate a
-                # broadcast window's layout through a trip.
-                kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
-                mask_by_chunk_cpu = (
-                    mask_bs_bb.transpose(0, 1)
-                    .unsqueeze(2)
-                    .unsqueeze(3)
-                    .expand(padded_batch_blocks, b_seqs, kv_extent, 1, block_size)
-                    .contiguous()
-                )
+                assert query_start_loc[:num_decode_seqs].tolist() == prefix
+                if envs.SPYRE_BATCHED_DECODE_GROUPING and decode_uniformity < 1.0:
+                    decode_groups = self._batched_decode_groups(
+                        decode_blocks,
+                        blocks_per_seq,
+                        block_table,
+                        query_start_loc,
+                        active_block_indices,
+                        attention_mask_stacks,
+                    )
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -989,7 +976,151 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             rep_row_ids_cpu=rep_row_ids_cpu,
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
+            decode_groups=decode_groups,
         )
+
+    def _batched_decode_tensors(
+        self,
+        members: list[int],
+        b_seqs: int,
+        b_blocks: int,
+        blocks_per_seq: list[int],
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        active_block_indices: list | None,
+        attention_mask_stacks: list[torch.Tensor],
+    ) -> tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        block_size = self.block_size
+        n = len(members)
+        decode_blocks = [blocks_per_seq[m] for m in members]
+        # Padding columns gather page 0 under an all--inf mask and
+        # contribute zero; chunk 0 still holds every real row's block 0,
+        # so the running max stays finite.
+        blocks_per_chunk, num_chunks = batched_decode_chunking(b_seqs, b_blocks)
+        padded_batch_blocks = num_chunks * blocks_per_chunk
+        assert padded_batch_blocks >= b_blocks
+        query_row_ids = torch.zeros(b_seqs, dtype=torch.int32)
+        query_row_ids[:n] = query_start_loc[members].to(torch.int32)
+        # Entry order (j, s), block-slot major, matching chunk_page_ids and the mask.
+        rep_row_ids_cpu = query_row_ids.repeat(blocks_per_chunk)
+
+        block_ids_padded = torch.zeros(padded_batch_blocks, b_seqs, dtype=torch.int32)
+        bt = block_table[members].to(torch.int32)
+        if active_block_indices is None:
+            n_use_list = [min(nb, b_blocks) for nb in decode_blocks]
+            w = min(b_blocks, bt.shape[1])
+            cols = torch.arange(w)
+            in_range = cols.unsqueeze(0) < torch.tensor(n_use_list, dtype=torch.int64).unsqueeze(1)
+            block_ids_padded[:w, :n] = (bt[:, :w] * in_range).t()
+        else:
+            # Position i is the i-th ACTIVE block, matching the mask tiles.
+            for s, m in enumerate(members):
+                abs_blocks = active_block_indices[m]
+                n_use = min(len(abs_blocks), b_blocks)
+                for b, abs_b in enumerate(abs_blocks[:n_use]):
+                    block_ids_padded[b, s] = bt[s, abs_b]
+        # Kept whole at offset 0: both walks narrow the block axis in-graph, so
+        # this is one transfer per step rather than one per chunk.
+        chunk_page_ids_cpu = block_ids_padded
+
+        # -inf on padded rows/blocks and past-kv-len positions; 0 on
+        # valid positions. The kernel broadcasts the mask to KV heads.
+        mask_bs_bb = torch.full(
+            (b_seqs, padded_batch_blocks, block_size),
+            float("-inf"),
+            dtype=self.model_dtype,
+        )
+        for s, m in enumerate(members):
+            # Under a window n_use spans the padded slots too, so they are
+            # filled from those tiles; correct only because they are finfo.min.
+            n_use = min(blocks_per_seq[m], b_blocks)
+            if n_use:
+                mask_bs_bb[s, :n_use] = attention_mask_stacks[m][:n_use, 0]
+        # A row past the batch is -inf in every block, so its softmax is NaN and
+        # the in-graph store would publish it. A real row always has a valid
+        # block 0, so its padded blocks can stay -inf and contribute zero.
+        # Holds under a window too: first_active <= num_blocks - 1.
+        mask_bs_bb[n:, 0] = torch.finfo(self.model_dtype).min
+        # Block-major, so each blocks_per_chunk tile is contiguous. The KV axis
+        # is only materialized for the tiled walk, whose body cannot propagate a
+        # broadcast window's layout through a trip.
+        kv_extent = self.num_kv_heads if tile_loop.USE_FOR_EACH_TILE else 1
+        mask_by_chunk_cpu = (
+            mask_bs_bb.transpose(0, 1)
+            .unsqueeze(2)
+            .unsqueeze(3)
+            .expand(padded_batch_blocks, b_seqs, kv_extent, 1, block_size)
+            .contiguous()
+        )
+        return (
+            b_seqs,
+            blocks_per_chunk,
+            padded_batch_blocks,
+            rep_row_ids_cpu,
+            chunk_page_ids_cpu,
+            mask_by_chunk_cpu,
+        )
+
+    def _batched_decode_groups(
+        self,
+        decode_blocks: list[int],
+        blocks_per_seq: list[int],
+        block_table: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        active_block_indices: list | None,
+        attention_mask_stacks: list[torch.Tensor],
+    ) -> "list[BatchedDecodeGroup] | None":
+        bucketer = self._attn_bucketer
+
+        def chunks(members: list[int]) -> int | None:
+            b_seqs = bucketer.find_sequence_bucket(len(members))
+            b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
+            if b_seqs is None or b_blocks is None:
+                return None
+            return batched_decode_chunking(b_seqs, b_blocks)[1]
+
+        by_bucket: dict[int, list[int]] = {}
+        for s, nb in enumerate(decode_blocks):
+            by_bucket.setdefault(bucketer.find_blocks_bucket(nb) or 0, []).append(s)
+        groups = [by_bucket[k] for k in sorted(by_bucket, reverse=True)]
+        dispatch_cost = envs.SPYRE_BATCHED_DECODE_GROUP_COST
+        merged = True
+        while merged and len(groups) > 1:
+            merged = False
+            for i in range(len(groups) - 1):
+                ca, cb, cab = (
+                    chunks(groups[i]),
+                    chunks(groups[i + 1]),
+                    chunks(groups[i] + groups[i + 1]),
+                )
+                if ca is None or cb is None or cab is None:
+                    return None
+                if cab <= ca + cb + dispatch_cost:
+                    groups[i : i + 2] = [groups[i] + groups[i + 1]]
+                    merged = True
+                    break
+        if len(groups) == 1:
+            return None
+        out = []
+        for members in groups:
+            members.sort()
+            b_seqs = bucketer.find_sequence_bucket(len(members))
+            b_blocks = bucketer.find_blocks_bucket(max(decode_blocks[m] for m in members))
+            assert b_seqs is not None and b_blocks is not None
+            fields = self._batched_decode_tensors(
+                members,
+                b_seqs,
+                b_blocks,
+                blocks_per_seq,
+                block_table,
+                query_start_loc,
+                active_block_indices,
+                attention_mask_stacks,
+            )
+            out.append(
+                BatchedDecodeGroup(len(members), torch.tensor(members, dtype=torch.int32), *fields)
+            )
+        return out
 
     def build_for_variant(self, bucket: SpyreAttnBucket) -> SpyreAttentionMetadata:
         """Metadata for the one-sequence batch that runs ``bucket`` through the per-seq loop.
@@ -1221,6 +1352,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
         )
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._group_staging: torch.Tensor | None = None
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1255,6 +1387,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     device_layout=layout,
                 ),
             )
+            # Not lazily: a buffer made in the step's inference mode misses the dispatch key
+            # the recorded variants guard on, so the batched kernel would recompile.
+            if envs.SPYRE_BATCHED_DECODE_GROUPING:
+                self._group_staging = convert(
+                    torch.zeros(shape, dtype=self.model_dtype), device, device_layout=layout
+                )
         return self._staging
 
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1298,9 +1436,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert attn_metadata.blocks_per_chunk is not None
         # The recorder's bound: a gather of the whole cache faults the device
         # (torch-spyre#4033), so warmup skips these variants and the per-seq loop serves them.
-        if attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk >= num_pages:
-            return False
-        return attn_metadata.decode_uniformity >= _BATCHED_DECODE_MIN_UNIFORMITY
+        return attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk < num_pages
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
     # which `TorchSpyreModelRunner.initialize_kv_cache_tensors` allocates
@@ -1337,7 +1473,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # layers whose impl can actually use the batched kernel (skips ALiBi
         # layers, eager attention and, under the tiled walk, the token-major layout).
         if (
-            self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
+            not self._grouped_decode_ok(attn_metadata, k_pages.shape[0])
+            and self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and attn_metadata.rep_row_ids_dev is None
         ):
             self._mirror_batched_decode_indices(attn_metadata, _target_device)
@@ -1531,7 +1668,26 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 realized,
                 time.time() - t0,
             )
+        if envs.SPYRE_BATCHED_DECODE_GROUPING:
+            self._record_group_scatter(sorted({v.num_seqs for v in variants}), kv_cache)
         return len(recorded)
+
+    def _record_group_scatter(self, seq_buckets: list[int], kv_cache: SpyrePagedKVCache) -> None:
+        device = kv_cache[0].device
+        _, out_staging = self._staging_buffers(device)
+        group_out = self._group_staging
+        assert group_out is not None
+        for b in seq_buckets:
+            try:
+                rows = convert(self._group_store_rows([], b), device=device)
+                _scatter_rows_compiled(out_staging, rows, group_out)
+            except Exception:
+                logger.warning(
+                    "Grouped decode store for %d seqs failed to record; it will compile on "
+                    "first use instead.",
+                    b,
+                    exc_info=True,
+                )
 
     def _record_batched_one(
         self,
@@ -1706,6 +1862,63 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         src_block = result_flat[:num_decode_seqs].clone()
         output[:num_decode_seqs].copy_(src_block)
 
+    def _grouped_decode_ok(self, attn_metadata: "SpyreAttentionMetadata", num_pages: int) -> bool:
+        groups = attn_metadata.decode_groups
+        if groups is None or not self._batched_decode_supported():
+            return False
+        # The recorder's bound, per group (torch-spyre#4033).
+        return all(g.padded_num_seqs * g.blocks_per_chunk < num_pages for g in groups)
+
+    def _run_grouped_decode(
+        self,
+        query_dev: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        attn_metadata: SpyreAttentionMetadata,
+        output: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        assert attn_metadata.decode_groups is not None
+        _, out_staging = self._staging_buffers(device)
+        group_out = self._group_staging
+        assert group_out is not None
+        store = output if output is out_staging else out_staging
+        for group in attn_metadata.decode_groups:
+            if group.metadata is None:
+                group.metadata = replace(
+                    attn_metadata,
+                    num_decode_seqs=group.num_seqs,
+                    padded_num_seqs=group.padded_num_seqs,
+                    blocks_per_chunk=group.blocks_per_chunk,
+                    padded_batch_blocks=group.padded_batch_blocks,
+                    rep_row_ids_cpu=group.rep_row_ids_cpu,
+                    rep_row_ids_dev=None,
+                    chunk_page_ids_cpu=group.chunk_page_ids_cpu,
+                    chunk_page_ids_dev=None,
+                    mask_by_chunk_cpu=group.mask_by_chunk_cpu,
+                    mask_by_chunk_dev=None,
+                    decode_groups=None,
+                )
+                self._mirror_batched_decode_indices(group.metadata, device)
+                group.rows_dev = convert(
+                    self._group_store_rows(group.rows_cpu.tolist(), group.padded_num_seqs),
+                    device=device,
+                )
+            self._run_batched_decode_dispatch(
+                query_dev, k_pages, v_pages, group.metadata, group_out
+            )
+            assert group.rows_dev is not None
+            _scatter_rows_compiled(store, group.rows_dev, group_out)
+        if store is not output:
+            num_decode_seqs = attn_metadata.num_decode_seqs
+            output[:num_decode_seqs].copy_(store[:num_decode_seqs].clone())
+
+    def _group_store_rows(self, rows: list[int], padded_num_seqs: int) -> torch.Tensor:
+        # Padded to the seq bucket so the store compiles once per bucket; padding writes the
+        # top staging rows, which no batch reaches.
+        pad = [self.staging_rows - 1 - k for k in range(padded_num_seqs - len(rows))]
+        return torch.tensor(rows + pad, dtype=torch.int32)
+
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> None:
@@ -1841,7 +2054,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         num_decode_seqs = attn_metadata.num_decode_seqs
         batched_done = False
-        if self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
+        if self._grouped_decode_ok(attn_metadata, k_pages.shape[0]):
+            self._run_grouped_decode(
+                query_dev, k_pages, v_pages, attn_metadata, output, _target_device
+            )
+            if num_decode_seqs == num_seqs:
+                return output
+            batched_done = True
+        elif self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0]):
             self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
             if num_decode_seqs == num_seqs:
                 return output

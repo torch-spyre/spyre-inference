@@ -74,15 +74,15 @@ def _hf_text_embeddings(prompts: list[str]) -> list[torch.Tensor]:
     return out
 
 
-def _hf_image_embedding(image) -> torch.Tensor:
+def _hf_image_embeddings(images: list) -> list[torch.Tensor]:
     from transformers import CLIPImageProcessor, CLIPModel
 
     model = CLIPModel.from_pretrained(MODEL, revision=REVISION).eval()
     processor = CLIPImageProcessor.from_pretrained(MODEL, revision=REVISION)
     with torch.inference_mode():
-        pixel_values = processor(images=image, return_tensors="pt")["pixel_values"]
+        pixel_values = processor(images=images, return_tensors="pt")["pixel_values"]
         features = model.get_image_features(pixel_values=pixel_values)
-    return F.normalize(features.pooler_output.float(), dim=-1)[0]
+    return list(F.normalize(features.pooler_output.float(), dim=-1))
 
 
 def _llm(enforce_eager: bool, max_num_seqs: int):
@@ -140,14 +140,9 @@ def test_clip_text_embeddings_match_hf_one_request_per_step(enforce_eager: bool)
 @pytest.mark.multimodal
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
-@pytest.mark.xfail(
-    reason="CLIP text embeddings are wrong when 2+ requests share a step "
-    "(https://github.com/torch-spyre/spyre-inference/issues/1140)",
-    strict=True,
-)
 def test_clip_text_embeddings_match_hf_batched() -> None:
-    """Every prompt in one step. Strict: once #1140 is fixed this passes, and the
-    marker has to go."""
+    """Every prompt in one step: the encoder grid lays the requests out apart, which the
+    causal text tower on the encoder backend reads correctly (#1140)."""
     _skip_without_spyre()
     refs = _hf_text_embeddings(PROMPTS)
     llm = _llm(enforce_eager=False, max_num_seqs=len(PROMPTS))
@@ -159,26 +154,51 @@ def test_clip_text_embeddings_match_hf_batched() -> None:
 
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
-@pytest.mark.parametrize(
-    "enforce_eager",
-    [
-        pytest.param(
-            True,
-            id="eager",
-            marks=pytest.mark.xfail(
-                reason="Eager CLIP vision blocks crash until the tower is compiled "
-                "(https://github.com/torch-spyre/spyre-inference/pull/1185)",
-                strict=True,
-            ),
-        ),
-        pytest.param(False, id="compiled", marks=pytest.mark.model_quality),
-    ],
-)
+@_EAGER_AND_COMPILED
 def test_clip_image_embedding_matches_hf(enforce_eager: bool) -> None:
     _skip_without_spyre()
     image = _synthetic_image()
-    ref = _hf_image_embedding(image)
+    (ref,) = _hf_image_embeddings([image])
     llm = _llm(enforce_eager, max_num_seqs=1)
     # CLIP's image-only prompt: the text must be empty.
     (out,) = llm.embed([{"prompt": "", "multi_modal_data": {"image": image}}])
     _assert_close("image", out.outputs.embedding, ref)
+
+
+@pytest.mark.multimodal
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+def test_clip_batched_images_match_hf() -> None:
+    """Several distinct images in one step. Past one image the class token was a strided
+    slice the on-card post-norm misread, so every image after the first came back wrong.
+    Distinct images, so the encoder cache cannot serve one from another."""
+    _skip_without_spyre()
+    images = [_synthetic_image(seed=seed) for seed in (0, 61, 122, 183)]
+    refs = _hf_image_embeddings(images)
+    llm = _llm(enforce_eager=False, max_num_seqs=len(images))
+    outputs = llm.embed([{"prompt": "", "multi_modal_data": {"image": im}} for im in images])
+    assert len(outputs) == len(images)
+    for i, (out, ref) in enumerate(zip(outputs, refs)):
+        _assert_close(f"image {i}", out.outputs.embedding, ref)
+
+
+@pytest.mark.multimodal
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+def test_clip_mixed_image_text_step_matches_hf() -> None:
+    """An image and two texts of different lengths in one step. vLLM 0.28 treated a step
+    holding any image as image-only, so its texts skipped the text tower."""
+    _skip_without_spyre()
+    short_text, long_text = PROMPTS[0], PROMPTS[1]
+    image = _synthetic_image()
+    text_refs = _hf_text_embeddings([short_text, long_text])
+    (image_ref,) = _hf_image_embeddings([image])
+    llm = _llm(enforce_eager=False, max_num_seqs=4)
+    outputs = llm.embed(
+        [short_text, {"prompt": "", "multi_modal_data": {"image": image}}, long_text]
+    )
+    assert len(outputs) == 3
+    for label, out, ref in zip(
+        ("short text", "image", "long text"), outputs, (text_refs[0], image_ref, text_refs[1])
+    ):
+        _assert_close(f"mixed step, {label}", out.outputs.embedding, ref)

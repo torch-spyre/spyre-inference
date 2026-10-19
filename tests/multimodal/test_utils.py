@@ -71,3 +71,22 @@ def test_padded_sdpa_without_mask_matches_cpu_on_spyre(batch, seq, mode):
             (row,) = utils._KEY_PAD_MASKS.values()  # built once, at trace time
             fn(q, k, v, None)
             assert next(iter(utils._KEY_PAD_MASKS.values())) is row  # graph input, not rebuilt
+
+
+def test_padded_sdpa_refuses_a_padded_mask_at_another_dtype():
+    """A mask already padded to `seq_pad` keys is used as is, so a dtype miss has to say
+    so instead of reaching `_padded_attn_mask`, which would reshape it to `[seq, seq]`."""
+    q, k, v = (torch.randn(2, 2, 50, 64, dtype=torch.float16) for _ in range(3))
+    mask = torch.zeros(2, 1, 1, 64, dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="float32"):
+        padded_sdpa(q, k, v, mask)
+
+
+def test_padded_sdpa_refuses_an_unpadded_float_mask():
+    """Every caller passes a bool keep-mask or an additive mask already padded to the
+    stick; an unpadded float mask is the ambiguous case and has to say so."""
+    q, k, v = (torch.randn(2, 2, 50, 64, dtype=torch.float16) for _ in range(3))
+
+    with pytest.raises(TypeError, match="bool keep-mask"):
+        padded_sdpa(q, k, v, torch.zeros(50, 50, dtype=torch.float16))

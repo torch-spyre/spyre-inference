@@ -397,7 +397,7 @@ def main():
     parser.add_argument("--probe", required=True, choices=sorted(PROBES))
     args = parser.parse_args()
 
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
 
     rank = int(os.environ["RANK"])

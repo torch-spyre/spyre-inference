@@ -285,8 +285,9 @@ def ref_encoder_attn(
     value: torch.Tensor,
     query_lens: list[int],
     scale: float,
+    causal: bool = False,
 ) -> torch.Tensor:
-    """Reference bidirectional self-attention (no causal mask, no KV cache)."""
+    """Reference self-attention with no KV cache; bidirectional unless ``causal``."""
     num_seqs = len(query_lens)
     outputs: list[torch.Tensor] = []
     start_idx = 0
@@ -302,6 +303,9 @@ def ref_encoder_attn(
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
 
         attn = torch.einsum("qhd,khd->hqk", q, k).float()
+        if causal:
+            future = torch.ones(query_len, query_len, dtype=torch.bool).triu(1)
+            attn = attn.masked_fill(future, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
 
@@ -803,6 +807,7 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
 @pytest.mark.parametrize(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
+@pytest.mark.parametrize("causal", [False, True], ids=["bidirectional", "causal"])
 @pytest.mark.parametrize("batched", [False, True], ids=["grouping_off", "grouping_on"])
 @pytest.mark.parametrize(
     "seq_lens",
@@ -819,6 +824,7 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
 @torch.inference_mode()
 def test_grouped_attention_matches_the_per_sequence_reference(
     default_vllm_config,
+    causal: bool,
     batched: bool,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
@@ -861,6 +867,8 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         ),
         slot_mapping=torch.arange(total_tokens, dtype=torch.int64),
     )
+    # A causal group (CLIP's text tower) gets `[N, 1, L, L]` masks instead.
+    attn_metadata.apply_causal_mask = causal
     impl = SpyreEncoderAttentionImpl(
         num_heads=num_heads,
         head_size=head_size,
@@ -901,7 +909,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         assert groups == [1] * len(groups), "grouping was disabled but a plan batched"
 
     ref_output = ref_encoder_attn(
-        query=query, key=key, value=value, query_lens=query_lens, scale=scale
+        query=query, key=key, value=value, query_lens=query_lens, scale=scale, causal=causal
     )
     assert_close_outliers(
         output.to("cpu"),
@@ -927,9 +935,11 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         pytest.param([50, 60], id="batch_pad_lanes"),
     ],
 )
+@pytest.mark.parametrize("causal", [False, True], ids=["bidirectional", "causal"])
 @torch.inference_mode()
 def test_fast_and_ragged_paths_agree(
     default_vllm_config,
+    causal: bool,
     query_lens: list[int],
     configure_compilation: str,
     configure_device: str,
@@ -965,7 +975,7 @@ def test_fast_and_ragged_paths_agree(
 
     def metadata(lens):
         cu = torch.tensor([0] + list(lens), dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
-        return _build_metadata(
+        md = _build_metadata(
             num_query_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_size=head_size,
@@ -975,6 +985,8 @@ def test_fast_and_ragged_paths_agree(
             block_table=torch.zeros(len(lens), extent // block_size, dtype=torch.int32),
             slot_mapping=torch.arange(sum(lens), dtype=torch.int64),
         )
+        md.apply_causal_mask = causal
+        return md
 
     kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
 

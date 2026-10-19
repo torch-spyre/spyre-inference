@@ -93,10 +93,13 @@ jobs:
 
       # Checkout with no ref = the trusted default branch. The agent pulls the
       # PR itself (gh pr checkout) when it must run the changed code on hardware.
+      # persist-credentials: false keeps the job token out of .git/config, where
+      # the PR's own code could otherwise read it.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Spyre RPMs
         if: env.REVIEW_MODE == 'hardware'
@@ -210,7 +213,8 @@ jobs:
           # also buys no real containment here: on-hardware verification needs
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
-          # network controls (see PR #785), not the tool list.
+          # network controls (see PR #785), not the tool list. The prompt has
+          # the agent run PR code with the secrets below unset.
           #
           # The agent posts its own PR-level summary comment (see the prompt);
           # the completion signal is the outcome reaction in the next step.

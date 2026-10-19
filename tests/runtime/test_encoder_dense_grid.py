@@ -30,6 +30,7 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from spyre_inference.models.bert import SpyreBertEmbedding
 from spyre_inference.models.roberta import SpyreRobertaEmbedding
 from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool, SpyreMeanPool
+from spyre_inference.v1.worker.encoder_grid import expand_body_to_grid
 from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
@@ -85,6 +86,46 @@ def test_embeds_gather_lands_every_token_on_its_grid_row(query_lens):
     assert torch.equal(grid[rows], embeds)
     assert torch.equal(grid[rows, 0].long(), grid_ids[rows])
     assert max(source_rows) == total - 1
+
+
+def test_expand_body_to_grid_lays_out_ids_and_keeps_embeds():
+    query_lens = [7, 1, 63]
+    extent, width = 64, 4
+    total = sum(query_lens)
+    # Upstream hands over the whole padded body; only the first `total` rows are real.
+    ids = torch.arange(1, total + 9, dtype=torch.int64)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens + [8]])
+    embeds = torch.zeros(1)
+
+    grid_ids, grid_embeds, grid_pos = expand_body_to_grid(
+        ids, embeds, positions, (extent, width, query_lens), pad_token_id=9, position_offset=2
+    )
+
+    want_ids, want_pos = expand_packed_to_encoder_grid(
+        ids[:total], positions[:total], query_lens, width, extent, pad_token_id=9, position_offset=2
+    )
+    assert torch.equal(grid_ids, want_ids)
+    assert torch.equal(grid_pos, want_pos)
+    assert grid_embeds is embeds
+
+
+def test_expand_body_to_grid_gathers_embeds_without_ids():
+    """Multimodal pooling preprocesses straight to embeddings; those move instead."""
+    query_lens = [7, 1, 63]
+    extent, width = 64, 4
+    total = sum(query_lens)
+    embeds = torch.arange(1, total + 9, dtype=torch.float16).unsqueeze(1).expand(-1, 8)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens + [8]])
+
+    grid_ids, grid_embeds, grid_pos = expand_body_to_grid(
+        None, embeds, positions, (extent, width, query_lens), pad_token_id=9, position_offset=0
+    )
+
+    assert grid_ids is None
+    assert grid_embeds is not None
+    rows = encoder_dense_row_indices(query_lens, extent)
+    assert torch.equal(grid_embeds[rows], embeds[:total])
+    assert torch.equal(grid_pos[rows], positions[:total])
 
 
 def test_embeds_gather_rejects_a_batch_wider_than_the_rectangle():

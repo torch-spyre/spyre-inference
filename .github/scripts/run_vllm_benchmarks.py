@@ -54,6 +54,13 @@ DATASET_PATH_DEFAULTS = {
         "/models/online_benchmarking_data_reordered/"
         "cics_results_2025.11.03_e2ee1b0_correct_order.jsonl"
     ),
+    "SPYRE_ALL_SEQUENCES_DATASET": (
+        "/models/online_benchmarking_data_reordered/"
+        "all_sequences_2025.11.03_e2ee1b0_correct_order.jsonl"
+    ),
+    "SPYRE_VISION_DATASET": (
+        "/models/online_benchmarking_data_reordered/wdu_combined_article_payload_fixed.jsonl"
+    ),
 }
 
 
@@ -105,6 +112,14 @@ def parse_args():
         type=str,
         default="",
         help="comma-separated subset of latency,throughput,serve to run (empty = all)",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="",
+        help="config suite to run: empty for the CI configs (<type>-tests.yaml), "
+        "or e.g. 'dev' for <type>-tests-dev.yaml; a bench type with no file "
+        "for the suite is skipped, and a suite with no file at all is an error",
     )
     return parser.parse_args()
 
@@ -186,8 +201,9 @@ def _select_configs(configs: list, models: set[str], tps: set[int]) -> list:
         for test_name, path in missing_datasets:
             log.error("%s needs dataset %s, which is not present on this host", test_name, path)
         log.error(
-            "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET at this host's copies "
-            "of the trace files, or mount them at the paths above."
+            "Point SPYRE_AIOPS_DATASET / SPYRE_CICS_DATASET / SPYRE_ALL_SEQUENCES_DATASET "
+            "/ SPYRE_VISION_DATASET at this host's copies of the trace files, or mount "
+            "them at the paths above."
         )
         sys.exit(2)
     return selected
@@ -459,66 +475,65 @@ def run_serve_benchmark(
             stderr=server_lf,
             start_new_session=True,
         )
+        try:
+            # Timed from before the spawn: for large models this is mostly the
+            # one-time warmup compile, which is worth comparing run to run.
+            health_url = f"http://{host}:{port}/health"
+            server_startup_sec = None
+            deadline = server_start_ts + health_timeout
+            while time.monotonic() < deadline:
+                if server_proc.poll() is not None:
+                    log.error("Server process died with exit code %d", server_proc.returncode)
+                    if server_log.exists():
+                        log.error("Server log:\n%s", server_log.read_text())
+                    return False
+                try:
+                    urllib.request.urlopen(health_url, timeout=2)
+                    server_startup_sec = round(time.monotonic() - server_start_ts, 1)
+                    log.info("Server ready after %.1fs", server_startup_sec)
+                    break
+                except Exception:
+                    time.sleep(1)
 
-        # Timed from before the spawn: for large models this is mostly the
-        # one-time warmup compile, which is worth comparing run to run.
-        health_url = f"http://{host}:{port}/health"
-        server_startup_sec = None
-        deadline = server_start_ts + health_timeout
-        while time.monotonic() < deadline:
-            if server_proc.poll() is not None:
-                log.error("Server process died with exit code %d", server_proc.returncode)
+            if server_startup_sec is None:
+                log.error("Server did not become healthy within %ds", health_timeout)
                 if server_log.exists():
                     log.error("Server log:\n%s", server_log.read_text())
                 return False
-            try:
-                urllib.request.urlopen(health_url, timeout=2)
-                server_startup_sec = round(time.monotonic() - server_start_ts, 1)
-                log.info("Server ready after %.1fs", server_startup_sec)
-                break
-            except Exception:
-                time.sleep(1)
 
-        if server_startup_sec is None:
-            log.error("Server did not become healthy within %ds", health_timeout)
-            if server_log.exists():
-                log.error("Server log:\n%s", server_log.read_text())
-            _kill_server(server_proc)
-            return False
-
-        # Run bench serve
-        bench_cmd = [*VLLM_CLI, "bench", "serve"]
-        bench_cmd.extend(build_command_args(bench_parameters))
-        bench_cmd.extend(
-            [
-                # The trace prompts already carry their chat template;
-                # re-applying it would change token counts and the
-                # prefix-cache hit rate.
-                "--skip-chat-template",
-                "--save-result",
-                "--result-dir",
-                str(results_dir),
-                "--result-filename",
-                f"{test_name}.json",
-            ]
-        )
-
-        bench_cmd_line = record_command(
-            bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
-        )
-
-        log.info("=== Running serve benchmark: %s ===", test_name)
-        log.info("Bench command: %s", bench_cmd_line)
-
-        bench_log = results_dir / f"{test_name}_bench.log"
-        with open(bench_log, "w") as blf:
-            blf.write(f"# {bench_cmd_line}\n")
-            blf.flush()
-            result = subprocess.run(
-                bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
+            # Run bench serve
+            bench_cmd = [*VLLM_CLI, "bench", "serve"]
+            bench_cmd.extend(build_command_args(bench_parameters))
+            bench_cmd.extend(
+                [
+                    # The trace prompts already carry their chat template;
+                    # re-applying it would change token counts and the
+                    # prefix-cache hit rate.
+                    "--skip-chat-template",
+                    "--save-result",
+                    "--result-dir",
+                    str(results_dir),
+                    "--result-filename",
+                    f"{test_name}.json",
+                ]
             )
 
-        _kill_server(server_proc)
+            bench_cmd_line = record_command(
+                bench_cmd, config_env, results_dir / f"{test_name}_bench.cmd"
+            )
+
+            log.info("=== Running serve benchmark: %s ===", test_name)
+            log.info("Bench command: %s", bench_cmd_line)
+
+            bench_log = results_dir / f"{test_name}_bench.log"
+            with open(bench_log, "w") as blf:
+                blf.write(f"# {bench_cmd_line}\n")
+                blf.flush()
+                result = subprocess.run(
+                    bench_cmd, env=env, stdout=blf, stderr=subprocess.PIPE, text=True
+                )
+        finally:
+            _kill_server(server_proc)
 
     if result.returncode != 0:
         log.error("Serve test %s failed with exit code %d", test_name, result.returncode)
@@ -594,7 +609,19 @@ def run_serve_benchmarks_from_file(
 VALID_BENCH_TYPES = ("latency", "throughput", "serve")
 
 
+def _suite_config_files(configs_dir: Path, suite: str, bench_types: set[str]) -> dict[str, Path]:
+    """Map each selected bench type to its `<type>-tests[-<suite>].yaml` config."""
+    suffix = f"-{suite}" if suite else ""
+    return {
+        b: configs_dir / f"{b}-tests{suffix}.yaml" for b in VALID_BENCH_TYPES if b in bench_types
+    }
+
+
 def main():
+    # Turn SIGTERM into SystemExit so the running server's process group, started in its
+    # own session, is still killed.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
+
     # s390x: the protobuf upb C runtime SIGSEGVs (upb_DefPool_Free) in vLLM's
     # model-inspection child; force pure-Python protobuf. Set on os.environ so
     # the child, spawned by vLLM not us, inherits it.
@@ -620,13 +647,25 @@ def main():
     if not bench_types:
         bench_types = set(VALID_BENCH_TYPES)
 
+    suite = args.suite.strip()
+    config_files = _suite_config_files(configs_dir, suite, bench_types)
+    # A mistyped suite would otherwise run nothing and still exit 0.
+    if suite and not any(f.exists() for f in config_files.values()):
+        log.error(
+            "Suite %r has no config in %s: expected one of %s",
+            suite,
+            configs_dir,
+            [f.name for f in config_files.values()],
+        )
+        sys.exit(2)
+
     total_passed = 0
     total_failed = 0
 
     # Run latency benchmarks
     if "latency" in bench_types:
         passed, failed = run_benchmarks_from_file(
-            config_file=configs_dir / "latency-tests.yaml",
+            config_file=config_files["latency"],
             bench_type="latency",
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
@@ -640,7 +679,7 @@ def main():
     # Run throughput benchmarks
     if "throughput" in bench_types:
         passed, failed = run_benchmarks_from_file(
-            config_file=configs_dir / "throughput-tests.yaml",
+            config_file=config_files["throughput"],
             bench_type="throughput",
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
@@ -654,7 +693,7 @@ def main():
     # Run serve benchmarks (after latency/throughput to avoid port conflicts)
     if "serve" in bench_types:
         passed, failed = run_serve_benchmarks_from_file(
-            config_file=configs_dir / "serve-tests.yaml",
+            config_file=config_files["serve"],
             results_dir=results_dir,
             spyre_devices=args.spyre_devices,
             aiu_world_size=args.aiu_world_size,

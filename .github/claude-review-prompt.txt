@@ -3,6 +3,11 @@
 Use the spyre-knowledgebase to search for relevant context.
 Verify the correctness of all modified behavior, using the provided spyre hardware.
 
+Run any code from the PR (pytest, python, uv run, scripts) with the job secrets stripped from its
+environment by prefixing the command with `env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u GH_TOKEN -u SPYRE_KB_MCP_URL`,
+e.g. `env -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL -u GH_TOKEN -u SPYRE_KB_MCP_URL uv run pytest ...`.
+Only gh commands need GH_TOKEN; never run PR code with it set.
+
 Be sure to validate that all new behavior is covered by tests. Additionally, ensure that
 any added tests are actually run through CI. This includes making sure that tests are
 scheduled on jobs that have the correct number of spyre cards to execute them.

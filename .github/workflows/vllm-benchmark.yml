@@ -1,8 +1,6 @@
 name: vLLM Benchmark
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main, 'release-*']
     types: [opened, synchronize, reopened, labeled]
@@ -45,8 +43,7 @@ on:
       clickhouse_env:
         description: >
           ClickHouse instance to ingest into: "prod" (the CLICKHOUSE_* secret
-          set) or "dev" (the CLICKHOUSE_*_DEV set). A push to main always uses
-          prod; this input only applies to a manual dispatch.
+          set) or "dev" (the CLICKHOUSE_*_DEV set).
         required: false
         type: choice
         options: [prod, dev]
@@ -205,16 +202,14 @@ jobs:
 
       # !cancelled(): a later benchmark failing must not discard the ones that completed.
       - name: Install ClickHouse ingest dependencies
-        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
         run: |
           set -eux
           uv pip install -r .github/scripts/requirements-benchmark.txt
 
       - name: Ingest benchmark results into ClickHouse
-        if: ${{ !cancelled() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' }}
         env:
-          # A push to main has no clickhouse_env input, so the selector resolves
-          # to prod. A manual dispatch can pick dev with the *_DEV secret set.
           CLICKHOUSE_HOST: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_HOST || secrets.CLICKHOUSE_HOST_DEV }}
           CLICKHOUSE_PORT: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_PORT || secrets.CLICKHOUSE_PORT_DEV }}
           CLICKHOUSE_USER: ${{ inputs.clickhouse_env != 'dev' && secrets.CLICKHOUSE_USER || secrets.CLICKHOUSE_USER_DEV }}
@@ -230,15 +225,28 @@ jobs:
         run: |
           set -eux
 
-          JSON_COUNT=$(find benchmark-results -name "*.pytorch.json" 2>/dev/null | wc -l || echo 0)
-          echo "PyTorch JSON result files found: ${JSON_COUNT}"
+          # Count the native results: vLLM writes no .pytorch.json for pooling models
+          # (embedding, reranker), and extract_rows reads their metrics from the native file.
+          # -maxdepth 1 matches the top-level glob extract_rows reads.
+          JSON_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" 2>/dev/null | wc -l)
+          echo "Benchmark JSON result files found: ${JSON_COUNT}"
+
+          # Latency and throughput results must have a .pytorch.json sibling: without it,
+          # extract_rows keys their rows by test name with native metric names.
+          MISSING=$(for f in benchmark-results/{latency,throughput}_*.json; do
+            [[ -e "$f" && "$f" != *.pytorch.json && ! -e "${f%.json}.pytorch.json" ]] && echo "$f"
+          done || true)
+          if [[ -n "${MISSING}" ]]; then
+            echo "Benchmark results without a .pytorch.json: ${MISSING}"
+            exit 1
+          fi
 
           if [[ "${JSON_COUNT}" -eq 0 ]]; then
             if [[ "${BENCH_STATE}" == "failed" ]]; then
               echo "No benchmark completed; nothing to ingest."
               exit 0
             fi
-            echo "No PyTorch benchmark result files found; failing ClickHouse ingest."
+            echo "No benchmark result files found; failing ClickHouse ingest."
             exit 1
           fi
 
@@ -263,7 +271,7 @@ jobs:
           MATRIX_MODELS: ${{ matrix.models }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          RESULT_COUNT=$(find benchmark-results -name "*.pytorch.json" 2>/dev/null | wc -l || echo 0)
+          RESULT_COUNT=$(find benchmark-results -maxdepth 1 -name "*.json" ! -name "*.pytorch.json" 2>/dev/null | wc -l)
 
           {
             echo "### Benchmark Results"

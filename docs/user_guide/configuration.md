@@ -5,11 +5,13 @@
 To load the plugin, set the `VLLM_PLUGINS` environment variable before running vLLM:
 
 ```bash
-export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+export VLLM_PLUGINS=spyre_inference
 ```
 
-`spyre_inference` activates the platform, and `spyre_inference_ops` registers the OOT
-custom ops plus the Spyre Transformers backend (used for `model_impl="transformers"`).
+`spyre_inference` names both the platform plugin and the general plugin: the first
+activates the platform, and the second registers the OOT custom ops and the Spyre
+model adaptations, including the Spyre Transformers backend (used for
+`model_impl="transformers"`).
 
 ## Usage
 
@@ -93,7 +95,7 @@ Those counts assume the rectangular path is opaque; traced into the block graph 
 below), each rectangle is a block graph of its own rather than an attention kernel.
 
 The choice is made once per step from the step's metadata, before the forward, and the
-runner counts it in `spyre_encoder_rect_steps` / `spyre_encoder_ragged_steps`. The
+runner counts it in `spyre_encoder_stats` (`rect_steps` / `ragged_steps`). The
 ragged path always runs behind the opaque attention op. When compiled and the head size
 fills whole 64-element sticks, the rectangular path is traced into the block graph
 instead, so each rectangle is its own block graph. In eager mode both paths stay

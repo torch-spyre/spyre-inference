@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CLIP boundary-LayerNorm workaround for Spyre.
+"""CLIP workarounds for Spyre: boundary LayerNorms and vision-tower compile.
 
 Only ``vision_model.pre_layrnorm``/``post_layernorm`` and
 ``text_model.final_layer_norm`` are swapped to ``SpyreLayerNorm``. Those three
@@ -27,6 +27,12 @@ Applied to the already-loaded model instance (weights included), so the
 replacement ``SpyreLayerNorm`` here copies the original's already-loaded
 weight/bias explicitly, rather than relying on a later ``load_weights()``
 pass to populate them.
+
+The vision tower's encoder layers are marked for the runner's per-block compile. Their
+body builds nothing on the host once ``MMEncoderAttention`` is Spyre's OOT
+implementation (``custom_ops/vit_attn.py``), so ``patch_vision_tower`` checks that
+instead of assuming it. It takes the tower itself, not the model, so a model that
+embeds a CLIP tower can reuse it.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import torch
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+from spyre_inference.multimodal.utils import mark_blocks_compilable
 
 logger = init_logger(__name__)
 
@@ -54,8 +61,36 @@ def _to_spyre_layer_norm(ln: torch.nn.LayerNorm, device: torch.device) -> torch.
     return new_ln
 
 
+def patch_vision_tower(tower: torch.nn.Module, device: torch.device) -> None:
+    """Swap a ``CLIPVisionTransformer``'s boundary LayerNorms and mark its encoder
+    layers compilable."""
+    pre_ln = getattr(tower, "pre_layrnorm", None)
+    if isinstance(pre_ln, torch.nn.LayerNorm):
+        tower.pre_layrnorm = _to_spyre_layer_norm(pre_ln, device)
+    post_ln = getattr(tower, "post_layernorm", None)
+    if isinstance(post_ln, torch.nn.LayerNorm):
+        tower.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+
+    layers = getattr(getattr(tower, "encoder", None), "layers", None)
+    if not layers:
+        return
+    # Deferred: vit_attn imports this package's utils, so a top-level import is a cycle.
+    from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
+
+    # A layer whose attention is not the OOT impl would trace upstream's opaque SDPA
+    # wrapper, which pads nothing; leave such a tower eager.
+    attns = [getattr(getattr(layer, "self_attn", None), "attn", None) for layer in layers]
+    if all(isinstance(attn, SpyreMMEncoderAttention) for attn in attns):
+        mark_blocks_compilable(layers)
+    else:
+        logger.warning_once(
+            "Spyre: CLIP vision layers do not use SpyreMMEncoderAttention; the tower stays eager."
+        )
+
+
 def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place.
+    """Swap CLIP's three boundary LayerNorms for ``SpyreLayerNorm``, in place, and
+    mark the vision tower's encoder layers compilable.
 
     The ``isinstance`` checks are a second line of defense on top of the
     ``model_type == "clip"`` dispatch gate in ``multimodal/__init__.py``: they
@@ -70,12 +105,7 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
 
     vision_model = getattr(model, "vision_model", None)
     if vision_model is not None:
-        pre_ln = getattr(vision_model, "pre_layrnorm", None)
-        if isinstance(pre_ln, torch.nn.LayerNorm):
-            vision_model.pre_layrnorm = _to_spyre_layer_norm(pre_ln, device)
-        post_ln = getattr(vision_model, "post_layernorm", None)
-        if isinstance(post_ln, torch.nn.LayerNorm):
-            vision_model.post_layernorm = _to_spyre_layer_norm(post_ln, device)
+        patch_vision_tower(vision_model, device)
 
     logger.info_once(
         "Spyre: CLIP's boundary LayerNorms (pre_layrnorm/post_layernorm/"

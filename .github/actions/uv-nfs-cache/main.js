@@ -42,6 +42,7 @@ lib.runHelper([
   '--event-name', process.env.GITHUB_EVENT_NAME || '',
   '--ref', process.env.GITHUB_REF || '',
   '--pr-number', prNumber,
+  '--uv', 'uv',
   '--github-env', process.env.GITHUB_ENV || '',
   '--github-output', process.env.GITHUB_OUTPUT || '',
 ]);

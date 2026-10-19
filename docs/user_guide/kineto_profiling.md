@@ -225,7 +225,7 @@ allow both Spyre plugin entry points:
 ```bash
 source .venv/bin/activate
 source examples/offline_inference/setup_profile_env.sh
-export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+export VLLM_PLUGINS=spyre_inference
 python -u examples/offline_inference/profile_spyre_inference.py
 ```
 
@@ -238,7 +238,7 @@ Contents of the script and why each entry matters:
 | Variable / action | Value | Purpose |
 |---|---|---|
 | (venv activation) | `source /opt/spyre-inference/bin/activate` | Used only when `VIRTUAL_ENV` is empty or unset; otherwise the current venv is kept. |
-| `VLLM_PLUGINS` | `spyre_inference` | Allowlists only the platform entry point. The recipe above also allows `spyre_inference_ops`, the general-plugin callback; the worker independently registers ops and model adaptations. |
+| `VLLM_PLUGINS` | `spyre_inference` | Allowlists the platform plugin and the general plugin, which share this name; the general plugin registers the ops and model adaptations in every process. |
 | (profiler check) | — | Still checks `torch.__version__` for the retired `+aiu.kineto` suffix, so it warns "stock torch detected" on every current install, profiler-enabled or not — ignore that warning. The real check is `ldd .../_C.so \| grep libaiupti` plus the `AiuptiActivityProfilerSession` symbols (§1.4); the suffix flow was retired by torch-spyre PR #1856. See §1.3. |
 | `OMP_NUM_THREADS` | `1` | Pin OpenMP thread pool so BLAS work does not compete with Spyre dispatch |
 | `OPENBLAS_NUM_THREADS` | `1` | Pin OpenBLAS thread pool (same rationale) |
@@ -438,7 +438,7 @@ of a row of `-` values.
 ```bash
 source .venv/bin/activate
 source examples/offline_inference/setup_profile_env.sh
-export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+export VLLM_PLUGINS=spyre_inference
 export DTCOMPILER_KEEP_EXPORT=true
 export SENLIB_DEVEL_CONFIG_FILE=<venv-prefix>/etc/senlib_config_aiusmi.json
 python examples/offline_inference/profile_spyre_inference.py

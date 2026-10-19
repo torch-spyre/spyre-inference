@@ -263,9 +263,12 @@ class _LanguageModel(torch.nn.Module):
     pass
 
 
-# All `_mark_language_model` reads from the vLLM config.
+# All `_mark_language_model` reads from the vLLM config (via get_multimodal_config()).
+_MM_CONFIG = SimpleNamespace(mm_encoder_only=False)
 _MM_VLLM_CONFIG = SimpleNamespace(
-    model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_encoder_only=False))
+    model_config=SimpleNamespace(
+        multimodal_config=_MM_CONFIG, get_multimodal_config=lambda: _MM_CONFIG
+    )
 )
 
 # A composite config, for which the weight loader pads only ``language_model.``.

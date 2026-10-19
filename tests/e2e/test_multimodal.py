@@ -157,8 +157,9 @@ def test_warmup_covers_text_only_token_embedding_on_multimodal_model(monkeypatch
 @pytest.mark.multimodal
 @pytest.mark.uses_subprocess
 def test_two_image_prompt_produces_output():
-    """Two images make the vision mask non-trivial: a pair of strided sub-block writes
-    rather than one full-range write, which is what `patch_block_attention_mask` is for.
+    """Two images make the vision mask non-trivial: the `cu_seqlens`-derived
+    block-diagonal mask must actually block cross-image attention, not collapse to a
+    single full-range block.
 
     Eager only: the mask is built on CPU either way, so a compiled twin would cost a
     graph build for no new coverage.
@@ -198,6 +199,9 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
         pytest.skip(f"{GEMMA4_MODEL}@{GEMMA4_REVISION[:7]} not in the local HF cache")
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
+    # A tower compile at request time is a missed warmup shape: fail, don't log.
+    if not enforce_eager:
+        monkeypatch.setenv("SPYRE_COMPILE_GUARD", "error")
 
     uri = _synthetic_image_data_uri()
     (text,) = _generate(

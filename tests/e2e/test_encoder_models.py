@@ -19,6 +19,7 @@ Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py`
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import math
@@ -29,8 +30,11 @@ from types import ModuleType
 import pytest
 import torch
 import torch.nn.functional as F
+from spyre_testing_plugin.tags import record_serving_capability
 from vllm import LLM
 from vllm.config import PoolerConfig
+
+MAX_MODEL_LEN = 64
 
 EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-125m-english",
@@ -149,32 +153,43 @@ def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> 
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
-def test_encoder_embed_models(model: str) -> None:
+def test_encoder_embed_models(model: str, record_property) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
-    _assert_embeddings_match_refs(model, enforce_eager=True)
+    _assert_embeddings_match_refs(model, enforce_eager=True, record_property=record_property)
 
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
-def test_encoder_embed_models_compiled(model: str) -> None:
+def test_encoder_embed_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
-    _assert_embeddings_match_refs(model, enforce_eager=False)
+    _assert_embeddings_match_refs(model, enforce_eager=False, record_property=record_property)
 
 
-def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
+def _assert_embeddings_match_refs(model: str, enforce_eager: bool, record_property) -> None:
     ref = _REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
 
     prompts = ref["prompts"]
+    max_num_seqs = 1
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="embed",
+        enforce_eager=enforce_eager,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=enforce_eager,
     )
     outputs = llm.embed(prompts)
@@ -194,7 +209,7 @@ def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", MEAN_POOLING_MODELS)
-def test_encoder_embed_mean_multi_seq(model: str) -> None:
+def test_encoder_embed_mean_multi_seq(model: str, record_property) -> None:
     """MEAN with ``max_num_seqs=2`` so two requests share one packed ``[T, H]``.
 
     The default embed e2e is ``max_num_seqs=1`` and never hits two sequences
@@ -205,13 +220,24 @@ def test_encoder_embed_mean_multi_seq(model: str) -> None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
 
     prompts = ref["prompts"]
+    max_num_seqs = 2
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="embed",
+        enforce_eager=True,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=2,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=True,
     )
     outputs = llm.embed(prompts)
@@ -254,7 +280,7 @@ def test_encoder_embed_last_pooling() -> None:
         revision=revision,
         tokenizer_revision=revision,
         runner="pooling",
-        max_model_len=64,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
         enforce_eager=True,
         pooler_config=PoolerConfig(seq_pooling_type="LAST"),
@@ -277,20 +303,20 @@ def test_encoder_embed_last_pooling() -> None:
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
-def test_encoder_rerank_models(model: str) -> None:
+def test_encoder_rerank_models(model: str, record_property) -> None:
     """Spyre reranker scores match the cached HF references within tolerance."""
-    _assert_rerank_scores_match_refs(model, enforce_eager=True)
+    _assert_rerank_scores_match_refs(model, enforce_eager=True, record_property=record_property)
 
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
-def test_encoder_rerank_models_compiled(model: str) -> None:
+def test_encoder_rerank_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
-    _assert_rerank_scores_match_refs(model, enforce_eager=False)
+    _assert_rerank_scores_match_refs(model, enforce_eager=False, record_property=record_property)
 
 
-def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
+def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool, record_property) -> None:
     """Classifier GEMM runs on Spyre in fp16 (no fp32 matmul, torch-spyre#1794)."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
@@ -298,13 +324,24 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
 
     documents = ref["documents"]
     ref_scores = ref["scores"]
+    max_num_seqs = 1
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="score",
+        enforce_eager=enforce_eager,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=enforce_eager,
     )
     outputs = llm.score(ref["query"], documents)
@@ -314,7 +351,7 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
-def test_encoder_rerank_default_max_model_len_compiled() -> None:
+def test_encoder_rerank_default_max_model_len_compiled(record_property) -> None:
     """Warmup at the default max_model_len survives, and a (1024, 2) batch matches HF."""
     ref = _RERANK_REFERENCES.get(LONG_RERANK_MODEL)
     if ref is None:
@@ -329,13 +366,29 @@ def test_encoder_rerank_default_max_model_len_compiled() -> None:
     for count in token_counts:
         assert 512 < count <= 1024, f"pair of {count} tokens no longer pads to L=1024"
 
-    llm = LLM(
-        model=LONG_RERANK_MODEL,
-        revision=revision,
-        tokenizer_revision=revision,
-        runner="pooling",
+    # vLLM resolves max_model_len and max_num_seqs here, so a failed build records `default`.
+    record = functools.partial(
+        record_serving_capability,
+        record_property,
+        LONG_RERANK_MODEL,
+        "served",
+        1,
+        task="score",
         enforce_eager=False,
     )
+    try:
+        llm = LLM(
+            model=LONG_RERANK_MODEL,
+            revision=revision,
+            tokenizer_revision=revision,
+            runner="pooling",
+            enforce_eager=False,
+        )
+    except BaseException:
+        record("default", "default")
+        raise
+    config = llm.llm_engine.vllm_config
+    record(config.model_config.max_model_len, config.scheduler_config.max_num_seqs)
     assert llm.llm_engine.model_config.max_model_len == 2048
     outputs = llm.score(LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS)
     assert len(outputs) == len(LONG_RERANK_DOCUMENTS)
@@ -386,7 +439,7 @@ def test_encoder_token_classify() -> None:
     llm = LLM(
         model=TOKEN_CLASSIFY_MODEL,
         runner="pooling",
-        max_model_len=64,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=2,
         enforce_eager=True,
     )

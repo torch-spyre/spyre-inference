@@ -159,8 +159,11 @@ def select_rows(hidden_states: torch.Tensor, row_indices: torch.Tensor) -> torch
     if device.type != "spyre":
         return torch.index_select(hidden_states, 0, flat_idx.to(device=device, dtype=torch.long))
 
-    indices = convert(flat_idx.to(torch.int32), device)
     source = hidden_states.clone() if hidden_states.storage_offset() != 0 else hidden_states
+    # A one-row gather lowers to an identity op dbo-opt cannot schedule.
+    if hidden_states.shape[0] == 1 and flat_idx.numel() == 1:
+        return source
+    indices = convert(flat_idx.to(torch.int32), device)
     return torch.index_select(source, 0, indices)
 
 

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from spyre_testing_plugin.tags import record_serving_capability
 from vllm import LLM, RequestOutput, SamplingParams
 
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
@@ -39,6 +40,15 @@ DECODER_MODELS = [
     "google/gemma-4-26B-A4B",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
+
+# Both gemma-4 checkpoints carry a vision tower this decoder test does not need. Every
+# modality at 0 keeps the default Gemma4ForConditionalGeneration load and stage-skips the
+# tower; test_compile.py pins the text backbone instead, so both text-only loads are covered.
+TEXT_ONLY_MM_LIMITS = {"image": 0, "video": 0, "audio": 0}
+MM_LIMITS = {
+    "google/gemma-4-31B": TEXT_ONLY_MM_LIMITS,
+    "google/gemma-4-26B-A4B": TEXT_ONLY_MM_LIMITS,
+}
 
 # Maps to the unquantized sibling whose prompts the smoke case borrows.
 FP8_DECODER_MODELS = {
@@ -102,6 +112,16 @@ def test_decoder_model_output(
 
     _assert_prompts_fit_prefill_bucket(model, revision, prompts)
 
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        MAX_NUM_SEQS,
+        task="generate",
+        enforce_eager=False,
+    )
     engine = LLM(
         model=model,
         revision=revision,
@@ -111,6 +131,7 @@ def test_decoder_model_output(
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         compilation_config={"compile_sizes": COMPILE_SIZES},
+        limit_mm_per_prompt=MM_LIMITS.get(model, {}),
     )
 
     outputs = engine.generate(
@@ -133,7 +154,11 @@ def test_decoder_model_output(
 
 
 @pytest.mark.parametrize("model", FP8_DECODER_MODELS)
-def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_fp8_decoder_model_smoke(
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, str], None],
+) -> None:
     """A compiled FP8 checkpoint loads and decodes; no reference (no CPU dequant)."""
     base = FP8_DECODER_MODELS[model]
     base_ref = _REFERENCES.get(base)
@@ -149,6 +174,16 @@ def test_fp8_decoder_model_smoke(model: str, monkeypatch: pytest.MonkeyPatch) ->
 
     _assert_prompts_fit_prefill_bucket(model, revision, prompts)
 
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        MAX_NUM_SEQS,
+        task="generate",
+        enforce_eager=False,
+    )
     engine = LLM(
         model=model,
         revision=revision,

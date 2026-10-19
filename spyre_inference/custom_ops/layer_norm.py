@@ -84,7 +84,9 @@ class SpyreLayerNorm(CompileOutermost, torch.nn.LayerNorm):
         bias = self.bias if self.elementwise_affine else None
         return self._spyre_forward(input, weight, bias)
 
-    @maybe_compile
+    # Forced: run eagerly, the fp32-to-fp16 cast leaves a layout the next eager
+    # LayerNorm cannot broadcast its weight against ("Multi-arg pointwise with mixed EA").
+    @maybe_compile(force=True)
     def _spyre_forward(
         self, x: torch.Tensor, weight: torch.Tensor | None, bias: torch.Tensor | None
     ) -> torch.Tensor:

@@ -19,15 +19,6 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from typing_extensions import override
-
-# `import torch_spyre` is intentionally deferred to inside `init_device`.
-# Importing it loads `libspyre_comms.so`, which captures
-# `RANK` / `WORLD_SIZE` / `LOCAL_RANK` / `LOCAL_WORLD_SIZE` via
-# `std::getenv` at dlopen time and caches them. Those env vars are only
-# known per-worker, so they must be populated before the C library
-# loads. `spyre_inference/__init__.py` sets
-# `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
-# autoload doesn't trigger the load at `import torch` time.
 from vllm.distributed.utils import get_worker_rank_suffix
 from vllm.logger import init_logger
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -97,8 +88,8 @@ class TorchSpyreWorker(Worker):
         return nullcontext()
 
     def init_device(self) -> None:
-        # Populate the env vars that `libspyre_comms.so` reads at dlopen
-        # time. `setdefault` leaves torchrun-supplied values intact.
+        # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
+        # values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
         # so parallel_config.world_size is the global rank count and
         # LOCAL_WORLD_SIZE == WORLD_SIZE on a single node. Revisit once
@@ -109,10 +100,8 @@ class TorchSpyreWorker(Worker):
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
 
-        # Trigger torch_spyre's autoload manually now that the env vars
-        # are set. Autoload registers the `spyre` device and the
-        # `spyreccl` distributed backend, and imports
-        # `torch_spyre._C` (which loads `libspyre_comms.so`).
+        # A no-op when `import torch` already autoloaded the backend; needed when
+        # TORCH_DEVICE_BACKEND_AUTOLOAD=0 disabled that.
         import torch_spyre
 
         torch_spyre._autoload()

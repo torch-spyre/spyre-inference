@@ -543,11 +543,13 @@ def test_wrapper_stages_an_image_step_at_two_rows_and_keeps_the_mask_on_the_host
     assert mask.device.type == "cpu"
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 @pytest.mark.parametrize("num_tokens", [1, 2, 63, 64, 65, 128])
 def test_compiled_merge_through_the_wrapper_on_spyre(monkeypatch, num_tokens):
     """Text rows on the card, image rows placed on the host, merged by the compiled graph and
     staged through the wrapper's buffer: the rows match a host merge exactly."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     from spyre_inference.custom_ops.utils import convert
     from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 

@@ -271,9 +271,11 @@ def test_loaded_vision_weights_are_reshaped_in_place(tp_group):
     assert not any("spyre_patch_weight" in n or "spyre_merge_weight" in n for n in names)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_pipeline_matches_upstream_on_spyre(tp_group):
     """Same comparison with the encoder on the card, uncompiled (the eager path)."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     args = _args()
     images = _images()
 
@@ -285,10 +287,12 @@ def test_pipeline_matches_upstream_on_spyre(tp_group):
         assert _cosine(got, want) > 0.995
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 @pytest.mark.parametrize("token_budget", [32, 64])
 def test_compiled_pipeline_matches_upstream_on_spyre(tp_group, token_budget):
     """The three compiled graphs at one bucket, fed the way the manager feeds them."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     from spyre_inference.custom_ops.utils import convert
 
     args = _args()
@@ -327,9 +331,11 @@ def _padded_device_inputs(model, images, token_budget):
     return {k: convert(v, device="spyre") for k, v in bufs.items()}
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group):
     """The same padded device buffers through the uncompiled and the compiled pipeline."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     args = _args()
     images = _images()
     model = _spyre_model(args).to("spyre")
@@ -345,11 +351,13 @@ def test_compiled_graphs_match_eager_on_the_same_inputs_on_spyre(tp_group):
     torch.testing.assert_close(compiled.float(), eager.float(), atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.skipif(not spyre_available(), reason="Spyre device not available")
 def test_gather_table_gathers_exact_rows_on_spyre():
     """Rows gathered on the card, eager and inside a compiled graph, are exactly the table's
     rows. Compared with the table as the card holds it: uploading fp16 rounds to the card's
     16-bit format, so the host values are not the reference."""
+    if not spyre_available():
+        pytest.skip("Spyre device not available")
+
     from spyre_inference.custom_ops.utils import convert
     from spyre_inference.models._vision_encoder import GatherTable
 

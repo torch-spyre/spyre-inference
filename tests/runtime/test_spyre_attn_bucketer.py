@@ -710,9 +710,32 @@ class TestLargeBatchLadder:
     def test_per_seq_variants_keep_the_base_ladder(self, hybrid):
         assert {v.num_blocks for v in hybrid.variants()} == set(hybrid.num_blocks_buckets)
 
-    def test_explicit_buckets_disable_it(self, monkeypatch):
+    def test_explicit_buckets_disable_it_with_a_warning(self, monkeypatch, caplog):
         monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
         envs.clear_env_cache()
-        b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
+        with caplog.at_level("WARNING"):
+            b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
         assert b.batched_blocks_buckets(32) == b.num_blocks_buckets
+        assert any("SPYRE_ATTN_KV_BUCKETS is set" in r.getMessage() for r in caplog.records)
+
+    def test_a_threshold_above_every_batch_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+        envs.clear_env_cache()
+        with caplog.at_level("WARNING"):
+            b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=8))
+        assert b.batched_blocks_buckets(8) == b.num_blocks_buckets
+        assert any("never applies" in r.getMessage() for r in caplog.records)
+
+    def test_an_unknown_large_batch_name_names_its_own_variable(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4")
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"):
+            SpyreAttnBucketer(make_config(max_model_len=4096, max_num_seqs=32))
+
+    @pytest.mark.parametrize("raw", ["0", "-4", "many", "1.5"])
+    def test_an_invalid_threshold_is_rejected(self, monkeypatch, raw):
+        monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", raw)
+        envs.clear_env_cache()
+        with pytest.raises(ValueError, match="SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"):
+            SpyreAttnBucketer(make_config())

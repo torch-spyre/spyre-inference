@@ -167,14 +167,35 @@ _KV_LADDERS: dict[str, Callable[[int, int], list[int]]] = {
 }
 
 
-def kv_ladder(name: str) -> Callable[[int, int], list[int]]:
+def kv_ladder(name: str, var: str = "SPYRE_ATTN_KV_LADDER") -> Callable[[int, int], list[int]]:
     try:
         return _KV_LADDERS[name]
     except KeyError:
         raise ValueError(
-            f"SPYRE_ATTN_KV_LADDER={name!r} is not one of {sorted(_KV_LADDERS)}. "
+            f"{var}={name!r} is not one of {sorted(_KV_LADDERS)}. "
             "SPYRE_ATTN_KV_BUCKETS overrides the ladder entirely if none of these fit."
         ) from None
+
+
+def large_batch_min_seqs() -> int:
+    raw = envs.SPYRE_ATTN_LARGE_BATCH_MIN_SEQS
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise ValueError(f"SPYRE_ATTN_LARGE_BATCH_MIN_SEQS must be an integer >= 1, got {raw!r}")
+    return value
+
+
+def validate_kv_ladder_env() -> None:
+    # SPYRE_ATTN_KV_BUCKETS replaces both ladders, so neither name is read then.
+    large_batch_min_seqs()
+    if envs.SPYRE_ATTN_KV_BUCKETS:
+        return
+    kv_ladder(envs.SPYRE_ATTN_KV_LADDER)
+    if envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH:
+        kv_ladder(envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")
 
 
 def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
@@ -309,17 +330,38 @@ class SpyreAttnBucketer:
 
         # Batched decode only: below the threshold the chunking already pads to whole chunks,
         # so dense buckets there mostly compile duplicate kernels. Unioned, so none rounds up.
-        self._large_batch_min_seqs = envs.SPYRE_ATTN_LARGE_BATCH_MIN_SEQS
+        self._large_batch_min_seqs = large_batch_min_seqs()
         self._large_batch_blocks_buckets = self._num_blocks_buckets
         large = envs.SPYRE_ATTN_KV_LADDER_LARGE_BATCH
-        if large and not envs.SPYRE_ATTN_KV_BUCKETS:
-            dense = kv_ladder(large)(max_model_len, block_size)
+        if large and envs.SPYRE_ATTN_KV_BUCKETS:
+            logger.warning(
+                "SPYRE_ATTN_KV_LADDER_LARGE_BATCH=%s is ignored: SPYRE_ATTN_KV_BUCKETS is set.",
+                large,
+            )
+        elif large and self._large_batch_min_seqs > self._num_seqs_buckets[-1]:
+            logger.warning(
+                "SPYRE_ATTN_KV_LADDER_LARGE_BATCH=%s never applies: "
+                "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS=%d is above the largest num_seqs bucket %d.",
+                large,
+                self._large_batch_min_seqs,
+                self._num_seqs_buckets[-1],
+            )
+        elif large:
+            dense = kv_ladder(large, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH")(max_model_len, block_size)
             self._large_batch_blocks_buckets = sorted(
                 set(self._num_blocks_buckets)
                 | {
                     max(self._num_blocks_buckets[0], (kv + block_size - 1) // block_size)
                     for kv in dense
                 }
+            )
+            logger.info(
+                "SpyreAttnBucketer: batched decode at >= %d seqs uses %d num_blocks buckets "
+                "(%s) instead of %d.",
+                self._large_batch_min_seqs,
+                len(self._large_batch_blocks_buckets),
+                large,
+                len(self._num_blocks_buckets),
             )
 
         logger.info(

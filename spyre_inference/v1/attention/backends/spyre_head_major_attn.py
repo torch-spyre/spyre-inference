@@ -217,14 +217,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
-        A page's rows are ``page * num_kv_heads + kv``, which the kernel cannot compute
-        from the page id: int32 arithmetic has no device op mapping. The kernel gathers
+        A page's rows are ``page * num_kv_heads + kv``. The kernel gathers
         them out of this pool rather than reading a per-block table, which also settles the
         int32 offset question the unrolled walk had to work around: an int32 argument's
         nonzero storage offset is still read as 0 and an in-graph slice of a stacked table
         still gathers the wrong rows at that shape (torch-spyre#3770 is closed, but the fix
         in torch-spyre#4449 landed for float16 only; strict xfails pin both cases --
-        test_spyre_compile_input_honors_storage_offset's int32 parametrization and
+        test_spyre_head_major_store_with_stacked_row_index and
         test_spyre_in_graph_slice_of_stacked_kv_row_index). A gather is offset-free, so one
         pool serves every block.
 

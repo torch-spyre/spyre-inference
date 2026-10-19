@@ -301,7 +301,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
     reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
+    (int32 index upcast under aten.index) and test_spyre_head_major_store_with_stacked_row_index
     (torch-spyre#3770).
     """
     num_kv_heads = 2
@@ -621,29 +621,15 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float16,
-        pytest.param(
-            torch.int32,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
-                    "read from offset 0 when passed into a compiled region. Index tensors "
-                    "are int32, hence the per-sequence page_index_tables."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
     Every offset here is a whole number of sticks, so a pass does not speak for a
-    row-misaligned view.
+    row-misaligned view. For int32 this covers an elementwise read only: an int32 view
+    used as a scatter index still reads the wrong rows
+    (test_spyre_head_major_store_with_stacked_row_index).
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
@@ -884,7 +870,7 @@ def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     """One stacked [num_blocks, 1] int32 table, sliced in-graph, feeding index_select.
 
     An int32 argument's offset is dropped
-    (test_spyre_compile_input_honors_storage_offset[dtype1]); an in-graph slice of a
+    (test_spyre_head_major_store_with_stacked_row_index); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
     ``page_attn_head_major_prefill`` reads.
     """
@@ -936,6 +922,69 @@ def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
         for b in range(blocks)
     )
     torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#3770: an integer index view with storage_offset != 0 is read from "
+        "offset 0 when passed into a compiled region (int64 is IEEE_INT32 on device), so "
+        "every head past the first scatters into the wrong rows -- silently. Hence "
+        "SpyreHeadMajorAttentionImpl.kv_write_index returns one allocation per KV head."
+    ),
+)
+def test_spyre_head_major_store_with_stacked_row_index(spyre_device):
+    """The head-major KV store, fed rows of one stacked [KV, T] index tensor.
+
+    The shape that decides it is a long prefill: a row past one int32 stick.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+        SpyreHeadMajorAttentionImpl,
+    )
+    from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
+        reshape_and_cache_head_major_kernel,
+    )
+
+    torch.manual_seed(0)
+    num_tokens, num_kv_heads, block_size, head_size = 300, 8, 64, 128
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    slots = torch.arange(num_tokens)
+    block, offset = slots // block_size, slots % block_size
+    base = block * num_kv_heads * block_size + offset
+    rows = torch.stack([base + h * block_size for h in range(num_kv_heads)])
+
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float16,
+    )
+    k_pages, v_pages = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, spyre_device)
+    k_rows, v_rows = k_pages.view(-1, head_size), v_pages.view(-1, head_size)
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+
+    stacked = convert(rows, device=spyre_device)
+    row_index = [stacked[h] for h in range(num_kv_heads)]
+    assert row_index[1].storage_offset() == num_tokens
+
+    store = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
+    store(
+        convert(key, device=spyre_device),
+        convert(value, device=spyre_device),
+        k_rows,
+        v_rows,
+        row_index,
+    )
+
+    expected = torch.zeros(num_blocks * num_kv_heads * block_size, head_size, dtype=torch.float16)
+    for h in range(num_kv_heads):
+        expected[rows[h]] = key[:, h]
+    # The store's elementwise source pass rounds on device.
+    torch.testing.assert_close(k_rows.cpu(), expected, atol=1e-2, rtol=1e-2)
 
 
 # ---------------------------------------------------------------------------

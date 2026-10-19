@@ -85,6 +85,7 @@ from spyre_inference.custom_ops.mlp_pad import (
 )
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
@@ -123,6 +124,7 @@ from spyre_inference.v1.worker.encoder_grid import (
     encoder_pad_token_id,
     expand_body_to_grid,
 )
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
@@ -365,8 +367,8 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
     # vLLM's KV-cache attention implementation. Transformers may prefix the
     # implementation with ``paged|`` when it enables its paged-cache wrapper.
-    # TODO: Drop the decoder-only restriction when
-    # test_spyre_compiled_pixtral_vision_attention_coarse_tile XPASSes.
+    # Vision towers compile through ``SpyreVisionEncoderMixin`` instead, per encoder
+    # budget, not through ``_compile_blocks``.
     implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
     return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
         "|"
@@ -527,7 +529,9 @@ class _SpyreModelWrapper:
                 return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
-        kwargs = tree_map(_to_spyre_float, kwargs)
+        # These prepare their inputs on the host and upload once themselves.
+        if not isinstance(self._model, SpyreVisionEncoderMixin):
+            kwargs = tree_map(_to_spyre_float, kwargs)
         # The parts of a vision tower outside a compiled block run eager, so each Spyre
         # op with a decomposition there reaches it through torch-spyre's lazily-compiled
         # PrivateUse1 kernel, which compiles without fullgraph. Decompositions built on
@@ -576,16 +580,27 @@ class _SpyreModelWrapper:
         # boolean-mask ops are handled inside the model's own patch (e.g.
         # patch_embed_input_ids for Granite4Vision).
         num_tokens = input_ids.shape[0]
+        vision = isinstance(self._model, SpyreVisionEncoderMixin)
+        # An image step stages at least two rows: a one-row copy out of the merge's layout
+        # fails (torch-spyre#4883).
+        merges = vision and multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        target = max(num_tokens, 2) if merges else num_tokens
         bucketer = self._shape_bucketer
-        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if bucketer is not None:
+            padded_tokens = bucketer.find_bucket(target)
+        else:
+            padded_tokens = target if target != num_tokens else None
         if padded_tokens is not None and padded_tokens != num_tokens:
             input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
             if is_multimodal is not None:
                 is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        is_multimodal = self._to_spyre(is_multimodal)
-        multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
+        # These place their image tokens on the host (``SpyreVisionEncoderMixin.embed_input_ids``),
+        # where their encoder output already is, so neither goes to the card here.
+        if not vision:
+            is_multimodal = self._to_spyre(is_multimodal)
+            multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
 
         result = self._model.embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
@@ -1024,6 +1039,60 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+        self._record_vision_graphs()
+
+    @torch.inference_mode()
+    def _record_vision_graphs(self) -> None:
+        """Compile the vision encoder at every budget; serving then runs through the manager."""
+        model = self._compiled_vision_model()
+        if model is None:
+            return
+        with _set_spyre_compilation_settings(self.vllm_config):
+            model.compile_vision_graphs()
+            self._maybe_init_encoder_cudagraph_manager()
+            assert self.encoder_cudagraph_manager is not None
+            self.encoder_cudagraph_manager.capture(graph_pool=None)
+            self._warmup_vision_merge(model)
+
+    def _warmup_vision_merge(self, model: SpyreVisionEncoderMixin) -> None:
+        """Compile ``vision_merge`` at every token bucket an image step can land on."""
+        bucketer = self.spyre_shape_bucketer
+        if bucketer is None:
+            return
+        wrapper = cast(_SpyreModelWrapper, self.model)
+        image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
+        # Image steps stage at least two rows (see _SpyreModelWrapper.embed_input_ids), so a
+        # bucket below two is never reached.
+        for size in bucketer.bucket_sizes:
+            if size < 2:
+                continue
+            is_multimodal = torch.zeros(size, dtype=torch.bool)
+            is_multimodal[0] = True
+            wrapper.embed_input_ids(
+                torch.zeros(size, dtype=torch.int32), image_rows, is_multimodal=is_multimodal
+            )
+        logger.info("Vision merge compiled at every token bucket.")
+
+    def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
+        if not self.supports_mm_inputs or self.compilation_config.mode is CompilationMode.NONE:
+            return None
+        model = getattr(self.model, "_model", self.model)
+        return model if isinstance(model, SpyreVisionEncoderMixin) else None
+
+    def _create_encoder_cudagraph_manager(self) -> SpyreEncoderGraphManager | None:
+        # Not keyed on `cudagraph_mm_encoder`, which also gates GPU-only memory profiling.
+        model = self._compiled_vision_model()
+        if model is None:
+            return None
+        # The processor's largest item, as upstream computes it for the scheduler's encoder
+        # budget; a model whose encoder tokens differ overrides its budget range.
+        assert self.mm_budget is not None
+        model.max_tokens_per_item = max(
+            self.mm_budget.mm_max_toks_per_item[m] for m in model.vision_modalities
+        )
+        return SpyreEncoderGraphManager(
+            self.vllm_config, self._spyre_device, self._model_dtype(), model
+        )
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:

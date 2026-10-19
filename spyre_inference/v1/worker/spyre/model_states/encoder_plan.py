@@ -14,28 +14,39 @@
 
 """MRV2: the per-step encoder plan, moved off the runner onto the model state.
 
-V1 keeps this on TorchSpyreModelRunner (_encoder_grid, _forced_encoder_rect,
-...); MRV2 expects per-step state on the model state instead. Set by
-encoder_only.py, read by pooling and warmup through this module only.
+V1 keeps this on TorchSpyreModelRunner (_encoder_grid); MRV2 expects per-step
+state on the model state instead. Built by encoder_only.py, which publishes it as
+``SpyreEncoderOnlyModelState.encoder_plan`` for pooling to read. Warmup forces a
+plan through ``SpyreEncoderOnlyModelState.forced_plan()``, not here.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+    EncoderGroupPlan,
+    EncoderRectPlan,
+)
 
 
-@dataclass
+# eq=False: the generated __eq__/__hash__ would compare the plan's tensors and lists.
+@dataclass(frozen=True, eq=False)
 class EncoderPlan:
     """The current step's encoder dispatch: a dense rectangle or ragged rows."""
 
-    is_rectangular: bool
-    # (extent, width, query_lens) on the rectangular path; empty on the ragged one.
-    grid: tuple[int, int, list[int]] | None
-    # Row ranges actually holding real (non-padding) tokens.
-    rows: list[tuple[int, int]] = field(default_factory=list)
-    # Warmup-only forcing; see warmup.py.
-    forced_rect: tuple[int, int] | None = None
-    force_ragged: bool = False
+    attn_plan: EncoderRectPlan | list[EncoderGroupPlan]
 
+    @property
+    def is_rectangular(self) -> bool:
+        return isinstance(self.attn_plan, EncoderRectPlan)
 
-def record_dispatch(plan: EncoderPlan) -> None:
-    """Update the dispatch counters (rect/ragged steps, real tokens, rows, seqs)."""
-    raise NotImplementedError
+    @property
+    def grid(self) -> tuple[int, int, list[int]] | None:
+        """``(extent, width, query_lens)`` on the rectangular path; None on the ragged one.
+
+        Real rows are ``encoder_dense_row_indices(query_lens, extent)``, the layout V1
+        unpads with too; the ragged body is already packed.
+        """
+        plan = self.attn_plan
+        if not isinstance(plan, EncoderRectPlan):
+            return None
+        return plan.extent, plan.width, plan.query_lens

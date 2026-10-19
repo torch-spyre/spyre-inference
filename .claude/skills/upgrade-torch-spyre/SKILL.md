@@ -173,6 +173,20 @@ these in `pyproject.toml` in the same commit:
 5. `[tool.uv.sources]` ppc64le torch: `tag = "vX.Y.Z"`
 6. `[[tool.uv.dependency-metadata]]` for torch: the `version` (and `requires-dist`, from the
    new tag's metadata) of the ppc64le source build
+7. torchvision, moved to the release built for the new torch: the one whose PyPI
+   `requires_dist` has `torch==X.Y.Z` (`curl -s https://pypi.org/pypi/torchvision/<V>/json
+   | jq .info.requires_dist`). Update all of these to `V`:
+   - the `torchvision==V` pins in `[project.dependencies]` and `override-dependencies`
+   - `[tool.uv.sources]` Power/Z torchvision: `tag = "vV"`
+   - `[tool.uv.extra-build-variables.torchvision]`: `BUILD_VERSION = "V"`,
+     `PYTORCH_VERSION = "X.Y.Z"`
+   - `[tool.uv.extra-build-dependencies]`: `torchvision = ["torch==X.Y.Z"]`
+   - `[[tool.uv.dependency-metadata]]` for torchvision: `version` and its `requires-dist`,
+     copied from PyPI's `V`
+
+   The `torch==X.Y.Z` override replaces torchvision's own torch requirement, so uv
+   reports no conflict if this step is skipped. The lock ends up pairing the new torch
+   with a torchvision built for the old one.
 
 The vLLM pin must allow the new torch too. If it pins torch exactly and doesn't, the torch
 bump needs a vLLM bump first ([[upgrade-vllm]]); stop and say so rather than overriding it.

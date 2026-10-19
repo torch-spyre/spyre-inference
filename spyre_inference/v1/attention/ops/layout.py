@@ -18,7 +18,7 @@ import torch
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
-# SpyreAttentionMetadata.page_index_tables.
+# SpyreAttentionMetadata.page_index_tables_cpu.
 INT32_ELEMS_PER_STICK = 32
 
 

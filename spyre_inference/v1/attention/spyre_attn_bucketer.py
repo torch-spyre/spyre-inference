@@ -42,6 +42,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from spyre_inference import envs
+from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
 
 logger = init_logger(__name__)
 
@@ -49,11 +50,6 @@ logger = init_logger(__name__)
 # max_num_batched_tokens. Every non-decode batch pads its query length up to a
 # multiple of this.
 _DEFAULT_QUERY_BUCKET_STEP = 512
-
-# Batches below this fall back to the per-seq loop: the batched matmul's
-# padded-row overhead exceeds the per-seq cost at small N. So the num_seqs ladder
-# starts here -- smaller batches never dispatch to a batched variant.
-_MIN_BATCHED_SEQS = 4
 
 # Cores available to split a gather's entry axis across.
 _SPYRE_CORE_COUNT = 32
@@ -124,6 +120,23 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
+    """The smallest KV head count any layer carries, after the TP split.
+
+    ``get_num_kv_heads`` reports one model-wide number that a heterogeneous config can
+    hide a smaller layer behind: gemma-4 reports 4 at TP2, its full-attention layers 1.
+    """
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    arch = model_config.model_arch_config
+    model_wide = model_config.get_num_kv_heads(parallel_config)
+    overrides = arch.per_layer_overrides or ()
+    return min(
+        (model_config.get_num_kv_heads(parallel_config, arch[i]) for i in range(len(overrides))),
+        default=model_wide,
+    )
+
+
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -177,14 +190,16 @@ class SpyreAttnBucketer:
         # exceed max_model_len even when max_num_batched_tokens is larger (unlike
         # a decoder's chunked-prefill step). Without this cap, warmup could record
         # a query bucket with no matching num_blocks bucket, crashing with
-        # "num_blocks=N exceeds the largest recorded bucket".
+        # "num_blocks=N exceeds the largest recorded bucket". Stick-aligned via
+        # _align_up_pow2 to match the encoder shape ladder's padding (CLIP: 77 -> 128).
         if vllm_config.model_config.runner_type == "pooling":
-            max_batched = min(max_batched, max_model_len)
+            max_batched = min(max_batched, _align_up_pow2(max_model_len))
 
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of
-            # two, just coarser at the bottom. Reachable because the platform
-            # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
+            # two, just coarser at the bottom. The platform rejects such a block size
+            # (TorchSpyrePlatform._align_block_size), so only a config built without
+            # it gets here.
             logger.warning(
                 "block_size=%d is not a power of two; the smallest KV bucket is the next "
                 "power of two instead, making it larger than one block. Prefer a "
@@ -192,18 +207,14 @@ class SpyreAttnBucketer:
                 block_size,
             )
 
-        # Default: powers of two from _MIN_BATCHED_SEQS up to max_num_seqs, the
-        # batch sizes the batched decode kernel can be asked for.
+        # Default: powers of two up to max_num_seqs, the batch sizes the batched
+        # decode kernel can be asked for.
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._num_seqs_buckets: list[int] = (
-            _resolve_buckets(
-                envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
-                max_num_seqs,
-                "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
-            )
-            if max_num_seqs >= _MIN_BATCHED_SEQS
-            else []
+        self._num_seqs_buckets: list[int] = _resolve_buckets(
+            envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+            max_num_seqs,
+            "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+            lambda: list(_powers_of_two_up_to(max_num_seqs)),
         )
 
         # Default: [1] (the decode-only batch, exempt from query padding by
@@ -233,6 +244,12 @@ class SpyreAttnBucketer:
         self._num_blocks_buckets: list[int] = sorted(
             {(kv + block_size - 1) // block_size for kv in self._kv_buckets}
         )
+
+        # One KV head on one page leaves torch-spyre's codegen no spare dim for the stick
+        # dim, so the head-major decode kernel will not compile there. A second, fully
+        # masked page does, and it lifts the SWA bound _max_active_blocks derives from it.
+        if envs.SPYRE_ATTN_KV_LAYOUT == "head_major" and _min_num_kv_heads(vllm_config) == 1:
+            self._num_blocks_buckets = sorted({max(2, n) for n in self._num_blocks_buckets})
 
         logger.info(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "

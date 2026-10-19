@@ -26,7 +26,8 @@ import torch.nn.functional as F
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer
 
-from .lazy_compile import CompileOutermost, compile_when_outermost
+from .lazy_compile import CompileOutermost, maybe_compile
+from .utils import convert
 
 logger = init_logger(__name__)
 
@@ -81,10 +82,10 @@ def _input_layout(x: torch.Tensor):
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
     """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
 
-    Spyre needs static shapes, so the kernel recompiles per distinct (H, W). Past
-    ``torch._dynamo.config.cache_size_limit`` (default 8) dynamo falls back to
-    eager, which is unvalidated for pre-laid-out tensors — bucket or resize images
-    if a workload uses many resolutions.
+    Spyre needs static shapes, so the kernel recompiles per distinct (H, W). The
+    platform lifts dynamo's recompile limits, so there is no eager fallback, but every
+    new resolution costs a full compile mid-request — bucket or resize images if a
+    workload uses many resolutions.
     """
 
     # Per-(H, W) recompiles are this layer's contract, so the compile guard must not
@@ -95,7 +96,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         super().__init__(*args, **kwargs)
         self._w_dev: torch.Tensor | None = None
 
-    @compile_when_outermost
+    @maybe_compile
     def _conv_native(self, x: torch.Tensor, w: torch.Tensor, bias) -> torch.Tensor:
         return F.conv2d(
             x,
@@ -107,14 +108,12 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
             groups=self.groups,
         )
 
-    def _weight_on_device(self) -> torch.Tensor:
-        """Place the conv weight into its tiled layout once, then cache."""
-        if self._w_dev is None:
-            w_cpu = self.weight.detach().to("cpu")
-            self._w_dev = w_cpu.to(  # ty: ignore[no-matching-overload]
-                "spyre", device_layout=_weight_layout(w_cpu)
-            )
-        return self._w_dev
+    def process_weights_after_loading(self) -> None:
+        """Place the patch-conv weight into its tiled layout once after model load."""
+        if self._w_dev is not None or self.weight.device.type != "spyre":
+            return
+        w_cpu = convert(self.weight.detach(), device="cpu")
+        self._w_dev = convert(w_cpu, device="spyre", device_layout=_weight_layout(w_cpu))
 
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4
@@ -136,8 +135,7 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.
-        x_cpu = x.to("cpu")
-        x_dev = x_cpu.to(  # ty: ignore[no-matching-overload]
-            "spyre", device_layout=_input_layout(x_cpu)
-        )
-        return self._conv_native(x_dev, self._weight_on_device(), self.bias)
+        x_cpu = convert(x, device="cpu")
+        x_dev = convert(x_cpu, device="spyre", device_layout=_input_layout(x_cpu))
+        assert self._w_dev is not None, "Conv weights must be prepared after model loading."
+        return self._conv_native(x_dev, self._w_dev, self.bias)

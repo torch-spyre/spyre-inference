@@ -139,7 +139,6 @@ concurrency:
 
 permissions:
   contents: read
-  checks: write
   # Must cover every permission _test_matrix.yaml requests: a reusable workflow
   # cannot widen its caller's grant, and asking for more fails the run at startup.
   actions: read
@@ -168,16 +167,16 @@ jobs:
             echo "| Test type           | ${{ inputs.test_type || 'integration' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # push-to-clickhouse.yaml (workflow_run-triggered) can't read this run's own inputs, so
-      # it recovers run_id the same way it already recovers XML results: as a downloaded artifact.
-      - name: Record orchestrator run_id for ingest
+      # The workflow_run ingests can't read this run's inputs, so the threaded run_id travels as
+      # the same "run-id" artifact _test_matrix.yaml uploads (it gets no run_id here, so it doesn't).
+      - name: Record threaded run_id for ingest
         run: echo -n "${{ inputs.run_id || '' }}" > run-id.txt
-      - name: Upload orchestrator run_id
+      - name: Upload threaded run_id
         uses: actions/upload-artifact@v4
         with:
-          name: orchestrator-run-id
+          name: run-id
           path: run-id.txt
-          retention-days: 7
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Run the test matrix via the reusable workflow shared with

@@ -18,7 +18,7 @@ Body (1D, decoder): sorted ``compile_sizes`` token counts; pad the packed batch 
 the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
 
 Pooling has one body shape, ``R`` rows, where ``R`` is the token budget (see
-``encoder_budget``). Fixing it is what reduces the encoder attention kernels'
+``encoder_budget_rows``). Fixing it is what reduces the encoder attention kernels'
 cache keys to the sequence shapes alone: both the rectangular path's rectangle and the
 ragged path's fused gather/attend/store take the body buffer as an argument, so a
 varying buffer size would multiply every attention graph.
@@ -313,6 +313,11 @@ def encoder_dense_row_indices(query_lens: Sequence[int], len_bucket: int) -> tor
     return packed + torch.repeat_interleave(shifts, lens)
 
 
+def encoder_cls_rows(num_seqs: int, extent: int) -> list[int]:
+    """CLS row of each sequence in a rectangular grid: sequence ``i`` starts at ``i * extent``."""
+    return [seq_idx * extent for seq_idx in range(num_seqs)]
+
+
 def expand_packed_to_encoder_grid(
     input_ids: torch.Tensor,
     positions: torch.Tensor,
@@ -320,11 +325,14 @@ def expand_packed_to_encoder_grid(
     batch_bucket: int,
     len_bucket: int,
     pad_token_id: int = 0,
+    position_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pad each sequence to ``L`` and the batch to ``B``; return two ``[B*L]`` tensors.
 
     Real pad tokens continue positions from the true length. Batch-pad sequences are
-    ``pad_token_id`` with positions ``0 .. L-1``.
+    ``pad_token_id`` with positions ``0 .. L-1``. ``position_offset`` is RoBERTa's
+    ``padding_idx + 1``, added here while the values are still a Python list so the
+    embedding gather never round-trips them through the host.
     """
     if len(query_lens) > batch_bucket:
         raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
@@ -340,14 +348,16 @@ def expand_packed_to_encoder_grid(
     for seq_idx, length in enumerate(query_lens):
         dst = seq_idx * len_bucket
         padded_ids[dst : dst + length] = id_list[src : src + length]
-        padded_pos[dst : dst + length] = pos_list[src : src + length]
+        padded_pos[dst : dst + length] = [
+            int(pos) + position_offset for pos in pos_list[src : src + length]
+        ]
         for offset in range(length, len_bucket):
-            padded_pos[dst + offset] = offset
+            padded_pos[dst + offset] = offset + position_offset
         src += length
     for seq_idx in range(len(query_lens), batch_bucket):
         dst = seq_idx * len_bucket
         for offset in range(len_bucket):
-            padded_pos[dst + offset] = offset
+            padded_pos[dst + offset] = offset + position_offset
     return (
         torch.tensor(padded_ids, dtype=input_ids.dtype),
         torch.tensor(padded_pos, dtype=positions.dtype),
@@ -365,7 +375,7 @@ def expand_packed_token_types(
     One value per packed token, so it takes the same layout as ``input_ids``. Left packed
     it would pair each sequence's segment ids with another sequence's tokens, and
     silently: the buffer still matches ``input_ids`` in shape, so the all-zeros fallback
-    in ``spyre_token_type_embeddings`` never fires.
+    in ``spyre_token_type_ids_for`` never fires.
     """
     values = token_type_ids.tolist()
     grid = [0] * (batch_bucket * len_bucket)
@@ -375,6 +385,30 @@ def expand_packed_token_types(
         grid[dst : dst + length] = values[src : src + length]
         src += length
     return torch.tensor(grid, dtype=token_type_ids.dtype)
+
+
+def encoder_grid_source_rows(
+    query_lens: Sequence[int], batch_bucket: int, len_bucket: int
+) -> list[int]:
+    """Packed row each ``[B*L]`` grid row reads from; every pad row reads row 0.
+
+    The inverse of ``encoder_dense_row_indices``, as a gather index rather than a
+    scatter, so a multimodal pooling model (e.g. CLIP) whose preprocessing produces
+    embeddings can build its grid with one ``index_select`` on the device. Pad rows
+    carry a real token's embedding rather than zeros: they are masked out of attention
+    and never pooled, so only finiteness matters.
+    """
+    if len(query_lens) > batch_bucket:
+        raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
+    rows = [0] * (batch_bucket * len_bucket)
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        if length > len_bucket:
+            raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {list(query_lens)}")
+        dst = seq_idx * len_bucket
+        rows[dst : dst + length] = range(src, src + length)
+        src += length
+    return rows
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
@@ -406,6 +440,32 @@ class SpyreShapeBucketer:
             self._bucket_sizes[0] if self._bucket_sizes else 0,
             self._max_bucket_size,
         )
+
+    @classmethod
+    def for_config(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
+        """The runner's bucketer for 1D body token sizes, or None when it needs none.
+
+        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
+        the token budget.
+
+        Pooling keeps a bucketer in eager *and* compile so *runtime* always
+        1D-pads the body. Warmup still differs: compile dummies each 1D size
+        (attention compiles through ``force_attention``); eager does one
+        dummy then ``mark_warmed_up()``. Decoder skips a bucketer when eager
+        because 1D pad exists only to hit compiled graphs.
+        """
+        if vllm_config.model_config.runner_type == "pooling":
+            return cls.for_pooling(vllm_config)
+
+        if vllm_config.model_config.enforce_eager:
+            logger.info("Graph Recorder disabled (enforce_eager=True)")
+            return None
+
+        if not vllm_config.compilation_config.compile_sizes:
+            logger.info("Graph Recorder disabled (no compile_sizes configured)")
+            return None
+
+        return cls(vllm_config)
 
     @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
@@ -448,6 +508,13 @@ class SpyreShapeBucketer:
         if idx < len(self._bucket_sizes):
             return self._bucket_sizes[idx]
         return None
+
+    def warmed_bucket(self, num_tokens: int) -> int | None:
+        """The padded token count, or None before warmup or past the last bucket."""
+        if not self._is_warmed_up:
+            return None
+        desc = self.dispatch(num_tokens)
+        return None if desc is None else desc.padded_num_tokens
 
     def dispatch(self, num_tokens: int) -> SpyreBucketDescriptor | None:
         """Compute padded batch descriptor for the given token count.

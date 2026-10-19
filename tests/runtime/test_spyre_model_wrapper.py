@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Device-free tests for RoBERTa position offset and model-wrapper I/O."""
+"""Device-free tests for model-wrapper I/O."""
 
 from __future__ import annotations
 
@@ -28,44 +28,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from spyre_inference.models.roberta import offset_roberta_position_ids
 from spyre_inference.v1.worker import spyre_model_runner as mr
-
-
-def test_offset_roberta_position_ids_runs_on_cpu(monkeypatch):
-    seen_devices: list[object] = []
-
-    def fake_convert(t, device=None, dtype=None):
-        seen_devices.append(device)
-        out = t
-        if dtype is not None:
-            out = out.to(dtype)
-        if device is not None:
-            # Stay on CPU in this unit test; only record the requested device.
-            pass
-        return out
-
-    monkeypatch.setattr("spyre_inference.models.roberta.convert", fake_convert)
-
-    pos = torch.tensor([0, 1, 2], dtype=torch.int64)
-    out = offset_roberta_position_ids(pos, 1)
-    # Round trips through the host, and lands back on the input's own device.
-    assert seen_devices[0] == "cpu"
-    assert seen_devices[1] == pos.device
-    assert out.dtype == torch.int64
-    torch.testing.assert_close(out, torch.tensor([2, 3, 4], dtype=torch.int64))
-
-
-def test_offset_roberta_position_ids_is_an_opaque_op():
-    """Whole-model compile needs the host round trip hidden behind one node: inlined,
-    the CPU intermediate makes Inductor emit spyre::to_dtype_cpu, which has no CPU
-    registration."""
-    assert hasattr(torch.ops.spyre_inference, "roberta_offset_positions")
-    pos = torch.tensor([0, 1, 2], dtype=torch.int64)
-    torch.testing.assert_close(
-        torch.ops.spyre_inference.roberta_offset_positions(pos, 1),
-        torch.tensor([2, 3, 4], dtype=torch.int64),
-    )
 
 
 def test_wrapper_converts_ints_to_int64(monkeypatch):
@@ -75,7 +38,7 @@ def test_wrapper_converts_ints_to_int64(monkeypatch):
         seen.append(dtype)
         return t if dtype is None else t.to(dtype)
 
-    monkeypatch.setattr(mr, "convert", fake_convert)
+    monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", fake_convert)
 
     class _Capture(nn.Module):
         def forward(self, input_ids=None, positions=None, **kwargs):
@@ -110,7 +73,14 @@ def test_kv_sharing_attention_lookup_preserves_physical_specs(monkeypatch):
     group = KVCacheGroupSpec(layer_names=[owner, sharing], kv_cache_spec=uniform_spec)
     config = KVCacheConfig(
         num_blocks=2,
-        kv_cache_tensors=[KVCacheTensor(size=2 * layer_spec.page_size_bytes, shared_by=[owner])],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * layer_spec.page_size_bytes,
+                layers=[owner],
+                layer_stride=2 * layer_spec.page_size_bytes,
+                block_stride=layer_spec.page_size_bytes,
+            )
+        ],
         kv_cache_groups=[group],
     )
     runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
@@ -136,7 +106,7 @@ def test_kv_sharing_attention_lookup_preserves_physical_specs(monkeypatch):
     assert config.kv_cache_groups[0] is group
     assert uniform_spec.kv_cache_specs == {owner: layer_spec}
     assert uniform_spec.page_size_bytes == original_page_size
-    assert config.kv_cache_tensors[0].shared_by == [owner]
+    assert config.kv_cache_tensors[0].layers == [owner]
 
 
 def test_no_kv_sharing_passes_the_config_through_untouched(monkeypatch):
@@ -152,7 +122,14 @@ def test_no_kv_sharing_passes_the_config_through_untouched(monkeypatch):
     assert uniform_spec is not None
     config = KVCacheConfig(
         num_blocks=2,
-        kv_cache_tensors=[KVCacheTensor(size=2 * layer_spec.page_size_bytes, shared_by=[owner])],
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=2 * layer_spec.page_size_bytes,
+                layers=[owner],
+                layer_stride=2 * layer_spec.page_size_bytes,
+                block_stride=layer_spec.page_size_bytes,
+            )
+        ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=[owner], kv_cache_spec=uniform_spec)],
     )
     runner = mr.TorchSpyreModelRunner.__new__(mr.TorchSpyreModelRunner)
@@ -171,6 +148,49 @@ def test_no_kv_sharing_passes_the_config_through_untouched(monkeypatch):
     runner.initialize_attn_backend(config)
 
     assert seen[0] is config, "no KV sharing should hand super() the caller's own config"
+
+
+def test_wrapper_recursively_converts_integer_inputs(monkeypatch):
+    """Nested tensor inputs share the same boundary conversion as direct inputs."""
+    seen: list[torch.dtype | None] = []
+
+    def fake_convert(t, device=None, dtype=None):
+        seen.append(dtype)
+        return t if dtype is None else t.to(dtype)
+
+    monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", fake_convert)
+
+    class _Capture(nn.Module):
+        def forward(self, nested):
+            return nested
+
+    wrapper = mr._SpyreModelWrapper(
+        _Capture(), torch.device("cpu"), keep_outputs_on_device=True, model_dtype=torch.float16
+    )
+    out = wrapper(nested={"positions": [torch.tensor([1], dtype=torch.int32)]})
+
+    assert seen == [torch.int64]
+    assert out["positions"][0].dtype == torch.int64
+
+
+def test_wrapper_recursively_converts_outputs_to_cpu(monkeypatch):
+    """The same tree conversion serves model outputs and multimodal inputs."""
+    seen: list[object] = []
+
+    def fake_convert(t, device=None, dtype=None):
+        seen.append(device)
+        return t
+
+    monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", fake_convert)
+
+    class _Capture(nn.Module):
+        def forward(self, input_ids):
+            return {"nested": [input_ids]}
+
+    wrapper = mr._SpyreModelWrapper(_Capture(), torch.device("spyre"), model_dtype=torch.float16)
+    wrapper(input_ids=torch.tensor([1], dtype=torch.int64))
+
+    assert seen == [torch.device("spyre"), "cpu"]
 
 
 def test_wrapper_casts_multimodal_floats_to_the_model_dtype(monkeypatch):
@@ -210,6 +230,116 @@ def test_wrapper_drops_all_false_multimodal_mask(monkeypatch):
     )
 
     assert result is None
+
+
+class _FixedBucketer:
+    """Minimal `SpyreShapeBucketer` stand-in: every size pads to one fixed bucket."""
+
+    def __init__(self, bucket: int) -> None:
+        self._bucket = bucket
+
+    def find_bucket(self, num_tokens: int) -> int:
+        return self._bucket
+
+
+class _Embedder(nn.Module):
+    """Returns a distinct value per row so staged/trimmed rows are checkable."""
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.hidden = hidden
+        self.seen_shapes: list[int] = []
+
+    def embed_input_ids(self, input_ids, multimodal_embeddings=None, *, is_multimodal=None):
+        self.seen_shapes.append(input_ids.shape[0])
+        n = input_ids.shape[0]
+        return torch.arange(n * self.hidden, dtype=torch.float32).reshape(n, self.hidden)
+
+
+def test_embed_input_ids_stages_the_padded_result_into_the_buffer():
+    """The result lands in `inputs_embeds_buffer` at the bucket shape, and the
+    returned tensor is that buffer's own prefix view -- so upstream's later
+    `inputs_embeds.gpu[:n].copy_(...)` is a self-copy, not a `copy_from_d2d`
+    recompiled for every distinct token count."""
+    hidden, bucket, num_tokens = 4, 8, 3
+    model = _Embedder(hidden)
+    buf = torch.zeros(bucket, hidden, dtype=torch.float32)
+    wrapper = mr._SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+        shape_bucketer=_FixedBucketer(bucket),
+        inputs_embeds_buffer=buf,
+    )
+
+    out = wrapper.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+
+    assert model.seen_shapes == [bucket], "the model must embed the padded (bucket) shape"
+    assert out.shape == (num_tokens, hidden)
+    assert out.data_ptr() == buf.data_ptr(), "must return a view into the buffer, not a copy"
+
+    # Prove it's a live view, not an incidentally-equal copy.
+    buf[0, 0] = 999.0
+    assert out[0, 0] == 999.0
+
+
+def test_embed_input_ids_stages_even_when_the_count_already_matches_a_bucket():
+    """No padding is needed, but the buffer path must still engage: staging is keyed
+    on there being a bucketer and a usable buffer, not on padding having occurred."""
+    hidden, bucket = 4, 8
+    model = _Embedder(hidden)
+    buf = torch.zeros(bucket, hidden, dtype=torch.float32)
+    wrapper = mr._SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+        shape_bucketer=_FixedBucketer(bucket),
+        inputs_embeds_buffer=buf,
+    )
+
+    out = wrapper.embed_input_ids(torch.zeros(bucket, dtype=torch.int32))
+
+    assert out.shape == (bucket, hidden)
+    assert out.data_ptr() == buf.data_ptr()
+
+
+def test_embed_input_ids_falls_back_to_trimming_on_a_dtype_mismatch():
+    """A buffer that can't hold the result as-is (dtype here) must be left alone;
+    the result is trimmed to a fresh tensor instead of force-fit into it."""
+    hidden, bucket, num_tokens = 4, 8, 3
+    model = _Embedder(hidden)
+    buf = torch.zeros(bucket, hidden, dtype=torch.float16)  # result comes back float32
+    wrapper = mr._SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+        shape_bucketer=_FixedBucketer(bucket),
+        inputs_embeds_buffer=buf,
+    )
+
+    out = wrapper.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+
+    assert out.shape == (num_tokens, hidden)
+    assert out.dtype == torch.float32
+    assert torch.count_nonzero(buf) == 0, "a mismatched buffer must be left untouched"
+
+
+def test_embed_input_ids_trims_padding_when_there_is_no_buffer():
+    """No buffer at all (e.g. construction didn't pass one): the pre-fix prefix-slice
+    behavior must still work."""
+    hidden, bucket, num_tokens = 4, 8, 3
+    model = _Embedder(hidden)
+    wrapper = mr._SpyreModelWrapper(
+        model,
+        torch.device("cpu"),
+        model_dtype=torch.float16,
+        shape_bucketer=_FixedBucketer(bucket),
+    )
+
+    out = wrapper.embed_input_ids(torch.zeros(num_tokens, dtype=torch.int32))
+
+    assert model.seen_shapes == [bucket]
+    assert out.shape == (num_tokens, hidden)
 
 
 def test_setattr_keeps_the_wrappers_own_state_off_the_model():

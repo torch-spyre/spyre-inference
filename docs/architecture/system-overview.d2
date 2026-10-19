@@ -134,7 +134,7 @@ worker: "n == TP size worker procs" {
     style.stroke: "#263238"
     style.font-color: "#ffffff"
   }
-  SpyreAttnBackend: SpyreAttentionBackend {
+  SpyreAttnBackend: "SpyreAttentionBackend\n(+ SpyreHeadMajorAttentionBackend,\nthe default KV layout)" {
     style.fill: "#1565c0"
     style.stroke: "#0d47a1"
     style.font-color: "#ffffff"

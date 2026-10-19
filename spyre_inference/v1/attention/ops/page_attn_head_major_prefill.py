@@ -38,7 +38,6 @@ def page_attn_head_major_prefill_kernel(
     num_heads,
     num_kv_heads,
     head_size,
-    block_size,
     logits_soft_cap=0.0,
     out=None,
 ):

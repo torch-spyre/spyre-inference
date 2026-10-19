@@ -393,11 +393,10 @@ class SpyreFp8LinearKernel(FP8ScaledMMLinearKernel):
 SpyreFp8DequantLinearKernel = SpyreFp8LinearKernel
 
 
-def register_spyre_fp8_linear_kernel() -> bool:
+def register_spyre_fp8_linear_kernel() -> None:
     global _REGISTERED
     if _REGISTERED:
-        return True
+        return
     register_linear_kernel(SpyreFp8LinearKernel, PlatformEnum.OOT, kernel_type="fp8")
     _REGISTERED = True
     logger.info("Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)")
-    return True

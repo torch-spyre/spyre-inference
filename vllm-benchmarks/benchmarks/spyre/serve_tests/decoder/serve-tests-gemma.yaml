@@ -1,0 +1,82 @@
+# Serve benchmarks for Gemma models on Spyre devices.
+#
+# Text entries use SPYRE_AIOPS_DATASET (4k).
+# Vision entries use SPYRE_VISION_DATASET (32k, openai-chat backend).
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 32
+    enable-prefix-caching: true
+    enable-chunked-prefill: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 200
+    custom-output-len: -1
+    ignore-eos: true
+    temperature: 0.1
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 5
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Gemma 4 26B A4B — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_gemma4-26b-a4b_tp4_aiops
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+
+  # ---------------------------------------------------------------------------
+  # Gemma 4 26B A4B — vision
+  # ---------------------------------------------------------------------------
+  - test_name: serve_gemma4-26b-a4b_tp4_vision
+    server_parameters:
+      model: google/gemma-4-26B-A4B
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_VISION_DATASET}
+      dataset-name: custom_image
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4
+
+  # ---------------------------------------------------------------------------
+  # Gemma 4 26B A4B-it (instruction-tuned) — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_gemma4-26b-a4b-it_tp4_aiops
+    server_parameters:
+      model: google/gemma-4-26B-A4B-it
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}
+
+  # ---------------------------------------------------------------------------
+  # Gemma 4 26B A4B-it (instruction-tuned) — vision
+  # ---------------------------------------------------------------------------
+  - test_name: serve_gemma4-26b-a4b-it_tp4_vision
+    server_parameters:
+      model: google/gemma-4-26B-A4B-it
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_VISION_DATASET}
+      dataset-name: custom_image
+      backend: openai-chat
+      endpoint: /v1/chat/completions
+      num-prompts: 166
+      output-len: 256
+      max-concurrency: 4

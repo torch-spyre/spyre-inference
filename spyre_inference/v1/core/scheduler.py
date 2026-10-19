@@ -23,7 +23,7 @@ from spyre_inference import envs
 class TorchSpyreScheduler(Scheduler):
     """V1 scheduler that caps how many sequences may prefill in one batch.
 
-    Attention runs one kernel per sequence, padding each to its own query bucket, so
+    Prefill attention runs one kernel per sequence, padding each to its own query bucket, so
     the short leftover chunk upstream uses to top up a batch costs a full-width
     prefill however few tokens it carries.
     """
@@ -49,12 +49,15 @@ class TorchSpyreScheduler(Scheduler):
         # The waiting loop re-reads this every iteration and appends one request per
         # admission, so a lowered cap stops it after `free_slots` of them while still
         # letting it skip candidates. Steps that preempt skip the loop entirely.
-        max_num_running_reqs = self.max_num_running_reqs
-        self.max_num_running_reqs = min(
-            max_num_running_reqs,
+        # Lower the admission cap, not max_num_running_reqs: since 0.31 the loop gates
+        # on max_num_active_reqs, and max_num_running_reqs is the runner slot count
+        # that `assert len(self.running) <= ...` checks after the loop.
+        max_num_active_reqs = self.max_num_active_reqs
+        self.max_num_active_reqs = min(
+            max_num_active_reqs,
             len(self.running) + self.num_waiting_for_streaming_input + free_slots,
         )
         try:
             return super().schedule(*args, **kwargs)
         finally:
-            self.max_num_running_reqs = max_num_running_reqs
+            self.max_num_active_reqs = max_num_active_reqs

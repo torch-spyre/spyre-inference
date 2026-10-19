@@ -137,7 +137,7 @@ def _in_graph_qfp8wt_mm_static(
 @pytest.mark.fp8
 class TestSpyreFp8LinearKernel:
     def test_register(self):
-        assert register_spyre_fp8_linear_kernel()
+        register_spyre_fp8_linear_kernel()
         assert SpyreFp8LinearKernel is not None
 
     def test_kernel_selected_for_oot(self):

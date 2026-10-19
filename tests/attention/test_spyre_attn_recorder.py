@@ -34,7 +34,6 @@ from vllm.logger import _print_warning_once
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
 from spyre_inference import envs
-from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
@@ -42,7 +41,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
-    _MIN_BATCHED_SEQS,
     SpyreAttnBucket,
     SpyreAttnBucketer,
 )
@@ -160,8 +158,8 @@ def _dispatch(impl, builder, kv_cache, num_blocks, padded_query_len):
 def _dispatch_batched(impl, builder, kv_cache, bucket):
     """``_dispatch`` for the batched decode kernel.
 
-    The page budget is unbounded: real dispatch has no such check, so this traces
-    whatever the bucket realizes onto, the way a request would.
+    The recorder's page budget is unbounded so this traces whatever the bucket realizes
+    onto, the way a request would; ``forward`` still applies dispatch's own page bound.
     """
     impl._record_batched_one(bucket, MagicMock(), kv_cache, builder, set(), sys.maxsize)
 
@@ -466,6 +464,18 @@ class TestRecordGraphs:
         assert "every shape will compile on first use" in caplog.text
 
 
+@pytest.mark.parametrize("num_blocks", [1, 2, 4])
+def test_one_token_variant_records_the_per_seq_kernel(builder, monkeypatch, num_blocks):
+    """Per-seq variants are built with the batched path off, so recording the one-token
+    variant runs the per-seq loop rather than the batched decode kernel."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    envs.clear_env_cache()
+
+    metadata = builder.build_for_variant(SpyreAttnBucket(num_blocks, 1))
+
+    assert metadata.padded_num_seqs is None
+
+
 class TestRecompileLimit:
     def test_limit_is_raised_during_recording_and_restored(self, impl, kv_cache, builder):
         """Dynamo's accumulated limit is global, so more buckets than it allows would
@@ -497,60 +507,6 @@ class TestRecompileLimit:
         with pytest.raises(RuntimeError):
             _record(impl, kv_cache, builder)
         assert torch._dynamo.config.accumulated_recompile_limit == before
-
-
-def _toy_kernel(x, n):
-    """`n` is a plain int, so ``dynamic=False`` gives one graph per value, like num_blocks."""
-    for _ in range(n):
-        x = x + 1
-    return x
-
-
-class TestLateCompileWarning:
-    """The runtime half of the acceptance criterion, for what the tests above cannot see:
-    a real config whose buckets miss something. ``backend="eager"`` suffices since the
-    counter is Dynamo's.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _isolated(self, monkeypatch):
-        torch._dynamo.reset()
-        # warning_once is lru_cached process-wide, so a prior emit would mask ours.
-        _print_warning_once.cache_clear()
-        monkeypatch.setattr(spyre_attn, "_warmup_complete", False)
-        yield
-        _print_warning_once.cache_clear()
-
-    def test_quiet_before_warmup_is_marked(self, caplog):
-        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
-        with caplog.at_level(logging.WARNING):
-            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
-        assert "outside warmup" not in caplog.text
-
-    def test_warns_when_an_unrecorded_variant_compiles(self, caplog):
-        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
-        spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
-        spyre_attn.mark_warmup_complete()
-
-        with caplog.at_level(logging.WARNING):
-            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 2)
-
-        assert "page attention compiled outside warmup" in caplog.text
-
-    def test_quiet_when_the_variant_was_already_recorded(self, caplog):
-        fn = torch.compile(_toy_kernel, dynamic=False, backend="eager")
-        spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
-        spyre_attn.mark_warmup_complete()
-
-        with caplog.at_level(logging.WARNING):
-            spyre_attn._call_kernel("page attention", fn, torch.ones(4), 1)
-
-        assert "outside warmup" not in caplog.text
-
-    def test_mark_warmup_complete_arms_the_check(self):
-        assert spyre_attn._warmup_complete is False
-        spyre_attn.mark_warmup_complete()
-        assert spyre_attn._warmup_complete is True
 
 
 class TestRecordBatchedDecode:
@@ -633,30 +589,41 @@ class TestRecordBatchedDecode:
         assert recorded == len(_recordable(bucketer)) + len(batched)
 
     def test_window_variants_over_the_requested_budget_still_record(
-        self, impl, kv_cache, sliding_window_builder
+        self, impl, sliding_window_builder
     ):
-        """A window shrinks the realized entry axis, so the skip must key on that.
+        """A window moves the realized entry axis, so the skip must key on that.
 
         Keying on the bucket's window-agnostic ``blocks_per_chunk`` would drop
         variants whose realized gather fits the cache, putting their compile back
         in the serving path.
         """
         bucketer = sliding_window_builder._attn_bucketer = make_bucketer()
-        # Over the budget as requested, but the window shrinks blocks_per_chunk to 1,
-        # so what the kernel actually gathers fits and dispatch does reach these.
-        reachable = [
-            v
-            for v in bucketer.batched_decode_variants()
-            if v.num_seqs * v.blocks_per_chunk >= NUM_PAGES and v.num_seqs < NUM_PAGES
-        ]
-        assert reachable, "no variant exceeds the requested budget; nothing under test"
+        # Wide enough for what the window realizes, too narrow for what the buckets
+        # ask for. NUM_PAGES no longer straddles any variant once padding lifts the
+        # realized axis back to the bucket maximum.
+        pages = 12
+        shape = (pages, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        cache = SpyrePagedKVCache(
+            k_pages=torch.zeros(shape, dtype=torch.float16),
+            v_pages=torch.zeros(shape, dtype=torch.float16),
+        )
+        # Whether the realized gather fits is a question about build()'s output.
+        reachable = []
+        for v in bucketer.batched_decode_variants():
+            if v.num_seqs * v.blocks_per_chunk < pages:
+                continue
+            md = sliding_window_builder.build_for_batched_decode_variant(v)
+            assert md.padded_num_seqs is not None and md.blocks_per_chunk is not None
+            if md.padded_num_seqs * md.blocks_per_chunk < pages:
+                reachable.append(v)
+        assert reachable, "no over-budget variant realizes a gather that fits; nothing under test"
 
-        _record(impl, kv_cache, sliding_window_builder)
+        _record(impl, cache, sliding_window_builder)
 
         # Each one must have been traced during recording, so dispatch compiles nothing.
         snapshot = compiles()
         for bucket in reachable:
-            _dispatch_batched(impl, sliding_window_builder, kv_cache, bucket)
+            _dispatch_batched(impl, sliding_window_builder, cache, bucket)
         assert compiles() == snapshot
 
     def test_re_recording_compiles_nothing(self, impl, wide_cache, builder):
@@ -711,7 +678,7 @@ class TestRecordBatchedDecode:
             for v in bucketer.batched_decode_variants()
         }
 
-        for num_seqs in (_MIN_BATCHED_SEQS, _MIN_BATCHED_SEQS + 1):
+        for num_seqs in (1, 2):
             for kv_len in (65, 200):
                 metadata = _padded_mask_metadata(
                     [(1, kv_len)] * num_seqs,

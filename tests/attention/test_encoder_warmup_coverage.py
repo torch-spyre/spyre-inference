@@ -100,6 +100,7 @@ def _fake_metadata(query_lens):
             "num_actual_tokens": starts[-1],
             "num_seqs": len(query_lens),
             "encoder_plan": None,
+            "apply_causal_mask": False,
         },
     )()
 

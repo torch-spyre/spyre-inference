@@ -26,7 +26,7 @@ from vllm.model_executor.models.gemma4 import (
     Gemma4SelfDecoderLayers,
 )
 
-from spyre_inference.custom_ops.lazy_compile import CompileOutermost, compile_when_outermost
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
 from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
@@ -38,16 +38,6 @@ if TYPE_CHECKING:
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
-
-# Scalar buffers that ``Gemma4Model`` owns and ``Gemma4SelfDecoderLayers``
-# re-exposes as plain attributes.
-_ALIASED_SCALARS = (
-    "normalizer",
-    "embed_scale_per_layer",
-    "per_layer_input_scale",
-    "per_layer_projection_scale",
-)
-
 
 # Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
 # mapped to the per-layer attribute of the same role it is rebuilt from.
@@ -160,17 +150,6 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
-def register_aliased_scalars(decoder: nn.Module) -> None:
-    """Turn the self-decoder's aliased scalar attributes into buffers."""
-    buffers = dict(decoder.named_buffers(recurse=False))
-    for name in _ALIASED_SCALARS:
-        scalar = getattr(decoder, name, None)
-        if scalar is None or name in buffers:
-            continue
-        delattr(decoder, name)
-        decoder.register_buffer(name, scalar, persistent=False)
-
-
 def reject_masked_per_layer_vocab(decoder: SpyreGemma4SelfDecoderLayers) -> None:
     """Reject PLE vocab masking, which torch-spyre cannot lower for integer inputs."""
     if decoder.embed_tokens_per_layer is None:
@@ -188,25 +167,28 @@ def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) ->
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
 
 
-def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
-    """Register Gemma-4's full-softmax, scaled GELU expert recipe."""
+def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe; returns the count."""
 
     configured = 0
     for decoder in layers:
-        moe = getattr(decoder, "moe", None)
-        if moe is None:
+        experts = getattr(decoder, "experts", None)
+        if experts is None:
             continue
         configure_spyre_moe_layer(
-            moe.experts.routed_experts,
+            experts.routed_experts,
             SpyreMoERecipe(
                 activation="gelu_tanh",
                 routing="full_softmax",
-                prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
+                prepare_down_weight=partial(
+                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                ),
             ),
         )
         configured += 1
     if configured:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
+    return configured
 
 
 class _PerLayerRows(torch.Tensor):
@@ -229,7 +211,7 @@ class _PerLayerRows(torch.Tensor):
 
 
 class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
-    @compile_when_outermost
+    @maybe_compile
     def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
         return tuple(
             ple[:, layer_idx, :].clone() for layer_idx in range(self.config.num_hidden_layers)
@@ -265,6 +247,14 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
         reject_masked_per_layer_vocab(decoder)
-        decoder.init_spyre_compile()
-        register_aliased_scalars(decoder)
-        configure_gemma4_moe_layers(self.model.layers)
+        decoder.arm_outer_compile()
+        # Without the recipe the experts run upstream's path, which is wrong on Spyre.
+        # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
+        is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(
+            self.config, "use_second_mlp_block", False
+        )
+        if not configure_gemma4_moe_layers(self.model.layers) and is_moe_checkpoint:
+            raise RuntimeError(
+                "gemma-4 MoE checkpoint, but no decoder layer exposes `experts`: vLLM has "
+                "moved them; update configure_gemma4_moe_layers."
+            )

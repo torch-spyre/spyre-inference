@@ -41,7 +41,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    _call_kernel,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
@@ -157,7 +156,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self._decode_fn = _batched_decode_compiled
         if self.alibi_slopes is not None:
             raise NotImplementedError(
-                "ALiBi is not supported on the head-major KV layout; use the default "
+                "ALiBi is not supported on the head-major KV layout; use the "
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
@@ -289,9 +288,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
-            return _call_kernel(
-                "batched decode attention",
-                self._decode_fn,
+            return self._decode_fn(
                 query_dev,
                 rep_row_ids,
                 k_pages,
@@ -337,9 +334,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
             with _capped_cores(self.num_kv_heads * padded_query_len):
-                return _call_kernel(
-                    "page attention (prefill)",
-                    _page_attn_prefill_compiled,
+                return _page_attn_prefill_compiled(
                     query,
                     row_table,
                     k_pages,
@@ -352,7 +347,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.num_heads,
                     self.num_kv_heads,
                     self.head_size,
-                    self.block_size,
                     self.logits_soft_cap,
                     out,
                 )
@@ -362,9 +356,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.
         with _capped_cores(self.num_kv_heads * padded_query_len):
-            return _call_kernel(
-                "page attention",
-                self._decode_attn_fn,
+            return self._decode_attn_fn(
                 query,
                 row_table,
                 k_folded,

@@ -18,7 +18,7 @@ No Spyre hardware: `apply()` is exercised against a minimal stand-in with real
 `nn.LayerNorm` instances (mirroring `CLIPEmbeddingModel`'s `text_model`/
 `vision_model` shape), on `device="cpu"` -- SpyreLayerNorm's CPU path is a
 plain `nn.LayerNorm`, so this checks the swap and weight-copy without needing
-a device.
+a device. It also checks which encoder layers get marked for per-block compile.
 """
 
 from __future__ import annotations
@@ -30,8 +30,10 @@ import pytest
 import torch
 
 from spyre_inference.custom_ops.layer_norm import SpyreLayerNorm
+from spyre_inference.custom_ops.vit_attn import SpyreMMEncoderAttention
 from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.multimodal.clip import apply as apply_clip_patches
+from spyre_inference.multimodal.utils import blocks_marked_compilable
 
 
 def _fake_clip_model(hidden_size: int = 64, with_post_norm: bool = True):
@@ -149,6 +151,47 @@ def test_apply_multimodal_patches_skips_a_non_clip_model_with_the_same_shape():
     apply_multimodal_patches(model, torch.device("cpu"))
 
     assert not isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
+
+
+def _encoder_layers(attn_cls: type[torch.nn.Module], num_layers: int = 2):
+    """`CLIPEncoderLayer`-shaped stand-ins: only `self_attn.attn` is read."""
+
+    def layer():
+        attn = object.__new__(attn_cls)
+        torch.nn.Module.__init__(attn)
+        self_attn = torch.nn.Module()
+        self_attn.attn = attn
+        block = torch.nn.Module()
+        block.self_attn = self_attn
+        return block
+
+    return torch.nn.ModuleList([layer() for _ in range(num_layers)])
+
+
+def test_apply_marks_only_the_vision_encoder_layers():
+    """The text tower is a decoder-style block list the runner already compiles; only
+    the vision tower needs the opt-in."""
+    model = _fake_clip_model()
+    model.text_model.encoder = types.SimpleNamespace(layers=_encoder_layers(torch.nn.Module))
+    model.vision_model.encoder = types.SimpleNamespace(
+        layers=_encoder_layers(SpyreMMEncoderAttention)
+    )
+
+    apply_clip_patches(model, torch.device("cpu"))
+
+    assert blocks_marked_compilable(model.vision_model.encoder.layers)
+    assert not any(blocks_marked_compilable([b]) for b in model.text_model.encoder.layers)
+
+
+def test_apply_leaves_a_tower_without_the_oot_attention_eager():
+    """Without Spyre's MMEncoderAttention the block would trace upstream's opaque SDPA
+    wrapper, which pads nothing, so the tower must not be marked."""
+    model = _fake_clip_model()
+    model.vision_model.encoder = types.SimpleNamespace(layers=_encoder_layers(torch.nn.Module))
+
+    apply_clip_patches(model, torch.device("cpu"))
+
+    assert not any(blocks_marked_compilable([b]) for b in model.vision_model.encoder.layers)
 
 
 if __name__ == "__main__":

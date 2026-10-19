@@ -51,7 +51,6 @@ Environment Variables
 ---------------------
 SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning, even when
                         the -m expression or --upstream asks for them
-UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
 XDG_CACHE_HOME          Base cache directory (default: ~/.cache)
@@ -555,7 +554,7 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
     # Let a shutting-down worker take longer to release the VFIO card: the default
     # 5s can expire mid-teardown (e.g. finishing a Spyre compile), leaving the card
@@ -694,9 +693,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
             item.add_marker(upstream_marker)
 
-            # Tag upstream items here (the conftest fixture binds only under
-            # tests/). Before the skip/xfail branches so a tag lands regardless
-            # of the item's eventual disposition.
+            # Tag upstream items before the skip/xfail branches so tags land
+            # regardless of the item's eventual disposition.
             params = getattr(getattr(item, "callspec", None), "params", {})
             for name, value in result_tags(params):
                 item.user_properties.append((name, value))
@@ -865,7 +863,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins
@@ -1110,6 +1108,19 @@ def register_ministral_14b(request, monkeypatch):
 
 
 @pytest.fixture()
+def register_granite_models(request, monkeypatch):
+    """Add our injected granite models to test_granite's MODELS dict.
+
+    test_granite's MODELS is a dict (model -> min transformers version) and the test
+    does MODELS[model]; models we inject via param override aren't keys,
+    so add them as unconstrained (None).
+    """
+    models = request.node.module.MODELS
+    for model in ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", "ibm-granite/granite-4.1-3b"):
+        monkeypatch.setitem(models, model, None)
+
+
+@pytest.fixture()
 def patch_backend_list(request, monkeypatch):
     """This fixture patches things for tests/v1/attention/test_attention_backends.py"""
 
@@ -1137,10 +1148,11 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
     # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
-    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
-    # layout underneath is token-major, which upstream expresses separately via
-    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # 2 * head_size] view; the physical layout underneath is token-major, which vLLM
+    # expresses through the KVCacheLayout descriptor's stride_order (the per-backend
+    # get_kv_cache_shape/get_kv_cache_stride_order hooks it replaced are gone).
+    # SpyreAttentionBackend keeps its own get_kv_cache_shape, which advertises the
+    # physical layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -1154,11 +1166,11 @@ def patch_backend_list(request, monkeypatch):
         key,
         value,
         kv_cache,
-        attn_type=None,
-        sliding_window=None,
-        kv_cache_dtype="auto",
-        sinks=None,
+        *args,
+        **kwargs,
     ):
+        # Everything after kv_cache passes through untouched: upstream keeps appending
+        # defaulted parameters (use_cuda_graph in 0.30, layer_k/v_scale in 0.31).
         if backend == AttentionBackendEnum.CUSTOM:
 
             def pin_slot_major(blocks):
@@ -1190,10 +1202,8 @@ def patch_backend_list(request, monkeypatch):
             key,
             value,
             kv_cache,
-            attn_type,
-            sliding_window,
-            kv_cache_dtype,
-            sinks,
+            *args,
+            **kwargs,
         )
 
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)

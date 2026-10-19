@@ -20,8 +20,10 @@ rectangle, when the batch fits one, where Q/K/V already *are* the ``[B, L]`` gri
 runner laid out; otherwise the packed buffer, with requests grouped by their own extent
 and each group a fused gather/attend/scatter. The runner picks once per step and records
 the choice as the type of ``attn_metadata.encoder_plan``, so no compiled region branches
-on it. Both paths cross the opaque ``unified_attention_with_output``, so the enclosing
-block graph is identical for either.
+on it. The ragged path always crosses the opaque ``unified_attention_with_output``. The
+rectangular path does too unless ``install_encoder`` traced it into the block graph
+(compiled, stick-aligned head size), in which case each rectangle is a block graph of its
+own and the impl below is reached only on the ragged path.
 
 Three torch-spyre constraints shape the design:
 
@@ -40,6 +42,7 @@ import types
 import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -55,7 +58,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    _call_kernel,
 )
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -101,20 +103,26 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     ``INT32_ELEMS_PER_STICK``, so the table is stick-aligned with no extra pad.
 
     The clamp makes the scatter write one destination row repeatedly. That is benign
-    -- the mask depends only on the KV column, so every duplicate lane carries the
-    same value -- but ``index_copy_`` with duplicate indices is formally undefined in
+    -- every duplicate lane attends exactly the real keys, as the last real row does
+    (a key-pad mask depends only on the KV column, and a causal row past the last real
+    one still sees all of them), so each carries the same value -- but ``index_copy_``
+    with duplicate indices is formally undefined in
     PyTorch, so ``build_encoder_plan`` asserts the intent rather than leaving it
     implicit.
     """
     return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
 
 
-def encoder_key_pad_mask(extent: int, kv_lens: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+def encoder_key_pad_mask(
+    extent: int, kv_lens: Sequence[int], dtype: torch.dtype, causal: bool = False
+) -> torch.Tensor:
     """Additive key-pad ``[N, 1, 1, extent]``, one row per sequence, on the host.
 
     Head and query axes stay 1 and broadcast: an encoder mask depends only on the KV
     column, since every query row -- real or padding -- attends to exactly the real
-    keys.
+    keys. ``causal`` adds the query axis (``[N, 1, extent, extent]``) and the
+    triangular constraint; key 0 stays attendable from every row, so no row is
+    fully masked.
 
     ``finfo.min / 2``, not ``finfo.min`` or ``-inf``: the fill is *added* to a score,
     and in fp16 ``finfo.min + score`` saturates to ``-inf``, which then NaNs through
@@ -127,11 +135,16 @@ def encoder_key_pad_mask(extent: int, kv_lens: Sequence[int], dtype: torch.dtype
     """
     lens = torch.tensor(list(kv_lens), dtype=torch.int32).unsqueeze(1)
     pos = torch.arange(extent, dtype=torch.int32).unsqueeze(0)
+    attend = pos < lens
+    if causal:
+        attend = attend.unsqueeze(1) & (pos.unsqueeze(2) >= pos.unsqueeze(1))
     row = torch.where(
-        pos < lens,
+        attend,
         torch.zeros((), dtype=dtype),
         torch.tensor(torch.finfo(dtype).min / 2, dtype=dtype),
     )
+    if causal:
+        return row.view(len(lens), 1, extent, extent).contiguous()
     return row.view(len(lens), 1, 1, extent).contiguous()
 
 
@@ -350,11 +363,12 @@ class EncoderRectPlan:
     extent: int
     width: int
     mask: torch.Tensor
-    """``[width, 1, 1, extent]`` additive key-pad, already on the device."""
+    """``[width, 1, 1, extent]`` additive key-pad (``[width, 1, extent, extent]`` when
+    causal), already on the device."""
     query_lens: list[int]
-    """Real length per request. The runner needs it to lay out the grid and to
-    compact the hidden states back afterwards, and this is the one place the ragged
-    lengths were already read off the metadata."""
+    """Real length per request. The runner uses it to lay out the grid and, when
+    packed-order pooling is needed, to compact hidden states afterwards. The ragged
+    lengths were already read off the metadata here."""
 
 
 @dataclass
@@ -391,7 +405,10 @@ def build_encoder_plan(
 
     ``query_start_loc``, not ``seq_lens``: query length *is* kv length here, and
     upstream's ``_dummy_run`` puts the whole padded token count in ``seq_lens``.
+
+    The masks are causal iff the metadata's ``apply_causal_mask`` is set.
     """
+    causal = attn_metadata.apply_causal_mask
     query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
     seq_lens = attn_metadata.seq_lens.cpu().tolist()
     # The body pads past num_actual_tokens; those rows are not a request.
@@ -422,7 +439,7 @@ def build_encoder_plan(
         return EncoderRectPlan(
             extent=extent,
             width=width,
-            mask=convert(encoder_key_pad_mask(extent, kv_lens, dtype), device),
+            mask=convert(encoder_key_pad_mask(extent, kv_lens, dtype, causal), device),
             query_lens=[m[1] for m in members],
         )
 
@@ -435,7 +452,8 @@ def build_encoder_plan(
 
     def plan(chunk: list[tuple[int, int, int]], extent: int) -> EncoderGroupPlan:
         # The row table's pad lanes repeat the last real row, so the scatter writes it
-        # several times. Sound only because the mask ignores the query axis.
+        # several times. Sound either way: the non-causal mask ignores the query axis,
+        # and the causal one puts every pad position past the real keys.
         assert all(m[1] >= 1 for m in chunk), "a zero-length request has no row to clamp onto"
         return EncoderGroupPlan(
             starts=[m[0] for m in chunk],
@@ -447,7 +465,9 @@ def build_encoder_plan(
             ),
             # Concatenated, not stacked: member order along dim 0 is what the
             # kernel's batch dim indexes.
-            mask=convert(encoder_key_pad_mask(extent, [m[2] for m in chunk], dtype), device),
+            mask=convert(
+                encoder_key_pad_mask(extent, [m[2] for m in chunk], dtype, causal), device
+            ),
         )
 
     plans: list[EncoderGroupPlan] = []
@@ -466,6 +486,70 @@ def build_encoder_plan(
     return plans
 
 
+def forced_rect_plan(
+    extent: int, width: int, dtype: torch.dtype, device: torch.device, causal: bool
+) -> EncoderRectPlan:
+    """Warmup's declared rectangle, ignoring the dummy batch's own shape.
+
+    Upstream's ``_dummy_run`` splits its tokens evenly over ``max_num_seqs``, so it only
+    ever lands on the shortest rectangle. Lengths of exactly ``extent`` make
+    ``sum(query_lens)`` the body row count, which keeps the grid expansion an identity.
+    The mask takes the group's causality, as its real plans do.
+    """
+    return EncoderRectPlan(
+        extent=extent,
+        width=width,
+        mask=convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device),
+        query_lens=[extent] * width,
+    )
+
+
+def plan_encoder_step(
+    metadatas: Iterable[object],
+    *,
+    rectangles: Sequence[tuple[int, int]],
+    width_cap_for: dict[int, int],
+    device: torch.device,
+    dtype: torch.dtype,
+    batched: bool,
+    forced_rect: tuple[int, int] | None = None,
+) -> EncoderRectPlan | list[EncoderGroupPlan] | None:
+    """Give each encoder metadata object its own plan, with its own causality; return the last."""
+    plan = None
+    seen: set[int] = set()
+    causal: set[bool] = set()
+    for md in metadatas:
+        if id(md) in seen or not hasattr(md, "encoder_plan"):
+            continue
+        seen.add(id(md))
+        encoder_md = cast(SpyreAttentionMetadata, md)
+        causal.add(encoder_md.apply_causal_mask)
+        if encoder_md.encoder_plan is None:
+            if forced_rect is not None:
+                plan = forced_rect_plan(*forced_rect, dtype, device, encoder_md.apply_causal_mask)
+            else:
+                plan = build_encoder_plan(
+                    encoder_md,
+                    rectangles=rectangles,
+                    width_cap_for=width_cap_for,
+                    device=device,
+                    dtype=dtype,
+                    batched=batched,
+                )
+            encoder_md.encoder_plan = plan
+        else:
+            plan = encoder_md.encoder_plan
+
+    # The traced rectangle reads one published mask in every inlined layer, so groups
+    # that differ in causality cannot share it.
+    if isinstance(plan, EncoderRectPlan) and encoder_inline_active() and len(causal) > 1:
+        raise NotImplementedError(
+            "Encoder attention groups mix causal and bidirectional masks; the traced "
+            "rectangle path publishes one mask for all of them."
+        )
+    return plan
+
+
 class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     """Bidirectional encoder self-attention (no KV cache).
 
@@ -473,6 +557,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``TorchSpyrePlatform.get_attn_backend_cls``). ``forward`` reads the step's plan
     off the metadata and runs the path that plan's type names; it never decides the
     path itself, so every layer in the stack agrees.
+
+    Causality is per attention group, read off the metadata's ``apply_causal_mask``:
+    ``EncoderOnlyAttention`` layers arrive bidirectional, ``CausalEncoderOnlyAttention``
+    layers (CLIP text, ``models/clip.py``) causal.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -481,13 +569,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._rect_fn = _encoder_rect_compiled
             self._rect_out_fn = _encoder_rect_out_compiled
             self._gather_fn = _encoder_gather_compiled
-            self._attn_fn = _encoder_sdpa_compiled
+            self._sdpa_fn = _encoder_sdpa_compiled
             self._fused_fn = _encoder_fused_compiled
         else:
             self._rect_fn = _encoder_rect_kernel
             self._rect_out_fn = _encoder_rect_kernel_out
             self._gather_fn = _encoder_gather_kernel
-            self._attn_fn = _encoder_sdpa_kernel
+            self._sdpa_fn = _encoder_sdpa_kernel
             self._fused_fn = _encoder_fused_kernel
         # get_current_vllm_config() only works at construction time; forward() runs
         # through a custom-op boundary that loses the context.
@@ -504,9 +592,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def _run_rect(self, out, query, key, value, plan_mask, width, extent, heads, kv_heads, dim):
         if out is None:
-            return _call_kernel(
-                "encoder_rect",
-                self._rect_fn,
+            return self._rect_fn(
                 query,
                 key,
                 value,
@@ -518,9 +604,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 kv_heads,
                 dim,
             )
-        return _call_kernel(
-            "encoder_rect_out",
-            self._rect_out_fn,
+        return self._rect_out_fn(
             out,
             query,
             key,
@@ -535,12 +619,10 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         )
 
     def _run_gather(self, query, key, value, row_index):
-        return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
+        return self._gather_fn(query, key, value, row_index)
 
     def _run_attn(self, q_rows, k_rows, v_rows, mask, group, heads, kv_heads, dim):
-        return _call_kernel(
-            "encoder_sdpa",
-            self._attn_fn,
+        return self._sdpa_fn(
             q_rows,
             k_rows,
             v_rows,
@@ -553,9 +635,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         )
 
     def _run_fused(self, out, row_index, query, key, value, mask, group, heads, kv_heads, dim):
-        return _call_kernel(
-            "encoder_fused",
-            self._fused_fn,
+        return self._fused_fn(
             out,
             row_index,
             query,
@@ -578,6 +658,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
+        causal: bool = False,
     ) -> int:
         """Trace every declared shape, on the caller's own tensors.
 
@@ -588,6 +669,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         A buffer that is not the declared body shape warms nothing -- every declared
         shape is sized against that one buffer, so a smaller one indexes out of bounds.
+
+        ``causal`` is the group's ``apply_causal_mask``: a causal mask is
+        ``[N, 1, L, L]`` rather than ``[N, 1, 1, L]``, a different compiled variant.
         """
         if self._warmed or query.shape[0] != self._buffer_rows:
             return 0
@@ -600,7 +684,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # per-rectangle dummy runs; tracing it here would compile a kernel nothing calls.
         rectangles = [] if encoder_inline_active() else self._rectangles
         for extent, width in rectangles:
-            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
+            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_rect(
                 output, query, key, value, mask, width, extent, num_heads, num_kv_heads, head_size
             )
@@ -611,7 +695,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 torch.cat([encoder_row_table(0, extent, extent, index_dtype)] * width),
                 device,
             )
-            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
+            mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype, causal), device)
             self._run_fused(
                 output,
                 rows,
@@ -693,7 +777,16 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             # Here, not in the runner's warmup: a Spyre tensor's device layout is part of
             # the compile cache key, so the declared shapes must be traced against these
             # buffers. Self-guarded, so only the first call of the run does the work.
-            self.warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
+            self.warm_kernels(
+                query,
+                key,
+                value,
+                output,
+                num_heads,
+                num_kv_heads,
+                head_size,
+                attn_metadata.apply_causal_mask,
+            )
 
         if isinstance(plan, EncoderRectPlan):
             self._forward_rect(plan, query, key, value, output, fused_store_ok, head_size)
@@ -784,7 +877,8 @@ _ORIG_ATTENTION_FORWARD = Attention.forward
 
 
 class EncoderGrid:
-    """This step's ``[width, 1, 1, extent]`` mask, or ``None`` off the rectangular path.
+    """This step's ``[width, 1, 1, extent]`` mask (``[width, 1, extent, extent]`` when
+    causal), or ``None`` off the rectangular path.
 
     ``(width, extent)`` is read from the mask's *shape*, not off the step's plan: ``view``
     needs both as trace-time ints, and the plan is a fresh object every step, so Dynamo
@@ -833,9 +927,8 @@ def _spyre_encoder_attention_forward(
     """Trace the rectangular path into the caller's graph; anything else falls through.
 
     Deliberately bypasses the impl: going through it would re-enter ``torch.compile`` for
-    the already-compiled kernel and run ``_call_kernel``'s host-side counters inside a
-    traced region. The fallthrough is upstream's own ``forward`` rather than a copy, so the
-    ragged path is untouched.
+    the already-compiled kernel inside a traced region. The fallthrough is upstream's own
+    ``forward`` rather than a copy, so the ragged path is untouched.
     """
     mask = _encoder_grid.mask
     # The inline path returns [tokens, num_heads * head_size], so a caller asking for any

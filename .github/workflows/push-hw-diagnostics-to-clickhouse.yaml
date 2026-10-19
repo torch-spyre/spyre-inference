@@ -59,6 +59,7 @@ jobs:
     env:
       TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id || inputs.gha_run_id }}
       TRIGGERING_WORKFLOW: ${{ github.event.workflow_run.name || inputs.workflow_name }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
 
       INGEST_COMPONENT: spyre-inference
       # The arch of the ANALYSED leg, not of this ingest job -- so never $(uname -m), which
@@ -79,12 +80,44 @@ jobs:
             .github/actions
           sparse-checkout-cone-mode: false
 
+      # run_id, tier and artifact_id resolved as push-to-clickhouse.yaml resolves them, so these
+      # rows share the leg's run_id and join its cases and artifact verdict.
+      - name: Recover threaded run_id
+        id: run-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Recover this run's artifact_id
+        id: leg-artifact-id
+        uses: ./.github/actions/recover-threaded-run-id
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          artifact-name: artifact-id
+          label: Leg artifact_id
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve test_type for trigger_type
+        id: extract-tier
+        run: |
+          if [[ "${TRIGGERING_DISPLAY_TITLE}" == *"("*")"* ]]; then
+            TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          else
+            TIER="${TRIGGERING_DISPLAY_TITLE}"
+          fi
+          echo "Resolved test_type: ${TIER:-<none>}"
+          echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
+
       - name: Ingest hardware-failure diagnostics into ClickHouse
         id: ingest
         uses: torch-spyre/torch-spyre/.github/actions/ingest-hw-diagnostics-to-clickhouse@main
         with:
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
           workflow-name: ${{ env.TRIGGERING_WORKFLOW }}
+          trigger-type: ${{ steps.extract-tier.outputs.tier }}
+          threaded-run-id: ${{ steps.run-id.outputs.run_id }}
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           component: ${{ env.INGEST_COMPONENT }}
           arch: ${{ env.LEG_ARCH }}
           gh-token: ${{ secrets.GITHUB_TOKEN }}

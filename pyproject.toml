@@ -2,6 +2,10 @@
 requires = [
   "setuptools>=82",
   "setuptools_scm>=10",
+  # csrc/ host kernels (setup.py). torch must match the `torch` pin in
+  # [project.dependencies]: the extension links libtorch, so an ABI drift fails at import.
+  "cmake>=3.26",
+  "torch==2.13.0",
 ]
 build-backend = "build_backend"
 backend-path  = ["."]
@@ -12,12 +16,15 @@ description = "Next iteration of sendnn-inference on the torch-spyre stack"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
-    "torch-spyre[cpsat]",
-    "vllm[grpc]>=0.28.0,<0.29",
+    # Only reaches wheel consumers: the `[tool.uv.sources]` pin below drops this
+    # specifier from uv's own resolution. `>=0.5.0` would reject the 0.5.0rc1 release.
+    "torch-spyre[cpsat]>=0.5.0rc1",
+    "vllm[grpc]>=0.31.0,<0.32",
 
-    # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
-    # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
-    "torch",
+    # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
+    # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
+    # must get the exact torch it was built against.
+    "torch==2.13.0",
 
     # Required at runtime by vLLM's image processors (the Pixtral/Ministral vision
     # path). Declared directly rather than relying on a transitive pull: the entry
@@ -46,7 +53,9 @@ Issues = "https://github.com/torch-spyre/spyre-inference/issues"
 spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
-spyre_inference_ops = "spyre_inference:register_ops"
+# Same name as the platform plugin, so `VLLM_PLUGINS=spyre_inference` also registers the
+# model adaptations in every process, before vLLM's first model lookup.
+spyre_inference = "spyre_inference:register_ops"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -63,6 +72,17 @@ local_scheme   = "_versioning:ci_local_scheme"
 
 [tool.uv]
 default-groups = ["dev"]
+
+# Rebuild the csrc/ extension when its sources change, not just the metadata files.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { file = "CMakeLists.txt" },
+    { file = "cmake/**/*.cmake" },
+    { file = "csrc/**/*.cpp" },
+    { file = "csrc/**/*.hpp" },
+    { file = "csrc/**/*.h" },
+]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs
 required-environments = [
@@ -108,6 +128,13 @@ override-dependencies = [
     "pyzmq>=27.2.0",
 ]
 
+constraint-dependencies = [
+    # ortools caps protobuf <6.34 on x86_64 and uv unifies that onto every platform, landing
+    # s390x on a protobuf whose upb decoder mis-handles big-endian; both fixes are in 7.36.1
+    # (protocolbuffers/protobuf#25363, #25683).
+    "protobuf>=7.36.1; platform_machine == 's390x'",
+]
+
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
@@ -125,9 +152,9 @@ USE_SPYRE_PROFILER = "0"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.28.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.31.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "011e8df526102d9cb28702cab7be43a525e9835b" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "cf027821b798af3206beba51383492d36c6245c9" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -176,6 +203,31 @@ requires-dist = [
     "pyyaml; extra == 'pyyaml'",
 ]
 provides-extras = ["optree", "opt-einsum", "pyyaml"]
+
+# spyre-rpms.lock is generated from this; after editing, re-run
+# `python3 scripts/lock_spyre_rpms.py`.
+[tool.spyre-rpms]
+bundle = "main_nightly_2026_10_15"
+packages = [
+  "ibm-aiu-toolbox-e2e",
+  "ibm-deeptools",
+  "ibm-deeptools-devel",
+  "ibm-flex",
+  "ibm-flex-devel",
+  "ibm-senlib-core",
+  "ibm-senlib-dd2",
+  "ibm-senlib-headers",
+  "ibm-spyre-comms",
+  "ibm-spyre-comms-devel",
+  "ibm-libaiupti",
+]
+
+# Not in bundles yet: each takes the version of the bundled package it ships with.
+[tool.spyre-rpms.devel]
+ibm-deeptools-devel = "ibm-deeptools"
+ibm-flex-devel = "ibm-flex"
+ibm-senlib-headers = "ibm-senlib-core"
+ibm-spyre-comms-devel = "ibm-spyre-comms"
 
 [tool.ty.rules]
 # TODO: re-enable after fixing subclass attribute lookups in custom_ops/linear.py.
@@ -279,6 +331,7 @@ markers = [
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
+    "attention_smoke: small representative decoder-attention subset (also marked attention); its own 1-card job carries attention coverage into the integration tier, which the full attention suite is excluded from",
     "probe: torch-spyre backend probes (tests/probes/); run in their own CI job, excluded from integration",
     "uses_subprocess: tests that spawn a subprocess engine; the plugin runs them first, before the main process initializes the Spyre device",
     "model_quality: product-model output gates vs cached HF references (tests/e2e/test_model_quality.py and the compiled encoder cases in test_encoder_models.py); compiles models from 125M encoders up to 31B decoders, runs in its own CI job",
@@ -287,9 +340,20 @@ markers = [
     "gsm8k: server-based GSM8K accuracy eval (upstream tests/evals/gsm8k); slow, runs in its own CI job",
     "conv: Spyre Conv2d custom-op tests (tests/custom_ops/test_conv.py)",
     "layer_norm: SpyreLayerNorm custom-op tests (tests/custom_ops/test_layer_norm.py)",
+    "mlp: Spyre linear-layer tests: merged-column, QKV, row-parallel and replicated layers, and the transposed-weight linear method (tests/custom_ops/test_mlp.py, tests/custom_ops/test_linear.py)",
+    "parallel_lm_head: SpyreParallelLMHead custom-op tests (tests/custom_ops/test_parallel_lm_head.py)",
+    "padding_workaround: LM-head vocab-padding tests for a torch-spyre work-division shape limit (tests/custom_ops/test_parallel_lm_head.py); remove with the workaround",
+    "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
+    "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
     "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
+    "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
+    "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
+    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
+    "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
+    "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
 ]
 # --8<-- [end:test-markers-definition]
 

@@ -49,10 +49,10 @@ GEMMA4_ROPE_PARAMS = {
 # stick-aligned for both (512->256, 256->128).
 GEMMA4_HEAD_SIZES = [512, 256]
 
-# head_size values with a stick-aligned 2x2 inner dim (128->64, 256->128). On the native
-# path the platform pads head_dim to a 128-multiple before RoPE is built, so SpyreRoPE
-# only ever sees stick-aligned inners.
-HEAD_SIZES = [128, 256]
+# 2x2 inner dim stick-aligned (64, 128): the CPU tests that call _rotate_neox_2x2 directly.
+ALIGNED_HEAD_SIZES = [128, 256]
+# 64 adds a sub-stick half (32), which forward_oot routes to the split-free path.
+HEAD_SIZES = [64, *ALIGNED_HEAD_SIZES]
 
 
 def _make_qk(num_tokens, num_q_heads, num_kv_heads, head_size, flatten):
@@ -86,7 +86,7 @@ def test_llama3_rotary_oot_registration(default_vllm_config):
 
 
 @pytest.mark.rotary
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size", ALIGNED_HEAD_SIZES)
 def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     """CPU-only: host gather + _rotate_neox_2x2 match forward_native without a
     Spyre device, so the core rotation formula is validated on dev laptops where the
@@ -109,6 +109,35 @@ def test_rotation_math_matches_reference_cpu(default_vllm_config, head_size):
     assert rot.device.type == "cpu"
     actual_query = _rotate_neox_2x2(query, rot, head_size)
     actual_key = _rotate_neox_2x2(key, rot, head_size)
+
+    expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("flatten", [True, False])
+def test_split_free_rotation_matches_reference_cpu(default_vllm_config, flatten):
+    """CPU-only: head_size=64 takes the split-free path; its cache layout, rotate_half
+    matrix and _rotate_neox_split_free match forward_native without a Spyre device."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+
+    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_split_free
+
+    head_size = 64
+    torch.manual_seed(11)
+    max_position, num_tokens = 2048, 32
+    rope = get_rope(head_size, max_position, is_neox_style=True, dtype=torch.float16)
+    assert rope._rotate_half is not None
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, 8, 2, head_size, flatten)
+
+    cos_sin = rope._get_device_rotation_cache().index_select(0, positions)
+    cos_sin = cos_sin.view(-1, 2, head_size).to(torch.float16)
+    actual_query = _rotate_neox_split_free(query, cos_sin, rope._rotate_half, head_size)
+    actual_key = _rotate_neox_split_free(key, cos_sin, rope._rotate_half, head_size)
 
     expected_query, expected_key = RotaryEmbedding.forward_native(rope, positions, query, key)
     torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
@@ -359,7 +388,7 @@ def test_yarn_rotary_oot_registration(default_vllm_config):
     ],
     ids=["factor4_defaults", "factor2_defaults", "factor8_custom_params"],
 )
-@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("head_size", ALIGNED_HEAD_SIZES)
 def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_params, head_size):
     """CPU-only: host gather + _rotate_neox_2x2 match forward_native for YaRN,
     validating that the scaled cos/sin cache produced by YaRN is correctly transformed

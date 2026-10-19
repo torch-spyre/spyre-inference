@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import importlib.metadata
-import json
+import logging
 import os
-from logging.config import dictConfig
-from typing import Any
 
 # Defer torch_spyre's autoload until we explicitly trigger it inside
 # `TorchSpyreWorker.init_device`. Autoload loads `libspyre_comms.so`,
@@ -42,51 +40,51 @@ def register_ops():
     register_models()
 
 
+def _route_logging() -> None:
+    """Parent ``spyre_inference`` under ``vllm``, unless a logging config gave it
+    handlers of its own: it then owns its routing, and propagating into ``vllm`` too
+    would print each record twice."""
+    ours = logging.getLogger("spyre_inference")
+    ours.parent = logging.root if ours.handlers else logging.getLogger("vllm")
+
+
 def _init_logging():
-    """Setup logging, extending from the vLLM logging config"""
-    from vllm.envs import VLLM_CONFIGURE_LOGGING, VLLM_LOGGING_CONFIG_PATH
-    from vllm.logger import DEFAULT_LOGGING_CONFIG, init_logger
+    """Route our loggers through vLLM's ``vllm`` logger.
 
-    global logger
-    logger = init_logger(__name__)
+    vLLM configures logging lazily (``vllm.logger.configure_logging``, from the engine,
+    workers and CLI) and only for the ``vllm`` logger, whose format needs a field its
+    record factory adds. Parenting ours under it inherits whatever handlers and level
+    vLLM installs, whenever it does; configuring our own at import would format records
+    before that factory exists.
 
-    config: dict[str, Any] = {}
+    ``dictConfig`` only spares the existing loggers a config names, or their children
+    by dotted name, so a custom config that leaves ``disable_existing_loggers`` at its
+    default would still disable ours. Every entry point configures through
+    ``_configure_vllm_root_logger``, so it is wrapped to re-enable them afterwards.
+    """
+    import vllm.logger as vllm_logger
 
-    if VLLM_CONFIGURE_LOGGING:
-        config = {**DEFAULT_LOGGING_CONFIG}
+    _route_logging()
 
-    if VLLM_LOGGING_CONFIG_PATH:
-        # Error checks must already be done in vllm.logger
-        with open(VLLM_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
-            config = json.loads(file.read())
+    configure = vllm_logger._configure_vllm_root_logger
+    if getattr(configure, "_spyre_patched", False):
+        return
 
-    if VLLM_CONFIGURE_LOGGING:
-        # Copy the vLLM logging configurations for our package
-        if "spyre_inference" not in config["formatters"]:
-            if "vllm" in config["formatters"]:
-                config["formatters"]["spyre_inference"] = config["formatters"]["vllm"]
-            else:
-                config["formatters"]["spyre_inference"] = DEFAULT_LOGGING_CONFIG["formatters"][
-                    "vllm"
-                ]
+    def _configure(*args, **kwargs):
+        ours = [
+            lg
+            for name, lg in logging.root.manager.loggerDict.items()
+            if isinstance(lg, logging.Logger)
+            and (name == "spyre_inference" or name.startswith("spyre_inference."))
+            and not lg.disabled
+        ]
+        configure(*args, **kwargs)
+        for lg in ours:
+            lg.disabled = False
+        _route_logging()
 
-        if "spyre_inference" not in config["handlers"]:
-            if "vllm" in config["handlers"]:
-                handler_config = config["handlers"]["vllm"]
-            else:
-                handler_config = DEFAULT_LOGGING_CONFIG["handlers"]["vllm"]
-            handler_config["formatter"] = "spyre_inference"
-            config["handlers"]["spyre_inference"] = handler_config
-
-        if "spyre_inference" not in config["loggers"]:
-            if "vllm" in config["loggers"]:
-                logger_config = config["loggers"]["vllm"]
-            else:
-                logger_config = DEFAULT_LOGGING_CONFIG["loggers"]["vllm"]
-            logger_config["handlers"] = ["spyre_inference"]
-            config["loggers"]["spyre_inference"] = logger_config
-
-    dictConfig(config)
+    _configure._spyre_patched = True
+    vllm_logger._configure_vllm_root_logger = _configure
 
 
 _init_logging()

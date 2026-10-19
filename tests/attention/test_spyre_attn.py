@@ -32,7 +32,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
-    _MIN_BATCHED_SEQS,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -181,7 +180,11 @@ def _run_spyre_attn_test(
     # The extra entries point at garbage pages on purpose: padded blocks are
     # fully masked and must not affect the result.
     max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-    buckets = SpyreAttnBucketer(get_current_vllm_config()).num_blocks_buckets
+    # The num_blocks ladder is derived from block_size, so the bucketer needs this
+    # test's value rather than the fixture default or it pads to the wrong width.
+    bucketer_config = get_current_vllm_config()
+    bucketer_config.cache_config.block_size = block_size
+    buckets = SpyreAttnBucketer(bucketer_config).num_blocks_buckets
     padded_width = SpyreAttnBucketer._round_up(max_num_blocks_per_seq, buckets)
     if padded_width is not None:
         max_num_blocks_per_seq = max(max_num_blocks_per_seq, padded_width)
@@ -354,9 +357,9 @@ def _run_spyre_attn_test(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)", marks=pytest.mark.attention_smoke),
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)", marks=pytest.mark.attention_smoke),
         pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
@@ -398,7 +401,9 @@ def test_spyre_attn_core(
 @pytest.mark.parametrize(
     "seq_lens",
     [
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param(
+            [(1, 256), (1, 512)], id="batch_decode(2seqs)", marks=pytest.mark.attention_smoke
+        ),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
         pytest.param([(1, 128), (1, 128)], id="batch_decode_shared_variant(2seqs)"),
@@ -852,6 +857,24 @@ def test_spyre_attn_mqa(
     )
 
 
+def test_kernel_block_sizes_accept_the_layer_spec():
+    """vLLM's attention layer passes its `kv_cache_spec` positionally (sliding-window
+    layers included); every spec gets the same stick-aligned constraint."""
+    from vllm.v1.attention.backend import MultipleOf
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    spec = SlidingWindowSpec(
+        block_size=64, num_kv_heads=2, head_size=64, dtype=torch.float16, sliding_window=128
+    )
+    for sizes in (
+        SpyreAttentionBackend.get_supported_kernel_block_sizes(spec),
+        SpyreAttentionBackend.get_supported_kernel_block_sizes(),
+    ):
+        assert [s.base for s in sizes if isinstance(s, MultipleOf)] == [64]
+
+
 def test_block_size_validation():
     """Test that SpyreAttentionMetadataBuilder validates block_size alignment.
 
@@ -935,8 +958,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     (1) the backend's advertised shape, (2) TorchSpyreModelRunner's allocation,
     and (3) the attention kernels. This regression test ensures they stay in
     sync. If get_kv_cache_shape drifts, vLLM code that allocates from the
-    contract (KV transfer, future tests, Mamba zeroing via
-    get_kv_cache_block_dim) will allocate a transposed cache.
+    contract (KV transfer, future tests) will allocate a transposed cache.
     """
     from vllm.config import CacheConfig, ModelConfig, VllmConfig
     from vllm.config.compilation import CompilationConfig
@@ -974,9 +996,9 @@ def test_kv_cache_shape_matches_runner_allocation():
         num_blocks, block_size, num_kv_heads, head_size
     )
 
-    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples.
-    # The base-class get_kv_cache_block_dim does shape.index(_S), which fails
-    # if shape is a list. Spyre stores K and V as separate NamedTuple fields.
+    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples:
+    # vLLM callers index into it directly. Spyre stores K and V as separate
+    # NamedTuple fields.
     assert isinstance(shape, tuple), f"get_kv_cache_shape must return a tuple, got {type(shape)}"
     assert shape == (
         num_blocks,
@@ -993,9 +1015,13 @@ def test_kv_cache_shape_matches_runner_allocation():
         head_size=head_size,
         dtype=torch.float16,
     )
+    # layer_stride/block_stride are required by the KVCacheTensor dataclass but
+    # unused by our runner (it reads only size + layers); pass the layer-outer values.
     kv_cache_tensor = KVCacheTensor(
         size=spec.page_size_bytes * num_blocks,
-        shared_by=["layers.0.self_attn"],
+        layers=["layers.0.self_attn"],
+        layer_stride=spec.page_size_bytes * num_blocks,
+        block_stride=spec.page_size_bytes,
     )
     kv_cache_group = KVCacheGroupSpec(
         layer_names=["layers.0.self_attn"],
@@ -1036,6 +1062,94 @@ def test_kv_cache_shape_matches_runner_allocation():
         assert pages.device_tensor_layout().device_size[0] == num_slots
 
 
+def test_each_layer_in_one_kv_cache_tensor_gets_its_own_pages(monkeypatch):
+    """A KVCacheTensor packs *every* attention layer into one allocation.
+
+    One shared page buffer per tensor would alias all those layers onto the same block,
+    so a later layer's KV write clobbers an earlier layer's. Prefill still looks right --
+    each layer reads back its own fresh write -- and only decode is corrupted, which is
+    why this needs an allocation-level guard rather than an output check.
+
+    Card-free on purpose: `allocate_pages` is stubbed with per-call sentinels, so the
+    card-less CI shards run this instead of skipping past it.
+    """
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import (
+        AttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+        KVCacheTensor,
+    )
+
+    from spyre_inference.v1.attention.backends import spyre_attn as spyre_attn_mod
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
+    layer_names = [f"layers.{i}.self_attn" for i in range(4)]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B",
+            max_model_len=1,
+            dtype=torch.float16,
+            trust_remote_code=True,
+        ),
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
+
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.float16,
+    )
+    # The shape under test: all four layers in a single KVCacheTensor, as vLLM packs them.
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks * len(layer_names),
+                layers=layer_names,
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+    )
+
+    for layer_name in layer_names:
+        fake_layer = Mock()
+        fake_layer.kv_cache = None
+        runner.compilation_config.static_forward_context[layer_name] = fake_layer
+
+    calls = []
+
+    def _fake_allocate_pages(cls, blocks, allocate_spec, device):
+        calls.append((blocks, allocate_spec, device))
+        return Mock(name=f"pages-{len(calls)}")
+
+    monkeypatch.setattr(
+        spyre_attn_mod.SpyreAttentionImpl,
+        "allocate_pages",
+        classmethod(_fake_allocate_pages),
+    )
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+
+    assert set(caches) == set(layer_names)
+    # The bug this guards against: one buffer handed to every layer.
+    assert len({id(caches[name]) for name in layer_names}) == len(layer_names), (
+        "layers packed into one KVCacheTensor must not share a page buffer"
+    )
+    # One allocation per layer, each sized for the full per-layer block count -- not one
+    # allocation carved up by layer_stride.
+    assert len(calls) == len(layer_names)
+    assert all(blocks == num_blocks for blocks, _, _ in calls)
+
+
 def test_supported_dtypes_includes_bfloat16():
     """Nothing selects bf16 by default, but `--dtype bfloat16` has to reach the kernels
     rather than be rejected during backend selection."""
@@ -1057,6 +1171,23 @@ def test_kv_cache_dtype_that_disagrees_with_the_model_is_rejected(default_vllm_c
 
     with pytest.raises(ValueError, match="does not match the model dtype"):
         SpyreAttentionImpl(kv_cache_dtype="bfloat16", **kwargs)
+
+
+def test_attention_sinks_are_rejected(default_vllm_config):
+    """Sink models (gpt-oss natively, and the Transformers backend) pass
+    sinks to the impl, and nothing screens sink models out before this constructor:
+    upstream consults `supports_sink()` only from
+    `AttentionBackendEnum.validate_configuration`, called from the CUDA and ROCm
+    platforms, while `TorchSpyrePlatform.get_attn_backend_cls` registers this backend
+    under `CUSTOM` and never calls it. The raise is the only thing standing between a
+    sink model and silently computing plain attention, so pin it."""
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+
+    kwargs = dict(num_heads=8, head_size=64, scale=0.125, num_kv_heads=8)
+    assert SpyreAttentionImpl(sinks=None, **kwargs) is not None
+
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        SpyreAttentionImpl(sinks=torch.zeros(8, dtype=torch.float16), **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1772,7 +1903,7 @@ def test_batched_decode_chunking_covers_every_block(
     # real block count, so this is what reaches the lattice's top entry.
     ctx = max_model_len
 
-    for num_seqs in range(_MIN_BATCHED_SEQS, max_num_seqs + 1):
+    for num_seqs in range(1, max_num_seqs + 1):
         seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
         query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
         block_table = torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
@@ -1839,10 +1970,10 @@ def test_batched_decode_mask_follows_the_layers_num_kv_heads(
     num_kv_heads, num_query_heads, head_size = 2, 4, 64
 
     vllm_config = get_current_vllm_config()
-    vllm_config.scheduler_config.max_num_seqs = _MIN_BATCHED_SEQS
+    vllm_config.scheduler_config.max_num_seqs = 1
     vllm_config.model_config.max_model_len = 2048
 
-    num_seqs = _MIN_BATCHED_SEQS
+    num_seqs = 1
     ctx = 256
     blocks_per_seq = ctx // block_size
     seq_lens = torch.full((num_seqs,), ctx, dtype=torch.int32)
@@ -2263,7 +2394,6 @@ def test_batched_decode_metadata_follows_env(
     must gate on the same flag — `_batched_decode_preconditions_met` does.
     """
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", batched_decode)
-    # 4 decode seqs: at or above _MIN_BATCHED_SEQS, so the count is not what gates here.
     metadata = _padded_mask_metadata([(1, 256)] * 4, block_size=64)
 
     if batched_decode == "1":
@@ -2499,8 +2629,16 @@ def test_sliding_window_block_skip_unaffected_by_clamp(default_vllm_config):
     context_len = kv_len - query_len
     first_active = max(0, context_len - window + 1) // block_size
     num_blocks = (kv_len + block_size - 1) // block_size
+    real_active = list(range(first_active, num_blocks))
     assert metadata.active_block_indices is not None
-    assert metadata.active_block_indices[0] == list(range(first_active, num_blocks))
+    active = metadata.active_block_indices[0]
+    # This case does pad, so assert the padded length first: the tail checks below
+    # are vacuous on an empty tail and would pass a regression to no padding.
+    assert len(active) == num_blocks > len(real_active)
+    # The real prefix is what the clamp could have disturbed; the tail is bucket
+    # padding, which repeats the last real block.
+    assert active[: len(real_active)] == real_active
+    assert set(active[len(real_active) :]) == {real_active[-1]}
 
 
 def test_sliding_window_mask_and_page_rows_share_active_block_order(default_vllm_config):

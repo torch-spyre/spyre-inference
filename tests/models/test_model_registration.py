@@ -22,12 +22,19 @@ covers the encoders still finds them.
 """
 
 import importlib
+import tomllib
+from pathlib import Path
 
 import pytest
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.registry import _VLLM_MODELS
 
-from spyre_inference.models import _ADAPTED_ARCHS, _ADAPTED_MODULES, register_models
+from spyre_inference.models import (
+    _ADAPTED_ARCHS,
+    _ADAPTED_MODULES,
+    check_spyre_model,
+    register_models,
+)
 from spyre_inference.models import spyre_models as _spyre_models
 
 SPYRE_MODELS = _spyre_models()
@@ -89,3 +96,40 @@ def test_register_models_rejects_an_unknown_arch(monkeypatch):
     monkeypatch.setitem(_ADAPTED_ARCHS, "NotAnArchitecture", "spyre_inference.models.bert:Nope")
     with pytest.raises(RuntimeError, match="NotAnArchitecture"):
         register_models()
+
+
+def _unbuilt(cls: type) -> object:
+    """An instance for ``isinstance`` alone: building a real model needs a vLLM config."""
+    return object.__new__(cls)
+
+
+@pytest.mark.parametrize("arch", sorted(SPYRE_MODELS))
+def test_check_accepts_the_spyre_class(arch):
+    spyre_cls = _load(SPYRE_MODELS[arch])
+    check_spyre_model(_unbuilt(spyre_cls), arch)
+    # vLLM wraps a resolved class for some runners (e.g. as_embedding_model).
+    check_spyre_model(_unbuilt(type("Wrapped", (spyre_cls,), {})), arch)
+
+
+@pytest.mark.parametrize("arch", sorted(SPYRE_MODELS))
+def test_check_rejects_the_unadapted_vllm_class(arch):
+    """What a worker builds when it resolved the architecture before registration."""
+    with pytest.raises(RuntimeError, match=arch):
+        check_spyre_model(_unbuilt(_upstream_class(arch)), arch)
+
+
+def test_check_ignores_an_architecture_without_an_adaptation():
+    assert "LlamaForCausalLM" not in SPYRE_MODELS
+    check_spyre_model(_unbuilt(_upstream_class("LlamaForCausalLM")), "LlamaForCausalLM")
+
+
+def test_platform_plugin_name_also_loads_the_model_registration():
+    """``VLLM_PLUGINS`` filters each group by name, so ``spyre_inference`` alone must
+    reach ``register_ops`` too: otherwise a worker resolves a multimodal architecture
+    (CLIP) before the Spyre classes are registered."""
+    pyproject = tomllib.loads((Path(__file__).parents[2] / "pyproject.toml").read_text())
+    entry_points = pyproject["project"]["entry-points"]
+    platform_names = set(entry_points["vllm.platform_plugins"])
+    general = entry_points["vllm.general_plugins"]
+    assert platform_names <= set(general)
+    assert {general[name] for name in platform_names} == {"spyre_inference:register_ops"}

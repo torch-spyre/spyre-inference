@@ -25,6 +25,12 @@ on:
         description: Workflow name (integration-tests | test_each_commit)
         required: false
         default: integration-tests
+      display_title:
+        description: >-
+          Run-name of the run being re-ingested ("regression", "trunk" or
+          "integration-tests (<test_type>)"). The tier comes from it, and v2 skips a run without one.
+        required: false
+        default: ''
 
 concurrency:
   # Allow at most one ingest per triggering run (re-runs queue behind)
@@ -73,18 +79,21 @@ jobs:
       # workflow's run-name, or the bare tier ("trunk" / "regression") via
       # test_each_commit's -- the only way this job can recover which tier
       # ran without an extra API call.
-      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || '' }}
+      TRIGGERING_DISPLAY_TITLE: ${{ github.event.workflow_run.display_title || inputs.display_title || '' }}
       # Triggering event (push/pull_request/schedule/workflow_dispatch/merge_group; empty on manual re-ingest) -- gates the PR-number lookup below.
       TRIGGERING_EVENT: ${{ github.event.workflow_run.event || '' }}
 
     steps:
       # workflow_run always executes this file as it exists on the default
       # branch, so a plain checkout (no ref:) here pulls the canonical copy
-      # of the ingest script regardless of which ref triggered the run.
-      - name: Checkout ingest script
+      # of the ingest scripts regardless of which ref triggered the run.
+      - name: Checkout ingest scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           sparse-checkout: |
+            .github/scripts/list_run_artifacts.py
+            .github/scripts/download_xml_artifacts.py
+            .github/scripts/group_xml_by_arch.py
             .github/scripts/ingest_xml_si.py
           sparse-checkout-cone-mode: false
 
@@ -150,106 +159,56 @@ jobs:
           echo "Resolved PR number: ${PR} (triggering event: ${TRIGGERING_EVENT:-<manual dispatch>})"
           echo "pr_number=${PR}" >> "${GITHUB_OUTPUT}"
 
-      # ---------------------------------------------------------------------------
-      # Download every artifact from the triggering run and unzip it — artifact
-      # *names* carry no file extension (only the file inside the zip does), so
-      # filtering has to happen post-unzip by actual filename, not by artifact name.
-      #
-      # `--paginate` is required: the artifacts endpoint defaults to 30 per
-      # page, and a run with more jobs than that silently lost every artifact
-      # past the first page, with no error — rows just never showed up in
-      # ClickHouse. `--paginate` applies `--jq` per page and concatenates the
-      # filtered results across pages (`gh api` rejects `--slurp` combined
-      # with `--jq`), so the per-artifact objects come out as a JSON stream,
-      # not a single array; python3 slurps that stream into one array below.
-      # ---------------------------------------------------------------------------
+      # Download only the junit-* artifacts and run-id/artifact-id sidecars of the triggering run.
       - name: List artifacts from triggering run
         id: list-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ARTIFACTS=$(gh api --paginate \
-            "/repos/${{ github.repository }}/actions/runs/${TRIGGERING_RUN_ID}/artifacts?per_page=100" \
-            --jq '.artifacts[] | {id: .id, name: .name}' \
-            | python3 -c "import json,sys; print(json.dumps([json.loads(l) for l in sys.stdin if l.strip()]))")
-          echo "artifacts=$ARTIFACTS" >> "$GITHUB_OUTPUT"
-          echo "Found artifacts:"
-          echo "$ARTIFACTS" | python3 -c "import json,sys; [print(' •', a['name']) for a in json.load(sys.stdin)]"
+          python3 .github/scripts/list_run_artifacts.py --run-id "${TRIGGERING_RUN_ID}"
 
       - name: Download XML artifacts
+        id: download-artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARTIFACTS: ${{ steps.list-artifacts.outputs.artifacts }}
         run: |
-          mkdir -p xml_artifacts
-          export ARTIFACTS='${{ steps.list-artifacts.outputs.artifacts }}'
-          python3 <<'PYEOF'
-          import json, os, subprocess, sys
-          from pathlib import Path
-
-          artifacts = json.loads(os.environ['ARTIFACTS'])
-          repo  = os.environ['GITHUB_REPOSITORY']
-          for a in artifacts:
-              print(f"Downloading: {a['name']} (id={a['id']})")
-              with open(f"xml_artifacts/{a['name']}.zip", "wb") as f:
-                result = subprocess.run([
-                    "gh", "api",
-                    f"/repos/{repo}/actions/artifacts/{a['id']}/zip",
-                ], check=True, env={**os.environ}, capture_output=True)
-                f.write(result.stdout)
-              # Each artifact unzips into its OWN subdirectory (named after
-              # the artifact) rather than a shared flat one, so two suites
-              # can never clobber each other even if they happen to produce
-              # a JUnit XML with the same basename. ingest_xml_si.py globs
-              # --xml-dir recursively and derives a unique filename from the
-              # path relative to it, so this nesting is exactly what it
-              # expects.
-              dest = Path("xml_artifacts") / a["name"]
-              subprocess.run(
-                  ["unzip", "-o", f"xml_artifacts/{a['name']}.zip", "-d", str(dest)],
-                  check=True,
-              )
-          PYEOF
+          python3 .github/scripts/download_xml_artifacts.py --out-dir xml_artifacts
           echo "Downloaded XML files:"
           find xml_artifacts -name "*.xml" 2>/dev/null || echo "(none)"
 
       # The orchestrator's threaded run_id, uploaded as an artifact because this workflow runs on
       # workflow_run and so cannot read the triggering run's inputs. Empty on a GHA-initiated run
       # or a manual re-ingest, in which case the ingest derives its own id from the run coordinate.
-      - name: Resolve orchestrator run_id
+      - name: Resolve threaded run_id
         id: resolve-run-id
         run: |
-          # Two producers upload the same value under different names: integration-tests.yaml
-          # writes "orchestrator-run-id", and _test_matrix.yaml (used by test_each_commit) writes
-          # "run-id". Both ride in via the download-every-artifact step above, so read whichever
-          # is present rather than adding a second API round-trip for one of them.
-          RID=""
-          for f in xml_artifacts/orchestrator-run-id/run-id.txt \
-                   xml_artifacts/run-id/run-id.txt; do
-            if [[ -f "$f" ]]; then
-              RID="$(tr -d '[:space:]' < "$f")"
-              [[ -n "$RID" ]] && break
-            fi
-          done
+          # _test_matrix.yaml or integration-tests.yaml uploads "run-id", downloaded with the XML.
+          RID="$(tr -d '[:space:]' < xml_artifacts/run-id/run-id.txt 2>/dev/null || true)"
           echo "Threaded run_id: ${RID:-<none, ingest will derive from the run coordinate>}"
           echo "run_id=${RID}" >> "${GITHUB_OUTPUT}"
+
+      # Uploaded by _test_matrix's artifact_identity job and downloaded with the XML above.
+      # Absent (unadopted run, image with no stamped id) makes the v2 ingest write cases only.
+      - name: Resolve this run's artifact_id
+        id: leg-artifact-id
+        run: |
+          REC="$(tr -d '[:space:]' < xml_artifacts/artifact-id/artifact-id.txt 2>/dev/null || true)"
+          LEG_AID="${REC%%|*}"
+          echo "Leg artifact_id: ${LEG_AID:-<none, no artifact rows>}"
+          echo "value=${REC}" >> "${GITHUB_OUTPUT}"
 
       - name: Resolve test_type for trigger_type
         id: extract-tier
         run: |
-          if [[ "${TRIGGERING_WORKFLOW}" == "test_each_commit" ]]; then
-            # test_each_commit's run-name IS the external-facing tier name
-            # itself ("trunk" on push, "regression" otherwise) -- no parens
-            # to parse out.
-            TIER="${TRIGGERING_DISPLAY_TITLE}"
-          else
-            # integration-tests' run-name is deliberately
-            # "integration-tests (<inputs.test_type>)" -- the RAW test_type
-            # value the caller passed (e.g. "integration" / "regression" /
-            # "trunk"); there is no internal alias vocabulary to resolve
-            # through (see _test_matrix.yaml's test_type description) -- so
-            # parsing it out of display_title recovers the real external-
-            # facing value without an extra API call.
+          # Keyed on the title's shape, not TRIGGERING_WORKFLOW: workflow_run.name carries the
+          # run-name, so it is never "test_each_commit".
+          if [[ "${TRIGGERING_DISPLAY_TITLE}" == *"("*")"* ]]; then
+            # integration-tests: "integration-tests (<inputs.test_type>)".
             TIER=$(echo "${TRIGGERING_DISPLAY_TITLE}" | sed -n 's/.*(\(.*\))\s*$/\1/p')
+          else
+            # test_each_commit: the bare tier ("trunk" on push, "regression" otherwise).
+            TIER="${TRIGGERING_DISPLAY_TITLE}"
           fi
           echo "Resolved test_type: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
@@ -287,61 +246,7 @@ jobs:
       - name: Group XML files by leg arch
         id: group-by-arch
         run: |
-          python3 - <<'PYEOF'
-          import os
-          from pathlib import Path
-
-          ROOT = Path("xml_artifacts")
-          OUT = Path("xml_by_arch")
-          DEFAULT_ARCH = "x86_64"
-          KNOWN_ARCHES = ("x86_64", "ppc64le", "s390x")
-
-          def canonical(arch: str) -> str:
-              a = arch.strip().lower()
-              return "x86_64" if a in ("amd64", "x86", "x86-64", "x86_64") else a
-
-          def leg_arch(xml_path: Path) -> str:
-              # A name-derived sidecar first, then any leg-arch-*.txt beside the XML.
-              sidecar = xml_path.with_name(
-                  xml_path.stem.replace("junit-", "leg-arch-") + ".txt"
-              )
-              for candidate in (sidecar, *sorted(xml_path.parent.glob("leg-arch-*.txt"))):
-                  try:
-                      arch = candidate.read_text().strip()
-                  except OSError:
-                      continue
-                  if arch:
-                      return arch
-              return ""
-
-          groups: dict[str, int] = {}
-          for xml_path in sorted(ROOT.rglob("*.xml")):
-              arch = canonical(leg_arch(xml_path) or DEFAULT_ARCH)
-              dest_dir = OUT / arch
-              dest_dir.mkdir(parents=True, exist_ok=True)
-              # Flattened with the relative path as filename: the action globs non-recursively.
-              rel = xml_path.relative_to(ROOT)
-              dest = dest_dir / str(rel).replace(os.sep, "__")
-              dest.symlink_to(xml_path.resolve())
-              groups[arch] = groups.get(arch, 0) + 1
-
-          print("Grouped XML files by leg arch:")
-          for arch, n in sorted(groups.items()):
-              print(f"  {arch}: {n} file(s)")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              for arch in KNOWN_ARCHES:
-                  present = "true" if groups.get(arch, 0) > 0 else "false"
-                  f.write(f"has_{arch}={present}\n")
-
-          unknown = sorted(set(groups) - set(KNOWN_ARCHES))
-          if unknown:
-              print(
-                  f"::warning::XML grouped under unrecognised arch(es) {unknown}; v2 "
-                  "will not be written for them -- add to KNOWN_ARCHES in "
-                  "push-to-clickhouse.yaml's grouping step."
-              )
-          PYEOF
+          python3 .github/scripts/group_xml_by_arch.py --src-dir xml_artifacts --dest-dir xml_by_arch
 
       - name: Ingest XML into shared v2 ClickHouse tables (x86_64)
         if: steps.group-by-arch.outputs.has_x86_64 == 'true'
@@ -353,8 +258,13 @@ jobs:
           sha: ${{ env.TRIGGERING_SHA }}
           run-id: ${{ steps.resolve-run-id.outputs.run_id }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          # x86_64 only: the record describes the x86_64 image every matrix leg runs on.
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
+          repository: ${{ github.repository }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
+          # Tags the artifact <repo>@<sha12> (push to main) or <repo>#<pr>[@<sha12>] (PR).
+          ci-event: ${{ env.TRIGGERING_EVENT }}
           trigger-type: ${{ steps.extract-tier.outputs.tier }}
           platform: x86_64
           component: spyre-inference

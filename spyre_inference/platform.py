@@ -47,9 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
-# accepted only when asked for explicitly. Both are 2 bytes wide, so every
-# stick-alignment constant in this plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the validated one; bfloat16 passes this check, but
+# apply_config_platform_defaults overwrites every model's dtype with float16, an explicit
+# --dtype bfloat16 included, so only a config edited after construction reaches it. Both are
+# 2 bytes wide, so every stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -338,8 +339,8 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
-        # This must be set here as the default, otherwise all usage (including test fixtures) would
-        # require setting the dtype.
+        # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
+        # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
@@ -458,41 +459,59 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
-        """Override hf_config.head_dim to a 128-multiple when the native head_dim
-        is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
+        """Override hf_config.head_dim to a stick-aligned size when the native
+        head_dim isn't one, stashing the original as ``_spyre_orig_head_dim``.
 
         Applies to the Transformers backend too: padding only the RoPE rotation leaves
         the KV cache allocated at the native ``get_head_size()``, which the device copy
         requires to be stick-aligned.
 
-        No-op for models whose head_dim is already a multiple of 128 (e.g.
-        head_size=128 Granite) and for models without RoPE. The restickify failure
-        this works around is RoPE-induced, so non-RoPE models (OPT, GPT-2,
-        GPT-BigCode) lower fine at head=64; padding them is both unnecessary and
-        unsupported by the port, which assumes a RoPE model that sizes attention from
-        ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
-        ``config.head_dim`` and uses ``out_proj``).
+        RoPE and pooling models pad to the next 64-multiple: a sub-stick head (e.g.
+        head_size=32 sharing a stick between two heads) cannot lower, while
+        SpyreRotaryEmbedding handles a sub-stick half (head_size=64). The Transformers
+        backend's RoPE views a head as two halves, so there RoPE models pad to the next
+        128-multiple. Non-RoPE generative decoders (OPT/GPT-2) are skipped; pooling
+        models also go through the construction patch in
+        ``spyre_inference.custom_ops.bert_head_pad`` (the generic property-shim doesn't
+        work on BertSelfAttention's own assert).
+
+        No-op for models whose head_dim is already a multiple of the applicable size.
         """
         from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        num_heads = getattr(hf_config, "num_attention_heads", None)
-        hidden_size = getattr(hf_config, "hidden_size", None)
+        # The config the runner's padding passes read, so both agree on the text part.
+        target_cfg = model_config.hf_text_config
+        num_heads = getattr(target_cfg, "num_attention_heads", None)
+        hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
             return
 
         # transformers 5.x unifies all RoPE config under `rope_parameters`
-        cfgs = (hf_config, model_config.hf_text_config)
-        if not any(getattr(c, "rope_parameters", None) for c in cfgs):
+        cfgs = tuple(
+            c
+            for c in (
+                hf_config,
+                getattr(hf_config, "text_config", None),
+                model_config.hf_text_config,
+            )
+            if c is not None
+        )
+        has_rope = any(getattr(c, "rope_parameters", None) for c in cfgs)
+        if has_rope:
+            multiple = 128 if model_config.using_transformers_backend() else 64
+        elif cls._is_pooling_model(vllm_config):
+            multiple = 64
+        else:
             return
 
-        orig = getattr(hf_config, "head_dim", None) or hidden_size // num_heads
-        if orig % 128 == 0:
+        orig = getattr(target_cfg, "head_dim", None) or hidden_size // num_heads
+        if orig % multiple == 0:
             return
 
-        padded = ((orig + 127) // 128) * 128
-        for cfg in (hf_config, model_config.hf_text_config):
+        padded = ((orig + multiple - 1) // multiple) * multiple
+        for cfg in cfgs:
             reason = reduced_rotary_dim_reason(cfg)
             if reason is not None:
                 raise NotImplementedError(
@@ -500,7 +519,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"alignment, but this model reduces the rotary dimension below "
                     f"head_dim ({reason})."
                 )
-        for cfg in {id(c): c for c in (hf_config, model_config.hf_text_config)}.values():
+        for cfg in {id(c): c for c in cfgs}.values():
             cfg._spyre_orig_head_dim = orig
             cfg.head_dim = padded
         # ModelConfig snapshots head_size into model_arch_config in __post_init__,
@@ -603,12 +622,40 @@ class TorchSpyrePlatform(CpuPlatform):
             )
 
     @classmethod
+    def _warn_if_not_in_registry(cls, vllm_config: VllmConfig) -> None:
+        """Warn when the requested model/tp/max_model_len/platform is not in the registry.
+
+        The registry is not exhaustive — unknown models may still work — so this
+        is a warning, not an error.
+        """
+        from spyre_inference.config import current_platform, lookup_config
+
+        model_id = vllm_config.model_config.model
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        max_model_len = vllm_config.model_config.max_model_len
+        machine = current_platform()
+
+        cfg = lookup_config(model_id, tp_size=tp_size, max_model_len=max_model_len, machine=machine)
+        if cfg is None:
+            logger.warning(
+                "Model %r with tp_size=%d max_model_len=%d platform=%s is not in the "
+                "Spyre model registry. The run may still succeed, but this "
+                "configuration has not been validated.",
+                model_id,
+                tp_size,
+                max_model_len,
+                machine,
+            )
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         cls.log_server_boot(vllm_config)
 
         # A bare VllmConfig() (no model) reaches this hook too; guard each
         # model_config access like upstream CpuPlatform.
         if vllm_config.model_config is not None:
+            cls._warn_if_not_in_registry(vllm_config)
+
             # From here, not from `hf_overrides`, so a user-supplied override does not skip
             # it; no-op for every other model. Runs again for the nested text config a
             # multimodal model builds its decoder from.
@@ -691,6 +738,56 @@ class TorchSpyrePlatform(CpuPlatform):
 
         configure_threading(parallel_config.world_size)
 
+        # Pin the V1 model runner: TorchSpyreWorker builds the V1 GPUModelRunner subclass
+        # directly, so V2 is not merely slower here, it does not run.
+        #
+        # Load-bearing twice over. VllmConfig.use_v2_model_runner returns an explicitly
+        # set VLLM_USE_V2_MODEL_RUNNER *before* it reaches the HAS_TRITON fallback, and
+        # HAS_TRITON is not reliably False here: a cpu-target vLLM build (>= 0.31) pulls
+        # in triton-cpu, which makes V2 the default.
+        if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") not in (None, "", "0"):
+            logger.warning(
+                "Spyre only supports the V1 model runner; overriding "
+                "VLLM_USE_V2_MODEL_RUNNER=%s to 0.",
+                os.environ["VLLM_USE_V2_MODEL_RUNNER"],
+            )
+        os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+
+        # Two features outrank that env var inside use_v2_model_runner, so rejecting them
+        # here is what actually keeps the pin true. Left alone, hisparse raises
+        # "HiSparse requires Model Runner V2; remove VLLM_USE_V2_MODEL_RUNNER=0" --
+        # blaming an env var the user never set, since we just set it -- and watermarking
+        # silently returns V2 anyway, landing on the missing Triton much later.
+        if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
+            raise ValueError(
+                "Spyre does not support HiSparse: it requires the V2 model runner, and "
+                "TorchSpyreWorker only builds the V1 runner."
+            )
+        if getattr(vllm_config, "watermark_config", None) is not None:
+            raise ValueError(
+                "Spyre does not support watermarking: it requires the V2 model runner, "
+                "and TorchSpyreWorker only builds the V1 runner."
+            )
+        # 0.31 leaves AuxOutput validation to out-of-tree platforms; in-tree it is only
+        # wired to the V2 runner, so on ours it would be accepted and never produced.
+        aux_output_config = getattr(vllm_config, "aux_output_config", None)
+        if aux_output_config is not None and aux_output_config.enabled:
+            raise ValueError(
+                "Spyre does not support AuxOutput (e.g. returning routed experts): it "
+                "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
+                "runner."
+            )
+
+        # The pin holds only if the resolved property agrees; anything new that outranks
+        # the env var must fail here rather than at the first V2-only code path. A raise,
+        # not an assert: -O would strip the tripwire and restore the deferred failure.
+        if vllm_config.use_v2_model_runner is not False:
+            raise RuntimeError(
+                "VLLM_USE_V2_MODEL_RUNNER=0 did not take effect: use_v2_model_runner is "
+                "True. A config field now forces the V2 model runner, which Spyre cannot "
+                "use; reject it in TorchSpyrePlatform.check_and_update_config."
+            )
+
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
@@ -732,6 +829,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # a single group drawing from the single global BlockPool.
         # Pooling / encoder-only models have no KV cache — do not size one.
         cache_config = vllm_config.cache_config
+        # Prefix caching on a zero-group config makes vLLM pick HybridKVCacheCoordinator,
+        # which asserts it has ≥2 attention groups.
+        if cls._is_pooling_model(vllm_config) and cache_config.enable_prefix_caching:
+            logger.info("Disabling prefix caching: pooling/encoder-only model has no KV cache.")
+            cache_config.enable_prefix_caching = False
+
         if vllm_config.model_config is not None and cache_config.num_gpu_blocks_override is None:
             if cls._is_pooling_model(vllm_config):
                 logger.info(

@@ -17,13 +17,17 @@
 Applies neox RoPE on Spyre via a 2x2 rotation-matrix formulation (ported from
 foundation-model-stack). The rotation cache is device-resident; ``forward_oot`` gathers
 this pass's per-token slice with ``index_select`` and applies it with ``_rotate_neox_2x2``,
-both directly in the full-model compile graph.
+both directly in the enclosing compile graph (the transformer block, by default).
 
 The cache must be materialized on-device *before* compile: building it inside the traced
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
 ``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
 The cache is flattened to 2D and placed rows-outermost (see ``place_row_gathered``).
+
+A head whose half is not stick-aligned (head_size=64) uses ``_rotate_neox_split_free``
+instead: the 2x2 form views each head as two halves, which cannot restickify when a
+half is narrower than a stick.
 
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
@@ -46,6 +50,9 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
 
 from .utils import place_row_gathered
 
+# One Spyre stick of fp16 elements.
+_STICK = 64
+
 logger = init_logger(__name__)
 
 
@@ -57,8 +64,8 @@ def _rotate_neox_2x2(
     """Apply full neox RoPE via per-token 2x2 rotation matrices.
 
     ``x`` is [T, H*head_size] or [T, H, head_size]; ``rot`` is [T, 2, 2, head_size // 2].
-    The inner dim head_size // 2 is stick-aligned (the platform pads head_dim to a
-    128-multiple before RoPE is built), so the split-half pairing is a pure view.
+    The inner dim head_size // 2 is stick-aligned (a head whose half isn't takes
+    ``_rotate_neox_split_free``), so the split-half pairing is a pure view.
     Returns the rotated tensor with ``x``'s shape.
     """
     num_tokens = x.shape[0]
@@ -68,12 +75,41 @@ def _rotate_neox_2x2(
     return out.flatten(-2).view(x.shape)
 
 
-class _SpyreRotaryMixin:
-    """Spyre RoPE wiring shared by the base and llama3 OOT classes.
+def _rotate_half_matrix(head_size: int, dtype: torch.dtype) -> torch.Tensor:
+    """``x @ R == cat(-x[half:], x[:half])``, neox ``rotate_half`` as a signed permutation."""
+    half = head_size // 2
+    idx = torch.arange(half)
+    r = torch.zeros(head_size, head_size, dtype=dtype)
+    r[idx + half, idx] = -1.0
+    r[idx, idx + half] = 1.0
+    return r
 
-    Runs the 2x2 rotation on Spyre for supported configs; unsupported configs raise
-    ``NotImplementedError`` at construction. The rotation cache is derived lazily from
-    the base ``cos_sin_cache`` (inheriting all rope-scaling variants) and kept on CPU.
+
+def _rotate_neox_split_free(
+    x: torch.Tensor,
+    cos_sin: torch.Tensor,
+    rotate_half: torch.Tensor,
+    head_size: int,
+) -> torch.Tensor:
+    """Full neox RoPE as ``x * cos + rotate_half(x) * sin``, viewing only whole heads.
+
+    ``x`` is [T, H*head_size] or [T, H, head_size]; ``cos_sin`` is [T, 2, head_size].
+    """
+    num_tokens = x.shape[0]
+    heads = x.view(num_tokens, -1, head_size)
+    cos, sin = cos_sin[:, 0].unsqueeze(1), cos_sin[:, 1].unsqueeze(1)
+    rotated = (heads.reshape(-1, head_size) @ rotate_half).view(heads.shape)
+    return (heads * cos + rotated * sin).view(x.shape)
+
+
+class _SpyreRotaryMixin:
+    """Spyre RoPE wiring shared by the OOT rotary classes.
+
+    Runs the 2x2 (or, for a sub-stick half, split-free) rotation on Spyre for supported
+    configs; unsupported configs raise ``NotImplementedError`` at construction. The
+    rotation cache is derived lazily on CPU from the base ``cos_sin_cache`` (inheriting
+    all rope-scaling variants), and ``_apply`` places a copy on the device when the
+    module moves there.
     """
 
     def __init__(self, *args, **kwargs):
@@ -89,6 +125,12 @@ class _SpyreRotaryMixin:
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Set only for the split-free path, i.e. when a half head is sub-stick.
+        self._rotate_half = (
+            _rotate_half_matrix(self.head_size, self.cos_sin_cache.dtype)
+            if self._padded_inner % _STICK != 0
+            else None
+        )
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
@@ -97,6 +139,8 @@ class _SpyreRotaryMixin:
         self._device_rotation_cache = place_row_gathered(
             self._get_device_rotation_cache(), fn, "RoPE rotation cache"
         )
+        if self._rotate_half is not None:
+            self._rotate_half = fn(self._rotate_half)
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
@@ -105,7 +149,7 @@ class _SpyreRotaryMixin:
         _padded_inner when a padded head injected a narrower original-frequency cache."""
         if self._rotation_cache is None:
             # Derive inner from the cache actually present, not rotary_dim: when a
-            # head is padded (head_size=64 -> 128), fix_padded_rope injects the
+            # head is padded (e.g. head_size=96 -> 128), fix_padded_rope injects the
             # original narrower cos_sin_cache so the real frequencies survive; the
             # trailing dims are then zero-padded to _padded_inner (harmless because
             # the matching x pair dims are zero from weight padding).
@@ -122,9 +166,15 @@ class _SpyreRotaryMixin:
     def _get_device_rotation_cache(self) -> torch.Tensor:
         """Device-resident rotation cache, flattened to 2D ``[max_pos, 4 * padded]`` so
         it can be stickified with the position axis outermost, and gathered on-device via
-        ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
+        ``index_select`` (single-row gather has a kernel since torch-spyre#3418). The
+        split-free path stores ``[cos | cos | sin | sin]`` instead."""
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = self._get_rotation_cache().flatten(1)
+            rot = self._get_rotation_cache()
+            if self._rotate_half is not None:
+                cos, sin = rot[:, 0, 0], rot[:, 1, 0]
+                self._device_rotation_cache = torch.cat([cos, cos, sin, sin], dim=-1)
+            else:
+                self._device_rotation_cache = rot.flatten(1)
         return self._device_rotation_cache
 
     def forward_oot(
@@ -135,6 +185,16 @@ class _SpyreRotaryMixin:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache()
+        rotate_half = self._rotate_half
+        if rotate_half is not None:
+            cos_sin = cache.index_select(0, positions.flatten()).view(-1, 2, self.head_size)
+            out_query = _rotate_neox_split_free(query, cos_sin, rotate_half, self.head_size)
+            out_key = (
+                _rotate_neox_split_free(key, cos_sin, rotate_half, self.head_size)
+                if key is not None
+                else None
+            )
+            return out_query, out_key
         rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
         out_query = _rotate_neox_2x2(query, rot, self.head_size)
         out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None

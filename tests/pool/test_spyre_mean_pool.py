@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre MEAN pooling: packed fp16 D2H then host ``MeanPool``.
+"""Spyre MEAN pooling: per-lane fp32 sum on a rectangle, else packed D2H then ``MeanPool``.
 
 Destagger of a device fp32 sum is garbage; see
 ``test_spyre_fp32_reduce_d2h_with_destagger``.
@@ -34,9 +34,10 @@ def spyre_device():
     return torch.device("spyre")
 
 
-def _mean_cursor(lens: torch.Tensor):
+def _mean_cursor(lens: torch.Tensor, grid_extent: int | None = None):
     class _Cursor:
         prompt_lens_cpu = lens
+        spyre_grid_extent = grid_extent
 
         def is_partial_prefill(self) -> bool:
             return False
@@ -140,3 +141,34 @@ def test_spyre_mean_pool_accumulates_in_float32(spyre_device):
     assert out.dtype == torch.float32
     torch.testing.assert_close(out.cpu(), expected, atol=1e-3, rtol=1e-3)
     assert out[0, 0].item() > 4.9
+
+
+@pytest.mark.parametrize(
+    "lanes,lens",
+    [
+        pytest.param(4, [3, 64, 10], id="pad-lane-past-the-real-count"),
+        pytest.param(3, [5, 1, 64], id="grid-narrower-than-the-bucket"),
+    ],
+)
+def test_spyre_mean_pool_grid_matches_cpu_fp32(spyre_device, lanes, lens):
+    """On the rectangular path each lane is one sequence, reduced in place.
+
+    Lanes past the real count, and rows past each length inside a lane, must not
+    enter any mean. Three sequences round up to a bucket of four, which a 3-lane
+    grid cannot hold -- the reduce then stops at the grid's width.
+    """
+    extent, hidden_size = 64, 64
+    rows = torch.arange(lanes * extent, dtype=torch.float32).unsqueeze(1)
+    cols = torch.arange(hidden_size, dtype=torch.float32).unsqueeze(0)
+    hidden_cpu = ((rows % 13) + (cols % 5)).to(torch.float16)
+    meta = _mean_cursor(torch.tensor(lens, dtype=torch.int64), grid_extent=extent)
+    out = SpyreMeanPool().forward(hidden_cpu.to(spyre_device), meta)
+    expected = torch.stack(
+        [
+            hidden_cpu[i * extent : i * extent + n].to(torch.float32).mean(0)
+            for i, n in enumerate(lens)
+        ]
+    )
+    assert out.dtype == torch.float16
+    assert out.shape[0] == len(lens)
+    torch.testing.assert_close(out.cpu().to(torch.float32), expected, atol=1e-2, rtol=1e-3)

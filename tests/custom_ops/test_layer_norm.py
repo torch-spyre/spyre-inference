@@ -95,9 +95,9 @@ def test_spyre_layer_norm_matches_reference_on_spyre(
 
 
 @pytest.mark.layer_norm
-def test_spyre_layer_norm_eager_mode_skips_torch_compile():
-    """CompilationMode.NONE (enforce_eager) runs the raw _layer_norm_kernel
-    directly, without ever populating a torch.compile'd kernel."""
+def test_spyre_layer_norm_compiles_in_eager_mode():
+    """CompilationMode.NONE (enforce_eager) still compiles the kernel: its eager output
+    layout crashes the next eager LayerNorm (CLIP's first encoder block)."""
     from vllm.config import (
         CompilationMode,
         DeviceConfig,
@@ -122,7 +122,7 @@ def test_spyre_layer_norm_eager_mode_skips_torch_compile():
         layer = SpyreLayerNorm(64, eps=1e-5).to(torch.float16).to("spyre")
         layer(torch.randn(2, 64, dtype=torch.float16).to("spyre"))
 
-    assert layer.spyre_compiled_kernel is None
+    assert layer.spyre_compiled_kernel is not None
 
 
 @pytest.mark.layer_norm

@@ -37,10 +37,10 @@ def walk_tiles(
 ) -> tuple[tuple, Any]:
     """Run `body` once per tile of `operands`, threading the carry through.
 
-    Same contract as `torch_spyre`'s `for_each_tile`, which is what runs with
-    SPYRE_ATTN_FOR_EACH_TILE set. Unset, the identical body runs under a Python
-    `for` loop, as the kernels did before `for_each_tile` existed, so a regression
-    in the tiled op or in the pin is isolated by unsetting one variable.
+    Same contract as `torch_spyre`'s `for_each_tile`, which is what runs by default
+    (SPYRE_ATTN_FOR_EACH_TILE=1). With it set to 0, the identical body runs under a
+    Python `for` loop, as the kernels did before `for_each_tile` existed, so a
+    regression in the tiled op or in the pin is isolated by flipping one variable.
 
     The loop path passes `carry=None` on the first trip rather than `init`: a
     materialized init and a computed tile can stickify differently for the same

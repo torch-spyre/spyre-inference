@@ -14,10 +14,9 @@
 
 """The out-of-band ``token_type_ids`` buffer must always match ``input_ids``.
 
-The buffer is reused across steps so the compiled graph sees one tensor, which
-makes a length change the interesting case: the embedding adds the buffer to the
-word embeddings inside the compiled region, so a stale length is a hard failure
-there rather than a wrong answer here.
+The buffer is reused across steps so the compiled graph sees segment IDs of the
+right shape: the embedding uses them to gather segment vectors and adds those to
+word embeddings. A stale length breaks that compiled lookup/addition.
 """
 
 import torch
@@ -33,8 +32,9 @@ class _Embedding(SpyreTokenTypeEmbedding):
 
 
 def _segment_ids(embedding: _Embedding, input_ids: torch.Tensor) -> torch.Tensor:
-    """The segment ids the embedding actually consumes for ``input_ids``."""
-    return embedding.spyre_token_type_embeddings(input_ids)[:, 0].to(torch.int64)
+    """The segment ids the embedding forward resolves, then gathers."""
+    token_type_ids = embedding.spyre_token_type_ids_for(input_ids)
+    return embedding.token_type_embeddings(token_type_ids)[:, 0].to(torch.int64)
 
 
 def test_padded_segment_ids_are_zero_extended():
@@ -58,8 +58,8 @@ def test_buffer_follows_a_shorter_padded_length():
 
 
 def test_batch_without_segment_ids_resizes_the_buffer():
-    """The regression: the None path used to zero the buffer without resizing it,
-    so the next embedding added a previous-length buffer inside the graph."""
+    """The regression: the None path zeroed the buffer without resizing it,
+    so the next embedding gathered segments with previous-length IDs."""
     embedding = _Embedding()
     embedding.set_spyre_token_type_ids(torch.arange(6), torch.tensor([0, 0, 1, 1]))
 

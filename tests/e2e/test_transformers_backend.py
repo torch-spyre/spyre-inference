@@ -336,11 +336,16 @@ def _model_repo(path, *, mistral_format: bool) -> str:
     return str(path)
 
 
-def _vllm_config(model: str):
+def _vllm_config(model: str, model_impl: str = "auto"):
     from vllm.config import LoadConfig, ModelConfig, VllmConfig
 
     model_config = ModelConfig(
-        model=model, trust_remote_code=False, dtype="float16", seed=0, max_model_len=128
+        model=model,
+        trust_remote_code=False,
+        dtype="float16",
+        seed=0,
+        max_model_len=128,
+        model_impl=model_impl,
     )
     return VllmConfig(model_config=model_config, load_config=LoadConfig())
 
@@ -365,7 +370,9 @@ def test_fix_generic_config_re_resolves_and_forces_hf_weights(tmp_path):
 
     from spyre_inference.transformers_backend import SpyreTransformersForCausalLM
 
-    vllm_config = _vllm_config(_model_repo(tmp_path, mistral_format=True))
+    # _fix_generic_config only runs on the Transformers backend, the one path that still
+    # pads head_dim 64 -> 128.
+    vllm_config = _vllm_config(_model_repo(tmp_path, mistral_format=True), "transformers")
     assert vllm_config.load_config.load_format == "auto"
 
     SpyreTransformersForCausalLM._fix_generic_config(vllm_config)

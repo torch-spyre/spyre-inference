@@ -1,0 +1,36 @@
+# Serve benchmarks for Llama models on Spyre devices.
+#
+# Llama 3.1 8B Instruct uses SPYRE_AIOPS_DATASET (4k).
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 32
+    enable-prefix-caching: true
+    enable-chunked-prefill: true
+  parameters:
+    dataset-name: custom
+    num-prompts: 200
+    custom-output-len: -1
+    ignore-eos: true
+    temperature: 0.1
+    endpoint: /v1/completions
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 5
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Llama 3.1 8B Instruct — text
+  # ---------------------------------------------------------------------------
+  - test_name: serve_llama31-8b_tp4_aiops
+    server_parameters:
+      model: meta-llama/Llama-3.1-8B-Instruct
+      tensor-parallel-size: 4
+      max-model-len: 32768
+    parameters:
+      dataset-path: ${SPYRE_AIOPS_DATASET}

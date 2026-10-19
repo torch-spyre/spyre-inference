@@ -21,7 +21,7 @@ on:
     branches: [main]
     tags: ['*']
   pull_request:
-    branches: [main]
+    branches: [main, 'release-*']
   merge_group:
     types: [checks_requested]
 
@@ -31,7 +31,6 @@ concurrency:
 
 permissions:
   contents: read
-  checks: write
   actions: read
 
 jobs:

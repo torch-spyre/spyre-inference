@@ -31,6 +31,8 @@ Visit our [documentation](https://torch-spyre.github.io/spyre-inference/):
 
 We welcome and value any contributions and collaborations. Please check out [Contributing to Spyre Inference](https://torch-spyre.github.io/spyre-inference/latest/contributing/) for how to get involved.
 
+This project follows the [Code of Conduct](.github/CODE_OF_CONDUCT.md). By participating, you are expected to uphold it.
+
 ## Contact
 
 You can reach out for discussion or support in the `#sig-spyre` channel in the [vLLM Slack](https://inviter.co/vllm-slack) workspace or by [opening an issue](https://github.com/torch-spyre/spyre-inference/issues).

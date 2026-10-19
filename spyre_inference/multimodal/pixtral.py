@@ -21,38 +21,19 @@ monkeypatch and `apply()` is the only entry point.
 
 from __future__ import annotations
 
-from functools import cache
-
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import (
+    block_diagonal_mask,
+    padded_sdpa,
+    rope_perm_matrix,
+    rope_rotate_matmul,
+)
 
 logger = init_logger(__name__)
-
-
-@cache
-def rope_perm_matrix(kind: str, head_dim: int, device: torch.device) -> torch.Tensor:
-    """Constant `[head_dim, head_dim]` permutation `M` so `x @ M` is a rope shuffle.
-
-    Rotating by a full-width matmul avoids slicing the head into `d/2`-wide halves:
-    at head_dim=64 that half is 32, which torch-spyre cannot lay out ("Unexpected
-    stick expression ... Mod(var, 32)"). kind="pair" swaps each `(2k, 2k+1)` pair.
-    """
-    if kind != "pair":
-        raise ValueError(f"unknown rope permutation kind {kind!r}")
-    m = torch.zeros(head_dim, head_dim, dtype=torch.float16)
-    even = torch.arange(0, head_dim, 2)
-    m[even, even + 1] = 1.0
-    m[even + 1, even] = 1.0
-    return convert(m, device=device, dtype=torch.float16)
-
-
-def rope_rotate_matmul(x, cos, sin, m: torch.Tensor):
-    """`x*cos + (x @ m)*sin` — the rope rotation as a stick-aligned matmul."""
-    return x * cos + torch.matmul(x, m) * sin
 
 
 def patch_vision_attention() -> None:
@@ -60,8 +41,8 @@ def patch_vision_attention() -> None:
 
     At a patch count coprime with the 64 stick, stock SDPA either fails to restickify
     a batch-matmul operand or returns silently wrong values, so the padding is a
-    correctness requirement. The body is upstream's non-xformers branch with only the
-    SDPA call swapped; `patch_vision_rope_vit` must run first because
+    correctness requirement. Images are packed along the sequence, so the block-diagonal
+    mask is rebuilt from `cu_seqlens`. `patch_vision_rope_vit` must run first because
     `apply_rotary_emb_vit` is resolved by name at call time.
     """
     try:
@@ -73,7 +54,7 @@ def patch_vision_attention() -> None:
     if attn_cls is None or getattr(attn_cls.forward, "_spyre_patched", False):
         return
 
-    def _forward(self, x, mask, freqs_cis):
+    def _forward(self, x, freqs_cis, cu_seqlens, max_seqlen=None, sequence_lengths=None):
         batch, patches, _ = x.shape
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
@@ -85,7 +66,7 @@ def patch_vision_attention() -> None:
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        out = padded_sdpa(q, k, v, mask)
+        out = padded_sdpa(q, k, v, block_diagonal_mask(cu_seqlens, patches))
         out = out.transpose(1, 2).reshape(batch, patches, self.n_heads * self.head_dim)
         out, _ = self.o_proj(out)
         return out
@@ -127,7 +108,7 @@ def patch_vision_rope_vit() -> None:
             # `positions[:, 1]` has storage_offset=1, which the device needs
             # stick-aligned, so fold both columns into a flat index on CPU first.
             row, col = idx
-            flat = (row.to("cpu") * self._width + col.to("cpu")).to(torch.int64)
+            flat = (convert(row, "cpu") * self._width + convert(col, "cpu")).to(torch.int64)
             flat = convert(flat, device=self._table.device, dtype=torch.int64)
             return self._table.index_select(0, flat)  # (seq, 2, head_dim)
 
@@ -145,8 +126,8 @@ def patch_vision_rope_vit() -> None:
             cos_full = cos.repeat_interleave(2, dim=-1)
             sin_signed = torch.stack([-sin, sin], dim=-1).reshape(*sin.shape[:-1], -1)
             packed = torch.stack([cos_full, sin_signed], dim=-2)  # (H, W, 2, head_dim)
-            self._freqs_cis = packed.reshape(-1, packed.shape[-2], packed.shape[-1]).to(
-                torch.float16
+            self._freqs_cis = convert(
+                packed.reshape(-1, packed.shape[-2], packed.shape[-1]), dtype=torch.float16
             )  # (H*W, 2, head_dim) on CPU
         if self._freqs_cis.device != self.device:
             self._freqs_cis = convert(self._freqs_cis, device=self.device, dtype=torch.float16)
@@ -172,37 +153,6 @@ def patch_vision_rope_vit() -> None:
     )
 
 
-def patch_block_attention_mask() -> None:
-    """Build Pixtral's block-diagonal vision mask on CPU.
-
-    Upstream zeroes one `[start:end, start:end]` sub-block per image on
-    `patch_embeds.device`; with N images those are strided sub-block writes, which are
-    not stick-safe. `_padded_attn_mask` pulls the mask to CPU anyway.
-    """
-    try:
-        from transformers.models.pixtral import modeling_pixtral
-    except ImportError:
-        return
-
-    orig = getattr(modeling_pixtral, "generate_block_attention_mask", None)
-    if orig is None or getattr(orig, "_spyre_patched", False):
-        return
-
-    def _cpu_mask(patch_embeds_list, tensor):
-        if tensor.device.type != "spyre":
-            return orig(patch_embeds_list, tensor)
-        # Only `dtype` and the two leading dims are read off `tensor`, so a CPU stand-in
-        # gives an identical mask without a D2H of patch_embeds.
-        stand_in = torch.empty((tensor.shape[0], tensor.shape[1]), dtype=tensor.dtype)
-        return orig(patch_embeds_list, stand_in)
-
-    _cpu_mask._spyre_patched = True
-    # vLLM imports this symbol inside the function body, so patching the module
-    # attribute is picked up at call time.
-    modeling_pixtral.generate_block_attention_mask = _cpu_mask  # ty: ignore[invalid-assignment]
-    logger.info("Spyre: Pixtral block attention mask built on CPU (N-image sub-block writes).")
-
-
 def patch_patch_merger() -> None:
     """Run Pixtral `PatchMerger.permute` (spatial s×s regroup) on CPU.
 
@@ -221,7 +171,7 @@ def patch_patch_merger() -> None:
 
     def _forward(self, x, image_sizes):
         dev = x.device
-        x_perm = self.permute(x.to("cpu"), image_sizes)  # unfold on CPU
+        x_perm = self.permute(convert(x, "cpu"), image_sizes)  # unfold on CPU
         return self.merging_layer(convert(x_perm, device=dev))  # GEMM on-card
 
     _forward._spyre_patched = True
@@ -266,9 +216,9 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     The patch-embedding conv is absent on purpose: `SpyreConv2d` in
     `custom_ops/conv.py` handles it through OOT dispatch.
 
-    `model` and `device` are unused: every remaining patch rewrites upstream module
-    attributes rather than a loaded instance. They stay for the `apply(model, device)`
-    contract the sibling architecture modules share.
+    `device` is unused, and `model` is read only by `patch_pre_transformer_norm`: every
+    other patch rewrites upstream module attributes rather than a loaded instance. Both
+    stay for the `apply(model, device)` contract the sibling architecture modules share.
     """
     try:
         from vllm.model_executor.models import pixtral
@@ -285,6 +235,5 @@ def apply(model: torch.nn.Module, device: torch.device) -> None:
     # Must precede the attention patch, which resolves apply_rotary_emb_vit by name.
     patch_vision_rope_vit()
     patch_vision_attention()
-    patch_block_attention_mask()
     patch_patch_merger()
     patch_pre_transformer_norm(model)

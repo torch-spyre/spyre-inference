@@ -93,23 +93,32 @@ jobs:
 
       # Checkout with no ref = the trusted default branch. The agent pulls the
       # PR itself (gh pr checkout) when it must run the changed code on hardware.
+      # persist-credentials: false keeps the job token out of .git/config, where
+      # the PR's own code could otherwise read it.
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Spyre RPMs
         if: env.REVIEW_MODE == 'hardware'
         uses: ./.github/actions/spyre-rpm-install
 
+      # Binary only; the cache is shipped from /storage-1. The review bot is a
+      # pure consumer (no save step), so it only ever reads the mount.
       - name: Set up uv
         if: env.REVIEW_MODE == 'hardware'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
-          enable-cache: true
-          cache-dependency-glob: |
-            uv.lock
-            spyre-rpms.lock
+          enable-cache: false
+
+      - name: uv cache (NFS)
+        if: env.REVIEW_MODE == 'hardware'
+        uses: ./.github/actions/uv-nfs-cache
+        with:
+          storage-root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          save: 'false'
 
       - name: Install spyre-inference
         if: env.REVIEW_MODE == 'hardware'
@@ -204,12 +213,13 @@ jobs:
           # also buys no real containment here: on-hardware verification needs
           # Bash(uv run:*), and `uv run python -c ...` is already arbitrary code
           # execution. The trust boundary is the maintainer write-access gate +
-          # network controls (see PR #785), not the tool list.
+          # network controls (see PR #785), not the tool list. The prompt has
+          # the agent run PR code with the secrets below unset.
           #
           # The agent posts its own PR-level summary comment (see the prompt);
           # the completion signal is the outcome reaction in the next step.
           claude -p "$prompt" \
-            --model claude-opus-4-8 \
+            --model 'claude-opus-5-5[1m]' \
             --max-turns 60 \
             --mcp-config "$mcp_config" \
             --strict-mcp-config \

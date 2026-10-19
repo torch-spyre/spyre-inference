@@ -297,10 +297,9 @@ def _run_head_major_attn_test(
 
 
 def test_head_major_kv_cache_shape():
-    """The backend advertises head-major, and vLLM can still find the block dim."""
+    """The backend advertises the head-major shape with num_blocks outermost."""
     shape = SpyreHeadMajorAttentionBackend.get_kv_cache_shape(16, 128, 8, 64)
     assert shape == (16, 8, 128, 64)
-    assert SpyreHeadMajorAttentionBackend.get_kv_cache_block_dim(128, 8, 64) == 0
 
 
 def test_head_major_write_index(default_vllm_config):
@@ -485,9 +484,9 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 
 
 _SHAPES = [
-    pytest.param([(1, 128)], id="decode_single"),
+    pytest.param([(1, 128)], id="decode_single", marks=pytest.mark.attention_smoke),
     pytest.param([(1, 300), (1, 64), (1, 512)], id="decode_batch"),
-    pytest.param([(64, 64)], id="prefill_single"),
+    pytest.param([(64, 64)], id="prefill_single", marks=pytest.mark.attention_smoke),
     pytest.param([(128, 128), (64, 200)], id="prefill_batch"),
     pytest.param([(64, 300), (1, 128)], id="mixed_batch"),
 ]
@@ -531,6 +530,11 @@ def test_head_major_dispatches_by_query_width(
     """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
     wide query to the decode kernel pays for residency the query width already amortises."""
     from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
+
+    # Batched decode now covers every batch size, and it serves a mixed batch's decode
+    # prefix before the per-seq loop runs, so the per-seq kernels are the subject here.
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    envs.clear_env_cache()
 
     called = []
 
@@ -802,7 +806,12 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layers.0.self_attn"])
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks,
+                layers=["layers.0.self_attn"],
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
         ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
     )
@@ -837,6 +846,83 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+def test_mixed_layout_layers_in_one_kv_cache_tensor_each_get_their_own_pages(monkeypatch):
+    """vLLM packs every attention layer into one KVCacheTensor.
+
+    Allocating once per tensor would both alias the layers onto the same blocks and pick
+    a single layout for all of them -- so a head-major layer would read a token-major
+    cache. Each layer must get its own allocation, from its own impl class.
+
+    Card-free: both `allocate_pages` implementations are stubbed with tagged sentinels.
+    """
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
+    layer_names = ["layers.0.self_attn", "layers.1.self_attn"]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
+        ),
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks * len(layer_names),
+                layers=layer_names,
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+    )
+
+    impl_kwargs = dict(
+        num_heads=32, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
+    )
+    with set_current_vllm_config(vllm_config):
+        impls = {
+            "layers.0.self_attn": SpyreHeadMajorAttentionImpl(**impl_kwargs),
+            "layers.1.self_attn": SpyreAttentionImpl(**impl_kwargs),
+        }
+    for layer_name, impl in impls.items():
+        fake_layer = Mock()
+        fake_layer.kv_cache = None
+        fake_layer.impl = impl
+        runner.compilation_config.static_forward_context[layer_name] = fake_layer
+
+    # Tag each sentinel with the class the runner dispatched on, so a single shared
+    # allocation shows up as both a repeated object and the wrong layout.
+    def _stub(cls):
+        def _allocate_pages(inner_cls, blocks, allocate_spec, device):
+            return Mock(name=f"{inner_cls.__name__}-pages-{blocks}", _spyre_impl_cls=inner_cls)
+
+        monkeypatch.setattr(cls, "allocate_pages", classmethod(_allocate_pages))
+
+    _stub(SpyreHeadMajorAttentionImpl)
+    _stub(SpyreAttentionImpl)
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+
+    assert caches["layers.0.self_attn"] is not caches["layers.1.self_attn"], (
+        "layers packed into one KVCacheTensor must not share a page buffer"
+    )
+    assert caches["layers.0.self_attn"]._spyre_impl_cls is SpyreHeadMajorAttentionImpl
+    assert caches["layers.1.self_attn"]._spyre_impl_cls is SpyreAttentionImpl
 
 
 def test_page_attn_head_major_matches_fp32_reference():
@@ -927,8 +1013,9 @@ def test_head_major_decode_body_matches_fp32_reference(
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
+    from test_spyre_attn import _decode_reference_fp32
+
     from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
-    from tests.attention.test_spyre_attn import _decode_reference_fp32
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
@@ -1042,7 +1129,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
     with num_kv_heads times the gather entries, which measured ~2x the kernel time.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 4, 64, 64
@@ -1070,7 +1157,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     )
 
     assert impl._batched_decode_supported()
-    assert impl._batched_decode_preconditions_met(attn_metadata), (
+    assert impl._batched_decode_preconditions_met(attn_metadata, 1 + num_seqs * blocks_per_seq), (
         "an all-decode batch of 8 must reach the batched path, or the test proves nothing"
     )
     assert attn_metadata.chunk_page_ids_cpu is not None
@@ -1082,6 +1169,48 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
         attn_metadata.padded_num_seqs,
     )
     assert table.dtype == torch.int32
+
+
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, configure_compilation):
+    """Dispatch keeps the recorder's page bound, so it never reaches a variant warmup skipped.
+
+    Two decode seqs of two blocks each over a three-page cache is the TP2 gemma-4 shape
+    that compiled the skipped variant mid-serving and hit a torch-spyre codegen assert.
+    """
+    from spyre_testing_plugin.attn_helpers import _build_metadata
+
+    torch.set_default_device("cpu")
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64
+    num_seqs, blocks_per_seq = 2, 2
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.full((num_seqs,), blocks_per_seq * block_size, dtype=torch.int32),
+        query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+        block_table=torch.ones(num_seqs, blocks_per_seq, dtype=torch.int32),
+        slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+    )
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+    assert attn_metadata.padded_num_seqs is not None
+    assert attn_metadata.blocks_per_chunk is not None
+    entries = attn_metadata.padded_num_seqs * attn_metadata.blocks_per_chunk
+
+    assert impl._batched_decode_preconditions_met(attn_metadata, entries + 1)
+    assert not impl._batched_decode_preconditions_met(attn_metadata, entries)
+    assert not impl._batched_decode_preconditions_met(attn_metadata, entries - 1)
 
 
 @pytest.fixture()

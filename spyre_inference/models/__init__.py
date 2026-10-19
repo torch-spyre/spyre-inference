@@ -15,16 +15,19 @@
 """Model-specific Spyre adaptations, per architecture.
 
 Every architecture ``spyre_models()`` names is replaced by a subclass that lives
-in the matching module here; ``_``-prefixed modules hold machinery shared between
-them. Registration is lazy: nothing is imported until vLLM resolves the
+in the matching module here (the Transformers backend's lives in
+``spyre_inference.transformers_backend``); ``_``-prefixed modules hold machinery shared
+between them. Registration is lazy: nothing is imported until vLLM resolves the
 architecture, so an architecture this deployment never serves costs nothing.
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    import torch
     from vllm.engine.arg_utils import EngineArgs
 
 # vLLM modules whose every architecture needs the same adaptation: these are the
@@ -37,8 +40,10 @@ _ADAPTED_MODULES = ("bert", "roberta")
 
 # Architectures adapted individually, for reasons that reach no further.
 _ADAPTED_ARCHS: dict[str, str] = {
-    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own:
-    # apply_prelaunch_overrides rewrites it to this text-only backbone first.
+    "CLIPModel": "spyre_inference.models.clip:SpyreCLIPEmbeddingModel",
+    # A Gemma4ForConditionalGeneration checkpoint needs no entry of its own: vLLM builds
+    # its language model through the registry as Gemma4ForCausalLM, which resolves here,
+    # and apply_prelaunch_overrides rewrites one with no vision tower to this backbone.
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
@@ -106,26 +111,41 @@ def has_per_layer_embeddings(text_config) -> bool:
     return (getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
 
 
+def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
+    """Fail if ``architecture`` has a Spyre adaptation that ``model`` was not built as.
+
+    vLLM caches the class it resolves per process, so an architecture it looks up
+    before ``register_models`` has run keeps the unadapted vLLM class, and builds it
+    without an error of its own. A worker looks a multimodal architecture up that early
+    (for its multimodal cache), so this is what a ``VLLM_PLUGINS`` allowlist leaving out
+    the general plugin produces.
+
+    Raises:
+        RuntimeError: if ``model`` is not an instance of the Spyre class.
+    """
+    target = spyre_models().get(architecture)
+    if target is None:
+        return
+    module_name, _, cls_name = target.partition(":")
+    spyre_cls = getattr(importlib.import_module(module_name), cls_name)
+    if not isinstance(model, spyre_cls):
+        raise RuntimeError(
+            f"{architecture} was built as {type(model).__name__}, not {cls_name}: vLLM "
+            "resolved it before the Spyre model adaptations were registered. Make sure "
+            "VLLM_PLUGINS allows the spyre_inference general plugin."
+        )
+
+
 def apply_prelaunch_overrides(engine_args: EngineArgs) -> None:
     """Apply per-model EngineArgs overrides that must run before create_model_config
-    builds the ModelConfig (e.g. text-only backbone selection)."""
+    builds the ModelConfig (e.g. text-only backbone selection).
+
+    Also registers the Spyre architectures: a ``VLLM_PLUGINS`` allowlist without the ops
+    plugin leaves that to the worker, too late for an in-process engine, which by then
+    has cached the upstream class of a multimodal architecture such as CLIP.
+    """
     from spyre_inference.models import clip, gemma4
 
+    register_models()
     gemma4.force_text_backbone(engine_args)
     clip.force_disable_chunked_prefill(engine_args)
-
-
-def install_pooling_model_patches() -> None:
-    """Install encoder/pooling model adapters (BERT / RoBERTa token_type, CLIP LayerNorm, …)."""
-    from spyre_inference.models import bert, clip, roberta
-
-    bert.install_spyre_patches()
-    roberta.install_spyre_patches()
-    clip.install_spyre_patches()
-
-
-def install_decoder_model_patches() -> None:
-    """Install decoder/generative model adapters (Gemma-4 embed scale, …)."""
-    from spyre_inference.models import gemma4
-
-    gemma4.install_spyre_patches()

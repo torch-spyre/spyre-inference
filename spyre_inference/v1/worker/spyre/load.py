@@ -30,6 +30,9 @@ def load_and_wrap(runner: "SpyreModelRunnerV2", *args: Any, **kwargs: Any) -> No
 
     Postcondition: ``runner.model`` is the wrapper, and every other holder of
     the model (``model_state.model``, ``encoder_runner.model``,
-    ``pooling_runner.model``) points at that same wrapper.
+    ``pooling_runner.model``) points at that same wrapper. ``runner.model_state``
+    comes from ``model_states.resolve_spyre_model_state``, and
+    ``runner.decode_query_len`` is set: upstream sets it in the ``load_model`` this
+    replaces, and ``SpyreBucketManager.from_runner`` reads it.
     """
     raise NotImplementedError

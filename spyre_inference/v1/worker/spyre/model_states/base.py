@@ -14,31 +14,31 @@
 
 """MRV2: Spyre mixin over vllm/v1/worker/gpu/model_states/interface.py:ModelState.
 
-Mixed into whichever upstream ModelState a model resolves to. Owns the one
-hook every Spyre model state needs regardless of shape: multimodal
-embeddings staged on Spyre rather than gathered on the GPU-native path.
+Mixed into whichever upstream ModelState a model resolves to. Upstream's states
+allocate on ``device``, which for this runner is the host; ``spyre_device`` is
+where tensors built for the accelerator itself go (encoder attention masks).
+
+The multimodal embeds hook (``prepare_inputs_embeds``) lands here with #1242. Until
+then upstream's runs: the mixin sits first in the MRO, so it must not define a method
+it does not implement.
 """
 
-from typing import TYPE_CHECKING
-
 import torch
-from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.worker.gpu.input_batch import InputBatch
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.states import RequestState
+import torch.nn as nn
+from vllm.config import VllmConfig
+from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 
 
 class SpyreModelStateMixin:
-    """MRV2: ModelState, staging inputs_embeds on Spyre instead of the GPU."""
+    """MRV2: ModelState, aware of the Spyre device beside the host one."""
 
-    def prepare_inputs_embeds(
+    def __init__(
         self,
-        scheduled_encoder_inputs: dict[str, list[int]],
-        input_batch: InputBatch,
-        req_states: "RequestState",
-    ) -> torch.Tensor | None:
-        raise NotImplementedError
-
-    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
-        raise NotImplementedError
+        vllm_config: VllmConfig,
+        model: nn.Module,
+        encoder_cache: EncoderCache | None,
+        device: torch.device,
+        spyre_device: torch.device,
+    ) -> None:
+        super().__init__(vllm_config, model, encoder_cache, device)  # ty: ignore[too-many-positional-arguments]
+        self.spyre_device = spyre_device

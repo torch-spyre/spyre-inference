@@ -154,7 +154,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.31.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "5c17a7fc16abad5a4973eaf6f59602cfeee06be4" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "cf027821b798af3206beba51383492d36c6245c9" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -203,6 +203,31 @@ requires-dist = [
     "pyyaml; extra == 'pyyaml'",
 ]
 provides-extras = ["optree", "opt-einsum", "pyyaml"]
+
+# spyre-rpms.lock is generated from this; after editing, re-run
+# `python3 scripts/lock_spyre_rpms.py`.
+[tool.spyre-rpms]
+bundle = "main_nightly_2026_10_15"
+packages = [
+  "ibm-aiu-toolbox-e2e",
+  "ibm-deeptools",
+  "ibm-deeptools-devel",
+  "ibm-flex",
+  "ibm-flex-devel",
+  "ibm-senlib-core",
+  "ibm-senlib-dd2",
+  "ibm-senlib-headers",
+  "ibm-spyre-comms",
+  "ibm-spyre-comms-devel",
+  "ibm-libaiupti",
+]
+
+# Not in bundles yet: each takes the version of the bundled package it ships with.
+[tool.spyre-rpms.devel]
+ibm-deeptools-devel = "ibm-deeptools"
+ibm-flex-devel = "ibm-flex"
+ibm-senlib-headers = "ibm-senlib-core"
+ibm-spyre-comms-devel = "ibm-spyre-comms"
 
 [tool.ty.rules]
 # TODO: re-enable after fixing subclass attribute lookups in custom_ops/linear.py.

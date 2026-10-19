@@ -835,6 +835,20 @@ def test_configure_threading_warn_only_leaves_envs_untouched(monkeypatch):
     assert os.environ["OMP_NUM_THREADS"] == "128"
 
 
+def test_configure_threading_sets_passive_wait_policy(monkeypatch):
+    """Enabled → idle OpenMP workers sleep instead of spinning on the CPU quota."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    monkeypatch.setenv("OMP_WAIT_POLICY", "")  # recorded, so undo removes what the code sets
+    monkeypatch.delenv("OMP_WAIT_POLICY")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=4)
+
+    assert os.environ["OMP_WAIT_POLICY"] == "PASSIVE"
+
+
 def test_configure_threading_raises_when_undetectable(monkeypatch):
     """Enabled but no CPU count detectable → fail loudly rather than guess."""
     from spyre_inference.threading_config import configure_threading

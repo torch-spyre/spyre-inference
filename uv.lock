@@ -295,20 +295,21 @@ wheels = [
 
 [[package]]
 name = "anthropic"
-version = "1.13.0"
+version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "docstring-parser" },
     { name = "httpx2" },
     { name = "jiter" },
+    { name = "opentelemetry-api" },
     { name = "pydantic" },
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0b/ed/e76e50601b7c476bcb9a2a7a4c4dab6f1a9b2c03e3922de8b3ec599ccbc5/anthropic-1.13.0.tar.gz", hash = "sha256:ad11d9bb9adafdfea26113943bcde9973e2a439ebeeda6c89ff3e3d85bb2f5c1", size = 1567362, upload-time = "2026-10-09T15:29:08.803Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/37/5a2a4316df8babd28f096477a707cd75f240b4264c97fb128c32375105d6/anthropic-1.15.0.tar.gz", hash = "sha256:90caa9df83e2fc8bddb4ddeb83b7191bce255f635c03eae055deec521741df08", size = 1726101, upload-time = "2026-10-15T19:45:34.635Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ad/9a/a835340c91bc9a233bd54c05fc438fe07cbef71ca667f24f3892a268ae20/anthropic-1.13.0-py3-none-any.whl", hash = "sha256:157bd74dbf6a595cf9e5fcac557c791fd297924dc48261f57470c2ed6f4e6671", size = 1958595, upload-time = "2026-10-09T15:29:10.689Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/65/54437e7edea49a3be9ef56f6b5965999bfdc52b9dadc9b448124ca51a594/anthropic-1.15.0-py3-none-any.whl", hash = "sha256:10189a7993c5c71a0a2d4bb80020ca6a2fd27679f51e627405da37251d15ff49", size = 2047755, upload-time = "2026-10-15T19:45:32.951Z" },
 ]
 
 [[package]]
@@ -497,11 +498,11 @@ wheels = [
 
 [[package]]
 name = "cachetools"
-version = "7.2.1"
+version = "7.2.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/31/44/71476a5812da1ddf2c9a3efd31ae76d01480a1cf03ed13ac28aa8f2402e4/cachetools-7.2.1.tar.gz", hash = "sha256:b1a7537025c06abf96fcc1443e496af9a3fb95e774e70e1f0af226f73f7f2dcc", size = 41357, upload-time = "2026-10-05T18:40:06.361Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/85/e0/27b467a38de29583a68973edbf99eeeee5b105567bdbd7d208e5b07525a7/cachetools-7.2.2.tar.gz", hash = "sha256:d521dc98d501ba9efd8d2b1663bbf88163509c0c0a090eea6dc154b421ec5410", size = 42916, upload-time = "2026-10-15T20:46:15.833Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/c9/2a61d784caf0d869a3326728c57c7203f50cc53f3cca2ee76bf924769eb4/cachetools-7.2.1-py3-none-any.whl", hash = "sha256:63aa53dfe7473c10cccdd5a01dedf76ef2c4b73a58840d9396e7d0752cbdac3b", size = 17006, upload-time = "2026-10-05T18:40:04.827Z" },
+    { url = "https://files.pythonhosted.org/packages/eb/d1/15cc3b3c07cfe11bf6fbe81a4a92ebb9d202d7d903aaa36b713c8f6eabda/cachetools-7.2.2-py3-none-any.whl", hash = "sha256:39b6c9291adde28c5de6622d25329375fadf3e8a678226e7872e2e72854e4549", size = 17819, upload-time = "2026-10-15T20:46:14.069Z" },
 ]
 
 [[package]]
@@ -1355,11 +1356,11 @@ wheels = [
 
 [[package]]
 name = "filelock"
-version = "4.1.2"
+version = "4.2.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/8c/32/5f1e1408eda63bdecdb814dfd18b1109d239fb9695d51780c2e8a2816e76/filelock-4.1.2.tar.gz", hash = "sha256:c541dd91878706be3ff20e934a0b913972d4eff7a20ddfc17defd2b7328d006c", size = 565129, upload-time = "2026-10-14T14:47:34.513Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f4/a9/1af41b37c3279712b22cdc63aac78a52432202b6fe1f9666a2a3d2831fb4/filelock-4.2.0.tar.gz", hash = "sha256:7a60906c75227cf04d0c273afadc8219400f11aeb13cc69591d4f6cdc6c8036e", size = 569667, upload-time = "2026-10-14T20:57:13.11Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/84/16cbc2a5a102edf4b745ca43d7b9aaa8e26d46686c8e54d70d3d1225659e/filelock-4.1.2-py3-none-any.whl", hash = "sha256:4d5dc2a1d64d6b48a5f0540814000986fd62ebd3ac9ccbb1d07d669e075db9bb", size = 132861, upload-time = "2026-10-14T14:47:33Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/a3/9bc26acff301fe1aaea1cc3d82a1d57e0a34df3e1cadbfa91ac2dbcdde5c/filelock-4.2.0-py3-none-any.whl", hash = "sha256:2ff5690882e8cdb00ef31fb3d01a3094c29f30985426c59495afb1733f3b7238", size = 135032, upload-time = "2026-10-14T20:57:11.349Z" },
 ]
 
 [[package]]
@@ -1487,8 +1488,7 @@ version = "1.75.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8d/2b/6ce81972d5c8cab9705fddce3153be63222d9e12fd96f8baba5038a744dd/googleapis_common_protos-1.75.5.tar.gz", hash = "sha256:c7a866fc34ed29a3b10af627a4b9b1dc2433313ca6e959f0ae4feb132047ed72", size = 156513, upload-time = "2026-09-29T19:26:14.863Z" }
 wheels = [
@@ -1619,8 +1619,7 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "grpcio" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 's390x'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4e/92/a8c62e9ab04957fe06e272244ed3d7a6780aacd3b72d9d723309ffbe5e9a/grpcio_health_checking-1.84.0.tar.gz", hash = "sha256:c69ea3775a5f90cd094f294859dfd0150a560f7101a8936bf7b4e08b7186a14e", size = 17089, upload-time = "2026-09-14T07:10:24.092Z" }
 wheels = [
@@ -1690,8 +1689,7 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "grpcio" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 's390x'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" } },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/6e/8a/94af17ae0738cc4508af96d5f107f352e2b54473eecf32f0ed9bcdd895da/grpcio_reflection-1.84.0.tar.gz", hash = "sha256:06bf3d7d8cef9afbcc721ee52191652b4483831774255e174404b0e0551741bc", size = 19321, upload-time = "2026-09-14T07:10:28.58Z" }
 wheels = [
@@ -3214,8 +3212,7 @@ version = "1.45.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/4b/7f/15f014fb195da6c2dbb6c71399b8e76824878718e94de6454038488eed28/opentelemetry_proto-1.45.1.tar.gz", hash = "sha256:79e0fb95e4616691a469439238aa9224d75779b3e108e895d1aa125ab29ca77c", size = 46488, upload-time = "2026-10-06T17:33:11.49Z" }
 wheels = [
@@ -3531,11 +3528,11 @@ wheels = [
 
 [[package]]
 name = "pluggy"
-version = "1.6.0"
+version = "1.7.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", hash = "sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", size = 69412, upload-time = "2025-05-15T12:30:07.975Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/db/7fc19e6f2dc92a966727031389fc2e08b558f0f25eb7403c1119ad4713cd/pluggy-1.7.0.tar.gz", hash = "sha256:d1eaa46ebb595891b860ab086b4d09c8588af65ebd4361b8e8f4bb8920b90ba8", size = 123304, upload-time = "2026-10-15T09:50:58.343Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
+    { url = "https://files.pythonhosted.org/packages/40/9e/2b38731e0fc536806f16490e1a12d7f0dc2a1235aa8cc07bcc75416a7daa/pluggy-1.7.0-py3-none-any.whl", hash = "sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec", size = 27082, upload-time = "2026-10-15T09:50:56.808Z" },
 ]
 
 [[package]]
@@ -3728,45 +3725,33 @@ resolution-markers = [
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version >= '3.14' and platform_machine == 's390x' and sys_platform == 'darwin'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version == '3.13.*' and platform_machine == 's390x' and sys_platform == 'darwin'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and platform_machine == 's390x' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform == 'win32'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform != 'darwin' and sys_platform != 'win32'",
     "python_full_version < '3.12' and platform_machine == 's390x' and sys_platform == 'darwin'",
+    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
+    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
+    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/86/73/f66c748df06e7fe24e658eddd600d19c4b40bad836c97ce2d0ad9851fb6b/protobuf-7.36.1.tar.gz", hash = "sha256:d0f6470f0ce2b84e3feaea2d4b816378b37ba4d4aa08a274305373de93e2d524", size = 512499, upload-time = "2026-08-31T22:40:04.667Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/6c/3a54a58f2948b0f485df9ecdd06590f15d0a7abf46a89d50c3de709ff4ff/protobuf-7.36.1-cp310-abi3-macosx_10_9_universal2.whl", hash = "sha256:3cf2ee25d006cee57294a1196ea43b37feb78e0dcd1e8af5c1aeddb777655aca", size = 456046, upload-time = "2026-08-31T22:39:56.865Z" },
     { url = "https://files.pythonhosted.org/packages/fe/51/1bdbd612fa3c51e42ea6f45d05e84dc748ddcd2663e1aa1e89a00a33facd/protobuf-7.36.1-cp310-abi3-manylinux2014_s390x.whl", hash = "sha256:39c518c05586c016d7874ff6079ee115bcec1ea5fbb1d177fbf7867ef4c67e44", size = 357229, upload-time = "2026-08-31T22:39:59.198Z" },
     { url = "https://files.pythonhosted.org/packages/39/ca/c47f91d3cab175b01fd8c4f0d80fdf8613be876cc616e66ad281a59c5ddf/protobuf-7.36.1-py3-none-any.whl", hash = "sha256:7d951e46b3f963d6c264c367c437921de9d5aedd9c3f9612b9077736b4e3ad5c", size = 179813, upload-time = "2026-08-31T22:40:03.54Z" },
-]
-
-[[package]]
-name = "protobuf"
-version = "7.36.2"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'win32'",
-    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform == 'emscripten'",
-    "python_full_version < '3.12' and platform_machine == 'ppc64le' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d9/89/5b8517baa72f84a67b8a307ba953c91057af618bf40bf676f3c03551f8f0/protobuf-7.36.2.tar.gz", hash = "sha256:497d0463ff3316681da6c0b9e8d06cb465d61abce00b613ab42226175644d1bb", size = 512737, upload-time = "2026-09-17T20:07:59.326Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/32/72/98342feb672507c8f3a69e34b4fa8961f608edba5c1a48a6f47156d92cb5/protobuf-7.36.2-cp310-abi3-macosx_10_9_universal2.whl", hash = "sha256:cbc70b17ee27e28894c7fee8bb04be1abead49e936bc70eb60052531eee2079e", size = 456039, upload-time = "2026-09-17T20:07:51.542Z" },
-    { url = "https://files.pythonhosted.org/packages/e4/04/d52c7016b04b6c5108f26691f9d33ec82a9b65d041f1a9c771137693d618/protobuf-7.36.2-py3-none-any.whl", hash = "sha256:bdb3a345d48db958e6ce1f18e508beb0cc981d64f24088427549c866cd039f1e", size = 179806, upload-time = "2026-09-17T20:07:58.211Z" },
 ]
 
 [[package]]
@@ -5457,22 +5442,21 @@ wheels = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.26"
+version = "0.4.27"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/b4/f152b6fff35918439dd0276265de9c11c73b9816f086a0e6cfcbf3d52d5b/smg_grpc_proto-0.4.26.tar.gz", hash = "sha256:849185603bee63c394d609ad57696df4b0df4927efcccea8438ef72873c386d7", size = 34082, upload-time = "2026-10-09T11:39:29.155Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cb/77/26920fe4654f11067e5b970433657b4dc96546e7b702f3394580ce760e02/smg_grpc_proto-0.4.27.tar.gz", hash = "sha256:f90f082ff4274a6baf32b6c185dcfe9623615cc3f3226af157a7dd93f2d140e0", size = 35614, upload-time = "2026-10-15T18:57:59.826Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/43/56/5437951c730ccaa4d70965d60dbfa877635c4880f39627939f207d0399de/smg_grpc_proto-0.4.26-py3-none-any.whl", hash = "sha256:2e7b54441d00b46e3727752e528494ab778a0592b0def7eba1a61f5932142fb0", size = 107598, upload-time = "2026-10-09T11:39:27.916Z" },
+    { url = "https://files.pythonhosted.org/packages/94/82/760c84998c37fc7bae8805f596cafc1117553c6b6af87863cc85d80dbc23/smg_grpc_proto-0.4.27-py3-none-any.whl", hash = "sha256:58dbd801d0d2745f8bc18ccdd73499e6d43f27a91bf84d7b18f99bfc9e59db14", size = 109659, upload-time = "2026-10-15T18:57:58.796Z" },
 ]
 
 [[package]]
 name = "smg-grpc-servicer"
-version = "0.13.6"
+version = "0.14.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio" },
@@ -5482,9 +5466,9 @@ dependencies = [
     { name = "grpcio-reflection", version = "1.84.0", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
     { name = "smg-grpc-proto" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f4/9f/87e863c0743642a2b8eb36028130984cdfa6e5fc093387471a3b6b8b2a9c/smg_grpc_servicer-0.13.6.tar.gz", hash = "sha256:e04fd15b09c6dbe423699c2afe12eb8e618fb3f5504eb2d6f008885250fbf2f2", size = 332848, upload-time = "2026-10-09T11:40:05.272Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e0/5a/5781860ffd563c6e3c89fe18489ad25b70e36ddd26fe99877a8f2ad0a039/smg_grpc_servicer-0.14.0.tar.gz", hash = "sha256:7cf8718683d3e90627311ff4d507a6783cb159d1f98d9baac574f904a8872b94", size = 481847, upload-time = "2026-10-15T18:58:36.031Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/7a/6e6b1066094910e7ec94a632e54e0feb9644361ccfd72c3abe906956879c/smg_grpc_servicer-0.13.6-py3-none-any.whl", hash = "sha256:1e5992f90d746ee93d48f929f9a9386651168844b27fc50b4ba20d35c83ffabd", size = 239781, upload-time = "2026-10-09T11:40:04.071Z" },
+    { url = "https://files.pythonhosted.org/packages/94/34/c632a5cb8984279f26a3ebbfeeedc2177e09b6739daa3422739f27c81ab0/smg_grpc_servicer-0.14.0-py3-none-any.whl", hash = "sha256:93e83f4bfffa16c3953ce2b431600ed3395c25d8f711932e21df870524ae4c83", size = 304074, upload-time = "2026-10-15T18:58:34.521Z" },
 ]
 
 [package.optional-dependencies]
@@ -5528,7 +5512,7 @@ dev = [
 requires-dist = [
     { name = "torch", marker = "platform_machine != 'ppc64le'", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torch", marker = "platform_machine == 'ppc64le'", git = "https://github.com/pytorch/pytorch?tag=v2.13.0" },
-    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=5c17a7fc16abad5a4973eaf6f59602cfeee06be4" },
+    { name = "torch-spyre", extras = ["cpsat"], git = "https://github.com/torch-spyre/torch-spyre?rev=cf027821b798af3206beba51383492d36c6245c9" },
     { name = "torchvision", marker = "platform_machine not in 's390x, ppc64le'", index = "https://download.pytorch.org/whl/cpu" },
     { name = "transformers", specifier = "<5.17" },
     { name = "vllm", extras = ["grpc"], git = "https://github.com/vllm-project/vllm?rev=v0.31.0" },
@@ -5943,8 +5927,8 @@ wheels = [
 
 [[package]]
 name = "torch-spyre"
-version = "0.6.0.dev240+main.g5c17a7fc"
-source = { git = "https://github.com/torch-spyre/torch-spyre?rev=5c17a7fc16abad5a4973eaf6f59602cfeee06be4#5c17a7fc16abad5a4973eaf6f59602cfeee06be4" }
+version = "0.6.0.dev270+master.gcf027821"
+source = { git = "https://github.com/torch-spyre/torch-spyre?rev=cf027821b798af3206beba51383492d36c6245c9#cf027821b798af3206beba51383492d36c6245c9" }
 dependencies = [
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
@@ -6293,8 +6277,7 @@ dependencies = [
     { name = "prometheus-client" },
     { name = "prometheus-fastapi-instrumentator" },
     { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
-    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 's390x'" },
-    { name = "protobuf", version = "7.36.2", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le'" },
+    { name = "protobuf", version = "7.36.1", source = { registry = "https://pypi.org/simple" }, marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
     { name = "psutil" },
     { name = "py-cpuinfo" },
     { name = "pybase64" },

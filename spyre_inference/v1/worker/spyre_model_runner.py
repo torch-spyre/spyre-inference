@@ -119,7 +119,11 @@ from spyre_inference.v1.pool.spyre_pooler import (
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.encoder_grid import EncoderDispatchStats, expand_body_to_grid
+from spyre_inference.v1.worker.encoder_grid import (
+    EncoderDispatchStats,
+    encoder_pad_token_id,
+    expand_body_to_grid,
+)
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -1654,7 +1658,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             inputs_embeds,
             positions,
             grid,
-            pad_token_id=self._encoder_pad_token_id(),
+            pad_token_id=encoder_pad_token_id(self.model_config),
             position_offset=position_offset,
         )
 
@@ -1729,11 +1733,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if counts is None or int(counts.numel()) != len(grid[2]):
             return None
         return pooling
-
-    def _encoder_pad_token_id(self) -> int:
-        """Pad id for batch-pad filler tokens; their outputs are masked and dropped."""
-        pad = getattr(getattr(self.model_config, "hf_config", None), "pad_token_id", None)
-        return int(pad) if isinstance(pad, int) else 0
 
     def _dummy_pooler_run_task(
         self,

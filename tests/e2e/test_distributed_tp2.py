@@ -182,7 +182,9 @@ def test_tp2_compiled_llm_generate_matches_tp1(model: str, hf_overrides, record_
 
 
 MULTIMODAL_MODEL = "mistralai/Ministral-3-14B-Instruct-2512-BF16"
-MULTIMODAL_MAX_MODEL_LEN = 4096
+# Short enough to keep both warmups (TP=1, then TP=2) inside one test's budget: the 176x176
+# image and the prompt fit, and attention records only the buckets up to it.
+MULTIMODAL_MAX_MODEL_LEN = 256
 
 
 def _image_conversation():
@@ -222,6 +224,8 @@ def _generate_image(tp: int) -> list[list[int]]:
         max_model_len=MULTIMODAL_MAX_MODEL_LEN,
         max_num_seqs=1,
         limit_mm_per_prompt={"image": 1},
+        # One decoding sequence, and a prefill of the whole prompt.
+        compilation_config={"compile_sizes": [1, MULTIMODAL_MAX_MODEL_LEN]},
     )
     try:
         outs = llm.chat([_image_conversation()], SamplingParams(max_tokens=8, temperature=0.0))
@@ -242,6 +246,7 @@ def _generate_image(tp: int) -> list[list[int]]:
     spyre_device_count() < 2,
     reason="needs >=2 Spyre cards; skipping TP=2 distributed test",
 )
+@pytest.mark.timeout(3600)
 def test_tp2_compiled_image_prompt_matches_tp1(monkeypatch) -> None:
     """TP=1 vs TP=2 greedy prefix match on one image prompt, compiled: the vision blocks
     and projection run their TP all_reduces inside the compiled graphs, and serving must

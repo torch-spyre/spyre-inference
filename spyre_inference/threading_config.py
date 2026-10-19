@@ -116,9 +116,8 @@ def configure_threading(worker_count: int) -> None:
             )
         for env in THREADING_ENVS:
             os.environ[env] = str(cpus_per_worker)
-        # Idle OpenMP workers otherwise spin after each parallel region, which uses up a
-        # container's CPU quota while the step's host thread waits on the device. Only the
-        # processes spawned after this (EngineCore, workers) read it, at their first OpenMP use.
+        # Spinning idle OpenMP threads use up the pod's CPU quota while the host waits on the
+        # device. Takes effect in the spawned EngineCore and workers, not in this process.
         os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
         logger.info(
             "%s. Setting each threading configuration to %d for %d worker(s), "

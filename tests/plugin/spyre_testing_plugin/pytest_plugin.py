@@ -146,8 +146,8 @@ def spyre_device_count() -> int:
             devices = [d.strip() for d in spyre_devices.split(",") if d.strip()]
             return min(len(devices), aiu_world_size)
         return aiu_world_size
-    except ValueError:
-        return 0
+    except ValueError as e:
+        print(f"AIU_WORLD_SIZE '{aiu_world_size}' is invalid, error: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

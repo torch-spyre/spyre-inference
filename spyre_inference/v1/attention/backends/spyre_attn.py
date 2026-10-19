@@ -156,8 +156,8 @@ def _build_query_row_tables(
 ) -> list[torch.Tensor]:
     """Build query gather/dest row tables for the whole batch.
 
-    Each row is converted on its own so it lands at storage offset 0
-    (torch-spyre#3770); slicing a batched device tensor instead hits
+    Each row is converted on its own rather than as a row of one 2-D table
+    (torch-spyre#3851); slicing a batched device tensor instead hits
     spyre::copy_from_d2d, which recompiles per (shape, src_off, dst_off).
     """
     num_seqs = attn_metadata.num_seqs

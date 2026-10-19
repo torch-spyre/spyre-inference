@@ -61,8 +61,8 @@ def page_attn_head_major_decode_kernel(
             unchanged.
         kv_row_pool: [num_pages_total, num_kv_heads, 1] int32 device tensor of every
             page's folded-cache rows, ``page * num_kv_heads + kv``. Gathered rather than
-            sliced out of a per-block table (an int32 argument's nonzero storage offset
-            still reads as 0, torch-spyre#3770). Pure cache geometry, so it is built once.
+            sliced out of a per-block table (a row of a stacked index table reads wrong,
+            torch-spyre#3851). Pure cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
 

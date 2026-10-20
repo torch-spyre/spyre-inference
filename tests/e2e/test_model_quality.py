@@ -41,6 +41,15 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
+# Both gemma-4 checkpoints carry a vision tower this decoder test does not need. Every
+# modality at 0 keeps the default Gemma4ForConditionalGeneration load and stage-skips the
+# tower; test_compile.py pins the text backbone instead, so both text-only loads are covered.
+TEXT_ONLY_MM_LIMITS = {"image": 0, "video": 0, "audio": 0}
+MM_LIMITS = {
+    "google/gemma-4-31B": TEXT_ONLY_MM_LIMITS,
+    "google/gemma-4-26B-A4B": TEXT_ONLY_MM_LIMITS,
+}
+
 # Maps to the unquantized sibling whose prompts the smoke case borrows.
 FP8_DECODER_MODELS = {
     "ibm-granite/granite-3.3-8b-instruct-FP8": "ibm-granite/granite-3.3-8b-instruct",
@@ -122,6 +131,7 @@ def test_decoder_model_output(
         max_num_seqs=MAX_NUM_SEQS,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         compilation_config={"compile_sizes": COMPILE_SIZES},
+        limit_mm_per_prompt=MM_LIMITS.get(model, {}),
     )
 
     outputs = engine.generate(

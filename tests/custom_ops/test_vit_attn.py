@@ -113,19 +113,30 @@ def test_traces_into_one_graph():
     assert F.scaled_dot_product_attention in targets
 
 
-@pytest.mark.parametrize(
-    ("kv_seq", "cu_seqlens"),
-    [(50, torch.tensor([0, 30, 50], dtype=torch.int32)), (64, None)],
-    ids=["packed", "cross_attention"],
-)
-def test_rejects_what_padded_sdpa_cannot_express(kv_seq, cu_seqlens):
-    """Upstream would split on `cu_seqlens`, and `padded_sdpa` pads both sides to the
-    query's length; either silently computing the wrong thing is worse than raising."""
+def test_rejects_cross_attention():
+    """`padded_sdpa` pads both sides to the query's length, so a shorter key would be
+    silently wrong; raising is the only safe answer."""
     attn = _attn(4, 64)
     q = torch.randn(1, 50, 4 * 64)
-    k = v = torch.randn(1, kv_seq, 4 * 64)
+    k = v = torch.randn(1, 64, 4 * 64)
     with pytest.raises(NotImplementedError):
-        attn.forward_oot(q, k, v, cu_seqlens)
+        attn.forward_oot(q, k, v)
+
+
+def test_packed_images_attend_within_their_own_block():
+    """Pixtral's HF tower packs every image into one sequence and passes `cu_seqlens`;
+    the result has to match attending over each image alone."""
+    attn = _attn(4, 64)
+    q, k, v = _random_qkv(1, 50, 4, 64)
+    cu_seqlens = torch.tensor([0, 30, 50], dtype=torch.int32)
+
+    expected = torch.cat(
+        [_reference(*(x[:, s:e] for x in (q, k, v)), attn) for s, e in [(0, 30), (30, 50)]],
+        dim=1,
+    )
+    torch.testing.assert_close(
+        attn.forward_oot(q, k, v, cu_seqlens), expected, atol=1e-5, rtol=1e-5
+    )
 
 
 def test_mm_encoder_attention_instantiates_the_spyre_class():

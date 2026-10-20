@@ -405,11 +405,20 @@ def test_post_load_rejects_an_unconfigured_layer(monkeypatch):
     assert prepared == []
 
 
-def test_post_load_advertises_no_preprocessed_weight_support():
-    """The destructive relayout cannot consume a vLLM preprocessed weight cache."""
+def test_post_load_advertises_no_preprocessed_weight_support(monkeypatch):
+    """The destructive relayout cannot consume a vLLM preprocessed weight cache. The
+    parent sets the flag per instance, so it is read off one, with the parent saying yes."""
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
     from spyre_inference.moe import SpyreUnquantizedFusedMoEMethod
 
-    assert not SpyreUnquantizedFusedMoEMethod.supports_pre_processed_weights
+    def parent_init(self, moe):
+        self.supports_pre_processed_weights = True
+
+    monkeypatch.setattr(UnquantizedFusedMoEMethod, "__init__", parent_init)
+    assert not SpyreUnquantizedFusedMoEMethod(object()).supports_pre_processed_weights
 
 
 _STANDARD = ("silu", "topk_softmax")

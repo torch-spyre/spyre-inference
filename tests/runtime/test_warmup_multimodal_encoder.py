@@ -160,6 +160,19 @@ def test_generative_warmup_runs_a_compiled_tower_at_every_width():
     assert vision.batches == [("image", n) for n in range(1, 4)]
 
 
+def test_generative_warmup_walks_images_only():
+    runner, vision = _runner(
+        "generate",
+        multimodal=True,
+        max_items={"video": 1, "image": 2, "audio": 1},
+        compiled_tower_blocks=2,
+    )
+
+    runner._warmup_multimodal_encoder()
+
+    assert vision.batches == [("image", 1), ("image", 2)]
+
+
 def test_text_only_pooling_skips_the_vision_tower():
     runner, vision = _runner("pooling", multimodal=False, max_items=None)
 

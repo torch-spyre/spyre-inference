@@ -575,6 +575,48 @@ def test_only_tensor_parallelism_is_accepted(field):
         TorchSpyrePlatform.check_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize("requested", ["1", "true", "0", None])
+def test_v1_model_runner_is_pinned(monkeypatch, requested):
+    """TorchSpyreWorker only builds the V1 runner, so the resolved config must agree
+    whatever the user asked for. An explicit VLLM_USE_V2_MODEL_RUNNER=1 short-circuits
+    upstream's HAS_TRITON fallback, so the override is what prevents V2 here."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    if requested is None:
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", requested)
+
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "0"
+    assert vllm_config.use_v2_model_runner is False
+
+
+@pytest.mark.parametrize("feature", ["hisparse", "watermark", "aux_output"])
+def test_v2_only_features_are_rejected(monkeypatch, feature):
+    """hisparse and watermarking outrank VLLM_USE_V2_MODEL_RUNNER inside
+    use_v2_model_runner: hisparse raises an error blaming the env var *we* set, and
+    watermarking silently returns V2. AuxOutput never flips the runner, so the tripwire
+    cannot catch it, and it would be accepted and never produced. Reject all three here."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+    vllm_config = _defaults_config(enforce_eager=True, mode=None)
+    if feature == "hisparse":
+        monkeypatch.setattr(
+            vllm_config.attention_config, "hisparse_config", object(), raising=False
+        )
+    elif feature == "watermark":
+        monkeypatch.setattr(vllm_config, "watermark_config", object(), raising=False)
+    else:
+        monkeypatch.setattr(vllm_config.aux_output_config, "enable_return_routed_experts", True)
+
+    with pytest.raises(ValueError, match="Spyre does not support"):
+        TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+
 def test_bfloat16_is_rejected_under_tensor_parallelism():
     """torch-spyre's all_reduce is fp16-only on both the eager (SpyreCCLBackend) and
     compiled (`spyre.allreduce_plan`) paths, so bf16 + TP>1 must fail at startup rather
@@ -791,6 +833,20 @@ def test_configure_threading_warn_only_leaves_envs_untouched(monkeypatch):
     configure_threading(worker_count=1)
 
     assert os.environ["OMP_NUM_THREADS"] == "128"
+
+
+def test_configure_threading_sets_passive_wait_policy(monkeypatch):
+    """Enabled → idle OpenMP workers sleep instead of spinning on the CPU quota."""
+    from spyre_inference.threading_config import configure_threading
+
+    monkeypatch.setenv("SPYRE_UPDATE_THREAD_CONFIG", "1")
+    monkeypatch.setenv("OMP_WAIT_POLICY", "")  # recorded, so undo removes what the code sets
+    monkeypatch.delenv("OMP_WAIT_POLICY")
+    _force_cpu_count(monkeypatch, 8.0)
+
+    configure_threading(worker_count=4)
+
+    assert os.environ["OMP_WAIT_POLICY"] == "PASSIVE"
 
 
 def test_configure_threading_raises_when_undetectable(monkeypatch):

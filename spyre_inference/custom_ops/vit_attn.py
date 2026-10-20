@@ -20,8 +20,8 @@ on whatever sequence length the image produces, behind the opaque
 ``torch.ops.vllm.torch_sdpa_wrapper``. torch-spyre's BMM-padding pass asserts when
 that length isn't a multiple of the 64-element fp16 stick (e.g. CLIP ViT-B/32's 50
 patches), so this routes through the same ``padded_sdpa`` helper Pixtral's tower
-uses (``multimodal/utils.py``). The path has no real mask of its own, so only the
-padded keys are masked.
+uses (``multimodal/utils.py``). Only the padded keys are masked, plus, for packed
+images, the keys outside each image's ``cu_seqlens`` block.
 
 ``padded_sdpa`` is called directly rather than behind the opaque wrapper, so a
 tower whose blocks are marked compilable traces attention into the block graph.
@@ -32,7 +32,7 @@ from __future__ import annotations
 import torch
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
 
-from spyre_inference.multimodal.utils import padded_sdpa
+from spyre_inference.multimodal.utils import block_diagonal_mask, padded_sdpa
 
 
 @MMEncoderAttention.register_oot(name="MMEncoderAttention")
@@ -50,18 +50,20 @@ class SpyreMMEncoderAttention(MMEncoderAttention):
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         # padded_sdpa pads both sides to the query's stick-aligned length.
-        if cu_seqlens is not None or q_len != kv_len:
+        if q_len != kv_len:
             raise NotImplementedError(
-                "Spyre MMEncoderAttention supports only unpacked self-attention "
-                f"(got cu_seqlens={cu_seqlens is not None}, q_len={q_len}, kv_len={kv_len})."
+                f"Spyre MMEncoderAttention supports only self-attention (q_len={q_len}, "
+                f"kv_len={kv_len})."
             )
+        # Packed images (Pixtral's HF tower) attend within their own `cu_seqlens` block.
+        mask = None if cu_seqlens is None else block_diagonal_mask(cu_seqlens, q_len)
         is_reshaped = query.dim() != 4
         q, k, v = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
         out = padded_sdpa(
             q.transpose(1, 2),
             k.transpose(1, 2),
             v.transpose(1, 2),
-            None,
+            mask,
             scale=self.scale,
             enable_gqa=self.num_heads > self.num_kv_heads,
         ).transpose(1, 2)

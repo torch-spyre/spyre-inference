@@ -23,9 +23,12 @@ seam `force_text_backbone` imports locally.
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from spyre_inference.models import gemma4
 from spyre_inference.models.gemma4 import (
     GEMMA4_TEXT_BACKBONE_OVERRIDE,
+    configure_gemma4_moe_layers,
     force_text_backbone,
     repair_head_dim_access,
 )
@@ -208,3 +211,44 @@ def test_force_text_backbone_respects_user_supplied_hf_overrides(monkeypatch):
     force_text_backbone(engine_args)
 
     assert engine_args.hf_overrides is _user_override
+
+
+def test_moe_recipe_reads_the_decoder_experts_and_router_scale(monkeypatch):
+    """vLLM's decoder holds `experts` and `router.per_expert_scale` directly; a dense
+    layer has `experts = None`. A rename must not silently skip the recipe."""
+    calls = []
+    monkeypatch.setattr(gemma4, "configure_spyre_moe_layer", lambda *a: calls.append(a))
+    scale = torch.tensor([2.0, 3.0])
+    moe = SimpleNamespace(
+        experts=SimpleNamespace(routed_experts="routed"),
+        router=SimpleNamespace(per_expert_scale=scale),
+    )
+
+    assert configure_gemma4_moe_layers([moe, SimpleNamespace(experts=None)]) == 1
+    ((routed, recipe),) = calls
+    assert routed == "routed"
+    folded = recipe.prepare_down_weight(torch.ones(2, 1, 1))
+    torch.testing.assert_close(folded.flatten(), scale)
+
+
+@pytest.mark.parametrize(
+    ("flag", "raises"),
+    [("enable_moe_block", True), ("use_second_mlp_block", True), (None, False)],
+)
+def test_moe_checkpoint_without_experts_raises(monkeypatch, flag, raises):
+    """Either flag makes upstream build the MoE block, so either has to trip the check
+    when no layer exposes `experts`; a dense checkpoint configures none and is fine."""
+    from torch import nn
+    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+
+    def parent_init(self, *, vllm_config, prefix=""):
+        nn.Module.__init__(self)
+        self.config = SimpleNamespace(**({flag: True} if flag else {}))
+        self.model = SimpleNamespace(layers=[SimpleNamespace(experts=None)])
+
+    monkeypatch.setattr(Gemma4ForCausalLM, "__init__", parent_init)
+    if raises:
+        with pytest.raises(RuntimeError, match="no decoder layer exposes"):
+            gemma4.SpyreGemma4ForCausalLM(vllm_config=None)
+    else:
+        gemma4.SpyreGemma4ForCausalLM(vllm_config=None)

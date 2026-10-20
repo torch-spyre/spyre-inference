@@ -14,7 +14,7 @@
 
 """Tests for TorchSpyreScheduler's partial-prefill cap.
 
-The cap lowers ``max_num_running_reqs`` around the upstream waiting loop, so these
+The cap lowers ``max_num_active_reqs`` around the upstream waiting loop, so these
 drive that real loop and count the prefills it admits per step. Stubbing ``schedule``
 would leave the cap free to degrade into a no-op under an upstream change.
 """
@@ -147,7 +147,7 @@ def test_streaming_slots_counted_as_occupancy(monkeypatch, num_streaming):
     """
     seen = []
     monkeypatch.setattr(
-        Scheduler, "schedule", lambda self, *a, **kw: seen.append(self.max_num_running_reqs)
+        Scheduler, "schedule", lambda self, *a, **kw: seen.append(self.max_num_active_reqs)
     )
     scheduler = _scheduler(max_num_seqs=8)
     scheduler.running = [

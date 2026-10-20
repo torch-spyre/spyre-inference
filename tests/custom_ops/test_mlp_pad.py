@@ -266,8 +266,11 @@ def test_verify_ignores_a_tower_mlp_of_another_width():
     class _Composite(torch.nn.Module, SupportsMultiModal):
         pass
 
+    mm_config = SimpleNamespace(mm_encoder_only=False)
     vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(multimodal_config=SimpleNamespace(mm_encoder_only=False))
+        model_config=SimpleNamespace(
+            multimodal_config=mm_config, get_multimodal_config=lambda: mm_config
+        )
     )
     model = _Composite()
     model.vision_tower = _model_with_down_proj(_ORIG)

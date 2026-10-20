@@ -18,7 +18,7 @@
 Upstream has no override hook for its init_attn_backend / BlockTables
 calls, so how init() reaches attn_groups.init() / SpyreBlockTables (full
 copy, monkeypatch, or otherwise) is open; see the plan's kv_cache seam
-discussion. Also waits on #945 (KVCacheTensor's schema changes at 0.29).
+discussion.
 """
 
 from typing import TYPE_CHECKING, Any

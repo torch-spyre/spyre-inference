@@ -18,6 +18,7 @@ A thin coordinator: every method here delegates to the component module
 that owns the concern.
 """
 
+from contextlib import AbstractContextManager
 from typing import Any
 
 import torch
@@ -39,8 +40,18 @@ class SpyreModelRunnerV2(GPUModelRunner):
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         load.load_and_wrap(self, *args, **kwargs)
 
-    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig, **kwargs: Any) -> None:
-        kv_cache.init(self, kv_cache_config, **kwargs)
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+        kv_cache_allocation_context: AbstractContextManager | None = None,
+    ) -> None:
+        kv_cache.init(
+            self,
+            kv_cache_config,
+            is_profiling=is_profiling,
+            kv_cache_allocation_context=kv_cache_allocation_context,
+        )
         self.cudagraph_manager = bucketing.SpyreBucketManager.from_runner(self)
 
     def pool(self, *args: Any, **kwargs: Any) -> Any:

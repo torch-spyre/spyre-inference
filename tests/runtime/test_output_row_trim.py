@@ -12,140 +12,87 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sampled hidden-state rows are gathered on Spyre before output D2H.
+"""Generation D2Hs only the sampled hidden-state rows when that pays off."""
 
-The gather only pays off once the body copy it removes is large enough to cover
-the gather kernel, so these use a realistic ``HIDDEN`` and body sizes: a toy
-hidden size would fall under ``_OUTPUT_TRIM_MIN_BYTES`` and never trim.
-"""
-
+import pytest
 import torch
 import torch.nn as nn
 
 from spyre_inference.v1.worker import spyre_model_runner as mr
-from spyre_inference.v1.worker.spyre_model_runner import (
-    _OUTPUT_TRIM_MIN_BYTES,
-    _SpyreModelWrapper,
-    _worth_trimming,
-)
+from spyre_inference.v1.worker.spyre_model_runner import _SpyreModelWrapper
 
+# fp16 at 4096 is 8 KiB a row: a 512-row body clears the byte floor, a 4-row one does not.
 HIDDEN = 4096
-# fp16: one row is 8 KiB, so a 512-row body is 4 MiB and trimming clears the
-# byte floor by a wide margin.
-BIG_BODY = 512
 
 
 class _Body(nn.Module):
+    """Row ``i`` of the output is filled with ``i``."""
+
     def forward(self, input_ids=None, **kwargs):
         rows = input_ids.shape[0]
         return torch.arange(rows, dtype=torch.float16).unsqueeze(1).expand(rows, HIDDEN)
 
 
-def _wrapper(monkeypatch, *, buckets, copied):
-    def fake_convert(t, device=None, dtype=None):
-        if device is not None and str(device) == "cpu" and t.dim() == 2:
-            copied.append(t.shape[0])
-        return t
+class _Bucketer:
+    def find_bucket(self, num_tokens):
+        return next((b for b in (1, 4, 512) if b >= num_tokens), None)
 
-    monkeypatch.setattr(mr, "convert", fake_convert)
-    # The full-copy fallback converts through convert_tensor_tree, which calls utils.convert.
-    monkeypatch.setattr("spyre_inference.custom_ops.utils.convert", fake_convert)
-    model = _Body()
-    return _SpyreModelWrapper(
-        model,
+
+def _wrapper(monkeypatch):
+    """A wrapper whose gathered D2H row counts land in the returned list."""
+    copied: list[int] = []
+    real_convert = mr.convert
+
+    def recording_convert(t, device=None, **kwargs):
+        copied.append(t.shape[0])
+        return real_convert(t, device=device, **kwargs)
+
+    monkeypatch.setattr(mr, "convert", recording_convert)
+    wrapper = _SpyreModelWrapper(
+        _Body(),
         torch.device("cpu"),
-        logits_row_buckets=buckets,
+        logits_row_buckets=[1, 4],
+        shape_bucketer=_Bucketer(),
         model_dtype=torch.float16,
     )
+    return wrapper, copied
 
 
 def _run(wrapper, num_tokens, rows=None):
-    ids = torch.zeros(num_tokens, dtype=torch.int64)
     if rows is not None:
-        object.__setattr__(wrapper, "_sample_rows", torch.tensor(rows, dtype=torch.int64))
-    return wrapper(input_ids=ids)
+        object.__setattr__(wrapper, "_sample_rows", torch.tensor(rows))
+    return wrapper(input_ids=torch.zeros(num_tokens, dtype=torch.int64))
 
 
-def test_copies_only_the_sampled_rows(monkeypatch):
-    copied: list[int] = []
-    wrapper = _wrapper(monkeypatch, buckets=[1, 4], copied=copied)
+def test_only_the_sampled_rows_are_copied_and_land_at_their_offsets(monkeypatch):
+    wrapper, copied = _wrapper(monkeypatch)
+    rows = torch.tensor([3, 255, 511])
 
-    out = _run(wrapper, BIG_BODY, rows=[BIG_BODY - 1])
+    out = _run(wrapper, 512, rows=rows)
 
-    assert copied == [1]
-    assert out.shape == (1, HIDDEN)
-    torch.testing.assert_close(
-        out[0], torch.full((HIDDEN,), float(BIG_BODY - 1), dtype=torch.float16)
-    )
+    assert copied == [4], "three rows gathered at the warmed width 4"
+    assert out.shape == (512, HIDDEN), "upstream indexes the full body"
+    torch.testing.assert_close(out[rows], rows.to(torch.float16).unsqueeze(1).expand(3, HIDDEN))
 
 
-def test_sampled_rows_are_returned_in_order(monkeypatch):
-    copied: list[int] = []
-    wrapper = _wrapper(monkeypatch, buckets=[1, 2, 4], copied=copied)
+# Too small for the gather to pay off, and past the largest bucket (no compiled gather).
+@pytest.mark.parametrize("num_tokens", [4, 600])
+def test_a_body_the_gather_cannot_serve_is_copied_whole(monkeypatch, num_tokens):
+    wrapper, copied = _wrapper(monkeypatch)
+    last = num_tokens - 1
 
-    out = _run(wrapper, BIG_BODY, rows=[127, 300, BIG_BODY - 1])
+    out = _run(wrapper, num_tokens, rows=[last])
 
-    assert copied == [4]
-    assert out.shape == (3, HIDDEN)
-    for result, row in zip(out, (127, 300, BIG_BODY - 1)):
-        torch.testing.assert_close(result, torch.full((HIDDEN,), float(row), dtype=torch.float16))
-
-
-def test_unarmed_call_copies_the_whole_body(monkeypatch):
-    copied: list[int] = []
-    wrapper = _wrapper(monkeypatch, buckets=[1, 4], copied=copied)
-
-    _run(wrapper, BIG_BODY)
-
-    assert copied == [BIG_BODY]
+    assert copied == []
+    torch.testing.assert_close(out[last], torch.full((HIDDEN,), float(last), dtype=torch.float16))
 
 
-def test_arming_does_not_leak_into_the_next_call(monkeypatch):
-    copied: list[int] = []
-    wrapper = _wrapper(monkeypatch, buckets=[1, 4], copied=copied)
+def test_rows_are_consumed_by_one_forward(monkeypatch):
+    wrapper, copied = _wrapper(monkeypatch)
+    _run(wrapper, 512, rows=[511])
+    copied.clear()
 
-    _run(wrapper, BIG_BODY, rows=[BIG_BODY - 1])
-    _run(wrapper, BIG_BODY)
+    out = _run(wrapper, 512)
 
-    assert copied == [1, BIG_BODY]
-
-
-def test_armed_gather_can_select_all_body_rows(monkeypatch):
-    copied: list[int] = []
-    wrapper = _wrapper(monkeypatch, buckets=[1, 8], copied=copied)
-
-    _run(wrapper, 8, rows=list(range(8)))
-
-    assert copied == [8]
-
-
-class TestSavingsGuard:
-    """The trim is skipped when the gather would cost more than the copy it saves.
-
-    The decision lives in the runner, before ``logits_indices`` is rewritten, so
-    these cover the predicate directly; the runner wiring is covered by
-    ``TestArming`` in ``test_warmup_logits_widths.py``.
-    """
-
-    def test_threshold_is_on_bytes_saved_not_rows(self):
-        # Same row count either side; only the wide body moves enough bytes to
-        # pay for the gather. A rows-based threshold would decide these the same
-        # way and be wrong on any model with a different hidden size.
-        assert _worth_trimming(64, 4, 4096, 2)
-        assert not _worth_trimming(64, 4, 64, 2)
-
-    def test_no_narrowing_is_rejected(self):
-        assert not _worth_trimming(4, 4, 4096, 2)
-        assert not _worth_trimming(4, 8, 4096, 2)
-
-    def test_floor_is_exact(self):
-        exact_rows = _OUTPUT_TRIM_MIN_BYTES // (4096 * 2)
-
-        assert _worth_trimming(1 + exact_rows, 1, 4096, 2)
-        assert not _worth_trimming(exact_rows, 1, 4096, 2)
-
-    def test_itemsize_is_honoured(self):
-        # fp32 halves the rows needed to clear the floor.
-        rows_fp16 = _OUTPUT_TRIM_MIN_BYTES // (4096 * 2)
-        assert not _worth_trimming(rows_fp16, 1, 4096, itemsize=2)
-        assert _worth_trimming(rows_fp16, 1, 4096, itemsize=4)
+    assert copied == [], "a forward without rows copies the whole body"
+    torch.testing.assert_close(out[7], torch.full((HIDDEN,), 7.0, dtype=torch.float16))

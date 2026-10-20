@@ -64,9 +64,9 @@ Prompt logprobs, auxiliary hidden-state outputs, speculative decoding, KV-sharin
 prefill, pooling, eager execution, and unbucketed shapes retain the full-output path. It
 is also skipped when the rows it would drop are too few to cover the gather: the gather
 is a near-fixed cost while the copy it removes scales with the body, so trimming only
-pays once enough hidden states would be left behind. All of these conditions are
-evaluated in one place before the step runs, because arming the trim rewrites the
-sampled-row indices and that rewrite cannot be undone later.
+pays once enough hidden states would be left behind. The gathered rows are written back
+into a full-size host tensor at their original offsets, so the sampled-row indices are
+never rewritten and the full copy stays a valid fallback for any step.
 
 ## Encoder / pooling compile buckets
 

@@ -148,6 +148,7 @@ def spyre_device_count() -> int:
         return aiu_world_size
     except ValueError as e:
         print(f"AIU_WORLD_SIZE '{aiu_world_size}' is invalid, error: {e}", file=sys.stderr)
+        return 0
 
 
 # ---------------------------------------------------------------------------

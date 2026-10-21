@@ -101,6 +101,7 @@ def _run(
         "TORCHINDUCTOR_FX_GRAPH_CACHE",
         "TORCHINDUCTOR_AUTOGRAD_CACHE",
         "VLLM_DISABLE_COMPILE_CACHE",
+        "TORCH_SPYRE_CACHE_SCAN",
     ):
         env.pop(var, None)
     env.update(
@@ -150,15 +151,6 @@ def _run(
     return json.loads(out_path.read_text()), log_text
 
 
-_XFAIL_FOR_EACH_TILE = pytest.mark.xfail(
-    strict=True,
-    raises=CacheGrewError,
-    reason=(
-        "torch-spyre#5199: with SPYRE_ATTN_FOR_EACH_TILE=1 (the default) some cache keys "
-        "are not stable across processes, so the populated-cache run compiles part of the "
-        "kernels again"
-    ),
-)
 _XFAIL_FRESH_LOWERING = pytest.mark.xfail(
     strict=True,
     raises=CacheGrewError,
@@ -175,7 +167,7 @@ _TP2 = [
 ]
 
 
-# The xfail cases run at TP=1 only: TP=2 would hit the same cache-key bugs. With
+# The xfail case runs at TP=1 only: TP=2 would hit the same cache-key bug. With
 # SPYRE_ATTN_FOR_EACH_TILE=1 only "shared" runs, since "fresh" would also hit the
 # fresh-lowering bug.
 @pytest.mark.timeout(3 * (_RUN_TIMEOUT_S + 60) + 120)
@@ -185,7 +177,7 @@ _TP2 = [
         pytest.param(1, False, False, id="tp1-for_each_tile_off-shared"),
         pytest.param(2, False, False, id="tp2-for_each_tile_off-shared", marks=_TP2),
         pytest.param(1, False, True, id="tp1-for_each_tile_off-fresh", marks=_XFAIL_FRESH_LOWERING),
-        pytest.param(1, True, False, id="tp1-for_each_tile_on-shared", marks=_XFAIL_FOR_EACH_TILE),
+        pytest.param(1, True, False, id="tp1-for_each_tile_on-shared"),
     ],
 )
 def test_kernel_cache(tmp_path: Path, tp: int, for_each_tile: bool, fresh_lowering: bool) -> None:

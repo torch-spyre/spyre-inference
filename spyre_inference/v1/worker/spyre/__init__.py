@@ -15,7 +15,8 @@
 """Spyre Model Runner V2 (MRV2) implementation. MRV2 ONLY.
 
 Subclasses vLLM's MRV2 runner and its components (vllm/v1/worker/gpu/).
-Nothing here is used by the V1 runner, and no module outside this package
-imports it. The V1 runner is spyre_model_runner.py / spyre_worker.py, next
+Nothing here is used by the V1 runner, and outside this package only
+spyre_inference/__init__.py and platform.py import it, for the Triton gate.
+The V1 runner is spyre_model_runner.py / spyre_worker.py, next
 to this package; those files are deleted when V2 becomes the default (#906).
 """

@@ -85,6 +85,7 @@ from spyre_inference.custom_ops.mlp_pad import (
 )
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
+from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
@@ -118,7 +119,12 @@ from spyre_inference.v1.pool.spyre_pooler import (
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.encoder_grid import EncoderDispatchStats, expand_body_to_grid
+from spyre_inference.v1.worker.encoder_grid import (
+    EncoderDispatchStats,
+    encoder_pad_token_id,
+    expand_body_to_grid,
+)
+from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_cls_rows,
@@ -147,10 +153,8 @@ def _compute_slot_mapping_impl(
     positions: torch.Tensor,
     block_table: torch.Tensor,
     block_table_stride: int,
-    block_size: int,
     slot_mapping: torch.Tensor,
-    KV_CACHE_BLOCK_SIZE: int | None = None,
-    BLOCKS_PER_KV_BLOCK: int = 1,
+    KV_CACHE_BLOCK_SIZE: int,
     TOTAL_CP_WORLD_SIZE: int = 1,
     TOTAL_CP_RANK: int = 0,
     CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -166,17 +170,12 @@ def _compute_slot_mapping_impl(
 
     Correctness is validated indirectly by the upstream attention backend test
     (test_causal_backend_correctness) and end-to-end model generation tests.
-
-    ``block_size`` is the kernel's block size, ``KV_CACHE_BLOCK_SIZE`` the KV
-    manager's, and ``BLOCKS_PER_KV_BLOCK`` the ratio between them (1 on Spyre).
     """
     assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-    kv_block_size = block_size if KV_CACHE_BLOCK_SIZE is None else KV_CACHE_BLOCK_SIZE
 
     token_positions = positions[:num_tokens]
-    virtual_block_indices = (token_positions // kv_block_size).to(torch.int64)
-    local_block_offsets = (token_positions % kv_block_size).to(torch.int64)
-    block_indices = virtual_block_indices * BLOCKS_PER_KV_BLOCK + local_block_offsets // block_size
+    block_indices = (token_positions // KV_CACHE_BLOCK_SIZE).to(torch.int64)
+    block_offsets = (token_positions % KV_CACHE_BLOCK_SIZE).to(torch.int64)
 
     num_reqs = query_start_loc.shape[0] - 1
     req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
@@ -187,7 +186,7 @@ def _compute_slot_mapping_impl(
 
     flat_indices = req_indices * block_table_stride + block_indices
     block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * block_size + local_block_offsets % block_size
+    slot_mapping[:num_tokens] = block_numbers * KV_CACHE_BLOCK_SIZE + block_offsets
     if num_tokens < max_num_tokens:
         slot_mapping[num_tokens:max_num_tokens] = PAD_ID
 
@@ -205,10 +204,8 @@ class _SlotMappingKernelShim:
         positions: torch.Tensor,
         block_table: torch.Tensor,
         block_table_stride: int,
-        block_size: int,
         slot_mapping: torch.Tensor,
-        KV_CACHE_BLOCK_SIZE: int | None = None,
-        BLOCKS_PER_KV_BLOCK: int = 1,
+        KV_CACHE_BLOCK_SIZE: int,
         TOTAL_CP_WORLD_SIZE: int = 1,
         TOTAL_CP_RANK: int = 0,
         CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
@@ -220,10 +217,8 @@ class _SlotMappingKernelShim:
             positions,
             block_table,
             block_table_stride,
-            block_size,
             slot_mapping,
-            KV_CACHE_BLOCK_SIZE=KV_CACHE_BLOCK_SIZE,
-            BLOCKS_PER_KV_BLOCK=BLOCKS_PER_KV_BLOCK,
+            KV_CACHE_BLOCK_SIZE,
             TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
             TOTAL_CP_RANK=TOTAL_CP_RANK,
             CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
@@ -361,8 +356,8 @@ def _is_decoder_attention_like(module: nn.Module) -> bool:
     # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
     # vLLM's KV-cache attention implementation. Transformers may prefix the
     # implementation with ``paged|`` when it enables its paged-cache wrapper.
-    # TODO: Drop the decoder-only restriction when
-    # test_spyre_compiled_pixtral_vision_attention_coarse_tile XPASSes.
+    # Vision towers compile through ``SpyreVisionEncoderMixin`` instead, per encoder
+    # budget, not through ``_compile_blocks``.
     implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
     return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
         "|"
@@ -523,7 +518,9 @@ class _SpyreModelWrapper:
                 return convert(t, dtype=self._model_dtype, device=self._spyre_device)
             return t
 
-        kwargs = tree_map(_to_spyre_float, kwargs)
+        # These prepare their inputs on the host and upload once themselves.
+        if not isinstance(self._model, SpyreVisionEncoderMixin):
+            kwargs = tree_map(_to_spyre_float, kwargs)
         # The parts of a vision tower outside a compiled block run eager, so each Spyre
         # op with a decomposition there reaches it through torch-spyre's lazily-compiled
         # PrivateUse1 kernel, which compiles without fullgraph. Decompositions built on
@@ -572,16 +569,27 @@ class _SpyreModelWrapper:
         # boolean-mask ops are handled inside the model's own patch (e.g.
         # patch_embed_input_ids for Granite4Vision).
         num_tokens = input_ids.shape[0]
+        vision = isinstance(self._model, SpyreVisionEncoderMixin)
+        # An image step stages at least two rows: a one-row copy out of the merge's layout
+        # fails (torch-spyre#4883).
+        merges = vision and multimodal_embeddings is not None and len(multimodal_embeddings) > 0
+        target = max(num_tokens, 2) if merges else num_tokens
         bucketer = self._shape_bucketer
-        padded_tokens = bucketer.find_bucket(num_tokens) if bucketer is not None else None
+        if bucketer is not None:
+            padded_tokens = bucketer.find_bucket(target)
+        else:
+            padded_tokens = target if target != num_tokens else None
         if padded_tokens is not None and padded_tokens != num_tokens:
             input_ids = F.pad(input_ids, (0, padded_tokens - num_tokens))
             if is_multimodal is not None:
                 is_multimodal = F.pad(is_multimodal, (0, padded_tokens - num_tokens))
 
         input_ids = convert(input_ids, dtype=torch.int64, device=self._spyre_device)
-        is_multimodal = self._to_spyre(is_multimodal)
-        multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
+        # These place their image tokens on the host (``SpyreVisionEncoderMixin.embed_input_ids``),
+        # where their encoder output already is, so neither goes to the card here.
+        if not vision:
+            is_multimodal = self._to_spyre(is_multimodal)
+            multimodal_embeddings = tree_map(self._to_spyre, multimodal_embeddings)
 
         result = self._model.embed_input_ids(
             input_ids, multimodal_embeddings, is_multimodal=is_multimodal
@@ -1020,6 +1028,60 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs()
+        self._record_vision_graphs()
+
+    @torch.inference_mode()
+    def _record_vision_graphs(self) -> None:
+        """Compile the vision encoder at every budget; serving then runs through the manager."""
+        model = self._compiled_vision_model()
+        if model is None:
+            return
+        with _set_spyre_compilation_settings(self.vllm_config):
+            model.compile_vision_graphs()
+            self._maybe_init_encoder_cudagraph_manager()
+            assert self.encoder_cudagraph_manager is not None
+            self.encoder_cudagraph_manager.capture(graph_pool=None)
+            self._warmup_vision_merge(model)
+
+    def _warmup_vision_merge(self, model: SpyreVisionEncoderMixin) -> None:
+        """Compile ``vision_merge`` at every token bucket an image step can land on."""
+        bucketer = self.spyre_shape_bucketer
+        if bucketer is None:
+            return
+        wrapper = cast(_SpyreModelWrapper, self.model)
+        image_rows = [torch.zeros(1, model.out_hidden_size, dtype=self._model_dtype())]
+        # Image steps stage at least two rows (see _SpyreModelWrapper.embed_input_ids), so a
+        # bucket below two is never reached.
+        for size in bucketer.bucket_sizes:
+            if size < 2:
+                continue
+            is_multimodal = torch.zeros(size, dtype=torch.bool)
+            is_multimodal[0] = True
+            wrapper.embed_input_ids(
+                torch.zeros(size, dtype=torch.int32), image_rows, is_multimodal=is_multimodal
+            )
+        logger.info("Vision merge compiled at every token bucket.")
+
+    def _compiled_vision_model(self) -> SpyreVisionEncoderMixin | None:
+        if not self.supports_mm_inputs or self.compilation_config.mode is CompilationMode.NONE:
+            return None
+        model = getattr(self.model, "_model", self.model)
+        return model if isinstance(model, SpyreVisionEncoderMixin) else None
+
+    def _create_encoder_cudagraph_manager(self) -> SpyreEncoderGraphManager | None:
+        # Not keyed on `cudagraph_mm_encoder`, which also gates GPU-only memory profiling.
+        model = self._compiled_vision_model()
+        if model is None:
+            return None
+        # The processor's largest item, as upstream computes it for the scheduler's encoder
+        # budget; a model whose encoder tokens differ overrides its budget range.
+        assert self.mm_budget is not None
+        model.max_tokens_per_item = max(
+            self.mm_budget.mm_max_toks_per_item[m] for m in model.vision_modalities
+        )
+        return SpyreEncoderGraphManager(
+            self.vllm_config, self._spyre_device, self._model_dtype(), model
+        )
 
     @torch.inference_mode()
     def _warmup_input_embedding(self, num_tokens: int) -> None:
@@ -1256,7 +1318,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         num_reqs: int,
         num_scheduled_tokens_np: np.ndarray,
         max_num_scheduled_tokens: int,
-        use_cascade_attn: bool,
+        use_cascade_attn: bool = False,
         allow_microbatching: bool = True,
         force_eager: bool = False,
         force_uniform_decode: bool | None = None,
@@ -1292,7 +1354,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_reqs=num_reqs,
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             max_num_scheduled_tokens=max_num_scheduled_tokens,
-            use_cascade_attn=use_cascade_attn,
             allow_microbatching=allow_microbatching,
             force_eager=force_eager,
             force_uniform_decode=force_uniform_decode,
@@ -1585,7 +1646,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             inputs_embeds,
             positions,
             grid,
-            pad_token_id=self._encoder_pad_token_id(),
+            pad_token_id=encoder_pad_token_id(self.model_config),
             position_offset=position_offset,
         )
 
@@ -1660,11 +1721,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if counts is None or int(counts.numel()) != len(grid[2]):
             return None
         return pooling
-
-    def _encoder_pad_token_id(self) -> int:
-        """Pad id for batch-pad filler tokens; their outputs are masked and dropped."""
-        pad = getattr(getattr(self.model_config, "hf_config", None), "pad_token_id", None)
-        return int(pad) if isinstance(pad, int) else 0
 
     def _dummy_pooler_run_task(
         self,
@@ -1888,10 +1944,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
-
-    def _init_device_properties(self) -> None:
-        # No CUDA/GPU device properties to query for Spyre
-        pass
 
     def _sync_device(self) -> None:
         # Wait for outstanding async H2D from SpyreCpuGpuBuffer.copy_to_gpu

@@ -100,13 +100,13 @@ class _MinimalGranite4VisionModel(nn.Module):
     as a bare instance call without instantiating the full model.
 
     Uses single-patch inputs (image_feature.shape[0] == 1) so only
-    `self.image_newline` is needed — the multi-patch branch additionally
+    `self.image_newline` is read — the multi-patch branch additionally
     reads `self.config`, `self._downsample_rate`, etc.
     """
 
     def __init__(self):
         super().__init__()
-        self.image_newline = None  # single-patch branch: only checked for None
+        self.image_newline = nn.Parameter(torch.full((FEATURE_DIM,), 0.5, dtype=torch.float16))
         # _pack_and_unpad_image_features reads self.config and self._downsample_rate
         # unconditionally on entry, before branching on image_feature.shape[0].
         self.config = _MinimalDownsamplerConfig()
@@ -263,7 +263,7 @@ def _make_pack_and_unpad_inputs(num_images: int = 1):
 
     Each entry has shape `[1, NEW_IMAGE_SIDE^2, FEATURE_DIM]` — the leading
     dimension of 1 selects the single-patch branch in the method, which only
-    reads `self.image_newline` (set to None in `_MinimalGranite4VisionModel`).
+    reads `self.image_newline`.
     The multi-patch branch additionally requires `self.config`,
     `self._downsample_rate`, etc., which a minimal stub cannot provide.
     """

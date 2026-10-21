@@ -31,6 +31,7 @@ Three environment variables must be set for Artifactory access:
 ARTIFACTORY_URL       # Base URL of the Artifactory instance
 ARTIFACTORY_TOKEN     # Bearer token (rotate via Artifactory UI → Access Tokens)
 ARTIFACTORY_RPM_REPO  # RPM repository name
+ARTIFACTORY_BUNDLE_PATH  # <repo>/<subpath> holding the RPM bundles (for lock_spyre_rpms.py)
 ```
 
 Validate before starting (note: strip trailing slash from `ARTIFACTORY_URL` to avoid double-slash in API paths — some Artifactory endpoints silently 404 on `//artifactory/...`):
@@ -172,6 +173,20 @@ these in `pyproject.toml` in the same commit:
 5. `[tool.uv.sources]` ppc64le torch: `tag = "vX.Y.Z"`
 6. `[[tool.uv.dependency-metadata]]` for torch: the `version` (and `requires-dist`, from the
    new tag's metadata) of the ppc64le source build
+7. torchvision, moved to the release built for the new torch: the one whose PyPI
+   `requires_dist` has `torch==X.Y.Z` (`curl -s https://pypi.org/pypi/torchvision/<V>/json
+   | jq .info.requires_dist`). Update all of these to `V`:
+   - the `torchvision==V` pins in `[project.dependencies]` and `override-dependencies`
+   - `[tool.uv.sources]` Power/Z torchvision: `tag = "vV"`
+   - `[tool.uv.extra-build-variables.torchvision]`: `BUILD_VERSION = "V"`,
+     `PYTORCH_VERSION = "X.Y.Z"`
+   - `[tool.uv.extra-build-dependencies]`: `torchvision = ["torch==X.Y.Z"]`
+   - `[[tool.uv.dependency-metadata]]` for torchvision: `version` and its `requires-dist`,
+     copied from PyPI's `V`
+
+   The `torch==X.Y.Z` override replaces torchvision's own torch requirement, so uv
+   reports no conflict if this step is skipped. The lock ends up pairing the new torch
+   with a torchvision built for the old one.
 
 The vLLM pin must allow the new torch too. If it pins torch exactly and doesn't, the torch
 bump needs a vLLM bump first ([[upgrade-vllm]]); stop and say so rather than overriding it.
@@ -243,7 +258,7 @@ uv run --no-sync pytest tests/e2e/test_vllm_spyre_next.py::test_basic_model_load
 
 This confirms torch-spyre loads and a model can be instantiated on the Spyre device — catching the most common bump failures (stale inductor cache, missing symbols, import errors) quickly.
 
-**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[packages]` entry — no need to reach into the `next` dev-preview tree.
+**A green local build/smoke test does not guarantee CI links.** The build host has many `ibm-*` libs pre-installed system-wide, so a new link-time dependency the bump introduces (e.g. `-laiupti`) resolves locally but fails in CI, which installs only what's in `spyre-rpms.lock`. Watch the CI "Build spyre-inference" step for `/usr/bin/ld: cannot find -l<lib>`. The fix is to add the missing lib to the lock (§7). Every lib we depend on — including the profiler's `ibm-libaiupti` — is published in the **prod** (base) tree now, so a new dependency is just another `[tool.spyre-rpms]` `packages` entry, then regenerate the lock.
 
 If the smoke test passes, tell the user:
 
@@ -259,30 +274,12 @@ If it fails, triage:
 
 ### 7. Update `spyre-rpms.lock`
 
-The torch-spyre bump typically coincides with newer `ibm-*` RPMs on the build host. `spyre-rpms.lock` is **TOML**. All packages live in the **prod** (base) tree — `<repo>/<arch>/` — so `[defaults].tree = ""` and there are no per-package tree overrides (`ibm-libaiupti` now ships to prod, so the `next` tree — still available for dev-preview builds — is no longer needed for the baseline). `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
+The torch-spyre bump typically coincides with newer `ibm-*` RPMs. Those are pinned by **bundle**: a published set of RPMs built against each other, at `<ARTIFACTORY_BUNDLE_PATH>/<arch>/prod/<bundle>/` next to a `build_hashes.json` naming each component's commit. `[tool.spyre-rpms]` in `pyproject.toml` names the bundle and the packages; `spyre-rpms.lock` is generated from it — never hand-edit the lock. CI still downloads from `ARTIFACTORY_RPM_PATH`'s prod tree (`<repo>/<arch>/`, `[defaults].tree = ""`), and `.github/scripts/resolve_rpms.py` turns the pins into per-arch filenames at CI time.
 
-The lock encodes two kinds of pin:
+The generated lock encodes two kinds of pin:
 
-- **`[packages]` — x86_64, EXACT build.** The trailing `_<buildnum>` is part of the pin. We have x86_64 CI, so we pin the exact build we tested; the build number matters — a newer build of the *same* commit can carry an ABI change that mismatches the compiled torch-spyre extension (we hit exactly this). `resolve_rpms.py` matches this filename verbatim; it does **not** resolve to a newer build.
-- **`[overrides.ppc64le]` / `[overrides.s390x]` — P and Z, same commit, build wildcarded.** We have no CI to validate an exact build on P/Z, so we pin the same commit as x86_64 with a `_*` where the build number goes; `resolve_rpms.py` picks the newest matching build. Tighten these to exact builds once P/Z CI exists.
-
-```toml
-version = 2
-
-[defaults]
-tree = ""
-
-[packages]                                                        # x86_64 — exact build
-ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_322" }
-
-[overrides.ppc64le]                                               # P — same commit, any build
-ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_*" }
-
-[overrides.s390x]                                                 # Z — same commit, any build
-ibm-deeptools = { version = "2.0.0-0.main.1+2403.cc6e4df_*" }
-```
-
-The version-string anatomy:
+- **`[packages]` — x86_64, EXACT build.** The bundle's own build, trailing `_<buildnum>` included. The build number matters — a newer build of the *same* commit can carry an ABI change that mismatches the compiled torch-spyre extension (we hit exactly this). `resolve_rpms.py` matches this filename verbatim.
+- **`[overrides.ppc64le]` / `[overrides.s390x]` — P and Z, same commit, build wildcarded (`_*`).** P/Z bundles don't line up with x86_64 ones yet, so `resolve_rpms.py` picks the newest P/Z build of the bundled commit.
 
 ```text
 2.0.0-0.main.1+2403.cc6e4df_322.el10.x86_64.rpm
@@ -291,51 +288,31 @@ The version-string anatomy:
             count  sha7   ← the commit
 ```
 
-For x86_64 you keep the whole `version`, including `_<build>`. For the P/Z overrides you keep up to the sha and replace `_<build>` with `_*`.
+#### Step 1: Pick a bundle
 
-#### Step 1: Read installed RPMs (name + full build)
-
-```bash
-rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ibm-*' \
-  | grep -v '(none)' \
-  | grep -E '^ibm-(deeptools|flex|senlib|spyre-comms|aiu-toolbox|libaiupti)' \
-  | sort > /tmp/host-rpms.txt
-```
-
-Each line is `NAME  VERSION-RELEASE`, e.g. `ibm-deeptools 2.0.0-0.main.1+2403.cc6e4df_322.el10`. The x86_64 `version` you pin is everything before `.el10` (`…cc6e4df_322`, build included); the commit (for the P/Z overrides) is that string up to the 7-hex sha, with `_<build>` replaced by `_*`.
-
-#### Step 2: Confirm the host build exists in prod on x86_64
-
-CI installs from prod, not from the host, so the *exact* host build must be published there (a locally-built RPM won't be). Query Artifactory for each one. `resolve_rpms.py` reads the same env vars (with `ARTIFACTORY_URL`/`ARTIFACTORY_RPM_REPO` accepted as fallbacks for `ARTIFACTORY_BASE_URL`/`ARTIFACTORY_RPM_PATH`).
+List the dated nightlies and take the newest that has a `build_hashes.json` (older ones don't, and the tool refuses them). `main` and `release-2.0` are re-published in place, so prefer a dated `main_nightly_YYYY_MM_DD`.
 
 ```bash
 ARTIFACTORY_URL="${ARTIFACTORY_URL%/}"
-aql() {  # POST an AQL query, return raw JSON
-  curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
-    -H "Content-Type: text/plain" \
-    -X POST "$ARTIFACTORY_URL/artifactory/api/search/aql" --data "$1"
-}
-
-while read -r name ver; do
-  build="${ver%.el10}"        # strip trailing .el10 → …cc6e4df_322
-  q='items.find({"repo":"'"$ARTIFACTORY_RPM_REPO"'","path":"x86_64",'
-  q+='"name":{"$match":"'"$name"'-'"$build"'.el10.x86_64.rpm"}})'
-  hit=$(aql "$q" | jq -r '.results[].name' | head -1)
-  echo "${hit:-MISSING: $name @ $build}"
-done < /tmp/host-rpms.txt
+curl -sf -H "Authorization: Bearer $ARTIFACTORY_TOKEN" \
+  "$ARTIFACTORY_URL/artifactory/api/storage/$ARTIFACTORY_BUNDLE_PATH/x86_64/prod" \
+  | jq -r '.children[].uri' | grep main_nightly_ | tail -5
 ```
 
-If a build prints `MISSING`, it wasn't published to prod (typically a local-only build). Pin the newest prod build of the **same commit** instead: query `"<name>-<…sha7>_*.el10.x86_64.rpm"`, `.sort({"$desc":["created"]})`, take the first, and note the substitution in the PR.
+If torch-spyre fails to build against the newest bundle, bisect over bundles, not over individual packages.
 
-#### Step 3: Edit the lock
+#### Step 2: Regenerate the lock
 
-Set each `[packages]` entry's `version` to the exact x86_64 build from step 2, and set the matching `[overrides.ppc64le]` and `[overrides.s390x]` entries to the same commit with `_*`. Keep the `-core`/`-dd2`/`-headers`/`-devel` sub-packages of a lib on the **same** commit as their base package (they're built together). Leave `[defaults]` and `version = 2` untouched. Then confirm it parses:
+Set `bundle` in `[tool.spyre-rpms]`, then:
 
 ```bash
-python3 .github/scripts/resolve_rpms.py names   # lists package names, no network
+ARTIFACTORY_BASE_URL="$ARTIFACTORY_URL" ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
+  python3 scripts/lock_spyre_rpms.py
 ```
 
-#### Step 4: Validate the pin resolves on **all** arches — mandatory
+It fails, leaving the lock untouched, unless every bundled RPM has a bit-exact (SHA-1) copy in the RPM repo, each `-devel`/`-headers` package in `[tool.spyre-rpms.devel]` exists at its base package's exact build (bundles don't ship them yet), and every commit has a build on ppc64le and s390x. A newly needed library is one more `packages` entry. CI's `Check spyre-rpms.lock` workflow runs `lock_spyre_rpms.py --verify`, which fails a PR whose lock doesn't match `[tool.spyre-rpms]` or was edited by hand.
+
+#### Step 3: Validate the pin resolves on **all** arches — mandatory
 
 A build/commit that's present on x86_64 but missing on P or Z must fail here, at upgrade time, not on a later per-arch run.
 
@@ -346,9 +323,9 @@ ARTIFACTORY_RPM_PATH="$ARTIFACTORY_RPM_REPO" \
   python3 .github/scripts/resolve_rpms.py validate
 ```
 
-Every line must print `OK`. A `FAIL … missing on: x86_64 (…_322)` means the exact build isn't in prod — fix per step 2. A `FAIL … missing on: ppc64le`/`s390x` means the pinned commit isn't published on that arch — pick a commit present on all arches, or ask the user. This is exactly the check CI's populate step runs before caching.
+Every line must print `OK`. A `FAIL … missing on: x86_64 (…_322)` means the exact build isn't in prod, and a `FAIL … missing on: ppc64le`/`s390x` means the pinned commit isn't published on that arch; step 2 already refuses both, so a failure here means the lock was edited by hand — regenerate it. This is exactly the check CI's populate step runs before caching.
 
-#### Step 5: Sanity-check — no accidental downgrades
+#### Step 4: Sanity-check — no accidental downgrades
 
 Compare the commit count (the number right after `+`) of each new pin against the old lock. Both are TOML now, so read them with `tomllib`:
 
@@ -376,7 +353,7 @@ PY
 
 Downgrade warnings are informational — the user may intentionally roll back — but confirm before proceeding.
 
-#### Step 6: Verify the download end-to-end
+#### Step 5: Verify the download end-to-end
 
 Resolve the per-arch filenames and download them, mirroring exactly what `populate-rpm-cache` does:
 

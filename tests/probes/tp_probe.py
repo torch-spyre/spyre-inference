@@ -404,10 +404,7 @@ def main():
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ["LOCAL_RANK"])
 
-    # spyre_inference/__init__.py sets TORCH_DEVICE_BACKEND_AUTOLOAD=0 to
-    # control when libspyre_comms.so is loaded (it captures RANK/WORLD_SIZE
-    # at dlopen time). Trigger torch_spyre's autoload manually here, after
-    # the env vars set by the parent fixture are in place.
+    # A no-op unless TORCH_DEVICE_BACKEND_AUTOLOAD=0 disabled the import-time autoload.
     import torch_spyre
 
     torch_spyre._autoload()

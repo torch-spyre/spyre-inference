@@ -318,7 +318,7 @@ def test_head_major_write_index(default_vllm_config):
     assert len(per_head) == num_kv_heads
     for h, rows in enumerate(per_head):
         assert rows.shape == slots.shape
-        # Its own allocation, not a row of a [KV, T] tensor (torch-spyre#3770).
+        # Its own allocation, not a row of a [KV, T] tensor (torch-spyre#3851).
         assert rows.storage_offset() == 0
         for t, slot in enumerate(slots.tolist()):
             block, offset = divmod(slot, block_size)

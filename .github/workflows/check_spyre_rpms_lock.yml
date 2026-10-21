@@ -1,0 +1,37 @@
+name: Check spyre-rpms.lock
+
+on:
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'spyre-rpms.lock'
+      - 'scripts/lock_spyre_rpms.py'
+      - '.github/scripts/resolve_rpms.py'
+  push:
+    branches: [main]
+    paths:
+      - 'pyproject.toml'
+      - 'spyre-rpms.lock'
+      - 'scripts/lock_spyre_rpms.py'
+      - '.github/scripts/resolve_rpms.py'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-lock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          python-version: "3.12"
+
+      - name: Check spyre-rpms.lock matches [tool.spyre-rpms]
+        run: uv run --no-project python scripts/lock_spyre_rpms.py --verify

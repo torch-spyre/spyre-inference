@@ -187,11 +187,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """Head h of the token at ``block * block_size + offset`` lives at row
         ``(block * num_kv_heads + h) * block_size + offset``.
 
-        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
-        storage offset is still dropped on the way to the device (torch-spyre#3770 is
-        closed, but its fix covers float16 only -- see ``_kv_row_pool``). That corruption is
-        shape-dependent — correct while a row fits one int32 stick, every head past it
-        silently wrong — so a short-token test passes while long prefill corrupts.
+        One tensor per head, not rows of one ``[KV, T]`` tensor: a row of a 2-D index is
+        followed for its first int32 stick only (torch-spyre#3851), so every head drops the
+        tokens past it -- a short-token test passes while long prefill corrupts.
         """
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
         base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
@@ -217,16 +215,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
-        A page's rows are ``page * num_kv_heads + kv``, which the kernel cannot compute
-        from the page id: int32 arithmetic has no device op mapping. The kernel gathers
+        A page's rows are ``page * num_kv_heads + kv``. The kernel gathers
         them out of this pool rather than reading a per-block table, which also settles the
-        int32 offset question the unrolled walk had to work around: an int32 argument's
-        nonzero storage offset is still read as 0 and an in-graph slice of a stacked table
-        still gathers the wrong rows at that shape (torch-spyre#3770 is closed, but the fix
-        in torch-spyre#4449 landed for float16 only; strict xfails pin both cases --
-        test_spyre_compile_input_honors_storage_offset's int32 parametrization and
-        test_spyre_in_graph_slice_of_stacked_kv_row_index). A gather is offset-free, so one
-        pool serves every block.
+        question the unrolled walk had to work around: an index argument that is a row of
+        a stacked table loses its layout (torch-spyre#3851,
+        test_spyre_scatter_index_row_of_2d_table), and an in-graph slice of a stacked table
+        gathers the wrong rows at that shape (test_spyre_in_graph_slice_of_stacked_kv_row_index).
+        One pool serves every block.
 
         Pure cache geometry, so it is built once rather than per step, unlike the index
         tables -- which retires one H2D transfer per active block per sequence per step.

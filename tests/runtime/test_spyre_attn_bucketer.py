@@ -143,7 +143,7 @@ class TestPoolingQueryBucketCap:
     max_model_len=77, max_num_batched_tokens much larger).
 
     Stick-aligned the same way the encoder shape ladder pads a request
-    (_align_up_pow2): CLIP's max_model_len=77 pads to 128, not 77."""
+    (_align_up): CLIP's max_model_len=77 pads to 128, not 77."""
 
     def test_pooling_caps_query_buckets_at_stick_aligned_max_model_len(self):
         b = SpyreAttnBucketer(

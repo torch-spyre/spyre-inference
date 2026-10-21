@@ -41,8 +41,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 )
 
 # (max_model_len, max_num_seqs, max_num_batched_tokens). The first is the plan's
-# worked example; the second is the narrow config, where no batch can miss the rectangular
-# path and the group family is therefore empty.
+# worked example; the second is granite-embedding-278m's narrow batch.
 _CONFIGS = [
     (512, 32, 2048),
     (512, 4, 2048),
@@ -130,7 +129,11 @@ class TestWarmKernelsTracesTheDeclaredSet:
         monkeypatch.setattr(impl, "_run_fused", record_fused)
         traced = impl.warm_kernels(*_buffers(impl, rows), impl.num_heads, impl.num_kv_heads, 64)
 
-        assert seen_rects == encoder_rectangles(config)
+        # Only rectangles whose grid is this buffer. A smaller one is warmed by the
+        # dummy that allocates that row count, not by a prefix of the budget tensor.
+        assert seen_rects == [
+            (extent, width) for extent, width in encoder_rectangles(config) if extent * width == rows
+        ]
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_rects) + len(seen_groups)
 
@@ -167,13 +170,11 @@ class TestWarmKernelsTracesTheDeclaredSet:
         assert seen_groups == encoder_group_shapes(config)
         assert traced == len(seen_groups)
 
-    def test_warmed_against_the_callers_own_output_tensor(self, monkeypatch):
-        """Regression: the store's destination layout is part of its cache key.
+    def test_group_kernels_are_warmed_on_the_fixed_staging_buffer(self, monkeypatch):
+        """The group kernel's destination is the staging buffer, not the caller's body.
 
-        vLLM hands ``forward`` an output built as ``torch.empty(rows, H*D).view(-1, H,
-        D)``. Warming against a fresh ``torch.zeros((rows, H, D))`` instead is the same
-        shape with a different Spyre device layout, so the graph warmup compiled was
-        not the one real traffic could reuse.
+        The caller's row count is the step's bucket. Compiling the gather against it
+        would make one attention graph per bucket and recompile during the benchmark.
         """
         config = _config(512, 32, 2048)
         impl = _make_impl(config)
@@ -183,21 +184,23 @@ class TestWarmKernelsTracesTheDeclaredSet:
         real_rect, real_fused = impl._run_rect, impl._run_fused
 
         def record_rect(out, *args, **kwargs):
-            seen_out.append(out)
+            seen_out.append(("rect", out))
             return real_rect(out, *args, **kwargs)
 
         def record_fused(out, *args, **kwargs):
-            seen_out.append(out)
+            seen_out.append(("group", out))
             return real_fused(out, *args, **kwargs)
 
         monkeypatch.setattr(impl, "_run_rect", record_rect)
         monkeypatch.setattr(impl, "_run_fused", record_fused)
         impl.warm_kernels(query, key, value, output, impl.num_heads, impl.num_kv_heads, 64)
 
-        assert seen_out, "warmup must exercise the store"
-        assert all(o is output for o in seen_out), (
-            "store must be warmed against the caller's output, not a substitute"
-        )
+        rects = [out for kind, out in seen_out if kind == "rect"]
+        groups = [out for kind, out in seen_out if kind == "group"]
+        assert rects and all(out is output for out in rects)
+        assert groups
+        assert all(out.shape[0] == impl._buffer_rows + 1 for out in groups)
+        assert all(out is groups[0] for out in groups)
 
     def test_warmed_against_the_callers_own_query_layout(self, monkeypatch):
         """Regression: a fused-QKV projection (``qkv.split(...)``) hands out a strided
@@ -219,7 +222,6 @@ class TestWarmKernelsTracesTheDeclaredSet:
             return real_rect(out, q, *a, **k)
 
         def record_fused(out, row_index, q, *a, **k):
-            seen_strides.append(q.stride())
             return real_fused(out, row_index, q, *a, **k)
 
         monkeypatch.setattr(impl, "_run_rect", record_rect)

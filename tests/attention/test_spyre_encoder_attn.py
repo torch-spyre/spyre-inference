@@ -315,13 +315,13 @@ def ref_encoder_attn(
     return torch.cat(outputs, dim=0)
 
 
-def test_alignment_units_for_rounds_up_to_powers_of_two():
+def test_alignment_units_for_rounds_up_to_a_stick():
     assert [_alignment_units_for(n) for n in (1, 64, 65, 128, 129, 200, 512)] == [
         1,
         1,
         2,
         2,
-        4,
+        3,
         4,
         8,
     ]

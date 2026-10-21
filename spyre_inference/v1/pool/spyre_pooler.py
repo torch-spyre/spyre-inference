@@ -807,10 +807,10 @@ def configure_pooling_for_spyre(
     Classifier / reranker heads are downcast to fp16 (no native fp32 matmul,
     torch-spyre#1794). False if the pooling method is unknown.
 
-    ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
-    of two from one stick to ``max_model_len``), which are the only per-request widths
-    ``SpyreAllPool``'s bucketed gather can see. Not the body's ``compile_sizes``, which is
-    one entry. Passed in rather than re-derived here because only the caller is guaranteed
+    ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (every
+    stick from 64 to ``max_model_len``), which are the only per-request widths
+    ``SpyreAllPool``'s bucketed gather can see. Not the body's ``compile_sizes``.
+    Passed in rather than re-derived here because only the caller is guaranteed
     to run inside a ``set_current_vllm_config`` context; without it token pooling falls
     back to plain stick alignment.
     """

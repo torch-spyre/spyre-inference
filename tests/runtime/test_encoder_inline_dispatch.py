@@ -447,25 +447,28 @@ class TestBuildAttentionMetadata:
         runner.spyre_encoder_stats = EncoderDispatchStats()
         return runner
 
-    def test_a_non_rectangle_step_clears_the_last_grid(self, monkeypatch):
-        """A stale grid would make ``_preprocess`` lay this step's tokens out wrongly."""
+    def test_a_packed_step_publishes_no_grid(self, monkeypatch):
+        """Serving stays packed, so a stale rectangle grid must not survive the step."""
         steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": _encoder_md([5, 7])}, None)]
         runner = self._runner(monkeypatch, steps)
+        runner._encoder_grid = (64, 2, [5, 7])
 
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        assert runner._encoder_grid is not None
-        assert runner._encoder_grid[2] == [5, 7]
+        runner._build_attention_metadata(num_tokens_padded=64)
+        assert runner._encoder_grid is None
+        assert runner.spyre_encoder_stats.ragged_steps == 1
+        assert runner.spyre_encoder_stats.rect_steps == 0
 
         runner._build_attention_metadata(num_tokens_padded=12)
         assert runner._encoder_grid is None
-        stats = runner.spyre_encoder_stats
-        assert (stats.rect_steps, stats.ragged_steps) == (1, 1)
+        assert runner.spyre_encoder_stats.ragged_steps == 2
 
     def test_a_step_without_encoder_metadata_clears_the_grid(self, monkeypatch):
         steps = [({"layer": _encoder_md([5, 7])}, None), ({"layer": SimpleNamespace()}, None)]
         runner = self._runner(monkeypatch, steps)
+        runner._encoder_grid = (64, 2, [5, 7])
 
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
-        runner._build_attention_metadata(num_tokens_padded=runner._encoder_budget)
+        runner._build_attention_metadata(num_tokens_padded=64)
+        runner._build_attention_metadata(num_tokens_padded=64)
         assert runner._encoder_grid is None
-        assert runner.spyre_encoder_stats.rect_steps == 1
+        assert runner.spyre_encoder_stats.rect_steps == 0
+        assert runner.spyre_encoder_stats.ragged_steps == 1

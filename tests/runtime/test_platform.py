@@ -225,14 +225,14 @@ def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batc
     return vllm_config
 
 
-def test_apply_config_gives_pooling_one_body_shape():
-    """The whole point of fixing the body at the budget: one compile size, so the
-    encoder attention kernels key on the sequence shapes alone."""
+def test_apply_config_gives_pooling_a_body_per_stick():
+    """The body is every multiple of 64 up to the budget, which stays the scheduler cap."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _pooling_platform_config(max_num_batched_tokens=512)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.compilation_config.compile_sizes == [512]
+    sizes = vllm_config.compilation_config.compile_sizes
+    assert sizes == list(range(64, 513, 64))
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
@@ -262,7 +262,7 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=256)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
-    assert vllm_config.compilation_config.compile_sizes == [512]
+    assert max(vllm_config.compilation_config.compile_sizes) == 512
 
 
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():

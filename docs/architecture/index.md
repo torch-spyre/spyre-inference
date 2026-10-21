@@ -492,38 +492,39 @@ loop either: a sequence's whole K/V fits one tensor, so nothing forces the block
 the decoder needs.
 
 Everything hangs off one number, `R = encoder_budget_rows(...)`: the token budget, capped
-at 2048, floored at `max_model_len` rounded up to a power-of-two multiple of 64, capped at
+at 2048, floored at `max_model_len` rounded up to a multiple of 64, capped at
 what `max_num_seqs` sequences of that length could carry, and finally floored to a whole
-multiple of that longest length — which is what makes every declared length divide `R`. **The pooling body is always `R` rows.** Fixing it
-is what reduces the attention kernels' cache keys to the sequence shapes alone — both
-kernels take the body buffer as an argument, so a varying buffer size would multiply every
-attention graph.
+multiple of that longest length. `R` is the most rows a step may run. A step runs the
+next multiple of 64 of its real token count. Attention gathers each sequence to its
+own stick length out of that packed buffer.
 
-On top of that one buffer sit two paths over a single power-of-two length ladder
-(`ENCODER_LEN_ALIGNMENT = 64` doubling up to `max_model_len`, rounded up to a power-of-two
-multiple of 64 — the same rounding a request's own extent gets, so the ladder declares
+On top of that budget sit two paths over a stick-aligned length ladder
+(`ENCODER_LEN_ALIGNMENT = 64`, every stick up to `max_model_len`, rounded up to a whole
+stick — the same rounding a request's own extent gets, so the ladder declares
 exactly the extents a request can be assigned):
 
-1. **Rectangular path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
-   body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`
+1. **Rectangular path** — several widths per length, powers of two up to `min(max_num_seqs, R / L)`.
+   The runner pads each sequence to `L` and the batch to `W` in `_preprocess`
    (host-side integer tensors for `input_ids`; multimodal `inputs_embeds` are copied to
    CPU, padded there and copied back), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
    inside the layer. For packed-order pooling, `_unpad_encoder_hidden` compacts the grid
    at a fixed row count so the gather does not specialise per token total. Homogeneous
    CLS pooling instead reads each sequence's first grid row and skips the gather.
-2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
-   are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
-   scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
-   ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
-   offsets are data. A group wider than the widest declared width is chunked into
-   descending powers of two, so every dispatch lands on a warmed pair.
+2. **Ragged path** — what serving runs. Q/K/V stay packed at the real token count and
+   requests are grouped by their own padded extent; `_encoder_fused_kernel` does gather,
+   attend and scatter for one group in a single graph, keyed on `(width, extent)` against
+   a fixed staging buffer, not the body's row count. Request boundaries ride in int32
+   row-index tables, so a card never does offset arithmetic on *shapes* — offsets are
+   data. A group wider than the widest declared width is chunked into descending powers
+   of two, so every dispatch lands on a warmed pair.
 
-The runner picks between them once per step in `_build_attention_metadata`, through
+The runner builds the plan once per step in `_build_attention_metadata`, through
 `plan_encoder_step`, and records the choice as the *type* of `attn_metadata.encoder_plan`
-(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). It has to run there rather than
-in `forward`: the builder does a D2H read and H2D conversions, which inside a traced
-region become graph nodes.
+(`EncoderRectPlan` versus a list of `EncoderGroupPlan`). Serving passes no rectangles, so
+the plan is the ragged one and `_preprocess` does not expand the batch. It has to run
+there rather than in `forward`: the builder does a D2H read and H2D conversions, which
+inside a traced region become graph nodes.
 
 The ragged path always stays behind the opaque `unified_attention_with_output`: it
 dispatches once per group, so tracing it in would make the block graph's structure depend on
@@ -550,18 +551,17 @@ the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane get
 
 ## Encoder / embedding models: compile shape axes
 
-The body always runs at `R` rows. Attention adds one rectangle per declared length on the
-rectangular path and one `(width, extent)` pair per group on the ragged one (a *group* being
-the requests that share one padded extent, attended together in one call). With
-`max_model_len=512`, `max_num_seqs=32` and a 2048-token budget that is four rectangles and
-18 group pairs; at `max_num_seqs=4` the group family is empty, since no batch that narrow can
-miss the rectangular path.
+A rectangular step runs at `W * L` rows; the ragged path runs at `R`. Attention adds one
+rectangle per declared `(L, W)` and one `(width, extent)` pair per ragged group (a *group*
+being the requests that share one padded extent, attended together in one call). At
+`max_num_seqs=4` the group family is empty, since no batch that narrow can miss the
+rectangular path.
 
 Where those shapes are compiled depends on whether the rectangular path is traced in (see
-above). Opaque, the body compiles once and each rectangle and group pair is its own attention
-kernel — 23 shapes in the example above. Traced in, each rectangle is instead its own block
-graph, warmed by one dummy run per rectangle (`_warm_encoder_inline_paths`), plus the
-opaque-attention block graph whenever a group is reachable; the 18 group pairs remain
+above). Opaque, each distinct row count is a block graph and each rectangle and group pair
+of that row count is its own attention kernel. Traced in, each rectangle is instead its own
+block graph, warmed by one dummy run per rectangle (`_warm_pooling_rectangles`), plus the
+opaque-attention block graph whenever a group is reachable; the group pairs remain
 attention kernels.
 
 <figure markdown="span">

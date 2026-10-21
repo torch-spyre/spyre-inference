@@ -42,7 +42,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from spyre_inference import envs
-from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up_pow2
+from spyre_inference.v1.worker.spyre_shape_bucketer import _align_up
 
 logger = init_logger(__name__)
 
@@ -191,9 +191,9 @@ class SpyreAttnBucketer:
         # a decoder's chunked-prefill step). Without this cap, warmup could record
         # a query bucket with no matching num_blocks bucket, crashing with
         # "num_blocks=N exceeds the largest recorded bucket". Stick-aligned via
-        # _align_up_pow2 to match the encoder shape ladder's padding (CLIP: 77 -> 128).
+        # _align_up to match the encoder shape ladder's padding (CLIP: 77 -> 128).
         if vllm_config.model_config.runner_type == "pooling":
-            max_batched = min(max_batched, _align_up_pow2(max_model_len))
+            max_batched = min(max_batched, _align_up(max_model_len))
 
         if block_size & (block_size - 1):
             # Not fatal: _powers_of_two_up_to rounds the start up to a power of

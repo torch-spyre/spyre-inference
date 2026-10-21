@@ -91,8 +91,8 @@ def expand_body_to_grid(
         extent,
         position_offset=position_offset,
     )
-    # Gathered from the whole body buffer, not a `[:num_tokens]` slice: the gather
-    # specialises on its source's row count, which then stays fixed.
+    # Source is the step's padded body. Its row count is ``W * L``, so the gather
+    # specialises per rectangle rather than per real token count.
     grid_embeds = select_rows(
         inputs_embeds,
         torch.tensor(encoder_grid_source_rows(query_lens, width, extent), dtype=torch.int64),
@@ -110,9 +110,8 @@ class EncoderDispatchStats:
     """Path counts and body occupancy of the encoder steps, logged periodically.
 
     The counters live in the worker process, so a log line is the only way they reach
-    whoever is running a benchmark. Occupancy is the number worth watching: the body is
-    one fixed shape, so a step that is narrow or short pays for rows it does not use,
-    and that is the cost the rectangular path trades away per-layer data movement for.
+    whoever is running a benchmark. Occupancy is real tokens over the rows the step
+    actually ran (``W * L`` on the rectangular path, ``R`` on the ragged one).
     """
 
     rect_steps: int = 0

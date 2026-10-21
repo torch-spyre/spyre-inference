@@ -1,0 +1,196 @@
+# Multimodal vision encoders on Spyre: compiled, bucketed on upstream's encoder budgets
+#
+# Source for multimodal-vision-encoder.svg. Design from spyre-inference#828, as implemented in
+# models/_vision_encoder.py, v1/worker/spyre_encoder_graph.py and v1/worker/spyre_model_runner.py,
+# with models/pixtral.py as the reference model.
+#
+# Top: the three code layers. Bottom: warmup at boot, then one serving step. In the flows, grey
+# steps run on the host and green steps on the Spyre card; labels name the code that runs each step.
+#
+# Render:
+#   d2 --layout elk --pad 40 docs/architecture/multimodal-vision-encoder.d2 docs/architecture/multimodal-vision-encoder.svg
+
+classes: {
+  vllm: {
+    style.fill: "#37474f"
+    style.stroke: "#263238"
+    style.font-color: "#ffffff"
+  }
+  spyre: {
+    style.fill: "#1565c0"
+    style.stroke: "#0d47a1"
+    style.font-color: "#ffffff"
+  }
+  model: {
+    style.fill: "#f9a825"
+    style.stroke: "#c17900"
+    style.font-color: "#212121"
+  }
+  host: {
+    style.fill: "#eceff1"
+    style.stroke: "#90a4ae"
+    style.font-color: "#212121"
+  }
+  device: {
+    style.fill: "#2e7d32"
+    style.stroke: "#1b5e20"
+    style.font-color: "#ffffff"
+  }
+  group: {
+    style.fill: "#f5f5f5"
+    style.stroke: "#9e9e9e"
+    style.font-color: "#212121"
+  }
+  card: {
+    style.fill: "#e8f5e9"
+    style.stroke: "#2e7d32"
+    style.stroke-width: 2
+    style.font-color: "#1b5e20"
+  }
+  inherit: {
+    style.stroke-dash: 4
+    target-arrowhead.shape: triangle
+    target-arrowhead.style.filled: false
+  }
+}
+
+grid-rows: 4
+grid-columns: 1
+grid-gap: 50
+
+code: "Code layers" {
+  class: group
+  grid-rows: 1
+  grid-columns: 3
+  grid-gap: 90
+
+  upstream: "upstream vLLM (unchanged)" {
+    class: group
+    grid-rows: 6
+    grid-columns: 1
+    grid-gap: 14
+
+    protocol: "SupportsEncoderCudaGraph\n(protocol)" {class: vllm}
+    manager: "EncoderCudaGraphManager\npower-of-two token budgets · greedy packing\nper-key padding · per-item output split" {class: vllm}
+    execute: "GPUModelRunner._execute_mm_encoder\nencoder work -> manager.execute" {class: vllm}
+    budget: "MultiModalBudget.mm_max_toks_per_item\n(processor's largest item)" {class: vllm}
+    cache: "encoder cache · embed_input_ids\ndecoder" {class: vllm}
+    pixtral: "PixtralForConditionalGeneration\nprocessor · weight loading · placeholders" {class: vllm}
+  }
+
+  shared: "spyre_inference, written once" {
+    class: group
+    grid-rows: 4
+    grid-columns: 1
+    grid-gap: 14
+
+    mixin: "SpyreVisionEncoderMixin (models/_vision_encoder.py)\nprotocol: config (per-group padding) · budget_range · item_specs\ncapture_inputs · replay_buffers · encoder_cudagraph_forward\nencoder_eager_forward · postprocess_encoder_output · embed_multimodal\ncompile_vision_graphs" {class: spyre}
+    gm: "SpyreEncoderGraphManager (v1/worker/spyre_encoder_graph.py)\n__init__: budgets aligned to vision_patch_multiple,\nlargest-item coverage check, items-per-call cap\n_capture_budget_graph · _run_budget_graph · _upload" {class: spyre}
+    helpers: "VisionBuffer · GatherTable · offset_major" {class: spyre}
+    runner: "TorchSpyreModelRunner · _SpyreModelWrapper\n_record_vision_graphs · _compiled_vision_model\n_create_encoder_cudagraph_manager · _warmup_input_embedding\nembed_multimodal · embed_input_ids" {class: spyre}
+  }
+
+  model: "per model: models/pixtral.py" {
+    class: group
+    grid-rows: 4
+    grid-columns: 1
+    grid-gap: 14
+
+    cls: "SpyrePixtralForConditionalGeneration\n(SpyreVisionEncoderMixin, PixtralForConditionalGeneration)" {class: model}
+    attrs: "vision_buffers: patches · segments · positions\npatches_per_token = M² · out_hidden_size\nvision_max_items_per_call = 63" {class: model}
+    hooks: "vision_item_tokens · vision_inputs (host)\nvision_embed · vision_blocks · vision_project\n(three compiled graphs)" {class: model}
+    attn: "SpyrePixtralAttention\nRoPE as a matmul · padded_sdpa\n+ get_input_modality · select_encoder_cudagraph_items" {class: model}
+  }
+
+  shared.mixin -> upstream.protocol: implements {class: inherit}
+  shared.gm -> upstream.manager: extends {class: inherit}
+  model.cls -> shared.mixin: subclasses {class: inherit}
+}
+
+warmup: "1. Warmup at boot (after the attention kernels)" {
+  class: group
+  direction: right
+
+  setup: "runner and manager setup (host)" {
+    class: group
+    direction: down
+    record: "runner\n_record_vision_graphs" {class: host}
+    wrap: "mixin\ncompile_vision_graphs\ntorch.compile embed, project, each block\ncompile_guard.watch" {class: host}
+    create: "runner\n_create_encoder_cudagraph_manager\nmax_tokens_per_item = mm_max_toks_per_item" {class: host}
+    build: "SpyreEncoderGraphManager()\nupstream budgets up to the largest item\naligned to vision_patch_multiple\ncoverage check · items-per-call cap" {class: host}
+    record -> wrap -> create -> build
+  }
+
+  capture: "manager.capture: every budget, largest first" {
+    class: group
+    direction: down
+    stage: "capture_inputs\npadding-filled host buffers\nkept as staging" {class: host}
+  }
+
+  card: "Spyre card" {
+    class: card
+    direction: down
+    up: "_upload\none H2D" {class: device}
+    fwd: "encoder_cudagraph_forward\ncompiles the three graphs\nat this budget" {class: device}
+    up -> fwd
+  }
+
+  setup.build -> capture.stage
+  capture.stage -> card.up
+}
+
+serving: "2. Serving a step" {
+  class: group
+  grid-rows: 3
+  grid-columns: 1
+  grid-gap: 40
+
+  prep: "prepare (host)" {
+    class: group
+    direction: right
+    mm: "GPUModelRunner._execute_mm_encoder\nmm_kwargs -> manager.execute" {class: host}
+    specs: "get_encoder_cudagraph_item_specs\nvision_item_tokens" {class: host}
+    pack: "upstream manager\ngreedy packing into budgets\nselect_encoder_cudagraph_items" {class: host}
+    inputs: "replay_buffers\nvision_inputs (model), validated, unpadded" {class: host}
+    pad: "padding_logics\nper-group padding into staging" {class: host}
+    mm -> specs -> pack -> inputs -> pad
+  }
+
+  card: "Spyre card: encoder_cudagraph_forward" {
+    class: card
+    direction: right
+    up: "_upload\none H2D" {class: device}
+    embed: "vision_embed\npatches, mask, RoPE gather" {class: device}
+    blocks: "vision_blocks ×N" {class: device}
+    project: "vision_project\nmerge, adapter" {class: device}
+    up -> embed -> blocks -> project
+  }
+
+  back: "return (host)" {
+    class: group
+    direction: right
+    d2h: "one D2H\n[tokens, out_hidden_size]" {class: host}
+    split: "postprocess_encoder_output\nper-item split" {class: host}
+    cache: "encoder cache" {class: host}
+    merge: "embed_input_ids\nscatter on host, upload,\ntorch.where on device" {class: host}
+    decoder: "decoder (Spyre)" {class: device}
+    d2h -> split -> cache -> merge -> decoder
+  }
+
+  prep.pad -> card.up
+  card.project -> back.d2h
+}
+
+legend: "Legend" {
+  class: group
+  grid-rows: 1
+  grid-columns: 6
+  grid-gap: 16
+
+  l1: "upstream vLLM" {class: vllm}
+  l2: "spyre_inference shared" {class: spyre}
+  l3: "per model" {class: model}
+  l4: "host step" {class: host}
+  l5: "Spyre device step" {class: device}
+  l6: "enforce_eager: embed_multimodal ->\nencoder_eager_forward, same hooks uncompiled" {class: host}
+}

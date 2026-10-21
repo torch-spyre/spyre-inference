@@ -74,11 +74,11 @@ def test_patch_raises_when_the_kernel_moves(monkeypatch):
 
 
 def test_shim_accepts_vllms_positional_launch():
-    """vLLM launches the kernel with 14 positional arguments and no keywords, so only
+    """vLLM launches the kernel with 12 positional arguments and no keywords, so only
     their *order* keeps them aligned with the shim's parameters.
 
     Read from the call site, not from `ComputeSlotMappingKernel.__call__`: upstream
-    declares that as `(self, num_reqs, *args)` in some releases and enumerates all 14 in
+    declares that as `(self, num_reqs, *args)` in some releases and enumerates them all in
     others, while the call site has stayed the same across both. The call is what the
     shim has to survive."""
     from vllm.v1.worker import block_table
@@ -101,7 +101,7 @@ def test_shim_accepts_vllms_positional_launch():
     assert len(sig.parameters) == len(launch.args)  # `self` is bound on the shim instance
 
     # Not just the same count: the launch as written has to bind. Defaults on the last
-    # five would otherwise hide a dropped argument.
+    # three would otherwise hide a dropped argument.
     sig.bind(*launch.args)
 
 
@@ -119,7 +119,6 @@ def test_shim_computes_the_slot_mapping_through_a_real_block_table():
         max_num_batched_tokens=max_tokens,
         pin_memory=False,
         device=torch.device("cpu"),
-        kernel_block_size=block_size,
         cp_kv_cache_interleave_size=1,
     )
 

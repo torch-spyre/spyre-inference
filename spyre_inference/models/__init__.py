@@ -47,6 +47,10 @@ _ADAPTED_ARCHS: dict[str, str] = {
     "Gemma4ForCausalLM": "spyre_inference.models.gemma4:SpyreGemma4ForCausalLM",
     "Ministral3ForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
     "MistralForCausalLM": "spyre_inference.models.mistral:SpyreMistralForCausalLM",
+    # Mistral-format Pixtral checkpoints, e.g. Ministral-3 with config_format="mistral".
+    "PixtralForConditionalGeneration": (
+        "spyre_inference.models.pixtral:SpyrePixtralForConditionalGeneration"
+    ),
     # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
     "TransformersForCausalLM": (
         "spyre_inference.transformers_backend:SpyreTransformersForCausalLM"

@@ -19,22 +19,21 @@ dependencies = [
     # Only reaches wheel consumers: the `[tool.uv.sources]` pin below drops this
     # specifier from uv's own resolution. `>=0.5.0` would reject the 0.5.0rc1 release.
     "torch-spyre[cpsat]>=0.5.0rc1",
-    "vllm[grpc]>=0.31.0,<0.32",
+    "vllm[grpc]>=0.32.0,<0.33",
 
     # Direct dep so it's picked up from the pytorch-cpu index. Pinned to the
     # [build-system] torch: the csrc/ extension links libtorch, so wheel consumers
     # must get the exact torch it was built against.
     "torch==2.13.0",
 
-    # Required at runtime by vLLM's image processors (the Pixtral/Ministral vision
-    # path). Declared directly rather than relying on a transitive pull: the entry
-    # in `override-dependencies` only constrains the version if something else
-    # requests torchvision, it does not install it.
-    # Version left out: resolved against the pinned torch from the pytorch-cpu index.
-    # Excluded on Power/Z: the index has no modern wheel there, and unmarked this
-    # resolves to the 2018 py2.py3 torchvision 0.2.0, which installs but cannot
-    # satisfy the transformers import. VLM is x86_64-only for now.
-    "torchvision; platform_machine not in 's390x, ppc64le'",
+    # Required at runtime by the transformers image processors (Gemma-4 and
+    # Pixtral/Ministral have no PIL fallback). Declared directly rather than
+    # relying on a transitive pull: the entry in `override-dependencies` only
+    # constrains the version if something else requests torchvision, it does
+    # not install it.
+    # 0.28.0 is the release built against torch 2.13.0. Power/Z have no wheels and
+    # build it from source (see [tool.uv.sources]).
+    "torchvision==0.28.0",
 
     # vLLM 0.28.0 imports PixtralRotaryEmbedding, which transformers 5.17 renamed to
     # PixtralVisionRotaryEmbedding; vLLM only floors transformers (>=5.5.3), so cap it here.
@@ -97,10 +96,8 @@ override-dependencies = [
 
     # Declared in [project.dependencies] too; this entry exists to neutralise any
     # version constraint a transitive dep (e.g. transformers) puts on torchvision,
-    # so it resolves against the pinned torch from the pytorch-cpu index. Same
-    # arch marker as the direct dep, so a transitive requester cannot pull the
-    # stale 0.2.0 wheel back in on Power/Z.
-    "torchvision; platform_machine not in 's390x, ppc64le'",
+    # so it stays on the release built against the pinned torch.
+    "torchvision==0.28.0",
 
     # (transformers imports it at module level via loss_rnnt.py)
     "torchaudio; sys_platform == 'never'",
@@ -143,6 +140,12 @@ constraint-dependencies = [
 VLLM_TARGET_DEVICE = "empty"
 CMAKE_ARGS = "--fresh"
 
+# Make the Power/Z source build report the same version and torch pin as the
+# vendored metadata below.
+[tool.uv.extra-build-variables.torchvision]
+BUILD_VERSION = "0.28.0"
+PYTORCH_VERSION = "2.13.0"
+
 # Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
 [tool.uv.extra-build-variables.torch-spyre]
 USE_SPYRE_PROFILER = "0"
@@ -152,9 +155,9 @@ USE_SPYRE_PROFILER = "0"
 [tool.uv.sources]
 vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
-  { git = "https://github.com/vllm-project/vllm", rev = "v0.31.0" },
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "cf027821b798af3206beba51383492d36c6245c9" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "10b02864e197f174d3edbc98ba97579661eda9ed" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -162,7 +165,9 @@ torch = [
   { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le'" },
 ]
 torchvision = [
-  { index = "pytorch-cpu" },
+  # No Power/Z wheels on either index; build from the release tag.
+  { git = "https://github.com/pytorch/vision", tag = "v0.28.0", marker = "platform_machine == 'ppc64le' or platform_machine == 's390x'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'ppc64le' and platform_machine != 's390x'" },
 ]
 # Testing plugin package
 spyre-testing-plugin = { workspace = true }
@@ -171,8 +176,9 @@ spyre-testing-plugin = { workspace = true }
 members = ["tests/plugin"]
 
 [tool.uv.extra-build-dependencies]
-# Pin the same torch version for building torch-spyre to avoid any ABI drift
+# Pin the same torch version for building torch-spyre and torchvision to avoid any ABI drift
 torch-spyre = ["torch==2.13.0"]
+torchvision = ["torch==2.13.0"]
 vllm = ["torch"] # Makes uv resolve torch during build-isolation via the sources defined here rather than pypi, avoiding failure on s390x
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
@@ -203,6 +209,21 @@ requires-dist = [
     "pyyaml; extra == 'pyyaml'",
 ]
 provides-extras = ["optree", "opt-einsum", "pyyaml"]
+
+# Vendored static metadata for the source-built (ppc64le/s390x) torchvision, copied
+# from torchvision 0.28.0 on PyPI.
+[[tool.uv.dependency-metadata]]
+name = "torchvision"
+version = "0.28.0"
+requires-python = ">=3.10,!=3.14.1"
+requires-dist = [
+    "numpy",
+    "torch==2.13.0",
+    "pillow!=8.3.*,>=5.3.0",
+    "gdown>=4.7.3; extra == 'gdown'",
+    "scipy; extra == 'scipy'",
+]
+provides-extras = ["gdown", "scipy"]
 
 # spyre-rpms.lock is generated from this; after editing, re-run
 # `python3 scripts/lock_spyre_rpms.py`.

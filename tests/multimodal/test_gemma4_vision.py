@@ -123,8 +123,8 @@ def _unpad_activation_quarters(padded: torch.Tensor, orig: int, padded_dim: int)
         "Gemma4VisionPooler",
         "apply_multidimensional_rope",
         "Gemma4VisionRotaryEmbedding",
-        # Compared by name in the multimodal dispatch: a rename routes a gemma-4 tower
-        # into `pixtral.apply` instead.
+        # Compared by name in the multimodal dispatch: a rename leaves a gemma-4 tower
+        # unpatched.
         "Gemma4VisionModel",
     ],
 )
@@ -427,7 +427,7 @@ def _stub_vision_applies(monkeypatch) -> list[str]:
     from spyre_inference import multimodal
 
     called: list[str] = []
-    for name in ("gemma4_vision", "pixtral", "clip"):
+    for name in ("gemma4_vision", "clip"):
         monkeypatch.setattr(
             getattr(multimodal, name),
             "apply",
@@ -437,14 +437,14 @@ def _stub_vision_applies(monkeypatch) -> list[str]:
     return called
 
 
-def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
-    """`apply_multimodal_patches` keys on the tower's class name, since Pixtral and
-    Gemma 4 both hang their tower off a `vision_tower` attribute."""
+def test_dispatch_routes_only_the_gemma4_tower_to_gemma4(monkeypatch):
+    """`apply_multimodal_patches` keys on the tower's class name, since several
+    architectures hang their tower off a `vision_tower` attribute."""
     from spyre_inference import multimodal
 
     called = _stub_vision_applies(monkeypatch)
 
-    class _PixtralTower(torch.nn.Module):
+    class _OtherTower(torch.nn.Module):
         pass
 
     gemma4_model = torch.nn.Module()
@@ -453,10 +453,10 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     assert called == ["gemma4_vision"]
 
     called.clear()
-    pixtral_model = torch.nn.Module()
-    pixtral_model.vision_tower = _PixtralTower()
-    multimodal.apply_multimodal_patches(pixtral_model, torch.device("cpu"))
-    assert called == ["pixtral"]
+    other_model = torch.nn.Module()
+    other_model.vision_tower = _OtherTower()
+    multimodal.apply_multimodal_patches(other_model, torch.device("cpu"))
+    assert called == []
 
     called.clear()
     multimodal.apply_multimodal_patches(torch.nn.Module(), torch.device("cpu"))

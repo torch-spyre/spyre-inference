@@ -15,9 +15,9 @@
 """Gemma 4 vision-tower workarounds for Spyre.
 
 vLLM loads the tower with plain ``AutoModel.from_config``, so it is stock
-transformers code outside vLLM's layer registries -- same category as
-``multimodal/pixtral.py``. Every fix is a guarded, idempotent monkeypatch and
-``apply()`` is the only entry point. The tensor math follows hf-adapters#495.
+transformers code outside vLLM's layer registries. Every fix is a guarded, idempotent
+monkeypatch and ``apply()`` is the only entry point. The tensor math follows
+hf-adapters#495.
 """
 
 from __future__ import annotations
@@ -387,8 +387,7 @@ def patch_vision_attention() -> None:
         if getattr(self, "_spyre_padded_head_dim", None) != padded_head_dim:
             raise RuntimeError(_NOT_PADDED)
 
-        # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA -- Pixtral's own
-        # order (`multimodal/pixtral.py::patch_vision_attention`).
+        # Rope at [B, L, H, D], then transpose to [B, H, L, D] for SDPA.
         q = self.q_proj(hidden_states).view(bsz, seq_len, num_heads, padded_head_dim)
         q = _padded_rms_norm(q, self.q_norm.weight, self.q_norm.eps, orig_head_dim)
         q = rope_rotate_matmul(q, cos, sin, self.spyre_rope_swap).transpose(1, 2)

@@ -42,7 +42,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_ind
 
 from .state_fakes import make_config, make_input_batch
 
-# make_config()'s shapes: rectangles (64, 8) and (128, 4) over a 512-row body.
+# make_config()'s shapes over a 512-row body. A step takes the shortest length and
+# the narrowest width that holds the batch; (64, 8) and (128, 4) are only the widest.
 _BUDGET = 512
 _ROBERTA = SimpleNamespace(
     architectures=["XLMRobertaModel"], position_embedding_type="absolute", pad_token_id=1
@@ -105,16 +106,19 @@ def _step(state, batch):
     return attn_metadata, state.prepare_inputs(batch, req_states=None)
 
 
-@pytest.mark.parametrize("query_lens", [[64, 64], [1, 64, 32], [10], [7, 1, 63, 64]])
-def test_rectangle_lays_every_real_token_on_its_grid_row(query_lens):
+@pytest.mark.parametrize(
+    ("query_lens", "width"),
+    [([64, 64], 2), ([1, 64, 32], 4), ([10], 1), ([7, 1, 63, 64], 4)],
+)
+def test_rectangle_lays_every_real_token_on_its_grid_row(query_lens, width):
     state = _state()
     batch = make_input_batch(query_lens, num_tokens_after_padding=_BUDGET)
     attn_metadata, inputs = _step(state, batch)
 
     plan = state.encoder_plan
     assert plan is not None and plan.is_rectangular
-    assert plan.grid == (64, 8, query_lens)
-    assert inputs["input_ids"].shape[0] == _BUDGET
+    assert plan.grid == (64, width, query_lens)
+    assert inputs["input_ids"].shape[0] == 64 * width
     rows = encoder_dense_row_indices(query_lens, 64)
     assert torch.equal(inputs["input_ids"][rows], batch.input_ids[: sum(query_lens)])
     assert torch.equal(inputs["positions"][rows], batch.positions[: sum(query_lens)])
@@ -125,20 +129,21 @@ def test_rectangle_lays_every_real_token_on_its_grid_row(query_lens):
 
 def test_real_pad_continues_positions_and_batch_pad_uses_the_pad_token():
     state = _state(hf_config=SimpleNamespace(pad_token_id=9))
-    _, inputs = _step(state, make_input_batch([4, 2], num_tokens_after_padding=_BUDGET))
+    # Three sequences take width 4, so the last lane is batch pad.
+    _, inputs = _step(state, make_input_batch([4, 2, 1], num_tokens_after_padding=_BUDGET))
     ids, positions = inputs["input_ids"], inputs["positions"]
     assert ids[:4].tolist() == [1, 2, 3, 4]
     assert positions[:8].tolist() == list(range(8))
     assert ids[4:64].unique().tolist() == [9]
-    assert ids[128:].unique().tolist() == [9]
+    assert ids[192:].unique().tolist() == [9]
     assert int(positions.max()) == 63
 
 
 def test_rectangle_rows_follow_the_plan_not_the_body_order():
-    """A longer request picks the 128-wide rectangle; the grid follows it."""
+    """A longer request picks the 128-long rectangle, two lanes wide."""
     state = _state()
     _, inputs = _step(state, make_input_batch([100, 5], num_tokens_after_padding=_BUDGET))
-    assert state.encoder_plan.grid == (128, 4, [100, 5])
+    assert state.encoder_plan.grid == (128, 2, [100, 5])
     assert inputs["input_ids"][128:133].tolist() == list(range(101, 106))
 
 
@@ -162,8 +167,9 @@ def test_token_types_follow_the_same_rows_as_the_ids():
 def test_roberta_offset_lands_on_the_grid():
     state = _state(hf_config=_ROBERTA)
     _, inputs = _step(state, make_input_batch([3], num_tokens_after_padding=_BUDGET))
+    # One sequence is a single stick, so the offset is on that lane only.
     assert inputs["positions"][:5].tolist() == [2, 3, 4, 5, 6]
-    assert inputs["positions"][64:67].tolist() == [2, 3, 4]
+    assert inputs["positions"].shape[0] == 64
 
 
 def test_roberta_offset_on_the_packed_path():
@@ -260,7 +266,7 @@ class TestForcedWarmupPlan:
         assert torch.equal(inputs["input_ids"], dummy.input_ids)
         assert torch.equal(inputs["positions"], dummy.positions)
 
-    @pytest.mark.parametrize("rect", [(64, 4), (8, 64)], ids=["undeclared", "transposed"])
+    @pytest.mark.parametrize("rect", [(64, 3), (8, 64)], ids=["undeclared", "transposed"])
     def test_only_a_declared_rectangle_can_be_forced(self, rect):
         """(extent, width): a transposed pair has the right area but is not declared."""
         with pytest.raises(ValueError, match="not a declared"), _state().forced_plan(rect=rect):
@@ -290,7 +296,7 @@ class TestForcedWarmupPlan:
         with pytest.raises(KeyError), state.forced_plan(rect=(64, 8), ragged=True):
             raise KeyError("warmup failed")
         _step(state, make_input_batch([100, 5], num_tokens_after_padding=_BUDGET))
-        assert state.encoder_plan.grid == (128, 4, [100, 5])
+        assert state.encoder_plan.grid == (128, 2, [100, 5])
 
 
 class _MaskedModel(nn.Module):

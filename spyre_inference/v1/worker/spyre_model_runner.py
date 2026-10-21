@@ -1536,10 +1536,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         seen_rows: set[int] = set()
 
         def _warm_sides(rows: int, hidden_states: torch.Tensor | None) -> None:
-            if hidden_states is None or rows in seen_rows:
+            if rows in seen_rows:
                 return
             seen_rows.add(rows)
+            # The embedding compile keys on the row count. A dummy that returns no
+            # activations still has to trace it; the pooler needs those activations.
             self._warmup_input_embedding(rows)
+            if hidden_states is None:
+                return
             self._dummy_pooler_run(hidden_states)
             self._warm_pooler_row_widths(hidden_states)
             self._warm_encoder_unpack(hidden_states)

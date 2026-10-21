@@ -3114,7 +3114,7 @@ exactly the extents a request can be assigned):</p>
    (host-side integer tensors for <code>input_ids</code>; multimodal <code>inputs_embeds</code> are copied to
    CPU, padded there and copied back), so Q/K/V <em>are</em> the grid: <code>_encoder_rect_kernel</code>
    reshapes, runs one <code>F.scaled_dot_product_attention</code>, and stores — no data movement
-   inside the layer. For packed-order pooling, <code>_unpad_encoder_hidden</code> compacts the grid
+   inside the layer. For packed-order pooling, <code>unpad_encoder_grid</code> compacts the grid
    at a fixed row count so the gather does not specialise per token total. Homogeneous
    CLS pooling instead reads each sequence's first grid row and skips the gather.</li>
 <li><strong>Ragged path</strong> — for a batch too wide for any rectangle. Q/K/V stay packed and requests

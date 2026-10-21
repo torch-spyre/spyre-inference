@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
     SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_NUM_CPUS: int = 0
+    SPYRE_SAMPLE_ROWS_ON_DEVICE: bool = True
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
 _cache: dict[str, Any] = {}
@@ -138,6 +139,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),
+    # "1" (default) gathers the sampled rows on Spyre so only the logits D2H; "0" D2Hs
+    # every hidden-state row and gathers on the CPU.
+    "SPYRE_SAMPLE_ROWS_ON_DEVICE": lambda: os.getenv("SPYRE_SAMPLE_ROWS_ON_DEVICE", "1") == "1",
     # When "1" (default), clamp the CPU threading env vars (OMP_NUM_THREADS and
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.

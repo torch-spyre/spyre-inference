@@ -44,8 +44,8 @@ if [[ "$GLOBAL" == true ]]; then
     SCOPE="--global"
 fi
 
-git config $SCOPE user.name "$NAME"
-git config $SCOPE user.email "$EMAIL"
+git config $SCOPE user.name -- "$NAME"
+git config $SCOPE user.email -- "$EMAIL"
 
 echo "Git config set:"
 echo "  user.name  = $NAME"

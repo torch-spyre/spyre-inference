@@ -8,7 +8,10 @@
     var text, flat = r.overlap;
     if (r.vs_hf) text = r.ratio.toFixed(2) + "× " + r.vs;
     else text = (r.change >= 0 ? "+" : MINUS) + Math.abs(r.change).toFixed(1) + "% vs " + r.vs;
-    return '<span class="delta' + (flat ? " flat" : "") + '">' + text + "</span>";
+    var span = document.createElement("span");
+    span.className = "delta" + (flat ? " flat" : "");
+    span.textContent = text;
+    return span.outerHTML;
   }
   function layout(bars, rows) {
     var max = 0;
@@ -25,7 +28,13 @@
     data.forEach(function (d) {
       var panel = document.createElement("div");
       panel.className = "panel";
-      panel.innerHTML = '<div class="pl">' + d.label + "<small>" + d.unit + " · " + d.sub + "</small></div>";
+      var pl = document.createElement("div");
+      pl.className = "pl";
+      pl.textContent = d.label;
+      var small = document.createElement("small");
+      small.textContent = d.unit + " · " + d.sub;
+      pl.appendChild(small);
+      panel.appendChild(pl);
       var bars = document.createElement("div");
       bars.className = "bars";
       d.rows.forEach(function (r) {
@@ -41,8 +50,22 @@
         }
         row.dataset.tip = r.name + ": " + val + " " + d.unit + "\nreplicates: " + (reps || "-") + change;
         row.setAttribute("aria-label", r.name + " " + val + " " + d.unit);
-        row.innerHTML = '<span class="name">' + r.short + '</span><div class="bar" style="background:' + r.color + '"></div>' +
-          '<span class="val"><b>' + val + "</b> " + d.unit.split(" ")[0] + pill(r) + "</span>";
+        var nameSpan = document.createElement("span");
+        nameSpan.className = "name";
+        nameSpan.textContent = r.short;
+        row.appendChild(nameSpan);
+        var barDiv = document.createElement("div");
+        barDiv.className = "bar";
+        barDiv.style.background = r.color;
+        row.appendChild(barDiv);
+        var valSpan = document.createElement("span");
+        valSpan.className = "val";
+        var b = document.createElement("b");
+        b.textContent = val;
+        valSpan.appendChild(b);
+        valSpan.appendChild(document.createTextNode(" " + d.unit.split(" ")[0]));
+        valSpan.insertAdjacentHTML('beforeend', pill(r));
+        row.appendChild(valSpan);
         bars.appendChild(row);
       });
       panel.appendChild(bars);

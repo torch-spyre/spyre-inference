@@ -114,6 +114,12 @@ class SpyreTransposedWeightMethod:
     def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
         """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
         a tied lm-head builds from a host copy, after the device move."""
+        # Weight already on Spyre; keep layout without re-stickifying.
+        if w.device.type == "spyre" and self.ROW_ALIGN is None:
+            layer.spyre_row_padding = 0
+            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t(), requires_grad=False))
+            return
+
         padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
         layer.spyre_row_padding = padding
         if padding:

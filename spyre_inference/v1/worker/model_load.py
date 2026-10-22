@@ -71,10 +71,6 @@ def fix_padded_model(model: nn.Module, model_config: ModelConfig) -> None:
 
 def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     """Move the layer weights to Spyre."""
-    # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-    # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
-    # an nn.Module, but just the attention implementation.
-    Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
     sink_owners = _sink_owners(model)
     model.to(device=device)
     # On Spyre the move registers a new Parameter for each sink tensor, and a reload

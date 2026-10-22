@@ -145,6 +145,33 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
+def _hf_config_has_moe(hf_config) -> bool:
+    """Return True when the HF config describes a MoE model.
+
+    Checks the standard attributes used across HF model families
+    (Mixtral, Qwen MoE, Gemma 4, DeepSeek, etc.) to detect a non-trivial
+    number of routed experts.  A missing attribute or a value of 0 / 1 is
+    treated as a dense model.
+    """
+    if hf_config is None:
+        return False
+    moe_attrs = (
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+        "num_experts_per_tok",  # some configs store total, not per-layer
+    )
+    for attr in moe_attrs:
+        val = getattr(hf_config, attr, None)
+        # Also check nested text_config (multimodal models)
+        if val is None:
+            text_cfg = getattr(hf_config, "text_config", None)
+            val = getattr(text_cfg, attr, None) if text_cfg is not None else None
+        if val is not None and int(val) > 1:
+            return True
+    return False
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -409,6 +436,22 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+
+        # MoE models stay on the stock loader until _SpyreSafeOpen learns the expert layout.
+        if getattr(vllm_config, "load_config", None) is not None:
+            if vllm_config.load_config.load_format == "auto":
+                model_config = getattr(vllm_config, "model_config", None)
+                parallel_config = getattr(vllm_config, "parallel_config", None)
+                tp_size = getattr(parallel_config, "tensor_parallel_size", 1) if parallel_config else 1
+                is_transformers = (
+                    model_config.using_transformers_backend()
+                    if model_config and hasattr(model_config, "using_transformers_backend")
+                    else False
+                )
+                is_quantized = getattr(model_config, "quantization", None) is not None if model_config else False
+                hf_config = getattr(model_config, "hf_config", None) if model_config else None
+                if tp_size == 1 and not is_transformers and not is_quantized and not _hf_config_has_moe(hf_config):
+                    vllm_config.load_config.load_format = "spyre"
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:

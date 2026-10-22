@@ -75,6 +75,7 @@ def move_model_to_spyre(model: nn.Module, device: torch.device) -> None:
     # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
     # an nn.Module, but just the attention implementation.
     Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+    sink_owners = _sink_owners(model)
     model.to(device=device)
 
 

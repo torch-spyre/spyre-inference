@@ -21,7 +21,10 @@ import types
 import torch
 from vllm.config import CompilationMode
 
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.v1.worker.spyre_model_runner import (
+    TorchSpyreModelRunner,
+    _SpyreModelWrapper,
+)
 
 HIDDEN = 8
 BODY_BUCKETS = [1, 2, 4, 8, 16, 32, 512]
@@ -118,3 +121,32 @@ def test_warmup_marks_the_bucketer_warmed():
     runner.warming_up_model()
 
     assert runner.spyre_shape_bucketer.warmed_up
+
+
+def test_the_output_row_gather_is_warmed_on_every_pair_the_runtime_trims(monkeypatch):
+    """A trimmed (body, rows) pair warmup skips would compile mid-request."""
+    hidden = 4096  # wide enough that the 512 body clears the trim's byte floor
+    runner, _, _ = _runner(bucket_sizes=[1, 4, 512], max_num_reqs=4)
+    runner._dummy_run = lambda size, *a, **k: (None, torch.zeros(size, hidden, dtype=torch.float16))
+    runner.model = _SpyreModelWrapper(
+        torch.nn.Identity(),
+        torch.device("cpu"),
+        logits_row_buckets=[1, 4],
+        shape_bucketer=runner.spyre_shape_bucketer,
+        model_dtype=torch.float16,
+    )
+    runner.num_prompt_logprobs = {}
+    runner.use_aux_hidden_state_outputs = False
+    runner.speculative_config = None
+    runner.cache_config = types.SimpleNamespace(kv_sharing_fast_prefill=False)
+    warmed = []
+    monkeypatch.setattr(
+        _SpyreModelWrapper,
+        "_d2h_sampled_rows",
+        lambda self, h, rows: warmed.append((h.shape[0], rows.numel())),
+    )
+
+    runner.warming_up_model()
+
+    # Only the 512 body drops enough rows to trim, at both row widths.
+    assert sorted(warmed) == [(512, 1), (512, 4)]

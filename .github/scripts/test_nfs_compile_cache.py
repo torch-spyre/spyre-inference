@@ -222,3 +222,27 @@ def test_stale_pr_scope_swept_by_cleanup(env):
     assert (key_dir / "delta-pr.tar").exists()
     _cleanup(env)
     assert not key_dir.exists()
+
+
+def _probe(env, ctx):
+    out = env["tmp"] / "probe.out"
+    out.unlink(missing_ok=True)
+    argv = ["probe", "--nfs-root", str(env["nfs"]), "--arch", "x86_64"]
+    argv += ["--key-file", env["lock"], "--github-output", str(out)]
+    assert ncc.main(argv + _flags(ctx)) == 0
+    return dict(line.split("=", 1) for line in out.read_text().splitlines())["warm"]
+
+
+def test_probe_is_warm_only_with_a_delta_under_the_key(env):
+    assert _probe(env, MAIN) == "false"
+    _job(env, "main", MAIN, ["fxgraph/m"])
+    assert _probe(env, MAIN) == "true"
+    assert _probe(env, _pr(7)) == "true"
+    pathlib.Path(env["lock"]).write_text("bumped")
+    assert _probe(env, MAIN) == "false"
+
+
+def test_probe_reads_only_its_own_pr_scope(env):
+    _job(env, "pr", _pr(7), ["fxgraph/p"])
+    assert _probe(env, _pr(7)) == "true"
+    assert _probe(env, _pr(8)) == "false"

@@ -141,6 +141,18 @@ def cmd_restore(args):
     return 0
 
 
+def cmd_probe(args):
+    """Report whether restore would find a delta for this key, without extracting any."""
+    warm = False
+    with contextlib.suppress(OSError):
+        key = compute_key(args.key_file, salt=KEY_SALT)
+        scopes = read_scopes(args.event_name, args.ref, args.pr_number)
+        warm = any(_deltas(_key_dir(args.nfs_root, s, args.arch, key)) for s in scopes)
+    _write_kv(args.github_output, {"warm": str(warm).lower()})
+    _log(f"compile cache probe: {'warm' if warm else 'cold'} ({args.arch})")
+    return 0
+
+
 def cmd_save(args):
     scope = write_scope(args.event_name, args.ref, args.pr_number)
     if scope is None:
@@ -215,20 +227,29 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    def add_common(p):
+    def add_scope(p):
         p.add_argument("--nfs-root", required=True, help="e.g. $STORAGE_1_DIR/.cache/compile")
-        p.add_argument("--local-dir", required=True, help="the job's TORCHINDUCTOR_CACHE_DIR")
-        p.add_argument("--manifest", required=True, help="files present after the restore")
         p.add_argument("--arch", default=platform.machine())
         p.add_argument("--event-name", default=os.getenv("GITHUB_EVENT_NAME", ""))
         p.add_argument("--ref", default=os.getenv("GITHUB_REF", ""))
         p.add_argument("--pr-number", default="")
+
+    def add_common(p):
+        add_scope(p)
+        p.add_argument("--local-dir", required=True, help="the job's TORCHINDUCTOR_CACHE_DIR")
+        p.add_argument("--manifest", required=True, help="files present after the restore")
 
     r = sub.add_parser("restore")
     add_common(r)
     r.add_argument("--key-file", action="append", required=True, dest="key_file")
     r.add_argument("--github-output", default=os.getenv("GITHUB_OUTPUT", ""))
     r.set_defaults(func=cmd_restore)
+
+    pr = sub.add_parser("probe")
+    add_scope(pr)
+    pr.add_argument("--key-file", action="append", required=True, dest="key_file")
+    pr.add_argument("--github-output", default=os.getenv("GITHUB_OUTPUT", ""))
+    pr.set_defaults(func=cmd_probe)
 
     s = sub.add_parser("save")
     add_common(s)

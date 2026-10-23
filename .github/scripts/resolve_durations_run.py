@@ -20,11 +20,16 @@ different weights would drop or double-run tests.
 
 Prefers the newest artifact on this PR's head branch (so a PR with heavy test
 changes self-balances against its own last run) and falls back to the base
-branch. Writes `durations_run_id=<id>` (empty when none found) to GITHUB_OUTPUT;
-an empty pin makes the plugin fall back to its static heuristic weights.
+branch. Writes `durations_run_id=<id>` (empty when none found) and
+`durations_artifact=<name>` to GITHUB_OUTPUT; an empty pin makes the plugin fall
+back to its static heuristic weights.
+
+A cold-compile run uploads `test-durations-cold` instead, since its compile-heavy
+tests run far slower; COMPILE_CACHE_WARM picks the matching artifact first.
 
 Usage (called by _test_matrix.yaml's resolve_durations job):
-    GH_TOKEN=... REPO=... HEAD_REF=... BASE_REF=... python3 resolve_durations_run.py
+    GH_TOKEN=... REPO=... HEAD_REF=... BASE_REF=... COMPILE_CACHE_WARM=true|false \
+        python3 resolve_durations_run.py
 """
 
 import json
@@ -35,8 +40,11 @@ import subprocess
 # long failure streak on a branch can't sit unboundedly in front of the whole matrix.
 _MAX_CONCLUSION_LOOKUPS = 10
 
+WARM_ARTIFACT = "test-durations"
+COLD_ARTIFACT = "test-durations-cold"
 
-def list_durations_artifacts(repo: str) -> list[dict]:
+
+def list_durations_artifacts(repo: str, name: str = WARM_ARTIFACT) -> list[dict]:
     # The artifacts REST API's workflow_run object exposes only id/head_branch/
     # head_sha (no conclusion), so run status is looked up separately per run.
     result = subprocess.run(
@@ -44,7 +52,7 @@ def list_durations_artifacts(repo: str) -> list[dict]:
             "gh",
             "api",
             "--paginate",
-            f"/repos/{repo}/actions/artifacts?name=test-durations&per_page=100",
+            f"/repos/{repo}/actions/artifacts?name={name}&per_page=100",
             "--jq",
             ".artifacts[] | select(.expired == false) "
             "| {created_at: .created_at, branch: .workflow_run.head_branch, "
@@ -106,16 +114,23 @@ def main() -> None:
     head_ref = os.environ.get("HEAD_REF", "")
     base_ref = os.environ.get("BASE_REF", "")
 
-    try:
-        artifacts = list_durations_artifacts(repo)
-    except subprocess.CalledProcessError as e:
-        # Never block the run on a resolve failure: fall back to heuristic weights.
-        print(f"Failed to list artifacts ({e}); shards will use heuristic weights.")
-        artifacts = []
+    warm = os.environ.get("COMPILE_CACHE_WARM", "") == "true"
+    names = [WARM_ARTIFACT, COLD_ARTIFACT] if warm else [COLD_ARTIFACT, WARM_ARTIFACT]
+    print(f"Compile cache is {'warm' if warm else 'cold'}; preferring {names[0]}.")
 
-    run_id = pick_run_id(repo, artifacts, head_ref, base_ref)
+    run_id, name = "", names[0]
+    for name in names:
+        try:
+            artifacts = list_durations_artifacts(repo, name)
+        except subprocess.CalledProcessError as e:
+            # Never block the run on a resolve failure: fall back to heuristic weights.
+            print(f"Failed to list {name} artifacts ({e}).")
+            continue
+        run_id = pick_run_id(repo, artifacts, head_ref, base_ref)
+        if run_id:
+            break
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-        f.write(f"durations_run_id={run_id}\n")
+        f.write(f"durations_run_id={run_id}\ndurations_artifact={name}\n")
 
 
 if __name__ == "__main__":

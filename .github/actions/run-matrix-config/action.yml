@@ -18,6 +18,10 @@ inputs:
       per-test runtime. Empty or missing artifact -> heuristic fallback.
     required: false
     default: ''
+  durations_artifact:
+    description: That run's durations artifact name (test-durations, or test-durations-cold for a cold-compile run)
+    required: false
+    default: test-durations
   test_type:
     description: >-
       Raw test tier this run was invoked as; resolved via `make print-test-type` and
@@ -230,7 +234,7 @@ runs:
       if: ${{ inputs.durations_run_id != '' }}
       uses: actions/download-artifact@v4
       with:
-        name: test-durations
+        name: ${{ inputs.durations_artifact || 'test-durations' }}
         path: ${{ runner.temp }}/test-durations
         run-id: ${{ inputs.durations_run_id }}
         repository: ${{ github.repository }}

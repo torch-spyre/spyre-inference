@@ -218,10 +218,13 @@ jobs:
   # fails the workflow.
   resolve_durations:
     name: Resolve test durations pin
+    # build_kernels probes the compile cache: only the self-hosted pool mounts it.
+    needs: build_kernels
     runs-on: ubuntu-latest
     continue-on-error: true
     outputs:
       durations_run_id: ${{ steps.resolve.outputs.durations_run_id }}
+      durations_artifact: ${{ steps.resolve.outputs.durations_artifact }}
     steps:
       - name: Checkout scripts
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -235,6 +238,7 @@ jobs:
           REPO: ${{ inputs.repository || github.repository }}
           HEAD_REF: ${{ github.head_ref }}
           BASE_REF: ${{ github.base_ref || github.event.repository.default_branch }}
+          COMPILE_CACHE_WARM: ${{ needs.build_kernels.outputs.compile_cache_warm }}
         run: python3 .github/scripts/resolve_durations_run.py
 
   # One `artifact-id` record per run for push-to-clickhouse's v2 ingest; every matrix leg shares
@@ -312,11 +316,26 @@ jobs:
       STORAGE_1_DIR: /storage-1/spyre-inference
     outputs:
       src_changed: ${{ steps.changed-src-files.outputs.any_changed }}
+      compile_cache_warm: ${{ steps.compile-cache-probe.outputs.warm }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
+
+      # Whether the test legs will restore a compile cache, so their shards are weighted by
+      # durations from a run that compiled the same way. Same gate as the legs' restore.
+      - name: Probe compile cache (NFS)
+        id: compile-cache-probe
+        if: ${{ !inputs.use_prebaked_image && inputs.torch_spyre_ref == '' && inputs.rpm_names == '' }}
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 -I .github/scripts/nfs_compile_cache.py probe \
+            --nfs-root "${STORAGE_1_DIR}/.cache/compile" \
+            --key-file uv.lock --key-file spyre-rpms.lock \
+            --event-name "$GITHUB_EVENT_NAME" --ref "$GITHUB_REF" --pr-number "$PR_NUMBER"
 
       - name: Get changed source files
         id: changed-src-files
@@ -930,6 +949,7 @@ jobs:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
+          durations_artifact: ${{ needs.resolve_durations.outputs.durations_artifact }}
           test_type: ${{ inputs.test_type }}
           # The declared membership set, not the invoked tier: one testtype__ tag per member,
           # so a later run of another tier reuses this coverage instead of re-running it.
@@ -1022,6 +1042,7 @@ jobs:
           cfg: ${{ matrix.cfg }}
           test_target: ${{ matrix.test_target }}
           durations_run_id: ${{ needs.resolve_durations.outputs.durations_run_id }}
+          durations_artifact: ${{ needs.resolve_durations.outputs.durations_artifact }}
           test_type: ${{ inputs.test_type }}
           # Survives the retry hop: the failed-suite descriptor is toJSON(matrix), so the whole
           # entry -- test_types and runs_on included -- is rebuilt by collect_failed_suites.
@@ -1149,7 +1170,7 @@ jobs:
   # ---------------------------------------------------------------------------
   durations:
     name: Aggregate test durations
-    needs: [test, test_retry]
+    needs: [build_kernels, test, test_retry]
     if: always()
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -1182,11 +1203,12 @@ jobs:
           python3 .github/scripts/merge_test_durations.py durations/*.json \
             --out test-durations.json
 
+      # A cold-compile run's durations are kept apart; see resolve_durations_run.py.
       - name: Upload test durations
         if: ${{ hashFiles('test-durations.json') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: test-durations
+          name: ${{ needs.build_kernels.outputs.compile_cache_warm == 'true' && 'test-durations' || 'test-durations-cold' }}
           path: test-durations.json
           retention-days: 30
 

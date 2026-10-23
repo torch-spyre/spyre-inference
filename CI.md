@@ -29,6 +29,8 @@ Each test job seeds its `TORCHINDUCTOR_CACHE_DIR` from `/storage-1/spyre-inferen
 
 Any change to either lockfile starts a cold key, so a PR that bumps a dependency runs fully cold, and PRs rebased onto a bump stay cold until the next push to `main` fills the new key. Most lockfile changes are torch-spyre bumps, which have to recompile anyway. The cache never falls back to an older key: Inductor's graph key does not cover all of torch-spyre's lowering code, so an entry from before a torch-spyre bump could run stale generated code.
 
+A cold run's tests take far longer than a warm run's, so the two shard by different durations. `build_kernels` probes whether the key has any delta yet; a cold run uploads `test-durations-cold` instead of `test-durations`, and `resolve_durations_run.py` pins the artifact matching the probe, falling back to the other one.
+
 Because CI always sets `SPYRE_KERNEL_CACHE=1`, the default user path with the kernel cache off only runs in jobs that skip the cache (torch-spyre or RPM overrides, prebaked images) and in `tests/e2e/test_kernel_cache.py`.
 
 The nightly [compile_cache_cleanup.yaml](.github/workflows/compile_cache_cleanup.yaml) keeps the two newest keys per scope and drops PR scopes untouched for 14 days. A delta that fails to extract is renamed to `.bad-delta-*.tar` and skipped.

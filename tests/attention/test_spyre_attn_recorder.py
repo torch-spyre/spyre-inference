@@ -43,6 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucket,
     SpyreAttnBucketer,
+    batched_decode_chunking,
 )
 
 pytestmark = pytest.mark.attention
@@ -696,3 +697,74 @@ class TestRecordBatchedDecode:
                     metadata.chunk_page_ids_cpu.shape[0] // metadata.blocks_per_chunk,
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+
+
+def test_large_batch_ladder_variants_build_onto_their_own_kernel(builder, monkeypatch):
+    """Warmup builds a large-batch bucket below the base bucket build() pads each sequence onto."""
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+    monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "4")
+    envs.clear_env_cache()
+    bucketer = builder._attn_bucketer = make_bucketer(max_model_len=1024)
+    assert set(bucketer.batched_blocks_buckets(8)) > set(bucketer.num_blocks_buckets)
+    for v in bucketer.batched_decode_variants():
+        md = builder.build_for_batched_decode_variant(v)
+        realized = (
+            md.padded_num_seqs,
+            md.blocks_per_chunk,
+            md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
+        )
+        assert realized == (v.num_seqs, v.blocks_per_chunk, v.num_chunks), v
+
+
+@pytest.mark.parametrize("num_seqs", [4, 8])
+def test_large_batch_dispatch_lands_on_a_recorded_key(builder, monkeypatch, num_seqs):
+    """build() must dispatch onto the large-batch kernels warmup records, not the base ones."""
+    from vllm.v1.attention.backend import CommonAttentionMetadata
+
+    monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER", "pow2")
+    monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
+    monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "4")
+    envs.clear_env_cache()
+    bucketer = builder._attn_bucketer = make_bucketer(max_model_len=1024)
+    keys = {
+        (v.num_seqs, v.blocks_per_chunk, v.num_chunks) for v in bucketer.batched_decode_variants()
+    }
+    max_blocks = 1024 // BLOCK_SIZE
+
+    realized = set()
+    for kv_len in range(65, 1025, 37):
+        seq_lens = torch.tensor([kv_len - 7 * i for i in range(num_seqs)], dtype=torch.int32)
+        md = builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=CommonAttentionMetadata(
+                query_start_loc=torch.arange(num_seqs + 1, dtype=torch.int32),
+                query_start_loc_cpu=torch.arange(num_seqs + 1, dtype=torch.int32),
+                seq_lens=seq_lens,
+                num_reqs=num_seqs,
+                num_actual_tokens=num_seqs,
+                max_query_len=1,
+                max_seq_len=int(seq_lens.max()),
+                block_table_tensor=torch.arange(num_seqs * max_blocks, dtype=torch.int32).reshape(
+                    num_seqs, max_blocks
+                ),
+                slot_mapping=torch.zeros(num_seqs, dtype=torch.int64),
+                causal=True,
+                is_prefilling=torch.zeros(num_seqs, dtype=torch.bool),
+            ),
+        )
+        assert md.padded_num_seqs is not None, "builder declined the batched path"
+        key = (
+            md.padded_num_seqs,
+            md.blocks_per_chunk,
+            md.chunk_page_ids_cpu.shape[0] // md.blocks_per_chunk,
+        )
+        assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+        realized.add(key)
+
+    base = {
+        (num_seqs, *batched_decode_chunking(num_seqs, nb)) for nb in bucketer.num_blocks_buckets
+    }
+    assert realized - base, "dispatch never used a large-batch bucket"

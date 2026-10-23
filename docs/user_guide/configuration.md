@@ -151,13 +151,58 @@ lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 every schedulable length keeps a bucket.
 
 ```bash
-export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from block_size
+export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: the SPYRE_ATTN_KV_LADDER preset (pow2)
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) because the recorded set grows
-with both axes, even after filtering. If your context never exceeds 2048, dropping the
-higher powers removes variants from warmup at no serving cost.
+The default KV buckets are the powers of two from `block_size`; the denser presets below
+union them with a further series. The ladder stays geometric rather than uniform because the
+recorded set grows with both the KV and num-sequences axes, even after filtering, so each
+extra entry costs warmup time. If your context never exceeds 2048,
+dropping the higher entries removes variants from warmup at no serving cost.
+
+### Choosing a KV ladder
+
+`SPYRE_ATTN_KV_LADDER` picks how finely the KV ladder subdivides, without having to write the
+buckets out. The default is `pow2`. Every preset keeps the powers of two, so a KV length's bucket
+can only move down relative to `pow2`, never up. Counts and overpay below are for block_size 128:
+
+| preset | spacing | buckets at 4096 / 16384 / 32768 | mean overpay vs the real KV length |
+|---|---|---|---|
+| `pow2` (default) | powers of two only | 6 / 8 / 9 | 39% |
+| `8_5` | 8/5 ratio | 10 / 15 / 18 | 21% |
+| `4_3` | 4/3 ratio | 14 / 20 / 24 | 15% |
+| `9_8` | 9/8 ratio | 20 / 34 / 41 | 8% |
+| `uniform` | evenly spaced above a knee | 13 / 15 / 16 | 14% |
+
+Overpay is averaged over every KV length above `block_size`, so it describes a workload whose
+lengths are spread out. Warmup cost tracks the number of distinct recorded kernels, which rises
+with the bucket count. The ratio presets put their buckets at fixed token counts; `uniform`
+places them as fractions of `--max-model-len`, so its count stays flat as the context grows but
+its buckets move up with it. Match `--max-model-len` to your real lengths before choosing it.
+
+As a rule of thumb, a denser preset pays off with long KV lengths and large batches, because the
+saving is a number of KV tokens per sequence per decode step; at short lengths or a few sequences
+it buys little for its warmup. `8_5` is the recommended compromise, `9_8` the fastest when warmup
+time does not matter, and `pow2` the default because it has the shortest warmup.
+
+If the KV lengths are known and clustered, `SPYRE_ATTN_KV_BUCKETS` beats every preset: put the
+buckets where the lengths actually are. A workload that sits on one power of two gains nothing
+from any preset.
+
+#### A denser ladder for large batches only
+
+A denser ladder pays off in proportion to the tokens it saves times the batch size, so its gain
+concentrates at large batches. `SPYRE_ATTN_KV_LADDER_LARGE_BATCH` names a second preset that
+batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LARGE_BATCH_MIN_SEQS`
+(default 16, which with the default buckets means 9 or more sequences), while the per-sequence
+path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the
+batched kernel already pads to whole chunks, so at short contexts dense buckets there would
+mostly compile duplicate kernels. The second ladder is unioned with the first, so no length rounds up further.
+It is off by default, and ignored with a warning when `SPYRE_ATTN_KV_BUCKETS` is set or the
+threshold is above the largest num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
+`SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
+less warmup.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps

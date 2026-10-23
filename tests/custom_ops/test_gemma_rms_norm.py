@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre GemmaRMSNorm: OOT dispatch, and on-device agreement with the fp32 reference.
+"""Spyre RMSNorm and GemmaRMSNorm: OOT dispatch, and on-device agreement with the fp32 reference.
 
-Plain ``RMSNorm`` no longer has an OOT op (torch-spyre#4490 keeps the fp32 reduction in
-the graph), but ``GemmaRMSNorm`` still needs one: its trailing fp32 multiply against a
-STANDARD ``[hidden]`` weight is a mixed-EA form the backend can neither broadcast nor
-de-stagger, so the kernel must be compiled rather than run eagerly.
+Both compile upstream ``forward_native`` where no block graph encloses them. GemmaRMSNorm
+compiles even under enforce_eager: its trailing fp32 multiply against a STANDARD
+``[hidden]`` weight is a mixed-EA form the backend can neither broadcast nor de-stagger.
 
 Since the op forwards to vLLM's ``forward_native``, the oracle is the fp32-accumulating
 upstream definition itself, so the tolerance is the device's own error rather than the
@@ -219,24 +218,56 @@ def test_gemma_rmsnorm_oot_dispatch(default_vllm_config):
 
 
 @pytest.mark.rmsnorm
-def test_plain_rmsnorm_has_no_oot_replacement(default_vllm_config):
-    """Plain RMSNorm runs upstream unchanged; only the Gemma variant keeps an op.
-
-    Guards the removal: a re-added `RMSNorm.register_oot` would silently reintroduce the
-    op that torch-spyre#4490 made unnecessary. On an OOT platform the base `CustomOp`
-    still dispatches to `forward_oot`, but that is `CustomOp`'s own default, which just
-    forwards to `forward_native` — so the check is that the class was not swapped and
-    the method is not overridden.
-    """
-    from vllm.model_executor.custom_op import CustomOp
+def test_plain_rmsnorm_oot_dispatch(default_vllm_config):
+    """Plain RMSNorm swaps to SpyreRMSNorm, whose op is upstream's forward_native."""
     from vllm.model_executor.layers.layernorm import RMSNorm
+
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
 
     layer = RMSNorm(128, eps=1e-6)
 
-    assert type(layer) is RMSNorm, f"unexpected OOT swap to {type(layer).__name__}"
-    assert type(layer).forward_oot is CustomOp.forward_oot, (
-        "RMSNorm.forward_oot is overridden; the Spyre op appears to be back"
-    )
+    assert isinstance(layer, SpyreRMSNorm)
+    assert layer._forward_method == layer.forward_oot
+
+
+def reference_rms_norm(x, weight, eps, residual=None):
+    orig_dtype = x.dtype
+    x = x.float()
+    residual_out = None
+    if residual is not None:
+        x = x + residual.float()
+        residual_out = x.to(orig_dtype)
+    x = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+    normed = (x * weight.float()).to(orig_dtype)
+    return normed if residual is None else (normed, residual_out)
+
+
+@pytest.mark.rmsnorm
+@pytest.mark.parametrize("hidden_size", [256, 4096])
+@pytest.mark.parametrize("use_residual", [False, True])
+def test_spyre_rmsnorm_compiled_outermost_matches_reference(
+    default_vllm_config, hidden_size, use_residual
+):
+    """Outside any graph, as the final norm runs, the op compiles once and is correct."""
+    from spyre_inference.custom_ops.rms_norm import SpyreRMSNorm
+
+    _install_worker_torch_wrap()
+
+    eps = 1e-6
+    torch.manual_seed(0)
+    x = torch.randn(4, hidden_size, dtype=torch.float16)
+    residual = torch.randn(4, hidden_size, dtype=torch.float16) if use_residual else None
+    layer = SpyreRMSNorm(hidden_size, eps=eps).to(torch.float16)
+    layer.weight.data = torch.randn(hidden_size, dtype=torch.float16)
+    expected = reference_rms_norm(x, layer.weight.data, eps, residual)
+
+    layer.to("spyre")
+    actual = layer.forward_oot(x.to("spyre"), residual.to("spyre") if use_residual else None)
+
+    assert layer.spyre_compiled_kernel is not None, "the outermost call did not compile"
+    pairs = zip(actual, expected) if use_residual else [(actual, expected)]
+    for got, want in pairs:
+        torch.testing.assert_close(got.cpu().float(), want.float(), atol=_ATOL, rtol=_RTOL)
 
 
 if __name__ == "__main__":

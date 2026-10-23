@@ -717,12 +717,13 @@ platform widens `head_dim` to the next 128-multiple, not the native path's 64-mu
 weight passes in `head_pad.py` are shared with the native path and pad Q/K interleaved, so
 this backend only has to rebuild the rotation cache at the pre-pad frequencies.
 
-`RMSNorm` registers no OOT op: upstream `forward_native` lowers its fp16→fp32 upcast
-into the compiled graph. `GemmaRMSNorm` still needs one, because its trailing fp32
-`weight` multiply hits a torch-spyre gap — a STANDARD `[hidden]` operand that can
-neither broadcast against nor de-stagger the staggered-EA activation. Because the
-fusers key on class names, the OOT registry covers the fused Gemma norm
-(`SpyreTPAwareGemmaRMSNorm`) too.
+`RMSNorm` and `GemmaRMSNorm` both run upstream `forward_native`, compiled as their own
+graph wherever no block graph encloses them, which is the final norm after the last
+block; eagerly that norm launches one Spyre program per op. `GemmaRMSNorm` also compiles
+under `--enforce-eager`, because its trailing fp32 `weight` multiply hits a torch-spyre
+gap eagerly: a STANDARD `[hidden]` operand that can neither broadcast against nor
+de-stagger the staggered-EA activation. Because the fusers key on class names, the OOT
+registry covers the fused norms (`SpyreTPAwareRMSNorm`, `SpyreTPAwareGemmaRMSNorm`) too.
 
 ## Distributed (TP)
 

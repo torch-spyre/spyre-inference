@@ -129,7 +129,7 @@ RESULTS_DIR ?= .
         test-probes test-probes-shard \
         test-attention test-attention-shard test-attention-smoke \
         test-distributed test-distributed-shard test-upstream test-upstream-shard \
-        test-upstream-distributed \
+        test-upstream-distributed test-model-ops \
         tests-single-card tests-multi-card
 
 help: ## Show this help message
@@ -328,9 +328,19 @@ test-upstream-shard-%:
 test-upstream-distributed: ## Run the upstream+distributed marker combo.
 	$(MAKE) run-one MARK_OVERRIDE='upstream and distributed' OMP_THREADS=1 JUNIT_XML=$(JUNIT_XML)
 
+# torch-spyre's model-ops op tests over the YAMLs in tests/model_ops/ (the torch ops a model
+# runs through this plugin). Each case compiles one op on its own, so no vLLM engine starts;
+# the test runner comes from torch-spyre's tests/ at the installed commit (see the script).
+# Not pytest-marker driven, so it bypasses run-one. MODEL_OPS_CONFIG narrows to one YAML.
+MODEL_OPS_CONFIG ?=
+test-model-ops: ## Run torch-spyre's model-ops op tests over tests/model_ops/*.yaml (MODEL_OPS_CONFIG=<yaml> narrows to one). Needs 1 card.
+	$(AIU_SETUP_CMD); \
+	uv run --active --no-sync python3 .github/scripts/run_model_ops.py $(MODEL_OPS_CONFIG) \
+	  $(if $(JUNIT_XML),--junit-xml=$(JUNIT_XML))
+
 # Single-card / multi-card split, grouping the marker combos above by how many cards they need.
 # Each suite gets its own junit-<target>/junit-<target>.xml subdir, matching GHA's artifact-name/file-name layout (_test_matrix.yaml) so a Jenkins run's JUnit paths line up 1:1 with a GHA run's.
-tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shards / attention shards / encoder-attention / upstream shards). Needs 1 card.
+tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shards / attention shards / encoder-attention / upstream shards) and the model-ops tests. Needs 1 card.
 	mkdir -p "$(RESULTS_DIR)"; \
 	rc=0; \
 	for i in $$(seq 0 $$(( $(SMOKE_SHARDS) - 1 ))); do \
@@ -346,6 +356,7 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shard
 	for i in $$(seq 0 $$(( $(UPSTREAM_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-upstream-shard-$$i" && $(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-shard-$$i/junit-test-upstream-shard-$$i.xml" || rc=1; \
 	done; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-model-ops" && $(MAKE) test-model-ops JUNIT_XML="$(RESULTS_DIR)/junit-test-model-ops/junit-test-model-ops.xml" || rc=1; \
 	exit $$rc
 
 tests-multi-card: ## Run the 2-card marker combos (distributed shards/upstream-distributed/probes). Needs 2 cards.

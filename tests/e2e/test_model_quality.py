@@ -43,13 +43,15 @@ DECODER_MODELS = [
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
 
-# Both gemma-4 checkpoints carry a vision tower this decoder test does not need. Every
+# Every gemma-4 checkpoint carries a vision tower this decoder test does not need. Every
 # modality at 0 keeps the default Gemma4ForConditionalGeneration load and stage-skips the
 # tower; test_compile.py pins the text backbone instead, so both text-only loads are covered.
 TEXT_ONLY_MM_LIMITS = {"image": 0, "video": 0, "audio": 0}
 MM_LIMITS = {
     "google/gemma-4-31B": TEXT_ONLY_MM_LIMITS,
     "google/gemma-4-26B-A4B": TEXT_ONLY_MM_LIMITS,
+    "google/gemma-4-E2B": TEXT_ONLY_MM_LIMITS,
+    "google/gemma-4-E4B": TEXT_ONLY_MM_LIMITS,
 }
 
 # Maps to the unquantized sibling whose prompts the smoke case borrows.

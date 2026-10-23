@@ -23,7 +23,7 @@ import torch.nn as nn
 from vllm.logger import init_logger
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.multimodal.utils import STICK, align_up, padded_sdpa
+from spyre_inference.multimodal.utils import STICK, align_up
 
 logger = init_logger(__name__)
 
@@ -80,25 +80,21 @@ def _pad_out_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) ->
 
 
 def patch_siglip_attention(model: torch.nn.Module) -> None:
-    """Pad SiglipAttention Q/K/V/O projections from head_dim=72 to 128 and replace forward.
+    """Pad SiglipAttention Q/K/V/O projections from head_dim=72 to 128 and update MMEncoderAttention.
 
     SigLIP so400m has head_dim=72 (not stick-aligned). Any on-device op that
     materialises a D=72 tensor triggers a restickify whose store index contains
     a fractional coefficient (9*c2/8), which torch-spyre's inductor cannot lower
     (torch-spyre#1353). Fix: zero-extend each head block of qkv_proj and out_proj
     from 72→128 at load time (mirroring hf-adapters' pad_attention_heads_linear),
-    then replace SiglipAttention.forward to bypass MMEncoderAttention and call
-    padded_sdpa directly. Scale is fixed to the original head_dim so the softmax
-    temperature is unchanged.
+    and update module.attn.head_size to 128 so MMEncoderAttention (SpyreMMEncoderAttention)
+    handles attention natively on-device.
 
     No-op for models already stick-aligned (head_dim % 64 == 0, e.g. D=64).
     """
     try:
         from vllm.model_executor.models.siglip import SiglipAttention
     except ImportError:
-        return
-
-    if getattr(SiglipAttention.forward, "_spyre_patched", False):
         return
 
     # Discover orig_head_dim from the first SiglipAttention instance.
@@ -111,7 +107,6 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
         return  # no SiglipAttention found, or already stick-aligned
 
     pad_head_dim = align_up(orig_head_dim, STICK)
-    scale = orig_head_dim**-0.5
 
     # Pad weights on every SiglipAttention instance.  Each weight is pulled
     # to CPU before the slice-assignments (Spyre slice-assign is silently wrong);
@@ -154,32 +149,13 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
         )
         # out_proj bias is [hidden] — output dim, unchanged.
 
+        if hasattr(module, "attn") and module.attn is not None:
+            module.attn.head_size = pad_head_dim
+
         module._spyre_head_dim_padded = True
 
-    def _siglip_attention_forward(
-        self: SiglipAttention,
-        hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, None]:
-        bsz, seq_len, _ = hidden_states.shape
-        qkv, _ = self.qkv_proj(hidden_states)
-        # qkv: [B, S, 3*H*pad_head_dim]
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.view(bsz, seq_len, self.num_heads_per_partition, pad_head_dim).transpose(1, 2)
-        k = k.view(bsz, seq_len, self.num_heads_per_partition, pad_head_dim).transpose(1, 2)
-        v = v.view(bsz, seq_len, self.num_heads_per_partition, pad_head_dim).transpose(1, 2)
-
-        # padded_sdpa handles seq-alignment; scale fixed to orig head_dim.
-        # No mask: SigLIP is bidirectional with no real mask.
-        attn_out = padded_sdpa(q, k, v, None, scale=scale)
-        attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
-        attn_output, _ = self.out_proj(attn_out)
-        return attn_output, None
-
-    _siglip_attention_forward._spyre_patched = True
-    SiglipAttention.forward = _siglip_attention_forward  # type: ignore[method-assign]
     logger.info(
-        "Spyre: padded SiglipAttention head_dim %d -> %d and replaced forward "
-        "to use padded_sdpa on-device (torch-spyre#1353).",
+        "Spyre: padded SiglipAttention head_dim %d -> %d and updated MMEncoderAttention head_size.",
         orig_head_dim,
         pad_head_dim,
     )

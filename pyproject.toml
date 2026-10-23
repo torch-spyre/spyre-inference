@@ -91,8 +91,10 @@ required-environments = [
 ]
 
 override-dependencies = [
-    # No triton support yet, don't allow any dependencies to pull it in
-    "triton; sys_platform == 'never'",
+    # triton-cpu on x86 only, for MRV2's Triton kernels until upstream's non-Triton ones
+    # exist (#906). Power/Z stay Triton-free; triton_gate hides it from V1.
+    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version == '3.11'",
+    "triton @ https://github.com/triton-lang/triton-cpu/releases/download/v3.8.0/triton-3.8.0+cpu-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64' and python_version >= '3.12'",
 
     # Declared in [project.dependencies] too; this entry exists to neutralise any
     # version constraint a transitive dep (e.g. transformers) puts on torchvision,

@@ -758,13 +758,7 @@ class TorchSpyrePlatform(CpuPlatform):
         runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
         if runner not in ("v1", "v2"):
             raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
-        gate = "open" if runner == "v2" else "closed"
-        if triton_gate.state() != gate:
-            raise ValueError(
-                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
-                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
-                "vLLM is imported, and the same in every process."
-            )
+        triton_gate.check(runner)
         # Again, for a value set after `import vllm` that child processes would inherit.
         pin_model_runner(runner)
 

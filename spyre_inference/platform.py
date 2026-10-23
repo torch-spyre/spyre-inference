@@ -161,6 +161,10 @@ class TorchSpyrePlatform(CpuPlatform):
     # Measured throughput argmax across pooling models; they regress above it.
     _POOLING_MAX_BATCHED_TOKENS = 2048
 
+    # A `--max-num-batched-tokens` the user passes (recorded by `pre_register_and_update`) wins.
+    _DEFAULT_PREFILL_BUCKET = 512
+    _user_max_num_batched_tokens: int | None = None
+
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -207,6 +211,7 @@ class TorchSpyrePlatform(CpuPlatform):
         @functools.wraps(original)
         def _spyre_patched(self, usage_context, model_config, parallel_config):
             user_supplied = self.max_num_seqs is not None
+            cls._user_max_num_batched_tokens = self.max_num_batched_tokens
             original(self, usage_context, model_config, parallel_config)
             if not user_supplied and self.max_num_seqs is not None:
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
@@ -337,12 +342,30 @@ class TorchSpyrePlatform(CpuPlatform):
             elif vllm_config.compilation_config.compile_sizes is not None:
                 compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                # Largest default bucket: scheduler limit and 512 (Spyre max).
                 # Decode packs one token per running sequence; prefill lands on
-                # the single largest bucket. Denser sizes only cost warmup time.
-                max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
+                # the largest bucket. Denser sizes only cost warmup time. The budget
+                # is the user's only if it still equals what they passed: a config
+                # built without EngineArgs carries vLLM's own default.
+                budget = vllm_config.scheduler_config.max_num_batched_tokens
+                prefill = cls._DEFAULT_PREFILL_BUCKET
+                user_budget = cls._user_max_num_batched_tokens
+                max_capture_size = (
+                    budget
+                    if user_budget is not None and budget == user_budget
+                    else min(budget, prefill)
+                )
+                if max_capture_size > 2 * prefill:
+                    logger.warning(
+                        "max_num_batched_tokens=%d: prefill variants this wide can exceed "
+                        "torch-spyre's backend compile time limit at a long context "
+                        "(torch-spyre#5250).",
+                        max_capture_size,
+                    )
                 num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                 sizes = {max_capture_size, num_seqs}
+                # Short prefills keep a default-size bucket instead of padding up.
+                if max_capture_size > prefill:
+                    sizes.add(prefill)
                 size = 1
                 while size < num_seqs:
                     sizes.add(size)

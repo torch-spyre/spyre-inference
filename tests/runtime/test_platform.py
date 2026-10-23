@@ -754,6 +754,45 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
 
 
+@pytest.mark.parametrize(
+    ("budget", "user_budget", "sizes"),
+    [
+        pytest.param(2048, None, [1, 2, 4, 512], id="unset_default_is_capped"),
+        pytest.param(1024, 1024, [1, 2, 4, 512, 1024], id="user_budget_keeps_512"),
+        pytest.param(2048, 1024, [1, 2, 4, 512], id="budget_not_from_user_is_capped"),
+        pytest.param(256, 256, [1, 2, 4, 256], id="user_budget_below_default"),
+    ],
+)
+def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_budget, sizes):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", user_budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == sizes
+    assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
+
+
+@pytest.mark.parametrize(("flag", "budget"), [(None, 512), (1024, 1024)])
+def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget):
+    """Through EngineArgs: an omitted flag keeps the default, a passed one is honored."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", None)
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", max_model_len=4096, max_num_batched_tokens=flag
+    ).create_engine_config()
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == budget
+
+
 def test_compile_sizes_empty_list_opts_out():
     """An explicit empty list disables bucketing and leaves the scheduler alone."""
     from spyre_inference.platform import TorchSpyrePlatform

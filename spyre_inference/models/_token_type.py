@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 
 from spyre_inference.custom_ops.lazy_compile import CompileOutermost
+from spyre_inference.models._retype import retype
 
 if TYPE_CHECKING:
     from torch import nn
@@ -111,15 +112,7 @@ class SpyreTokenTypeModel:
 
     def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)  # ty: ignore[unknown-argument]
-        embeddings = self.spyre_embeddings()
-        upstream_class = self.spyre_embedding_class.__bases__[-1]
-        if type(embeddings) is not upstream_class:
-            raise RuntimeError(
-                f"expected {upstream_class.__name__} embeddings, got "
-                f"{type(embeddings).__name__}; the Spyre token_type transport "
-                "needs updating for this vLLM version."
-            )
-        embeddings.__class__ = self.spyre_embedding_class
+        embeddings = retype(self.spyre_embeddings(), self.spyre_embedding_class)
         # The swap does not rerun ``__init__``. This is that constructor hook.
         CompileOutermost.arm_outer_compile(cast(CompileOutermost, embeddings))
 

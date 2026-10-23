@@ -118,13 +118,13 @@ and `register_models()` first checks every key against vLLM's own registry, so a
 rename fails loudly instead of silently falling through to the unadapted class.
 
 Where upstream hardcodes a class and offers no hook (the BERT wrappers hardcode
-`embedding_class`), the already-built instance is **retyped** to its Spyre subclass — same
+`embedding_class`; gemma-4 builds its self-decoder inline), the already-built instance is **retyped** to its Spyre subclass — same
 `__init__`, same parameters and module tree, but a Spyre `forward` and armed compile
 state. Prefer a documented upstream extension point where one exists: `CustomOp.register_oot` /
 `PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.
 
-Two adaptations worth knowing:
+Three adaptations worth knowing:
 
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
@@ -156,6 +156,18 @@ Two adaptations worth knowing:
   `MoERunner`, takes vLLM's direct `_moe_forward` entry — as upstream does on CPU and TPU —
   instead of the opaque `torch.ops.vllm.moe_forward` custom op, so a compiled block traces
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
+
+- **Gemma-4 per-layer embeddings** (`models/gemma4.py`, E2B / E4B) retype the self-decoder
+  to `SpyreGemma4SelfDecoderLayers`. It drops upstream's in-vocab mask on the PLE lookup,
+  which has no Spyre lowering (`aten::logical_and`) and is a no-op when every token has a
+  per-layer row, so a narrower `vocab_size_per_layer_input` is rejected at construction. It
+  also cuts the backbone's per-layer rows in one compiled graph and hands each block its own
+  offset-0 row through the `[:, layer_idx, :]` the backbone loop already does: a view of the
+  packed tensor carries a different `storage_offset` per layer, which torch-spyre guards on,
+  so every layer would compile its own block. The multimodal wrapper allocates its PLE cache
+  on the host as a plain attribute, so `multimodal/gemma4_vision.py` moves it to the device;
+  that path runs even text-only, since the default load keeps the wrapper with every modality
+  at 0.
 
 ### MoE expert weights
 
@@ -284,7 +296,7 @@ eager form. `lm_head` is never in a block graph either — `compute_logits` is a
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)).
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count.
+grows with layer count (gemma-4-E2B: about 6x the block compile).
 
 ## Vision encoders
 
@@ -385,6 +397,16 @@ The compiled kernels themselves — the per-sequence page attention, the batched
 path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
 the host-side orchestration that calls them.
+
+### Cross-layer KV sharing
+
+A layer with a `kv_sharing_target_layer_name` (gemma-4 E2B / E4B) allocates no cache: the
+runner aliases its target's pages in `initialize_kv_cache_tensors`. vLLM adds such a layer to
+its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
+per-layer spec lookup in `initialize_attn_backend` would `KeyError`; the runner hands the
+attention backend a copy that maps it to the target's spec, leaving the retained config's
+specs, and so its `page_size_bytes`, physical. YOCO fast prefill
+(`kv_sharing_fast_prefill`) swaps in an attention backend Spyre does not provide and is rejected.
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records

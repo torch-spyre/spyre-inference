@@ -1,0 +1,276 @@
+# Serve benchmarks for Embedding models on Spyre devices.
+
+defaults:
+  server_health_timeout: 1800
+  server_parameters:
+    load-format: auto
+    max-num-seqs: 256
+    enable-prefix-caching: false
+    tensor-parallel-size: 1
+    runner: pooling
+    max-model-len: 512
+    compilation-config.mode: STOCK_TORCH_COMPILE
+  parameters:
+    backend: openai-embeddings
+    endpoint: /v1/embeddings
+    dataset-name: random
+    num-prompts: 50000
+    random-input-len: 512
+    random-range-ratio: 0.5
+    num-warmups: 10
+  container_parameters:
+    container_shm_size: 1G
+    container_memory: 16g
+
+tests:
+
+  # ---------------------------------------------------------------------------
+  # Granite Embedding 30M English
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-embedding-30m-english_mc4
+    server_parameters:
+      model: ibm-granite/granite-embedding-30m-english
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_granite-embedding-30m-english_mc16
+    server_parameters:
+      model: ibm-granite/granite-embedding-30m-english
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_granite-embedding-30m-english_mc32
+    server_parameters:
+      model: ibm-granite/granite-embedding-30m-english
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_granite-embedding-30m-english_mc64
+    server_parameters:
+      model: ibm-granite/granite-embedding-30m-english
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_granite-embedding-30m-english_mc256
+    server_parameters:
+      model: ibm-granite/granite-embedding-30m-english
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # Granite Embedding 107M Multilingual
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-embedding-107m-multilingual_mc4
+    server_parameters:
+      model: ibm-granite/granite-embedding-107m-multilingual
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_granite-embedding-107m-multilingual_mc16
+    server_parameters:
+      model: ibm-granite/granite-embedding-107m-multilingual
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_granite-embedding-107m-multilingual_mc32
+    server_parameters:
+      model: ibm-granite/granite-embedding-107m-multilingual
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_granite-embedding-107m-multilingual_mc64
+    server_parameters:
+      model: ibm-granite/granite-embedding-107m-multilingual
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_granite-embedding-107m-multilingual_mc256
+    server_parameters:
+      model: ibm-granite/granite-embedding-107m-multilingual
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # Granite Embedding 125M English
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-embedding-125m-english_mc4
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_granite-embedding-125m-english_mc16
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_granite-embedding-125m-english_mc32
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_granite-embedding-125m-english_mc64
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_granite-embedding-125m-english_mc256
+    server_parameters:
+      model: ibm-granite/granite-embedding-125m-english
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # Granite Embedding 278M Multilingual
+  # ---------------------------------------------------------------------------
+  - test_name: serve_granite-embedding-278m-multilingual_mc4
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_granite-embedding-278m-multilingual_mc16
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_granite-embedding-278m-multilingual_mc32
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_granite-embedding-278m-multilingual_mc64
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_granite-embedding-278m-multilingual_mc256
+    server_parameters:
+      model: ibm-granite/granite-embedding-278m-multilingual
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # Multilingual E5 Large Instruct
+  # ---------------------------------------------------------------------------
+  - test_name: serve_multilingual-e5-large-instruct_mc4
+    server_parameters:
+      model: intfloat/multilingual-e5-large-instruct
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_multilingual-e5-large-instruct_mc16
+    server_parameters:
+      model: intfloat/multilingual-e5-large-instruct
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_multilingual-e5-large-instruct_mc32
+    server_parameters:
+      model: intfloat/multilingual-e5-large-instruct
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_multilingual-e5-large-instruct_mc64
+    server_parameters:
+      model: intfloat/multilingual-e5-large-instruct
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_multilingual-e5-large-instruct_mc256
+    server_parameters:
+      model: intfloat/multilingual-e5-large-instruct
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # Multilingual E5 Large
+  # ---------------------------------------------------------------------------
+  - test_name: serve_multilingual-e5-large_mc4
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+    parameters:
+      max-concurrency: 4
+
+  - test_name: serve_multilingual-e5-large_mc16
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+    parameters:
+      max-concurrency: 16
+
+  - test_name: serve_multilingual-e5-large_mc32
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+    parameters:
+      max-concurrency: 32
+
+  - test_name: serve_multilingual-e5-large_mc64
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+    parameters:
+      max-concurrency: 64
+
+  - test_name: serve_multilingual-e5-large_mc256
+    server_parameters:
+      model: intfloat/multilingual-e5-large
+    parameters:
+      max-concurrency: 256
+
+  # ---------------------------------------------------------------------------
+  # BAAI BGE Reranker V2 M3
+  # ---------------------------------------------------------------------------
+  - test_name: serve_bge-reranker-v2-m3_mc4
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+    parameters:
+      backend: vllm-rerank
+      endpoint: /v1/rerank
+      dataset-name: random-rerank
+      max-concurrency: 4
+      num-prompts: 10000
+
+  - test_name: serve_bge-reranker-v2-m3_mc16
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+    parameters:
+      backend: vllm-rerank
+      endpoint: /v1/rerank
+      dataset-name: random-rerank
+      max-concurrency: 16
+      num-prompts: 10000
+
+  - test_name: serve_bge-reranker-v2-m3_mc32
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+    parameters:
+      backend: vllm-rerank
+      endpoint: /v1/rerank
+      dataset-name: random-rerank
+      max-concurrency: 32
+      num-prompts: 10000
+
+  - test_name: serve_bge-reranker-v2-m3_mc64
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+    parameters:
+      backend: vllm-rerank
+      endpoint: /v1/rerank
+      dataset-name: random-rerank
+      max-concurrency: 64
+      num-prompts: 10000
+
+  - test_name: serve_bge-reranker-v2-m3_mc256
+    server_parameters:
+      model: BAAI/bge-reranker-v2-m3
+    parameters:
+      backend: vllm-rerank
+      endpoint: /v1/rerank
+      dataset-name: random-rerank
+      max-concurrency: 256
+      num-prompts: 10000

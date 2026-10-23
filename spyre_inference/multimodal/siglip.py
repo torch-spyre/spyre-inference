@@ -80,7 +80,7 @@ def _pad_out_weight(w: torch.Tensor, num_heads: int, orig_d: int, pad_d: int) ->
 
 
 def patch_siglip_attention(model: torch.nn.Module) -> None:
-    """Pad SiglipAttention Q/K/V/O projections from head_dim=72 to 128 and update MMEncoderAttention.
+    """Pad SiglipAttention Q/K/V/O projections from head_dim=72 to 128 for MMEncoderAttention.
 
     SigLIP so400m has head_dim=72 (not stick-aligned). Any on-device op that
     materialises a D=72 tensor triggers a restickify whose store index contains

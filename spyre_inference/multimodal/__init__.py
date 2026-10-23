@@ -17,19 +17,15 @@
 One module per architecture, each exposing `apply(model, device)`. These monkeypatch
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
-`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4) are not patched
-here.
+`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4, Granite 4 Vision)
+are not patched here;
+`blip2` and `siglip` hold the layer helpers the Granite 4 Vision subclass reuses.
 """
 
 import torch
 from vllm.model_executor.models.utils import StageMissingLayer
 
-from . import (
-    blip2,
-    clip,
-    granite4_vision,
-    siglip,
-)
+from . import clip
 
 
 def _tower(model: torch.nn.Module, *names: str) -> torch.nn.Module | None:
@@ -67,12 +63,6 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
                 f"{type(model).__name__}: the Gemma 4 vision tower runs on Spyre only under "
                 "Gemma4ForConditionalGeneration."
             )
-        if tower_cls == "SiglipVisionModel":
-            # Granite4Vision uses a SigLIP tower. All three patches are
-            # needed together and none apply to any other architecture.
-            siglip.apply(model, device)
-            granite4_vision.apply(model, device)
-            blip2.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
     # Gated on model_type, not just attribute presence: other architectures (e.g.

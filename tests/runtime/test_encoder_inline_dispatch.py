@@ -320,7 +320,7 @@ class TestForcedWarmupPlan:
     @pytest.mark.parametrize(("extent", "width"), encoder_rectangles(_config(512, 32, 2048)))
     def test_fills_the_body_exactly(self, extent, width):
         """``sum(query_lens) == width * extent`` keeps ``_preprocess``'s expansion an
-        identity and lets ``_unpad_encoder_hidden`` short-circuit, so the dummy's buffers
+        identity and lets ``unpad_encoder_grid`` short-circuit, so the dummy's buffers
         stay self-consistent."""
         plan = self._plan((extent, width))
         assert isinstance(plan, EncoderRectPlan)

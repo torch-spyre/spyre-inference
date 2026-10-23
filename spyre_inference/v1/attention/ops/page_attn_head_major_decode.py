@@ -44,6 +44,7 @@ def page_attn_head_major_decode_kernel(
     block_size,
     logits_soft_cap=0.0,
     out=None,
+    v_scale=None,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -65,6 +66,8 @@ def page_attn_head_major_decode_kernel(
             torch-spyre#3851). Pure cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
         out: buffer to store into, or None to return the result instead.
+        v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
+            folds k_scale into ``scale``.
 
     Returns [padded_query_len, num_heads, head_size], or ``out``.
     """
@@ -84,6 +87,9 @@ def page_attn_head_major_decode_kernel(
         # [num_kv_heads, 1] lets the split land per kv head.
         k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
         v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+        if k_page.dtype != q.dtype:
+            k_page = k_page.to(q.dtype)
+            v_page = v_page.to(q.dtype)
 
         scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
         if logits_soft_cap > 0.0:
@@ -130,6 +136,8 @@ def page_attn_head_major_decode_kernel(
         ),
     )
     attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
+    if v_scale is not None and v_scale != 1.0:
+        attn = attn * v_scale
     if out is not None:
         out.index_copy_(0, query_row_index, attn)
         return out

@@ -29,7 +29,7 @@ import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.worker.utils import AttentionGroup
 
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.v1.worker.kv_cache_setup import split_attn_groups_by_window
 
 # gemma-3-1b-it: 26 layers, window 512, every 6th layer full attention.
 _NUM_LAYERS = 26
@@ -50,34 +50,18 @@ def _group(names, spec) -> AttentionGroup:
     return AttentionGroup(object, list(names), spec, 0)
 
 
-@pytest.fixture
-def split(monkeypatch):
-    """Run the split over ``groups``, with each layer's window stubbed.
-
-    The windows come off the ``Attention`` modules, reached through
-    ``get_layers_from_vllm_config``; stubbing it keeps this device- and model-free.
-    """
-
-    def _split(windows_by_layer: dict[str, int | None], groups):
-        import vllm.config
-
-        layers = {
-            name: types.SimpleNamespace(sliding_window=window)
-            for name, window in windows_by_layer.items()
-        }
-        monkeypatch.setattr(
-            vllm.config, "get_layers_from_vllm_config", lambda *args, **kwargs: layers
-        )
-        runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-        runner.vllm_config = types.SimpleNamespace()
-        runner.attn_groups = [list(groups)]
-        runner._split_attn_groups_by_layer_window()
-        return runner.attn_groups[0]
-
-    return _split
+def split(windows_by_layer: dict[str, int | None], groups) -> list[AttentionGroup]:
+    """Run the split over ``groups``, with each layer's window on a stub module."""
+    layers = {
+        name: types.SimpleNamespace(sliding_window=window)
+        for name, window in windows_by_layer.items()
+    }
+    attn_groups = [list(groups)]
+    split_attn_groups_by_window(attn_groups, layers)
+    return attn_groups[0]
 
 
-def test_splits_one_group_per_distinct_window(split) -> None:
+def test_splits_one_group_per_distinct_window() -> None:
     """Each layer ends up under the window its own module declares, exactly once."""
     names = _names(range(_NUM_LAYERS))
     windows = {n: (None if _index(n) in _FULL_IDX else _WINDOW) for n in names}
@@ -135,7 +119,7 @@ def test_splits_one_group_per_distinct_window(split) -> None:
         ),
     ],
 )
-def test_single_window_groups_are_left_alone(split, windows, groups) -> None:
+def test_single_window_groups_are_left_alone(windows, groups) -> None:
     """A group that already carries one window is returned untouched.
 
     Covers gemma-4, whose differing head shapes stop the merge, so vLLM hands the

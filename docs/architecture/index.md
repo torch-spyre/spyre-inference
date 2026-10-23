@@ -77,7 +77,9 @@ in two overrides:
 
 - `process_weights_after_loading` replaces the loaded `[out, in]` weight with a contiguous
   `[in, out]` `Wᵀ` (optionally padding the output rows first), so the transpose is paid once at
-  load time rather than every forward.
+  load time rather than every forward. A plain `w.t().contiguous()` runs on one thread and is
+  slow on big weights, so by default (`SPYRE_BLOCKED_TRANSPOSE=1`) the same `Wᵀ` is built 128
+  source rows at a time, on torch's CPU threads (bit-identical).
 - `apply` runs `spyre_linear_t` — `torch.matmul(x, Wᵀ)` plus optional bias — instead of
   `F.linear`, dropping any trailing pad columns with an on-device un-pad slice.
 
@@ -461,6 +463,29 @@ transpose to a restickify, whose cross-frame barrier bars an LX-resident input w
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
 
+#### FP8 KV cache
+
+`--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the head-major pages as `float8_e4m3fn`,
+halving KV memory and the bytes each page read moves; the token-major layout rejects it.
+Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
+The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
+the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
+has no device lowering and falls back to CPU, which writes bytes in sequential order
+while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
+`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
+dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
+impl passes them. The attention math itself stays fp16.
+
+The scales are per-tensor and per-layer, read from the layer's `_k_scale_float` /
+`_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) at model load and
+again after `reload_weights`, which re-warms when they change, and passed to the kernels
+as Python floats, skipped entirely at 1.0. A KV-sharing layer takes its target's scales. A `[1]` scale tensor would let layers
+with different scales share one compiled block, but its broadcast fails torch-spyre's
+pointwise layout pass. Baking them in costs one attention variant set per distinct scale
+pair at warmup, and one block compile per distinct pair in the model graph: free for a
+checkpoint without KV scales, where every layer is 1.0, and up to one per layer for a
+calibrated one.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
@@ -472,6 +497,7 @@ Key constraints:
   powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); eligible
   `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
+  — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a
   user-supplied `block_size` is rounded up to the next multiple of 64, and one that is then
   not a power of two is rejected
@@ -509,7 +535,7 @@ exactly the extents a request can be assigned):
    (host-side integer tensors for `input_ids`; multimodal `inputs_embeds` are copied to
    CPU, padded there and copied back), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
-   inside the layer. For packed-order pooling, `_unpad_encoder_hidden` compacts the grid
+   inside the layer. For packed-order pooling, `unpad_encoder_grid` compacts the grid
    at a fixed row count so the gather does not specialise per token total. Homogeneous
    CLS pooling instead reads each sequence's first grid row and skips the gather.
 2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests

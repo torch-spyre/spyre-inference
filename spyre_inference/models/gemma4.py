@@ -20,8 +20,9 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer, Gemma4ForCausalLM
 
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
@@ -174,6 +175,61 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
     return configured
 
 
+def _fused_ffn_forward(
+    self: Gemma4DecoderLayer,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    per_layer_input: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Upstream's forward with the dense-MLP and MoE outputs reduced together: each feeds its own
+    # RMSNorm, so they cannot be summed first, but one all-reduce of the two stacked replaces two.
+    residual = hidden_states
+    hidden_states = self.input_layernorm(residual)
+    hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states, **kwargs)
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = hidden_states + residual
+    residual = hidden_states
+
+    assert self.post_feedforward_layernorm_1 is not None
+    assert self.pre_feedforward_layernorm_2 is not None
+    assert self.router is not None
+    assert self.experts is not None
+    assert self.post_feedforward_layernorm_2 is not None
+    mlp_out = self.mlp(self.pre_feedforward_layernorm(hidden_states))
+    router_logits = self.router(residual)
+    moe_out = self.experts(self.pre_feedforward_layernorm_2(residual), router_logits)
+    mlp_out, moe_out = tensor_model_parallel_all_reduce(torch.stack((mlp_out, moe_out))).unbind(0)
+    hidden_states = self.post_feedforward_layernorm_1(mlp_out) + self.post_feedforward_layernorm_2(
+        moe_out
+    )
+
+    hidden_states = self.post_feedforward_layernorm(hidden_states)
+    hidden_states = hidden_states + residual
+    if per_layer_input is not None and self.per_layer_input_gate is not None:
+        assert self.per_layer_projection is not None
+        assert self.post_per_layer_input_norm is not None
+        gate = torch.nn.functional.gelu(
+            self.per_layer_input_gate(hidden_states), approximate="tanh"
+        )
+        contribution = self.per_layer_projection(gate * per_layer_input)
+        hidden_states = hidden_states + self.post_per_layer_input_norm(contribution)
+    return hidden_states * self.layer_scalar, None  # ty: ignore[invalid-return-type]
+
+
+def fuse_gemma4_ffn_allreduce(layers: Iterable[nn.Module]) -> int:
+    fused = 0
+    for decoder in layers:
+        if not isinstance(decoder, Gemma4DecoderLayer) or decoder.experts is None:
+            continue
+        decoder.mlp.down_proj.reduce_results = False
+        decoder.experts.moe_config.skip_final_all_reduce = True
+        decoder.forward = _fused_ffn_forward.__get__(decoder)  # ty: ignore[invalid-assignment]
+        fused += 1
+    return fused
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
 
@@ -189,3 +245,5 @@ class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
                 "gemma-4 MoE checkpoint, but no decoder layer exposes `experts`: vLLM has "
                 "moved them; update configure_gemma4_moe_layers."
             )
+        if vllm_config.parallel_config.tensor_parallel_size > 1:
+            fuse_gemma4_ffn_allreduce(self.model.layers)

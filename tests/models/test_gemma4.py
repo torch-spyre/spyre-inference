@@ -247,8 +247,107 @@ def test_moe_checkpoint_without_experts_raises(monkeypatch, flag, raises):
         self.model = SimpleNamespace(layers=[SimpleNamespace(experts=None)])
 
     monkeypatch.setattr(Gemma4ForCausalLM, "__init__", parent_init)
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1))
     if raises:
         with pytest.raises(RuntimeError, match="no decoder layer exposes"):
-            gemma4.SpyreGemma4ForCausalLM(vllm_config=None)
+            gemma4.SpyreGemma4ForCausalLM(vllm_config=vllm_config)
     else:
-        gemma4.SpyreGemma4ForCausalLM(vllm_config=None)
+        gemma4.SpyreGemma4ForCausalLM(vllm_config=vllm_config)
+
+
+class _Branch(torch.nn.Module):
+    def __init__(self, seed, reduce, world):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.weight = torch.randn(8, 8, generator=g)
+        self.reduce, self.world = reduce, world
+
+    def forward(self, x, router_logits=None):
+        out = x @ self.weight
+        if router_logits is not None:
+            out = out * router_logits.sigmoid()
+        return out * self.world if self.reduce else out
+
+
+def _decoder_layer(*, fused, world=4):
+    from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
+
+    norms = {
+        name: _Branch(i, reduce=False, world=world)
+        for i, name in enumerate(
+            (
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm_1",
+                "pre_feedforward_layernorm_2",
+                "post_feedforward_layernorm_2",
+                "post_feedforward_layernorm",
+            )
+        )
+    }
+    layer = Gemma4DecoderLayer.__new__(Gemma4DecoderLayer)
+    torch.nn.Module.__init__(layer)
+    for name, mod in norms.items():
+        setattr(layer, name, mod)
+    attn = _Branch(20, reduce=True, world=world)
+    layer.self_attn = lambda positions, hidden_states, **_: attn(hidden_states)
+    layer.mlp = _Branch(21, reduce=not fused, world=world)
+    layer.router = _Branch(22, reduce=False, world=world)
+    layer.experts = _Branch(23, reduce=not fused, world=world)
+    layer.enable_moe_block = True
+    layer.per_layer_input_gate = None
+    layer.register_buffer("layer_scalar", torch.tensor([0.5]))
+    return layer
+
+
+def test_fused_ffn_forward_matches_upstreams_forward(monkeypatch):
+    """Fails when upstream's forward changes and the copy no longer matches it."""
+    world = 4
+    monkeypatch.setattr(gemma4, "tensor_model_parallel_all_reduce", lambda x: x * world)
+    x = torch.randn(3, 8, generator=torch.Generator().manual_seed(7))
+
+    expected, _ = _decoder_layer(fused=False, world=world).forward(None, x, None)
+    got, _ = gemma4._fused_ffn_forward(_decoder_layer(fused=True, world=world), None, x, None)
+
+    torch.testing.assert_close(got, expected)
+
+
+def test_fuse_gemma4_ffn_allreduce_turns_off_both_branch_reductions():
+    from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
+
+    down_proj = SimpleNamespace(reduce_results=True)
+    moe_config = SimpleNamespace(skip_final_all_reduce=False)
+    moe = Gemma4DecoderLayer.__new__(Gemma4DecoderLayer)
+    torch.nn.Module.__init__(moe)
+    moe.mlp = SimpleNamespace(down_proj=down_proj)
+    moe.experts = SimpleNamespace(moe_config=moe_config)
+    dense = Gemma4DecoderLayer.__new__(Gemma4DecoderLayer)
+    torch.nn.Module.__init__(dense)
+    dense.experts = None
+
+    assert gemma4.fuse_gemma4_ffn_allreduce([moe, dense]) == 1
+    assert not down_proj.reduce_results
+    assert moe_config.skip_final_all_reduce
+    assert moe.forward.__func__ is gemma4._fused_ffn_forward
+
+
+@pytest.mark.parametrize(("tp", "fused"), [(1, 0), (4, 1)])
+def test_ffn_allreduce_is_fused_only_under_tensor_parallelism(monkeypatch, tp, fused):
+    from torch import nn
+    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+
+    def parent_init(self, *, vllm_config, prefix=""):
+        nn.Module.__init__(self)
+        self.config = SimpleNamespace(enable_moe_block=True)
+        self.model = SimpleNamespace(layers=["layer"])
+
+    calls = []
+    monkeypatch.setattr(Gemma4ForCausalLM, "__init__", parent_init)
+    monkeypatch.setattr(gemma4, "configure_gemma4_moe_layers", lambda layers: 1)
+    monkeypatch.setattr(gemma4, "fuse_gemma4_ffn_allreduce", calls.append)
+    vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=tp))
+
+    gemma4.SpyreGemma4ForCausalLM(vllm_config=vllm_config)
+
+    assert len(calls) == fused

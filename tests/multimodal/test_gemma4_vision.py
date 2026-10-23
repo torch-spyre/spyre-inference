@@ -444,6 +444,30 @@ def test_dispatch_routes_only_the_gemma4_tower_to_gemma4(monkeypatch):
     assert called == [], "a text-only model must get no vision patches"
 
 
+def test_apply_moves_plain_per_layer_embedding_cache(monkeypatch):
+    from spyre_inference.multimodal import gemma4_vision
+
+    model = torch.nn.Module()
+    model.per_layer_embeddings = torch.zeros(3, 2, 4)
+    moved = torch.ones_like(model.per_layer_embeddings)
+
+    monkeypatch.setattr(gemma4_vision, "patch_rms_norm", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_patch_embedder", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_pooler", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "patch_vision_encoder", lambda: None)
+    monkeypatch.setattr(gemma4_vision, "pad_vision_weights", lambda model: None)
+    monkeypatch.setattr(gemma4_vision, "place_vision_tail_on_cpu", lambda model: None)
+    monkeypatch.setattr(
+        gemma4_vision,
+        "convert",
+        lambda tensor, *, device: moved if device == torch.device("spyre") else tensor,
+    )
+
+    gemma4_vision.apply(model, torch.device("spyre"))
+
+    assert model.per_layer_embeddings is moved
+
+
 def test_dispatch_skips_a_stage_missing_tower(monkeypatch):
     """With every modality limited to 0, vLLM builds the tower on the meta device behind
     a `StageMissingLayer` that forwards attribute reads but must never run: its class

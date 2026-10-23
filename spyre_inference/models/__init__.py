@@ -112,6 +112,11 @@ def register_models() -> None:
         ModelRegistry.register_model(arch, model_cls)
 
 
+def has_per_layer_embeddings(text_config) -> bool:
+    """``Gemma4Model`` builds ``embed_tokens_per_layer`` exactly when this is positive."""
+    return (getattr(text_config, "hidden_size_per_layer_input", 0) or 0) > 0
+
+
 def check_spyre_model(model: torch.nn.Module, architecture: str) -> None:
     """Fail if ``architecture`` has a Spyre adaptation that ``model`` was not built as.
 

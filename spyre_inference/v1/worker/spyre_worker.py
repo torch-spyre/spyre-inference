@@ -18,24 +18,12 @@ import os
 from contextlib import AbstractContextManager, nullcontext
 
 import torch
-from typing_extensions import override
-
-# `import torch_spyre` is intentionally deferred to inside `init_device`.
-# Importing it loads `libspyre_comms.so`, which captures
-# `RANK` / `WORLD_SIZE` / `LOCAL_RANK` / `LOCAL_WORLD_SIZE` via
-# `std::getenv` at dlopen time and caches them. Those env vars are only
-# known per-worker, so they must be populated before the C library
-# loads. `spyre_inference/__init__.py` sets
-# `TORCH_DEVICE_BACKEND_AUTOLOAD=0` so torch's `[torch.backends]`
-# autoload doesn't trigger the load at `import torch` time.
-from vllm.distributed.utils import get_worker_rank_suffix
 from vllm.logger import init_logger
-from vllm.profiler.wrapper import TorchProfilerWrapper
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environment
 from vllm.v1.worker.worker_base import CompilationTimes
 
-from spyre_inference import envs
+from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
@@ -57,21 +45,22 @@ def _get_spyre_pcie_address(local_rank: int) -> str:
     return os.environ.get(f"AIU_WORLD_RANK_{requested_indices[local_rank]}", "unknown")
 
 
-def monkey_patch_torch_profiler_activity_map():
-    """This function monkey-patches vLLM's TorchProfilerActivityMap to include PrivateUse1.
+def allow_private_use1_profiler_activity() -> None:
+    """Allow PrivateUse1 in vLLM's validate_worker_profiler_config for the "cpu" device type.
 
-    This is a temporary workaround and should be removed once PR
-    https:// github.com/vllm-project/vllm/pull/50977 lands in vLLM, which adds
-    PrivateUse1 to the TorchProfilerActivityMap.
+    Spyre reports device_type "cpu", for which vLLM only accepts the CPU activity, so
+    `torch_profiler_activities` containing PrivateUse1 would fail at worker start.
+    Temporary until vLLM lets a platform declare its profiler activities.
     """
-    from vllm.profiler.wrapper import TorchProfilerActivityMap as vllm_activity_map
+    from vllm.profiler import wrapper
 
-    if "PrivateUse1" not in vllm_activity_map:
-        vllm_activity_map["PrivateUse1"] = torch.profiler.ProfilerActivity.PrivateUse1
-        logger.debug("Patched vLLM TorchProfilerActivityMap to include PrivateUse1")
+    supported = wrapper._SUPPORTED_TORCH_PROFILER_ACTIVITIES
+    if "PrivateUse1" not in supported["cpu"]:
+        supported["cpu"] = supported["cpu"] | {"PrivateUse1"}
+        logger.debug("Allowed PrivateUse1 in vLLM's torch profiler activities for cpu")
 
 
-monkey_patch_torch_profiler_activity_map()
+allow_private_use1_profiler_activity()
 
 
 class TorchSpyreWorker(Worker):
@@ -97,8 +86,8 @@ class TorchSpyreWorker(Worker):
         return nullcontext()
 
     def init_device(self) -> None:
-        # Populate the env vars that `libspyre_comms.so` reads at dlopen
-        # time. `setdefault` leaves torchrun-supplied values intact.
+        # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
+        # values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
         # so parallel_config.world_size is the global rank count and
         # LOCAL_WORLD_SIZE == WORLD_SIZE on a single node. Revisit once
@@ -109,13 +98,12 @@ class TorchSpyreWorker(Worker):
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
 
-        # Trigger torch_spyre's autoload manually now that the env vars
-        # are set. Autoload registers the `spyre` device and the
-        # `spyreccl` distributed backend, and imports
-        # `torch_spyre._C` (which loads `libspyre_comms.so`).
+        # A no-op when `import torch` already autoloaded the backend; needed when
+        # TORCH_DEVICE_BACKEND_AUTOLOAD=0 disabled that.
         import torch_spyre
 
-        torch_spyre._autoload()
+        with keep_sigterm_handler():
+            torch_spyre._autoload()
 
         # torch_spyre's autoload sets cache_size_limit=1024, undoing the limits
         # platform.py raised at import.
@@ -206,24 +194,3 @@ class TorchSpyreWorker(Worker):
     def wake_up(self, tags: list[str] | None = None) -> None:
         # Nothing to restore, since sleep() keeps everything resident.
         pass
-
-    @override
-    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
-        if (
-            is_start
-            and self.profiler is None
-            and self.profiler_config is not None
-            and self.profiler_config.profiler == "torch"
-        ):
-            rank_suffix = get_worker_rank_suffix(global_rank=self.rank)
-            trace_name = f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
-
-            self.profiler = TorchProfilerWrapper(
-                self.profiler_config,
-                worker_name=trace_name,
-                local_rank=self.local_rank,
-                activities=["CPU", "PrivateUse1"],
-            )
-            logger.debug("Starting torch profiler with trace name: %s", trace_name)
-
-        return super().profile(is_start, profile_prefix)

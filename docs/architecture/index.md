@@ -77,7 +77,9 @@ in two overrides:
 
 - `process_weights_after_loading` replaces the loaded `[out, in]` weight with a contiguous
   `[in, out]` `Wᵀ` (optionally padding the output rows first), so the transpose is paid once at
-  load time rather than every forward.
+  load time rather than every forward. A plain `w.t().contiguous()` runs on one thread and is
+  slow on big weights, so by default (`SPYRE_BLOCKED_TRANSPOSE=1`) the same `Wᵀ` is built 128
+  source rows at a time, on torch's CPU threads (bit-identical).
 - `apply` runs `spyre_linear_t` — `torch.matmul(x, Wᵀ)` plus optional bias — instead of
   `F.linear`, dropping any trailing pad columns with an on-device un-pad slice.
 
@@ -224,7 +226,7 @@ Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entr
 hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
 `Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack. So is any list under a vision tower
 (`vision_encoder`, `vision_tower`, `vision_model`, `visual`), which stays eager unless
-marked (below). Models whose
+marked (below) or compiled per encoder budget (see [Vision encoders](#vision-encoders)). Models whose
 attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi) — match nothing and fall back to a
 whole-model graph.
 
@@ -283,6 +285,77 @@ on the wrapper — so its projection compiles its own graph, over row widths war
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
 grows with layer count.
+
+## Vision encoders
+
+A multimodal architecture gets a compiled, bucketed vision encoder by subclassing its upstream
+class with `SpyreVisionEncoderMixin` (`models/_vision_encoder.py`) ahead of it. The mixin implements
+upstream's `SupportsEncoderCudaGraph` protocol, so the bucketing is upstream's:
+`EncoderCudaGraphManager` picks power-of-two token budgets, packs a step's images into them,
+pads the inputs and splits the output per image. `SpyreEncoderGraphManager`
+(`v1/worker/spyre_encoder_graph.py`) replaces only capture and replay: capturing a budget
+compiles the encoder at that static shape during warmup, and replay uploads the padded
+inputs and runs those graphs. Warmup compiles every budget, largest first, after the attention
+kernels, so the compile guard covers the vision graphs. Upstream's
+`GPUModelRunner._execute_mm_encoder` already sends encoder work through the manager, and
+the embedding merge, encoder cache and decoder are unchanged.
+
+![Vision encoder](multimodal-vision-encoder.svg)
+
+Its source is `multimodal-vision-encoder.d2`; regenerate it from `docs/architecture/` with `d2 --layout elk --pad 40 multimodal-vision-encoder.d2 multimodal-vision-encoder.svg`.
+
+Adding a model means one file in `models/` (plus its `_ADAPTED_ARCHS` entry): the subclass
+implements the hooks below and nothing in the runner or manager changes. The units follow
+upstream: an *image token* is one position of `vision_project`'s output, counted by upstream's token
+budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
+`patches_per_token` per image token.
+
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
+|---|---|---|---|
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
+
+Two upstream protocol methods are also the extension points for model-specific shapes, used
+as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
+differ from the encoder's image tokens (unpadding, newline tokens; its input is already on the
+host), and `get_encoder_cudagraph_budget_range` when the processor's largest item is not counted
+in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
+capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
+upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
+upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
+(`enforce_eager`) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
+placeholders and `embed_input_ids` are inherited unchanged.
+
+Constraints the layout follows:
+
+- The largest budget is the largest item the model's upstream processor can produce
+  (`MultiModalBudget.mm_max_toks_per_item`, the same number the scheduler's encoder budget
+  uses, or the model's `get_encoder_cudagraph_budget_range`), so no item needs a shape
+  warmup skipped. Each budget's patch count is a whole multiple of `vision_patch_multiple`.
+- Patches are **offset-major**: one group per offset inside a merge group, each padded at
+  its own tail. The patch merge is then a free view to `[M², tokens, D]`, a batched matmul
+  and a sum. Upstream's `unfold` regroup has no lowering, and a `[L, D] → [L/M², M²·D]`
+  reshape feeding a matmul cannot be laid out.
+- The image mask is `segments @ segmentsᵀ` over a one-hot `[L, 64]` segment matrix (the last
+  column reserved for padding slots), not a column-minus-row broadcast, which torch-spyre
+  cannot lay out.
+- RoPE positions are uploaded as integers and cos/sin are gathered on the card from a
+  `GatherTable` (placed rows-outermost, as the decoder's RoPE cache is), so the host uploads
+  one index per patch. The rotation is a matmul against a constant pair-swap matrix, since a
+  64-wide head's 32-wide halves cannot be sliced.
+- The encoder output comes back to the host in one copy and is sliced there: device views
+  at offsets off the stick read as offset 0 (torch-spyre#3770), and the embedding merge
+  runs on the host anyway.
+- Tensor parallelism only; `mm_encoder_tp_mode="data"` is rejected.
 
 ## Attention Backend
 
@@ -390,6 +463,29 @@ transpose to a restickify, whose cross-frame barrier bars an LX-resident input w
 that PR's local-read proof. V is read directly by `probs @ V` and stays resident either
 way.
 
+#### FP8 KV cache
+
+`--kv-cache-dtype fp8` (or `fp8_e4m3`) stores the head-major pages as `float8_e4m3fn`,
+halving KV memory and the bytes each page read moves; the token-major layout rejects it.
+Upstream sizes the cache as `uint8` bytes and `allocate_pages` maps that back to e4m3.
+The store writes `K / k_scale` and `V / v_scale`, clamped to e4m3's range first because
+the float8 cast maps an overflow to NaN, and converts with `spyre.qfp8ch`: a plain `.to`
+has no device lowering and falls back to CPU, which writes bytes in sequential order
+while the fp8 -> fp16 read expects qfp8ch's order — so the pages are tagged `QFP8CH` in
+`head_major_kv_layout`. The three read kernels cast a gathered page back to the model
+dtype and apply `v_scale` to the output; `k_scale` is folded into the softmax scale the
+impl passes them. The attention math itself stays fp16.
+
+The scales are per-tensor and per-layer, read from the layer's `_k_scale_float` /
+`_v_scale_float` (1.0 for a checkpoint without a `kv_cache_scheme`) at model load and
+again after `reload_weights`, which re-warms when they change, and passed to the kernels
+as Python floats, skipped entirely at 1.0. A KV-sharing layer takes its target's scales. A `[1]` scale tensor would let layers
+with different scales share one compiled block, but its broadcast fails torch-spyre's
+pointwise layout pass. Baking them in costs one attention variant set per distinct scale
+pair at warmup, and one block compile per distinct pair in the model graph: free for a
+checkpoint without KV scales, where every layer is 1.0, and up to one per layer for a
+calibrated one.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`
@@ -401,6 +497,7 @@ Key constraints:
   powers of two from 1 to `max_num_seqs` (`SPYRE_ATTN_NUM_SEQS_BUCKETS`); eligible
   `(num_blocks, num_seqs)` combinations are recorded during warmup
 - **Head size**: Must be a multiple of 64 (128-byte Spyre stick ÷ 2-byte float16)
+  — of 128 with an FP8 KV cache (1-byte elements)
 - **Block size**: Must be a power of two and a multiple of 64. The default is 128; a
   user-supplied `block_size` is rounded up to the next multiple of 64, and one that is then
   not a power of two is rejected
@@ -438,7 +535,7 @@ exactly the extents a request can be assigned):
    (host-side integer tensors for `input_ids`; multimodal `inputs_embeds` are copied to
    CPU, padded there and copied back), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
-   inside the layer. For packed-order pooling, `_unpad_encoder_hidden` compacts the grid
+   inside the layer. For packed-order pooling, `unpad_encoder_grid` compacts the grid
    at a fixed row count so the gather does not specialise per token total. Homogeneous
    CLS pooling instead reads each sequence's first grid row and skips the gather.
 2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests

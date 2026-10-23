@@ -301,8 +301,8 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
     Was xfail(strict=True) for diverging from CPU silently; fixed in the torch-spyre
     f4f0bcc..9f975a3 range. The kernels still pass a one-element index, for unrelated
     reasons still probed by test_spyre_indirect_page_gather_subscript_needs_compile
-    (int32 index upcast under aten.index) and test_spyre_compile_input_honors_storage_offset
-    (torch-spyre#3770).
+    (int32 index upcast under aten.index) and test_spyre_scatter_index_row_of_2d_table
+    (torch-spyre#3851).
     """
     num_kv_heads = 2
     block_size = 64
@@ -621,29 +621,14 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        torch.float16,
-        pytest.param(
-            torch.int32,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "torch-spyre#3770: an int32 device view with storage_offset != 0 is "
-                    "read from offset 0 when passed into a compiled region. Index tensors "
-                    "are int32, hence the per-sequence page_index_tables."
-                ),
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
     These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
     Every offset here is a whole number of sticks, so a pass does not speak for a
-    row-misaligned view.
+    row-misaligned view. For int32 this covers an elementwise read only, not an index
+    (test_spyre_scatter_index_row_of_2d_table).
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
@@ -883,8 +868,8 @@ def _stacked_index_pages(blocks, entries, block_size, head_size, spyre_device):
 def test_spyre_in_graph_slice_of_stacked_page_index(spyre_device):
     """One stacked [num_blocks, 1] int32 table, sliced in-graph, feeding index_select.
 
-    An int32 argument's offset is dropped
-    (test_spyre_compile_input_honors_storage_offset[dtype1]); an in-graph slice of a
+    An index that is a row of a 2-D table argument loses all but its first stick
+    (test_spyre_scatter_index_row_of_2d_table); an in-graph slice of a
     stacked table is a different mechanism and holds at this shape, which is what
     ``page_attn_head_major_prefill`` reads.
     """
@@ -936,6 +921,39 @@ def test_spyre_in_graph_slice_of_stacked_kv_row_index(spyre_device):
         for b in range(blocks)
     )
     torch.testing.assert_close(fn(pages, table).cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#3851: an index that is a row of a 2-D table is followed for its first "
+        "int32 stick only; the entries past it are dropped, silently. Offset 0 fails too."
+    ),
+)
+def test_spyre_scatter_index_row_of_2d_table(spyre_device):
+    """index_copy_ with row 0 of a [2, 64] table, the form a [KV, T] head-major write index takes.
+
+    When this XPASS-es, SpyreHeadMajorAttentionImpl.kv_write_index can upload one [KV, T]
+    tensor and hand the store its rows, instead of one allocation and H2D copy per KV head.
+    """
+    rows, entries, width = 128, 64, 128
+    table_cpu = torch.stack([torch.arange(entries) * 2, torch.arange(entries) * 2 + 1])
+    table = table_cpu.to(spyre_device)
+    source_cpu = (1 + torch.arange(entries, dtype=torch.float16)).unsqueeze(1).expand(-1, width)
+    source = source_cpu.contiguous().to(spyre_device)
+    out = torch.zeros(rows, width, dtype=torch.float16).to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(o, i, s):
+        o.index_copy_(0, i, s)
+
+    index = table[0]
+    assert index.storage_offset() == 0
+    fn(out, index, source)
+    expected = torch.zeros(rows, width, dtype=torch.float16).index_copy_(
+        0, table_cpu[0], source_cpu
+    )
+    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1203,100 +1221,7 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
 
 
 # ---------------------------------------------------------------------------
-# 13. Compiled Pixtral vision attention (coarse-tile hint split)
-# ---------------------------------------------------------------------------
-
-
-_VISION_ATTN_COMPILE_REASON = (
-    "torch.compile of Pixtral vision Attention (RoPE + padded SDPA) dies in "
-    "coarse-tile: `hint_id=N appears in both group 0 and group 1` — ops from "
-    "the same spyre_hint were split across two loop nests. That is why "
-    "`_is_decoder_attention_like` refuses vision towers. When this XPASS-es, "
-    "vision blocks can compile and the decoder-only restriction can be dropped."
-)
-
-
-@pytest.mark.xfail(strict=True, reason=_VISION_ATTN_COMPILE_REASON)
-def test_spyre_compiled_pixtral_vision_attention_coarse_tile(spyre_device, tp_group, monkeypatch):
-    """A compiled vision-attention block must match the eager patched forward.
-
-    `_compile_blocks` wraps each TransformerBlock the same way. First
-    ``embed_multimodal`` then traces that graph and coarse-tile raises.
-    """
-    pixtral = pytest.importorskip("vllm.model_executor.models.pixtral")
-    from vllm.model_executor.layers.linear import LinearBase
-
-    from spyre_inference.multimodal.pixtral import (
-        patch_vision_attention,
-        patch_vision_rope_vit,
-    )
-
-    monkeypatch.setattr(pixtral, "apply_rotary_emb_vit", pixtral.apply_rotary_emb_vit)
-    monkeypatch.setattr(
-        pixtral.VisionTransformer,
-        "freqs_cis",
-        pixtral.VisionTransformer.__dict__["freqs_cis"],
-    )
-    monkeypatch.setattr(pixtral.Attention, "forward", pixtral.Attention.forward)
-
-    hidden, heads, num_patches, max_side = 256, 4, 64, 16
-    args = pixtral.VisionEncoderArgs(
-        hidden_size=hidden,
-        num_channels=3,
-        image_size=128,
-        patch_size=16,
-        intermediate_size=512,
-        num_hidden_layers=1,
-        num_attention_heads=heads,
-        rope_theta=10000.0,
-        image_token_id=10,
-        spatial_merge_size=1,
-    )
-
-    class _FreqsStub:
-        def __init__(self):
-            self.args = args
-            self.max_patches_per_side = max_side
-            self._freqs_cis = None
-            self.device = torch.device("cpu")
-
-    layer = pixtral.Attention(args, disable_tp=True).to(torch.float16)
-    torch.manual_seed(31)
-    for param in layer.parameters():
-        param.data.normal_(std=0.02)
-    for module in layer.modules():
-        if isinstance(module, LinearBase):
-            module.quant_method.process_weights_after_loading(module)
-
-    patch_vision_rope_vit()
-    patch_vision_attention()
-
-    torch.manual_seed(7)
-    positions = torch.stack(
-        [
-            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
-            torch.randint(0, max_side, (num_patches,), dtype=torch.int64),
-        ],
-        dim=-1,
-    )
-    freqs_cis = pixtral.VisionTransformer.__dict__["freqs_cis"].fget(_FreqsStub())[
-        (positions[:, 0], positions[:, 1])
-    ]
-    torch.manual_seed(37)
-    x = torch.randn(1, num_patches, hidden, dtype=torch.float16)
-    mask = torch.ones(num_patches, num_patches, dtype=torch.bool).tril()
-
-    expected = pixtral.Attention.forward(layer, x, mask, freqs_cis)
-
-    layer = layer.to(spyre_device)
-    layer.compile(backend="inductor", fullgraph=True, dynamic=False)
-    out = layer(x.to(spyre_device), mask, freqs_cis.to(spyre_device))
-
-    torch.testing.assert_close(out.cpu().float(), expected.float(), atol=2e-2, rtol=2e-2)
-
-
-# ---------------------------------------------------------------------------
-# 14. Eager GemmaRMSNorm
+# 13. Eager GemmaRMSNorm
 # ---------------------------------------------------------------------------
 
 

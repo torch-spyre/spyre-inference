@@ -140,6 +140,20 @@ EXCLUDED = {
     "pqdm",
     "tritonclient",
     "torch-abi-audit",  # CI check for PyTorch stable ABI compliance; not a collected/run test dep
+    # Upstream Dependabot GHSA floors on transitive test deps; no collected/run test imports them
+    "black",
+    "fonttools",
+    "h2",
+    "hpack",
+    "lxml",
+    "mako",
+    "msgpack",
+    "nltk",
+    "orjson",
+    "pyarrow",
+    "pyasn1",
+    "virtualenv",
+    "werkzeug",
 }
 
 # Header emitted inside the generated dependencies array.

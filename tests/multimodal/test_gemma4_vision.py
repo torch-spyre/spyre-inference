@@ -35,11 +35,7 @@ configuration_gemma4 = pytest.importorskip("transformers.models.gemma4.configura
 # The patch replaces the class attribute process-wide, so capture the stock forward here.
 STOCK_ENCODER_FORWARD = modeling_gemma4.Gemma4VisionEncoder.forward
 
-# `Gemma4RMSNorm` is shared with the gemma-4 text model, so a patch that outlives the
-# test changes every later one in the process.
 _PATCHED_ATTRS = [
-    (modeling_gemma4.Gemma4RMSNorm, "forward"),
-    (modeling_gemma4.Gemma4VisionAttention, "forward"),
     (modeling_gemma4.Gemma4VisionEncoder, "forward"),
     (modeling_gemma4.Gemma4VisionPooler, "forward"),
     (modeling_gemma4.Gemma4VisionPatchEmbedder, "_position_embeddings"),
@@ -123,8 +119,8 @@ def _unpad_activation_quarters(padded: torch.Tensor, orig: int, padded_dim: int)
         "Gemma4VisionPooler",
         "apply_multidimensional_rope",
         "Gemma4VisionRotaryEmbedding",
-        # Compared by name in the multimodal dispatch: a rename routes a gemma-4 tower
-        # into `pixtral.apply` instead.
+        # Compared by name in the multimodal dispatch: a rename leaves a gemma-4 tower
+        # unpatched.
         "Gemma4VisionModel",
     ],
 )
@@ -272,15 +268,14 @@ def test_padded_rms_norm_does_not_promote_via_an_fp32_weight():
     assert out.dtype == torch.float16
 
 
-def test_patched_rms_norm_does_not_promote_via_its_fp32_weight():
-    """Same hazard through the patched module: transformers builds these weights at
-    the default (fp32) dtype, and the vision tower feeds fp16 activations."""
-    from spyre_inference.multimodal import gemma4_vision
+def test_spyre_rms_norm_does_not_promote_via_its_fp32_weight():
+    """Same hazard through the module: transformers builds these weights at the default
+    (fp32) dtype, and the vision tower feeds fp16 activations."""
+    from spyre_inference.multimodal.gemma4_vision import SpyreGemma4RMSNorm
 
-    norm = modeling_gemma4.Gemma4RMSNorm(dim=16, eps=1e-6, with_scale=True)
+    norm = SpyreGemma4RMSNorm(dim=16, eps=1e-6, with_scale=True)
     assert norm.weight.dtype == torch.float32, "premise of this test changed upstream"
 
-    gemma4_vision.patch_rms_norm()
     out = norm(torch.randn(2, 3, 16, dtype=torch.float16))
     assert out.dtype == torch.float16
 
@@ -381,37 +376,26 @@ def test_patches_are_idempotent():
     """`apply()` runs per model load, so every patch must be re-entrant."""
     from spyre_inference.multimodal import gemma4_vision
 
-    gemma4_vision.patch_rms_norm()
-    first = modeling_gemma4.Gemma4RMSNorm.forward
-    gemma4_vision.patch_rms_norm()
-    assert modeling_gemma4.Gemma4RMSNorm.forward is first
-
-    gemma4_vision.patch_vision_attention()
-    first_attention = modeling_gemma4.Gemma4VisionAttention.forward
-    gemma4_vision.patch_vision_attention()
-    assert modeling_gemma4.Gemma4VisionAttention.forward is first_attention
-
     gemma4_vision.patch_vision_encoder()
     first_encoder = modeling_gemma4.Gemma4VisionEncoder.forward
     gemma4_vision.patch_vision_encoder()
     assert modeling_gemma4.Gemma4VisionEncoder.forward is first_encoder
 
 
-def test_patched_rms_norm_stays_in_input_dtype_and_matches_reference():
-    """The patched forward drops stock's fp32 round trip; in fp32 (where the
+def test_spyre_rms_norm_stays_in_input_dtype_and_matches_reference():
+    """`SpyreGemma4RMSNorm` drops stock's fp32 round trip; in fp32 (where the
     promotion is a no-op) it must still agree with stock to tight tolerance."""
-    from spyre_inference.multimodal import gemma4_vision
+    from spyre_inference.multimodal.gemma4_vision import SpyreGemma4RMSNorm
 
     torch.manual_seed(0)
     dim = 16
-    norm = modeling_gemma4.Gemma4RMSNorm(dim=dim, eps=1e-6, with_scale=True)
+    norm = SpyreGemma4RMSNorm(dim=dim, eps=1e-6, with_scale=True)
     norm.weight.data.normal_()
     x = torch.randn(2, 3, dim, dtype=torch.float32)
 
     mean_squared = x.pow(2).mean(-1, keepdim=True) + norm.eps
     want = x * torch.pow(mean_squared, -0.5) * norm.weight
 
-    gemma4_vision.patch_rms_norm()
     got = norm(x)
 
     assert got.dtype == torch.float32
@@ -423,13 +407,29 @@ class Gemma4VisionModel(torch.nn.Module):
     pass
 
 
+def test_multimodal_imports_without_transformers_gemma4():
+    """The model runner imports `spyre_inference.multimodal` for every model, so an
+    upstream move of the gemma-4 classes may only break a gemma-4 vision load."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "sys.modules['transformers.models.gemma4.modeling_gemma4'] = None\n"
+        "import spyre_inference.multimodal\n"
+        "assert 'spyre_inference.multimodal.gemma4_vision' not in sys.modules\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
 def _stub_vision_applies(monkeypatch) -> list[str]:
-    from spyre_inference import multimodal
+    import importlib
 
     called: list[str] = []
-    for name in ("gemma4_vision", "pixtral", "clip"):
+    for name in ("gemma4_vision", "clip"):
         monkeypatch.setattr(
-            getattr(multimodal, name),
+            importlib.import_module(f"spyre_inference.multimodal.{name}"),
             "apply",
             lambda *a, _name=name: called.append(_name),
             raising=True,
@@ -437,14 +437,14 @@ def _stub_vision_applies(monkeypatch) -> list[str]:
     return called
 
 
-def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
-    """`apply_multimodal_patches` keys on the tower's class name, since Pixtral and
-    Gemma 4 both hang their tower off a `vision_tower` attribute."""
+def test_dispatch_routes_only_the_gemma4_tower_to_gemma4(monkeypatch):
+    """`apply_multimodal_patches` keys on the tower's class name, since several
+    architectures hang their tower off a `vision_tower` attribute."""
     from spyre_inference import multimodal
 
     called = _stub_vision_applies(monkeypatch)
 
-    class _PixtralTower(torch.nn.Module):
+    class _OtherTower(torch.nn.Module):
         pass
 
     gemma4_model = torch.nn.Module()
@@ -453,10 +453,10 @@ def test_dispatch_routes_gemma4_tower_away_from_pixtral(monkeypatch):
     assert called == ["gemma4_vision"]
 
     called.clear()
-    pixtral_model = torch.nn.Module()
-    pixtral_model.vision_tower = _PixtralTower()
-    multimodal.apply_multimodal_patches(pixtral_model, torch.device("cpu"))
-    assert called == ["pixtral"]
+    other_model = torch.nn.Module()
+    other_model.vision_tower = _OtherTower()
+    multimodal.apply_multimodal_patches(other_model, torch.device("cpu"))
+    assert called == []
 
     called.clear()
     multimodal.apply_multimodal_patches(torch.nn.Module(), torch.device("cpu"))
@@ -970,7 +970,7 @@ def test_layers_stay_the_per_block_compile_unit():
 
 
 def test_marked_layers_lower_as_fullgraph_blocks_on_spyre():
-    """The runner's compile unit -- stock layer body, patched attention, rope buffer,
+    """The runner's compile unit -- stock layer body, Spyre attention, rope buffer,
     per-image key-pad rows -- as one `fullgraph`, `dynamic=False` block on the card."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
@@ -999,7 +999,6 @@ def test_patched_encoder_refuses_to_pad_its_own_weights():
     unpadded tower has to say so instead of mutating itself mid-trace."""
     from spyre_inference.multimodal import gemma4_vision
 
-    gemma4_vision.patch_vision_attention()
     gemma4_vision.patch_vision_encoder()
     encoder = _encoder()
     embeds, mask, pos = _encoder_inputs()
@@ -1009,14 +1008,13 @@ def test_patched_encoder_refuses_to_pad_its_own_weights():
 
 
 @pytest.mark.parametrize("padded_to", [None, PADDED_HEAD_DIM + 128])
-def test_patched_attention_refuses_an_unpadded_instance(padded_to):
-    """The class-level patch reaches every `Gemma4VisionAttention`, padded or not; an
-    instance `pad_vision_weights` never touched, or padded for another head dim, says so
-    rather than failing on a missing attribute or a bad view."""
-    from spyre_inference.multimodal import gemma4_vision
+def test_spyre_attention_refuses_an_unpadded_instance(padded_to):
+    """An instance `pad_vision_weights` never touched, or padded for another head dim,
+    says so rather than failing on a missing attribute or a bad view."""
+    from spyre_inference.multimodal.gemma4_vision import SpyreGemma4VisionAttention
 
-    gemma4_vision.patch_vision_attention()
     attn = _encoder(num_layers=1).layers[0].self_attn
+    attn.__class__ = SpyreGemma4VisionAttention
     if padded_to is not None:
         attn._spyre_padded_head_dim = padded_to
 
@@ -1026,6 +1024,31 @@ def test_patched_attention_refuses_an_unpadded_instance(padded_to):
             position_embeddings=(None, None),
             attention_mask=None,
         )
+
+
+def test_apply_swaps_only_the_towers_own_modules():
+    """The Spyre norm and attention go onto this tower's instances, not the transformers
+    classes, which the gemma-4 text and audio models share. Weight names stay put."""
+    from spyre_inference.multimodal.gemma4_vision import (
+        SpyreGemma4RMSNorm,
+        SpyreGemma4VisionAttention,
+    )
+
+    stock_norm_forward = modeling_gemma4.Gemma4RMSNorm.forward
+    stock_attn_forward = modeling_gemma4.Gemma4VisionAttention.forward
+    encoder = _encoder()
+    names = list(encoder.state_dict())
+    _load(encoder)
+    _load(encoder)  # per-load re-entrancy
+
+    assert modeling_gemma4.Gemma4RMSNorm.forward is stock_norm_forward
+    assert modeling_gemma4.Gemma4VisionAttention.forward is stock_attn_forward
+    assert list(encoder.state_dict()) == names
+    for layer in encoder.layers:
+        assert type(layer.self_attn) is SpyreGemma4VisionAttention
+        assert type(layer.input_layernorm) is SpyreGemma4RMSNorm
+        assert type(layer.self_attn.q_norm) is SpyreGemma4RMSNorm
+    assert not any(type(m) is modeling_gemma4.Gemma4RMSNorm for m in encoder.modules())
 
 
 def test_pad_vision_weights_pads_every_layer():
@@ -1039,14 +1062,26 @@ def test_pad_vision_weights_pads_every_layer():
         assert layer.mlp.gate_proj.linear.out_features == align_up(encoder.config.intermediate_size)
 
 
-@pytest.mark.parametrize("missing", ["Gemma4VisionAttention", "Gemma4VisionEncoder"])
+@pytest.mark.parametrize(
+    "missing", ["Gemma4RMSNorm", "Gemma4VisionAttention", "Gemma4VisionEncoder"]
+)
 def test_apply_refuses_a_tower_its_patches_cannot_reach(monkeypatch, missing):
-    """An upstream rename leaves a class unpatched; padded projections no longer fit
-    the stock attention, so the load fails here rather than on the first image."""
+    """An upstream rename leaves a class unpatched; the stock attention and norm do not
+    run on the padded tower, so the load fails here rather than on the first image."""
     from spyre_inference.multimodal import gemma4_vision
 
     encoder = _encoder(num_layers=1)
-    monkeypatch.delattr(modeling_gemma4, missing)
+    if missing == "Gemma4VisionEncoder":
+        monkeypatch.delattr(modeling_gemma4, missing)
+    else:
+        layer = encoder.layers[0]
+        target = (
+            layer.self_attn
+            if missing == "Gemma4VisionAttention"
+            else layer.post_feedforward_layernorm
+        )
+        # Not the exact class `apply()` swaps, as a renamed or reworked upstream one is.
+        target.__class__ = type("_Renamed", (type(target),), {})
 
     with pytest.raises(RuntimeError, match="patches did not install"):
         gemma4_vision.apply(_model(encoder), torch.device("cpu"))

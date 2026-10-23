@@ -156,8 +156,8 @@ def _build_query_row_tables(
 ) -> list[torch.Tensor]:
     """Build query gather/dest row tables for the whole batch.
 
-    Each row is converted on its own so it lands at storage offset 0
-    (torch-spyre#3770); slicing a batched device tensor instead hits
+    Each row is converted on its own rather than as a row of one 2-D table
+    (torch-spyre#3851); slicing a batched device tensor instead hits
     spyre::copy_from_d2d, which recompiles per (shape, src_off, dst_off).
     """
     num_seqs = attn_metadata.num_seqs
@@ -185,6 +185,9 @@ _batched_decode_compiled = torch.compile(
 compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
+
+# Stored as float8_e4m3fn with one per-tensor (k_scale, v_scale) pair per layer.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
 
 
 @dataclass
@@ -1135,6 +1138,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     compiles its attention kernels, including under --enforce-eager.
     """
 
+    supports_fp8_kv_cache: ClassVar[bool] = False
+    # False for layers that keep no KV cache (encoder self-attention).
+    keeps_kv_cache: ClassVar[bool] = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1173,13 +1180,33 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        fp8_requested = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        self.kv_cache_fp8 = fp8_requested and self.keeps_kv_cache
+        if self.kv_cache_fp8:
+            if not self.supports_fp8_kv_cache:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} is not supported by "
+                    f"{type(self).__name__}; it needs the head-major KV layout "
+                    "(unset SPYRE_ATTN_KV_LAYOUT)."
+                )
+            # A float8 stick holds 128 elements.
+            if head_size % 128:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} needs head_size % 128 == 0, got {head_size}."
+                )
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
-        # the two 2-byte dtypes are not interchangeable per-cache.
-        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+        # the two 2-byte dtypes are not interchangeable per-cache. A layer without a cache
+        # has nothing to apply an fp8 dtype to; upstream passes the engine-wide one.
+        elif not fp8_requested and kv_cache_dtype not in (
+            "auto",
+            str(self.model_dtype).removeprefix("torch."),
+        ):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."
             )
+        # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
+        self._kv_scales: tuple[float, float] | None = None
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1618,6 +1645,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
+
+    def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
+        """Read the layer's float8 KV scales as floats (a [1] tensor fails torch-spyre's
+        pointwise layout pass). The runner calls it at load and after a reload."""
+        if not self.kv_cache_fp8:
+            return
+        # Set by upstream after weight loading.
+        self._kv_scales = (
+            float(getattr(layer, "_k_scale_float", 1.0)),
+            float(getattr(layer, "_v_scale_float", 1.0)),
+        )
 
     def do_kv_cache_update(
         self,

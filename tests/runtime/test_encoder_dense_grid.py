@@ -29,9 +29,9 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference.models.bert import SpyreBertEmbedding
 from spyre_inference.models.roberta import SpyreRobertaEmbedding
+from spyre_inference.v1.pool.encoder_grid import rect_pooling_method, unpad_encoder_grid
 from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool, SpyreMeanPool
 from spyre_inference.v1.worker.encoder_grid import expand_body_to_grid
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
     encoder_dense_row_indices,
@@ -338,14 +338,6 @@ def _pooling_metadata(lengths: list[int]) -> PoolingMetadata:
     return metadata
 
 
-def _runner(pooler, grid):
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner._encoder_grid = grid
-    runner.model = type("_Model", (), {})()
-    runner.model.pooler = pooler
-    return runner
-
-
 def test_rectangular_cls_matches_unpad_then_gather():
     """Grid CLS rows name the same vectors the packed cursor names after unpad."""
     extent, width = 8, 3
@@ -354,26 +346,28 @@ def test_rectangular_cls_matches_unpad_then_gather():
         torch.arange(width * extent, dtype=torch.float32).unsqueeze(1).expand(-1, 4).contiguous()
     )
     metadata = _pooling_metadata(query_lens)
-    pooler = SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity())
-    runner = _runner(pooler, (extent, width, query_lens))
+    grid = (extent, width, query_lens)
 
-    assert isinstance(runner._rectangular_pooling(metadata), SpyreCLSPool)
     assert isinstance(
-        _runner(
-            SequencePooler(pooling=SpyreMeanPool(), head=nn.Identity()),
-            (extent, width, query_lens),
-        )._rectangular_pooling(metadata),
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity()), metadata, grid
+        ),
+        SpyreCLSPool,
+    )
+    assert isinstance(
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreMeanPool(), head=nn.Identity()), metadata, grid
+        ),
         SpyreMeanPool,
     )
     assert (
-        _runner(
-            SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()),
-            (extent, width, query_lens),
-        )._rectangular_pooling(metadata)
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()), metadata, grid
+        )
         is None
     )
 
-    packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
+    packed = unpad_encoder_grid(hidden, grid)
     cls = SpyreCLSPool()
     from_unpad = cls(packed, metadata)
     metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(

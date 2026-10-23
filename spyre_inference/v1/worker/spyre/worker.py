@@ -32,7 +32,7 @@ import torch
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.gpu_worker import init_worker_distributed_environment
 
-from spyre_inference import envs
+from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
@@ -50,8 +50,8 @@ class SpyreWorkerV2(TorchSpyreWorker):
     """MRV2: vllm/v1/worker/gpu_worker.py:Worker, via TorchSpyreWorker."""
 
     def init_device(self) -> None:
-        # Populate the env vars that `libspyre_comms.so` reads at dlopen
-        # time. `setdefault` leaves torchrun-supplied values intact.
+        # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
+        # values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,
         # so parallel_config.world_size is the global rank count and
         # LOCAL_WORLD_SIZE == WORLD_SIZE on a single node. Revisit once
@@ -62,13 +62,12 @@ class SpyreWorkerV2(TorchSpyreWorker):
         os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
         os.environ.setdefault("LOCAL_WORLD_SIZE", str(world_size))
 
-        # Trigger torch_spyre's autoload manually now that the env vars
-        # are set. Autoload registers the `spyre` device and the
-        # `spyreccl` distributed backend, and imports
-        # `torch_spyre._C` (which loads `libspyre_comms.so`).
+        # A no-op when `import torch` already autoloaded the backend; needed when
+        # TORCH_DEVICE_BACKEND_AUTOLOAD=0 disabled that.
         import torch_spyre
 
-        torch_spyre._autoload()
+        with keep_sigterm_handler():
+            torch_spyre._autoload()
 
         # torch_spyre's autoload sets cache_size_limit=1024, undoing the limits
         # platform.py raised at import.

@@ -12,23 +12,77 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib.metadata
 import logging
 import os
-
-# Defer torch_spyre's autoload until we explicitly trigger it inside
-# `TorchSpyreWorker.init_device`. Autoload loads `libspyre_comms.so`,
-# which captures `RANK`/`WORLD_SIZE`/`LOCAL_RANK`/`LOCAL_WORLD_SIZE`
-# at dlopen time — those env vars are only known per-worker, so the
-# library can't load before init_device runs.
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+import signal
+import threading
 
 __version__ = importlib.metadata.version("spyre_inference")
 
 
 def register():
     """Register the Spyre platform."""
+    # vLLM resolves the platform during `import vllm`, before vllm.triton_utils is
+    # imported, which is the last point the Triton gate can act.
+    from vllm.logger import init_logger
+
+    from spyre_inference import envs
+    from spyre_inference.v1.worker.spyre import triton_gate
+
+    # vLLM's plugin probe swallows exceptions here and falls back to another platform,
+    # so errors are only logged; check_and_update_config rejects the resulting state.
+    try:
+        if envs.SPYRE_MODEL_RUNNER == "v2":
+            triton_gate.open()
+        else:
+            triton_gate.close()
+    except Exception:
+        init_logger(__name__).exception("Spyre Triton gate could not be applied")
+    # VllmConfig.__post_init__ reads use_v2_model_runner before the platform hook.
+    pin_model_runner(envs.SPYRE_MODEL_RUNNER)
     return "spyre_inference.platform.TorchSpyrePlatform"
+
+
+def pin_model_runner(runner: str) -> None:
+    """Point VLLM_USE_V2_MODEL_RUNNER at SPYRE_MODEL_RUNNER's choice.
+
+    Pinned for v1 too: use_v2_model_runner returns an explicit value before its
+    HAS_TRITON fallback, and vLLM's own heuristics can otherwise still pick V2.
+    """
+    want = "1" if runner == "v2" else "0"
+    current = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
+    if current not in (None, "", want):
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning(
+            "SPYRE_MODEL_RUNNER=%s picks the model runner; overriding "
+            "VLLM_USE_V2_MODEL_RUNNER=%s to %s.",
+            runner,
+            current,
+            want,
+        )
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = want
+
+
+@contextlib.contextmanager
+def keep_sigterm_handler():
+    """Restore the SIGTERM handler that loading senlib (via ``torch_spyre._C``) replaces.
+
+    senlib's handler exits at once, while vLLM's shuts the engine's workers down; without
+    it they outlive the engine and keep the card. By default ``import torch`` loads senlib
+    before vLLM installs its handler, so this only matters with
+    ``TORCH_DEVICE_BACKEND_AUTOLOAD=0``, where senlib loads inside these blocks.
+    senlib's crash handlers (SIGSEGV, SIGABRT, ...) are left in place.
+    """
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    handler = signal.getsignal(signal.SIGTERM) if on_main_thread else None
+    try:
+        yield
+    finally:
+        if handler is not None:
+            signal.signal(signal.SIGTERM, handler)
 
 
 def register_ops():
@@ -36,8 +90,9 @@ def register_ops():
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
 
-    register_all()
-    register_models()
+    with keep_sigterm_handler():
+        register_all()
+        register_models()
 
 
 def _route_logging() -> None:

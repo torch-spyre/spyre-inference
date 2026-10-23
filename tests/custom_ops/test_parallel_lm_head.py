@@ -583,6 +583,44 @@ def test_projection_stays_eager_inside_an_enclosing_graph(tp_group, monkeypatch)
     assert method.spyre_compiled_kernel is None
 
 
+def _cpu_gather_worker(rank: int, world_size: int, port: int, shards: list) -> None:
+    import torch.distributed as dist
+    import vllm.distributed.parallel_state as ps
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    from spyre_inference.custom_ops.logits_processor import SpyreLogitsProcessor
+
+    dist.init_process_group(
+        "gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    ps._TP = GroupCoordinator(
+        group_ranks=[list(range(world_size))],
+        local_rank=rank,
+        torch_distributed_backend="gloo",
+        use_device_communicator=False,
+        group_name="tp",
+    )
+    gathered = SpyreLogitsProcessor._cpu_all_gather_logits(shards[rank])
+    torch.testing.assert_close(gathered, torch.cat(shards, dim=-1), atol=0, rtol=0)
+    dist.destroy_process_group()
+
+
+@pytest.mark.parallel_lm_head
+def test_cpu_all_gather_logits_concatenates_the_vocab_shards_in_rank_order():
+    import socket
+
+    import torch.multiprocessing as mp
+
+    world_size = 2
+    torch.manual_seed(0)
+    shards = [torch.randn(4, 64, dtype=torch.float16) for _ in range(world_size)]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    mp.spawn(_cpu_gather_worker, args=(world_size, port, shards), nprocs=world_size)
+
+
 @pytest.fixture
 def spyre_or_cpu_device():
     """Use Spyre if available, otherwise CPU."""

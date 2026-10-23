@@ -73,7 +73,7 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.28.0) with two
+        # Mirrors upstream TopKTopPSampler.forward_native (vLLM 0.32.0) with two
         # Spyre changes: sort-free top-k (and top-k + top-p) and a log-space
         # Gumbel draw. Re-sync with upstream on a vLLM bump.
         if k is not None and p is not None:

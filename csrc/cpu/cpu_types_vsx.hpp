@@ -165,7 +165,7 @@ struct FP32Vec8 : public Vec<FP32Vec8> {
       tmp.val[1] = two_x;
       FP32Vec8 temp_vec(tmp);
       FP32Vec8 exp_vec = temp_vec.exp();
-      vector float e = temp_vec.exp().reg.val[0];
+      vector float e = exp_vec.reg.val[0];
 
       vector float num = vec_sub(e, one);
       vector float den = vec_add(e, one);

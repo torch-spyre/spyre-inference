@@ -26,6 +26,7 @@ import torch.nn as nn
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.worker.utils import AttentionGroup
 
 from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionMetadataBuilder
 from spyre_inference.v1.worker.spyre.model_states.default import SpyreDefaultModelState
@@ -72,8 +73,12 @@ def _prepare_attn(batch):
         torch.device("cpu"),
     )
     recorder = _Recorder()
-    group = SimpleNamespace(
-        layer_names=["layer.0"], kv_cache_spec=None, get_metadata_builder=lambda _: recorder
+    group = AttentionGroup(
+        backend=None,  # ty: ignore[invalid-argument-type]
+        layer_names=["layer.0"],
+        kv_cache_spec=None,  # ty: ignore[invalid-argument-type]
+        kv_cache_group_id=0,
+        metadata_builders=[recorder],  # ty: ignore[invalid-argument-type]
     )
     block_tables = (torch.arange(batch.num_reqs * 4, dtype=torch.int32).view(batch.num_reqs, 4),)
     slot_mappings = torch.full((1, batch.num_tokens_after_padding), -1, dtype=torch.int64)

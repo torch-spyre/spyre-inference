@@ -28,8 +28,8 @@ own and the impl below is reached only on the ragged path.
 Three torch-spyre constraints shape the design:
 
 * A compile input's ``storage_offset`` is a Dynamo guard (torch-spyre#4449, which
-  closed #3770), and for int32 it is still dropped outright, so rows are gathered with
-  ``index_select``: slicing would either recompile per offset or read the wrong rows.
+  closed #3770), so rows are gathered with ``index_select``: slicing would recompile per
+  offset.
 * There is no on-device ``arange`` or ``full``, so index and mask tensors are host-built
   and reach the device in one ``convert`` per plan.
 * SDPA decomposes to ``amax`` then ``exp(scores - max)``, which NaNs a fully masked row.
@@ -42,7 +42,7 @@ import types
 import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -562,6 +562,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     ``EncoderOnlyAttention`` layers arrive bidirectional, ``CausalEncoderOnlyAttention``
     layers (CLIP text, ``models/clip.py``) causal.
     """
+
+    keeps_kv_cache: ClassVar[bool] = False
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

@@ -132,17 +132,22 @@ def spyre_available() -> bool:
 def spyre_device_count() -> int:
     """Return the number of visible Spyre cards, or 0 if unavailable.
 
-    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
-    cards are visible) instead of touching the Spyre runtime, so
-    `uses_subprocess` tests don't import torch_spyre in the main
-    pytest process.
+    Reads SPYRE_DEVICES (if set) and AIU_WORLD_SIZE (set by the Spyre runtime
+    environment when cards are visible) without touching the Spyre runtime, so
+    `uses_subprocess` tests don't import torch_spyre in the main pytest process.
 
     Returns:
         Number of visible Spyre devices, or 0 if unavailable.
     """
     try:
-        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
-    except ValueError:
+        aiu_world_size = int(os.environ.get("AIU_WORLD_SIZE", "0"))
+        spyre_devices = os.environ.get("SPYRE_DEVICES")
+        if spyre_devices is not None:
+            devices = [d.strip() for d in spyre_devices.split(",") if d.strip()]
+            return min(len(devices), aiu_world_size)
+        return aiu_world_size
+    except ValueError as e:
+        print(f"AIU_WORLD_SIZE '{aiu_world_size}' is invalid, error: {e}", file=sys.stderr)
         return 0
 
 
@@ -1105,19 +1110,6 @@ def register_ministral_14b(request, monkeypatch):
         "ministral-3-14b",
         "mistralai/Ministral-3-14B-Instruct-2512-BF16",
     )
-
-
-@pytest.fixture()
-def register_granite_models(request, monkeypatch):
-    """Add our injected granite models to test_granite's MODELS dict.
-
-    test_granite's MODELS is a dict (model -> min transformers version) and the test
-    does MODELS[model]; models we inject via param override aren't keys,
-    so add them as unconstrained (None).
-    """
-    models = request.node.module.MODELS
-    for model in ("ibm-ai-platform/micro-g3.3-8b-instruct-1b", "ibm-granite/granite-4.1-3b"):
-        monkeypatch.setitem(models, model, None)
 
 
 @pytest.fixture()

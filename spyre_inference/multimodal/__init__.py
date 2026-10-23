@@ -16,7 +16,8 @@
 
 One module per architecture, each exposing `apply(model, device)`. These monkeypatch
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
-implementations by layer class.
+implementations by layer class. Architectures migrated to a registered subclass on
+`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral) are not patched here.
 """
 
 import torch
@@ -25,9 +26,7 @@ from vllm.model_executor.models.utils import StageMissingLayer
 from . import (
     blip2,
     clip,
-    gemma4_vision,
     granite4_vision,
-    pixtral,
     siglip,
 )
 
@@ -49,16 +48,22 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
     A no-op for text-only models. Call after weights are on the device but before
     compile, which wraps modules in `OptimizedModule` and breaks traversal.
     """
-    # Both spellings: mistral-format Pixtral names the tower `vision_encoder`, HF-format
-    # Mistral3 and Gemma 4 `vision_tower`. Ungated, the patches rewrite vLLM's shared
-    # module.
-    vision_tower = _tower(model, "vision_tower", "vision_encoder")
+    from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
+
+    # Adapted by their registered architecture subclass, not by patches.
+    if isinstance(model, SpyreVisionEncoderMixin):
+        return
+
+    vision_tower = _tower(model, "vision_tower")
     if vision_tower is not None:
-        # Dispatch by tower class name: the `vision_tower` / `vision_encoder`
-        # attribute is shared across architectures, so we cannot infer the model
-        # family from the attribute name alone.
+        # Dispatch by tower class name: the `vision_tower` attribute is shared
+        # across architectures, so it does not name the model family.
         tower_cls = type(vision_tower).__name__
         if tower_cls == "Gemma4VisionModel":
+            # Lazy: it subclasses transformers' gemma-4 classes at import, and a move
+            # upstream must not break models without this tower.
+            from . import gemma4_vision
+
             gemma4_vision.apply(model, device)
         elif tower_cls == "SiglipVisionModel":
             # Granite4Vision uses a SigLIP tower. All three patches are
@@ -66,12 +71,6 @@ def apply_multimodal_patches(model: torch.nn.Module, device: torch.device) -> No
             siglip.apply(model, device)
             granite4_vision.apply(model, device)
             blip2.apply(model, device)
-        else:
-            # Pixtral (mistral-format, VisionTransformer) and Mistral3 HF-format
-            # (PixtralHFVisionModel) both need the Pixtral patches. Any tower that
-            # is not Gemma4 or SigLIP goes here; the patch functions are
-            # individually guarded and no-op when the expected symbols are absent.
-            pixtral.apply(model, device)
 
     # CLIPEmbeddingModel: text_model/vision_model, not vision_encoder/vision_tower.
     # Gated on model_type, not just attribute presence: other architectures (e.g.

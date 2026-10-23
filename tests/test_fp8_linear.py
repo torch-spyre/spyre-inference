@@ -596,7 +596,7 @@ class TestDetectFp8ForCompile:
     """``_compile_for_spyre`` must use fullgraph=False for Granite FP8."""
 
     def test_detects_fp8_weight_dtype(self):
-        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+        from spyre_inference.v1.worker.block_compile import model_has_spyre_fp8
 
         layer = torch.nn.Linear(8, 8, bias=False)
         layer.weight = torch.nn.Parameter(
@@ -604,10 +604,10 @@ class TestDetectFp8ForCompile:
             requires_grad=False,
         )
         model = torch.nn.Sequential(layer)
-        assert TorchSpyreModelRunner._model_has_spyre_fp8(model)
+        assert model_has_spyre_fp8(model)
 
     def test_detects_compressed_tensors_scheme_kernel(self):
-        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+        from spyre_inference.v1.worker.block_compile import model_has_spyre_fp8
 
         if SpyreFp8LinearKernel is None:
             pytest.skip("vLLM FP8 kernel base unavailable")
@@ -621,10 +621,10 @@ class TestDetectFp8ForCompile:
         layer = torch.nn.Linear(4, 4, bias=False)
         layer.quant_method = _QuantMethod()
         model = torch.nn.Sequential(layer)
-        assert TorchSpyreModelRunner._model_has_spyre_fp8(model)
+        assert model_has_spyre_fp8(model)
 
     def test_plain_fp16_is_not_fp8(self):
-        from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+        from spyre_inference.v1.worker.block_compile import model_has_spyre_fp8
 
         model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
-        assert not TorchSpyreModelRunner._model_has_spyre_fp8(model)
+        assert not model_has_spyre_fp8(model)

@@ -85,7 +85,7 @@ def flag(level: str, arm: str, message: str) -> None:
 
 def _run(*cmd: str, env: dict | None = None) -> str | None:
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        out = subprocess.run(list(cmd), capture_output=True, text=True, timeout=120, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return out.stdout.strip() if out.returncode == 0 else None

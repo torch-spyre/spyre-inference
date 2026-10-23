@@ -17,7 +17,7 @@
 - `spyre_inference/v1/attention/backends/spyre_attn.py` — PyTorch-native paged-KV attention
 - `spyre_inference/custom_ops/` — device-specific layer implementations (linear, gemma_rms_norm, rotary_embedding, vocab_parallel_embedding, parallel_lm_head, logits_processor, …)
 
-**Attention notes:** FlashAttention-style online softmax walking the pages of dense per-layer K and V tensors (indirect page gather, no compact copy), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, a batched decode kernel eligible even for one sequence when its other dispatch conditions hold.
+**Attention notes:** FlashAttention-style online softmax walking the pages of dense per-layer K and V tensors (indirect page gather, no compact copy), KV length bucketed by padded block count onto power-of-two buckets starting at `block_size` by default, denser with `SPYRE_ATTN_KV_LADDER` (avoids per-step recompile), query bucketed to `[1] + multiples of min(512, max_num_batched_tokens)`, a batched decode kernel eligible even for one sequence when its other dispatch conditions hold.
 
 ## Development Commands
 

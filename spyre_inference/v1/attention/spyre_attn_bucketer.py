@@ -120,6 +120,55 @@ def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
     return tuple(result)
 
 
+def _uniform_union_up_to(n: int, block_size: int, step_div: int, knee_div: int) -> list[int]:
+    step = max(block_size, (n // step_div) // block_size * block_size)
+    knee = max(block_size, (n // knee_div) // block_size * block_size)
+    extra = range(knee + step, n, step)
+    return sorted(set(_powers_of_two_up_to(n, start=block_size)) | set(extra) | {n})
+
+
+# Grain chosen up to here, not up to max_model_len, so the context never moves lower buckets.
+_KV_LADDER_GRAIN_HORIZON = 32768
+
+
+def _geometric_union_up_to(n: int, block_size: int, numerator: int, denominator: int) -> list[int]:
+    def _series(grain: int, limit: int) -> list[int]:
+        out = []
+        v = grain
+        while (v := v * numerator // denominator) < limit:
+            if (r := v // grain * grain) > block_size:
+                out.append(r)
+        return out
+
+    # A 64-token grain leaves some buckets off whole blocks from block_size 128 upward.
+    grain = 64
+    if any(r % block_size for r in _series(grain, _KV_LADDER_GRAIN_HORIZON)):
+        grain = block_size
+    series = {r // block_size * block_size for r in _series(grain, n)}
+    return sorted(set(_powers_of_two_up_to(n, start=block_size)) | series | {n})
+
+
+# Every preset keeps the powers of two, so a KV length's bucket never moves up. Batched
+# decode pads blocks to whole chunks, so at one sequence some buckets save nothing there.
+_KV_LADDERS: dict[str, Callable[[int, int], list[int]]] = {
+    "pow2": lambda n, bs: list(_powers_of_two_up_to(n, start=bs)),
+    "8_5": lambda n, bs: _geometric_union_up_to(n, bs, 8, 5),
+    "4_3": lambda n, bs: _geometric_union_up_to(n, bs, 4, 3),
+    "9_8": lambda n, bs: _geometric_union_up_to(n, bs, 9, 8),
+    "uniform": lambda n, bs: _uniform_union_up_to(n, bs, step_div=8, knee_div=16),
+}
+
+
+def kv_ladder(name: str) -> Callable[[int, int], list[int]]:
+    try:
+        return _KV_LADDERS[name]
+    except KeyError:
+        raise ValueError(
+            f"SPYRE_ATTN_KV_LADDER={name!r} is not one of {sorted(_KV_LADDERS)}. "
+            "SPYRE_ATTN_KV_BUCKETS overrides the ladder entirely if none of these fit."
+        ) from None
+
+
 def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     """The smallest KV head count any layer carries, after the TP split.
 
@@ -228,14 +277,13 @@ class SpyreAttnBucketer:
             lambda: sorted({1, *range(step, max_batched + 1, step), max_batched}),
         )
 
-        # Default: powers of two from block_size up to max_model_len. Geometric
-        # because the recorded set is a product of both axes; the extra padding
-        # each bucket costs is absorbed by the mask.
+        # Default: the SPYRE_ATTN_KV_LADDER preset. Geometric because the recorded set
+        # is a product of both axes; the extra padding each bucket costs is absorbed by the mask.
         self._kv_buckets: list[int] = _resolve_buckets(
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: kv_ladder(envs.SPYRE_ATTN_KV_LADDER)(max_model_len, block_size),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv

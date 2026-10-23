@@ -181,9 +181,10 @@ def test_gemma4_single_image_prompt_produces_output(enforce_eager, monkeypatch):
     """The Gemma 4 tower on card, which the unit tests cannot reach: they check the
     rewrite on CPU, this checks that what it rewrites to actually lowers.
 
-    Both modes, as for Pixtral above: compiled is the repo default, and the tower's
-    rewrites (permutation-matmul rope, padded SDPA, the pooling matmul) have to lower
-    inside a graph, not just run eagerly.
+    Both modes, as for Pixtral above: compiled is the repo default, where the tower's
+    rewrites (gathered position embeddings and rope, permutation-matmul rope, the
+    stick-aligned SDPA, the offset-group pool) have to lower inside per-budget graphs,
+    not just run eagerly.
     """
     if spyre_device_count() == 0:
         pytest.skip("Spyre device not available")

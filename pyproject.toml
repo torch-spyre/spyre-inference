@@ -369,7 +369,7 @@ markers = [
     "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
     "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
-    "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
     "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",

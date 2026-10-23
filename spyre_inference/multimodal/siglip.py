@@ -34,7 +34,7 @@ def _host(t: torch.Tensor) -> torch.Tensor:
     Strided slice-assignments lower silently wrong on Spyre-resident tensors.
     vLLM moves the model before our patches run, so every padding helper pulls
     its source to CPU here; the caller moves the finished weight back.
-    Mirrors gemma4_vision._host.
+    Mirrors models.gemma4_mm._host.
     """
     return convert(t.detach(), device="cpu")
 
@@ -126,7 +126,7 @@ def patch_siglip_attention(model: torch.nn.Module) -> None:
 
     # Pad weights on every SiglipAttention instance.  _host() pulls each weight
     # to CPU before the slice-assignments (Spyre slice-assign is silently wrong);
-    # .to(dev) moves the padded result back.  Mirrors gemma4_vision._prepare_attention.
+    # .to(dev) moves the padded result back.  Mirrors models.gemma4_mm._prepare_attention.
     for module in model.modules():
         if not isinstance(module, SiglipAttention):
             continue

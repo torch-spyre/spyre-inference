@@ -153,6 +153,25 @@ def test_apply_multimodal_patches_skips_a_non_clip_model_with_the_same_shape():
     assert not isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
 
 
+def test_apply_multimodal_patches_skips_a_stage_missing_tower(monkeypatch):
+    """With every modality limited to 0, vLLM builds the tower on the meta device behind
+    a `StageMissingLayer` that forwards attribute reads but must never run: there are no
+    weights to patch."""
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    import spyre_inference.multimodal.clip as clip_module
+
+    called: list[bool] = []
+    monkeypatch.setattr(clip_module, "apply", lambda *a: called.append(True))
+
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(model_type="clip")
+    model.vision_model = StageMissingLayer("vision_tower", torch.nn.Module())
+    apply_multimodal_patches(model, torch.device("cpu"))
+
+    assert called == [], "a stage-skipped tower must get no vision patches"
+
+
 def _encoder_layers(attn_cls: type[torch.nn.Module], num_layers: int = 2):
     """`CLIPEncoderLayer`-shaped stand-ins: only `self_attn.attn` is read."""
 

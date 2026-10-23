@@ -12,35 +12,43 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma 4 vision-tower workarounds for Spyre.
-
-vLLM loads the tower with plain ``AutoModel.from_config``, so it is stock
-transformers code outside vLLM's layer registries. ``apply()`` is the only entry point.
-The tensor math follows hf-adapters#495.
-"""
+"""Gemma 4 with its vision encoder compiled per token budget (math from hf-adapters#495)."""
 
 from __future__ import annotations
 
-from typing import cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.models.gemma4 import modeling_gemma4
-from vllm.logger import init_logger
+from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
+from vllm.model_executor.models.utils import scatter_output_slices
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.models._vision_encoder import (
+    SEGMENT_ITEMS,
+    GatherTable,
+    SpyreVisionEncoderMixin,
+    VisionBuffer,
+    offset_major,
+    one_hot_segments,
+    segment_buffer,
+    segment_mask,
+    unbind_items,
+)
+from spyre_inference.models.pixtral import _linear_weight
 from spyre_inference.multimodal.utils import (
     STICK,
     align_up,
-    mark_blocks_compilable,
     padded_sdpa,
     rope_perm_matrix,
     rope_rotate_matmul,
 )
-from spyre_inference.v1.attention.backends.spyre_encoder_attn import encoder_key_pad_mask
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def _host(t: torch.Tensor) -> torch.Tensor:
@@ -48,8 +56,8 @@ def _host(t: torch.Tensor) -> torch.Tensor:
 
     The padding helpers rebuild weights out of composed strided slice-assignments, which
     lower silently wrong on a Spyre-resident tensor -- finite but inaccurate, and nothing
-    raises. vLLM moves the model before our patches run, so each helper pulls its source
-    here and the caller moves the finished weight back.
+    raises. Each helper pulls its source here, wherever it lives, and the caller moves the
+    finished weight back.
     """
     return convert(t.detach(), device="cpu")
 
@@ -212,43 +220,6 @@ def _padded_rms_norm(
     return hidden_states
 
 
-def _gemma4_rope_cos_sin(
-    inv_freq: torch.Tensor,
-    position_ids: torch.Tensor,
-    padded_head_dim: int,
-    dtype: torch.dtype,
-    attention_scaling: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tables for `rope_rotate_matmul`.
-
-    Gemma 4 vision rotates its two position axes independently, each with its own
-    `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the padded
-    head as `[X, Y, zeros | X, Y, zeros]`, so one first-half/second-half swap serves both
-    axes at once: each axis's angle is duplicated into both blocks, with `rotate_half`'s
-    sign flip baked into `sin`.
-
-    `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
-    the padded ones stay an exact identity rotation.
-    """
-    positions = position_ids.to("cpu").clamp(min=0).float()
-    angles = positions[..., None] * inv_freq.to("cpu").float()  # [bsz, seq, 2, quarter]
-    cos_axis = angles.cos() * attention_scaling
-    sin_axis = angles.sin() * attention_scaling
-    bsz, seq_len, _, quarter = cos_axis.shape
-    half = padded_head_dim // 2
-    cos_half = torch.ones(bsz, seq_len, half)
-    sin_half_neg = torch.zeros(bsz, seq_len, half)
-    sin_half_pos = torch.zeros(bsz, seq_len, half)
-    for axis in range(2):
-        start, end = axis * quarter, axis * quarter + quarter
-        cos_half[..., start:end] = cos_axis[:, :, axis, :]
-        sin_half_neg[..., start:end] = -sin_axis[:, :, axis, :]
-        sin_half_pos[..., start:end] = sin_axis[:, :, axis, :]
-    cos_full = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(2)  # [bsz, seq, 1, D]
-    sin_full = torch.cat([sin_half_neg, sin_half_pos], dim=-1).unsqueeze(2)
-    return cos_full.to(dtype), sin_full.to(dtype)
-
-
 def _fp32_inv_freq(rotary_emb, config) -> tuple[torch.Tensor, float]:
     """Rope frequencies in fp32 plus the initializer's attention scaling, recomputed rather
     than read off the module buffer.
@@ -342,26 +313,28 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
         _pad_norm_weight(attn.k_norm, orig_head_dim, padded_head_dim).to(device),
         requires_grad=False,
     )
-    # A buffer: an index write inside a compiled block has no device layout. Projection
-    # dtype, not the norm's: transformers builds RMSNorm weights fp32, which would promote.
-    attn.register_buffer(
-        "spyre_rope_swap",
-        rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
-        persistent=False,
-    )
     attn._spyre_padded_head_dim = padded_head_dim
 
 
 _NOT_PADDED = (
-    "Gemma 4 vision weights are not padded for this head dim; `pad_vision_weights` runs "
-    "from `apply()` at load time and has to precede the first forward."
+    "Gemma 4 vision weights are not padded for this head dim; "
+    "`process_weights_after_loading` pads them and has to precede the first forward."
 )
 
 
 class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
-    """Padded rope + `padded_sdpa` over the head dim `pad_vision_weights` padded to."""
+    """Padded rope + `padded_sdpa` over the head dim `_prepare_attention` padded to."""
 
     spyre_rope_swap: torch.Tensor
+
+    def __init__(self, config, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        weight = self.q_proj.linear.weight
+        self.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", _padded_head_dim(self.head_dim), weight.device, weight.dtype),
+            persistent=False,
+        )
 
     def forward(  # ty: ignore[invalid-method-override]
         self,
@@ -417,273 +390,232 @@ _LAYER_NORMS = (
 )
 
 
-def _swap_class(root: nn.Module, stock: type[nn.Module], spyre: type[nn.Module]) -> None:
-    for module in root.modules():
-        if type(module) is stock:
-            module.__class__ = spyre
+def gemma4_rope_tables(
+    inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[2, size, D]` cos and signed-sin per axis; patch (x, y) sums rows [0, x], [1, y].
 
+    Gemma 4 vision rotates its two position axes independently, each with its own
+    `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the padded
+    head as `[X, Y, zeros | X, Y, zeros]`, so one first-half/second-half swap serves both
+    axes at once: each axis's angle is duplicated into both blocks, with `rotate_half`'s
+    sign flip baked into `sin`.
 
-def patch_vision_encoder() -> None:
-    """Replace `Gemma4VisionEncoder.forward` with a Spyre-safe walk over its layers.
-
-    Three things in the stock forward do not lower: the mask built by
-    `create_bidirectional_mask`, rope over a head_dim that is not stick-aligned, and
-    attention over a patch count coprime with the stick. The last two are handled per
-    layer by `SpyreGemma4VisionAttention`; this builds the mask and the rope tables on the
-    host, once per call rather than once per layer.
+    `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
+    the padded ones stay an exact identity rotation.
     """
-    cls = getattr(modeling_gemma4, "Gemma4VisionEncoder", None)
-    if cls is None or getattr(cls.forward, "_spyre_patched", False):
-        return
+    quarter = inv_freq.shape[0]
+    half = padded_head_dim // 2
+    angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
+    cos_axis = angles.cos() * attention_scaling
+    sin_axis = angles.sin() * attention_scaling
+    cos = torch.zeros(2, size, padded_head_dim)
+    sin = torch.zeros(2, size, padded_head_dim)
+    for axis in range(2):
+        lanes = slice(axis * quarter, (axis + 1) * quarter)
+        upper = slice(half + axis * quarter, half + (axis + 1) * quarter)
+        cos[axis, :, lanes] = cos_axis
+        cos[axis, :, upper] = cos_axis
+        sin[axis, :, lanes] = -sin_axis
+        sin[axis, :, upper] = sin_axis
+    cos[0, :, 2 * quarter : half] = 1.0
+    cos[0, :, half + 2 * quarter :] = 1.0
+    return cos, sin
 
-    def _forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        attention_mask: torch.Tensor,
-        pixel_position_ids: torch.Tensor | None = None,
-        **kwargs,
-    ):
-        del kwargs
-        config = self.config
-        if config.num_key_value_heads != config.num_attention_heads:
+
+# Not a module, so the model's move to the card leaves it on the host.
+@dataclass
+class _VisionTail:
+    scale: float
+    std_bias: torch.Tensor | None
+    std_scale: torch.Tensor | None
+    eps: float
+    weight: torch.Tensor  # embed_vision's projection, [out, in]
+    dtype: torch.dtype
+
+
+def _images(mm_kwargs: dict[str, Any]) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    pixel_values = mm_kwargs.get("pixel_values")
+    if pixel_values is None:
+        return []
+    positions = mm_kwargs["pixel_position_ids"]
+    return list(zip(unbind_items(pixel_values), unbind_items(positions), strict=True))
+
+
+def _valid_patches(
+    pixel_values: torch.Tensor, positions: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pixel_values = convert(pixel_values, device="cpu")
+    positions = convert(positions, device="cpu")
+    valid = (positions != -1).any(dim=-1)
+    return pixel_values[valid], positions[valid]
+
+
+class SpyreGemma4ForConditionalGeneration(SpyreVisionEncoderMixin, Gemma4ForConditionalGeneration):
+    vision_max_items_per_call = SEGMENT_ITEMS
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        # Transformers builds the tower at vision_config.dtype (bf16), and bf16 + fp16 in a graph
+        # promotes to an fp32 convert Spyre cannot lay out; loading converts the checkpoint.
+        model_config = vllm_config.model_config
+        model_config.hf_config.vision_config.dtype = model_config.dtype
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._init_spyre_vision()
+
+    def _init_spyre_vision(self) -> None:
+        vision_config = self.config.vision_config
+        self._pool = vision_config.pooling_kernel_size
+        self.patches_per_token = self._pool**2
+        self.out_hidden_size = self.config.text_config.hidden_size
+        self._patch_width = align_up(3 * vision_config.patch_size**2)
+        self.vision_buffers = {
+            "patches": VisionBuffer(self._patch_width),
+            "segments": segment_buffer(),
+            "pos_x": VisionBuffer(None, pad=0, dtype=torch.int64),
+            "pos_y": VisionBuffer(None, pad=0, dtype=torch.int64),
+        }
+
+        # With image and video limits of 0, upstream leaves a placeholder instead of the tower.
+        if not isinstance(self.vision_tower, modeling_gemma4.Gemma4VisionModel):
+            return
+        if vision_config.num_key_value_heads != vision_config.num_attention_heads:
             raise NotImplementedError(
                 "Gemma 4 vision GQA is not supported on Spyre; num_key_value_heads "
                 "must equal num_attention_heads."
             )
-        if pixel_position_ids is None:
-            # Optional only to match the stock signature; every caller supplies it.
-            raise NotImplementedError("Gemma 4 vision requires pixel_position_ids on Spyre.")
-        layers = self.layers[: config.num_hidden_layers]
-        # The class patch reaches every encoder; only `apply()` swaps in the padded attention.
-        if not all(isinstance(layer.self_attn, SpyreGemma4VisionAttention) for layer in layers):
-            raise RuntimeError(_NOT_PADDED)
-        padded_head_dim = _padded_head_dim(config.head_dim)
+        for layer in self.vision_tower.encoder.layers:
+            stock = layer.self_attn
+            attn = SpyreGemma4VisionAttention(vision_config, stock.layer_idx)
+            # Upstream has already replaced these with vLLM linears; keep them.
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                setattr(attn, name, getattr(stock, name))
+            layer.self_attn = attn
+            for name in _LAYER_NORMS:
+                norm = SpyreGemma4RMSNorm(vision_config.hidden_size, eps=vision_config.rms_norm_eps)
+                setattr(layer, name, norm)
 
-        device = inputs_embeds.device
-        dtype = inputs_embeds.dtype
+    def process_weights_after_loading(self) -> None:
+        """Rebuild the vision weights in place, in the graphs' layouts, on the host."""
+        tower = self.vision_tower
+        if not isinstance(tower, modeling_gemma4.Gemma4VisionModel):
+            return
+        config = tower.config
+        padded = _padded_head_dim(config.head_dim)
+        for layer in tower.encoder.layers[: config.num_hidden_layers]:
+            _prepare_attention(layer.self_attn, config.num_attention_heads, config.head_dim, padded)
+            _pad_mlp(layer, config.intermediate_size, align_up(config.intermediate_size))
 
-        inv_freq, attention_scaling = _fp32_inv_freq(self.rotary_emb, config)
-        cos, sin = _gemma4_rope_cos_sin(
-            inv_freq, pixel_position_ids, padded_head_dim, dtype, attention_scaling
+        embedder = tower.patch_embedder
+        weight = _linear_weight(embedder.input_proj).float()
+        # Not the tower's dtype: see __init__.
+        dtype = cast(torch.dtype, self.model_dtype)
+        weight_t = F.pad(weight, (0, self._patch_width - weight.shape[1])).t().contiguous()
+        # A plain holder: nothing runs the linear, so no second copy of it goes to the card.
+        embedder.input_proj = nn.Module()
+        embedder.input_proj.weight = nn.Parameter(weight_t.to(dtype), requires_grad=False)
+
+        # One row per coordinate and axis: [position embedding | cos | sin].
+        table = _host(cast(torch.Tensor, embedder.position_embedding_table)).float()
+        inv_freq, attention_scaling = _fp32_inv_freq(tower.encoder.rotary_emb, config)
+        cos, sin = gemma4_rope_tables(inv_freq, table.shape[1], padded, attention_scaling)
+        rows = torch.cat([table, cos, sin], dim=-1).to(dtype)
+        self.spyre_vision_x = GatherTable(rows[0].contiguous())
+        self.spyre_vision_y = GatherTable(rows[1].contiguous())
+        del embedder.position_embedding_table
+
+        standardize = getattr(config, "standardize", False)
+        projection = self.embed_vision.embedding_projection
+        self._spyre_vision_tail = _VisionTail(
+            # vision_project sums the k*k patches; the pooler averages and scales them.
+            scale=tower.pooler.root_hidden_size / self.patches_per_token,
+            std_bias=_host(tower.std_bias).float() if standardize else None,
+            std_scale=_host(tower.std_scale).float() if standardize else None,
+            eps=self.embed_vision.eps,
+            weight=_host(_linear_weight(projection)).float(),
+            dtype=dtype,
         )
-        cos = convert(cos, device=device)
-        sin = convert(sin, device=device)
+        # Only upstream's eager image and video paths ran it; the tail above replaces it.
+        self.embed_vision = None
 
-        # One key-pad row per image, built on the host: the processor pads an image's
-        # patches after its content, so a length per image is the whole mask.
-        mask_host = convert(attention_mask, device="cpu").bool()
-        seq = mask_host.shape[-1]
-        valid = mask_host.sum(-1)
-        if not torch.equal(mask_host, torch.arange(seq) < valid[:, None]):
+    def embed_multimodal(self, **kwargs: object) -> Any:
+        if "pixel_values_videos" in kwargs:
             raise NotImplementedError(
-                "Gemma 4 vision on Spyre needs each image's padding after its patches."
+                "Gemma 4 video input is not supported on Spyre; send the frames as images."
             )
-        attn_mask = convert(
-            encoder_key_pad_mask(align_up(seq), valid.tolist(), dtype), device=device
+        return super().embed_multimodal(**kwargs)
+
+    def postprocess_encoder_output(
+        self,
+        outputs: dict[str, torch.Tensor],
+        indices: list[int],
+        per_item_out_tokens: list[int],
+        dest: dict[int, torch.Tensor] | list[torch.Tensor | None],
+        clone: bool = False,
+        batch_mm_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """The tail in fp32 on the host, as upstream: its scale can overflow fp16."""
+        num_tokens = sum(per_item_out_tokens[i] for i in indices)
+        tail = self._spyre_vision_tail
+        x = outputs["default"][:num_tokens].float() * tail.scale
+        if tail.std_bias is not None and tail.std_scale is not None:
+            x = (x - tail.std_bias) * tail.std_scale
+        # embed_vision: a weightless RMSNorm, then the projection.
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + tail.eps)
+        tokens = (x @ tail.weight.t()).to(tail.dtype)
+        scatter_output_slices(tokens, indices, per_item_out_tokens, dest, clone)
+
+    def vision_item_tokens(self, mm_kwargs: dict[str, Any]) -> list[int]:
+        return [
+            int((pos != -1).any(dim=-1).sum()) // self.patches_per_token
+            for _, pos in _images(mm_kwargs)
+        ]
+
+    def vision_inputs(self, mm_kwargs: dict[str, Any]) -> dict[str, torch.Tensor]:
+        """Valid patches laid out offset-major, so the pool is a sum over offset groups."""
+        k = self._pool
+        patches, segments, xs, ys = [], [], [], []
+        for i, (pixel_values, positions) in enumerate(_images(mm_kwargs)):
+            values, pos = _valid_patches(pixel_values, positions)
+            wp, hp = (int(n) + 1 for n in pos.max(dim=0).values)
+            if hp * wp != pos.shape[0] or hp % k or wp % k:
+                raise ValueError(
+                    f"Gemma 4 image {i}: {pos.shape[0]} valid patches do not fill a "
+                    f"{hp}x{wp} grid divisible by the {k}x{k} pooling kernel"
+                )
+            grid = torch.empty(hp, wp, values.shape[-1], dtype=values.dtype)
+            grid[pos[:, 1], pos[:, 0]] = values
+            patches.append(offset_major(grid, k))
+            xs.append(offset_major(torch.arange(wp).expand(hp, wp), k))
+            ys.append(offset_major(torch.arange(hp)[:, None].expand(hp, wp), k))
+            segments.append(torch.full((k * k, hp * wp // (k * k)), i))
+        # Stock's patch embedder starts with 2 * (x - 0.5).
+        flat = (torch.cat(patches, dim=1).flatten(0, 1).float() * 2 - 1).to(torch.float16)
+        return {
+            "patches": F.pad(flat, (0, self._patch_width - flat.shape[1])),
+            "segments": one_hot_segments(torch.cat(segments, dim=1).flatten()),
+            "pos_x": torch.cat(xs, dim=1).flatten().to(torch.int64),
+            "pos_y": torch.cat(ys, dim=1).flatten().to(torch.int64),
+        }
+
+    def vision_embed(self, values: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
+        tower = self.vision_tower
+        hidden = tower.config.hidden_size
+        head_dim = _padded_head_dim(tower.config.head_dim)
+        rows = self.spyre_vision_x.gather(values["pos_x"]) + self.spyre_vision_y.gather(
+            values["pos_y"]
         )
+        # [patch width, D] since process_weights_after_loading.
+        patch_weight_t = cast(torch.Tensor, tower.patch_embedder.input_proj.weight)
+        x = (torch.matmul(values["patches"], patch_weight_t) + rows[:, :hidden]).unsqueeze(0)
+        cos = rows[:, hidden : hidden + head_dim][None, :, None]
+        sin = rows[:, hidden + head_dim :][None, :, None]
+        mask = segment_mask(values["segments"], x.dtype)
+        return x, {"position_embeddings": (cos, sin), "attention_mask": mask}
 
-        hidden_states = inputs_embeds
-        for layer in layers:
-            hidden_states = layer(
-                hidden_states, position_embeddings=(cos, sin), attention_mask=attn_mask
-            )
+    def vision_blocks(self) -> nn.ModuleList:
+        return self.vision_tower.encoder.layers
 
-        from transformers.modeling_outputs import BaseModelOutputWithPast
-
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states  # ty: ignore[invalid-argument-type]
-        )
-
-    _forward._spyre_patched = True
-    cls.forward = _forward
-    logger.info_once("Spyre: patched Gemma4VisionEncoder to head_dim-padded rope + padded SDPA.")
-
-
-def _pool_weights(
-    pixel_position_ids: torch.Tensor,
-    padding_positions: torch.Tensor,
-    length: int,
-    k: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Host-built `[bsz, patches, length]` averaging weights, and the validity mask.
-
-    Everything in the stock pooler the device cannot run, and all of it integer geometry
-    over `pixel_position_ids`, which already live on the host. Stock's `masked_fill` of
-    padding patches folds in by zeroing those patches' weight *rows* instead --
-    `out[j] = sum_i W[i,j] * h[i]`, so zeroing either factor drops the term.
-
-    The mask comes from the unzeroed weights, matching stock: an output cell fed only by
-    padding patches still counts as valid.
-
-    TODO: rebuilt per image, so a multi-image batch pays for it once per image even when
-    the patch geometry repeats. Cache it keyed on that geometry before raising
-    ``limit_mm_per_prompt`` above 1.
-    """
-    clamped = pixel_position_ids.clamp(min=0)
-    max_x = clamped[..., 0].max(dim=-1, keepdim=True)[0] + 1
-    kernel_idxs = torch.div(clamped, k, rounding_mode="floor")
-    kernel_idxs = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
-    raw = F.one_hot(kernel_idxs.long(), length).float() / (k * k)
-    mask = torch.logical_not((raw == 0).all(dim=1))
-    return raw.masked_fill(padding_positions.unsqueeze(-1), 0.0), mask
-
-
-def patch_pooler() -> None:
-    """Run the ``Gemma4VisionPooler`` average as one matmul on Spyre.
-
-    Stock pools with an fp32 batchmatmul against a one-hot weight matrix, which the device
-    has no kernel for (`SPYRE_FP32_OPS` carries no matmul, torch-spyre#1794 -- the same
-    limit `v1/pool`'s MEAN pooler cites), so we run it in the input dtype instead. Stock
-    rounds that matmul's fp32 result straight back to the input dtype one line later, so
-    only the accumulation differs. The `sqrt(hidden_size)` scale still happens on the host
-    in fp32, as stock does it.
-
-    The weights and the validity mask stay host-side (`_pool_weights`), and the pooled
-    rows come back to the host because the tail after this is host-side anyway
-    (`place_vision_tail_on_cpu`).
-    """
-    cls = getattr(modeling_gemma4, "Gemma4VisionPooler", None)
-    if cls is None or getattr(cls.forward, "_spyre_patched", False):
-        return
-
-    orig_forward = cls.forward
-
-    def forward(self, hidden_states, pixel_position_ids, padding_positions, output_length=None):
-        num_patches = hidden_states.shape[1]
-        k = int((num_patches // output_length) ** 0.5) if output_length else 0
-        if (
-            hidden_states.device.type != "spyre"
-            or not output_length
-            # `!=`, mirroring stock's own guard: at equal lengths it skips pooling
-            # entirely and hands back `padding_positions` as the mask, so taking the
-            # pooling path here would return a differently-derived mask.
-            or num_patches == output_length
-            or output_length > num_patches
-            or k * k * output_length != num_patches
-        ):
-            # Nothing to pool (stock then only masks and scales, and its `masked_fill`
-            # has no Spyre kernel), or a ratio stock itself rejects -- let it raise.
-            return orig_forward(
-                self,
-                convert(hidden_states, device="cpu"),
-                convert(pixel_position_ids, device="cpu"),
-                convert(padding_positions, device="cpu"),
-                output_length,
-            )
-
-        weights, mask = _pool_weights(
-            convert(pixel_position_ids, device="cpu"),
-            convert(padding_positions, device="cpu"),
-            output_length,
-            k,
-        )
-        weights = convert(weights.to(hidden_states.dtype), device=hidden_states.device)
-        pooled = torch.matmul(weights.transpose(1, 2), hidden_states)
-        return convert(pooled, device="cpu").float() * self.root_hidden_size, mask
-
-    forward._spyre_patched = True
-    cls.forward = forward
-    logger.info_once(
-        "Spyre: Gemma4VisionPooler averages on device as one matmul; its one_hot/"
-        "masked_fill geometry stays on CPU."
-    )
-
-
-def patch_patch_embedder() -> None:
-    """Run ``Gemma4VisionPatchEmbedder``'s position-embedding gather on the host.
-
-    ``F.embedding`` needs index and weight on one device, and ``pixel_position_ids`` stays
-    on the host (``embed_multimodal`` only moves float inputs) while the table lives on
-    Spyre.
-    """
-    cls = getattr(modeling_gemma4, "Gemma4VisionPatchEmbedder", None)
-    if cls is None or getattr(cls._position_embeddings, "_spyre_patched", False):
-        return
-
-    def _position_embeddings(self, pixel_position_ids, padding_positions):
-        device = self.position_embedding_table.device
-        clamped_positions = convert(pixel_position_ids, device="cpu").clamp(min=0)
-        table = convert(self.position_embedding_table, device="cpu")
-        x_emb = F.embedding(clamped_positions[..., 0], table[0])
-        y_emb = F.embedding(clamped_positions[..., 1], table[1])
-        position_embeddings = x_emb + y_emb
-        padding_cpu = convert(padding_positions, device="cpu")
-        position_embeddings = torch.where(padding_cpu.unsqueeze(-1), 0.0, position_embeddings)
-        return convert(position_embeddings, device=device)
-
-    _position_embeddings._spyre_patched = True
-    cls._position_embeddings = _position_embeddings
-    logger.info_once("Spyre: Gemma4VisionPatchEmbedder position-embedding gather runs on CPU.")
-
-
-def pad_vision_weights(encoder) -> None:
-    """Pad the encoder's attention projections, norms and MLP width to the stick.
-
-    Load-time weight surgery rather than a first-forward side effect: `apply()` already
-    runs after the weights land and before compile, and a forward that padded in place
-    would both probe every layer forever and mutate the module mid-trace.
-    """
-    config = encoder.config
-    padded_head_dim = _padded_head_dim(config.head_dim)
-    padded_intermediate = align_up(config.intermediate_size)
-    for layer in encoder.layers[: config.num_hidden_layers]:
-        _prepare_attention(
-            layer.self_attn, config.num_attention_heads, config.head_dim, padded_head_dim
-        )
-        _pad_mlp(layer, config.intermediate_size, padded_intermediate)
-    logger.info_once(
-        "Spyre: padded the Gemma 4 vision tower's head dim to %d and its MLP width to %d.",
-        padded_head_dim,
-        padded_intermediate,
-    )
-
-
-def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
-    """Keep the post-pooler tail on the host: standardize buffers and ``embed_vision``.
-
-    ``_process_image_input`` boolean-selects the pooled rows (no Spyre kernel), applies the
-    fp32 standardize affine, then projects to text space -- all on the pooler's output,
-    which ``patch_pooler`` already returns on the host. These operands have to follow or
-    each step trips a device mismatch.
-    """
-    tower = getattr(model, "vision_tower", None)
-    if tower is not None and getattr(tower.config, "standardize", False):
-        for name in ("std_bias", "std_scale"):
-            buf = getattr(tower, name, None)
-            if buf is not None and buf.device.type != "cpu":
-                setattr(tower, name, buf.to("cpu"))
-    embed_vision = getattr(model, "embed_vision", None)
-    if embed_vision is not None:
-        embed_vision.to("cpu")
-    logger.info_once(
-        "Spyre: Gemma 4 vision tail (standardize buffers + embed_vision) placed on CPU."
-    )
-
-
-def apply(model: torch.nn.Module, device: torch.device) -> None:
-    """Install every Gemma 4 vision-tower workaround."""
-    del device
-    patch_patch_embedder()
-    patch_pooler()
-    patch_vision_encoder()
-    encoder = getattr(getattr(model, "vision_tower", None), "encoder", None)
-    if encoder is not None:
-        _swap_class(encoder, modeling_gemma4.Gemma4RMSNorm, SpyreGemma4RMSNorm)
-        _swap_class(encoder, modeling_gemma4.Gemma4VisionAttention, SpyreGemma4VisionAttention)
-        # Padded projections no longer fit the stock attention's `view(..., head_dim)`,
-        # and the stock norm's fp32 path does not lower, so a tower the patches did not
-        # reach cannot run at all.
-        swapped = all(
-            isinstance(layer.self_attn, SpyreGemma4VisionAttention)
-            and all(isinstance(getattr(layer, n, None), SpyreGemma4RMSNorm) for n in _LAYER_NORMS)
-            for layer in encoder.layers
-        )
-        if not getattr(type(encoder).forward, "_spyre_patched", False) or not swapped:
-            raise RuntimeError(
-                "Gemma 4 vision patches did not install: transformers no longer exposes "
-                "Gemma4RMSNorm/Gemma4VisionAttention/Gemma4VisionEncoder as expected, and "
-                "the padded tower cannot run on Spyre unpatched."
-            )
-        pad_vision_weights(encoder)
-        mark_blocks_compilable(encoder.layers)
-    place_vision_tail_on_cpu(model)
+    def vision_project(self, x: torch.Tensor, taps: list[torch.Tensor]) -> torch.Tensor:
+        """The pool only: the tail runs in ``postprocess_encoder_output``."""
+        x = x.squeeze(0)
+        return x.reshape(self.patches_per_token, -1, x.shape[-1]).sum(dim=0)

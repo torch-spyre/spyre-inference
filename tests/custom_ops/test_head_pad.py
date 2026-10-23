@@ -170,6 +170,49 @@ def test_shim_skipped_on_the_transformers_backend(monkeypatch):
     assert "head_dim" not in vars(cls)
 
 
+def test_shim_reaches_attention_defined_in_a_base_class_module(monkeypatch):
+    """Phi3ForCausalLM subclasses LlamaForCausalLM and declares no Attention class
+    of its own, so its real attention lives in the base class's module, not
+    ``model_cls.__module__``. The scan must follow the class hierarchy to find it.
+    """
+    base_module_name = "spyre_test_fake_llama_module"
+    base_module = ModuleType(base_module_name)
+    attn_cls = type("LlamaAttention", (_DerivesOwnHeadDim,), {})
+    attn_cls.__module__ = base_module_name
+    base_module.LlamaAttention = attn_cls
+    monkeypatch.setitem(sys.modules, base_module_name, base_module)
+
+    base_cls = type("LlamaForCausalLM", (), {})
+    base_cls.__module__ = base_module_name
+
+    sub_module_name = "spyre_test_fake_phi3_module"
+    sub_module = ModuleType(sub_module_name)
+    model_cls = type("Phi3ForCausalLM", (base_cls,), {})
+    model_cls.__module__ = sub_module_name
+    sub_module.Phi3ForCausalLM = model_cls
+    monkeypatch.setitem(sys.modules, sub_module_name, sub_module)
+
+    hf_config = SimpleNamespace(
+        head_dim=_PADDED, architectures=["Phi3ForCausalLM"], _spyre_orig_head_dim=_ORIG
+    )
+    model_config = SimpleNamespace(
+        hf_config=hf_config,
+        hf_text_config=hf_config,  # non-multimodal: text_config == hf_config
+        using_transformers_backend=lambda: False,
+        registry=SimpleNamespace(
+            resolve_model_cls=lambda archs, model_config: (model_cls, archs[0])
+        ),
+    )
+
+    install_padded_head_dim(model_config)
+
+    assert attn_cls().head_dim == _PADDED, (
+        "LlamaAttention in the base class's module must be shimmed; Phi3ForCausalLM "
+        "subclasses LlamaForCausalLM and defines no Attention class of its own, so "
+        "scanning only model_cls.__module__ finds nothing to patch"
+    )
+
+
 def _model_with_attention(head_size):
     """A model exposing one vLLM-shaped Attention layer (has .impl and .head_size)."""
     model = torch.nn.Module()

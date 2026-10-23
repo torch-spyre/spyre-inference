@@ -208,22 +208,28 @@ def install_padded_head_dim(model_config) -> None:
     orig = getattr(target_config, _ORIG_ATTR)
     padded = target_config.head_dim
 
+    def modules_for_class(cls) -> set:
+        # A class that declares no Attention class of its own (e.g. Phi3ForCausalLM,
+        # a thin subclass of LlamaForCausalLM) has nothing to find in its own module;
+        # its bases' modules must be scanned too to reach the Attention it inherits.
+        return {mod for base in cls.__mro__ if (mod := sys.modules.get(base.__module__))}
+
     modules = set()
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     if architectures:
         model_cls, _ = model_config.registry.resolve_model_cls(
             architectures, model_config=model_config
         )
-        if model_cls and sys.modules.get(model_cls.__module__):
-            modules.add(sys.modules[model_cls.__module__])
+        if model_cls:
+            modules |= modules_for_class(model_cls)
 
     # For multimodal composite architectures, also check the text backbone module
     text_archs = getattr(target_config, "architectures", None) or []
     for arch in text_archs:
         try:
             text_cls, _ = model_config.registry.resolve_model_cls([arch], model_config=model_config)
-            if text_cls and sys.modules.get(text_cls.__module__):
-                modules.add(sys.modules[text_cls.__module__])
+            if text_cls:
+                modules |= modules_for_class(text_cls)
         except Exception as e:
             logger.warning("Cannot resolve text backbone %r for head_dim shim: %s", arch, e)
 

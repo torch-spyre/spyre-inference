@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import gc
+import importlib.util
 import os
+import pathlib
 
 import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
@@ -26,8 +28,14 @@ from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
 from spyre_inference.models.gemma4 import GEMMA4_TEXT_BACKBONE_OVERRIDE
 
-MAX_MODEL_LEN = 128
-MAX_NUM_SEQS = 2
+_helpers_path = pathlib.Path(__file__).parent / "_helpers.py"
+_spec = importlib.util.spec_from_file_location("_e2e_helpers", _helpers_path)
+_helpers = importlib.util.module_from_spec(_spec)  # type: ignore[arg-type]
+_spec.loader.exec_module(_helpers)  # type: ignore[union-attr]
+_generate = _helpers.generate
+
+MAX_MODEL_LEN = _helpers.MAX_MODEL_LEN
+MAX_NUM_SEQS = _helpers.MAX_NUM_SEQS
 
 
 @pytest.mark.uses_subprocess
@@ -63,43 +71,6 @@ def test_tp2_llm_construction(record_property) -> None:
         max_model_len=MAX_MODEL_LEN,
         max_num_seqs=MAX_NUM_SEQS,
     )
-
-
-def _generate(
-    model: str,
-    tp: int,
-    enforce_eager: bool,
-    compilation_config: dict | None = None,
-    hf_overrides=None,
-    kv_cache_dtype: str = "auto",
-) -> list[list[int]]:
-    from vllm import LLM, SamplingParams
-
-    llm = LLM(
-        model=model,
-        tensor_parallel_size=tp,
-        dtype="float16",
-        enforce_eager=enforce_eager,
-        max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=MAX_NUM_SEQS,
-        kv_cache_dtype=kv_cache_dtype,
-        **({"compilation_config": compilation_config} if compilation_config is not None else {}),
-        **({"hf_overrides": hf_overrides} if hf_overrides is not None else {}),
-    )
-    try:
-        outs = llm.generate(
-            ["Hello, world!", "The capital of France is"],
-            SamplingParams(max_tokens=8, temperature=0.0),
-        )
-        result = [list(o.outputs[0].token_ids) for o in outs]
-    finally:
-        llm.llm_engine.engine_core.shutdown(timeout=60)
-        del llm
-        gc.collect()
-        freed = wait_until_card_free(exclude_pids={os.getpid()}, timeout=60)
-    # Outside the finally, where a generate failure would mask this check's own.
-    assert freed, "Spyre devices were not released after LLM shutdown"
-    return result
 
 
 def _assert_matches_tp1(

@@ -662,6 +662,10 @@ def place_vision_tail_on_cpu(model: torch.nn.Module) -> None:
 
 def apply(model: torch.nn.Module, device: torch.device) -> None:
     """Install every Gemma 4 vision-tower workaround."""
+    # Upstream allocates the PLE cache (E2B/E4B) on the host; a plain attribute
+    # does not follow the model to Spyre.
+    if getattr(model, "per_layer_embeddings", None) is not None:
+        model.per_layer_embeddings = convert(model.per_layer_embeddings, device=device)
     del device
     patch_patch_embedder()
     patch_pooler()

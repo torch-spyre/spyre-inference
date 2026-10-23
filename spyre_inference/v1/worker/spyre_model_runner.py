@@ -1282,8 +1282,31 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return builders
 
     def initialize_attn_backend(self, kv_cache_config, is_profiling: bool = False) -> None:
+        if self.shared_kv_cache_layers:
+            kv_cache_config = self._with_kv_sharing_layer_specs(kv_cache_config)
         super().initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
         self._split_attn_groups_by_layer_window()
+
+    def _with_kv_sharing_layer_specs(self, kv_cache_config):
+        """Copy mapping each KV-sharing layer to its target's spec, for attention only."""
+        from copy import copy
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        groups = []
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                specs = dict(spec.kv_cache_specs)
+                for layer, target in self.shared_kv_cache_layers.items():
+                    if target in specs:
+                        specs[layer] = specs[target]
+                group = replace(group, kv_cache_spec=replace(spec, kv_cache_specs=specs))
+            groups.append(group)
+        kv_cache_config = copy(kv_cache_config)
+        kv_cache_config.kv_cache_groups = groups
+        return kv_cache_config
 
     def _split_attn_groups_by_layer_window(self) -> None:
         from vllm.config import get_layers_from_vllm_config

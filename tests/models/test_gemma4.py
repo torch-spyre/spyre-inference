@@ -239,12 +239,15 @@ def test_moe_checkpoint_without_experts_raises(monkeypatch, flag, raises):
     """Either flag makes upstream build the MoE block, so either has to trip the check
     when no layer exposes `experts`; a dense checkpoint configures none and is fine."""
     from torch import nn
-    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+    from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4SelfDecoderLayers
 
     def parent_init(self, *, vllm_config, prefix=""):
         nn.Module.__init__(self)
         self.config = SimpleNamespace(**({flag: True} if flag else {}))
-        self.model = SimpleNamespace(layers=[SimpleNamespace(experts=None)])
+        decoder = Gemma4SelfDecoderLayers.__new__(Gemma4SelfDecoderLayers)
+        nn.Module.__init__(decoder)
+        decoder.embed_tokens_per_layer = None
+        self.model = SimpleNamespace(self_decoder=decoder, layers=[SimpleNamespace(experts=None)])
 
     monkeypatch.setattr(Gemma4ForCausalLM, "__init__", parent_init)
     if raises:

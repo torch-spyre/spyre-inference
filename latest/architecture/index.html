@@ -2770,15 +2770,11 @@ every image-batch width up to <code>mm_max_items_per_batch</code>, for pooling a
 alike, and the compile guard watches its blocks like the decoder's: a tower compile after
 warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
-marked. Gemma 4's tower is marked too (<code>multimodal/gemma4_vision.py</code>): its rope half-swap
-is a buffer, and its key-pad mask is one row per image built in the encoder forward from
-the image's patch count, since the processor pads an image's patches after its content.
-Every image is padded to the patch count <code>max_soft_tokens</code> fixes, so the image-batch widths
-warmup runs are the shapes image serving sees. Not covered: a per-request <code>max_soft_tokens</code>
-(vLLM accepts one per prompt), and a video, whose frames reach the tower in memory-sized
-chunks at their own budget; those compile on first use and the guard reports them at its
-default <code>warn</code> level. At <code>error</code> the guard refuses them like any other unwarmed watched
-shape, so a deployment serving video keeps <code>warn</code>.</p>
+marked. Gemma 4's tower is not marked: <code>SpyreGemma4ForConditionalGeneration</code>
+(<code>models/gemma4_mm.py</code>) runs it on the vision encoder mixin below, compiled per token
+budget, and rejects video. The budgets stop at the largest image the engine's
+<code>max_soft_tokens</code> allows, so a request passing a larger <code>max_soft_tokens</code> compiles on first
+use: the guard reports it at its default <code>warn</code> level and refuses it at <code>error</code>.</p>
 <p>Blocks of one class share one <code>forward</code> code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
 backend compile count is independent of depth, but it is not 1: layer 0 specializes
@@ -2829,6 +2825,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <th>Required</th>
 <th>Purpose</th>
 <th>Native Pixtral (<code>models/pixtral.py</code>)</th>
+<th>Gemma 4 (<code>models/gemma4_mm.py</code>)</th>
 </tr>
 </thead>
 <tbody>
@@ -2837,41 +2834,48 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>yes</td>
 <td>host inputs (fp16, or integer indices) and their padding values; patches per image token; output width</td>
 <td>patches, one-hot segments, positions; <code>M²</code>; text hidden size</td>
+<td>patches, one-hot segments, x and y positions; <code>k²</code> (pooling kernel); text hidden size</td>
 </tr>
 <tr>
 <td><code>vision_item_tokens(mm_kwargs)</code></td>
 <td>yes</td>
 <td>image tokens per item, for packing into budgets</td>
 <td>patches / <code>M²</code> per image</td>
+<td>valid patches / <code>k²</code> per image</td>
 </tr>
 <tr>
 <td><code>vision_inputs(mm_kwargs)</code></td>
 <td>yes</td>
 <td>host buffers, unpadded; validated against <code>vision_buffers</code></td>
 <td>offset-major patches, segments, RoPE positions</td>
+<td>valid patches only, offset-major by position; segments; x and y</td>
 </tr>
 <tr>
 <td><code>vision_embed(values)</code></td>
 <td>yes</td>
 <td>graph 1: patches -&gt; block input embeddings and shared block inputs</td>
 <td>patch linear, <code>ln_pre</code>, image mask</td>
+<td>patch linear plus position embeddings and RoPE, gathered per axis; image mask</td>
 </tr>
 <tr>
 <td><code>vision_blocks()</code></td>
 <td>yes</td>
 <td>graph 2: blocks sharing one artifact</td>
 <td><code>TransformerBlock</code>s with <code>SpyrePixtralAttention</code></td>
+<td>stock encoder layers, their attention and norm instances switched to Spyre subclasses</td>
 </tr>
 <tr>
 <td><code>vision_project(x, taps)</code></td>
 <td>yes</td>
 <td>graph 3: merge or pool, then project into the text space</td>
 <td>projector norm, patch merge, adapter</td>
+<td>the <code>k×k</code> pool only; the tail runs in <code>postprocess_encoder_output</code></td>
 </tr>
 <tr>
 <td><code>vision_call_block</code></td>
 <td>no</td>
 <td>block call convention (default <code>block(x, **kw)</code>)</td>
+<td>default</td>
 <td>default</td>
 </tr>
 <tr>
@@ -2879,17 +2883,20 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>no</td>
 <td>intermediate hidden states passed to <code>vision_project</code></td>
 <td>none</td>
+<td>none</td>
 </tr>
 <tr>
 <td><code>vision_pad_groups</code>, <code>vision_patch_multiple</code></td>
 <td>no</td>
 <td>padding layout and alignment (default: one group per merge offset, 64-wide sticks)</td>
 <td>default</td>
+<td>default (576 patches at <code>k = 3</code>)</td>
 </tr>
 <tr>
 <td><code>vision_max_items_per_call</code></td>
 <td>no</td>
 <td>layout bound on items per encoder call</td>
+<td>63 (one-hot width)</td>
 <td>63 (one-hot width)</td>
 </tr>
 <tr>
@@ -2897,6 +2904,7 @@ budgets and <code>EncoderItemSpec.output_tokens</code>, and host inputs hold one
 <td>no</td>
 <td>modalities run through the graphs; others go to upstream's <code>embed_multimodal</code></td>
 <td><code>("image",)</code></td>
+<td><code>("image",)</code>; video is rejected</td>
 </tr>
 </tbody>
 </table>
@@ -2907,7 +2915,10 @@ host), and <code>get_encoder_cudagraph_budget_range</code> when the processor's 
 in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. <code>select_encoder_cudagraph_items</code> and <code>get_input_modality</code> come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
-upstream Pixtral does not, so <code>SpyrePixtralForConditionalGeneration</code> writes them. The eager
+upstream Pixtral does not, so <code>SpyrePixtralForConditionalGeneration</code> writes them. Gemma 4
+overrides <code>postprocess_encoder_output</code> to run its tail on the host in fp32, as upstream does:
+the pooler's <code>sqrt(hidden_size)</code> scale can leave the fp16 range, so the scale, standardize and
+<code>embed_vision</code> never run on the card, and its graphs end at the pooled vision hidden size. The eager
 (<code>enforce_eager</code>) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
 placeholders and <code>embed_input_ids</code> are inherited unchanged.</p>
 <p>Constraints the layout follows:</p>

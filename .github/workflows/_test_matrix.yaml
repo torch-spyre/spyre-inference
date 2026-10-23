@@ -329,6 +329,7 @@ jobs:
             .github/actions/override-spyre-rpms/action.yml
             .github/actions/run-matrix-config/action.yml
             .github/actions/spyre-rpm-install/action.yml
+            .github/scripts/run_model_ops.py
             pyproject.toml
             uv.lock
             spyre-rpms.lock
@@ -712,6 +713,19 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-encoder-attention
+          # The op-level configs in tests/model_ops/ record which torch ops a model
+          # executes through this plugin. Run by torch-spyre's own OOT runner, which
+          # is baked into the runner image; the configs carry the trunk label, and
+          # regression (the nightly) covers trunk here. Verdicts reach the v2
+          # capability tables through the JUnit properties the ingest already reads.
+          - cfg: Model ops tests
+            test_types: regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x1
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-model-ops
           # Small decoder-attention subset carrying attention coverage into the integration
           # tier, which the full test-attention-shard-* suite above is excluded from. Hence
           # integration-only: regression/trunk/unit already run the full shards.

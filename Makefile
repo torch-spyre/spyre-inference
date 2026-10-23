@@ -277,6 +277,20 @@ test-attention-shard-%:
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
+# Model-ops: the op-level configs in tests/model_ops/ record which torch ops a model
+# executes through this plugin. They are run by torch-spyre's own OOT runner
+# (tests/models/test_model_ops_v2.py), which reads one config per session from
+# PYTORCH_TEST_CONFIG -- so this target is not a marker subset of this repo's tests.
+# MODEL_OPS_CONFIG=<yaml> narrows it to a single config for a local run.
+MODEL_OPS_DIR ?= tests/model_ops
+MODEL_OPS_CONFIG ?=
+test-model-ops: ## Run the model-ops op tests over every tests/model_ops/*.yaml (MODEL_OPS_CONFIG=<yaml> for one). Needs 1 card.
+	$(AIU_SETUP_CMD); \
+	$(OMP_ENV) uv run --active --no-sync python .github/scripts/run_model_ops.py \
+	  --config-dir "$(MODEL_OPS_DIR)" \
+	  $(if $(MODEL_OPS_CONFIG),--config "$(MODEL_OPS_CONFIG)",) \
+	  $(if $(JUNIT_XML),--junit-xml "$(JUNIT_XML)",)
+
 # Small decoder-attention subset; the full attention suite is excluded from the integration
 # tier, so this is the only attention the upstream dispatch exercises. Also marked `attention`,
 # so the same cases still run inside the full shards under the other tiers.
@@ -343,6 +357,7 @@ tests-single-card: ## Run the 1-card marker combos (smoke shards / quality shard
 	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
 	done; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
+	mkdir -p "$(RESULTS_DIR)/junit-test-model-ops" && $(MAKE) test-model-ops JUNIT_XML="$(RESULTS_DIR)/junit-test-model-ops/junit-test-model-ops.xml" || rc=1; \
 	for i in $$(seq 0 $$(( $(UPSTREAM_SHARDS) - 1 ))); do \
 	  mkdir -p "$(RESULTS_DIR)/junit-test-upstream-shard-$$i" && $(MAKE) test-upstream-shard UPSTREAM_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-shard-$$i/junit-test-upstream-shard-$$i.xml" || rc=1; \
 	done; \

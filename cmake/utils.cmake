@@ -95,6 +95,7 @@ endfunction()
 #
 # DESTINATION <dest>   - Install destination, relative to the install prefix.
 # SOURCES <sources>    - Source files.
+# INCLUDE_DIRECTORIES <dirs> - Include directories besides csrc/.
 # COMPILE_FLAGS <flags>
 # LIBRARIES <libraries>
 #
@@ -103,10 +104,10 @@ function (define_extension_target MOD_NAME)
     ARG
     ""
     "DESTINATION"
-    "SOURCES;COMPILE_FLAGS;LIBRARIES")
+    "SOURCES;INCLUDE_DIRECTORIES;COMPILE_FLAGS;LIBRARIES")
 
   Python_add_library(${MOD_NAME} MODULE WITH_SOABI "${ARG_SOURCES}")
-  target_include_directories(${MOD_NAME} PRIVATE csrc)
+  target_include_directories(${MOD_NAME} PRIVATE csrc ${ARG_INCLUDE_DIRECTORIES})
   target_compile_options(${MOD_NAME} PRIVATE ${ARG_COMPILE_FLAGS})
   target_compile_definitions(${MOD_NAME} PRIVATE "-DTORCH_EXTENSION_NAME=${MOD_NAME}")
   target_link_libraries(${MOD_NAME} PRIVATE torch ${TORCH_LIBRARIES} ${ARG_LIBRARIES})

@@ -172,7 +172,7 @@ runs:
       if: ${{ inputs.use_prebaked_image != 'true' }}
       shell: bash
       run: |
-        .venv/bin/python -c "from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels; assert has_sampling_kernels(), 'the sampling kernels did not build or load; see the Build spyre-inference step'"
+        .venv/bin/python -c "from spyre_inference.v1.host_kernels import has_host_kernels; assert has_host_kernels(), 'the sampling kernels did not build or load; see the Build spyre-inference step'"
 
     # Same gate as the build step above: on a prebaked run there is no freshly-built workspace venv to point at, and repointing would send tests at an incomplete one instead of the complete baked one.
     - name: Activate the freshly-built venv

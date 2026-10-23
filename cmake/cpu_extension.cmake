@@ -15,13 +15,48 @@
 # Portions adapted from vLLM (https://github.com/vllm-project/vllm),
 # Copyright contributors to the vLLM project, Apache-2.0.
 
-# Host CPU kernels, ported from vLLM's cmake/cpu_extension.cmake for the ISAs
-# spyre-inference ships on: x86_64 (AVX512 + AVX2 fallback), ppc64le (VSX) and
-# s390x (VXE). Keep the flags in sync with vLLM when resyncing csrc/cpu.
+# Compiles only SPYRE_EXT_SRC from vLLM's csrc/, for x86_64 (AVX512 + AVX2),
+# ppc64le (VSX) and s390x (VXE).
+
+include(FetchContent)
+
+# vLLM's Python calls some of these ops, so build from the rev pyproject.toml installs.
+if(NOT SPYRE_VLLM_REV)
+  run_python(SPYRE_VLLM_REV
+    "
+import tomllib
+with open('${CMAKE_SOURCE_DIR}/pyproject.toml', 'rb') as f:
+    sources = tomllib.load(f)['tool']['uv']['sources']['vllm']
+revs = {s['rev'] for s in (sources if isinstance(sources, list) else [sources])}
+assert len(revs) == 1, f'expected one vllm rev in [tool.uv.sources], got {revs}'
+print(revs.pop())
+"
+    "Failed to read the vllm rev from pyproject.toml")
+endif()
+message(STATUS "Building vLLM host kernels from vLLM ${SPYRE_VLLM_REV}")
+
+# A pre-fetched checkout can be passed with -DFETCHCONTENT_SOURCE_DIR_VLLM=<dir>.
+FetchContent_Declare(vllm
+  URL "https://github.com/vllm-project/vllm/archive/${SPYRE_VLLM_REV}.tar.gz"
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  # Nonexistent, so vLLM's own CMake is never configured.
+  SOURCE_SUBDIR spyre-no-cmake)
+FetchContent_MakeAvailable(vllm)
+message(STATUS "vLLM host kernel sources: ${vllm_SOURCE_DIR}")
+
+execute_process(
+  COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/check_schemas.py"
+          "${CMAKE_SOURCE_DIR}/csrc/torch_bindings.cpp"
+          "${vllm_SOURCE_DIR}/csrc/cpu/torch_bindings.cpp"
+  RESULT_VARIABLE SCHEMA_CHECK_RET)
+if(NOT SCHEMA_CHECK_RET EQUAL 0)
+  message(FATAL_ERROR "csrc/torch_bindings.cpp no longer matches vLLM ${SPYRE_VLLM_REV}.")
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-list(APPEND CXX_COMPILE_FLAGS "-fopenmp")
+# Drops utils.cpp's NUMA binding and its libnuma link.
+list(APPEND CXX_COMPILE_FLAGS "-fopenmp" "-DVLLM_CPU_EXTENSION" "-DVLLM_NUMA_DISABLED")
 
 # Link the libgomp torch loads, falling back to the toolchain's when torch was
 # built from source (Power) or distro-packaged and vendors none.
@@ -53,8 +88,10 @@ find_isa(${CPUINFO} "POWER10" POWER10_FOUND)
 find_isa(${CPUINFO} "S390" S390_FOUND)
 
 set(SPYRE_EXT_SRC
-  "csrc/cpu/sampling_kernels.cpp"
-  "csrc/cpu/torch_bindings.cpp")
+  "${vllm_SOURCE_DIR}/csrc/cpu/sampling_kernels.cpp"
+  "${vllm_SOURCE_DIR}/csrc/cpu/utils.cpp"
+  "csrc/torch_bindings.cpp")
+set(SPYRE_EXT_INCLUDES "${vllm_SOURCE_DIR}/csrc")
 
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
   if (NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND
@@ -74,12 +111,14 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     _C
     DESTINATION spyre_inference
     SOURCES ${SPYRE_EXT_SRC}
+    INCLUDE_DIRECTORIES ${SPYRE_EXT_INCLUDES}
     LIBRARIES ${OPEN_MP}
     COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX512})
   define_extension_target(
     _C_AVX2
     DESTINATION spyre_inference
     SOURCES ${SPYRE_EXT_SRC}
+    INCLUDE_DIRECTORIES ${SPYRE_EXT_INCLUDES}
     LIBRARIES ${OPEN_MP}
     COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX2})
   return()
@@ -97,5 +136,6 @@ define_extension_target(
   _C
   DESTINATION spyre_inference
   SOURCES ${SPYRE_EXT_SRC}
+  INCLUDE_DIRECTORIES ${SPYRE_EXT_INCLUDES}
   LIBRARIES ${OPEN_MP}
   COMPILE_FLAGS ${CXX_COMPILE_FLAGS})

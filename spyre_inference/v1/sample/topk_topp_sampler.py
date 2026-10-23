@@ -18,7 +18,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p_pytorch,
 )
 
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
+from spyre_inference.v1.host_kernels import has_host_kernels
 
 
 def apply_top_k_top_p_sort_free(
@@ -85,14 +85,14 @@ class SpyreTopKTopPSampler(TopKTopPSampler):
             logits_to_return = logits
         elif self.logprobs_mode == "processed_logprobs":
             logits_to_return = logits.log_softmax(dim=-1, dtype=torch.float32)
-        if not self.use_fp64_gumbel and has_sampling_kernels():
+        if not self.use_fp64_gumbel and has_host_kernels():
             # Per-row seeds key the kernel's noise, so the draw is one pass with
             # no noise tensor; seeded requests stay reproducible.
             seeds = torch.randint(0, 2**62, (logits.shape[0],), dtype=torch.long)
             for i, generator in generators.items():
                 seeds[i] = torch.randint(0, 2**62, (1,), generator=generator)
             return (
-                torch.ops._spyre_C.fused_gumbel_argmax(
+                torch.ops._C.fused_gumbel_argmax(
                     logits.float(),  # ty: ignore[invalid-argument-type]
                     seeds,  # ty: ignore[invalid-argument-type]
                 ),

@@ -18,8 +18,8 @@ import pytest
 import torch
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 
+from spyre_inference.v1.host_kernels import has_host_kernels
 from spyre_inference.v1.sample.sampler import greedy_sample
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
 from spyre_inference.v1.sample.topk_topp_sampler import (
     SpyreTopKTopPSampler,
     apply_top_k_top_p_sort_free,
@@ -30,7 +30,7 @@ from spyre_inference.v1.sample.topk_topp_sampler import (
 # on a missing extension: the build_kernels job and the post-build check in
 # run-matrix-config enforce it, independent of these tests.
 pytestmark = pytest.mark.skipif(
-    not has_sampling_kernels(), reason="csrc/ sampling kernels are not built"
+    not has_host_kernels(), reason="csrc/ sampling kernels are not built"
 )
 
 
@@ -42,7 +42,7 @@ def test_greedy_matches_argmax(rows: int, vocab: int) -> None:
     top = x.max() + 1
     x[:, vocab // 2] = top
     x[:, vocab // 3] = top  # tie: argmax keeps the lowest index
-    assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))
+    assert torch.equal(torch.ops._C.greedy_argmax(x), x.argmax(dim=-1))
 
 
 def _i64(x: int) -> int:
@@ -83,7 +83,7 @@ def test_gumbel_matches_pytorch_reference(vocab: int, keep: int | None) -> None:
     logits[0] = float("-inf")  # an all-masked row picks token 0, like argmax
     seeds = torch.randint(-(2**63), 2**63 - 1, (32,), dtype=torch.long)
     assert torch.equal(
-        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds),
+        torch.ops._C.fused_gumbel_argmax(logits, seeds),
         _reference_gumbel_argmax(logits, seeds),
     )
 
@@ -116,7 +116,7 @@ def test_gumbel_matches_softmax_distribution() -> None:
     vocab, draws = 8, 200_000
     logp = torch.log_softmax(torch.randn(vocab) * 1.5, dim=-1)
     seeds = torch.randint(0, 2**31, (draws,), dtype=torch.long)
-    out = torch.ops._spyre_C.fused_gumbel_argmax(logp.expand(draws, vocab), seeds)
+    out = torch.ops._C.fused_gumbel_argmax(logp.expand(draws, vocab), seeds)
     freq = torch.bincount(out, minlength=vocab).float() / draws
     assert (freq - logp.exp()).abs().max() < 0.01
 
@@ -133,7 +133,7 @@ def test_gumbel_reaches_large_vocab_tail() -> None:
     for _ in range(draws // chunk):
         seeds = torch.randint(0, 2**62, (chunk,), dtype=torch.long, generator=gen)
         logits = row.float().expand(chunk, vocab).contiguous()
-        hits += int(tail[torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds)].sum())
+        hits += int(tail[torch.ops._C.fused_gumbel_argmax(logits, seeds)].sum())
     expected = float(p[tail].sum())
     sigma = (expected * (1 - expected) / draws) ** 0.5
     assert abs(hits / draws - expected) < 4 * sigma
@@ -143,7 +143,7 @@ def test_gumbel_never_picks_masked_tokens() -> None:
     logits = torch.randn(64, 32000)
     logits[:, 100:] = float("-inf")
     seeds = torch.randint(0, 2**31, (64,), dtype=torch.long)
-    assert (torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds) < 100).all()
+    assert (torch.ops._C.fused_gumbel_argmax(logits, seeds) < 100).all()
 
 
 def test_seeded_requests_are_reproducible() -> None:
@@ -168,11 +168,11 @@ def test_gumbel_strided_seeds_match_contiguous() -> None:
     seeds = torch.randint(0, 2**31, (16,), dtype=torch.long)[::2]
     assert not seeds.is_contiguous()
     assert torch.equal(
-        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds),
-        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.contiguous()),
+        torch.ops._C.fused_gumbel_argmax(logits, seeds),
+        torch.ops._C.fused_gumbel_argmax(logits, seeds.contiguous()),
     )
     with pytest.raises(RuntimeError, match="seeds must be int64"):
-        torch.ops._spyre_C.fused_gumbel_argmax(logits, seeds.int())
+        torch.ops._C.fused_gumbel_argmax(logits, seeds.int())
 
 
 def test_greedy_nan_matches_argmax() -> None:
@@ -187,4 +187,4 @@ def test_greedy_nan_matches_argmax() -> None:
     x[3, vocab - 1] = float("nan")
     x[4, 10] = float("inf")
     x[4, 20] = float("-inf")  # inf + -inf: NaN sum without a NaN logit
-    assert torch.equal(torch.ops._spyre_C.greedy_argmax(x), x.argmax(dim=-1))
+    assert torch.equal(torch.ops._C.greedy_argmax(x), x.argmax(dim=-1))

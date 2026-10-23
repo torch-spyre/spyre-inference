@@ -15,10 +15,10 @@
 import torch
 from vllm.v1.sample.sampler import Sampler
 
-from spyre_inference.v1.sample.sampling_kernels import has_sampling_kernels
+from spyre_inference.v1.host_kernels import has_host_kernels
 
 
 def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
-    if not has_sampling_kernels():
+    if not has_host_kernels():
         return Sampler.greedy_sample(logits)
-    return torch.ops._spyre_C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]
+    return torch.ops._C.greedy_argmax(logits)  # ty: ignore[invalid-argument-type]

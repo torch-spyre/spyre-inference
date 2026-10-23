@@ -29,10 +29,9 @@ The plugin registers via two entry points:
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
-a no-op (there is no `vllm._C`), and the model runner reimplements the slot-mapping
-kernel in pure PyTorch. The host-side sampling kernels vLLM's CPU backend would supply
-are built by the plugin itself, as `spyre_inference._C` (see
-[Host-side sampling](#host-side-sampling)).
+a no-op (there is no `vllm._C`). The few host kernels the plugin needs from vLLM's CPU
+backend (sampling and slot mapping) are compiled from vLLM's own source by the plugin's
+build, as `spyre_inference._C` (see [Host-side sampling](#host-side-sampling)).
 
 ## Component view of a Granite model
 
@@ -611,9 +610,10 @@ override:
 - **Int / bool dtypes**: `.gpu` aliased to `.cpu` (Spyre doesn't natively support these)
 
 `self.device` stays `cpu` so that scatter, indexing, and block-table ops run on CPU, but
-float compute tensors land on Spyre via `self._spyre_device`. Because there is no
-`vllm._C` under `VLLM_TARGET_DEVICE=empty`, the runner also swaps in a pure-PyTorch
-`_compute_slot_mapping_impl` for the paged-cache slot-mapping kernel.
+float compute tensors land on Spyre via `self._spyre_device`. Spyre has no Triton, so
+the runner routes vLLM's slot mapping kernel to vLLM's C++ host version
+(`torch.ops._C.compute_slot_mapping_kernel_impl`, see below) through vLLM's Triton
+kernel dispatcher (`register_slot_mapping_kernel`, `v1/host_kernels.py`).
 
 At load time, `load_model` moves every module except `Attention` scale buffers onto Spyre.
 The weight transposes happen before that, in each layer's
@@ -665,17 +665,15 @@ greedy draw at `greedy_sample` (`v1/sample/sampler.py`) and its random draw at
 same way. That brings back the CPU kernels and drops the full-vocabulary sort:
 
 - **Random draw** — `SpyreTopKTopPSampler.forward_native` calls
-  `torch.ops._spyre_C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
+  `torch.ops._C.fused_gumbel_argmax`: one pass of `argmax(logits + g)`, with the
   Gumbel noise `g` hashed per element from a per-row seed (splitmix64 of `(seed, i)`), so
   there is no softmax and no noise tensor. The noise is bounded, so tokens too far below the
   running best (including every `-inf` left by top-k/top-p) are skipped exactly, and most
   others are rejected with one `exp` before the two `log`s of the Gumbel transform. A
   seeded request draws its row seed from its own `torch.Generator`, so it stays
   reproducible. `use_fp64_gumbel` keeps fresh fp64 noise, drawn in log space
-  (`argmax(x - log q)`, `q ~ Exp(1)`). vLLM's kernel reads its noise from a fixed 2^20-entry
-  table instead, which limits each row to 2^20 noise windows and leaves much of a large
-  vocabulary unreachable.
-- **Greedy** — `greedy_sample` calls `torch.ops._spyre_C.greedy_argmax`, a
+  (`argmax(x - log q)`, `q ~ Exp(1)`).
+- **Greedy** — `greedy_sample` calls `torch.ops._C.greedy_argmax`, a
   vectorized max followed by a first-match scan, so ties break like `torch.argmax`. A
   single row falls back to `torch.argmax`, where OpenMP fork/join would cost more than the
   scan.
@@ -684,16 +682,21 @@ same way. That brings back the CPU kernels and drops the full-vocabulary sort:
   only. vLLM keeps every token tied with a row's k-th value, so the window widens to the
   exact tie count when ties run past it. Top-p without top-k still sorts.
 
-The kernels live in `csrc/cpu/sampling_kernels.cpp` and are built with CMake from
-`setup.py`, over the `cpu_types_{x86,vsx,vxe}.hpp` SIMD headers copied unchanged from vLLM,
-so x86, POWER and s390x all get vector code. x86 ships an AVX512 build (`_C`) and an
-AVX2 fallback (`_C_AVX2`), and `v1/sample/sampling_kernels.py` imports whichever the host
-supports, as vLLM's CPU backend does. The ops register under the fixed `_spyre_C`
-namespace rather than `TORCH_EXTENSION_NAME`, so the two builds share one op name and
-cannot collide with a vLLM `_C` in the same environment. If the extension
-is missing or fails to import (a failed build, or a dev checkout that never built it), the
-import logs a warning and the samplers fall back to `torch.argmax` and a fresh-noise
-log-space draw. Because the sampler reimplements
+The kernels are vLLM's own C++ (`csrc/cpu/sampling_kernels.cpp` and `csrc/cpu/utils.cpp`),
+compiled from vLLM's source at the installed vLLM rev: `cmake/cpu_extension.cmake` reads
+the `vllm` rev from `[tool.uv.sources]` in `pyproject.toml`, fetches it with `FetchContent`
+(`-DSPYRE_VLLM_REV=<rev>` overrides the rev, `-DFETCHCONTENT_SOURCE_DIR_VLLM=<checkout>`
+builds offline) and compiles only those two
+files, so none of vLLM's oneDNN, attention or GEMM code is built. vLLM's
+`cpu_types_{x86,vsx,vxe}.hpp` give x86, POWER and s390x vector code. Our only C++ is
+`csrc/torch_bindings.cpp`, which registers the ops into vLLM's `_C` namespace with
+vLLM's schemas; the configure step fails if one no longer matches vLLM's
+`csrc/cpu/torch_bindings.cpp` (`cmake/check_schemas.py`). x86 ships an AVX512 build (`_C`)
+and an AVX2 fallback (`_C_AVX2`), and `v1/host_kernels.py` imports whichever the host
+supports, as vLLM's CPU backend does. If the extension is missing or fails to import (a
+failed build, or a dev checkout that never built it), the import logs a warning and the
+samplers fall back to `torch.argmax` and a fresh-noise log-space draw; the slot mapping
+has no fallback, so the runner fails at construction instead. Because the sampler reimplements
 the tail of upstream `TopKTopPSampler.forward_native`, it has to be re-synced on a vLLM
 bump.
 

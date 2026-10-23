@@ -48,7 +48,8 @@ jobs:
       - x86_64
       - linux
       - image_ingest
-    timeout-minutes: 15
+    # PyPI/GitHub downloads from torch-cicd pods can be slow enough to blow a tighter budget.
+    timeout-minutes: 30
     # Skip if the triggering workflow was cancelled (but ingest failures are fine)
     if: |
       github.event_name == 'workflow_dispatch' ||
@@ -98,14 +99,15 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # Picks the version from checksums bundled in this pin instead of fetching the full
+          # versions manifest, whose download times out from torch-cicd pods.
+          version: latest-known
 
       - name: setup venv
         run: |
-          # Named .venv-v1, not .venv: the v2 ingest step below (the shared
-          # torch-spyre composite action) also runs `uv venv` in this same
-          # workspace, and `uv venv .venv` a second time fails with "A virtual
-          # environment already exists at: .venv".
+          # Not .venv: the shared ingest action builds one there when it is not handed this venv.
           uv venv .venv-v1
           source .venv-v1/bin/activate
           echo "VIRTUAL_ENV $VIRTUAL_ENV"
@@ -252,6 +254,8 @@ jobs:
         if: steps.group-by-arch.outputs.has_x86_64 == 'true'
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
+          # Already holds the ingest library, so the action skips a second install.
+          venv: .venv-v1
           xml-dir: xml_by_arch/x86_64
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
@@ -280,6 +284,7 @@ jobs:
         if: steps.group-by-arch.outputs.has_ppc64le == 'true'
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
+          venv: .venv-v1
           xml-dir: xml_by_arch/ppc64le
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}
@@ -303,6 +308,7 @@ jobs:
         if: steps.group-by-arch.outputs.has_s390x == 'true'
         uses: torch-spyre/torch-spyre/.github/actions/ingest-xml-to-clickhouse@main
         with:
+          venv: .venv-v1
           xml-dir: xml_by_arch/s390x
           workflow: ${{ env.TRIGGERING_WORKFLOW }}
           branch: ${{ env.TRIGGERING_BRANCH }}

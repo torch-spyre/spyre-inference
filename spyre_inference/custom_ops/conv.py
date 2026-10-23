@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-specific Conv2d implementation (Pixtral/Ministral vision patch embed).
+"""Spyre-specific Conv2d implementation (Pixtral/Ministral/SigLIP vision patch embed).
 
 vLLM lowers a patch conv to im2col + GEMM, whose on-device reshape produces a
 sub-stick `copy_from_d2d` expression torch-spyre cannot lay out for patch grids
-coprime with the 64-wide stick. So run the real `F.conv2d` on-card instead, with
-the weight and input placed into explicit `SpyreTensorLayout`s. Layout tuples are
-derived from shapes, so any out-channel count and image size work.
+coprime with the 64-wide stick. Use `F.conv2d` instead. Single-image calls retain
+explicit `SpyreTensorLayout`s; batched calls avoid staging layouts that the
+backend's CPU-unfold decomposition immediately discards.
 """
 
 import torch
@@ -33,16 +33,17 @@ logger = init_logger(__name__)
 
 
 def _layouts_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
-    """Whether the layout tuples below apply: one image, in-channels within a stick,
+    """Whether the layout tuples below apply: in-channels within a stick,
     out-channels a whole number of sticks.
 
-    True for a Pixtral patch embed, not for convs in general — and this class is
-    registered OOT for *every* `Conv2dLayer`, so fall back rather than assert.
+    True for a vision patch embed (e.g. Pixtral, SigLIP), not for convs in
+    general — and this class is registered OOT for *every* `Conv2dLayer`, so
+    fall back rather than assert.
     """
     if x.dim() != 4 or weight.dim() != 4:
         return False
-    b, c = x.shape[0], x.shape[1]
-    return b == 1 and c <= 64 and weight.shape[0] % 64 == 0
+    c = x.shape[1]
+    return c <= 64 and weight.shape[0] % 64 == 0
 
 
 def _weight_layout(weight: torch.Tensor):
@@ -62,17 +63,18 @@ def _weight_layout(weight: torch.Tensor):
 
 
 def _input_layout(x: torch.Tensor):
-    """SpyreTensorLayout for a conv input (1, C, H, W), sticked on in-channels.
+    """SpyreTensorLayout for a conv input (B, C, H, W), sticked on in-channels.
 
-    The stick walks the channel dim (host stride H*W), padding C up to a full stick.
+    The stick walks the channel dim (host stride H*W), padding C up to a full
+    stick.  The batch dim maps to device dim 3 with host stride C*H*W; for
+    B==1 that dimension has size 1 and is essentially free.
     """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype
 
     b, c, h, w = x.shape
-    assert b == 1, f"conv input batch {b} != 1 (Pixtral feeds one image at a time)"
     assert c <= 64, f"conv in_channels {c} must fit in one 64-wide stick"
     return SpyreTensorLayout(
-        [w, h, 1, 1, 64],
+        [w, h, 1, b, 64],
         [1, w, -1, c * h * w, h * w],
         get_device_dtype(x.dtype),
     )
@@ -80,7 +82,7 @@ def _input_layout(x: torch.Tensor):
 
 @Conv2dLayer.register_oot(name="Conv2dLayer")
 class SpyreConv2d(CompileOutermost, Conv2dLayer):
-    """Out-of-tree Conv2d for Spyre: `F.conv2d` on-card with explicit tiled layouts.
+    """Out-of-tree `F.conv2d` dispatch for Spyre vision patch embeddings.
 
     Spyre needs static shapes, so the kernel recompiles per distinct (H, W). The
     platform lifts dynamo's recompile limits, so there is no eager fallback, but every
@@ -126,12 +128,15 @@ class SpyreConv2d(CompileOutermost, Conv2dLayer):
         if not _layouts_supported(x, self.weight):
             logger.warning_once(
                 "Spyre conv2d: shape %s (weight %s) outside the tiled-layout "
-                "assumptions (batch 1, in_channels <= 64, out_channels %% 64 == 0); "
+                "assumptions (in_channels <= 64, out_channels %% 64 == 0); "
                 "falling back to F.conv2d without them.",
                 tuple(x.shape),
                 tuple(self.weight.shape),
             )
             return self._forward_conv(x)
+        if x.shape[0] > 1:
+            # CPU unfold discards the tiled input layout, so do not stage it first.
+            return self._conv_native(x, self.weight, self.bias)
         logger.info_once("Spyre conv2d: on-card F.conv2d with tiled layouts")
         # Via CPU: CPU->spyre is the tested entry path, and a device-side
         # restickify would hit the same unsupported layout.

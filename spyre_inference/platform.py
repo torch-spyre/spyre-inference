@@ -132,6 +132,82 @@ def _maybe_uniproc(parallel_config, requested_backend) -> None:
     parallel_config.distributed_executor_backend = "uni"
 
 
+def _hf_config_has_moe(hf_config) -> bool:
+    """Return True when the HF config describes a MoE model.
+
+    Checks the standard attributes used across HF model families
+    (Mixtral, Qwen MoE, Gemma 4, DeepSeek, etc.) to detect a non-trivial
+    number of routed experts.  A missing attribute or a value of 0 / 1 is
+    treated as a dense model.
+    """
+    if hf_config is None:
+        return False
+    moe_attrs = (
+        "num_experts",
+        "num_local_experts",
+        "n_routed_experts",
+        "num_experts_per_tok",  # some configs store total, not per-layer
+    )
+    for attr in moe_attrs:
+        val = getattr(hf_config, attr, None)
+        # Also check nested text_config (multimodal models)
+        if val is None:
+            text_cfg = getattr(hf_config, "text_config", None)
+            val = getattr(text_cfg, attr, None) if text_cfg is not None else None
+        if val is not None and int(val) > 1:
+            return True
+    return False
+
+
+def _is_multimodal_config(model_config) -> bool:
+    """Return True when model_config describes a multimodal model.
+
+    Checks the two vLLM-native attributes that are authoritatively set for
+    multimodal models; hf_config vision/audio stubs are intentionally ignored
+    as some text-only models carry them.
+    """
+    if getattr(model_config, "is_multimodal_model", False):
+        return True
+    if getattr(model_config, "multimodal_config", None) is not None:
+        return True
+    return False
+
+
+def _spyre_loader_supported(vllm_config) -> bool:
+    """Return True when SpyreModelLoader is safe to use for this config.
+
+    Allow-list: only runner_type="generate", TP=1, unquantized, dense, non-MoE,
+    non-multimodal, non-transformers-backend models are supported. Any config
+    outside that set stays on the stock loader until explicitly validated.
+    Excluded:
+      - runner_type != "generate": pooling and any future runner types are
+        excluded; their host-residency needs are not yet covered (torch-spyre#2971).
+      - TP > 1: weight sharding not tested with the direct-to-device path.
+      - quantized: FP8 and other quant schemes have their own weight layout logic.
+      - transformers backend: uses a different model class hierarchy.
+      - MoE: dma_moe_expert_weight_to_spyre requires a CPU source tensor.
+      - multimodal: vision-tower param host-residency not yet covered.
+    """
+    model_config = getattr(vllm_config, "model_config", None)
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    tp_size = getattr(parallel_config, "tensor_parallel_size", 1) if parallel_config else 1
+    if tp_size != 1:
+        return False
+    if model_config is None:
+        return False
+    if getattr(model_config, "quantization", None) is not None:
+        return False
+    if getattr(model_config, "runner_type", None) != "generate":
+        return False
+    if hasattr(model_config, "using_transformers_backend") and model_config.using_transformers_backend():
+        return False
+    if _hf_config_has_moe(getattr(model_config, "hf_config", None)):
+        return False
+    if _is_multimodal_config(model_config):
+        return False
+    return True
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -363,6 +439,11 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
         # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
+
+        if getattr(vllm_config, "load_config", None) is not None:
+            if vllm_config.load_config.load_format == "auto":
+                if _spyre_loader_supported(vllm_config):
+                    vllm_config.load_config.load_format = "spyre"
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
@@ -727,6 +808,19 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"Spyre does not support pipeline_parallel_size > 1 "
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
+
+        # Reject an explicitly-requested --load-format spyre for configs the loader
+        # doesn't support. apply_config_platform_defaults only runs for load_format="auto";
+        # a user who passes --load-format spyre directly bypasses that gate.
+        load_config = getattr(vllm_config, "load_config", None)
+        if load_config is not None and load_config.load_format == "spyre":
+            if not _spyre_loader_supported(vllm_config):
+                raise ValueError(
+                    "--load-format spyre is not supported for this configuration. "
+                    "Supported: TP=1, unquantized, dense, non-MoE, generate-only, "
+                    "non-multimodal, non-transformers-backend models. "
+                    "Use --load-format auto or --load-format safetensors instead."
+                )
 
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has

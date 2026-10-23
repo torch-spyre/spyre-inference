@@ -87,6 +87,7 @@ def keep_sigterm_handler():
 
 def register_ops():
     """Register the Spyre OOT custom ops and model adaptations."""
+    import spyre_inference.model_loader  # noqa: F401
     from spyre_inference.custom_ops import register_all
     from spyre_inference.models import register_models
 

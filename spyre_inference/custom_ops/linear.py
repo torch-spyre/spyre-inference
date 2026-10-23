@@ -114,6 +114,24 @@ class SpyreTransposedWeightMethod:
     def build_weight_t(self, layer: torch.nn.Module, w: torch.Tensor) -> None:
         """Pad and transpose `w` into `WEIGHT_T_ATTR`. `w` need not be `layer.weight`:
         a tied lm-head builds from a host copy, after the device move."""
+        # Weight already on Spyre: SpyreModelLoader streams linear weights via
+        # _dma_to_spyre_dim_order_swapped (dim_order=[1,0]), so they arrive in
+        # physical [in, out] order — already the layout w.t() wants.
+        # .contiguous() reconciles the SpyreTensorLayout metadata with the swapped
+        # strides; because the physical layout already matches, it returns self
+        # (no restickify copy).  Layers with ROW_ALIGN set need padding first and
+        # keep the general path below.
+        # NOTE: this fast path fires for any Spyre-resident weight with ROW_ALIGN=None.
+        # Today that is only load_format=spyre, which the platform restricts to TP=1,
+        # unquantized, dense, non-transformers-backend models.  If a future native-backend
+        # multimodal model reaches here its linears will also have been streamed via
+        # _dma_to_spyre_dim_order_swapped, so the assumption holds — but verify if
+        # a new model class is added to the spyre load path.
+        if w.device.type == "spyre" and self.ROW_ALIGN is None:
+            layer.spyre_row_padding = 0
+            setattr(layer, self.WEIGHT_T_ATTR, Parameter(w.t().contiguous(), requires_grad=False))
+            return
+
         padding = (-w.shape[0]) % self.ROW_ALIGN if self.ROW_ALIGN else 0
         layer.spyre_row_padding = padding
         if padding:

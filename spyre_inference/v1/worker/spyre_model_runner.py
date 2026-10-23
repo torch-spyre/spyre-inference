@@ -35,6 +35,7 @@ Data flow in the current WIP version:
 from __future__ import annotations
 
 import bisect
+import os
 import time
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, cast
@@ -720,8 +721,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
         text_config = self.model_config.hf_text_config
         install_padded_head_dim(self.model_config)
         install_bert_head_pad(self.model_config)
-        install_head_pad_weight_loader(model_loader, text_config, self.model_config)
-        install_mlp_pad_weight_loader(model_loader, text_config, self.model_config)
+        install_head_pad_weight_loader(
+            model_loader, self.model_config.hf_text_config, self.model_config
+        )
+        install_mlp_pad_weight_loader(
+            model_loader, self.model_config.hf_text_config, self.model_config
+        )
+        # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
+        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
+        # an nn.Module, but just the attention implementation.
+        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -750,17 +759,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         fix_padded_attention_scale(self.model, text_config, self.model_config)
         fix_padded_qk_norm_eps(self.model, text_config, self.model_config)
 
-        # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
-        # an nn.Module, but just the attention implementation.
-        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
-
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
         self._resolve_kv_scales()
 
-        # Move layer weights to Spyre device.
+        # Move layer weights to Spyre device. Parameters SpyreModelLoader already
+        # streamed to the device are no-ops here; this still places what stayed on
+        # CPU (vocab tables via their _apply, RoPE caches) after the fix_padded_* passes.
         self.model.to(device=self._spyre_device)
+
         for module in self.model.modules():
             if isinstance(module, SpyreConv2d):
                 module.process_weights_after_loading()

@@ -295,7 +295,10 @@ def _moe_gathered(
         raw_indices.reshape(-1)[:, None].expand(rows, stick).contiguous().to(torch.float32)
     )
     entries = (expert_fp32[:, None, :] * chunk_scale + chunk_offsets).reshape(rows * chunks, stick)
-    slice_index = entries[..., : stick // 2].to(torch.int32)[:, 0]
+    # Every lane of the one-stick-wide entries holds the entry, so take it as the max over the
+    # stick: the float32 holds each pair of sticks in an interleaved order, and a reduction
+    # reads it whole where a slice would split a pair.
+    slice_index = entries.amax(-1).to(torch.int32)
     inputs = (
         x.reshape(tokens, 1, chunks, slice_rows)
         .expand(tokens, top_k, chunks, slice_rows)

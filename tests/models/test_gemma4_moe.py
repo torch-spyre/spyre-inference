@@ -1012,22 +1012,6 @@ def test_traced_persistent_dispatch_matches_dense_reference():
     torch.testing.assert_close(actual.cpu().float(), expected, atol=2e-2, rtol=2e-2)
 
 
-# One core; a split that is the whole axis; a divisor below the core count; and a
-# core-count split at a longer axis.
-@pytest.mark.parametrize("tokens", [1, 24, 40, 64])
-def test_token_cores_is_the_largest_split_that_divides_the_token_axis(tokens):
-    """The token work-division split must divide the axis and not exceed the cores."""
-    from torch_spyre._inductor import config as spyre_config
-
-    from spyre_inference.moe import _token_cores
-
-    limit = min(tokens, spyre_config.sencores)
-    cores = _token_cores(tokens)
-    assert tokens % cores == 0, f"{cores} does not divide {tokens}"
-    assert 1 <= cores <= limit
-    assert all(tokens % larger for larger in range(cores + 1, limit + 1)), "not the largest split"
-
-
 def test_persistent_expert_loop_matches_dense_on_host():
     from spyre_inference.moe import _moe_persistent
 

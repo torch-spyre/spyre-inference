@@ -254,6 +254,13 @@ runs:
       shell: bash
       run: echo "SPYRE_TEST_DURATIONS_OUT=${RUNNER_TEMP}/durations-${{ inputs.job_slot }}.json" >> "$GITHUB_ENV"
 
+    # Warn-only, one smoke leg: flags Spyre libraries the test env loads from the image instead of the lock. Via make so it gets the test shell's env.
+    - name: Spyre library provenance
+      if: ${{ inputs.use_prebaked_image != 'true' && startsWith(inputs.cfg, 'Non-distributed spyre tests (shard 1/') }}
+      shell: bash
+      continue-on-error: true
+      run: timeout 10m make spyre-lib-provenance
+
     # Marker expression and coverage wiring both live in the Makefile test_target; COVERAGE=1 drops .coverage.* data files for the fan-in.
     # Bounded so a wedged card acquisition (a blocking open() on a contended /dev/vfio device) cannot hang the job silently -- failing here keeps the step's log and lets the post steps publish JUnit.
     # The bound lives on the caller's step (`timeout-minutes` in _test_matrix.yaml): composite

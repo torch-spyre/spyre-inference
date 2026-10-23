@@ -124,7 +124,7 @@ endif
 # one shot (ingest_xml.py globs `${RESULTS_DIR}/*.xml` non-recursively).
 RESULTS_DIR ?= .
 
-.PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
+.PHONY: help test tests run-one aiu-setup spyre-lib-provenance perf-tests coverage print-test-type \
         test-smoke test-smoke-shard test-quality test-quality-shard \
         test-probes test-probes-shard \
         test-attention test-attention-shard test-attention-smoke \
@@ -172,6 +172,10 @@ endef
 
 aiu-setup: ## Internal: source ibm-aiu-setup.sh and run its one-time side effects (memoized via a stamp file for this run).
 	$(AIU_SETUP_CMD)
+
+spyre-lib-provenance: ## Report Spyre libraries/packages the test env loads from the image instead of the lock. Needs 1 card.
+	$(AIU_SETUP_CMD); \
+	uv run --active --no-sync python .github/scripts/spyre_lib_provenance.py
 
 # uv invocations below pass --active --no-sync: they must use the active venv
 # ($VIRTUAL_ENV, repointed above to the project .venv when one is present) and skip

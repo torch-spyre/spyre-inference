@@ -20,9 +20,25 @@ every query row, so this kernel spends it instead: batched GQA over
 ``[kv_head, group, query, D]``, one accumulator, store fuses.
 """
 
+import math
+
 import torch
+from torch_spyre._inductor import config as ts_config
+from torch_spyre._inductor import spyre_hint
 
 from spyre_inference.v1.attention.ops.tile_loop import walk_tiles
+
+# Hkv/4 was hand-picked at num_kv_heads=8: a wider Hkv split costs LX residency.
+_MAX_HKV_SPLIT = 4
+
+
+def prefill_work_div(num_kv_heads: int, padded_query_len: int) -> tuple[int, int]:
+    """(Hkv, T) splits for the prefill hints: work_div rejects an uneven split, so each
+    divides its own axis, and T takes the cores Hkv leaves. sencores is read at trace
+    time, so a `_capped_cores` budget is honoured."""
+    hkv_split = math.gcd(num_kv_heads, _MAX_HKV_SPLIT)
+    t_split = math.gcd(padded_query_len, max(ts_config.sencores // hkv_split, 1))
+    return hkv_split, t_split
 
 
 def page_attn_head_major_prefill_kernel(
@@ -54,17 +70,26 @@ def page_attn_head_major_prefill_kernel(
             folds k_scale into ``scale``.
     """
     num_queries_per_kv = num_heads // num_kv_heads
+    hkv_split, t_split = prefill_work_div(num_kv_heads, padded_query_len)
 
     # Gathered, not sliced outside: since torch-spyre#4449 a view's storage_offset is a
     # Dynamo graph guard, and q_start varies, so a slice would compile one kernel per batch
     # layout -- test_spyre_compile_input_offset_specialises_the_graph. The builder now
     # creates this table at exactly padded_query_len rows.
     q_rows = query.index_select(0, query_row_index)
-    q = (
+    q_view = (
         q_rows.unsqueeze(0)
         .transpose(1, 2)
         .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
     )
+    # named_dims is required: work_div can only split a dimension that's already
+    # named somewhere in the op's own input chain. Without it, "x"/"mb" below would
+    # only land on Hkv/Hq_kv by positional coincidence, and nothing downstream (e.g.
+    # a matmul hinted with a named `T` split) could inherit a real T-split from Q.
+    with spyre_hint(
+        named_dims=["Hkv", "Hq_kv", "T", "D"], work_div={"T": t_split, "Hkv": hkv_split}
+    ):
+        q = q_view * 1.0
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
     # stacked on dim 0.
@@ -76,12 +101,16 @@ def page_attn_head_major_prefill_kernel(
 
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
+        # Q's Hkv split alone (K/V have no query-length axis) lets the solver's same-group
+        # relayout path (torch-spyre#5057) land both the restickify and identity consumers
+        # below in LX via a reconciling shuffle into the matmuls' own split, instead of HBM.
         page_idx = page_index[0, 0:1]
-        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
-        if k_page.dtype != q.dtype:
-            k_page = k_page.to(q.dtype)
-            v_page = v_page.to(q.dtype)
+        with spyre_hint(named_dims=["Hkv", "Hq_kv", "St", "D"], work_div={"Hkv": hkv_split}):
+            k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            if k_page.dtype != q.dtype:
+                k_page = k_page.to(q.dtype)
+                v_page = v_page.to(q.dtype)
 
         scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:

@@ -802,36 +802,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             inputs_embeds_buffer=self.inputs_embeds.gpu,
         )
 
-    @staticmethod
-    def _model_has_spyre_fp8(model: nn.Module) -> bool:
-        """True if the model has Spyre FP8 linears.
-
-        ``Fp8LinearMethod`` stores the kernel at ``quant_method.fp8_linear``.
-        Granite ``compressed-tensors`` stores it on the scheme
-        (``quant_method.scheme.fp8_linear`` / ``layer.scheme.fp8_linear``).
-        Checkpoint FP8 is dequanted to CPU fp16 in
-        ``process_weights_after_loading``; first Spyre forward caches ``qfp8wt``.
-        """
-        from spyre_inference.custom_ops.fp8_linear_kernel import SpyreFp8LinearKernel
-
-        def _is_fp8_kernel(obj: object) -> bool:
-            return isinstance(obj, SpyreFp8LinearKernel) or isinstance(
-                getattr(obj, "fp8_linear", None), SpyreFp8LinearKernel
-            )
-
-        for module in model.modules():
-            weight = getattr(module, "weight", None)
-            if isinstance(weight, torch.Tensor) and weight.dtype == torch.float8_e4m3fn:
-                return True
-            quant_method = getattr(module, "quant_method", None)
-            if _is_fp8_kernel(quant_method) or _is_fp8_kernel(
-                getattr(quant_method, "scheme", None)
-            ):
-                return True
-            if _is_fp8_kernel(getattr(module, "scheme", None)):
-                return True
-        return False
-
     def _resolve_kv_scales(self) -> bool:
         """Read each float8-cache layer's KV scales into its impl; True when any changed."""
         changed = False
@@ -902,8 +872,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Install torch.compile wrappers; tracing happens on the first forward.
 
         `dynamic=False` is mandatory: the Spyre backend rejects SymInt shapes.
-        FP8 apply is dynamo-disabled, so ``fullgraph=False`` when the model has
-        Spyre FP8 linears.
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -923,10 +891,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
-        # stays isolated. fullgraph=True cannot graph-break.
-        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
-        fullgraph = not uses_fp8
         model_name = type(self.model).__name__
 
         if granularity == "block":
@@ -938,16 +902,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
                     "SPYRE_COMPILE_GRANULARITY=model may warm up faster.",
                     defeated_by,
                 )
-            num_blocks = self._compile_blocks(fullgraph=fullgraph)
+            num_blocks = self._compile_blocks()
             tower = self._compiled_tower_blocks
             if num_blocks:
                 logger.info(
-                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre "
-                    "(fullgraph=%s).",
+                    "Wrapped %d transformer blocks%s of %s for per-block compile on Spyre.",
                     num_blocks,
                     f" and {tower} tower blocks" if tower else "",
                     model_name,
-                    fullgraph,
                 )
                 return
             logger.warning(
@@ -960,13 +922,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.model = torch.compile(
             self.model,
             backend="inductor",
-            fullgraph=fullgraph,
+            fullgraph=True,
             dynamic=False,
         )
         compile_guard.watch(self.model, f"{model_name} (whole-model graph)")
-        logger.info("Wrapped %s as a single graph for Spyre (fullgraph=%s).", model_name, fullgraph)
+        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
 
-    def _compile_blocks(self, fullgraph: bool = True) -> int:
+    def _compile_blocks(self) -> int:
         # Only decoder blocks are returned: the count decides the whole-model fallback,
         # which an opted-in tower must not pre-empt (it compiles beside either form).
         num_blocks = num_tower = 0
@@ -981,7 +943,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 # In place: rebinding blocks[i] to the returned OptimizedModule reparents
                 # the block under `_orig_mod`, renaming every parameter and breaking
                 # reload_weights and save_sharded_state.
-                block.compile(backend="inductor", fullgraph=fullgraph, dynamic=False)
+                block.compile(backend="inductor", fullgraph=True, dynamic=False)
                 # Identical blocks share one `forward` code object -- that is why this
                 # granularity shares a single artifact -- so this collapses to one
                 # registration per block *class*, which is the right granularity for

@@ -475,7 +475,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        # Linear layers use SpyreFp8LinearKernel (spyre.scaled_mm).
         return True
 
     @classmethod
@@ -691,8 +691,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
-            # weights included.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(

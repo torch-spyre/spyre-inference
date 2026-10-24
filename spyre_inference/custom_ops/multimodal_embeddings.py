@@ -35,7 +35,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models import utils as vllm_utils
 from vllm.multimodal import NestedTensors
 
-from .utils import convert, row_outermost_layout
+from .utils import convert, convert_tensor_tree, row_outermost_layout
 
 logger = init_logger(__name__)
 
@@ -55,16 +55,21 @@ def _spyre_merge_multimodal_embeddings(
     if len(multimodal_embeddings) == 0:
         return inputs_embeds
 
-    mm_embeds_flat = vllm_utils._flatten_embeddings(multimodal_embeddings)
     input_dtype = inputs_embeds.dtype
+    # Per-item embeddings are views into the batched encoder output, each at its own
+    # storage offset; flattening them on device recompiles `cat` per offset
+    # (torch-spyre#4449), so move them to CPU first.
+    multimodal_embeddings = convert_tensor_tree(
+        multimodal_embeddings, device="cpu", dtype=input_dtype
+    )
+    mm_embeds_flat_cpu = vllm_utils._flatten_embeddings(multimodal_embeddings)
 
     is_multimodal_cpu = convert(is_multimodal, device="cpu")
-    mm_embeds_flat_cpu = convert(mm_embeds_flat, dtype=input_dtype, device="cpu")
     scattered_cpu = torch.zeros(inputs_embeds.shape, dtype=input_dtype)
     try:
         scattered_cpu[is_multimodal_cpu] = mm_embeds_flat_cpu
     except RuntimeError as e:
-        num_actual_tokens = len(mm_embeds_flat)
+        num_actual_tokens = len(mm_embeds_flat_cpu)
         num_expected_tokens = is_multimodal_cpu.sum().item()
 
         if num_actual_tokens != num_expected_tokens:

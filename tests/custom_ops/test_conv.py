@@ -80,10 +80,20 @@ def test_layouts_supported_accepts_a_patch_embed():
 
 
 @pytest.mark.conv
+@pytest.mark.parametrize("batch", [1, 2, 4])
+def test_layouts_supported_accepts_multi_batch(batch):
+    """Batch size is not a gate -- a granite-vision-style tile batch is fine."""
+    from spyre_inference.custom_ops.conv import _layouts_supported
+
+    x = torch.randn(batch, 3, 64, 64, dtype=torch.float16)
+    weight = torch.randn(OUT_CHANNELS, 3, PATCH, PATCH, dtype=torch.float16)
+    assert _layouts_supported(x, weight) is True
+
+
+@pytest.mark.conv
 @pytest.mark.parametrize(
     "x_shape,w_shape,reason",
     [
-        ((2, 3, 64, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "batch > 1"),
         ((1, 65, 64, 64), (OUT_CHANNELS, 65, PATCH, PATCH), "in_channels > 64"),
         ((1, 3, 64, 64), (100, 3, PATCH, PATCH), "out_channels not a multiple of 64"),
         ((1, 3, 64), (OUT_CHANNELS, 3, PATCH, PATCH), "input not 4-D"),
@@ -171,15 +181,17 @@ def test_layouts_build_for_valid_shapes(out_ch, hw):
     ],
 )
 @pytest.mark.parametrize("use_bias", [False, True])
-def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias):
-    """On-card `F.conv2d` with tiled layouts matches a plain CPU `F.conv2d`."""
+@pytest.mark.parametrize("batch", [1, 2, 5])
+def test_patch_conv_matches_cpu_reference(patch, height, width, use_bias, batch):
+    """`F.conv2d` through `SpyreConv2d` matches a plain CPU `F.conv2d`, at any
+    batch size -- a granite-vision-style tile batch included."""
     if not spyre_available():
         pytest.skip("Spyre device not available")
 
     layer = _layer(kernel=patch, stride=patch, bias=use_bias)
 
     torch.manual_seed(3)
-    x = torch.randn(1, 3, height, width, dtype=torch.float16)
+    x = torch.randn(batch, 3, height, width, dtype=torch.float16)
     expected = F.conv2d(
         x,
         layer.weight.data,

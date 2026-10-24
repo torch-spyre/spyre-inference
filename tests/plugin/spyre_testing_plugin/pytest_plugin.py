@@ -64,6 +64,7 @@ import atexit
 import fnmatch
 import math
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -650,6 +651,26 @@ def _find_allow_entry(test_name: str, allow_list: tuple[AllowEntry, ...]) -> All
     return None
 
 
+# Architecture-specific model family exclusions for upstream tests
+_UNSUPPORTED_ARCH_MODELS: dict[str, tuple[str, ...]] = {
+    "ppc64le": ("qwen",),
+    "ppc64": ("qwen",),
+}
+
+
+def _is_unsupported_on_current_platform(item: pytest.Item) -> bool:
+    """Return True if the test item matches unsupported model families for the host architecture."""
+    arch = platform.machine()
+    patterns = _UNSUPPORTED_ARCH_MODELS.get(arch)
+    if not patterns:
+        return False
+    path_str = str(item.fspath).lower()
+    if any(pat in path_str for pat in patterns):
+        return True
+    params = getattr(getattr(item, "callspec", None), "params", {})
+    return any(any(pat in str(v).lower() for pat in patterns) for v in params.values())
+
+
 def _should_skip_params(item: pytest.Item, allow_entry: AllowEntry) -> bool:
     """Check if test should be skipped based on param_skips or param_allows.
 
@@ -690,10 +711,16 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         }
 
         upstream_marker = pytest.mark.upstream
+        deselected: list[pytest.Item] = []
 
-        for item in items:
+        for item in items[:]:
             test_path = Path(item.fspath).resolve()
             if not test_path.is_relative_to(upstream_tests_base):
+                continue
+
+            if _is_unsupported_on_current_platform(item):
+                items.remove(item)
+                deselected.append(item)
                 continue
 
             item.add_marker(upstream_marker)
@@ -743,6 +770,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             # Inject fixtures for tests that have fixture_names defined
             for fixture_name in allow_entry.fixture_names:
                 item.fixturenames.append(fixture_name)
+
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
 
     _signal_timeout_for_subprocess_tests(items)
     _reorder_tests_by_name(items)

@@ -214,6 +214,7 @@ def _encoder_rect_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    kv_extent=None,
 ):
     """Rectangular path: view ``[B*L, H, D]`` as the grid, attend, un-view. One graph.
 
@@ -221,13 +222,16 @@ def _encoder_rect_kernel(
     rather than standalone d2d copies; these kernels are dispatch-bound, so the
     launch count is what matters.
 
+    Key/value may have a shorter per-rectangle extent; query extent sizes the output.
+
     ``enable_gqa`` lets SDPA broadcast the KV heads itself, keeping operands 4-D: the
     rank-5 tensor an explicit expand would build is rejected by
     ``insert_restickify_padding``.
     """
     q = query.view(width, extent, num_heads, head_size).transpose(1, 2)
-    k = key.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
-    v = value.view(width, extent, num_kv_heads, head_size).transpose(1, 2)
+    kv_extent = extent if kv_extent is None else kv_extent
+    k = key.view(width, kv_extent, num_kv_heads, head_size).transpose(1, 2)
+    v = value.view(width, kv_extent, num_kv_heads, head_size).transpose(1, 2)
     attn = F.scaled_dot_product_attention(
         q,
         k,

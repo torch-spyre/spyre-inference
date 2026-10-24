@@ -641,6 +641,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     the dual-buffer device placement pattern.
     """
 
+    # True only while warmup compiles the fresh-prompt variant.
+    _warming_inline_prefill = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Store the real Spyre device before super().__init__ so that
         # _make_buffer can place .gpu tensors on Spyre directly.
@@ -1085,6 +1088,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
+                if attn_layer.warms_inline_prefill(size):
+                    # Compile the variant that a real all-fresh-prompt step selects.
+                    self._warming_inline_prefill = True
+                    try:
+                        self._dummy_run(size)
+                    finally:
+                        self._warming_inline_prefill = False
+                        attn_layer.clear_prefill_masks()
                 self._warmup_input_embedding(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
@@ -1435,7 +1446,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # pin this override to upstream's parameter order across vLLM bumps.
         num_tokens = kwargs.get("num_tokens", args[0] if args else None)
         if num_tokens is not None:
-            attn_layer.publish_null_slots(num_tokens)
+            attn_layer.publish_null_slots(num_tokens, inline_prefill=self._warming_inline_prefill)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:

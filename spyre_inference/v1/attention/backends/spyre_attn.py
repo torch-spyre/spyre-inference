@@ -876,6 +876,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
         self._slot_mapping.publish(slot_mapping)
+        # If every sequence is a fresh prompt, no page is read, so the forward can trace
+        # this step's attention into the block graph (see attn_layer).
+        fresh_prompts = (
+            apply_causal_mask
+            and not per_seq_only
+            and not self._is_pooling
+            and bool((seq_lens[:num_seqs] == query_lens).all())
+        )
+        self._slot_mapping.publish_prefill(
+            query_lens.tolist() if fresh_prompts else None, int(slot_mapping.shape[0])
+        )
 
         num_decode_seqs, _, num_decode_tokens, _ = split_decodes_and_prefills(
             common_attn_metadata,

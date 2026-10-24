@@ -42,10 +42,25 @@ def reshape_and_cache_head_major_kernel(
     # `key` is a strided view of the fused QKV projection, and the per-head slice of one
     # stores wrong values on device, so the source is materialized here. Not contiguous():
     # at one token the view already reports contiguous. clone() does not fix it either.
-    # Quantizing is an elementwise pass too, so it materializes the source the same way.
     if k_scale is None:
-        key = key * 1.0
-        value = value * 1.0
+        from torch_spyre._inductor import config as spyre_config
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        # Partition rows on whole 32-row int32 index sticks.
+        # Keep complete snapshots before any per-head scatter.
+        index_sticks = key.shape[0] // 32
+        row_owners = min(spyre_config.sencores, max(1, index_sticks))
+        while row_owners > 1 and index_sticks % row_owners:
+            row_owners -= 1
+        if key.shape[0] % 32:
+            row_owners = 1
+        dims = ["_untracked_cache_T", "_untracked_cache_H", "_untracked_cache_D"]
+        with spyre_hint(
+            named_dims=dims,
+            work_div={dims[0]: row_owners, dims[1]: 1, dims[2]: 1},
+        ):
+            key = key * 1.0
+            value = value * 1.0
     else:
         key = quantize_kv(key, k_scale, k_rows.dtype)
         value = quantize_kv(value, v_scale, v_rows.dtype)

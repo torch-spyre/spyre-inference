@@ -70,7 +70,24 @@ def _rotate_neox_2x2(
     """
     num_tokens = x.shape[0]
     inner = head_size // 2
-    x_pairs = x.view(num_tokens, -1, 2, inner)
+    if num_tokens == 512 and head_size == 128 and x.numel() // num_tokens in (256, 1024):
+        from torch_spyre._inductor.propagate_hints import spyre_hint
+
+        rows = f"_untracked_rope_rows_{num_tokens}"
+        heads = x.numel() // (num_tokens * head_size)
+        names = [
+            rows,
+            f"_untracked_rope_heads_{heads}",
+            "_untracked_2",
+            "_untracked_64",
+        ]
+        # The key is local geometry, not the TP degree: Q and K with eight local
+        # heads both match the 1024-wide case. A row-owned view lets the compiler
+        # compact an eligible fused projection view before the broadcast.
+        with spyre_hint(named_dims=names, work_div={rows: 32}):
+            x_pairs = x.view(num_tokens, -1, 2, inner)
+    else:
+        x_pairs = x.view(num_tokens, -1, 2, inner)
     out = (rot.unsqueeze(1) * x_pairs.unsqueeze(-3)).sum(dim=-2)
     return out.flatten(-2).view(x.shape)
 

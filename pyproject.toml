@@ -230,7 +230,7 @@ provides-extras = ["gdown", "scipy"]
 # spyre-rpms.lock is generated from this; after editing, re-run
 # `python3 scripts/lock_spyre_rpms.py`. Bump SPYRE_RPM_BUNDLE above with `bundle`.
 [tool.spyre-rpms]
-bundle = "main_nightly_2026_10_15"
+bundle = "main_nightly_2026_10_20"
 packages = [
   "ibm-aiu-toolbox-e2e",
   "ibm-deeptools",

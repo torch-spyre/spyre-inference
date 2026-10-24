@@ -12,34 +12,34 @@ version = 2
 tree = ""
 
 [bundle]
-id = "main_nightly_2026_10_15"
+id = "main_nightly_2026_10_20"
 
 [bundle.build_hashes]
 aiu-toolbox = "3307e2f9ae8747787b3ae5bcec5f88aed7d83c37"
-deeptools = "57e4f2f35fc3bc560cee32dffe031bc13cb08b00"
-flex = "e066296616826cbf3f32b13a5a5627408e7c65d9"
+deeptools = "3ea3067b66aee8deeb131debb659ebc634ba7ccc"
+flex = "fbad2ca4e01c6e10d4aa40acf44c42fc5699d4a9"
 libaiupti = "3c1815cb2f05cc501ff288c5cafd19806ddf9a49"
-senlib = "9b2385fa8aea16c23bfd2838b691ab92224f4d87"
-spyre-comms = "435e481696ea69228976228154f01f81651dfc8f"
+senlib = "cb9aa6103e29efa3a5b4191d0a9056add18cfac1"
+spyre-comms = "8e6c6b06b31a49198628862e34dee0961178af84"
 spyre-meta-rpm = "a8ee829aaced5915bedb8d7e6d9e0c57acb01de9"
-timestamp = "2026-10-16 02:02:37"
+timestamp = "2026-10-20 15:49:17"
 branch = "main"
-build_number = "301"
+build_number = "304"
 bundle_subpath = "main"
 
 # x86_64
 [packages]
-ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_173" }
-ibm-deeptools         = { version = "2.1.0-0.main.1+2831.57e4f2f_490" }
-ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2831.57e4f2f_490" }
-ibm-flex              = { version = "2.0.0-0.main.1+700.e066296_608" }
-ibm-flex-devel        = { version = "2.0.0-0.main.1+700.e066296_608" }
-ibm-senlib-core       = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-senlib-dd2        = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-senlib-headers    = { version = "2.0.0-0.main.1+316.9b2385f_451" }
-ibm-spyre-comms       = { version = "2.0.0-0.main.1+217.435e481_315" }
-ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+217.435e481_315" }
-ibm-libaiupti         = { version = "2.0.0-0.main.1+50.3c1815c_96" }
+ibm-aiu-toolbox-e2e   = { version = "2.0.0-0.main.1+39.3307e2f_175" }
+ibm-deeptools         = { version = "2.1.0-0.main.1+2851.3ea3067_499" }
+ibm-deeptools-devel   = { version = "2.1.0-0.main.1+2851.3ea3067_499" }
+ibm-flex              = { version = "2.0.0-0.main.1+712.fbad2ca_622" }
+ibm-flex-devel        = { version = "2.0.0-0.main.1+712.fbad2ca_622" }
+ibm-senlib-core       = { version = "2.0.0-0.main.1+323.cb9aa61_460" }
+ibm-senlib-dd2        = { version = "2.0.0-0.main.1+323.cb9aa61_460" }
+ibm-senlib-headers    = { version = "2.0.0-0.main.1+323.cb9aa61_460" }
+ibm-spyre-comms       = { version = "2.0.0-0.main.1+221.8e6c6b0_321" }
+ibm-spyre-comms-devel = { version = "2.0.0-0.main.1+221.8e6c6b0_321" }
+ibm-libaiupti         = { version = "2.0.0-0.main.1+50.3c1815c_98" }
 
 # Power
 [overrides.ppc64le]

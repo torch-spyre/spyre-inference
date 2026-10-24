@@ -158,9 +158,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
-
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -368,15 +365,16 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
-        The token budget ``R`` is the only input. Both other limits are written back
-        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
-        shape every encoder path runs on.
+        ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
+        one entry when the model fits in the 2048-row body, and one entry per body when
+        ``max_model_len`` is longer — a step pads to the smallest of those.
 
-        The scheduler is left alone -- the ragged path means no batch upstream can form
-        has to be refused.
+        The scheduler token cap stays the largest body, so one max-length sequence can
+        be scheduled. The ragged path still covers a batch no rectangle holds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -389,18 +387,17 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # vLLM's verify_max_model_len runs before this hook, so the floor
-        # `encoder_budget_rows` applies is not checked for us.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
+        # fast body; `encoder_budget_rows` then floors back up to max_model_len when
+        # the model is longer, which is the scheduler cap.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
+        full_budget = encoder_budget_rows(
+            max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+        )
 
         # The shortest length carries the widest rectangle, so no batch ever needs more
         # width than the ladder offers.
-        widest = max(
-            1,
-            encoder_budget_rows(
-                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
-            )
-            // ENCODER_SEQ_ALIGNMENT,
-        )
+        widest = max(1, full_budget // ENCODER_SEQ_ALIGNMENT)
         if prev_num_seqs > widest:
             logger.warning(
                 "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
@@ -411,24 +408,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
-        budget = encoder_shape_tables(vllm_config).budget
-        scheduler_config.max_num_batched_tokens = budget
-
-        # One body shape: every rectangle is exactly `budget` rows and the ragged path
-        # packs into the same buffer, so the attention kernels key on sequence shapes
-        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        # Restore the scheduler cap before the tables are memoised. The worker reads
+        # the same limits, and a table built against the temporary 2048 cap would be a
+        # different cache entry from the one serving uses. That restored cap is the
+        # largest body, so the tables do not change it again.
+        scheduler_config.max_num_batched_tokens = full_budget
+        tables = encoder_shape_tables(vllm_config)
+        # A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
-            vllm_config.compilation_config.compile_sizes = [budget]
+            vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; ragged groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
+            "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
-            budget,
-            budget,
+            tables.budget,
+            list(tables.budgets),
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )

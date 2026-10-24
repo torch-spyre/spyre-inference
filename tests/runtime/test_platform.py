@@ -265,6 +265,19 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     assert vllm_config.compilation_config.compile_sizes == [512]
 
 
+def test_apply_config_keeps_a_fast_body_when_the_model_is_longer_than_2k():
+    """bge-reranker-v2-m3 at 8K. The scheduler can still accept one 8K sequence,
+    but compile sizes include the 2K and 4K bodies so shorter steps do not pad to 8K."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [2048, 4096, 8192]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 8192
+
+
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
     from spyre_inference.platform import TorchSpyrePlatform
 

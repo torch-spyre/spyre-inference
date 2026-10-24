@@ -186,6 +186,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         runner._spyre_kv_caches = {}
         runner._encoder_budget = max(bucket_sizes, default=64)
         runner._encoder_rectangles = []
+        runner._encoder_groups_by_rows = {}
         runner._pooling_on_spyre = False
 
         attn = Attention(

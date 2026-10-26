@@ -22,8 +22,13 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import (
+    Gemma4ForCausalLM,
+    Gemma4SelfDecoderLayers,
+)
 
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
@@ -161,6 +166,18 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
+def reject_masked_per_layer_vocab(decoder: SpyreGemma4SelfDecoderLayers) -> None:
+    """Reject PLE vocab masking, which torch-spyre cannot lower for integer inputs."""
+    if decoder.embed_tokens_per_layer is None:
+        return
+    per_layer, full = decoder.vocab_size_per_layer_input, decoder.config.vocab_size
+    if per_layer < full:
+        raise NotImplementedError(
+            f"Gemma-4 per-layer embeddings on Spyre require vocab_size_per_layer_input "
+            f">= vocab_size (got {per_layer} < {full})."
+        )
+
+
 def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Fold Gemma's output scale into the source down-projection stack."""
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
@@ -190,11 +207,63 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
     return configured
 
 
+class _PerLayerRows(torch.Tensor):
+    """Return materialized PLE rows to avoid nonzero-offset views (torch-spyre#3770)."""
+
+    # No subclass propagation: only the instance the projection hands back carries rows.
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
+class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
+    @maybe_compile
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            ple[:, layer_idx, :].clone() for layer_idx in range(self.config.num_hidden_layers)
+        )
+
+    def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        if self.embed_tokens_per_layer is None:
+            return None
+        per_layer_embeds = self.embed_tokens_per_layer(input_ids) * self.embed_scale_per_layer
+        return per_layer_embeds.reshape(
+            *input_ids.shape,
+            self.config.num_hidden_layers,
+            self.hidden_size_per_layer_input,
+        )
+
+    def project_per_layer_inputs(
+        self,
+        inputs_embeds: torch.Tensor,
+        per_layer_inputs: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        ple = super().project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+        if ple is None:
+            return None
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple)
+        return rows
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
+    """Gemma-4 adapted for the Spyre compile path, with Spyre MoE expert dispatch."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        decoder = retype(self.model.self_decoder, SpyreGemma4SelfDecoderLayers)
+        reject_masked_per_layer_vocab(decoder)
+        decoder.arm_outer_compile()
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
         # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
         is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(

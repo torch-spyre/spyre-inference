@@ -124,7 +124,7 @@ state. Prefer a documented upstream extension point where one exists: `CustomOp.
 `PluggableLayer.register_oot` for a layer, and — for a MoE — the quant-method seam the
 unquantized oracle leaves open for an out-of-tree platform.
 
-Two adaptations worth knowing:
+Three adaptations worth knowing:
 
 - **BERT / RoBERTa** (`models/_token_type.py`) carry `token_type_ids` in a side buffer
   owned by the embedding instead of vLLM's bit-pack into the high bits of `input_ids`,
@@ -156,6 +156,19 @@ Two adaptations worth knowing:
   `MoERunner`, takes vLLM's direct `_moe_forward` entry — as upstream does on CPU and TPU —
   instead of the opaque `torch.ops.vllm.moe_forward` custom op, so a compiled block traces
   the expert forms into its own graph; an eager run dispatches them to compiled regions.
+- **Gemma-4** (`models/gemma4.py`) carries two repairs. The self-decoder is retyped for two
+  per-layer-embedding (PLE) operations, both no-ops on a checkpoint without PLE: a mask
+  upstream builds as a `torch.bool` result over an int32 operand is dropped, and `project_per_layer_inputs` returns
+  a tensor subclass whose `[:, layer_idx, :]` — the backbone loop's per-block cut — hands back
+  a row pre-materialized at offset zero by one compiled graph, since a compiled block reads a
+  nonzero-offset view from offset 0
+  ([torch-spyre#3770](https://github.com/torch-spyre/torch-spyre/issues/3770)). Lastly,
+  `force_text_backbone` points a gemma-4 config at its text-only backbone through
+  `hf_overrides`, rebuilding the `global_*` head / kv-head attributes vLLM's builder reads and
+  transformers >=5.16 consumes into `per_layer_config`. A PLE checkpoint consequently rejects
+  three configurations up front: `SPYRE_COMPILE_GRANULARITY=model`, `kv_sharing_fast_prefill`,
+  and a narrower `vocab_size_per_layer_input` than `vocab_size` — that last one is the dropped
+  mask's own precondition, and torch-spyre lowers the mask in neither compile nor eager mode.
 
 ### MoE expert weights
 
@@ -280,7 +293,8 @@ eager form. `lm_head` is never in a block graph either — `compute_logits` is a
 on the wrapper — so its projection compiles its own graph, over row widths warmup pads onto (see [Decoder compile buckets](../user_guide/configuration.md#decoder-compile-buckets)).
 
 `SPYRE_COMPILE_GRANULARITY=model` restores the whole-model fullgraph, whose compile cost
-grows with layer count.
+grows with layer count. A model with per-layer embeddings rejects it: its PLE row cut has to
+stay outside the graph.
 
 ## Vision encoders
 
@@ -384,6 +398,18 @@ The compiled kernels themselves — the per-sequence page attention, the batched
 path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
 the host-side orchestration that calls them.
+
+### Cross-layer KV sharing
+
+Gemma-4's per-layer-embedding checkpoints (E2B, E4B) are the first models here to
+share a KV cache across layers (`num_kv_shared_layers`), so the runner's aliasing in
+`initialize_kv_cache_tensors` — which points a sharing layer's cache at its target's —
+went from dead code to load-bearing. One gap sits above it: vLLM adds a sharing layer to
+its target's KV cache group but not to that group's `UniformTypeKVCacheSpecs`, so the
+per-layer spec lookup in `initialize_attn_backend` cannot find it. The runner resolves
+those specs into a throwaway copy of the config before delegating upward, and skips the
+whole step for a model without KV sharing. `kv_sharing_fast_prefill` is rejected outright
+for per-layer-embedding models (see Model Adaptations).
 
 Because attention kernels are `dynamic=False` too, they are pre-compiled during warmup
 rather than lazily on first use: by default (`SPYRE_ATTN_RECORD=1`) warmup records

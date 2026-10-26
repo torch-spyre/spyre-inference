@@ -21,6 +21,7 @@ lib.runHelper([
   '--nfs-root', root,
   '--local-dir', local,
   ...lib.keyFileArgs(lib.getState('keyfiles')),
+  '--key', lib.getState('key'),
   '--compress', lib.getState('compress') || 'none',
   '--keep', lib.getState('keep') || '5',
   '--event-name', process.env.GITHUB_EVENT_NAME || '',

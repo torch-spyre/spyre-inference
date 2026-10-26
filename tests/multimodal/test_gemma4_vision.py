@@ -332,25 +332,6 @@ def test_padded_rope_matches_transformers_reference():
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.rotary
-def test_rope_cos_sin_padding_lanes_are_the_identity_rotation():
-    """Padding lanes must rotate by nothing (cos=1, sin=0) so a padded channel that
-    is not exactly zero still cannot leak into a real one."""
-    from spyre_inference.multimodal.gemma4_vision import _gemma4_rope_cos_sin
-
-    config = _vision_config()
-    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
-    cos, sin = _gemma4_rope_cos_sin(rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32)
-
-    assert cos.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
-    assert sin.shape == (1, NUM_PATCHES, 1, PADDED_HEAD_DIM)
-    quarter = ORIG_HEAD_DIM // 4
-    half = PADDED_HEAD_DIM // 2
-    for lanes in (slice(2 * quarter, half), slice(half + 2 * quarter, PADDED_HEAD_DIM)):
-        assert torch.all(cos[..., lanes] == 1.0)
-        assert torch.all(sin[..., lanes] == 0.0)
-
-
 @pytest.mark.parametrize(
     ("head_dim", "dtype"), [(8, torch.float32), (64, torch.float16)], ids=["small", "stick"]
 )
@@ -536,27 +517,6 @@ def test_fp32_inv_freq_resolves_the_rope_type_off_the_module_not_the_registry():
     inv_freq, attention_scaling = _fp32_inv_freq(AxialRotary(), config)
     assert inv_freq.shape == (ORIG_HEAD_DIM // 4,)
     assert attention_scaling == 2.0
-
-
-def test_rope_cos_sin_applies_attention_scaling_to_the_real_lanes_only():
-    from spyre_inference.multimodal.gemma4_vision import _gemma4_rope_cos_sin
-
-    config = _vision_config()
-    rope = modeling_gemma4.Gemma4VisionRotaryEmbedding(config)
-    args = (rope.inv_freq, _position_ids(), PADDED_HEAD_DIM, torch.float32)
-    cos, sin = _gemma4_rope_cos_sin(*args)
-    cos_scaled, sin_scaled = _gemma4_rope_cos_sin(*args, 2.0)
-
-    quarter = ORIG_HEAD_DIM // 4
-    half = PADDED_HEAD_DIM // 2
-    real = [slice(0, 2 * quarter), slice(half, half + 2 * quarter)]
-    pad = [slice(2 * quarter, half), slice(half + 2 * quarter, PADDED_HEAD_DIM)]
-    for lanes in real:
-        torch.testing.assert_close(cos_scaled[..., lanes], 2.0 * cos[..., lanes])
-        torch.testing.assert_close(sin_scaled[..., lanes], 2.0 * sin[..., lanes])
-    for lanes in pad:
-        assert torch.all(cos_scaled[..., lanes] == 1.0)
-        assert torch.all(sin_scaled[..., lanes] == 0.0)
 
 
 # ---------------------------------------------------------------------------

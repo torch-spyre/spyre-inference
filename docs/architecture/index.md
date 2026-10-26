@@ -248,15 +248,11 @@ every image-batch width up to `mm_max_items_per_batch`, for pooling and generati
 alike, and the compile guard watches its blocks like the decoder's: a tower compile after
 warmup is a shape warmup missed. A tower whose per-image shape varies beyond the batch
 width (a patch budget, an aspect ratio) has to make that shape enumerable before it is
-marked. Gemma 4's tower is marked too (`multimodal/gemma4_vision.py`): its rope half-swap
-is a buffer, and its key-pad mask is one row per image built in the encoder forward from
-the image's patch count, since the processor pads an image's patches after its content.
-Every image is padded to the patch count `max_soft_tokens` fixes, so the image-batch widths
-warmup runs are the shapes image serving sees. Not covered: a per-request `max_soft_tokens`
-(vLLM accepts one per prompt), and a video, whose frames reach the tower in memory-sized
-chunks at their own budget; those compile on first use and the guard reports them at its
-default `warn` level. At `error` the guard refuses them like any other unwarmed watched
-shape, so a deployment serving video keeps `warn`.
+marked. Gemma 4's tower is not marked: `SpyreGemma4ForConditionalGeneration`
+(`models/gemma4_mm.py`) runs it on the vision encoder mixin below, compiled per token
+budget, and rejects video. The budgets stop at the largest image the engine's
+`max_soft_tokens` allows, so a request passing a larger `max_soft_tokens` compiles on first
+use: the guard reports it at its default `warn` level and refuses it at `error`.
 
 Blocks of one class share one `forward` code object, so Dynamo traces the first and the
 rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
@@ -310,19 +306,19 @@ upstream: an *image token* is one position of `vision_project`'s output, counted
 budgets and `EncoderItemSpec.output_tokens`, and host inputs hold one entry per *patch*,
 `patches_per_token` per image token.
 
-| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) |
-|---|---|---|---|
-| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size |
-| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image |
-| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions |
-| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask |
-| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` |
-| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter |
-| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default |
-| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none |
-| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default |
-| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) |
-| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` |
+| Hook | Required | Purpose | Native Pixtral (`models/pixtral.py`) | Gemma 4 (`models/gemma4_mm.py`) |
+|---|---|---|---|---|
+| `vision_buffers`, `patches_per_token`, `out_hidden_size` | yes | host inputs (fp16, or integer indices) and their padding values; patches per image token; output width | patches, one-hot segments, positions; `M²`; text hidden size | patches, one-hot segments, x and y positions; `k²` (pooling kernel); text hidden size |
+| `vision_item_tokens(mm_kwargs)` | yes | image tokens per item, for packing into budgets | patches / `M²` per image | valid patches / `k²` per image |
+| `vision_inputs(mm_kwargs)` | yes | host buffers, unpadded; validated against `vision_buffers` | offset-major patches, segments, RoPE positions | valid patches only, offset-major by position; segments; x and y |
+| `vision_embed(values)` | yes | graph 1: patches -> block input embeddings and shared block inputs | patch linear, `ln_pre`, image mask | patch linear plus position embeddings and RoPE, gathered per axis; image mask |
+| `vision_blocks()` | yes | graph 2: blocks sharing one artifact | `TransformerBlock`s with `SpyrePixtralAttention` | stock encoder layers, their attention and norm instances switched to Spyre subclasses |
+| `vision_project(x, taps)` | yes | graph 3: merge or pool, then project into the text space | projector norm, patch merge, adapter | the `k×k` pool only; the tail runs in `postprocess_encoder_output` |
+| `vision_call_block` | no | block call convention (default `block(x, **kw)`) | default | default |
+| `vision_taps` | no | intermediate hidden states passed to `vision_project` | none | none |
+| `vision_pad_groups`, `vision_patch_multiple` | no | padding layout and alignment (default: one group per merge offset, 64-wide sticks) | default | default (576 patches at `k = 3`) |
+| `vision_max_items_per_call` | no | layout bound on items per encoder call | 63 (one-hot width) | 63 (one-hot width) |
+| `vision_modalities` | no | modalities run through the graphs; others go to upstream's `embed_multimodal` | `("image",)` | `("image",)`; video is rejected |
 
 Two upstream protocol methods are also the extension points for model-specific shapes, used
 as upstream models use them: override `postprocess_encoder_output` when placeholder embeddings
@@ -331,7 +327,10 @@ host), and `get_encoder_cudagraph_budget_range` when the processor's largest ite
 in the encoder's image tokens. The mixin owns the other protocol methods tied to the layout (replay buffers, item specs,
 capture inputs, forward), so an upstream class's own versions of those are always shadowed. `select_encoder_cudagraph_items` and `get_input_modality` come from the
 upstream class when it implements the protocol (Gemma 3/4, Qwen-VL), else from the model;
-upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. The eager
+upstream Pixtral does not, so `SpyrePixtralForConditionalGeneration` writes them. Gemma 4
+overrides `postprocess_encoder_output` to run its tail on the host in fp32, as upstream does:
+the pooler's `sqrt(hidden_size)` scale can leave the fp16 range, so the scale, standardize and
+`embed_vision` never run on the card, and its graphs end at the pooled vision hidden size. The eager
 (`enforce_eager`) path runs the same hooks uncompiled. Upstream's processor, weight mapper,
 placeholders and `embed_input_ids` are inherited unchanged.
 

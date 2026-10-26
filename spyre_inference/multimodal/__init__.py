@@ -17,7 +17,8 @@
 One module per architecture, each exposing `apply(model, device)`. These monkeypatch
 upstream vLLM model code, unlike `custom_ops/`, which registers out-of-tree
 implementations by layer class. Architectures migrated to a registered subclass on
-`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral) are not patched here.
+`models._vision_encoder.SpyreVisionEncoderMixin` (native Pixtral, Gemma 4) are not patched
+here.
 """
 
 import torch

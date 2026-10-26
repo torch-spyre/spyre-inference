@@ -15,8 +15,10 @@
 """Gemma 4 vision-tower workarounds for Spyre.
 
 vLLM loads the tower with plain ``AutoModel.from_config``, so it is stock
-transformers code outside vLLM's layer registries. ``apply()`` is the only entry point.
-The tensor math follows hf-adapters#495.
+transformers code outside vLLM's layer registries. The tensor math follows hf-adapters#495.
+``models/gemma4_mm.py`` adapts ``Gemma4ForConditionalGeneration`` with the helpers and
+layers here; ``apply()`` patches the tower only for architectures with no Spyre subclass
+that build it too (``DiffusionGemma``, ``EmbeddingGemma2``).
 """
 
 from __future__ import annotations
@@ -212,14 +214,10 @@ def _padded_rms_norm(
     return hidden_states
 
 
-def _gemma4_rope_cos_sin(
-    inv_freq: torch.Tensor,
-    position_ids: torch.Tensor,
-    padded_head_dim: int,
-    dtype: torch.dtype,
-    attention_scaling: float = 1.0,
+def gemma4_rope_tables(
+    inv_freq: torch.Tensor, size: int, padded_head_dim: int, attention_scaling: float = 1.0
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin tables for `rope_rotate_matmul`.
+    """`[2, size, D]` cos and signed-sin per axis; patch (x, y) sums rows [0, x], [1, y].
 
     Gemma 4 vision rotates its two position axes independently, each with its own
     `rotate_half` (stock `apply_multidimensional_rope`). `_pad_qk_linear` packs the padded
@@ -230,23 +228,40 @@ def _gemma4_rope_cos_sin(
     `attention_scaling` (stock applies it to the whole table) scales the real lanes only;
     the padded ones stay an exact identity rotation.
     """
-    positions = position_ids.to("cpu").clamp(min=0).float()
-    angles = positions[..., None] * inv_freq.to("cpu").float()  # [bsz, seq, 2, quarter]
+    quarter = inv_freq.shape[0]
+    half = padded_head_dim // 2
+    angles = torch.arange(size, dtype=torch.float32)[:, None] * inv_freq.float()
     cos_axis = angles.cos() * attention_scaling
     sin_axis = angles.sin() * attention_scaling
-    bsz, seq_len, _, quarter = cos_axis.shape
-    half = padded_head_dim // 2
-    cos_half = torch.ones(bsz, seq_len, half)
-    sin_half_neg = torch.zeros(bsz, seq_len, half)
-    sin_half_pos = torch.zeros(bsz, seq_len, half)
+    cos = torch.zeros(2, size, padded_head_dim)
+    sin = torch.zeros(2, size, padded_head_dim)
     for axis in range(2):
-        start, end = axis * quarter, axis * quarter + quarter
-        cos_half[..., start:end] = cos_axis[:, :, axis, :]
-        sin_half_neg[..., start:end] = -sin_axis[:, :, axis, :]
-        sin_half_pos[..., start:end] = sin_axis[:, :, axis, :]
-    cos_full = torch.cat([cos_half, cos_half], dim=-1).unsqueeze(2)  # [bsz, seq, 1, D]
-    sin_full = torch.cat([sin_half_neg, sin_half_pos], dim=-1).unsqueeze(2)
-    return cos_full.to(dtype), sin_full.to(dtype)
+        lanes = slice(axis * quarter, (axis + 1) * quarter)
+        upper = slice(half + axis * quarter, half + (axis + 1) * quarter)
+        cos[axis, :, lanes] = cos_axis
+        cos[axis, :, upper] = cos_axis
+        sin[axis, :, lanes] = -sin_axis
+        sin[axis, :, upper] = sin_axis
+    cos[0, :, 2 * quarter : half] = 1.0
+    cos[0, :, half + 2 * quarter :] = 1.0
+    return cos, sin
+
+
+def _gemma4_rope_cos_sin(
+    inv_freq: torch.Tensor,
+    position_ids: torch.Tensor,
+    padded_head_dim: int,
+    dtype: torch.dtype,
+    attention_scaling: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[bsz, seq, 1, padded_head_dim]` cos and signed-sin per patch, from `gemma4_rope_tables`."""
+    positions = position_ids.to("cpu").clamp(min=0).long()
+    size = int(positions.max()) + 1
+    cos, sin = gemma4_rope_tables(inv_freq.to("cpu"), size, padded_head_dim, attention_scaling)
+    x, y = positions[..., 0], positions[..., 1]
+    cos_rows = (cos[0, x] + cos[1, y]).unsqueeze(2)
+    sin_rows = (sin[0, x] + sin[1, y]).unsqueeze(2)
+    return cos_rows.to(dtype), sin_rows.to(dtype)
 
 
 def _fp32_inv_freq(rotary_emb, config) -> tuple[torch.Tensor, float]:
@@ -344,11 +359,13 @@ def _prepare_attention(attn, num_heads: int, orig_head_dim: int, padded_head_dim
     )
     # A buffer: an index write inside a compiled block has no device layout. Projection
     # dtype, not the norm's: transformers builds RMSNorm weights fp32, which would promote.
-    attn.register_buffer(
-        "spyre_rope_swap",
-        rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
-        persistent=False,
-    )
+    # Only for a `__class__`-swapped instance (`apply()`), which skipped the constructor's.
+    if "spyre_rope_swap" not in attn._buffers:
+        attn.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", padded_head_dim, device, attn.q_proj.linear.weight.dtype),
+            persistent=False,
+        )
     attn._spyre_padded_head_dim = padded_head_dim
 
 
@@ -362,6 +379,15 @@ class SpyreGemma4VisionAttention(modeling_gemma4.Gemma4VisionAttention):
     """Padded rope + `padded_sdpa` over the head dim `pad_vision_weights` padded to."""
 
     spyre_rope_swap: torch.Tensor
+
+    def __init__(self, config, layer_idx: int) -> None:
+        super().__init__(config, layer_idx)
+        weight = self.q_proj.linear.weight
+        self.register_buffer(
+            "spyre_rope_swap",
+            rope_perm_matrix("half", _padded_head_dim(self.head_dim), weight.device, weight.dtype),
+            persistent=False,
+        )
 
     def forward(  # ty: ignore[invalid-method-override]
         self,

@@ -159,7 +159,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "4cc089379a82a1cf315d781808708c702fcdb829" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "c79a93c82560591c2101acb34d25a7bd4886db6e" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -369,7 +369,7 @@ markers = [
     "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
     "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
-    "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
     "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",

@@ -137,8 +137,8 @@ def _dma_checkpoint_qfp8wt(weight: torch.Tensor) -> torch.Tensor:
     """
     from torch_spyre.model_utils import _dma_to_spyre_fp8_kernel
 
-    host = weight.detach().cpu().contiguous()
-    qweight = _dma_to_spyre_fp8_kernel(host)
+    assert weight.device.type == "cpu"
+    qweight = _dma_to_spyre_fp8_kernel(weight.contiguous())
     _require_qfp8wt(qweight)
     return qweight
 

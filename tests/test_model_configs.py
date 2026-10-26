@@ -54,9 +54,13 @@ def test_all_configs_are_typed():
     [
         "google/gemma-3-1b-it",
         "google/gemma-4-26B-A4B-it",
+        "ibm-granite/granite-4.1-3b",
+        "ibm-granite/granite-3.3-8b-instruct",
         "ibm-granite/granite-4.1-8b",
         "ibm-granite/granite-4.1-8b-fp8",
         "ibm-granite/granite-vision-4.1-4b",
+        "google-bert/bert-base-uncased",
+        "google-bert/bert-large-uncased",
         "sentence-transformers/all-MiniLM-L6-v2",
         "sentence-transformers/all-roberta-large-v1",
         "openai/clip-vit-base-patch32",

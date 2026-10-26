@@ -33,6 +33,7 @@ from vllm import LLM, RequestOutput, SamplingParams
 pytestmark = [pytest.mark.model_quality, pytest.mark.uses_subprocess]
 
 DECODER_MODELS = [
+    "ibm-granite/granite-4.1-3b",
     "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",

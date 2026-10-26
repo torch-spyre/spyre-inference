@@ -27,16 +27,19 @@ models:
         max_num_seqs: 32
 
   # ---- Granite decoder models ------------------------------------------
+  ibm-granite/granite-4.1-3b:
+    platforms: [x86_64, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 32768
+        max_num_seqs: 32
+
   ibm-granite/granite-3.3-8b-instruct:
     platforms: [x86_64, ppc64le]
     serving_configs:
       - tp_size: 1
         max_model_len: 4096
         max_num_seqs: 32
-
-  ibm-granite/granite-3.3-8b-instruct:
-    platforms: [x86_64, ppc64le]
-    serving_configs:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
@@ -54,10 +57,6 @@ models:
       - tp_size: 1
         max_model_len: 4096
         max_num_seqs: 32
-
-  ibm-granite/granite-4.1-8b-fp8:
-    platforms: [x86_64, ppc64le]
-    serving_configs:
       - tp_size: 4
         max_model_len: 32768
         max_num_seqs: 32
@@ -71,6 +70,20 @@ models:
         max_num_seqs: 16
 
   # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
+
+  google-bert/bert-base-uncased:
+    platforms: [x86_64, s390x, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 256
+
+  google-bert/bert-large-uncased:
+    platforms: [x86_64, s390x, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 128
 
   sentence-transformers/all-MiniLM-L6-v2:
     platforms: [x86_64, s390x]

@@ -33,6 +33,8 @@ from vllm import LLM
 from vllm.config import PoolerConfig
 
 EMBEDDING_MODELS = [
+    "google-bert/bert-base-uncased",
+    "google-bert/bert-large-uncased",
     "ibm-granite/granite-embedding-125m-english",
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",

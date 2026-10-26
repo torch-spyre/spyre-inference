@@ -14,7 +14,7 @@
 
 import math
 import warnings
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
@@ -1693,6 +1693,42 @@ def test_install_patches_layers_not_the_attention_class():
     # No cache bound, so there is no device to mirror onto and nothing to publish.
     holder.publish_null(8)
     assert holder.slots is None
+
+
+def test_kv_sharing_layer_is_staged_but_never_writes_the_cache():
+    """A KV-sharing layer still needs the staging buffers, or the decode kernel sees a
+    bucket-sized query and recompiles; its K/V are None and its cache is the target's."""
+    from types import MethodType
+
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention import attn_layer
+
+    layer = _StubAttentionLayer(AttentionType.DECODER)
+    layer.kv_sharing_target_layer_name = "layers.0.self_attn.attn"
+    layer.num_heads, layer.num_kv_heads, layer.head_size, layer.head_size_v = 2, 1, 4, 4
+    layer.layer_name = "layers.1.self_attn.attn"
+    staged = (torch.zeros(8, 2, 4), torch.full((8, 2, 4), 7.0))
+    layer.impl.staging_buffers = MagicMock(return_value=staged)
+
+    holder = attn_layer.install([layer])
+    assert layer.forward.__func__ is attn_layer._spyre_attention_forward
+    holder.slots = torch.zeros(3, dtype=torch.int64)
+
+    seen = []
+    with patch.object(
+        torch.ops.vllm,
+        "unified_attention_with_output",
+        lambda q, k, v, out, name, **kw: seen.append(q),
+        create=True,
+    ):
+        out = MethodType(attn_layer._spyre_attention_forward, layer)(
+            torch.ones(3, 8), torch.ones(3, 4), torch.ones(3, 4)
+        )
+
+    layer.impl.do_kv_cache_update.assert_not_called()
+    assert seen[0] is staged[0], "the kernel must see the constant-shaped staging buffer"
+    assert torch.equal(out, torch.full((3, 8), 7.0))
 
 
 @pytest.mark.parametrize(

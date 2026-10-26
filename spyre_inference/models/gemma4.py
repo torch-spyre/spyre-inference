@@ -17,13 +17,15 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
-from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM, Gemma4SelfDecoderLayers
 
+from spyre_inference.custom_ops.lazy_compile import CompileOutermost, maybe_compile
+from spyre_inference.models._retype import retype
 from spyre_inference.moe import SpyreMoERecipe, configure_spyre_moe_layer
 
 if TYPE_CHECKING:
@@ -190,11 +192,60 @@ def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
     return configured
 
 
+class _PerLayerRows(torch.Tensor):
+    """PLE tensor whose ``[:, layer_idx, :]`` returns a row with its own storage, so all
+    layers share one compiled block (a view's storage_offset is guarded per layer)."""
+
+    __torch_function__ = torch._C._disabled_torch_function_impl  # ty: ignore[invalid-method-override]
+
+    spyre_rows: tuple[torch.Tensor, ...]
+
+    def __getitem__(self, index: Any) -> torch.Tensor:
+        if (
+            isinstance(index, tuple)
+            and len(index) == 3
+            and index[0] == index[2] == slice(None)
+            and isinstance(index[1], int)
+        ):
+            return self.spyre_rows[index[1]]
+        return torch.Tensor.__getitem__(self, index)
+
+
+class SpyreGemma4SelfDecoderLayers(CompileOutermost, Gemma4SelfDecoderLayers):
+    def get_per_layer_inputs(self, input_ids: torch.Tensor) -> torch.Tensor | None:
+        # Drops upstream's in-vocab mask: no Spyre lowering, and a no-op when every
+        # token has a per-layer row (checked at retype).
+        embed = cast("nn.Module", self.embed_tokens_per_layer)
+        per_layer_embeds = embed(input_ids) * self.embed_scale_per_layer
+        return per_layer_embeds.reshape(
+            *input_ids.shape, self.config.num_hidden_layers, self.hidden_size_per_layer_input
+        )
+
+    @maybe_compile
+    def split_per_layer_inputs(self, ple: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        # One graph: L eager clones would cost L host launches per step.
+        return tuple(ple[:, i, :].clone() for i in range(self.config.num_hidden_layers))
+
+    def project_per_layer_inputs(self, inputs_embeds, per_layer_inputs):
+        ple = cast(torch.Tensor, super().project_per_layer_inputs(inputs_embeds, per_layer_inputs))
+        rows = ple.as_subclass(_PerLayerRows)
+        rows.spyre_rows = self.split_per_layer_inputs(ple)
+        return rows
+
+
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
     """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        decoder = self.model.self_decoder
+        if decoder.embed_tokens_per_layer is not None:
+            if decoder.vocab_size_per_layer_input < self.config.vocab_size:
+                raise NotImplementedError(
+                    "Gemma-4 per-layer embeddings on Spyre need vocab_size_per_layer_input "
+                    ">= vocab_size."
+                )
+            retype(decoder, SpyreGemma4SelfDecoderLayers).arm_outer_compile()
         # Without the recipe the experts run upstream's path, which is wrong on Spyre.
         # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
         is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(

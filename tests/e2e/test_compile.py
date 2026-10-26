@@ -63,8 +63,20 @@ _COSINE_MIN = 0.99
             "\n\nWhat is the difference between a product and a service?\n\nWhat is the",
             GEMMA4_TEXT_BACKBONE_OVERRIDE,
         ),
+        # Per-layer embeddings and cross-layer KV sharing.
+        (
+            "google/gemma-4-E2B",
+            "\n\nWhat is the main business of IBM?\n\nWhat is the main business of",
+            GEMMA4_TEXT_BACKBONE_OVERRIDE,
+        ),
     ],
-    ids=["micro-g3.3", "gemma-3-1b-it", "gemma-4-31B-text", "gemma-4-26B-A4B-text"],
+    ids=[
+        "micro-g3.3",
+        "gemma-3-1b-it",
+        "gemma-4-31B-text",
+        "gemma-4-26B-A4B-text",
+        "gemma-4-E2B-text",
+    ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
     """Construct `vllm.LLM(enforce_eager=False)` end-to-end.

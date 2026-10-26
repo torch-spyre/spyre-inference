@@ -725,6 +725,11 @@ class TorchSpyrePlatform(CpuPlatform):
                 f"(got {parallel_config.pipeline_parallel_size})."
             )
 
+        # YOCO fast prefill swaps in its own attention backend and metadata, which the
+        # Spyre backend does not provide.
+        if vllm_config.cache_config.kv_sharing_fast_prefill:
+            raise ValueError("Spyre does not support kv_sharing_fast_prefill.")
+
         # torch-spyre's all_reduce is float16-only on both paths: eager SpyreCCLBackend
         # rejects bfloat16 outright, and the compiled `spyre.allreduce_plan` lowering has
         # no bfloat16 `add`. Reject here rather than crash minutes into warmup.

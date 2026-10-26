@@ -1101,6 +1101,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Offline engine in the calling process
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#pyprojecttoml-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1748,6 +1759,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Offline engine in the calling process
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#pyprojecttoml-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2088,6 +2110,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#offline-engine-in-the-calling-process" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Offline engine in the calling process
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#pyprojecttoml-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2303,6 +2336,16 @@ relying on it.</p>
 different KV scales therefore compiles the transformer block and each recorded attention
 kernel once per distinct pair of scales, which lengthens warmup; one without scales
 compiles them once, as an fp16 cache does.</p>
+<h2 id="offline-engine-in-the-calling-process">Offline engine in the calling process<a class="headerlink" href="#offline-engine-in-the-calling-process" title="Permanent link">&para;</a></h2>
+<p>At <code>tensor_parallel_size=1</code>, set <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> to run the offline
+<code>LLM</code> engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. <code>vllm serve</code> always spawns EngineCore.</p>
+<p>The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves <code>RANK</code>/<code>WORLD_SIZE</code>
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with <code>tensor_parallel_size &gt; 1</code> in a new process. Set
+<code>OMP_WAIT_POLICY=PASSIVE</code> before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.</p>
 <h2 id="pyprojecttoml-reference">pyproject.toml Reference<a class="headerlink" href="#pyprojecttoml-reference" title="Permanent link">&para;</a></h2>
 <p>The <code>pyproject.toml</code> includes several key build configurations:</p>
 <h3 id="build-configuration">Build Configuration<a class="headerlink" href="#build-configuration" title="Permanent link">&para;</a></h3>

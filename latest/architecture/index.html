@@ -2573,7 +2573,7 @@ sub-stick half) run directly in the compiled graph (see below).</p>
 <td>FP8 <code>ColumnParallelLinear</code> / fused QKV / <code>MergedColumnParallelLinear</code> / <code>RowParallelLinear</code></td>
 <td><code>SpyreFp8LinearKernel</code></td>
 <td>Spyre</td>
-<td>Checkpoint FP8 is dequanted to CPU fp16 at load so <code>model.to("spyre")</code> is a legal H2D. First Spyre forward eager-quantizes each SuperDSC N-tile to <code>qfp8wt</code> and caches it; later forwards compile <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>aten._scaled_mm</code>. LM head stays FP16</td>
+<td>Checkpoint FP8 is DMA'd straight into <code>qfp8wt</code> at load (torch-spyre#4663), so <code>model.to("spyre")</code> skips it. <code>quantscalepertokenfp8</code> + <code>qfp8ch</code> + <code>spyre.scaled_mm</code> trace into the block graph, or compile as their own graph (<code>maybe_compile</code>) outside one. LM head stays FP16</td>
 </tr>
 </tbody>
 </table>
@@ -2598,8 +2598,8 @@ linear subclasses install it in <code>__init__</code>, but only when <code>quant
 pure-PyTorch equivalent of torch-spyre's <code>[1,0]</code> weight layout, which only fires
 for <code>nn.Linear</code> and so misses every vLLM parallel-linear. FP8 checkpoints use
 <code>SpyreFp8LinearKernel</code> (<code>custom_ops/fp8_linear_kernel.py</code>) rather than <code>F.linear</code>:
-load dequants to fp16, the first Spyre forward caches <code>qfp8wt</code> per N-tile, and
-the compiled GEMM is <code>qfp8ch</code> + <code>aten._scaled_mm</code>.
+load DMAs the checkpoint FP8 weight into <code>qfp8wt</code>, and the GEMM is <code>qfp8ch</code> +
+<code>spyre.scaled_mm</code>.
 <code>SpyreUnquantizedLMHeadMethod</code> reuses the same base with <code>WEIGHT_T_ATTR="padded_weight_t"</code> and
 <code>ROW_ALIGN=64*32</code>, so the fast path and the padding/un-pad logic are defined once.</p>
 <p>Fused projections stay fused. <code>SpyreQKVParallelLinear</code> returns the whole <code>[..., q+k+v]</code>
@@ -2732,8 +2732,7 @@ persistent form. Down's output slices are concatenated, not summed.</p>
 <h2 id="compilation-granularity">Compilation Granularity<a class="headerlink" href="#compilation-granularity" title="Permanent link">&para;</a></h2>
 <p>Under <code>CompilationMode.STOCK_TORCH_COMPILE</code>, <code>_compile_for_spyre</code> compiles each entry of
 the model's block <code>ModuleList</code> in place via <code>block.compile(backend="inductor",
-fullgraph=not uses_fp8, dynamic=False)</code>. FP8 linears need graph breaks, so their blocks
-use <code>fullgraph=False</code>. In place matters: rebinding the list entry to the
+fullgraph=True, dynamic=False)</code>. In place matters: rebinding the list entry to the
 <code>OptimizedModule</code> that <code>torch.compile</code> returns would re-parent the block under an
 <code>_orig_mod</code> child and rename every parameter, breaking weight save/reload.</p>
 <p>Every graph is compiled <code>dynamic=False</code> because torch-spyre's Inductor backend rejects

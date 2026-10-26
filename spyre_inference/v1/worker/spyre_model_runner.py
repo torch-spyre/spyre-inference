@@ -408,7 +408,11 @@ def _repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
 class _SpyreHiddenStates(torch.Tensor):
     """Select sampled rows on Spyre, reusing the padded body output for decode.
 
-    Spyre has no ``aten::index.Tensor``; every other op sees a plain tensor.
+    Spyre has no ``aten::index.Tensor``, so a 1-D integer index is rerouted through
+    ``select_rows``. Upstream reaches it from ``execute_model``'s
+    ``hidden_states[logits_indices]`` and ``_dummy_run``'s
+    ``hidden_states[logit_indices_device]``. Slices such as
+    ``hidden_states[:num_scheduled_tokens]`` and every other op see a plain tensor.
     """
 
     _row_buckets: list[int]

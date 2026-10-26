@@ -49,14 +49,14 @@ def test_index_gathers_the_requested_rows_on_a_warmed_width(monkeypatch):
     assert rows._spyre_padded_rows.shape[0] == 4
 
 
-def test_an_exact_width_is_returned_unpadded(monkeypatch):
+def test_an_exact_width_is_marked_with_its_own_rows(monkeypatch):
     plain, hidden, widths = _hidden(monkeypatch, [1, 2, 4])
     idx = torch.tensor([0, 5])
 
     rows = hidden[idx]
 
     assert widths == [2]
-    assert not hasattr(rows, "_spyre_padded_rows")
+    assert rows._spyre_padded_rows.shape[0] == 2
     torch.testing.assert_close(rows, plain[idx])
 
 
@@ -174,9 +174,7 @@ def test_cpu_fallback_pooling_dummy_keeps_the_host_output_contract(monkeypatch):
     "offset,num_rows,stride",
     [(0, 1, 1), (0, 3, 1), (3, 3, 1), (4, 4, 1), (31, 33, 1), (1, 65, 1), (0, 4, 2), (3, 3, 2)],
 )
-def test_device_logits_materialize_views_without_unnecessary_host_copies(
-    monkeypatch, offset, num_rows, stride
-):
+def test_device_views_take_the_host_pad_path(monkeypatch, offset, num_rows, stride):
     from spyre_testing_plugin.pytest_plugin import spyre_available
 
     if not spyre_available():
@@ -209,7 +207,7 @@ def test_device_logits_materialize_views_without_unnecessary_host_copies(
     monkeypatch.setattr(mr, "convert", track_conversion)
     actual = wrapper.compute_logits(hidden)
 
-    assert copies == (["cpu"] if stride != 1 else [])
+    assert copies == ["cpu"]
     assert actual.device.type == "cpu"
     torch.testing.assert_close(
         actual, plain[offset : offset + num_rows, ::stride] @ weight, atol=0.01, rtol=0.03

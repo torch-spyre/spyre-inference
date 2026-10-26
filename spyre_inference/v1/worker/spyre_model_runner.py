@@ -450,8 +450,7 @@ class _SpyreHiddenStates(torch.Tensor):
             if padded_rows != num_rows:
                 idx = torch.cat([idx, idx[-1:].expand(padded_rows - num_rows)])
             rows = select_rows(source, idx)
-        if padded_rows == num_rows:
-            return rows
+        # Marks the rows ``compute_logits`` may project on Spyre without a host round trip.
         out = cast(Any, rows[:num_rows])
         out._spyre_padded_rows = rows
         return out
@@ -547,18 +546,14 @@ class _SpyreModelWrapper:
         buckets = self._logits_row_buckets
         idx = bisect.bisect_left(buckets, num_rows)
         padded_rows = buckets[idx] if idx < len(buckets) else num_rows
-        hidden_states = getattr(hidden_states, "_spyre_padded_rows", hidden_states)
-        if hidden_states.device.type == "spyre" and not hidden_states.is_contiguous():
-            # Spyre cannot materialize arbitrary feature strides on-device.
-            hidden_states = convert(hidden_states, device="cpu")
-        if hidden_states.device.type == "spyre":
-            if hidden_states.storage_offset() != 0:
-                # Prompt-logprob slices need materializing before the compiled head.
-                hidden_states = hidden_states.clone()
-            if hidden_states.shape[0] != padded_rows:
-                indices = torch.arange(padded_rows, dtype=torch.int32).clamp_max(num_rows - 1)
-                hidden_states = select_rows(hidden_states, indices)
+        gathered = getattr(hidden_states, "_spyre_padded_rows", None)
+        if gathered is not None:
+            hidden_states = gathered
         else:
+            if hidden_states.device.type == "spyre":
+                # A view of the body output (prompt logprobs) changes the head's work
+                # division, and with it the fp16 accumulation order.
+                hidden_states = convert(hidden_states, device="cpu")
             if padded_rows != num_rows:
                 hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
             hidden_states = convert(hidden_states, device=self._spyre_device)
@@ -1540,9 +1535,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 model.compute_logits(hidden_states[indices])
                 if rows == hidden_states.shape[0] and rows > 1:
                     # Mixed prefill/decode can need a gather even on an exact body bucket.
-                    model.compute_logits(
-                        select_rows(hidden_states.as_subclass(torch.Tensor), indices)
-                    )
+                    model.compute_logits(hidden_states[indices.flip(0)])
 
     @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:

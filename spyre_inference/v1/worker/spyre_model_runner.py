@@ -861,8 +861,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+            # Without a bucketer (enforce_eager) the body is unpadded, so every prompt
+            # length would compile a fresh gather.
             sample_rows_on_device=(
-                self.model_config.runner_type == "generate" and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE
+                self.model_config.runner_type == "generate"
+                and bucketer is not None
+                and envs.SPYRE_SAMPLE_ROWS_ON_DEVICE
             ),
         )
 

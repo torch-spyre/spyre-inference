@@ -146,10 +146,14 @@ class SpyreGranite4VisionForConditionalGeneration(
         self.out_hidden_size = cfg.text_config.hidden_size * self._levels
         self.vision_buffers = {"patches": VisionBuffer(self._patch_width)}
         self._tile_order, self._window_order = window_major_order(side, window, query)
-        self._max_tiles = max(
+        max_tiles = max(
             (h // vision.image_size) * (w // vision.image_size) + 1
             for h, w in cfg.image_grid_pinpoints
         )
+        # Rounded up to a power of two: on hardware, budgets of 5 and 11 tiles crash the Spyre
+        # compiler in the first block (dcc Selector.cpp:272), while 1, 2, 4 and 8 compile. The
+        # extra tiles are padding that postprocess drops.
+        self._max_tiles = 1 << (max_tiles - 1).bit_length()
 
     def process_weights_after_loading(self) -> None:
         """Reshape the tower and projector weights for the vision graphs, in place, as the Spyre

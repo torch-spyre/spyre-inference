@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
     
     
       
@@ -29,10 +29,10 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.57a0d79d.min.css">
       
         
-        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/palette.fb2fffe2.min.css">
       
       
 
@@ -3292,12 +3292,13 @@ HF's <code>rotate_half</code> slicing. That rotation still views a head as two h
 platform widens <code>head_dim</code> to the next 128-multiple, not the native path's 64-multiple. The
 weight passes in <code>head_pad.py</code> are shared with the native path and pad Q/K interleaved, so
 this backend only has to rebuild the rotation cache at the pre-pad frequencies.</p>
-<p><code>RMSNorm</code> registers no OOT op: upstream <code>forward_native</code> lowers its fp16→fp32 upcast
-into the compiled graph. <code>GemmaRMSNorm</code> still needs one, because its trailing fp32
-<code>weight</code> multiply hits a torch-spyre gap — a STANDARD <code>[hidden]</code> operand that can
-neither broadcast against nor de-stagger the staggered-EA activation. Because the
-fusers key on class names, the OOT registry covers the fused Gemma norm
-(<code>SpyreTPAwareGemmaRMSNorm</code>) too.</p>
+<p><code>RMSNorm</code> and <code>GemmaRMSNorm</code> both run upstream <code>forward_native</code>, compiled as their own
+graph wherever no block graph encloses them, which is the final norm after the last
+block; eagerly that norm launches one Spyre program per op. <code>GemmaRMSNorm</code> also compiles
+under <code>--enforce-eager</code>, because its trailing fp32 <code>weight</code> multiply hits a torch-spyre
+gap eagerly: a STANDARD <code>[hidden]</code> operand that can neither broadcast against nor
+de-stagger the staggered-EA activation. Because the fusers key on class names, the OOT
+registry covers the fused norms (<code>SpyreTPAwareRMSNorm</code>, <code>SpyreTPAwareGemmaRMSNorm</code>) too.</p>
 <h2 id="distributed-tp">Distributed (TP)<a class="headerlink" href="#distributed-tp" title="Permanent link">&para;</a></h2>
 <p><code>TorchSpyrePlatform.get_device_communicator_cls</code> returns <code>SpyreCommunicator</code>, a
 <code>DeviceCommunicatorBase</code> override in
@@ -3383,10 +3384,10 @@ profiling). Data and pipeline parallelism (<code>data_parallel_size &gt; 1</code
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.top", "search.highlight", "search.share", "toc.follow"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.tabs.link", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.top", "search.highlight", "search.share", "toc.follow"], "search": "../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      <script src="../assets/javascripts/bundle.c21346df.min.js"></script>
       
     
   </body>

@@ -1533,8 +1533,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
             if rows <= hidden_states.shape[0]:
                 indices = torch.arange(rows, dtype=torch.int64)
                 model.compute_logits(hidden_states[indices])
-                if rows == hidden_states.shape[0] and rows > 1:
-                    # Mixed prefill/decode can need a gather even on an exact body bucket.
+                # Mixed prefill/decode can need a gather on an exact body bucket, but
+                # two rows on a two-token body are always the identity.
+                if rows == hidden_states.shape[0] and rows > 2:
                     model.compute_logits(hidden_states[indices.flip(0)])
 
     @torch.inference_mode()

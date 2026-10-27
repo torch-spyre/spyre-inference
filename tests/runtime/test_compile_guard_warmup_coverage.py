@@ -235,6 +235,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         runner._dummy_sampler_run = lambda hidden_states: torch.tensor([])
         runner._dummy_pooler_run = lambda hidden_states: None
         runner._record_attention_graphs = lambda: None
+        runner._warmup_output_row_gather = lambda bucket_sizes, row_widths, like: None
         if not warmup_embeddings:
             runner._warmup_input_embedding = lambda num_tokens: None
 

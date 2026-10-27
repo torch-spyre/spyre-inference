@@ -32,6 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Model ids must match tests/e2e/test_model_quality.py.
 DECODER_MODELS = [
+    "ibm-granite/granite-4.1-3b",
     "ibm-granite/granite-3.3-8b-instruct",
     "ibm-granite/granite-4.1-8b",
     "google/gemma-4-31B",
@@ -40,6 +41,7 @@ DECODER_MODELS = [
 ]
 
 MODEL_REVISIONS = {
+    "ibm-granite/granite-4.1-3b": "c0650403e44e78ec0262dab1c90914c65b196c4e",
     "ibm-granite/granite-3.3-8b-instruct": "51dd4bc2ade4059a6bd87649d68aa11e4fb2529b",
     "ibm-granite/granite-4.1-8b": "1504002f650e656a0a3789d99574df12e3e94ed0",
     "google/gemma-4-31B": "5bbc2fb1c1b2c611d06e3d9f23c170ba21659d89",

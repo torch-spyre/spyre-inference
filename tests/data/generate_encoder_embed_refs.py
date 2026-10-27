@@ -26,6 +26,8 @@ from sentence_transformers import SentenceTransformer
 
 # Model ids must match tests/e2e/test_encoder_models.py.
 EMBEDDING_MODELS = [
+    "google-bert/bert-base-uncased",
+    "google-bert/bert-large-uncased",
     "ibm-granite/granite-embedding-125m-english",
     "ibm-granite/granite-embedding-278m-multilingual",
     "intfloat/multilingual-e5-large",
@@ -39,6 +41,8 @@ EMBEDDING_MODELS = [
 # Written into the JSON and read back by the test, so an upstream re-upload cannot redefine
 # what the gate compares against.
 MODEL_REVISIONS = {
+    "google-bert/bert-base-uncased": "86b5e0934494bd15c9632b12f734a8a67f723594",
+    "google-bert/bert-large-uncased": "6da4b6a26a1877e173fca3225479512db81a5e5b",
     "ibm-granite/granite-embedding-125m-english": "4ab61ffd423be45cd932b21a7c696063d82bf45f",
     "ibm-granite/granite-embedding-278m-multilingual": "a9cb5338491faf32b73dd17b714a31821c021bbf",
     "intfloat/multilingual-e5-large": "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3",

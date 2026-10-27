@@ -201,6 +201,67 @@ def test_a_cpu_kv_cache_space_next_to_kv_cache_memory_bytes(
     assert "VLLM_CPU_KVCACHE_SPACE" not in os.environ
 
 
+def _mamba_hybrid_config(max_model_len, **cache_kwargs):
+    return VllmConfig(
+        model_config=ModelConfig(
+            model="nvidia/Nemotron-H-8B-Base-8K", max_model_len=max_model_len, dtype=torch.float16
+        ),
+        cache_config=CacheConfig(**cache_kwargs),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+
+def test_mamba_hybrid_drops_prefix_caching_for_fp16_state():
+    """The Spyre mixer writes no `align` checkpoints and runs an fp16 state only."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    # Upstream's model hooks pick `align` and an fp32 state for this config; VllmConfig
+    # then runs the platform hook. Running it again must not change the result.
+    vllm_config = _mamba_hybrid_config(1024, enable_prefix_caching=True)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    assert not cache_config.enable_prefix_caching
+    assert cache_config.mamba_cache_mode == "none"
+    assert cache_config.mamba_block_size == 1024
+    assert cache_config.mamba_ssm_cache_dtype == "float16"
+    assert cache_config.mamba_cache_dtype == "float16"
+    assert vllm_config.scheduler_config.disable_hybrid_kv_cache_manager is False
+
+
+@pytest.mark.parametrize(
+    ("max_model_len", "mamba_block_size"),
+    [
+        # Below the rounded block: raised to it, or the engine would take it as the
+        # block size the attention builder checks against.
+        (512, 1024),
+        # Above: kept at max_model_len, so a request still holds one Mamba block.
+        (8192, 8192),
+    ],
+)
+def test_mamba_hybrid_block_size_is_a_power_of_two(monkeypatch, max_model_len, mamba_block_size):
+    """Upstream aligns Nemotron-H-8B at 576 tokens; the Spyre attention buckets need 1024."""
+    from vllm.platforms.interface import Platform
+
+    from spyre_inference.platform import TorchSpyrePlatform
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionBackend
+
+    vllm_config = _mamba_hybrid_config(max_model_len, block_size=64)
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    # The attention backend is only known once the model is built.
+    monkeypatch.setattr(
+        Platform, "_find_non_ssm_backends", classmethod(lambda cls, c: [SpyreAttentionBackend])
+    )
+
+    TorchSpyrePlatform.update_block_size_for_backend(vllm_config)
+
+    cache_config = vllm_config.cache_config
+    assert cache_config.block_size == 1024
+    assert cache_config.mamba_block_size == mamba_block_size
+    # The Mamba page still equals an attention page: K and V, 8 heads of 128, fp16.
+    assert cache_config.mamba_page_size_padded == 1024 * 2 * 8 * 128 * 2
+
+
 def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
     from unittest.mock import MagicMock
 

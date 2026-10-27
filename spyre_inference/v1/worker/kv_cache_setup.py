@@ -20,9 +20,10 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.worker.utils import AttentionGroup
 
+from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
@@ -69,13 +70,24 @@ def split_attn_groups_by_window(
         attn_groups[kv_cache_group_id] = split_groups
 
 
+def _allocate_mamba_states(
+    num_blocks: int, spec: MambaSpec, device: torch.device
+) -> tuple[torch.Tensor, ...]:
+    """One device tensor per state, ``num_blocks`` slots each, as upstream views its page."""
+    return tuple(
+        convert(torch.zeros((num_blocks, *shape), dtype=dtype), device=device)
+        for shape, dtype in zip(spec.shapes, spec.dtypes)
+    )
+
+
 def allocate_spyre_kv_caches(
     kv_cache_config: KVCacheConfig,
     static_ctx: dict[str, Any],
     shared_layers: dict[str, str],
     device: torch.device,
-) -> dict[str, SpyrePagedKVCache]:
-    """One SpyrePagedKVCache per layer, in the layout its attention impl allocates."""
+) -> dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]]:
+    """One SpyrePagedKVCache per attention layer, in the layout its impl allocates, and
+    one tuple of state tensors per Mamba layer."""
     # One spec per layer. disable_hybrid_kv_cache_manager (set in the platform)
     # collapses hybrid models into a single group; when the layers' head shapes differ
     # its spec is a UniformTypeKVCacheSpecs, which unwraps to the real per-layer specs
@@ -88,13 +100,16 @@ def allocate_spyre_kv_caches(
         else:
             spec_by_layer.update({ln: group.kv_cache_spec for ln in group.layer_names})
 
-    kv_caches: dict[str, SpyrePagedKVCache] = {}
+    kv_caches: dict[str, SpyrePagedKVCache | tuple[torch.Tensor, ...]] = {}
     # A KVCacheTensor lists several layers; sharing one page buffer among them
     # would let each layer's KV write clobber the others'.
     num_blocks = kv_cache_config.num_blocks
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         for layer_name in kv_cache_tensor.layers:
             spec = spec_by_layer[layer_name]
+            if isinstance(spec, MambaSpec):
+                kv_caches[layer_name] = _allocate_mamba_states(num_blocks, spec, device)
+                continue
             # The layout belongs to the backend; a layer without an impl (fixture
             # stubs) gets the token-major default.
             impl = getattr(static_ctx.get(layer_name), "impl", None)

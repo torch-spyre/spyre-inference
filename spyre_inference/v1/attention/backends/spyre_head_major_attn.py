@@ -232,6 +232,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """One row per (block, kv_head, token), which is what ``kv_write_index`` indexes."""
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
+            # A hybrid's block size is grown after construction to cover a Mamba page.
+            self.block_size = k_pages.shape[2]
             shape = (-1, k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots

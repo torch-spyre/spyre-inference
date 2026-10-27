@@ -701,13 +701,14 @@ def test_bfloat16_is_accepted_at_tp1():
         ("SPYRE_ATTN_KV_LADDER", "7_4", None, "SPYRE_ATTN_KV_LADDER='7_4'"),
         ("SPYRE_ATTN_KV_LADDER", "7_4", "256,1024", None),
         ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4", None, "SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"),
-        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "7_4", "256,1024", None),
+        ("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8", "256,1024", "cannot be combined"),
         ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", None, "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
         ("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", "0", "256,1024", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
     ],
 )
 def test_a_bad_kv_ladder_setting_fails_at_startup(monkeypatch, var, value, kv_buckets, match):
-    """SPYRE_ATTN_KV_BUCKETS replaces both ladders, so their names are not read then."""
+    """SPYRE_ATTN_KV_BUCKETS replaces the base ladder, so its name is not read then, and the
+    large-batch ladder that extends it is rejected."""
     from spyre_inference import envs
     from spyre_inference.platform import TorchSpyrePlatform
 

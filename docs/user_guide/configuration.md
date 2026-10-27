@@ -251,8 +251,9 @@ batched decode uses once the batch's num-sequences bucket reaches `SPYRE_ATTN_LA
 path and smaller batches keep `SPYRE_ATTN_KV_LADDER`. Below the threshold the
 batched kernel already pads to whole chunks, so at short contexts dense buckets there would
 mostly compile duplicate kernels. The second ladder is unioned with the first, so no length rounds up further.
-It is off by default, and ignored with a warning when `SPYRE_ATTN_KV_BUCKETS` is set or the
-threshold is above the largest num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
+It is off by default, rejected at startup together with `SPYRE_ATTN_KV_BUCKETS`, which replaces
+the ladder it extends, and ignored with a warning when the threshold is above the largest
+num-sequences bucket. `SPYRE_ATTN_KV_LADDER=8_5` with
 `SPYRE_ATTN_KV_LADDER_LARGE_BATCH=9_8` gets close to plain `9_8` at large batches for noticeably
 less warmup.
 

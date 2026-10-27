@@ -710,14 +710,12 @@ class TestLargeBatchLadder:
     def test_per_seq_variants_keep_the_base_ladder(self, hybrid):
         assert {v.num_blocks for v in hybrid.variants()} == set(hybrid.num_blocks_buckets)
 
-    def test_explicit_buckets_disable_it_with_a_warning(self, monkeypatch, caplog):
+    def test_explicit_buckets_reject_it(self, monkeypatch):
         monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
         monkeypatch.setenv("SPYRE_ATTN_KV_BUCKETS", "256,1024")
         envs.clear_env_cache()
-        with caplog.at_level("WARNING"):
-            b = SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
-        assert b.batched_blocks_buckets(32) == b.num_blocks_buckets
-        assert any("SPYRE_ATTN_KV_BUCKETS is set" in r.getMessage() for r in caplog.records)
+        with pytest.raises(ValueError, match="cannot be combined with SPYRE_ATTN_KV_BUCKETS"):
+            SpyreAttnBucketer(make_config(max_model_len=4096, block_size=128, max_num_seqs=32))
 
     def test_a_threshold_above_every_batch_warns(self, monkeypatch, caplog):
         monkeypatch.setenv("SPYRE_ATTN_KV_LADDER_LARGE_BATCH", "9_8")
@@ -733,9 +731,17 @@ class TestLargeBatchLadder:
         with pytest.raises(ValueError, match="SPYRE_ATTN_KV_LADDER_LARGE_BATCH='7_4'"):
             SpyreAttnBucketer(make_config(max_model_len=4096, max_num_seqs=32))
 
-    @pytest.mark.parametrize("raw", ["0", "-4", "many", "1.5"])
-    def test_an_invalid_threshold_is_rejected(self, monkeypatch, raw):
+    @pytest.mark.parametrize(
+        ("raw", "match"),
+        [
+            ("0", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+            ("-4", "SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"),
+            ("many", "invalid literal for int"),
+            ("1.5", "invalid literal for int"),
+        ],
+    )
+    def test_an_invalid_threshold_is_rejected(self, monkeypatch, raw, match):
         monkeypatch.setenv("SPYRE_ATTN_LARGE_BATCH_MIN_SEQS", raw)
         envs.clear_env_cache()
-        with pytest.raises(ValueError, match="SPYRE_ATTN_LARGE_BATCH_MIN_SEQS"):
+        with pytest.raises(ValueError, match=match):
             SpyreAttnBucketer(make_config())

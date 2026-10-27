@@ -2304,12 +2304,28 @@ platform clamps <code>--max-num-batched-tokens</code> to the largest entry. A de
 </span></code></pre></div>
 <p><code>1</code> and <code>8</code> cover decode steps (one token per running sequence, up to 8); <code>512</code> is the
 prefill bucket.</p>
+<p>The default prefill bucket is 512 tokens, but larger ones compile. For prompts of many
+thousands of tokens, a 1024-token prefill chunk shortens time to first token, on dense
+models such as granite-3.3-8b as well as on MoE models such as gemma-4, where each
+prefill step reads every expert's weights however many tokens it carries. Pass a larger
+<code>--max-num-batched-tokens</code> to get one; the default buckets then keep <code>512</code> too, so short
+prefills don't pad up to the larger one:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>google/gemma-4-26B-A4B<span class="w"> </span>-tp<span class="w"> </span><span class="m">4</span><span class="w"> </span>--max-model-len<span class="w"> </span><span class="m">32768</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span>--max-num-batched-tokens<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span>--limit-mm-per-prompt<span class="w"> </span><span class="s1">'{"image": 0, "video": 0, "audio": 0}'</span>
+</span></code></pre></div>
+<p>Warmup takes longer, and for prompts under a few thousand tokens it gains little; decode
+can get slightly slower. The example serves text only: a larger token budget also raises
+the number of image-batch widths the vision tower is warmed at, which can run out of
+device memory (#1302). At a long <code>--max-model-len</code>, a 2048-token bucket can push the
+largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
+they are left to compile on first use (torch-spyre#5250 makes that limit configurable).</p>
 <p><strong>Attention (KV length × query length).</strong> Set the buckets directly as comma-separated
 lists. Each is clamped to its limit: entries above <code>--max-model-len</code> (KV) or
 <code>--max-num-batched-tokens</code> (query) are dropped, and the limit is appended if missing, so
 every schedulable length keeps a bucket.</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: powers of two from block_size</span>
-</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_KV_BUCKETS</span><span class="o">=</span><span class="m">256</span>,1024,2048<span class="w">    </span><span class="c1"># default: powers of two from block_size</span>
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">SPYRE_ATTN_QUERY_BUCKETS</span><span class="o">=</span><span class="m">1</span>,512<span class="w">         </span><span class="c1"># 1 = decode; 512 = prefill chunk</span>
 </span></code></pre></div>
 <p>The default KV buckets are geometric (powers of two) because the recorded set grows
 with both axes, even after filtering. If your context never exceeds 2048, dropping the
@@ -2322,7 +2338,7 @@ extra lever there, and the same keep-it-short advice applies.</p>
 <h2 id="fp8-kv-cache">FP8 KV cache<a class="headerlink" href="#fp8-kv-cache" title="Permanent link">&para;</a></h2>
 <p>Pass <code>--kv-cache-dtype fp8</code> to store the KV cache in float8 (e4m3), halving the bytes
 each cached token takes:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-4.1-8b-fp8<span class="w"> </span>--kv-cache-dtype<span class="w"> </span>fp8
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-4.1-8b-fp8<span class="w"> </span>--kv-cache-dtype<span class="w"> </span>fp8
 </span></code></pre></div>
 <p>It needs the default head-major layout (<code>SPYRE_ATTN_KV_LAYOUT=head_major</code>) and a head size
 that is a multiple of 128. It does not raise capacity: the platform pins the block count
@@ -2349,12 +2365,12 @@ default the plugin sets only reaches spawned processes.</p>
 <h2 id="pyprojecttoml-reference">pyproject.toml Reference<a class="headerlink" href="#pyprojecttoml-reference" title="Permanent link">&para;</a></h2>
 <p>The <code>pyproject.toml</code> includes several key build configurations:</p>
 <h3 id="build-configuration">Build Configuration<a class="headerlink" href="#build-configuration" title="Permanent link">&para;</a></h3>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">[tool.uv.extra-build-variables.vllm]</span>
-</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="n">VLLM_TARGET_DEVICE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"empty"</span>
-</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"--fresh"</span>
-</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>
-</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="k">[tool.uv.extra-build-dependencies]</span>
-</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">[tool.uv.extra-build-variables.vllm]</span>
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">VLLM_TARGET_DEVICE</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"empty"</span>
+</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">CMAKE_ARGS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"--fresh"</span>
+</span><span id="__span-8-4"><a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>
+</span><span id="__span-8-5"><a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="k">[tool.uv.extra-build-dependencies]</span>
+</span><span id="__span-8-6"><a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"torch==2.13.0"</span><span class="p">]</span>
 </span></code></pre></div>
 <p>These settings ensure:</p>
 <ul>
@@ -2366,16 +2382,16 @@ default the plugin sets only reaches spawned processes.</p>
 </ul>
 <h3 id="source-repositories">Source Repositories<a class="headerlink" href="#source-repositories" title="Permanent link">&para;</a></h3>
 <p>The plugin pulls dependencies from specific Git repositories:</p>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">[tool.uv.sources]</span>
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="n">vllm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/vllm-project/vllm"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
-</span><span id="__span-8-3"><a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/torch-spyre/torch-spyre"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">[tool.uv.sources]</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">vllm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/vllm-project/vllm"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
+</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">torch-spyre</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">git</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"https://github.com/torch-spyre/torch-spyre"</span><span class="p">,</span><span class="w"> </span><span class="n">rev</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w"> </span><span class="p">}</span>
 </span></code></pre></div>
 <p>This ensures that torch-spyre and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.</p>
 <h3 id="pytorch-cpu-index">PyTorch CPU Index<a class="headerlink" href="#pytorch-cpu-index" title="Permanent link">&para;</a></h3>
-<div class="language-toml highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">[[tool.uv.index]]</span>
-</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"pytorch-cpu"</span>
-</span><span id="__span-9-3"><a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"https://download.pytorch.org/whl/cpu"</span>
-</span><span id="__span-9-4"><a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="n">explicit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<div class="language-toml highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="k">[[tool.uv.index]]</span>
+</span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"pytorch-cpu"</span>
+</span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"https://download.pytorch.org/whl/cpu"</span>
+</span><span id="__span-10-4"><a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="n">explicit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 </span></code></pre></div>
 <p>This ensures the CPU flavor of PyTorch is installed, as CUDA support is not required.</p>
 

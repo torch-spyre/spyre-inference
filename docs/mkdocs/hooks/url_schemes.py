@@ -52,10 +52,10 @@ def on_page_markdown(markdown: str, *, page: Page, config: MkDocsConfig, files: 
         return f"[{gh_icon} {match.group('title')}]({url})"
 
     def replace_auto_link(match: re.Match) -> str:
-        type = match.group("type")
+        link_type = match.group("type")
         path = match.group("path")
-        title = f"{titles[type]}{path}"
-        url = f"{urls[type]}/{path}"
+        title = f"{titles[link_type]}{path}"
+        url = f"{urls[link_type]}/{path}"
         if fragment := match.group("fragment"):
             url += f"#{fragment}"
 

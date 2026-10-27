@@ -164,7 +164,7 @@ runs:
         [ -n "${CH_DB_IN}" ] && export CLICKHOUSE_DB="${CH_DB_IN}"
         [ -n "${CH_DB_V2_IN}" ] && export CLICKHOUSE_DB_V2="${CH_DB_V2_IN}"
         # Invoke by path: the script's own directory is sys.path[0], so its
-        # sibling `from utils import ...` resolves without extra PYTHONPATH.
+        # sibling `from ingest_identity import ...` resolves without extra PYTHONPATH.
         python3 .github/scripts/ingest_vllm_benchmarks.py \
           --results-dir "${{ inputs.results-dir }}" \
           --workflow "${{ inputs.workflow }}" \

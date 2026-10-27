@@ -49,9 +49,7 @@ def _load(name, **stubs):
 
 @pytest.fixture(scope="module")
 def vllm_mod():
-    utils = types.ModuleType("utils")
-    utils.read_benchmark_results = lambda *a, **k: []
-    return _load("ingest_vllm_benchmarks", utils=utils)
+    return _load("ingest_vllm_benchmarks")
 
 
 # --- the goldens each writer carries ----------------------------------------------------

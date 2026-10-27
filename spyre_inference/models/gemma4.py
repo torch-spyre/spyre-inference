@@ -20,6 +20,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
@@ -33,16 +34,6 @@ if TYPE_CHECKING:
     from vllm.engine.arg_utils import EngineArgs
 
 logger = init_logger(__name__)
-
-# Scalar buffers that ``Gemma4Model`` owns and ``Gemma4SelfDecoderLayers``
-# re-exposes as plain attributes.
-_ALIASED_SCALARS = (
-    "normalizer",
-    "embed_scale_per_layer",
-    "per_layer_input_scale",
-    "per_layer_projection_scale",
-)
-
 
 # Each "global" attribute vLLM's gemma-4 builder reads for full-attention layers,
 # mapped to the per-layer attribute of the same role it is rebuilt from.
@@ -106,6 +97,24 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
+def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) -> None:
+    # A limit of 0 makes the frontend refuse the input per request; past it, the worker
+    # raises mid-step and takes the engine down with every in-flight request.
+    limits = dict(engine_args.limit_mm_per_prompt or {})
+    for modality in ("video", "audio") if has_audio else ("video",):
+        value = limits.get(modality)
+        # A dict without "count" takes vLLM's default, which enables the modality.
+        if isinstance(value, dict):
+            value = value.get("count", BaseDummyOptions().count)
+        if value:
+            raise NotImplementedError(
+                f"gemma-4 {modality} input is not supported on Spyre; remove it from "
+                "limit_mm_per_prompt."
+            )
+        limits[modality] = 0
+    engine_args.limit_mm_per_prompt = limits
+
+
 def force_text_backbone(engine_args: EngineArgs) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
@@ -113,7 +122,8 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     documents, so a user override of any shape replaces it wholesale (the head-dim repair
     they also need runs from the platform hook, not from here). A vision checkpoint keeps
     its real ``architectures`` -- forcing ``Gemma4ForCausalLM`` there would strip the tower
-    -- while an audio-only one is rejected rather than silently reduced to text.
+    -- with video and audio capped at 0 per prompt, while an audio-only one is rejected
+    rather than silently reduced to text.
     """
     if engine_args.hf_overrides:
         return
@@ -138,11 +148,7 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
-        if has_audio:
-            logger.warning(
-                "gemma-4: this checkpoint has an audio tower, which is not supported on "
-                "Spyre; image and text inputs work, audio input will fail."
-            )
+        _disable_unsupported_modalities(engine_args, has_audio)
         return
     if has_audio:
         # Falling through would force the text-only backbone and silently drop the
@@ -155,56 +161,47 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     logger.info("gemma-4: loading text-only backbone Gemma4ForCausalLM.")
 
 
-def register_aliased_scalars(decoder: nn.Module) -> None:
-    """Turn the self-decoder's aliased scalar attributes into buffers."""
-    buffers = dict(decoder.named_buffers(recurse=False))
-    for name in _ALIASED_SCALARS:
-        scalar = getattr(decoder, name, None)
-        if scalar is None or name in buffers:
-            continue
-        delattr(decoder, name)
-        decoder.register_buffer(name, scalar, persistent=False)
-
-
 def _fold_gemma4_expert_scale(down_weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Fold Gemma's output scale into the source down-projection stack."""
     return down_weight * scale.detach().to(down_weight.dtype).view(-1, 1, 1)
 
 
-def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> None:
-    """Register Gemma-4's full-softmax, scaled GELU expert recipe."""
+def configure_gemma4_moe_layers(layers: Iterable[nn.Module]) -> int:
+    """Register Gemma-4's full-softmax, scaled GELU expert recipe; returns the count."""
 
     configured = 0
     for decoder in layers:
-        moe = getattr(decoder, "moe", None)
-        if moe is None:
+        experts = getattr(decoder, "experts", None)
+        if experts is None:
             continue
         configure_spyre_moe_layer(
-            moe.experts.routed_experts,
+            experts.routed_experts,
             SpyreMoERecipe(
                 activation="gelu_tanh",
                 routing="full_softmax",
-                prepare_down_weight=partial(_fold_gemma4_expert_scale, scale=moe.per_expert_scale),
+                prepare_down_weight=partial(
+                    _fold_gemma4_expert_scale, scale=decoder.router.per_expert_scale
+                ),
             ),
         )
         configured += 1
     if configured:
         logger.info("Spyre: configured %d Gemma-4 MoE layers.", configured)
+    return configured
 
 
 class SpyreGemma4ForCausalLM(Gemma4ForCausalLM):
-    """Gemma-4 on Spyre: device-resident scalars, and Spyre MoE expert dispatch.
-
-    ``Gemma4SelfDecoderLayers`` holds four scalar buffers owned by ``Gemma4Model``
-    as plain tensor attributes. ``model.to("spyre")`` rebinds the parent's buffers
-    but leaves the aliases on CPU, so the compiled ``embed_input_ids`` feeds a 0-d
-    CPU tensor into Inductor, which has no notion of a live CPU graph input.
-    Re-registering the aliases restores the parent's stated intent (move with the
-    model, interact with torch.compile) and needs no change to the embedding math:
-    a device-side 0-d scalar lowers fine.
-    """
+    """Gemma-4 on Spyre with Spyre MoE expert dispatch."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        register_aliased_scalars(self.model.self_decoder)
-        configure_gemma4_moe_layers(self.model.layers)
+        # Without the recipe the experts run upstream's path, which is wrong on Spyre.
+        # Either flag enables the MoE block, as in upstream's Gemma4DecoderLayer.
+        is_moe_checkpoint = getattr(self.config, "enable_moe_block", False) or getattr(
+            self.config, "use_second_mlp_block", False
+        )
+        if not configure_gemma4_moe_layers(self.model.layers) and is_moe_checkpoint:
+            raise RuntimeError(
+                "gemma-4 MoE checkpoint, but no decoder layer exposes `experts`: vLLM has "
+                "moved them; update configure_gemma4_moe_layers."
+            )

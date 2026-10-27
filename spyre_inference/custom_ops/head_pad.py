@@ -14,14 +14,14 @@
 
 """Native-path attention head padding to a stick-aligned head_dim.
 
-A head_dim whose half is not a multiple of the 64-element fp16 stick (e.g.
-head_size=64) cannot restickify after RoPE, so the KV write-back fails to lower
-on Spyre. ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to a
-128-multiple before the model is built (sizing QKV/o_proj/Attention/KV-cache/RoPE
-at the padded width); the passes here fill the padded region on load (including the
-QK-norm weights of models that normalize over head_dim) and restore the two things
-the width override would otherwise corrupt — the RoPE frequencies and the attention
-scale.
+A head_dim that is not a multiple of the 64-element fp16 stick cannot lower on Spyre,
+and on the Transformers backend neither can one whose half isn't (its RoPE views a head
+as two halves). ``TorchSpyrePlatform._maybe_pad_head_dim`` overrides ``head_dim`` to the
+next 64-multiple (128-multiple for RoPE on the Transformers backend) before the model is
+built (sizing QKV/o_proj/Attention/KV-cache/RoPE at the padded width); the passes here
+fill the padded region on load (including the QK-norm weights of models that normalize
+over head_dim), restore the RoPE frequencies and attention scale, and compensate QK-norm
+epsilon for the wider reduction.
 
 Padding is interleaved (RoPE-compatible) for Q/K and end-of-head for V/O, and the
 rotation cache keeps the original frequencies. The Transformers backend shares the
@@ -34,10 +34,18 @@ from __future__ import annotations
 import math
 import sys
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+
+from spyre_inference.custom_ops.text_backbone import (
+    is_text_weight,
+    text_modules,
+    text_weight_prefix,
+)
 
 logger = init_logger(__name__)
 
@@ -107,9 +115,12 @@ def _pad_qk_norm_weight(w: torch.Tensor, orig: int, padded: int) -> torch.Tensor
     """Pad a per-head QK-norm weight ``[orig] -> [padded]`` to match padded Q/K.
 
     RMS over the padded head divides by ``padded`` not ``orig``; folding
-    ``sqrt(orig/padded)`` into the weight restores the original scale. Exact but
-    for the eps term (the wider divisor scales it by ``padded/orig``), which is
-    negligible at the usual eps=1e-6.
+    ``sqrt(orig/padded)`` into the weight restores the original scale. That leaves the
+    eps term, which the wider divisor makes ``padded/orig`` too large --
+    ``fix_padded_qk_norm_eps`` scales it back, and the pair is then exact.
+
+    Assumes the stored weight is the multiplier; ``verify_padded_qk_norm_weights``
+    rejects the zero-centred norms for which it is not.
     """
     return _pad_qk_interleaved(w * math.sqrt(orig / padded), 1, orig, padded)
 
@@ -128,24 +139,6 @@ def _pad_fused_qkv(
     )
 
 
-def _is_target_attn_weight(name: str, text_prefix: str | None = None) -> bool:
-    """True when *name* is an attention weight that should be padded.
-
-    For composite (multimodal) checkpoints ``text_prefix`` is the dotted path
-    prefix under which the language backbone lives (e.g. ``"language_model."``).
-    Only weights under that prefix are padded; everything else (vision towers,
-    projectors, adapters) is left untouched.  This is an allowlist: any new
-    sub-model in the checkpoint that does not live under ``text_prefix``
-    automatically passes through unmodified, with no maintenance required here.
-
-    For single-config (text-only) checkpoints ``text_prefix`` is ``None`` and
-    every weight is a candidate — the original behaviour.
-    """
-    if text_prefix is not None:
-        return text_prefix in name
-    return True
-
-
 def _pad_weight(
     name: str,
     w: torch.Tensor,
@@ -156,7 +149,7 @@ def _pad_weight(
     text_prefix: str | None = None,
 ) -> torch.Tensor:
     """Dispatch a single checkpoint tensor to the right padding by its name."""
-    if not _is_target_attn_weight(name, text_prefix):
+    if not is_text_weight(name, text_prefix):
         return w
     # Must precede the v_proj test: "qkv_proj.weight" also ends with "v_proj.weight".
     if name.endswith(("qkv_proj.weight", "qkv_proj.bias")):
@@ -193,8 +186,8 @@ def install_padded_head_dim(model_config) -> None:
 
     Overriding ``config.head_dim`` only widens a model that reads it. vLLM's
     ``Qwen2Attention`` computes ``self.head_dim = hidden_size // total_num_heads``
-    and never consults the config, so the override left it 64-wide while the weight
-    pass emitted 128-wide tensors — which ``QKVParallelLinear.weight_loader``
+    and never consults the config, so the override left it at the native width while
+    the weight pass emitted padded tensors — which ``QKVParallelLinear.weight_loader``
     narrows back to the param width without complaint, loading truncated weights
     and no error.
 
@@ -280,15 +273,8 @@ def install_padded_head_dim(model_config) -> None:
     logger.info("Shimmed head_dim %d -> %d on: %s", orig, padded, ", ".join(patched))
 
 
-def _attention_layers(model) -> list[tuple[str, torch.nn.Module]]:
-    """``named_modules()`` plus ``attention_instances``, a plain dict nn.Module never
-    registers (the Transformers backend keeps its Attention layers there)."""
-    instances = getattr(model, "attention_instances", None) or {}
-    return list(model.named_modules()) + [(f"attn.{i}", m) for i, m in instances.items()]
-
-
-def verify_padded_head_dim(model, hf_config) -> None:
-    """Fail loudly if any attention layer was still built at the unpadded width.
+def verify_padded_head_dim(model, hf_config, model_config=None) -> None:
+    """Fail loudly if any text attention layer was still built at the unpadded width.
 
     Guards the silent-corruption path: the weight pass emits padded tensors and the
     linear weight loader narrows an over-wide tensor to the param width without
@@ -298,12 +284,17 @@ def verify_padded_head_dim(model, hf_config) -> None:
     if not head_padding_active(hf_config):
         return
     padded = hf_config.head_dim
+
+    def unpadded(_, module) -> bool:
+        return (
+            getattr(module, "impl", None) is not None
+            and getattr(module, "head_size", padded) != padded
+        )
+
     bad = sorted(
         {
             f"{name}(head_size={module.head_size})"
-            for name, module in _attention_layers(model)
-            if getattr(module, "impl", None) is not None
-            and getattr(module, "head_size", padded) != padded
+            for name, module in text_modules(model, model_config, unpadded, "attention layers")
         }
     )
     if bad:
@@ -316,19 +307,14 @@ def verify_padded_head_dim(model, hf_config) -> None:
 
 def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -> None:
     """Wrap ``model_loader.get_all_weights`` to pad q/k/v/o head_dim to the width
-    the platform chose (64->128 for RoPE decoders, 32->64 for pooling models).
+    the platform chose (the next 64-multiple, e.g. 16->64 or 96->128; the next
+    128-multiple for RoPE decoders on the Transformers backend).
 
     The transform runs on the raw ``(name, tensor)`` stream before vLLM's
     ``WeightsMapper`` and ``weight_loader`` (which ``.narrow`` and assert exact
-    shapes against the now-128-wide params). Full unsharded tensors are padded
+    shapes against the now-padded params). Full unsharded tensors are padded
     per-head, so TP narrowing downstream still selects whole padded heads.
-
-    For composite (multimodal) checkpoints, where ``model_config.hf_text_config
-    is not model_config.hf_config``, only weights under the language backbone
-    prefix ``"language_model."`` are padded.  vLLM composite models consistently
-    store the text backbone under ``self.language_model`` (and therefore under
-    ``language_model.`` in the checkpoint), so this allowlist is forward-compatible
-    with any new composite architecture without requiring additions here.
+    Only text-backbone weights are padded (see ``text_backbone``).
     """
     if not head_padding_active(hf_config):
         return
@@ -344,12 +330,8 @@ def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -
     n_heads = hf_config.num_attention_heads
     n_kv_heads = getattr(hf_config, "num_key_value_heads", None) or n_heads
 
-    # For composite (multimodal) models, restrict padding to the text backbone.
-    # vLLM composite models store the language backbone as ``self.language_model``,
-    # so its checkpoint weights live under the ``language_model.`` prefix.
-    text_prefix: str | None = None
-    if model_config is not None and model_config.hf_text_config is not model_config.hf_config:
-        text_prefix = "language_model."
+    text_prefix = text_weight_prefix(model_config)
+    if text_prefix is not None:
         logger.debug("Composite model detected; head padding restricted to prefix %r.", text_prefix)
 
     original_get_all_weights = model_loader.get_all_weights
@@ -361,7 +343,7 @@ def install_head_pad_weight_loader(model_loader, hf_config, model_config=None) -
     model_loader.get_all_weights = padded_get_all_weights
 
 
-def fix_padded_attention_scale(model, hf_config) -> None:
+def fix_padded_attention_scale(model, hf_config, model_config=None) -> None:
     """Restore the attention scale to ``1/sqrt(orig_head_dim)`` for head_dim-derived scales.
 
     A model that computes ``scale = head_dim**-0.5`` (Llama, Mistral) picks up
@@ -370,7 +352,8 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     ``sqrt(orig_head_dim)`` or softmax flattens. Models with a head_dim-independent
     scale (Granite's ``attention_multiplier``) were never corrupted by padding, so
     their scale must be left untouched — detected by comparing the built scale
-    against the padded head_dim default.
+    against the padded head_dim default. Only the text backbone is touched: a tower
+    whose native head_dim equals the padded one has that scale legitimately.
 
     HF's ``module.scaling`` is reset too: ``vllm_attention_forward`` copies it onto
     ``impl.scale`` on every forward, so fixing only the vLLM layer would not stick.
@@ -386,8 +369,14 @@ def fix_padded_attention_scale(model, hf_config) -> None:
             float(scale), padded_default, rel_tol=1e-3
         )
 
+    def has_padded_scale(_, module) -> bool:
+        impl = getattr(module, "impl", None)
+        return (impl is not None and is_padded_default(getattr(impl, "scale", None))) or (
+            is_padded_default(getattr(module, "scaling", None))
+        )
+
     n = 0
-    for _, module in _attention_layers(model):
+    for _, module in text_modules(model, model_config, has_padded_scale, "attention scales"):
         impl = getattr(module, "impl", None)
         if impl is not None and is_padded_default(getattr(impl, "scale", None)):
             impl.scale = orig_default
@@ -398,15 +387,73 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     logger.info("Reset attention scale to 1/sqrt(%d) on %d head_dim-derived layers.", orig, n)
 
 
-def fix_padded_rope(model, hf_config) -> None:
-    """Inject the original-frequency cos/sin cache into each padded RoPE.
+def _padded_qk_norms(model, padded: int, model_config=None) -> list[tuple[str, torch.nn.Module]]:
+    """The head_dim-wide QK-norms of the text backbone, i.e. those the loader padded."""
+
+    def is_padded_qk_norm(name, module) -> bool:
+        weight = getattr(module, "weight", None)
+        return (
+            name.endswith(("q_norm", "k_norm"))
+            and hasattr(module, "variance_epsilon")
+            and weight is not None
+            and weight.numel() == padded
+        )
+
+    return text_modules(model, model_config, is_padded_qk_norm, "QK-norms")
+
+
+def verify_padded_qk_norm_weights(model, hf_config, model_config=None) -> None:
+    """Refuse a zero-centred QK-norm, whose padded weight would be silently wrong.
+
+    ``_pad_qk_norm_weight`` folds ``sqrt(orig/padded)`` into the stored weight to undo
+    the wider reduction. That assumes the stored weight *is* the multiplier. A
+    ``GemmaRMSNorm`` multiplies by ``1 + w``, so folding into ``w`` yields
+    ``1 + w*sqrt(orig/padded)`` where ``(1 + w)*sqrt(orig/padded)`` is needed.
+    """
+    if not head_padding_active(hf_config):
+        return
+    from vllm.model_executor.layers.layernorm import GemmaRMSNorm
+
+    bad = sorted(
+        name
+        for name, module in _padded_qk_norms(model, hf_config.head_dim, model_config)
+        if isinstance(module, GemmaRMSNorm)
+    )
+    if bad:
+        raise NotImplementedError(
+            f"Spyre padded head_dim {getattr(hf_config, _ORIG_ATTR)} -> "
+            f"{hf_config.head_dim}, but these QK-norms are zero-centred "
+            f"({GemmaRMSNorm.__name__}, weight applied as 1 + w), so the "
+            f"sqrt(orig/padded) folded into their padded weight is wrong: "
+            f"{', '.join(bad)}"
+        )
+
+
+def fix_padded_qk_norm_eps(model, hf_config, model_config=None) -> None:
+    """Scale QK-norm epsilon to compensate for the wider padded reduction."""
+    if not head_padding_active(hf_config):
+        return
+    orig = getattr(hf_config, _ORIG_ATTR)
+    padded = hf_config.head_dim
+    n = 0
+    for _, module in _padded_qk_norms(model, padded, model_config):
+        if getattr(module, "_spyre_padded_qk_norm_eps", False):
+            continue
+        module.variance_epsilon *= orig / padded
+        module._spyre_padded_qk_norm_eps = True
+        n += 1
+    logger.info("Scaled QK-norm epsilon by %d/%d on %d layers.", orig, padded, n)
+
+
+def fix_padded_rope(model, hf_config, model_config=None) -> None:
+    """Inject the original-frequency cos/sin cache into each padded text RoPE.
 
     ``get_rope(padded)`` built frequencies at the padded spacing (wrong); rebuild
     a reference rope at the original head_dim (reusing vLLM's rope-scaling dispatch
     for correct Llama3/YaRN frequencies) and swap its narrower cos_sin_cache in.
     ``SpyreRotaryEmbedding._get_rotation_cache`` then derives the real rotations
     from it and zero-pads the trailing dims (harmless — the matching x pair dims
-    are zero from weight padding).
+    are zero from weight padding). A tower's RoPE keeps its own frequencies.
     """
     if not head_padding_active(hf_config):
         return
@@ -414,28 +461,28 @@ def fix_padded_rope(model, hf_config) -> None:
     max_position = hf_config.max_position_embeddings
     rope_parameters = getattr(hf_config, "rope_parameters", None)
 
-    seen: set[int] = set()
+    # Duck-type on an attribute only _SpyreRotaryMixin sets, then cast for the
+    # RotaryEmbeddingBase attribute reads below.
+    def is_spyre_rope(_, module) -> bool:
+        return hasattr(module, "_rotation_cache")
+
     n = 0
-    for module in model.modules():
-        # Duck-type on an attribute only _SpyreRotaryMixin sets, not isinstance: keeps
-        # `module` typed as nn.Module so the RotaryEmbedding attribute reads below type-check.
-        if not hasattr(module, "_rotation_cache") or id(module) in seen:
-            continue
-        seen.add(id(module))
+    for _, module in text_modules(model, model_config, is_spyre_rope, "RoPE modules"):
+        rope = cast(RotaryEmbeddingBase, module)
         ref = get_rope(
             orig,
             max_position=max_position,
-            is_neox_style=module.is_neox_style,
+            is_neox_style=rope.is_neox_style,
             rope_parameters=rope_parameters,
-            dtype=module.dtype,
+            dtype=rope.dtype,
         )
-        module.cos_sin_cache = ref.cos_sin_cache.to(module.cos_sin_cache.dtype)
-        module._rotation_cache = None
-        module._device_rotation_cache = None
+        rope.cos_sin_cache = ref.cos_sin_cache.to(rope.cos_sin_cache.dtype)
+        rope._rotation_cache = None
+        rope._device_rotation_cache = None
         # Narrowed frequencies make this instance model-specific; unshare it so
-        # get_rope cannot hand it to a later model with a real head_dim of orig*2.
+        # get_rope cannot hand it to a later model whose real head_dim is the padded width.
         for cache_key, cached in list(_ROPE_DICT.items()):
-            if cached is module:
+            if cached is rope:
                 del _ROPE_DICT[cache_key]
         n += 1
     logger.info("Injected original head_dim=%d RoPE frequencies into %d modules.", orig, n)

@@ -32,6 +32,10 @@ def _swept_widths(monkeypatch, max_num_seqs: int) -> list[int]:
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner._pooling_on_spyre = True
     runner.scheduler_config = types.SimpleNamespace(max_num_seqs=max_num_seqs)
+    # No classifier/embed head, so _warm_pooler_row_widths's real-width sweep
+    # (which needs one to warm) stays a no-op and only the plain gather below runs.
+    runner.model = torch.nn.Module()
+    runner.model.pooler = torch.nn.Module()
 
     widths: list[int] = []
     monkeypatch.setattr(

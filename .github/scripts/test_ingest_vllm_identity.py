@@ -34,8 +34,6 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
-import sys
-import types
 import uuid
 
 import pytest
@@ -57,10 +55,7 @@ _GOLDEN_LEG_ID = "932cc6a6-c3eb-5be2-8057-a4fe5303ffd3"
 
 @pytest.fixture(scope="module")
 def mod():
-    """Load the ingest script by path; stub `utils`, which pulls in the repo's test deps."""
-    stub = types.ModuleType("utils")
-    stub.read_benchmark_results = lambda *a, **k: []
-    sys.modules.setdefault("utils", stub)
+    """Load the ingest script by path."""
     spec = importlib.util.spec_from_file_location("ingest_vllm_benchmarks", _SCRIPT)
     m = importlib.util.module_from_spec(spec)
     try:

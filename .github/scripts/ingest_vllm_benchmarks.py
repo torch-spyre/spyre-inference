@@ -20,13 +20,12 @@ Expects the following environment variables:
   CLICKHOUSE_PASS, CLICKHOUSE_DB
 """
 
-import glob
+import datetime
 import hashlib
 import json
 import logging
 import os
 import sys
-import time
 import uuid
 from argparse import ArgumentParser
 from typing import Any
@@ -37,16 +36,21 @@ from spyre_clickhouse_ingest import (
     artifact_id_for,
     base_artifact_id,
     benchmark_id_for,
-    benchmarks_already_ingested,
+    ensure,
     gha_artifact_id,
-    insert_benchmarks,
-    insert_gha_artifact_result,
+    insert_artifact_result,
     run_id_of,
     schema,
     tables_present,
     target_database,
 )
-from utils import read_benchmark_results
+from spyre_clickhouse_ingest.vllm import (
+    BENCH_COMPONENT,
+    BENCH_ID_KEYS,
+    duration_s,
+    extract_rows,
+    write_benchmarks,
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -131,285 +135,18 @@ def parse_args() -> Any:
         help="owner/name, for the run url and the artifact's sources.",
     )
     parser.add_argument(
+        "--ci-event",
+        type=str,
+        default=os.environ.get("GITHUB_EVENT_NAME", ""),
+        help="The GHA event that built the leg's artifact; tagged as the library's ci_tags spells.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print rows instead of inserting into ClickHouse",
     )
 
     return parser.parse_args()
-
-
-# Scalar metrics per vLLM bench schema. Each entry is the JSON key vLLM writes
-# to --output-json (latency, throughput) or --result-filename (serve). Only
-# scalar (single-number) metrics are ingested; list fields (latencies, itls,
-# ttfts, ...) are the raw samples behind these aggregates and are skipped.
-_LATENCY_METRICS = ("avg_latency",)
-_THROUGHPUT_METRICS = (
-    "elapsed_time",
-    "requests_per_second",
-    "tokens_per_second",
-)
-_SERVE_METRICS = (
-    "request_throughput",
-    "output_throughput",
-    "total_token_throughput",
-    "mean_ttft_ms",
-    "median_ttft_ms",
-    "p99_ttft_ms",
-    "mean_tpot_ms",
-    "median_tpot_ms",
-    "p99_tpot_ms",
-    "mean_itl_ms",
-    "median_itl_ms",
-    "p99_itl_ms",
-    "mean_e2el_ms",
-    "median_e2el_ms",
-    "p99_e2el_ms",
-)
-
-
-def extract_vllm_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
-    """Return (metric_name, value) pairs from one vLLM-native benchmark record.
-
-    Detects the vLLM bench schema (latency / throughput / serve) by the keys
-    the record carries and pulls out the scalar metrics for each. The three
-    schemas are disjoint on their signature keys, so a record maps to exactly
-    one. `percentiles` (latency) is a nested {percentile: value} dict and is
-    flattened to `p{percentile}_latency` metrics.
-    """
-    pairs: list[tuple[str, float]] = []
-
-    def _add(name: str, value: Any) -> None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return
-        pairs.append((name, float(value)))
-
-    if "avg_latency" in record:
-        for key in _LATENCY_METRICS:
-            if key in record:
-                _add(key, record[key])
-        percentiles = record.get("percentiles")
-        if isinstance(percentiles, dict):
-            for pct, value in percentiles.items():
-                _add(f"p{pct}_latency", value)
-    elif "requests_per_second" in record or "tokens_per_second" in record:
-        for key in _THROUGHPUT_METRICS:
-            if key in record:
-                _add(key, record[key])
-    elif "request_throughput" in record or "output_throughput" in record:
-        for key in _SERVE_METRICS:
-            if key in record:
-                _add(key, record[key])
-
-    return pairs
-
-
-def sample_count(record: dict[str, Any]) -> int:
-    """The n behind a native record's aggregates: latency iterations, serve requests, or the
-    one timed pass of a throughput run. 0 when the record does not say."""
-    if "avg_latency" in record:
-        latencies = record.get("latencies")
-        return len(latencies) if isinstance(latencies, list) else 0
-    if "requests_per_second" in record or "tokens_per_second" in record:
-        return 1
-    if "request_throughput" in record or "output_throughput" in record:
-        completed = record.get("completed")
-        return completed if isinstance(completed, int) and not isinstance(completed, bool) else 0
-    return 0
-
-
-_UNITS = {
-    "elapsed_time": "s",
-    "requests_per_second": "req/s",
-    "request_throughput": "req/s",
-    "tokens_per_second": "tok/s",
-    "output_throughput": "tok/s",
-    "total_token_throughput": "tok/s",
-}
-
-
-def metric_unit(metric: str) -> str:
-    """vLLM's own unit for a metric; its names encode ms but not seconds (latency, p99_latency)."""
-    if metric.endswith("_ms"):
-        return "ms"
-    if metric.endswith("latency"):
-        return "s"
-    return _UNITS.get(metric, "")
-
-
-def extract_pytorch_metrics(record: dict[str, Any]) -> list[tuple[str, float]]:
-    """Return (metric_name, value) pairs from one PyTorch-format record.
-
-    This is the schema `convert_to_pytorch_benchmark_format` writes to
-    `*.pytorch.json`, produced only when SAVE_TO_PYTORCH_BENCHMARK_FORMAT is
-    set. Kept for compatibility with runs that enable it.
-    """
-    if "benchmark" not in record or "metric" not in record:
-        return []
-    metric = record["metric"]
-    metric_name = metric.get("name", "unknown")
-    return [(metric_name, float(v)) for v in metric.get("benchmark_values", [])]
-
-
-def _test_name(filename: str) -> str:
-    """Strip .pytorch.json or .json suffix to get the bare test name."""
-    return filename.removesuffix(".pytorch.json").removesuffix(".json")
-
-
-def _model_from_record(record: dict[str, Any], filename: str) -> str:
-    """Best-effort model name from a benchmark record, falling back to the file."""
-    # vLLM-native JSON writes "model" as a top-level string
-    raw_model = record.get("model")
-    if isinstance(raw_model, str) and raw_model:
-        return raw_model
-
-    benchmark = record.get("benchmark", {})
-    if not isinstance(benchmark, dict):
-        benchmark = {}
-    model_info = raw_model if isinstance(raw_model, dict) else {}
-    return (
-        benchmark.get("model")
-        or benchmark.get("model_name")
-        or model_info.get("name")
-        or record.get("model_id")
-        or _test_name(filename)
-    )
-
-
-def extract_rows(
-    results_dir: str,
-    branch: str,
-    sha: str,
-    run_id: str,
-    job_id: str,
-    workflow: str,
-    pr_number: int,
-    arch: str = "x86_64",
-) -> list[dict[str, Any]]:
-    """Extract ClickHouse rows from vLLM benchmark JSON files.
-
-    The vLLM benchmark runner writes native `{test_name}.json` files
-    (latency / throughput / serve schemas). When SAVE_TO_PYTORCH_BENCHMARK_FORMAT
-    is set it ALSO writes `{test_name}.pytorch.json`, which re-reports a subset of
-    the same numbers. The PyTorch file is the source for every metric it carries
-    (its names are what the HUD reads); the native file adds only the metrics the
-    PyTorch file lacks, so no measurement is stored twice.
-    """
-    rows = []
-    ts = int(time.time() * 1000)
-
-    all_json = set(glob.glob(f"{results_dir}/*.json"))
-    pytorch_files = set(glob.glob(f"{results_dir}/*.pytorch.json"))
-    native_files = sorted(all_json - pytorch_files)
-    log.info(
-        "Found %d vLLM-native and %d PyTorch-format benchmark JSON files in %s",
-        len(native_files),
-        len(pytorch_files),
-        results_dir,
-    )
-
-    def _emit(filename: str, model: str, metric_name: str, value: float, n: int = 0) -> None:
-        info = {
-            "device": "spyre",
-            "arch": arch,
-            "hardware_type": "IBM_Spyre",
-            "model": model,
-            "test_name": _test_name(filename),
-            "head_sha": sha,
-            "pr_number": pr_number,
-            "value": value,
-        }
-        if n:
-            info["iterations"] = n
-        rows.append(
-            {
-                "timestamp": ts,
-                "schema_version": "v3",
-                "name": "spyre_e2e_benchmark",
-                "metric": metric_name,
-                "actual": float(value),
-                "target": 0.0,
-                "repo": "spyre-inference",
-                "head_branch": branch,
-                "workflow_id": int(run_id) if run_id.isdigit() else 0,
-                "job_id": int(job_id) if job_id.isdigit() else 0,
-                "run_attempt": 1,
-                "extra": json.dumps(info),
-            }
-        )
-
-    # Build a test_name -> model lookup from PyTorch files (which carry the
-    # model name). Native latency/throughput JSON has no model key, so we
-    # resolve it via the sibling .pytorch.json that shares the same test_name.
-    # Relies on SAVE_TO_PYTORCH_BENCHMARK_FORMAT=1 in CI; a deeper fix would
-    # inject the model into the native JSON at run time (run_vllm_benchmarks.py).
-    model_by_test: dict[str, str] = {}
-    pytorch_metrics: dict[str, set[str]] = {}
-    # Kept apart from the rows: a native record whose metrics all dedup away still has an n.
-    samples_by_test: dict[str, int] = {}
-
-    for file, extractor in [
-        *[(f, extract_pytorch_metrics) for f in sorted(pytorch_files)],
-        *[(f, extract_vllm_metrics) for f in native_files],
-    ]:
-        filename = os.path.basename(file)
-        test_name = _test_name(filename)
-
-        try:
-            records = read_benchmark_results(file)
-        except Exception:
-            log.exception("Failed to read benchmark results from %s", filename)
-            continue
-
-        if not records:
-            log.warning("No results in %s", filename)
-            continue
-
-        before_rows = len(rows)
-
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            model = _model_from_record(record, filename)
-            # Cache model from pytorch files; use cached model for native files
-            is_pytorch = filename.endswith(".pytorch.json")
-            if is_pytorch:
-                if model != test_name:
-                    model_by_test[test_name] = model
-            elif model == test_name and test_name in model_by_test:
-                model = model_by_test[test_name]
-            covered = pytorch_metrics.setdefault(test_name, set())
-            n = 0 if is_pytorch else sample_count(record)
-            if n:
-                samples_by_test.setdefault(test_name, n)
-            for metric_name, value in extractor(record):
-                if is_pytorch:
-                    covered.add(metric_name)
-                elif metric_name in covered:
-                    continue
-                _emit(filename, model, metric_name, value, n)
-
-        extracted = len(rows) - before_rows
-        if extracted:
-            log.info("Extracted %d rows from %s", extracted, filename)
-        else:
-            log.warning("No usable metrics in %s", filename)
-
-    counted = set()
-    for r in rows:
-        extra = json.loads(r["extra"])
-        if extra.get("iterations"):
-            counted.add(extra.get("test_name"))
-    for r in rows:
-        extra = json.loads(r["extra"])
-        name = extra.get("test_name")
-        if name in samples_by_test and name not in counted:
-            extra["iterations"] = samples_by_test[name]
-            r["extra"] = json.dumps(extra)
-            counted.add(name)
-
-    log.info("Total rows extracted: %d", len(rows))
-    return rows
 
 
 # ── GHA artifact identity ────────────────────────────────────────────────────────────────
@@ -429,21 +166,6 @@ def leg_installed(sha: str, rpm_lock: str, extra: str) -> str:
             log.warning("%s unreadable — left out of the installed delta", rpm_lock)
     tokens += (extra or "").replace(",", " ").split()
     return " ".join(tokens)
-
-
-def _parse_input_shapes(test_name: str) -> dict[str, str]:
-    """tp1_in64_out64 -> {tensor_parallel, input_len, output_len}.
-
-    These are identity discriminators, not decoration: without them tp1 and tp4 are one
-    benchmark whose trend line alternates between two unrelated numbers.
-    """
-    out: dict[str, str] = {}
-    for token in (test_name or "").split("_"):
-        for prefix, key in (("tp", "tensor_parallel"), ("in", "input_len"), ("out", "output_len")):
-            rest = token[len(prefix) :]
-            if token.startswith(prefix) and rest.isdigit():
-                out[key] = rest
-    return out
 
 
 def _is_uuid(value) -> bool:
@@ -493,6 +215,19 @@ def resolve_v2_run_id(args) -> str:
     return run_id_of("gha", gha, args.arch, getattr(args, "test_type", "perf"))
 
 
+def _ci_tags(leg) -> list:
+    """The main/pr/nightly tags of the leg's artifact; none from a library that predates them."""
+    try:
+        from spyre_clickhouse_ingest import ci_tags
+    except ImportError:
+        return []
+    day = datetime.datetime.now(datetime.UTC).date()
+    return ci_tags(
+        getattr(leg, "ci_event", ""), leg.repository, leg.branch, leg.sha,
+        getattr(leg, "pr_number", ""), day=day,
+    )  # fmt: skip
+
+
 def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> None:
     """This leg's artifacts row and its performance verdict in artifact_results.
 
@@ -512,24 +247,30 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> No
         aid = gha_artifact_id(BENCH_COMPONENT, base, installed, leg.arch)
         repo, gha = leg.repository, leg.gha_run_id
         run_url = f"https://github.com/{repo}/actions/runs/{gha}" if repo and gha else ""
-        wrote = insert_gha_artifact_result(
+        # The derive-gha-artifact-id record, so the leg registers as every GHA leg does.
+        ensure(
+            client,
+            db,
+            f"gha:{aid}|{base}|{installed}",
+            leg.arch,
+            component=BENCH_COMPONENT,
+            run_url=run_url,
+            sources=[(repo, leg.branch, leg.sha)],
+            tags=_ci_tags(leg),
+            tag_props={"source": "gha"},
+        )
+        wrote = insert_artifact_result(
             client,
             db,
             artifact_id=aid,
-            component=BENCH_COMPONENT,
-            arch=leg.arch,
             run_id=run_id_value,
             test_type=leg.test_type,
             state=leg.state,
+            arch=leg.arch,
             result_kind="performance",
             # Suite wall clock: each throughput run's own elapsed_time.
-            duration_s=sum(r["actual"] for r in rows if r.get("metric") == "elapsed_time"),
-            base_artifact_id=base,
-            installed=installed,
-            repo=repo,
-            git_ref=leg.branch,
-            git_sha=leg.sha,
-            run_url=run_url,
+            duration_s=duration_s(rows),
+            props={"run_url": run_url, "source": "gha"},
         )
         if wrote:
             log.info("Linked artifact %s (base %s) to run_id=%s", aid, base, run_id_value)
@@ -543,15 +284,6 @@ def _write_artifact_results(client, db: str, rows, run_id_value: str, leg) -> No
 # (schema/70-vllm-hud-projection.sql in torch-spyre). So this is the ONLY perf write: the
 # upstream-shaped rows are projected from it rather than inserted a second time, which is what
 # keeps the two from disagreeing.
-BENCH_COMPONENT = "spyre-inference"
-
-_BENCH_TABLES = (schema.BENCHMARKS, schema.BENCHMARK_RUNS)
-
-# In the hash, not merely in props: mode and the input shapes are what separate two runs of
-# the same model. component leads the hash, so a `latency` here cannot collide with a
-# same-named benchmark in another producer's suite.
-_BENCH_ID_KEYS = ("record_type", "run_mode", "tensor_parallel", "input_len", "output_len")
-
 # The identities this script writes, pinned as literals against the library that mints
 # them. Installed from a floating `@main`, so the job that WRITES has to check them --
 # ingest_identity says why the test-time goldens are not enough. run_id and the artifact ids
@@ -595,94 +327,17 @@ IDENTITY_GOLDENS = (
                 "input_len": "64",
                 "output_len": "64",
             },
-            _BENCH_ID_KEYS,
+            BENCH_ID_KEYS,
         ),
         "f07dc029-26b3-51d2-8109-7e32e0edc1b7",
     ),
 )
 
-# The MV cannot see the CI coordinates, so it reads them off benchmark_runs.props; guessing
-# them downstream would put a wrong commit on a chart.
-_RUN_PROP_COLUMNS = ("repo", "head_branch", "workflow_id", "run_attempt", "job_id")
-_RUN_PROP_EXTRA_KEYS = ("head_sha", "arch", "hardware_type")
-
-
-def _bench_entries(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The flat results_v3 rows in the shared writer's entry shape.
-
-    One entry per (benchmark, metric); insert_benchmarks merges them into one benchmark_runs
-    row per (benchmark, backend), so the 26 metrics of one benchmark stay one measurement
-    rather than 26 trend points.
-
-    iterations is the n the native record reports (sample_count), set on ONE entry per
-    benchmark: insert_benchmarks sums it across the merged entries.
-    """
-    entries = []
-    counted: set[str] = set()
-    for r in rows:
-        extra = json.loads(r["extra"])
-        # Already suffix-stripped by _test_name, which is what makes the native json and the
-        # `.pytorch.json` copy of one benchmark reach one identity rather than two.
-        name = extra.get("test_name") or ""
-        if not name:
-            continue
-        # vLLM's own mode: latency | throughput | serve. Already the test_name prefix.
-        props = {"record_type": "model", "run_mode": name.split("_")[0]}
-        props.update(_parse_input_shapes(name))
-        model = extra.get("model", "")
-        # The native latency json carries no model, so _model_from_record falls back to the
-        # filename. Keep it only when it says something the name does not already.
-        if model and model != name:
-            props["model"] = model
-        run_props = {k: str(r.get(k, "")) for k in _RUN_PROP_COLUMNS}
-        run_props.update({k: str(extra.get(k, "")) for k in _RUN_PROP_EXTRA_KEYS})
-        # One key per metric: the writer merges run_props by update, so a single JSON blob
-        # would keep only the last entry's metric.
-        unit = metric_unit(r["metric"])
-        if unit:
-            run_props[f"unit.{r['metric']}"] = unit
-        iterations = 0
-        if extra.get("iterations") and name not in counted:
-            counted.add(name)
-            iterations = int(extra["iterations"])
-        entries.append(
-            {
-                "name": name,
-                "tags": [],
-                # backend is a COLUMN, never a hash input: it is the axis a cross-backend
-                # comparison pivots ON, so folding it into identity would make the two sides
-                # of the comparison different benchmarks.
-                "backend": extra.get("device", ""),
-                "props": props,
-                "measurements": {r["metric"]: [float(r["actual"])]},
-                "iterations": iterations,
-                "run_props": run_props,
-                "disc": props,
-                "disc_keys": _BENCH_ID_KEYS,
-            }
-        )
-    return entries
-
 
 def _write_v2_benchmarks(client, db: str, rows, run_id_value: str) -> None:
-    """benchmarks + benchmark_runs for this leg. Additive and contained: an absent table is
-    the normal state until the DDL lands, and a failure must not cost the flat rows."""
+    """benchmarks + benchmark_runs for this leg; a failure must not cost the flat rows."""
     try:
-        if not tables_present(client, db, tables=_BENCH_TABLES):
-            log.info("benchmarks/benchmark_runs absent or stale in %s — v2 perf rows skipped", db)
-            return
-        if benchmarks_already_ingested(client, db, run_id_value, BENCH_COMPONENT, "vllm"):
-            log.info("v2 perf rows already present for run_id=%s — skipping", run_id_value)
-            return
-        n = insert_benchmarks(
-            client,
-            db,
-            BENCH_COMPONENT,
-            run_id_value,
-            _bench_entries(rows),
-            report_kind="vllm",
-        )
-        log.info("Inserted %d benchmark_runs row(s) under run_id=%s", n, run_id_value)
+        write_benchmarks(client, db, rows, run_id_value)
     except Exception as exc:  # noqa: BLE001
         log.warning("v2 perf write failed, %s unaffected: %r", RESULTS_TABLE, exc)
 

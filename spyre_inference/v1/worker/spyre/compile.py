@@ -1,0 +1,35 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""MRV2: per-block compile, suppressing MRV2's whole-model stock compile.
+
+STOCK_TORCH_COMPILE on MRV2 doesn't exist before vLLM 0.32 (vllm#59079);
+compiles one block at a time instead, through the same shared helpers V1
+uses (_repeated_block_lists, _compile_granularity, spyre_model_runner.py).
+"""
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
+
+
+def suppress_whole_model_compile(runner: "SpyreModelRunnerV2") -> None:
+    """Stop MRV2 from stock-compiling the whole model."""
+    raise NotImplementedError
+
+
+def compile_blocks(runner: "SpyreModelRunnerV2", fullgraph: bool = True) -> int:
+    """Compile each repeated transformer block once. Returns the block count."""
+    raise NotImplementedError

@@ -26,12 +26,33 @@ models:
         max_model_len: 32768
         max_num_seqs: 32
 
-  # ---- Granite 4.1 decoder models ------------------------------------------
-  ibm-granite/granite-4.1-8b:
+  # ---- Granite decoder models ------------------------------------------
+  ibm-granite/granite-3.3-8b-instruct:
+    platforms: [x86_64, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 4096
+        max_num_seqs: 32
+
+  ibm-granite/granite-3.3-8b-instruct:
     platforms: [x86_64, ppc64le]
     serving_configs:
       - tp_size: 4
         max_model_len: 32768
+        max_num_seqs: 32
+
+  ibm-granite/granite-4.1-8b:
+    platforms: [x86_64]
+    serving_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+
+  ibm-granite/granite-4.1-8b-fp8:
+    platforms: [x86_64, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 4096
         max_num_seqs: 32
 
   ibm-granite/granite-4.1-8b-fp8:
@@ -55,22 +76,22 @@ models:
     platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
-        max_model_len: 512
-        max_num_seqs: 256
+        max_model_len: 256
+        max_num_seqs: 8
 
   sentence-transformers/all-roberta-large-v1:
-    platforms: [x86_64, ppc64le]
+    platforms: [x86_64]
     serving_configs:
       - tp_size: 1
-        max_model_len: 512
-        max_num_seqs: 128
+        max_model_len: 256
+        max_num_seqs: 8
 
   openai/clip-vit-base-patch32:
-    platforms: [x86_64, s390x, ppc64le]
+    platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
         max_model_len: 77
-        max_num_seqs: 256
+        max_num_seqs: 8
 
   # Granite embedding models — English
   ibm-granite/granite-embedding-30m-english:
@@ -78,14 +99,21 @@ models:
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 256
+        max_num_seqs: 4
 
   ibm-granite/granite-embedding-125m-english:
     platforms: [x86_64, ppc64le]
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 256
+        max_num_seqs: 4
+
+  ibm-granite/granite-embedding-107m-multilingual:
+    platforms: [x86_64, ppc64le]
+    serving_configs:
+      - tp_size: 1
+        max_model_len: 512
+        max_num_seqs: 4
 
   # Multilingual RAG — embedding dim 768
   ibm-granite/granite-embedding-278m-multilingual:
@@ -93,7 +121,7 @@ models:
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 256
+        max_num_seqs: 4
 
   # Multilingual embedding — XLM-RoBERTa-large backbone
   intfloat/multilingual-e5-large:
@@ -101,44 +129,44 @@ models:
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 128
+        max_num_seqs: 4
 
   # NLI / zero-shot classification — embedding dim 1024
   FacebookAI/roberta-large-mnli:
-    platforms: [x86_64, s390x, ppc64le]
+    platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 128
+        max_num_seqs: 4
 
   # Token classification / NER — embedding dim 768 (BERT-base)
   dslim/bert-base-NER:
-    platforms: [x86_64, s390x, ppc64le]
+    platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 256
+        max_num_seqs: 4
 
   # Token classification / NER — embedding dim 1024 (RoBERTa-large)
   Jean-Baptiste/roberta-large-ner-english:
-    platforms: [x86_64, s390x, ppc64le]
+    platforms: [x86_64, s390x]
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 128
+        max_num_seqs: 4
 
   # ---- Cross-encoder / Reranker models ------------------------------------
 
   BAAI/bge-reranker-large:
-    platforms: [x86_64, ppc64le]
+    platforms: [x86_64]
     serving_configs:
       - tp_size: 1
         max_model_len: 512
-        max_num_seqs: 128
+        max_num_seqs: 4
 
   BAAI/bge-reranker-v2-m3:
     platforms: [x86_64, ppc64le]
     serving_configs:
       - tp_size: 1
-        max_model_len: 512
-        max_num_seqs: 128
+        max_model_len: 8192
+        max_num_seqs: 4

@@ -28,9 +28,11 @@ parameterised. This layout does not carry ALiBi.
 """
 
 import contextlib
+from typing import ClassVar
 
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -38,11 +40,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    FP8_KV_CACHE_DTYPES,
     SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
-    _call_kernel,
 )
 from spyre_inference.v1.attention.ops.batched_decode_head_major import (
     batched_decode_head_major_kernel,
@@ -126,6 +128,11 @@ def _capped_cores(output_units: int):
 class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
     """Head-major variant of the paged KV-cache backend."""
 
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        *SpyreAttentionBackend.supported_kv_cache_dtypes,
+        *FP8_KV_CACHE_DTYPES,
+    ]
+
     @staticmethod
     def get_impl_cls() -> type["SpyreHeadMajorAttentionImpl"]:
         return SpyreHeadMajorAttentionImpl
@@ -142,7 +149,12 @@ class SpyreHeadMajorAttentionBackend(SpyreAttentionBackend):
 
 
 class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
-    """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache."""
+    """Online-softmax paged attention over a ``[num_blocks, KV, block_size, D]`` cache.
+
+    A float8 cache stores ``K / k_scale`` and ``V / v_scale``, dequantized on read.
+    """
+
+    supports_fp8_kv_cache: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -158,7 +170,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self._decode_fn = _batched_decode_compiled
         if self.alibi_slopes is not None:
             raise NotImplementedError(
-                "ALiBi is not supported on the head-major KV layout; use the default "
+                "ALiBi is not supported on the head-major KV layout; use the "
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
@@ -173,7 +185,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def allocate_pages(
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
-        dtype = spec.dtype
+        # Upstream sizes an fp8 cache as uint8 bytes; the pages hold e4m3 values.
+        dtype = torch.float8_e4m3fn if spec.dtype == torch.uint8 else spec.dtype
         layout = head_major_kv_layout(
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, dtype
         )
@@ -183,17 +196,31 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
         )
 
+    def _kernel_kv_scales(self) -> tuple[float, ...]:
+        """Trailing (k_scale, v_scale) store arguments; none for a model-dtype cache."""
+        if not self.kv_cache_fp8:
+            return ()
+        assert self._kv_scales is not None, (
+            "KV scales unresolved: the runner reads them at load (_resolve_kv_scales)"
+        )
+        return self._kv_scales
+
+    def _read_scales(self) -> tuple[float, tuple[float, ...]]:
+        """The softmax scale with k_scale folded in, and the trailing (v_scale,) argument."""
+        if not self.kv_cache_fp8:
+            return self.scale, ()
+        k_scale, v_scale = self._kernel_kv_scales()
+        return self.scale * k_scale, (v_scale,)
+
     def kv_write_index(
         self, slot_mapping: torch.Tensor, device: torch.device
     ) -> list[torch.Tensor]:
         """Head h of the token at ``block * block_size + offset`` lives at row
         ``(block * num_kv_heads + h) * block_size + offset``.
 
-        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: an int32 view's
-        storage offset is still dropped on the way to the device (torch-spyre#3770 is
-        closed, but its fix covers float16 only -- see ``_kv_row_pool``). That corruption is
-        shape-dependent — correct while a row fits one int32 stick, every head past it
-        silently wrong — so a short-token test passes while long prefill corrupts.
+        One tensor per head, not rows of one ``[KV, T]`` tensor: a row of a 2-D index is
+        followed for its first int32 stick only (torch-spyre#3851), so every head drops the
+        tokens past it -- a short-token test passes while long prefill corrupts.
         """
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
         base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
@@ -219,16 +246,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _kv_row_pool(self, num_pages: int, device: torch.device) -> torch.Tensor:
         """Every page's rows in the folded cache, for the decode kernel to gather from.
 
-        A page's rows are ``page * num_kv_heads + kv``, which the kernel cannot compute
-        from the page id: int32 arithmetic has no device op mapping. The kernel gathers
+        A page's rows are ``page * num_kv_heads + kv``. The kernel gathers
         them out of this pool rather than reading a per-block table, which also settles the
-        int32 offset question the unrolled walk had to work around: an int32 argument's
-        nonzero storage offset is still read as 0 and an in-graph slice of a stacked table
-        still gathers the wrong rows at that shape (torch-spyre#3770 is closed, but the fix
-        in torch-spyre#4449 landed for float16 only; strict xfails pin both cases --
-        test_spyre_compile_input_honors_storage_offset's int32 parametrization and
-        test_spyre_in_graph_slice_of_stacked_kv_row_index). A gather is offset-free, so one
-        pool serves every block.
+        question the unrolled walk had to work around: an index argument that is a row of
+        a stacked table loses its layout (torch-spyre#3851,
+        test_spyre_scatter_index_row_of_2d_table), and an in-graph slice of a stacked table
+        gathers the wrong rows at that shape (test_spyre_in_graph_slice_of_stacked_kv_row_index).
+        One pool serves every block.
 
         Pure cache geometry, so it is built once rather than per step, unlike the index
         tables -- which retires one H2D transfer per active block per sequence per step.
@@ -289,17 +313,16 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         block_size: int,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
+        scale, v_args = self._read_scales()
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
-            return _call_kernel(
-                "batched decode attention",
-                self._decode_fn,
+            return self._decode_fn(
                 query_dev,
                 rep_row_ids,
                 k_pages,
                 v_pages,
                 chunk_index_tables,
                 mask_by_chunk,
-                self.scale,
+                scale,
                 b_seqs,
                 blocks_per_chunk,
                 self.num_kv_heads,
@@ -308,6 +331,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.head_size,
                 self.logits_soft_cap,
                 out,
+                *v_args,
             )
 
     def _run_page_attn(
@@ -334,28 +358,27 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         assert index_table.shape[0] == num_blocks, (
             f"index table has {index_table.shape[0]} rows for {num_blocks} blocks"
         )
+        scale, v_args = self._read_scales()
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
             with _capped_cores(self.num_kv_heads * padded_query_len):
-                return _call_kernel(
-                    "page attention (prefill)",
-                    _page_attn_prefill_compiled,
+                return _page_attn_prefill_compiled(
                     query,
                     row_table,
                     k_pages,
                     v_pages,
                     index_table,
                     mask_stack,
-                    self.scale,
+                    scale,
                     num_blocks,
                     padded_query_len,
                     self.num_heads,
                     self.num_kv_heads,
                     self.head_size,
-                    self.block_size,
                     self.logits_soft_cap,
                     out,
+                    *v_args,
                 )
 
         k_folded, v_folded = self._folded_pages(k_pages, v_pages)
@@ -363,9 +386,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.
         with _capped_cores(self.num_kv_heads * padded_query_len):
-            return _call_kernel(
-                "page attention",
-                self._decode_attn_fn,
+            return self._decode_attn_fn(
                 query,
                 row_table,
                 k_folded,
@@ -373,7 +394,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 index_table,
                 kv_row_pool,
                 mask_stack,
-                self.scale,
+                scale,
                 num_blocks,
                 padded_query_len,
                 self.num_heads,
@@ -382,6 +403,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.block_size,
                 self.logits_soft_cap,
                 out,
+                *v_args,
             )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
@@ -399,7 +421,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
         k_rows, v_rows = self.kv_slot_views(kv_cache)
-        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping)
+        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping, *self._kernel_kv_scales())
         # Only k_rows is returned; Inductor fuses the stores into one kernel, so
         # ordering the read after it covers the V write too.
         return k_rows

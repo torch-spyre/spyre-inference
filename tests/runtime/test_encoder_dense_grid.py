@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The rectangular path's grid layout is a contract between two places in the runner:
-``_preprocess`` scatters the packed tokens into ``[B*L]``, and ``_unpad_encoder_hidden``
-gathers them back for the pooler. They share one row-index table, so a round trip is
-the thing worth testing.
+"""Test the rectangular grid layout and its pooling row selections.
+
+``_preprocess`` expands packed tokens into ``[B*L]``; packed-order pooling
+re-compacts the grid, while CLS selects its first rows directly and MEAN reduces
+each lane in place.
 """
 
 import numpy as np
@@ -28,11 +29,13 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
 from spyre_inference.models.bert import SpyreBertEmbedding
 from spyre_inference.models.roberta import SpyreRobertaEmbedding
-from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool
-from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+from spyre_inference.v1.pool.encoder_grid import rect_pooling_method, unpad_encoder_grid
+from spyre_inference.v1.pool.spyre_pooler import SpyreCLSPool, SpyreLastPool, SpyreMeanPool
+from spyre_inference.v1.worker.encoder_grid import expand_body_to_grid
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_cls_rows,
     encoder_dense_row_indices,
+    encoder_grid_source_rows,
     expand_packed_to_encoder_grid,
     expand_packed_token_types,
 )
@@ -62,6 +65,77 @@ def test_expand_then_gather_round_trips(query_lens):
     rows = encoder_dense_row_indices(query_lens, extent)
     assert torch.equal(grid_ids[rows], ids)
     assert torch.equal(grid_pos[rows], positions)
+
+
+@pytest.mark.parametrize("query_lens", [[64, 64], [1, 64, 32], [10], [7, 1, 63, 64]])
+def test_embeds_gather_lands_every_token_on_its_grid_row(query_lens):
+    """The embeddings gather must put each packed row where the ids expansion puts
+    its id, and read nothing past the packed tokens."""
+    extent, width = 64, len(query_lens) + 2
+    total = sum(query_lens)
+    embeds = torch.arange(1, total + 1, dtype=torch.float16).unsqueeze(1).expand(-1, 8)
+    ids = torch.arange(1, total + 1, dtype=torch.int64)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens])
+
+    source_rows = encoder_grid_source_rows(query_lens, width, extent)
+    grid = embeds[torch.tensor(source_rows)]
+    grid_ids, _ = expand_packed_to_encoder_grid(ids, positions, query_lens, width, extent)
+
+    assert grid.shape == (width * extent, 8)
+    rows = encoder_dense_row_indices(query_lens, extent)
+    assert torch.equal(grid[rows], embeds)
+    assert torch.equal(grid[rows, 0].long(), grid_ids[rows])
+    assert max(source_rows) == total - 1
+
+
+def test_expand_body_to_grid_lays_out_ids_and_keeps_embeds():
+    query_lens = [7, 1, 63]
+    extent, width = 64, 4
+    total = sum(query_lens)
+    # Upstream hands over the whole padded body; only the first `total` rows are real.
+    ids = torch.arange(1, total + 9, dtype=torch.int64)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens + [8]])
+    embeds = torch.zeros(1)
+
+    grid_ids, grid_embeds, grid_pos = expand_body_to_grid(
+        ids, embeds, positions, (extent, width, query_lens), pad_token_id=9, position_offset=2
+    )
+
+    want_ids, want_pos = expand_packed_to_encoder_grid(
+        ids[:total], positions[:total], query_lens, width, extent, pad_token_id=9, position_offset=2
+    )
+    assert torch.equal(grid_ids, want_ids)
+    assert torch.equal(grid_pos, want_pos)
+    assert grid_embeds is embeds
+
+
+def test_expand_body_to_grid_gathers_embeds_without_ids():
+    """Multimodal pooling preprocesses straight to embeddings; those move instead."""
+    query_lens = [7, 1, 63]
+    extent, width = 64, 4
+    total = sum(query_lens)
+    embeds = torch.arange(1, total + 9, dtype=torch.float16).unsqueeze(1).expand(-1, 8)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens + [8]])
+
+    grid_ids, grid_embeds, grid_pos = expand_body_to_grid(
+        None, embeds, positions, (extent, width, query_lens), pad_token_id=9, position_offset=0
+    )
+
+    assert grid_ids is None
+    assert grid_embeds is not None
+    rows = encoder_dense_row_indices(query_lens, extent)
+    assert torch.equal(grid_embeds[rows], embeds[:total])
+    assert torch.equal(grid_pos[rows], positions[:total])
+
+
+def test_embeds_gather_rejects_a_batch_wider_than_the_rectangle():
+    with pytest.raises(ValueError, match="exceeds batch_bucket"):
+        encoder_grid_source_rows([1, 1, 1], 2, 64)
+
+
+def test_embeds_gather_rejects_a_length_past_the_extent():
+    with pytest.raises(ValueError, match="exceeds len_bucket"):
+        encoder_grid_source_rows([65], 1, 64)
 
 
 def test_real_pad_continues_positions_and_batch_pad_restarts():
@@ -264,14 +338,6 @@ def _pooling_metadata(lengths: list[int]) -> PoolingMetadata:
     return metadata
 
 
-def _runner(pooler, grid):
-    runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
-    runner._encoder_grid = grid
-    runner.model = type("_Model", (), {})()
-    runner.model.pooler = pooler
-    return runner
-
-
 def test_rectangular_cls_matches_unpad_then_gather():
     """Grid CLS rows name the same vectors the packed cursor names after unpad."""
     extent, width = 8, 3
@@ -280,16 +346,28 @@ def test_rectangular_cls_matches_unpad_then_gather():
         torch.arange(width * extent, dtype=torch.float32).unsqueeze(1).expand(-1, 4).contiguous()
     )
     metadata = _pooling_metadata(query_lens)
-    pooler = SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity())
-    runner = _runner(pooler, (extent, width, query_lens))
+    grid = (extent, width, query_lens)
 
-    assert runner._rectangular_cls(metadata)
-    assert not _runner(
-        SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()),
-        (extent, width, query_lens),
-    )._rectangular_cls(metadata)
+    assert isinstance(
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreCLSPool(), head=nn.Identity()), metadata, grid
+        ),
+        SpyreCLSPool,
+    )
+    assert isinstance(
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreMeanPool(), head=nn.Identity()), metadata, grid
+        ),
+        SpyreMeanPool,
+    )
+    assert (
+        rect_pooling_method(
+            SequencePooler(pooling=SpyreLastPool(), head=nn.Identity()), metadata, grid
+        )
+        is None
+    )
 
-    packed = runner._unpad_encoder_hidden(hidden, sum(query_lens))
+    packed = unpad_encoder_grid(hidden, grid)
     cls = SpyreCLSPool()
     from_unpad = cls(packed, metadata)
     metadata.get_pooling_cursor().first_token_indices_gpu = torch.tensor(

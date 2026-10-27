@@ -1,0 +1,34 @@
+# Multimodal serve benchmarks for Spyre devices, using vLLM's random-mm dataset.
+# Same defaults/tests format as serve-tests.yaml.
+
+defaults:
+  server_health_timeout: 3600
+  environment_variables:
+    VLLM_CPU_KVCACHE_SPACE: 64
+    DTLOG_LEVEL: error
+  server_parameters:
+    load-format: auto
+    tensor-parallel-size: 4
+    max-model-len: 32768
+  parameters:
+    dataset-name: random-mm
+    backend: openai-chat
+    endpoint: /v1/chat/completions
+    ignore-eos: true
+    percentile-metrics: ttft,tpot,itl,e2el
+    metric-percentiles: 99,100
+    max-concurrency: 4
+    num-prompts: 200
+    input-len: 8192
+    output-len: 128
+    random-mm-limit-mm-per-prompt: '{"image": 1, "video": 0}'
+    random-mm-bucket-config: '{(2048, 2048, 1): 1}'
+
+tests:
+  - test_name: serve_ministral3-14b_tp4_mm_random
+    server_parameters:
+      model: mistralai/Ministral-3-14B-Instruct-2512-BF16
+
+  - test_name: serve_gemma4-26b-a4b-it_tp4_mm_random
+    server_parameters:
+      model: google/gemma-4-26B-A4B-it

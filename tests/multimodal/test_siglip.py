@@ -315,7 +315,6 @@ def test_patch_siglip_attention_scale_uses_orig_head_dim():
     and corrupt the encoder's attention pattern.  Verified indirectly: running the
     patched forward with a manually-computed reference at the correct scale.
     """
-    from spyre_inference.custom_ops.vit_attn import _full_attend_mask
     from spyre_inference.multimodal.siglip import (
         _pad_out_weight,
         _pad_qkv_weight,
@@ -347,7 +346,7 @@ def test_patch_siglip_attention_scale_uses_orig_head_dim():
     q = q.view(bsz, seq, _NUM_HEADS_SIGLIP, _PAD_HEAD_DIM).transpose(1, 2)
     k = k.view(bsz, seq, _NUM_HEADS_SIGLIP, _PAD_HEAD_DIM).transpose(1, 2)
     v = v.view(bsz, seq, _NUM_HEADS_SIGLIP, _PAD_HEAD_DIM).transpose(1, 2)
-    ref_out = padded_sdpa(q, k, v, _full_attend_mask(seq), scale=_ORIG_HEAD_DIM**-0.5)
+    ref_out = padded_sdpa(q, k, v, None, scale=_ORIG_HEAD_DIM**-0.5)
     ref_out = ref_out.transpose(1, 2).reshape(bsz, seq, -1)
     expected, _ = ref_out @ pad_out_w, None
 

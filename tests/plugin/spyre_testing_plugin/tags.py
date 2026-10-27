@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared JUnit result-tagging helpers for both the tests/conftest.py autouse
-fixture and this plugin's collection hook (which tags upstream vLLM tests,
-collected outside tests/ where the fixture never binds).
+"""Shared JUnit result-tagging helpers for the collection hooks in
+tests/conftest.py (local tests) and this plugin (upstream vLLM tests).
 
 Tags emit as JUnit `<property name="tag" value="key__value"/>`, the convention
 the ClickHouse ingest reads.
@@ -80,3 +79,22 @@ def result_tags(params):
     for tier in declared_tiers():
         tags.append(("tag", f"testtype__{tier}"))
     return tags
+
+
+def record_serving_capability(
+    record_property, model, name, tensor_parallel, max_model_len, max_num_seqs, **props
+):
+    """Record the case as a `model_serving` capability: `declared` for a registry entry,
+    `served` for a vLLM engine built with this config, whose outcome is the case's. Record
+    before building the engine, so a config that crashes it still counts; `None`/`""` props
+    are dropped."""
+    for prop in [
+        ("capability.test_type", "model_serving"),
+        ("capability.subject", model),
+        ("capability.name", name),
+        ("capability.backend", "spyre"),
+        ("capability.sig.tensor_parallel", str(tensor_parallel)),
+        ("capability.sig.max_model_len", str(max_model_len)),
+        ("capability.sig.max_num_seqs", str(max_num_seqs)),
+    ] + [(f"capability.prop.{k}", str(v)) for k, v in sorted(props.items()) if v not in (None, "")]:
+        record_property(*prop)

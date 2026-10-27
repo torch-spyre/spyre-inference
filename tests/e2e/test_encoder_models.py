@@ -19,16 +19,22 @@ Regenerate: ``generate_encoder_embed_refs.py``, ``generate_rerank_score_refs.py`
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
 import torch.nn.functional as F
+from spyre_testing_plugin.tags import record_serving_capability
 from vllm import LLM
 from vllm.config import PoolerConfig
+
+MAX_MODEL_LEN = 64
 
 EMBEDDING_MODELS = [
     "ibm-granite/granite-embedding-125m-english",
@@ -63,6 +69,17 @@ RERANKER_MODELS = [
     "BAAI/bge-reranker-large",
 ]
 
+# Pairs of 513-1024 tokens at the default-derived max_model_len (2048) batch onto the
+# (1024, 2) rectangle, whose fused-QKV attention needs torch-spyre#5069 (#4893).
+LONG_RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+LONG_RERANK_QUERY = "What is the performance of the Spyre accelerator for reranking tasks?"
+LONG_RERANK_DOCUMENTS = [
+    ("the spyre accelerator delivers fast reranking throughput on ibm hardware " * 45).strip(),
+    (
+        "reranking vllm spyre inference benchmark token test document paragraph context " * 45
+    ).strip(),
+]
+
 # Token classification applies its own classifier after a head_dtype cast.
 # Same path as sequence-classify: fp16 x @ Wᵀ and bias on Spyre.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
@@ -89,6 +106,19 @@ _RERANK_REF_PATH = Path(__file__).parent.parent / "data" / "rerank_score_refs.js
 _RERANK_REFERENCES: dict = (
     json.loads(_RERANK_REF_PATH.read_text()) if _RERANK_REF_PATH.exists() else {}
 )
+_RERANK_GENERATOR_PATH = _RERANK_REF_PATH.with_name("generate_rerank_score_refs.py")
+
+
+def _rerank_generator() -> ModuleType:
+    """The reference generator, loaded by path: ``tests`` is a namespace package, so
+    importing it as ``tests.data...`` breaks whenever another ``tests`` package wins."""
+    spec = importlib.util.spec_from_file_location(
+        "generate_rerank_score_refs", _RERANK_GENERATOR_PATH
+    )
+    assert spec is not None and spec.loader is not None, _RERANK_GENERATOR_PATH
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -123,32 +153,43 @@ def _hf_last_token_embeddings(model: str, revision: str, prompts: list[str]) -> 
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
-def test_encoder_embed_models(model: str) -> None:
+def test_encoder_embed_models(model: str, record_property) -> None:
     """Spyre embeddings match cached HF references within cosine tolerance."""
-    _assert_embeddings_match_refs(model, enforce_eager=True)
+    _assert_embeddings_match_refs(model, enforce_eager=True, record_property=record_property)
 
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", EMBEDDING_MODELS)
-def test_encoder_embed_models_compiled(model: str) -> None:
+def test_encoder_embed_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
-    _assert_embeddings_match_refs(model, enforce_eager=False)
+    _assert_embeddings_match_refs(model, enforce_eager=False, record_property=record_property)
 
 
-def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
+def _assert_embeddings_match_refs(model: str, enforce_eager: bool, record_property) -> None:
     ref = _REFERENCES.get(model)
     if ref is None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
 
     prompts = ref["prompts"]
+    max_num_seqs = 1
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="embed",
+        enforce_eager=enforce_eager,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=enforce_eager,
     )
     outputs = llm.embed(prompts)
@@ -168,7 +209,7 @@ def _assert_embeddings_match_refs(model: str, enforce_eager: bool) -> None:
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", MEAN_POOLING_MODELS)
-def test_encoder_embed_mean_multi_seq(model: str) -> None:
+def test_encoder_embed_mean_multi_seq(model: str, record_property) -> None:
     """MEAN with ``max_num_seqs=2`` so two requests share one packed ``[T, H]``.
 
     The default embed e2e is ``max_num_seqs=1`` and never hits two sequences
@@ -179,13 +220,24 @@ def test_encoder_embed_mean_multi_seq(model: str) -> None:
         pytest.skip(f"No HF ref for {model}; run tests/data/generate_encoder_embed_refs.py")
 
     prompts = ref["prompts"]
+    max_num_seqs = 2
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="embed",
+        enforce_eager=True,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=2,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=True,
     )
     outputs = llm.embed(prompts)
@@ -228,7 +280,7 @@ def test_encoder_embed_last_pooling() -> None:
         revision=revision,
         tokenizer_revision=revision,
         runner="pooling",
-        max_model_len=64,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=1,
         enforce_eager=True,
         pooler_config=PoolerConfig(seq_pooling_type="LAST"),
@@ -251,20 +303,20 @@ def test_encoder_embed_last_pooling() -> None:
 
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
-def test_encoder_rerank_models(model: str) -> None:
+def test_encoder_rerank_models(model: str, record_property) -> None:
     """Spyre reranker scores match the cached HF references within tolerance."""
-    _assert_rerank_scores_match_refs(model, enforce_eager=True)
+    _assert_rerank_scores_match_refs(model, enforce_eager=True, record_property=record_property)
 
 
 @pytest.mark.model_quality
 @pytest.mark.uses_subprocess
 @pytest.mark.parametrize("model", RERANKER_MODELS)
-def test_encoder_rerank_models_compiled(model: str) -> None:
+def test_encoder_rerank_models_compiled(model: str, record_property) -> None:
     """Same models and references, compiled rather than eager."""
-    _assert_rerank_scores_match_refs(model, enforce_eager=False)
+    _assert_rerank_scores_match_refs(model, enforce_eager=False, record_property=record_property)
 
 
-def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
+def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool, record_property) -> None:
     """Classifier GEMM runs on Spyre in fp16 (no fp32 matmul, torch-spyre#1794)."""
     ref = _RERANK_REFERENCES.get(model)
     if ref is None:
@@ -272,19 +324,85 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
 
     documents = ref["documents"]
     ref_scores = ref["scores"]
+    max_num_seqs = 1
+    record_serving_capability(
+        record_property,
+        model,
+        "served",
+        1,
+        MAX_MODEL_LEN,
+        max_num_seqs,
+        task="score",
+        enforce_eager=enforce_eager,
+    )
     llm = LLM(
         model=model,
         revision=ref["revision"],
         tokenizer_revision=ref["revision"],
         runner="pooling",
-        max_model_len=64,
-        max_num_seqs=1,
+        max_model_len=MAX_MODEL_LEN,
+        max_num_seqs=max_num_seqs,
         enforce_eager=enforce_eager,
     )
     outputs = llm.score(ref["query"], documents)
     assert len(outputs) == len(documents)
+    _assert_scores_match(model, documents, [out.outputs.score for out in outputs], ref_scores)
 
-    scores = [out.outputs.score for out in outputs]
+
+@pytest.mark.model_quality
+@pytest.mark.uses_subprocess
+def test_encoder_rerank_default_max_model_len_compiled(record_property) -> None:
+    """Warmup at the default max_model_len survives, and a (1024, 2) batch matches HF."""
+    ref = _RERANK_REFERENCES.get(LONG_RERANK_MODEL)
+    if ref is None:
+        pytest.skip(
+            f"No HF ref for {LONG_RERANK_MODEL}; run tests/data/generate_rerank_score_refs.py"
+        )
+    revision = ref["revision"]
+
+    ref_scores, token_counts = _rerank_generator().score_pairs(
+        LONG_RERANK_MODEL, revision, LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS
+    )
+    for count in token_counts:
+        assert 512 < count <= 1024, f"pair of {count} tokens no longer pads to L=1024"
+
+    # vLLM resolves max_model_len and max_num_seqs here, so a failed build records `default`.
+    record = functools.partial(
+        record_serving_capability,
+        record_property,
+        LONG_RERANK_MODEL,
+        "served",
+        1,
+        task="score",
+        enforce_eager=False,
+    )
+    try:
+        llm = LLM(
+            model=LONG_RERANK_MODEL,
+            revision=revision,
+            tokenizer_revision=revision,
+            runner="pooling",
+            enforce_eager=False,
+        )
+    except BaseException:
+        record("default", "default")
+        raise
+    config = llm.llm_engine.vllm_config
+    record(config.model_config.max_model_len, config.scheduler_config.max_num_seqs)
+    assert llm.llm_engine.model_config.max_model_len == 2048
+    outputs = llm.score(LONG_RERANK_QUERY, LONG_RERANK_DOCUMENTS)
+    assert len(outputs) == len(LONG_RERANK_DOCUMENTS)
+    _assert_scores_match(
+        LONG_RERANK_MODEL,
+        LONG_RERANK_DOCUMENTS,
+        [out.outputs.score for out in outputs],
+        ref_scores,
+    )
+
+
+def _assert_scores_match(
+    model: str, documents: list[str], scores: list[float], ref_scores: list[float]
+) -> None:
     assert all(math.isfinite(s) for s in scores), f"{model}: non-finite score in {scores}"
 
     # Checked apart from the per-score bound: a pair can swap with both inside tolerance,
@@ -299,8 +417,8 @@ def _assert_rerank_scores_match_refs(model: str, enforce_eager: bool) -> None:
     for document, score, ref_score in zip(documents, scores, ref_scores, strict=True):
         tol = min(SCORE_ABS_TOL, max(SCORE_REL_TOL * ref_score, SCORE_REL_FLOOR))
         assert abs(score - ref_score) <= tol, (
-            f"{model}: score {score:.6f} vs cached HF {ref_score:.6f} (tol {tol:.6f}) "
-            f"for {document!r}"
+            f"{model}: score {score:.6f} vs HF {ref_score:.6f} (tol {tol:.6f}) "
+            f"for {document[:80]!r}"
         )
 
 
@@ -321,7 +439,7 @@ def test_encoder_token_classify() -> None:
     llm = LLM(
         model=TOKEN_CLASSIFY_MODEL,
         runner="pooling",
-        max_model_len=64,
+        max_model_len=MAX_MODEL_LEN,
         max_num_seqs=2,
         enforce_eager=True,
     )

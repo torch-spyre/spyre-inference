@@ -101,8 +101,8 @@ class SpyreTokenTypeModel:
 
     The wrapper classes (``*ForSequenceClassification`` and friends) hardcode
     ``embedding_class``, so the already-built embedding is retyped to its Spyre
-    subclass: same ``__init__``, same parameters, same module tree — only
-    ``forward`` differs. ``super().forward`` is then called with no
+    subclass: same ``__init__``, parameters and module tree, but a Spyre
+    ``forward`` and armed compile state. ``super().forward`` is then called with no
     ``token_type_ids`` so upstream skips the bit-pack.
     """
 

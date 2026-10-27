@@ -28,8 +28,8 @@ from spyre_inference.custom_ops.head_pad import head_padding_active
 
 logger = init_logger(__name__)
 
-# One Spyre stick of fp16 elements. Encoder attention has no RoPE, so unlike the
-# RoPE path's 128-multiple (head_pad.py), this is the only alignment that matters.
+# One Spyre stick of fp16 elements. Encoder attention has no RoPE, so this is the only
+# alignment that matters.
 _STICK = 64
 
 _PATCHED_ATTR = "_spyre_bert_head_pad_patched"

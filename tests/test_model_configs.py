@@ -15,6 +15,7 @@
 """Tests for the Spyre model registry (model_configs.yaml + Python loader)."""
 
 import pytest
+from spyre_testing_plugin.tags import record_serving_capability
 
 from spyre_inference.config import (
     DeviceConfig,
@@ -73,6 +74,29 @@ def test_all_configs_are_typed():
 )
 def test_known_models_are_present(model_id):
     assert model_id in model_registry(), f"{model_id} missing from registry"
+
+
+_DECLARED = [
+    (m, cfg, e.platforms) for m, e in model_registry().items() for cfg in e.serving_configs
+]
+
+
+@pytest.mark.parametrize(
+    "model_id,cfg,platforms",
+    _DECLARED,
+    ids=[f"{m}-tp{c.tp_size}-{c.max_model_len}-{c.max_num_seqs}" for m, c, _ in _DECLARED],
+)
+def test_declared_serving_config(model_id, cfg, platforms, record_property):
+    """Each registry serving config, as a declared `model_serving` capability."""
+    record_serving_capability(
+        record_property,
+        model_id,
+        "declared",
+        cfg.tp_size,
+        cfg.max_model_len,
+        cfg.max_num_seqs,
+        platforms=",".join(platforms or []),
+    )
 
 
 def test_config_positive_fields():

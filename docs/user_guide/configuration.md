@@ -5,11 +5,13 @@
 To load the plugin, set the `VLLM_PLUGINS` environment variable before running vLLM:
 
 ```bash
-export VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+export VLLM_PLUGINS=spyre_inference
 ```
 
-`spyre_inference` activates the platform, and `spyre_inference_ops` registers the OOT
-custom ops plus the Spyre Transformers backend (used for `model_impl="transformers"`).
+`spyre_inference` names both the platform plugin and the general plugin: the first
+activates the platform, and the second registers the OOT custom ops and the Spyre
+model adaptations, including the Spyre Transformers backend (used for
+`model_impl="transformers"`).
 
 ## Usage
 
@@ -89,15 +91,23 @@ With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that 
 23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
 exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
 empty — no batch that narrow can miss the rectangular path — leaving five shapes.
+Those counts assume the rectangular path is opaque; traced into the block graph (see
+below), each rectangle is a block graph of its own rather than an attention kernel.
 
-Both paths go through the same opaque attention op, so the block graph is identical
-for either and the choice is made once per step from the step's metadata. The
-runner counts them in `spyre_encoder_rect_steps` /
-`spyre_encoder_ragged_steps`.
+The choice is made once per step from the step's metadata, before the forward, and the
+runner counts it in `spyre_encoder_stats` (`rect_steps` / `ragged_steps`). The
+ragged path always runs behind the opaque attention op. When compiled and the head size
+fills whole 64-element sticks, the rectangular path is traced into the block graph
+instead, so each rectangle is its own block graph. In eager mode both paths stay
+opaque, with no block graph; a compiled, unpadded sub-stick head size also keeps
+both paths opaque, sharing one block graph. Pooling models such as granite-30m
+pad their native 32-wide heads to 64 before construction.
 
-Compiled pooling warmup runs one dummy at the body shape; the first attention call
-in it traces every declared rectangle and group pair, against that call's own
-tensors (a Spyre tensor's device layout is part of its cache key). Eager pooling
+Compiled pooling warmup runs one dummy at the body shape. With the rectangular path
+opaque, the first attention call in it traces every declared rectangle and group pair,
+against that call's own tensors (a Spyre tensor's device layout is part of its cache
+key). With it traced in, warmup adds one dummy per rectangle, plus one forced onto the
+ragged path (when any group is reachable) that traces the group pairs. Eager pooling
 uses one short dummy and always takes the packed path.
 
 Example:
@@ -112,10 +122,10 @@ vllm serve ibm-granite/granite-embedding-125m-english \
 Bucketing trades warmup time for per-request padding. A request is padded up to the next
 bucket on each axis and the padding is masked out, so buckets far above your real shapes
 waste compute, while buckets that hug your workload cut that waste but add graphs to
-compile at warmup. Attention is recorded as the **product** of its KV-length and
-query-length buckets (and, when the batched-decode kernel is enabled, a second KV-length ×
-num-sequences product), so extra attention buckets cost multiplicatively — keep those
-lists short.
+compile at warmup. Per-sequence attention pairs each query bucket only with KV buckets
+that fit its smallest real query length. Batched decode uses KV-length/num-sequences
+pairs; both recording paths also enforce the allocated page-capacity limit. Extra
+buckets can still multiply the recorded variants, so keep those lists short.
 
 **Decoder body (packed token count).** Override the defaults with `compile_sizes`; the
 platform clamps `--max-num-batched-tokens` to the largest entry. A decode-heavy run at
@@ -145,15 +155,51 @@ export SPYRE_ATTN_KV_BUCKETS=256,1024,2048    # default: powers of two from bloc
 export SPYRE_ATTN_QUERY_BUCKETS=1,512         # 1 = decode; 512 = prefill chunk
 ```
 
-The default KV buckets are geometric (powers of two) precisely because the recorded set
-is a product. If your context never exceeds 2048, dropping the higher powers removes
-variants from warmup at no serving cost.
+The default KV buckets are geometric (powers of two) because the recorded set grows
+with both axes, even after filtering. If your context never exceeds 2048, dropping the
+higher powers removes variants from warmup at no serving cost.
 
 With the batched-decode kernel enabled (`SPYRE_BATCHED_DECODE=1`, the default; under the
 default tiled walk it is reached on the head-major layout only, and a token-major run keeps
-the per-sequence loop), warmup also records it over the KV-length × num-sequences grid. `SPYRE_ATTN_NUM_SEQS_BUCKETS`
-(default: powers of two from 1 to `--max-num-seqs`) is the extra lever there, and the same
-keep-it-short advice applies.
+the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
+`SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
+extra lever there, and the same keep-it-short advice applies.
+
+## FP8 KV cache
+
+Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
+each cached token takes:
+
+```bash
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+```
+
+It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
+that is a multiple of 128. It does not raise capacity: the platform pins the block count
+to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
+same number of tokens in half the device memory. Attention still computes in the model
+dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
+when it has none. The speedup grows with the number of cached tokens each decode step
+reads, so it is small at short contexts; check accuracy against an fp16 cache before
+relying on it.
+
+The scales are compiled into the graphs as constants. A checkpoint whose layers carry
+different KV scales therefore compiles the transformer block and each recorded attention
+kernel once per distinct pair of scales, which lengthens warmup; one without scales
+compiles them once, as an fp16 cache does.
+
+## Offline engine in the calling process
+
+At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline
+`LLM` engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. `vllm serve` always spawns EngineCore.
+
+The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves `RANK`/`WORLD_SIZE`
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with `tensor_parallel_size > 1` in a new process. Set
+`OMP_WAIT_POLICY=PASSIVE` before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.
 
 ## pyproject.toml Reference
 
@@ -162,14 +208,18 @@ The `pyproject.toml` includes several key build configurations:
 ### Build Configuration
 
 ```toml
-[tool.uv]
-build-constraint-dependencies = ["torch==2.13.0"]
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
+[tool.uv.extra-build-variables.vllm]
+VLLM_TARGET_DEVICE = "empty"
+CMAKE_ARGS = "--fresh"
+
+[tool.uv.extra-build-dependencies]
+torch-spyre = ["torch==2.13.0"]
 ```
 
 These settings ensure:
 
-- All packages are built with the same PyTorch version (2.13.0)
+- torch-spyre is built against the same PyTorch version (2.13.0) the runtime pins, so its
+  C++ extension cannot drift in ABI
 - vLLM is built with the **empty** backend — no device-specific C kernels. This avoids
   the torch-version coupling of prebuilt CPU wheels and the dependency on `vllm._C`
   (whose CPU-optimized ops we don't need; Spyre provides its own)

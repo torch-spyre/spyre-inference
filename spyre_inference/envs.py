@@ -28,8 +28,9 @@ if TYPE_CHECKING:
     # Declarations so type checkers and IDEs resolve the lazily-provided
     # module attributes. Keep in sync with ``environment_variables``.
     SPYRE_DEVICES: str | None = None
+    SPYRE_MODEL_RUNNER: str = "v1"
     SPYRE_COMPILE_GRANULARITY: str = "block"
-    SPYRE_COMPILE_GUARD: str = "off"
+    SPYRE_COMPILE_GUARD: str = "warn"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_ATTN_RECORD: bool = True
     SPYRE_ATTN_FOR_EACH_TILE: bool = True
@@ -39,9 +40,12 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
     SPYRE_BATCHED_DECODE: bool = True
+    SPYRE_BLOCKED_TRANSPOSE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
+    SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
-    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 4
+    SPYRE_MOE_GATHERED_MAX_TOKENS: int = 8
+    SPYRE_MOE_CHUNKS: int | None = None
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -53,21 +57,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated Spyre device indices to run on, mapping each tensor-parallel
     # local rank to a physical card. Unset lets the runtime pick the default device(s).
     "SPYRE_DEVICES": lambda: os.getenv("SPYRE_DEVICES"),
+    # Which model runner the worker uses:
+    #  - "v1": the V1 runner (default)
+    #  - "v2": the Model Runner V2 port (#906), in bring-up and not yet functional. On
+    #    x86 it runs MRV2's Triton kernels on triton-cpu.
+    "SPYRE_MODEL_RUNNER": lambda: os.getenv("SPYRE_MODEL_RUNNER") or "v1",
     # Granularity of the decoder's torch.compile graph:
     #  - "block": compile one transformer block at a time (default)
     #  - "model": compile the whole model as a single graph
     "SPYRE_COMPILE_GRANULARITY": lambda: os.getenv("SPYRE_COMPILE_GRANULARITY") or "block",
     # What to do when a model block, attention kernel or the lm_head compiles *after*
     # warmup, which costs a full Inductor compile mid-request:
-    #  - "off": nothing (default)
-    #  - "warn": log each distinct violation
+    #  - "off": nothing
+    #  - "warn": log each distinct violation (default)
     #  - "error": raise. Use in CI to keep a warmup-coverage regression from landing,
     #    bearing in mind it catches most but not all: torch runs its compile-start
     #    callbacks only when a process-wide pending counter goes 0 -> 1, so a compile
     #    starting while another is in flight goes unreported.
     # torch-spyre compiles every eager aten op, so those compiles continue for the
     # whole run; they are never reported.
-    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "off",
+    "SPYRE_COMPILE_GUARD": lambda: os.getenv("SPYRE_COMPILE_GUARD") or "warn",
     # When "1", wrap attention forward/softmax in torch.profiler.record_function
     # spans for kineto trace capture. Off by default: profiled runs are not
     # wall-clock comparable.
@@ -87,7 +96,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
-    # default buckets of powers of two from 4 up to max_num_seqs.
+    # default buckets of powers of two from 1 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size] (default), which
@@ -105,10 +114,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # head-major cache, which uses a split page index, so a token-major run keeps
     # the per-seq loop whatever this is set to.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
+    # When "1" (default), build each linear layer's transposed weight on the host in
+    # blocks of source rows. A plain `w.t().contiguous()` copies on one thread; the
+    # blocked copy runs on torch's CPU threads and cuts model load time. Bit-identical.
+    # Set to "0" when torch runs far more threads than the CPUs it gets (e.g. with
+    # SPYRE_UPDATE_THREAD_CONFIG=0 in a CPU-limited pod): there it is slower.
+    "SPYRE_BLOCKED_TRANSPOSE": lambda: bool(int(os.getenv("SPYRE_BLOCKED_TRANSPOSE", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
     "SPYRE_KERNEL_CACHE": lambda: os.getenv("SPYRE_KERNEL_CACHE", "0") == "1",
+    # When "1", each TP rank copies only its vocab shard of the logits to the host and the
+    # shards are gathered on the CPU. Needs OMP_WAIT_POLICY=PASSIVE (spinning OpenMP
+    # threads otherwise slow the next step).
+    "SPYRE_LOGITS_CPU_GATHER": lambda: os.getenv("SPYRE_LOGITS_CPU_GATHER", "0") == "1",
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
     # instead of topping itself up with a short chunk of the next. Any non-positive
@@ -116,7 +135,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
     # Largest packed-token count handled by a compiled loop of single-token gathered kernels.
     # Larger batches use one all-expert kernel because its fixed weight-read cost is amortized.
-    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")),
+    # "8" (default) is measured on gemma-4-26B-A4B: gathered wins up to 8 at TP1 and TP4.
+    "SPYRE_MOE_GATHERED_MAX_TOKENS": lambda: int(os.getenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "8")),
+    # Override the automatically selected hidden-axis chunk count for gathered MoE. Unset
+    # derives it from top_k, stick alignment and the core count.
+    "SPYRE_MOE_CHUNKS": lambda: (
+        int(value) if (value := os.getenv("SPYRE_MOE_CHUNKS")) is not None else None
+    ),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

@@ -25,20 +25,18 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-import sys
 import types
 
 import pytest
 
 _SCRIPT = pathlib.Path(__file__).resolve().parent / "ingest_vllm_benchmarks.py"
+# The shaping lives in the ingest library, shared with offline results bundles.
+vllm = pytest.importorskip("spyre_clickhouse_ingest.vllm")
 _RUN = "dab2a67f-14bf-53be-b6e4-fc9642086e47"
 
 
 @pytest.fixture(scope="module")
 def mod():
-    stub = types.ModuleType("utils")
-    stub.read_benchmark_results = lambda *a, **k: []
-    sys.modules.setdefault("utils", stub)
     spec = importlib.util.spec_from_file_location("ingest_vllm_benchmarks", _SCRIPT)
     m = importlib.util.module_from_spec(spec)
     try:
@@ -95,7 +93,7 @@ def _write(mod, rows):
 
     client = _Client()
     insert_benchmarks(
-        client, "v2", mod.BENCH_COMPONENT, _RUN, mod._bench_entries(rows), report_kind="vllm"
+        client, "v2", mod.BENCH_COMPONENT, _RUN, vllm.bench_entries(rows), report_kind="vllm"
     )
     return client.inserted.get("benchmarks", []), client.inserted.get("benchmark_runs", [])
 
@@ -104,7 +102,7 @@ def _write(mod, rows):
 
 
 def test_parse_input_shapes_reads_all_three_discriminators(mod):
-    assert mod._parse_input_shapes("latency_tp4_in128_out256") == {
+    assert vllm.parse_input_shapes("latency_tp4_in128_out256") == {
         "tensor_parallel": "4",
         "input_len": "128",
         "output_len": "256",
@@ -115,7 +113,7 @@ def test_parse_input_shapes_reads_all_three_discriminators(mod):
 def test_parse_input_shapes_ignores_non_numeric_tokens(mod, name):
     # A bare prefix with no digits is not a shape; emitting one would fabricate a
     # discriminator and split one benchmark's history in two.
-    assert mod._parse_input_shapes(name) == {}
+    assert vllm.parse_input_shapes(name) == {}
 
 
 def test_shapes_discriminate_two_runs_of_one_benchmark(mod):
@@ -129,7 +127,7 @@ def test_shapes_discriminate_two_runs_of_one_benchmark(mod):
 
 
 def test_entries_carry_what_the_flat_write_dropped(mod):
-    (entry,) = mod._bench_entries([_flat()])
+    (entry,) = vllm.bench_entries([_flat()])
     assert entry["name"] == "latency_tp1_in64_out64", "the flat write hardcodes one constant"
     assert entry["backend"] == "spyre", "backend is the HUD's pivot axis"
     assert entry["props"]["model"] == "granite"
@@ -139,7 +137,7 @@ def test_entries_carry_what_the_flat_write_dropped(mod):
 def test_run_props_carry_the_ci_coordinates_the_hud_view_reads(mod):
     # oss_ci_benchmark_v3_mv reads these off benchmark_runs.props; it cannot see them
     # otherwise, and a guess would put a wrong commit on a chart.
-    (entry,) = mod._bench_entries([_flat()])
+    (entry,) = vllm.bench_entries([_flat()])
     assert entry["run_props"] == {
         "repo": "torch-spyre/spyre-inference",
         "head_branch": "main",
@@ -154,21 +152,21 @@ def test_run_props_carry_the_ci_coordinates_the_hud_view_reads(mod):
 
 
 def test_metric_samples_stay_floats(mod):
-    (entry,) = mod._bench_entries([_flat(actual="2.5")])
+    (entry,) = vllm.bench_entries([_flat(actual="2.5")])
     (samples,) = entry["measurements"].values()
     assert samples == [2.5] and all(isinstance(s, float) for s in samples)
 
 
 def test_run_mode_comes_from_the_test_name_prefix(mod):
     for name, mode in (("serve_tp1", "serve"), ("throughput_tp1", "throughput")):
-        (entry,) = mod._bench_entries([_flat(test_name=name)])
+        (entry,) = vllm.bench_entries([_flat(test_name=name)])
         assert entry["props"]["run_mode"] == mode
 
 
 def test_which_file_reported_it_does_not_split_the_benchmark(mod):
     # Both the native json and the .pytorch.json feed one benchmark, and a benchmark_id is
     # a content hash of the name -- so the two must converge before they reach the hash.
-    assert mod._test_name("latency_tp1.json") == mod._test_name("latency_tp1.pytorch.json")
+    assert vllm.bench_name("latency_tp1.json") == vllm.bench_name("latency_tp1.pytorch.json")
     a = _flat(test_name="latency_tp1")
     b = _flat(test_name="latency_tp1", metric="p90")
     idents, _facts = _write(mod, [a, b])
@@ -177,7 +175,7 @@ def test_which_file_reported_it_does_not_split_the_benchmark(mod):
 
 def test_unnamed_benchmarks_are_skipped_not_merged(mod):
     # An id over a blank name would collide every unidentifiable benchmark onto one identity.
-    assert mod._bench_entries([_flat(test_name="")]) == []
+    assert vllm.bench_entries([_flat(test_name="")]) == []
 
 
 def test_iterations_stays_zero_when_unreported(mod):
@@ -205,7 +203,7 @@ def test_iterations_is_counted_once_per_benchmark(mod):
     ],
 )
 def test_sample_count_per_vllm_schema(mod, record, n):
-    assert mod.sample_count(record) == n
+    assert vllm.sample_count(record) == n
 
 
 def test_units_ride_run_props_per_metric(mod):
@@ -228,13 +226,7 @@ def _extract(mod, monkeypatch, tmp_path, files):
     for name, record in files.items():
         (tmp_path / name).write_text(json.dumps(record), encoding="utf-8")
 
-    def _read(path):
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, list) else [data]
-
-    monkeypatch.setattr(mod, "read_benchmark_results", _read)
-    return mod.extract_rows(str(tmp_path), "main", "abc", "7", "0", "wf", 0)
+    return vllm.extract_rows(str(tmp_path), "main", "abc", "7", "0", "wf", 0)
 
 
 def _pytorch(name, values, model="granite"):
@@ -408,6 +400,7 @@ def test_leg_writes_its_artifact_and_a_performance_verdict(mod, monkeypatch):
     assert artifact["component"] == "spyre-inference"
     assert artifact["props"]["base_artifact_id"] == _BASE
     assert artifact["props"]["installed"] == "spyre-inference@abc123def456"
+    assert (artifact["identity_deps"], artifact["props"]["source"]) == ([f"base={_BASE}"], "gha")
     assert result["artifact_id"] == artifact["artifact_id"] != _BASE
     assert (result["run_id"], result["result_kind"], result["test_type"]) == (
         _RUN,
@@ -418,6 +411,16 @@ def test_leg_writes_its_artifact_and_a_performance_verdict(mod, monkeypatch):
     assert result["props"]["run_url"].endswith(
         "/torch-spyre/spyre-inference/actions/runs/36128188844"
     )
+
+
+def test_a_refused_record_skips_the_link_not_the_ingest(mod, monkeypatch, caplog):
+    def refuse(*_a, **_k):
+        raise ValueError("gha record: its inputs hash to another id")
+
+    monkeypatch.setattr(mod, "ensure", refuse)
+    with caplog.at_level("WARNING"):
+        assert _artifact_write(mod, [_flat()], monkeypatch) == {}
+    assert "benchmark rows unaffected" in caplog.text
 
 
 def test_no_base_id_means_no_link(mod, monkeypatch):
@@ -446,3 +449,20 @@ def test_artifact_results_duration_is_zero_without_elapsed_time(mod, monkeypatch
     rows = [_flat(metric="avg_latency", actual=0.42, test_name="latency_a")]
     (result,) = _artifact_write(mod, rows, monkeypatch)["artifact_results"]
     assert result["duration_s"] == 0.0
+
+
+def test_the_leg_artifact_carries_the_ci_tags(mod, monkeypatch):
+    import spyre_clickhouse_ingest as lib
+
+    seen = {}
+
+    def ci_tags(event, repo, branch, sha, pr, day=None):
+        seen.update(event=event, repo=repo, branch=branch, sha=sha, day=day)
+        return [("spyre-inference@abc123def456", "main")]
+
+    monkeypatch.setattr(lib, "ci_tags", ci_tags, raising=False)
+    got = _artifact_write(mod, [_flat()], monkeypatch, ci_event="push", pr_number="0")
+    assert [(t["tag"], t["tag_family"]) for t in got["artifact_tags"]] == [
+        ("spyre-inference@abc123def456", "main")
+    ]
+    assert (seen["event"], seen["branch"], seen["sha"]) == ("push", "main", "abc123def4567890")

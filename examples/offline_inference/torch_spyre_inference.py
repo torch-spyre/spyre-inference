@@ -31,6 +31,8 @@ import multiprocessing as mp
 import platform
 import time
 
+SEPARATOR = "=" * 15
+
 
 def parse_args():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -62,7 +64,8 @@ def parse_args():
         "--enforce-eager",
         action="store_true",
         dest="enforce_eager",
-        help="Skip torch.compile (whole model and attention kernel), run in eager mode",
+        help="Run the model eagerly; required kernels (including head-major attention "
+        "and Gemma RMSNorm) still compile",
     )
     parser.add_argument(
         "--no-compile-sizes",
@@ -148,16 +151,16 @@ def main():
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
-    print("=============== GENERATE")
+    print(f"{SEPARATOR} GENERATE")
     t0 = time.time()
     outputs = llm.generate(prompts, sampling_params)
     elapsed = time.time() - t0
     total_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
     print(f"Time elapsed for {total_tokens} generated tokens is {elapsed:.2f} sec")
-    print("===============")
+    print(SEPARATOR)
     for output in outputs:
         print(output.outputs[0])
-    print("===============")
+    print(SEPARATOR)
     for output in outputs:
         prompt = output.prompt
         generated_text = output.outputs[0].text
@@ -167,7 +170,7 @@ def main():
 
     if args.compare_with_cpu:
         print("Comparing results with HF on cpu")
-        print("===============")
+        print(SEPARATOR)
         any_differ = False
 
         import torch

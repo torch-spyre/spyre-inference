@@ -47,9 +47,10 @@ else:
 
 logger = init_logger(__name__)
 
-# Dtypes torch-spyre can run. float16 is the default and the validated one; bfloat16 is
-# accepted only when asked for explicitly. Both are 2 bytes wide, so every
-# stick-alignment constant in this plugin holds for either.
+# Dtypes torch-spyre can run. float16 is the validated one; bfloat16 passes this check, but
+# apply_config_platform_defaults overwrites every model's dtype with float16, an explicit
+# --dtype bfloat16 included, so only a config edited after construction reaches it. Both are
+# 2 bytes wide, so every stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
 
@@ -110,6 +111,27 @@ def _raise_dynamo_recompile_limits() -> None:
 _raise_dynamo_recompile_limits()
 
 
+def _maybe_uniproc(parallel_config, requested_backend) -> None:
+    """Keep the single worker inside EngineCore (the uni executor) at world_size 1.
+
+    CpuPlatform rewrites the "uni" backend to "mp" so OMP can be set up in a fresh
+    worker process. Spyre already pins the threading env vars in configure_threading()
+    before that rewrite, so at world_size 1 the extra Worker process only costs startup
+    time. ``requested_backend`` is the value before CpuPlatform ran. vLLM picks "uni" at
+    world_size 1 when no backend is given, so an explicit
+    ``--distributed-executor-backend mp`` (or any other backend) is left alone.
+    """
+    if parallel_config.world_size != 1 or requested_backend not in (None, "uni"):
+        return
+    if parallel_config.distributed_executor_backend != "mp":
+        return
+    logger.info(
+        "Using the uni executor at world_size 1; pass --distributed-executor-backend mp "
+        "to run the worker in its own process."
+    )
+    parallel_config.distributed_executor_backend = "uni"
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -135,9 +157,6 @@ class TorchSpyrePlatform(CpuPlatform):
     # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
-
-    # Measured throughput argmax across pooling models; they regress above it.
-    _POOLING_MAX_BATCHED_TOKENS = 2048
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
@@ -338,23 +357,24 @@ class TorchSpyrePlatform(CpuPlatform):
                 )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
-        # This must be set here as the default, otherwise all usage (including test fixtures) would
-        # require setting the dtype.
+        # Set here so no usage (test fixtures included) has to pass a dtype. Unconditional: it
+        # replaces whatever the user asked for, bfloat16 included.
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
-        The token budget ``R`` is the only input. Both other limits are written back
-        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
-        shape every encoder path runs on.
+        ``max_num_seqs`` is lowered to the widest short rectangle. ``compile_sizes`` is
+        one entry when the model fits in the 2048-row body, and one entry per body when
+        ``max_model_len`` is longer — a step pads to the smallest of those.
 
-        The scheduler is left alone -- the ragged path means no batch upstream can form
-        has to be refused.
+        The scheduler token cap stays the largest body, so one max-length sequence can
+        be scheduled. The ragged path still covers a batch no rectangle holds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
+            POOLING_FAST_BODY_ROWS,
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
@@ -367,18 +387,17 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # vLLM's verify_max_model_len runs before this hook, so the floor
-        # `encoder_budget_rows` applies is not checked for us.
-        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # `encoder_budget_rows` applies is not checked for us. The 2048 cap is the
+        # fast body; `encoder_budget_rows` then floors back up to max_model_len when
+        # the model is longer, which is the scheduler cap.
+        scheduler_config.max_num_batched_tokens = min(prev_budget, POOLING_FAST_BODY_ROWS)
+        full_budget = encoder_budget_rows(
+            max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+        )
 
         # The shortest length carries the widest rectangle, so no batch ever needs more
         # width than the ladder offers.
-        widest = max(
-            1,
-            encoder_budget_rows(
-                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
-            )
-            // ENCODER_SEQ_ALIGNMENT,
-        )
+        widest = max(1, full_budget // ENCODER_SEQ_ALIGNMENT)
         if prev_num_seqs > widest:
             logger.warning(
                 "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
@@ -389,24 +408,24 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
-        budget = encoder_shape_tables(vllm_config).budget
-        scheduler_config.max_num_batched_tokens = budget
-
-        # One body shape: every rectangle is exactly `budget` rows and the ragged path
-        # packs into the same buffer, so the attention kernels key on sequence shapes
-        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        # Restore the scheduler cap before the tables are memoised. The worker reads
+        # the same limits, and a table built against the temporary 2048 cap would be a
+        # different cache entry from the one serving uses. That restored cap is the
+        # largest body, so the tables do not change it again.
+        scheduler_config.max_num_batched_tokens = full_budget
+        tables = encoder_shape_tables(vllm_config)
+        # A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
-            vllm_config.compilation_config.compile_sizes = [budget]
+            vllm_config.compilation_config.compile_sizes = list(tables.budgets)
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; ragged groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: bodies %s; rectangles (L, B) %s; "
+            "ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
-            budget,
-            budget,
+            tables.budget,
+            list(tables.budgets),
             encoder_rectangles(vllm_config),
             encoder_group_shapes(vllm_config) or "none reachable",
         )
@@ -453,7 +472,7 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def supports_fp8(cls) -> bool:
-        # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
+        # Linear layers use SpyreFp8LinearKernel (spyre.scaled_mm).
         return True
 
     @classmethod
@@ -465,14 +484,14 @@ class TorchSpyrePlatform(CpuPlatform):
         the KV cache allocated at the native ``get_head_size()``, which the device copy
         requires to be stick-aligned.
 
-        Two independent restickify failures share this hook, at different widths:
-        RoPE models pad to the next 128-multiple (the failure is RoPE-induced, so
-        non-RoPE decoders like OPT/GPT-2 lower fine at head=64 and are skipped).
-        Pooling/encoder-only models (BERT/RoBERTa) have no RoPE, so theirs is the
-        plain sub-stick failure (e.g. head_size=32 sharing a stick between two
-        heads) -- the next 64-multiple is enough, applied via the construction
-        patch in ``spyre_inference.custom_ops.bert_head_pad`` (the generic
-        property-shim doesn't work on BertSelfAttention's own assert).
+        RoPE and pooling models pad to the next 64-multiple: a sub-stick head (e.g.
+        head_size=32 sharing a stick between two heads) cannot lower, while
+        SpyreRotaryEmbedding handles a sub-stick half (head_size=64). The Transformers
+        backend's RoPE views a head as two halves, so there RoPE models pad to the next
+        128-multiple. Non-RoPE generative decoders (OPT/GPT-2) are skipped; pooling
+        models also go through the construction patch in
+        ``spyre_inference.custom_ops.bert_head_pad`` (the generic property-shim doesn't
+        work on BertSelfAttention's own assert).
 
         No-op for models whose head_dim is already a multiple of the applicable size.
         """
@@ -480,7 +499,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
-        target_cfg = getattr(hf_config, "text_config", None) or hf_config
+        # The config the runner's padding passes read, so both agree on the text part.
+        target_cfg = model_config.hf_text_config
         num_heads = getattr(target_cfg, "num_attention_heads", None)
         hidden_size = getattr(target_cfg, "hidden_size", None)
         if num_heads is None or hidden_size is None:
@@ -498,7 +518,7 @@ class TorchSpyrePlatform(CpuPlatform):
         )
         has_rope = any(getattr(c, "rope_parameters", None) for c in cfgs)
         if has_rope:
-            multiple = 128
+            multiple = 128 if model_config.using_transformers_backend() else 64
         elif cls._is_pooling_model(vllm_config):
             multiple = 64
         else:
@@ -668,8 +688,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     f"was specified to be {vllm_config.model_config.dtype}"
                 )
 
-            # SpyreFp8LinearKernel is float16 end to end, its scales and dequantized
-            # weights included.
+            # SpyreFp8LinearKernel is float16 end to end, its scales included.
             quantization = getattr(vllm_config.model_config, "quantization", None)
             if quantization is not None and vllm_config.model_config.dtype == torch.bfloat16:
                 raise ValueError(
@@ -727,8 +746,65 @@ class TorchSpyrePlatform(CpuPlatform):
         configure_threading(parallel_config.world_size)
 
         # ---- worker ----
+        from spyre_inference import envs, pin_model_runner
+        from spyre_inference.v1.worker.spyre import triton_gate
+
+        # Read fresh, not from the cache register() filled, so a value changed after
+        # `import vllm` is caught by the gate check below.
+        runner = envs.environment_variables["SPYRE_MODEL_RUNNER"]()
+        if runner not in ("v1", "v2"):
+            raise ValueError(f"SPYRE_MODEL_RUNNER={runner!r} is not v1 or v2.")
+        gate = "open" if runner == "v2" else "closed"
+        if triton_gate.state() != gate:
+            raise ValueError(
+                f"SPYRE_MODEL_RUNNER={runner} needs the Triton gate {gate}, but it is "
+                f"{triton_gate.state() or 'not applied'}: set SPYRE_MODEL_RUNNER before "
+                "vLLM is imported, and the same in every process."
+            )
+        # Again, for a value set after `import vllm` that child processes would inherit.
+        pin_model_runner(runner)
+
+        if runner == "v1":
+            # Two features outrank the env var inside use_v2_model_runner, so rejecting
+            # them here is what actually keeps the pin true. Left alone, hisparse raises
+            # "HiSparse requires Model Runner V2; remove VLLM_USE_V2_MODEL_RUNNER=0" --
+            # blaming an env var the user never set, since we set it -- and watermarking
+            # silently returns V2 anyway, landing on the missing Triton much later.
+            if getattr(vllm_config.attention_config, "hisparse_config", None) is not None:
+                raise ValueError(
+                    "Spyre does not support HiSparse: it requires the V2 model runner, and "
+                    "TorchSpyreWorker only builds the V1 runner."
+                )
+            if getattr(vllm_config, "watermark_config", None) is not None:
+                raise ValueError(
+                    "Spyre does not support watermarking: it requires the V2 model runner, "
+                    "and TorchSpyreWorker only builds the V1 runner."
+                )
+            # 0.31 leaves AuxOutput validation to out-of-tree platforms; in-tree it is
+            # only wired to the V2 runner, so on ours it would be accepted and never
+            # produced.
+            aux_output_config = getattr(vllm_config, "aux_output_config", None)
+            if aux_output_config is not None and aux_output_config.enabled:
+                raise ValueError(
+                    "Spyre does not support AuxOutput (e.g. returning routed experts): it "
+                    "requires the V2 model runner, and TorchSpyreWorker only builds the V1 "
+                    "runner."
+                )
+
+        # The pin holds only if the resolved property agrees; anything new that outranks
+        # the env var must fail here rather than at the first runner-specific code path.
+        # A raise, not an assert: -O would strip the tripwire.
+        if vllm_config.use_v2_model_runner != (runner == "v2"):
+            raise RuntimeError(
+                f"SPYRE_MODEL_RUNNER={runner} did not take effect: use_v2_model_runner is "
+                f"{vllm_config.use_v2_model_runner}. A config field now forces the other "
+                "model runner; reject it in TorchSpyrePlatform.check_and_update_config."
+            )
+
+        worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
+        if runner == "v2":
+            worker_class = "spyre_inference.v1.worker.spyre.worker.SpyreWorkerV2"
         if parallel_config.worker_cls == "auto":
-            worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
 
@@ -754,8 +830,12 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
+        # CpuPlatform turns "uni" into "mp"; remember what was asked for (see _maybe_uniproc).
+        requested_backend = parallel_config.distributed_executor_backend
+
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
+        _maybe_uniproc(parallel_config, requested_backend)
 
         # Must run after super(), which sets a block_size default of its own, and before
         # the num_gpu_blocks_override math below, which reads block_size.

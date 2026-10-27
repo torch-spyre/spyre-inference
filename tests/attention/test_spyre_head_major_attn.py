@@ -31,6 +31,7 @@ from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.platform import TorchSpyrePlatform
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionBackend,
     SpyreAttentionImpl,
     SpyrePagedKVCache,
 )
@@ -45,7 +46,11 @@ from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK
 from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
     page_attn_head_major_decode_kernel,
 )
+from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
+    page_attn_head_major_prefill_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
+    quantize_kv,
     reshape_and_cache_head_major_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
@@ -99,6 +104,7 @@ def _fresh_pages(
     block_size: int,
     head_size: int,
     device: torch.device,
+    fp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Zeroed head-major pages, through the impl so they carry the production layout.
 
@@ -107,12 +113,14 @@ def _fresh_pages(
     """
     if device.type != "spyre":
         shape = (num_blocks, num_kv_heads, block_size, head_size)
-        return torch.zeros(shape, dtype=DTYPE), torch.zeros(shape, dtype=DTYPE)
+        dtype = torch.float8_e4m3fn if fp8 else DTYPE
+        return torch.zeros(shape, dtype=dtype), torch.zeros(shape, dtype=dtype)
     spec = AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
-        dtype=DTYPE,
+        # Upstream's spec dtype for an fp8 cache.
+        dtype=torch.uint8 if fp8 else DTYPE,
     )
     cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, device)
     return cache.k_pages, cache.v_pages
@@ -133,6 +141,8 @@ def _run_head_major_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    kv_cache_dtype: str = "auto",
+    kv_scales: tuple[float, float] = (1.0, 1.0),
 ) -> None:
     """Validate against the same CPU reference the token-major suite uses.
 
@@ -231,13 +241,18 @@ def _run_head_major_attn_test(
         num_kv_heads=num_kv_heads,
         alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
-        kv_cache_dtype="auto",
+        kv_cache_dtype=kv_cache_dtype,
         logits_soft_cap=soft_cap,
     )
     assert attn_impl.block_size == block_size
 
     cache_device = torch.device(configure_device)
-    k_pages, v_pages = _fresh_pages(num_blocks, num_kv_heads, block_size, head_size, cache_device)
+    fp8 = attn_impl.kv_cache_fp8
+    k_scale, v_scale = kv_scales
+    attn_impl.prepare_kv_scales(Mock(_k_scale_float=k_scale, _v_scale_float=v_scale))
+    k_pages, v_pages = _fresh_pages(
+        num_blocks, num_kv_heads, block_size, head_size, cache_device, fp8
+    )
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
 
     if hist_slots:
@@ -251,6 +266,28 @@ def _run_head_major_attn_test(
         )
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     _write(attn_impl, kv_cache, key_src, value_src, slot_mapping_t, cache_device)
+
+    if fp8:
+        # The cache holds K / k_scale and V / v_scale in e4m3: the reference reads what was
+        # stored, and the stored bytes are checked first, so a bad store and a bad read fail
+        # apart.
+        k_expected = quantize_kv(k_expected, k_scale, torch.float8_e4m3fn)
+        v_expected = quantize_kv(v_expected, v_scale, torch.float8_e4m3fn)
+        for name, pages, expected in (("K", k_pages, k_expected), ("V", v_pages, v_expected)):
+            # Through the device's fp8 -> fp16 conversion: the stored order is QFP8CH, so a
+            # raw byte copy would read shuffled. The device conversion rounds a few values
+            # one e4m3 step (2^-3 relative) from the host cast, mostly below the smallest
+            # normal (2^-6); a misplaced or misordered store is off by far more.
+            stored = pages.to(DTYPE).to("cpu").float()
+            torch.testing.assert_close(
+                stored,
+                expected.float(),
+                atol=2**-6,
+                rtol=2**-3,
+                msg=lambda m, name=name: f"fp8 {name} store: {m}",
+            )
+        k_expected = (k_expected.float() * k_scale).to(DTYPE)
+        v_expected = (v_expected.float() * v_scale).to(DTYPE)
 
     # NaN, not empty: a store that lands nowhere has to fail here.
     output = torch.full_like(query, float("nan")).to(cache_device)
@@ -297,10 +334,9 @@ def _run_head_major_attn_test(
 
 
 def test_head_major_kv_cache_shape():
-    """The backend advertises head-major, and vLLM can still find the block dim."""
+    """The backend advertises the head-major shape with num_blocks outermost."""
     shape = SpyreHeadMajorAttentionBackend.get_kv_cache_shape(16, 128, 8, 64)
     assert shape == (16, 8, 128, 64)
-    assert SpyreHeadMajorAttentionBackend.get_kv_cache_block_dim(128, 8, 64) == 0
 
 
 def test_head_major_write_index(default_vllm_config):
@@ -319,7 +355,7 @@ def test_head_major_write_index(default_vllm_config):
     assert len(per_head) == num_kv_heads
     for h, rows in enumerate(per_head):
         assert rows.shape == slots.shape
-        # Its own allocation, not a row of a [KV, T] tensor (torch-spyre#3770).
+        # Its own allocation, not a row of a [KV, T] tensor (torch-spyre#3851).
         assert rows.storage_offset() == 0
         for t, slot in enumerate(slots.tolist()):
             block, offset = divmod(slot, block_size)
@@ -327,6 +363,263 @@ def test_head_major_write_index(default_vllm_config):
     # Every destination distinct: two writes sharing a row would silently drop one.
     stacked = torch.stack(per_head)
     assert stacked.unique().numel() == stacked.numel()
+
+
+def test_fp8_kv_cache_is_head_major_only(default_vllm_config):
+    assert "fp8" in SpyreHeadMajorAttentionBackend.supported_kv_cache_dtypes
+    assert "fp8" not in SpyreAttentionBackend.supported_kv_cache_dtypes
+
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    assert impl.kv_cache_fp8
+    with pytest.raises(ValueError, match="head-major"):
+        SpyreAttentionImpl(
+            num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+        )
+    # A float8 stick is 128 elements wide.
+    with pytest.raises(ValueError, match="head_size % 128"):
+        SpyreHeadMajorAttentionImpl(
+            num_heads=8, head_size=64, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+        )
+
+
+def test_encoder_layers_ignore_an_fp8_cache_dtype(default_vllm_config):
+    """Upstream hands encoder layers the engine's cache dtype, but they keep no cache."""
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        SpyreEncoderAttentionImpl,
+    )
+
+    impl = SpyreEncoderAttentionImpl(
+        num_heads=8,
+        head_size=64,
+        scale=1.0,
+        num_kv_heads=2,
+        kv_cache_dtype="fp8",
+        attn_type=AttentionType.ENCODER_ONLY,
+    )
+    assert not impl.kv_cache_fp8
+
+
+def test_fp8_kv_scales_mirror_the_layer_floats(default_vllm_config):
+    impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    layer = Mock(_k_scale_float=0.25, _v_scale_float=0.5)
+    impl.prepare_kv_scales(layer)
+    assert impl._kernel_kv_scales() == (0.25, 0.5)
+    assert impl._read_scales() == (0.25, (0.5,))
+    # A model-dtype cache passes no scales, so its kernels trace as before.
+    plain = SpyreHeadMajorAttentionImpl(num_heads=8, head_size=128, scale=1.0, num_kv_heads=2)
+    plain.prepare_kv_scales(layer)
+    assert plain._kernel_kv_scales() == ()
+    assert plain._read_scales() == (1.0, ())
+
+
+def test_fp8_quantize_saturates():
+    """The float8 cast maps an overflow to NaN; the store must clamp first."""
+    x = torch.tensor([1e4, -1e4, 3.0], dtype=DTYPE)
+    stored = quantize_kv(x, 0.05, torch.float8_e4m3fn)
+    assert stored.float().tolist() == [448.0, -448.0, 60.0]
+
+
+def _fp8_pages(num_pages, num_kv_heads, block_size, head_size, k_scale, v_scale):
+    """Random head-major pages stored as float8, and the model-dtype pages they decode to."""
+    k = (torch.randn(num_pages, num_kv_heads, block_size, head_size) * 3).to(DTYPE)
+    v = torch.randn(num_pages, num_kv_heads, block_size, head_size).to(DTYPE)
+    k8 = quantize_kv(k, k_scale, torch.float8_e4m3fn)
+    v8 = quantize_kv(v, v_scale, torch.float8_e4m3fn)
+    return (
+        k8,
+        v8,
+        (k8.float() * k_scale).to(DTYPE),
+        (v8.float() * v_scale).to(DTYPE),
+    )
+
+
+def _fp8_layer(k_scale, v_scale, **attrs):
+    """An fp8-cache attention layer whose upstream-resolved scales are (k_scale, v_scale)."""
+    from vllm.model_executor.layers.attention.attention import Attention
+
+    layer = Mock(spec=Attention)
+    layer.impl = SpyreHeadMajorAttentionImpl(
+        num_heads=8, head_size=128, scale=1.0, num_kv_heads=2, kv_cache_dtype="fp8"
+    )
+    layer._k_scale_float, layer._v_scale_float = k_scale, v_scale
+    for name, value in attrs.items():
+        setattr(layer, name, value)
+    return layer
+
+
+def _runner_over(monkeypatch, layers, static_forward_context=None):
+    """A runner whose model is just ``layers``."""
+    from types import SimpleNamespace
+
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    runner = object.__new__(TorchSpyreModelRunner)
+    monkeypatch.setattr(runner, "get_model", lambda: Mock(modules=Mock(return_value=layers)))
+    runner.compilation_config = SimpleNamespace(static_forward_context=static_forward_context or {})
+    return runner
+
+
+def _warnings(monkeypatch):
+    from spyre_inference.v1.worker import spyre_model_runner
+
+    warnings = []
+    monkeypatch.setattr(
+        spyre_model_runner.logger, "warning_once", lambda msg, *args: warnings.append(msg)
+    )
+    return warnings
+
+
+def test_distinct_kv_scales_warn_about_warmup(default_vllm_config, monkeypatch):
+    """Each distinct (k_scale, v_scale) pair is its own compile, so startup says so."""
+    first, other = _fp8_layer(0.25, 0.5), _fp8_layer(0.25, 0.5)
+    runner = _runner_over(monkeypatch, [first, other])
+    warnings = _warnings(monkeypatch)
+
+    runner._resolve_kv_scales()
+    assert warnings == [], "one shared pair compiles once"
+    other._k_scale_float = 0.125
+    runner._resolve_kv_scales()
+    assert len(warnings) == 1 and "distinct" in warnings[0]
+
+
+def test_per_head_kv_scales_warn(default_vllm_config, monkeypatch):
+    """Upstream reduces a per-head scheme to its max scale; the cache cannot do better."""
+    layer = _fp8_layer(0.25, 0.5, _k_scale=torch.tensor([0.25, 0.025]))
+    warnings = _warnings(monkeypatch)
+
+    _runner_over(monkeypatch, [layer])._resolve_kv_scales()
+
+    assert layer.impl._kernel_kv_scales() == (0.25, 0.5)
+    assert len(warnings) == 1 and "per-head" in warnings[0]
+
+
+def test_kv_sharing_layer_reads_with_its_target_scales(default_vllm_config, monkeypatch):
+    """A layer reading another's cache dequantizes with the scales that cache was written at."""
+    target = _fp8_layer(0.05, 0.02)
+    # A sharing layer stores nothing, so a calibrated checkpoint leaves its own at 1.0.
+    reader = _fp8_layer(1.0, 1.0, kv_sharing_target_layer_name="layers.0.attn")
+    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
+
+    runner._resolve_kv_scales()
+
+    assert reader.impl._kernel_kv_scales() == (0.05, 0.02)
+
+
+def test_kv_sharing_layer_and_target_must_agree_on_fp8(default_vllm_config, monkeypatch):
+    """A reader whose target skipped fp8 through kv_cache_dtype_skip_layers would decode
+    fp16 pages as fp8, so it fails at load and names the setting."""
+    target = _fp8_layer(1.0, 1.0)
+    target.impl.kv_cache_fp8 = False
+    reader = _fp8_layer(
+        1.0, 1.0, layer_name="layers.1.attn", kv_sharing_target_layer_name="layers.0.attn"
+    )
+    runner = _runner_over(monkeypatch, [reader, target], {"layers.0.attn": target})
+
+    with pytest.raises(ValueError, match="kv_cache_dtype_skip_layers"):
+        runner._resolve_kv_scales()
+
+
+def test_reload_weights_refreshes_the_kv_scales(default_vllm_config, monkeypatch):
+    """A reload passes its arguments through, re-reads the scales, and re-warms only on a
+    change, so an armed compile guard never sees the new scales mid-request."""
+    import contextlib
+
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    from spyre_inference.v1.worker import compile_guard
+
+    layer = _fp8_layer(0.25, 0.5)
+    runner = _runner_over(monkeypatch, [layer])
+    runner._resolve_kv_scales()
+    calls, warmups, allowed = [], [], []
+    new_k_scale = 0.25
+
+    @contextlib.contextmanager
+    def allow_compile(reason):
+        allowed.append(True)
+        yield
+        allowed.pop()
+
+    def reprocess(self, *args, **kwargs):
+        calls.append((args, kwargs))
+        layer._k_scale_float = new_k_scale
+
+    monkeypatch.setattr(GPUModelRunner, "reload_weights", reprocess)
+    monkeypatch.setattr(compile_guard, "allow_compile", allow_compile)
+    monkeypatch.setattr(runner, "warming_up_model", lambda: warmups.append(bool(allowed)))
+
+    runner.reload_weights(weights_path="/ckpt", is_checkpoint_format=False)
+    assert calls == [((), {"weights_path": "/ckpt", "is_checkpoint_format": False})]
+    assert warmups == [], "unchanged scales leave every graph valid"
+
+    new_k_scale = 0.125
+    runner.reload_weights()
+    assert layer.impl._kernel_kv_scales() == (0.125, 0.5)
+    assert warmups == [True], "a change re-warms once, with the compile guard suspended"
+
+
+def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
+    """A float8 cache read through the scales equals the model-dtype read of its values."""
+    from spyre_inference.v1.attention.ops import tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    set_random_seed(0)
+    num_kv_heads, qpk, head_size, block_size, num_blocks, padded_q = 2, 4, 128, 64, 3, 4
+    num_heads = num_kv_heads * qpk
+    k_scale, v_scale = 0.05, 0.02
+    k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
+
+    query = torch.randn(padded_q, num_heads, head_size).to(DTYPE)
+    rows = torch.arange(padded_q, dtype=torch.int32)
+    index_table = torch.zeros(num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+    index_table[:, 0] = torch.tensor([4, 1, 3])
+    mask = torch.zeros(num_blocks, padded_q, block_size, dtype=DTYPE)
+    mask[-1, :, 40:] = float("-inf")
+    args = (num_blocks, padded_q, num_heads, num_kv_heads, head_size)
+    scale = head_size**-0.5
+
+    got = page_attn_head_major_prefill_kernel(
+        query, rows, k8, v8, index_table, mask, scale * k_scale, *args, 0.0, None, v_scale
+    )
+    want = page_attn_head_major_prefill_kernel(
+        query, rows, k_dq, v_dq, index_table, mask, scale, *args
+    )
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
+
+
+# Named clear of the conftest batched-decode skip: this is the untiled walk on CPU.
+def test_fp8_decode_batch_reads_match_the_dequantized_cache(monkeypatch):
+    from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
+
+    monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
+    monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
+    set_random_seed(0)
+    num_kv_heads, qpk, head_size, block_size = 2, 4, 128, 64
+    num_seqs, bpc, num_chunks = 2, 2, 3
+    k_scale, v_scale = 0.05, 0.02
+    k8, v8, k_dq, v_dq = _fp8_pages(6, num_kv_heads, block_size, head_size, k_scale, v_scale)
+
+    query = torch.randn(num_seqs, num_kv_heads * qpk, head_size).to(DTYPE)
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat(bpc)
+    page_ids = torch.randint(0, 6, (num_chunks * bpc, num_seqs), dtype=torch.int64)
+    mask = torch.zeros(num_chunks * bpc, num_seqs, 1, 1, block_size, dtype=DTYPE)
+    mask[-1, ..., 32:] = float("-inf")
+    scale = head_size**-0.5
+    args = (num_seqs, bpc, num_kv_heads, qpk, block_size, head_size)
+
+    got = batched_decode_head_major_kernel(
+        query, rep_row_ids, k8, v8, page_ids, mask, scale * k_scale, *args, 0.0, None, v_scale
+    )
+    want = batched_decode_head_major_kernel(
+        query, rep_row_ids, k_dq, v_dq, page_ids, mask, scale, *args
+    )
+    torch.testing.assert_close(got, want, atol=1e-2, rtol=1e-2)
 
 
 def test_token_major_write_index_is_the_slot_mapping(default_vllm_config):
@@ -485,9 +778,9 @@ def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads,
 
 
 _SHAPES = [
-    pytest.param([(1, 128)], id="decode_single"),
+    pytest.param([(1, 128)], id="decode_single", marks=pytest.mark.attention_smoke),
     pytest.param([(1, 300), (1, 64), (1, 512)], id="decode_batch"),
-    pytest.param([(64, 64)], id="prefill_single"),
+    pytest.param([(64, 64)], id="prefill_single", marks=pytest.mark.attention_smoke),
     pytest.param([(128, 128), (64, 200)], id="prefill_batch"),
     pytest.param([(64, 300), (1, 128)], id="mixed_batch"),
 ]
@@ -514,6 +807,31 @@ def test_head_major_attn_core(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize("seq_lens", _SHAPES)
+# Unit scales are a checkpoint without a kv_cache_scheme; the others a calibrated one.
+@pytest.mark.parametrize("kv_scales", [(1.0, 1.0), (0.05, 0.02)], ids=["unit", "scaled"])
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_attn_fp8_kv_cache(
+    default_vllm_config, seq_lens, kv_scales, configure_compilation, configure_device
+):
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        kv_cache_dtype="fp8",
+        kv_scales=kv_scales,
     )
 
 
@@ -807,7 +1125,12 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
-            KVCacheTensor(size=spec.page_size_bytes * num_blocks, shared_by=["layers.0.self_attn"])
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks,
+                layers=["layers.0.self_attn"],
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
         ],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=["layers.0.self_attn"], kv_cache_spec=spec)],
     )
@@ -842,6 +1165,83 @@ def test_runner_allocates_head_major_for_a_head_major_layer():
 
     del caches, k_pages, v_pages
     gc.collect()
+
+
+def test_mixed_layout_layers_in_one_kv_cache_tensor_each_get_their_own_pages(monkeypatch):
+    """vLLM packs every attention layer into one KVCacheTensor.
+
+    Allocating once per tensor would both alias the layers onto the same blocks and pick
+    a single layout for all of them -- so a head-major layer would read a token-major
+    cache. Each layer must get its own allocation, from its own impl class.
+
+    Card-free: both `allocate_pages` implementations are stubbed with tagged sentinels.
+    """
+    from vllm.config import CacheConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
+    from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
+
+    block_size, num_kv_heads, head_size, num_blocks = 128, 8, 128, 16
+    layer_names = ["layers.0.self_attn", "layers.1.self_attn"]
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(
+            model="Qwen/Qwen3-0.6B", max_model_len=1, dtype=torch.float16, trust_remote_code=True
+        ),
+        cache_config=CacheConfig(block_size=block_size),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+    runner = TorchSpyreModelRunner(vllm_config, torch.device("spyre"))
+    spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=num_kv_heads, head_size=head_size, dtype=DTYPE
+    )
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=spec.page_size_bytes * num_blocks * len(layer_names),
+                layers=layer_names,
+                layer_stride=spec.page_size_bytes * num_blocks,
+                block_stride=spec.page_size_bytes,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)],
+    )
+
+    impl_kwargs = dict(
+        num_heads=32, head_size=head_size, scale=head_size**-0.5, num_kv_heads=num_kv_heads
+    )
+    with set_current_vllm_config(vllm_config):
+        impls = {
+            "layers.0.self_attn": SpyreHeadMajorAttentionImpl(**impl_kwargs),
+            "layers.1.self_attn": SpyreAttentionImpl(**impl_kwargs),
+        }
+    for layer_name, impl in impls.items():
+        fake_layer = Mock()
+        fake_layer.kv_cache = None
+        fake_layer.impl = impl
+        runner.compilation_config.static_forward_context[layer_name] = fake_layer
+
+    # Tag each sentinel with the class the runner dispatched on, so a single shared
+    # allocation shows up as both a repeated object and the wrong layout.
+    def _stub(cls):
+        def _allocate_pages(inner_cls, blocks, allocate_spec, device):
+            return Mock(name=f"{inner_cls.__name__}-pages-{blocks}", _spyre_impl_cls=inner_cls)
+
+        monkeypatch.setattr(cls, "allocate_pages", classmethod(_allocate_pages))
+
+    _stub(SpyreHeadMajorAttentionImpl)
+    _stub(SpyreAttentionImpl)
+
+    caches = runner.initialize_kv_cache_tensors(kv_cache_config, [block_size])
+
+    assert caches["layers.0.self_attn"] is not caches["layers.1.self_attn"], (
+        "layers packed into one KVCacheTensor must not share a page buffer"
+    )
+    assert caches["layers.0.self_attn"]._spyre_impl_cls is SpyreHeadMajorAttentionImpl
+    assert caches["layers.1.self_attn"]._spyre_impl_cls is SpyreAttentionImpl
 
 
 def test_page_attn_head_major_matches_fp32_reference():
@@ -932,8 +1332,9 @@ def test_head_major_decode_body_matches_fp32_reference(
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
+    from test_spyre_attn import _decode_reference_fp32
+
     from spyre_inference.v1.attention.ops import batched_decode_head_major, tile_loop
-    from tests.attention.test_spyre_attn import _decode_reference_fp32
 
     monkeypatch.setattr(tile_loop, "USE_FOR_EACH_TILE", False)
     monkeypatch.setattr(batched_decode_head_major, "USE_FOR_EACH_TILE", False)
@@ -1051,7 +1452,7 @@ def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, conf
     It does not here: the whole-page gather is already LX-resident, so the fold is a dead end
     rather than a tuning gap.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 4, 64, 64
@@ -1104,7 +1505,7 @@ def test_dispatch_declines_a_gather_spanning_the_cache(default_vllm_config, conf
     Two decode seqs of two blocks each over a three-page cache is the TP2 gemma-4 shape
     that compiled the skipped variant mid-serving and hit a torch-spyre codegen assert.
     """
-    from tests.attention.test_spyre_attn import _build_metadata
+    from spyre_testing_plugin.attn_helpers import _build_metadata
 
     torch.set_default_device("cpu")
     num_query_heads, num_kv_heads, head_size, block_size = 8, 2, 64, 64

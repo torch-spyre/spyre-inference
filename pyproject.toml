@@ -78,9 +78,8 @@ cache-keys = [
     { file = "setup.py" },
     { file = "CMakeLists.txt" },
     { file = "cmake/**/*.cmake" },
+    { file = "cmake/**/*.py" },
     { file = "csrc/**/*.cpp" },
-    { file = "csrc/**/*.hpp" },
-    { file = "csrc/**/*.h" },
 ]
 
 # Declare every platform this lockfile must stay installable on, independent of which host runs

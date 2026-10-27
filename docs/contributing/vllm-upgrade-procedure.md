@@ -113,18 +113,32 @@ uv run --no-sync python -c "import spyre_inference; print('ok')"
 
 If this fails with `ImportError` from inside vLLM, the upstream API moved out from under one of our imports — `grep -rn "<missing-symbol>" .venv/lib64/python3.12/site-packages/vllm/` to find where it went, then update our import.
 
-## Step 2b: Re-sync the Vendored Host-Sampling Code
+## Step 2b: Re-sync the Host Kernels and the Sampler
 
-Spyre copies logits to the host for sampling, and spyre-inference vendors vLLM's CPU
-sampling code to do it fast. Every bump must re-check that code against the new upstream,
-even when nothing fails: the build and the tests only catch breakage, not upstream fixes we
-are missing.
+Spyre copies logits to the host for sampling and runs vLLM's own C++ host kernels there
+(sampling, slot mapping). They are compiled from vLLM's source, not copied into this
+repository: `cmake/cpu_extension.cmake` reads the `vllm` rev from `[tool.uv.sources]` in
+`pyproject.toml` and fetches that, so bumping the rev there moves the kernels with it.
+
+The build checks the rest:
+
+- `csrc/torch_bindings.cpp` registers the ops with vLLM's schemas. CMake configure fails
+  (`cmake/check_schemas.py`) if one no longer matches vLLM's `csrc/cpu/torch_bindings.cpp`;
+  copy the new schema and C++ declaration over.
+- A kernel that moved file or gained a dependency fails to compile or link: update
+  `SPYRE_EXT_SRC` in `cmake/cpu_extension.cmake`.
+- `register_slot_mapping_kernel` (`spyre_inference/v1/host_kernels.py`) binds the C++ op
+  to vLLM's Triton slot mapping kernel by the kernel's parameter names, so a renamed
+  parameter fails the first `compute_slot_mapping` (and `test_host_kernels.py`). It
+  exists because vLLM 0.32's own CPU override passes those arguments out of order (fixed
+  upstream in vllm#61992); once the pin includes that fix,
+  `CpuPlatform.register_triton_kernel_overrides` can replace it.
+
+Python still mirrored from upstream, to re-check against the new version even when nothing
+fails:
 
 | Ours | Upstream (vLLM) | How ours differs |
 |---|---|---|
-| `csrc/cpu/cpu_types.hpp`, `cpu_types_{x86,vsx,vxe}.hpp` | same paths | Trimmed to `FP32Vec8`/`FP32Vec16`; every kept line is unchanged. Port fixes to those two types only. |
-| `csrc/cpu/sampling_kernels.cpp` | same path (added in vllm#53913, after v0.28.0) | Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); `greedy_argmax` matches `torch.argmax` on NaN; inputs are checked. Port performance and correctness changes, never the table. |
-| `csrc/core/registration.h`, `cmake/utils.cmake`, `cmake/cpu_extension.cmake` | same paths | Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of `-march=native`, so wheels are portable. |
 | `SpyreTopKTopPSampler.forward_native` (`spyre_inference/v1/sample/topk_topp_sampler.py`) | `TopKTopPSampler.forward_native` (`vllm/v1/sample/ops/topk_topp_sampler.py`) | Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors. |
 | The sampler patch in `TorchSpyreModelRunner.__init__` | `Sampler` (`vllm/v1/sample/sampler.py`), its construction and `RejectionSampler(self.sampler)` (`vllm/v1/worker/gpu_model_runner.py`) | Relies on `Sampler` calling `self.greedy_sample` and `self.topk_topp_sampler`, and on the rejection sampler holding the same `Sampler` object. |
 
@@ -133,9 +147,6 @@ Diff the upstream side between the current pin and the target:
 ```bash
 cd <vllm checkout> && git fetch --tags
 git diff v<current> v{VERSION} --stat -- \
-  csrc/cpu/cpu_types.hpp csrc/cpu/cpu_types_x86.hpp csrc/cpu/cpu_types_vsx.hpp \
-  csrc/cpu/cpu_types_vxe.hpp csrc/cpu/sampling_kernels.cpp csrc/core/registration.h \
-  cmake/cpu_extension.cmake cmake/utils.cmake \
   vllm/v1/sample/ops/topk_topp_sampler.py vllm/v1/sample/sampler.py \
   vllm/v1/sample/rejection_sampler.py vllm/v1/worker/gpu_model_runner.py
 ```
@@ -145,12 +156,13 @@ comment. If the new vLLM pins a different torch, move every torch pin in `pyproj
 together: the extension links libtorch, so a mismatch fails at import. The list (six
 places, including the ppc64le source build) is in §3b of the `upgrade-torch-spyre` skill,
 and torch-spyre must support the new torch as well.
-`uv sync` rebuilds the extension because `csrc/` and `pyproject.toml` are in its cache keys.
+`uv sync` rebuilds the extension because `cmake/`, `csrc/` and `pyproject.toml` are in its
+cache keys.
 
 Then check the kernels and the PyTorch fallback (CPU only, no card needed):
 
 ```bash
-uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
+uv run --no-sync pytest tests/runtime/test_host_kernels.py tests/runtime/test_sampling_kernels.py \
   tests/runtime/test_sampling_fallback.py tests/runtime/test_spyre_topk_sampler.py --no-header
 ```
 
@@ -240,14 +252,14 @@ bash format.sh
 
 ## What to Commit
 
-Five files typically change for a vLLM bump, plus the vendored sampling code when upstream touched it:
+Five files typically change for a vLLM bump, plus the host-kernel pin and the mirrored sampler:
 
 1. `pyproject.toml` — two things: the `rev` in the `[tool.uv.sources]` vllm entry, and the `vllm>=X.Y.Z,<X.(Y+1)` constraint in `[project] dependencies`.
 2. `uv.lock` — auto-regenerated by `uv sync`. Don't hand-edit.
 3. `tests/plugin/pyproject.toml` — auto-regenerated by `sync-upstream-test-deps` from the allow-list. Review the diff but don't hand-edit; to add or drop a dep, edit `ALLOW_LIST`/`EXCLUDED` in `sync_upstream_test_deps.py` and re-run. The allow-list edit itself is the fourth file that may change on a bump.
 4. `spyre_inference/v1/worker/spyre_worker.py` (sometimes) or `spyre_inference/platform.py` — surgical overrides for new upstream wrappers.
 5. `tests/plugin/spyre_testing_plugin/pytest_plugin.py` (sometimes) — fixture updates for upstream test-infra churn.
-6. `csrc/cpu/`, `cmake/` and `spyre_inference/v1/sample/` (when upstream changed them) — the Step 2b re-sync of the vendored sampling code.
+6. `csrc/torch_bindings.cpp`, `cmake/cpu_extension.cmake` and `spyre_inference/v1/sample/` (when upstream changed them) — the Step 2b re-sync.
 
 If your bump touched custom ops, attention, or distributed code in `spyre_inference/`, that's a sign the upstream API changed — make sure the change is *necessary*, not just "looked easier than figuring out the new contract."
 

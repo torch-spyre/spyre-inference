@@ -29,8 +29,8 @@ from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 
 @pytest.fixture(autouse=True)
 def _no_kernels(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sampler, "has_sampling_kernels", lambda: False)
-    monkeypatch.setattr(topk_topp_sampler, "has_sampling_kernels", lambda: False)
+    monkeypatch.setattr(sampler, "has_host_kernels", lambda: False)
+    monkeypatch.setattr(topk_topp_sampler, "has_host_kernels", lambda: False)
 
 
 def _meta(rows: int, k: int | None, p: float | None, greedy: bool = False) -> SamplingMetadata:

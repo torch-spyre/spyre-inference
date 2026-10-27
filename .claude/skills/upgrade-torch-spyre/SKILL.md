@@ -196,7 +196,7 @@ After the lock refresh and `uv sync` in §4 (which rebuilds the extension, since
 PyTorch baselines:
 
 ```bash
-uv run --no-sync pytest tests/runtime/test_sampling_kernels.py \
+uv run --no-sync pytest tests/runtime/test_host_kernels.py tests/runtime/test_sampling_kernels.py \
   tests/runtime/test_sampling_fallback.py --no-header
 ```
 

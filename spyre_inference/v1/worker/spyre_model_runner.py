@@ -96,6 +96,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     allocate_staging_buffers,
 )
+from spyre_inference.v1.host_kernels import register_slot_mapping_kernel
 from spyre_inference.v1.pool import (
     SpyreAllPool,
     SpyreTokenPooler,
@@ -139,122 +140,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 )
 
 logger = init_logger(__name__)
-
-
-# Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
-# (unavailable with VLLM_TARGET_DEVICE=empty).
-
-_PAD_SLOT_ID = -1
-
-
-def _compute_slot_mapping_impl(
-    num_tokens: int,
-    max_num_tokens: int,
-    query_start_loc: torch.Tensor,
-    positions: torch.Tensor,
-    block_table: torch.Tensor,
-    block_table_stride: int,
-    slot_mapping: torch.Tensor,
-    KV_CACHE_BLOCK_SIZE: int,
-    TOTAL_CP_WORLD_SIZE: int = 1,
-    TOTAL_CP_RANK: int = 0,
-    CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
-    PAD_ID: int = _PAD_SLOT_ID,
-    # Triton tile width; unused here, kept for call compatibility.
-    BLOCK_SIZE: int = 1024,
-) -> None:
-    """Map each token position to its flat index in the paged KV cache.
-
-    The upstream vLLM implementation is a Triton kernel (requires a GPU) and
-    the CPU backend delegates to a C++ op in _C.so. Neither is available with
-    VLLM_TARGET_DEVICE=empty, so we reimplement the logic in pure PyTorch.
-
-    Correctness is validated indirectly by the upstream attention backend test
-    (test_causal_backend_correctness) and end-to-end model generation tests.
-    """
-    assert TOTAL_CP_WORLD_SIZE == 1, "Context Parallelism is not supported on Spyre."
-
-    token_positions = positions[:num_tokens]
-    block_indices = (token_positions // KV_CACHE_BLOCK_SIZE).to(torch.int64)
-    block_offsets = (token_positions % KV_CACHE_BLOCK_SIZE).to(torch.int64)
-
-    num_reqs = query_start_loc.shape[0] - 1
-    req_indices = torch.empty(num_tokens, dtype=torch.int64, device=positions.device)
-    for i in range(num_reqs):
-        start = query_start_loc[i].item()
-        end = query_start_loc[i + 1].item()
-        req_indices[start:end] = i
-
-    flat_indices = req_indices * block_table_stride + block_indices
-    block_numbers = block_table.flatten()[flat_indices].to(torch.int64)
-    slot_mapping[:num_tokens] = block_numbers * KV_CACHE_BLOCK_SIZE + block_offsets
-    if num_tokens < max_num_tokens:
-        slot_mapping[num_tokens:max_num_tokens] = PAD_ID
-
-
-class _SlotMappingKernelShim:
-    """Drop-in for vLLM's Triton ``ComputeSlotMappingKernel``, which Spyre cannot run:
-    calls go to the pure-PyTorch impl and warmup registration is a no-op."""
-
-    def __call__(
-        self,
-        num_reqs: int,
-        num_tokens: int,
-        max_num_tokens: int,
-        query_start_loc: torch.Tensor,
-        positions: torch.Tensor,
-        block_table: torch.Tensor,
-        block_table_stride: int,
-        slot_mapping: torch.Tensor,
-        KV_CACHE_BLOCK_SIZE: int,
-        TOTAL_CP_WORLD_SIZE: int = 1,
-        TOTAL_CP_RANK: int = 0,
-        CP_KV_CACHE_INTERLEAVE_SIZE: int = 1,
-    ) -> None:
-        _compute_slot_mapping_impl(
-            num_tokens,
-            max_num_tokens,
-            query_start_loc,
-            positions,
-            block_table,
-            block_table_stride,
-            slot_mapping,
-            KV_CACHE_BLOCK_SIZE,
-            TOTAL_CP_WORLD_SIZE=TOTAL_CP_WORLD_SIZE,
-            TOTAL_CP_RANK=TOTAL_CP_RANK,
-            CP_KV_CACHE_INTERLEAVE_SIZE=CP_KV_CACHE_INTERLEAVE_SIZE,
-        )
-
-    def register_warmup(self, *args, **kwargs) -> None:
-        pass
-
-
-_compute_slot_mapping_kernel = _SlotMappingKernelShim()
-
-# The module attribute in vllm.v1.worker.block_table that both launches the
-# slot-mapping kernel and receives its warmup registration.
-_SLOT_MAPPING_KERNEL_ATTR = "_COMPUTE_SLOT_MAPPING_KERNEL"
-
-
-def _patch_compute_slot_mapping() -> None:
-    """Swap vLLM's slot-mapping kernel instance for our shim before any BlockTable exists.
-
-    The attribute is checked first: vLLM has moved this kernel before, and assigning a
-    name nothing reads would leave the Triton placeholder in place until the first
-    decode step.
-    """
-    from vllm.v1.worker import block_table
-
-    if not hasattr(block_table, _SLOT_MAPPING_KERNEL_ATTR):
-        raise RuntimeError(
-            f"Cannot find vLLM's slot-mapping kernel to patch: "
-            f"block_table.{_SLOT_MAPPING_KERNEL_ATTR} does not exist. vLLM has moved it; "
-            f"update _SlotMappingKernelShim and _patch_compute_slot_mapping for the "
-            f"new launch site. Leaving the patch unapplied would defer the failure to "
-            f"the first decode step."
-        )
-
-    setattr(block_table, _SLOT_MAPPING_KERNEL_ATTR, _compute_slot_mapping_kernel)
 
 
 class SpyreCpuGpuBuffer(CpuGpuBuffer):
@@ -701,11 +586,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # kernels against real pages. Populated by initialize_kv_cache_tensors.
         self._spyre_kv_caches: dict[str, SpyrePagedKVCache] = {}
 
-        # Replace Triton kernel with a pure-PyTorch implementation.
-        # GPUModelRunner uses @triton.jit which is mocked on non-GPU platforms.
-        # The upstream CPU backend uses a C++ kernel (torch.ops._C) as its
-        # fallback, but we don't have _C.abi3.so with VLLM_TARGET_DEVICE=empty.
-        _patch_compute_slot_mapping()
+        # GPUModelRunner's slot mapping is a Triton kernel; Spyre has no Triton.
+        register_slot_mapping_kernel()
 
     def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load weights on CPU, move Spyre layers to device, compile, and wrap."""

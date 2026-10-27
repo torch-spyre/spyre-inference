@@ -3056,10 +3056,17 @@ runs the other way round: its page index is uploaded one entry per stick here, w
 what the tiled walk needs, so the batched kernel is reached on this layout and declined on
 token-major until that port lands.</p>
 <p>Residency is a property of the layout plan, not of a result, so it is measured off the
-planner's own verdicts. K's residency needs torch-spyre#4153: <code>q @ Kᵀ</code> lowers the
+planner's own verdicts. Read those from the allocation — <code>LifetimeBoundBuffer.address</code>, where
+<code>None</code> means HBM — and not from the allocator's <code>lx_pinning:</code> debug log, whose <code>→ lx</code> is the
+default for any buffer the spill-reason dict does not mention, and which never reports a
+graph-input clone at all. K's residency needs torch-spyre#4153: <code>q @ Kᵀ</code> lowers the
 transpose to a restickify, whose cross-frame barrier bars an LX-resident input without
 that PR's local-read proof. V is read directly by <code>probs @ V</code> and stays resident either
 way.</p>
+<p>Batched decode needs none of this. Its whole-page gather is LX-resident as it stands, so the
+per-sequence kernel's <code>(page, kv_head)</code> fold has nothing to buy there: folding anyway divides
+<code>blocks_per_chunk</code> by <code>num_kv_heads</code> and multiplies the chunk trips, which measured roughly
+1.5–2x more kernel time across the decode batches and contexts tried.</p>
 <h4 id="fp8-kv-cache">FP8 KV cache<a class="headerlink" href="#fp8-kv-cache" title="Permanent link">&para;</a></h4>
 <p><code>--kv-cache-dtype fp8</code> (or <code>fp8_e4m3</code>) stores the head-major pages as <code>float8_e4m3fn</code>,
 halving KV memory and the bytes each page read moves; the token-major layout rejects it.

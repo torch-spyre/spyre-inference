@@ -622,11 +622,16 @@ The weight transposes happen before that, in each layer's
 call boundary:
 
 - **Input**: CPU `int32`/`int64` tensors → Spyre `int64` (for embedding lookup)
-- **Output**: Spyre `float16` tensors → CPU (for logits indexing and sampling). A pooling
-  model whose pooler runs on Spyre keeps its hidden states there instead, and the pooler
-  copies back only the pooled vectors
-- **`compute_logits`**: moves the CPU-sliced `hidden_states[logits_indices]` back onto
-  Spyre for the `SpyreParallelLMHead` matmul, which returns logits on Spyre
+- **Output**: a generative model's hidden states stay on Spyre. Upstream's
+  `hidden_states[logits_indices]` is routed through `select_rows`, which gathers the
+  sampled rows on Spyre onto a warmed row bucket; a decode step whose indices are the
+  identity reuses the padded body output with no gather. A pooling model whose pooler
+  runs on Spyre keeps its hidden states there too, and the pooler copies back only the
+  pooled vectors. Every other output, including the eager decoder's, which has no shape
+  bucketer, is converted to CPU
+- **`compute_logits`**: projects a gathered row bucket on Spyre directly. Any other
+  input, such as a prompt-logprob slice, is padded onto a row bucket on the host and moved
+  onto Spyre for the `SpyreParallelLMHead` matmul. Only the logits cross back to the host
 
 `SpyreVocabParallelEmbedding` inherits weight loading and shard arithmetic from upstream
 and overrides `forward`. The weight moves to Spyre with the rest of the model, and the

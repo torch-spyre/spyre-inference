@@ -58,6 +58,11 @@ would otherwise take every value in `1..--max-num-seqs` as requests finish. Thos
 pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
 no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 
+The sampled rows are gathered on Spyre, so only the logits are copied to the host.
+Warmup compiles that gather at every row bucket. `SPYRE_SAMPLE_ROWS_ON_DEVICE=0` copies
+every hidden-state row to the host and gathers there instead. Under `--enforce-eager`
+there are no buckets, so the host gather is always used.
+
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass

@@ -2341,7 +2341,8 @@ each cached token takes:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span>ibm-granite/granite-4.1-8b-fp8<span class="w"> </span>--kv-cache-dtype<span class="w"> </span>fp8
 </span></code></pre></div>
 <p>It needs the default head-major layout (<code>SPYRE_ATTN_KV_LAYOUT=head_major</code>) and a head size
-that is a multiple of 128. It does not raise capacity: the platform pins the block count
+that is a multiple of 128. Other quantized cache dtypes (<code>fp8_e5m2</code>, <code>fp8_inc</code>, <code>nvfp4</code>,
+...) are rejected at startup. It does not raise capacity: the platform pins the block count
 to <code>max_num_seqs</code> × <code>max_model_len</code> (<code>num_gpu_blocks_override</code>), so an fp8 cache holds the
 same number of tokens in half the device memory. Attention still computes in the model
 dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0

@@ -1268,3 +1268,83 @@ def test_expert_kernel_layout_keeps_experts_whole_and_stick_columns_contiguous(c
         assert host_at[first] == e * block + c * free_elems + s * stick
         if c + 1 < contract:
             assert host_at[first + stick] == host_at[first] + free_elems
+
+
+# ``stick`` is ``get_elem_in_stick(fp16)`` on the card; fix a representative value so these
+# host-only tests need no device, matching the chunk math the fixture above exercises.
+_STICK = 16
+
+
+def _cores_filled(entries, max_cores):
+    """The largest divisor of ``entries`` no larger than ``max_cores`` — the kernel's split."""
+    return max(s for s in range(1, min(entries, max_cores) + 1) if entries % s == 0)
+
+
+@pytest.mark.parametrize(
+    ("hidden", "top_k", "max_cores"),
+    [
+        (256, 4, 8),
+        (64, 2, 8),
+        (256, 8, 8),
+        (128, 1, 8),
+        (512, 3, 8),
+        (256, 4, 1),
+        (256, 4, 64),
+    ],
+)
+def test_derive_moe_chunks_picks_the_smallest_fullest_split(hidden, top_k, max_cores):
+    """Auto selection returns the fewest stick-legal chunks that fill the most cores."""
+    from spyre_inference.moe import _derive_moe_chunks
+
+    chunks = _derive_moe_chunks(hidden, top_k, _STICK, max_cores)
+
+    hidden_sticks = hidden // _STICK
+    assert hidden_sticks % chunks == 0, "chunks must split the hidden sticks evenly"
+
+    best_cores = max(
+        _cores_filled(top_k * c, max_cores)
+        for c in range(1, hidden_sticks + 1)
+        if hidden_sticks % c == 0
+    )
+    assert _cores_filled(top_k * chunks, max_cores) == best_cores, "must fill the most cores"
+    smaller = [
+        c
+        for c in range(1, chunks)
+        if hidden_sticks % c == 0 and _cores_filled(top_k * c, max_cores) == best_cores
+    ]
+    assert not smaller, "ties go to the fewest chunks"
+
+
+def test_derive_moe_chunks_override_bypasses_the_core_math():
+    """A divisible override is returned as-is, whatever the auto heuristic would have chosen."""
+    from spyre_inference.moe import _derive_moe_chunks
+
+    auto = _derive_moe_chunks(256, 4, _STICK, 8)
+    assert auto != 4
+    assert _derive_moe_chunks(256, 4, _STICK, 8, override=4) == 4
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"hidden": 0, "top_k": 2, "stick": _STICK, "max_cores": 8}, "positive dimensions"),
+        ({"hidden": 256, "top_k": 0, "stick": _STICK, "max_cores": 8}, "positive dimensions"),
+        ({"hidden": 256, "top_k": 2, "stick": 0, "max_cores": 8}, "positive dimensions"),
+        ({"hidden": 256, "top_k": 2, "stick": _STICK, "max_cores": 0}, "at least one core"),
+        ({"hidden": 255, "top_k": 2, "stick": _STICK, "max_cores": 8}, "multiple of"),
+        (
+            {"hidden": 256, "top_k": 2, "stick": _STICK, "max_cores": 8, "override": 0},
+            "must be positive",
+        ),
+        (
+            {"hidden": 256, "top_k": 2, "stick": _STICK, "max_cores": 8, "override": 3},
+            "whole 16-element-stick chunks",
+        ),
+    ],
+)
+def test_derive_moe_chunks_rejects_illegal_shapes(kwargs, match):
+    """Each guard in the selector raises before any chunk count is returned."""
+    from spyre_inference.moe import _derive_moe_chunks
+
+    with pytest.raises(ValueError, match=match):
+        _derive_moe_chunks(**kwargs)

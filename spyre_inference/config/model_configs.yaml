@@ -71,20 +71,6 @@ models:
 
   # ---- Encoder / Embedding models (TP=1, pooling) -------------------------
 
-  google-bert/bert-base-uncased:
-    platforms: [x86_64, s390x, ppc64le]
-    serving_configs:
-      - tp_size: 1
-        max_model_len: 512
-        max_num_seqs: 256
-
-  google-bert/bert-large-uncased:
-    platforms: [x86_64, s390x, ppc64le]
-    serving_configs:
-      - tp_size: 1
-        max_model_len: 512
-        max_num_seqs: 128
-
   sentence-transformers/all-MiniLM-L6-v2:
     platforms: [x86_64, s390x]
     serving_configs:

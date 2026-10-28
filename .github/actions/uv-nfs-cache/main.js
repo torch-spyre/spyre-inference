@@ -45,4 +45,5 @@ lib.runHelper([
   '--uv', 'uv',
   '--github-env', process.env.GITHUB_ENV || '',
   '--github-output', process.env.GITHUB_OUTPUT || '',
+  '--github-state', process.env.GITHUB_STATE || '',
 ]);

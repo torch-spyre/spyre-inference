@@ -17,19 +17,26 @@
 Body (1D, decoder): sorted ``compile_sizes`` token counts; pad the packed batch to
 the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
 
-Pooling has one body shape, ``R`` rows, where ``R`` is the token budget (see
-``encoder_budget_rows``). Fixing it is what reduces the encoder attention kernels'
-cache keys to the sequence shapes alone: both the rectangular path's rectangle and the
-ragged path's fused gather/attend/store take the body buffer as an argument, so a
-varying buffer size would multiply every attention graph.
+Pooling pads each step to a body of ``R`` rows (see ``encoder_body_budgets``). A model
+whose context fits in 2048 rows has one body, the token budget. A longer model (bge-m3
+at 8K) keeps that 2048-row body for steps that fit it and adds a body per larger
+power of two up to ``max_model_len``. One 8K body would pad a short request out to
+8192 rows and shrink the long rectangles until a multi-document batch missed them.
 
-On top of that one buffer sit two shape families, both derived from a single
-power-of-two length ladder:
+Each body is its own buffer size, so a rectangle and a ragged group are compiled per
+body: both kernels take the buffer as an argument. Steps pick the smallest body that
+holds their token count, then a rectangle of that body or the ragged path inside it.
 
-* ``encoder_rectangles`` -- the rectangular path. One ``(L, B)`` per length, ``B = R // L``,
-  so the grid is exactly the body buffer and a batch needs no per-layer movement.
-* ``encoder_group_shapes`` -- the ragged path, for batches too wide for a rectangle.
-  One ``(width, extent)`` per group of equal-extent requests.
+On top of each body sit two shape families, both derived from a single power-of-two
+length ladder:
+
+* ``encoder_rectangles`` -- the rectangular path. One ``(L, B)`` per length a step
+  on that body can reach, ``B = R // L``, so the grid is exactly that body and a
+  batch needs no per-layer movement. A short length on a larger body is left out:
+  the step pads to the smallest body that holds it, and never gets there.
+* ``encoder_group_shapes`` -- the ragged path of the largest body, for batches too wide
+  for a rectangle. One ``(width, extent)`` per group of equal-extent requests. The other
+  bodies' groups are on ``EncoderShapeTables.tier_groups``.
 """
 
 from __future__ import annotations
@@ -50,6 +57,12 @@ logger = init_logger(__name__)
 
 # Spyre stick (64 fp16 elements), and the encoder attention KV block width.
 ENCODER_SEQ_ALIGNMENT = 64
+
+# Measured throughput peak for a pooling body. The platform caps
+# ``max_num_batched_tokens`` at this for models that fit; longer models keep it as
+# the smallest body and only step up when the batch does not. One constant: the
+# platform reads it from here, so the cap and the tier ladder cannot drift.
+POOLING_FAST_BODY_ROWS = 2048
 
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
@@ -91,19 +104,23 @@ class EncoderShapeTables:
     """Every encoder shape a pooling run can reach, derived from the engine limits."""
 
     budget: int
-    """``R``: body rows, and the row cap on one attention dispatch."""
+    """Largest body: one max-length sequence has to fit, and the scheduler token cap."""
     lengths: tuple[int, ...]
     """The length ladder: powers of two from one stick up to ``max_model_len``."""
     rectangles: tuple[tuple[int, int], ...]
-    """Rectangular path ``(L, B)``, one per length."""
+    """Rectangular path ``(L, B)`` across every body. ``L * B`` is that rectangle's body."""
     groups: tuple[tuple[int, int], ...]
-    """The ragged path's shapes, as ``(width, extent)``.
+    """Ragged-path ``(width, extent)`` pairs for the largest body.
 
     A *group* is the unit the ragged path splits a batch into: the requests that share one
     padded extent, dispatched together as a single ``width``-wide kernel call. So one
     ragged step usually has several groups, and these pairs are every group shape it can
     produce. Empty when no batch can miss the rectangular path.
     """
+    budgets: tuple[int, ...]
+    """Body row counts, ascending. A step pads to the smallest one that holds it."""
+    tier_groups: tuple[tuple[int, tuple[tuple[int, int], ...]], ...]
+    """``(body rows, ragged groups)`` for every body, including ones with no groups."""
 
 
 def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
@@ -130,20 +147,40 @@ def _encoder_shape_tables(
 ) -> EncoderShapeTables:
     del query_buckets_override  # read from envs below; a cache key only
     lengths = _encoder_lengths(max_model_len)
-    budget = encoder_budget_rows(max_model_len, max_num_batched_tokens, max_num_seqs)
+    budgets = encoder_body_budgets(max_model_len, max_num_batched_tokens, max_num_seqs)
 
     # `budget // length`, not `min(max_num_seqs, budget // length)`: the rectangle is
-    # the *physical* grid, and holding it at exactly `budget` rows is what keeps the
-    # body at one shape. Where `max_num_seqs` is the smaller of the two, the surplus
-    # lanes are batch padding -- one attendable key each, output never read. They cost
-    # only attention rows, and only at the short lengths where attention is cheapest.
-    rectangles = tuple((length, budget // length) for length in lengths)
+    # the *physical* grid of that body. Where `max_num_seqs` is the smaller of the two,
+    # the surplus lanes are batch padding -- one attendable key each, output never read.
+    # They cost only attention rows, and only at the short lengths where attention is cheapest.
+    rectangles: list[tuple[int, int]] = []
+    tier_groups: list[tuple[int, tuple[tuple[int, int], ...]]] = []
+    previous = 0
+    for budget in budgets:
+        # A step reaches this body only once its token count passes the previous
+        # one. An extent whose fullest batch (``max_num_seqs`` sequences of that
+        # length) still fits below stays on the smaller body, so its rectangle
+        # and ragged groups here would compile and never dispatch.
+        usable = tuple(
+            length
+            for length in lengths
+            if length <= budget
+            and budget % length == 0
+            and _extent_reaches_body(length, previous, max_num_seqs)
+        )
+        rectangles.extend((length, budget // length) for length in usable)
+        tier_groups.append(
+            (budget, _encoder_groups(usable, budget, max_num_seqs) if usable else ())
+        )
+        previous = budget
 
     return EncoderShapeTables(
-        budget=budget,
+        budget=budgets[-1],
         lengths=lengths,
-        rectangles=rectangles,
-        groups=_encoder_groups(lengths, budget, max_num_seqs),
+        rectangles=tuple(rectangles),
+        groups=tier_groups[-1][1],
+        budgets=budgets,
+        tier_groups=tuple(tier_groups),
     )
 
 
@@ -191,6 +228,18 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
     return tuple(ladder)
 
 
+def _extent_reaches_body(length: int, previous: int, max_num_seqs: int) -> bool:
+    """Whether a batch of extent ``length`` can be padded onto this body.
+
+    The smallest body has no previous tier, so every length that divides it is
+    reachable. A later body is used only above ``previous`` tokens, and a batch
+    of this extent holds at most ``max_num_seqs * length``.
+    """
+    if previous <= 0:
+        return True
+    return max_num_seqs * length > previous
+
+
 def _encoder_groups(
     lengths: tuple[int, ...], budget: int, max_num_seqs: int
 ) -> tuple[tuple[int, int], ...]:
@@ -216,6 +265,49 @@ def _encoder_groups(
             pairs.append((width, extent))
             width *= 2
     return tuple(pairs)
+
+
+def encoder_body_budgets(
+    max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int
+) -> tuple[int, ...]:
+    """Body row counts, smallest first.
+
+    The largest starts as ``encoder_budget_rows`` and is then clamped. A body past
+    the aligned model length — 16K rows for an 8K model — is the regression the
+    fast body exists to avoid. A short model still packs inside the fast body.
+    When the result is within ``POOLING_FAST_BODY_ROWS`` there is one body, which
+    is what every pooling model at 512 context already runs.
+
+    Past that, a single body of ``max_model_len`` rows is what makes bge-reranker-v2-m3
+    miss the rectangle at long context. vLLM raises ``max_num_batched_tokens`` to the
+    model length (8K), the floor above then makes every step an 8K buffer, and ``B =
+    R / L`` at ``L`` of 4096 or 8192 is 2 or 1, so a batch of long documents is wider
+    than the rectangle and takes the ragged path. Shorter bodies keep a request that
+    fits in 2K on the fast rectangle, and a single document in (2K, 4K] on a 4K
+    rectangle instead of an 8K buffer with a padded twin sequence.
+    """
+    full = encoder_budget_rows(max_model_len, max_num_batched_tokens, max_num_seqs)
+    # One max-length sequence already fits in the aligned model length. A body
+    # past that (an 8K model asked for 16K tokens) is the regression the fast
+    # body exists to avoid, and this must hold without the platform capping
+    # tokens first. A short model still packs inside the fast body: 512 tokens
+    # of budget stays 2048, which is not past that body.
+    longest = _align_up_pow2(max_model_len)
+    if full > longest:
+        full = max(longest, min(full, POOLING_FAST_BODY_ROWS))
+    if full <= POOLING_FAST_BODY_ROWS:
+        return (full,)
+
+    # Each smaller body is the power of two itself. The loop only runs while
+    # ``size < full``, and ``full`` never exceeds ``max_num_seqs`` times the model
+    # length, so ``encoder_budget_rows`` of this size returns ``size``.
+    tiers: list[int] = []
+    size = POOLING_FAST_BODY_ROWS
+    while size < full:
+        tiers.append(size)
+        size *= 2
+    tiers.append(full)
+    return tuple(tiers)
 
 
 def encoder_budget_rows(max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int) -> int:
@@ -249,7 +341,12 @@ def encoder_len_ladder(vllm_config: VllmConfig) -> list[int]:
 
 
 def encoder_width_for(length: int, vllm_config: VllmConfig) -> int:
-    """Widest batch of ``length``-token sequences the budget and the engine allow."""
+    """Widest batch of ``length``-token sequences the largest body allows.
+
+    Divides ``tables.budget``, the scheduler token cap, not the smaller body a short
+    step pads to. A length of 100 on tiers ``(2048, 4096, 8192)`` is ``8192 // 100``
+    here; the 2048-row rectangle for that length is ``2048 // 100``.
+    """
     tables = encoder_shape_tables(vllm_config)
     return min(int(vllm_config.scheduler_config.max_num_seqs), tables.budget // max(1, length))
 
@@ -264,10 +361,10 @@ def encoder_group_shapes(vllm_config: VllmConfig) -> list[tuple[int, int]]:
     return list(encoder_shape_tables(vllm_config).groups)
 
 
-def encoder_group_width_caps(vllm_config: VllmConfig) -> dict[int, int]:
+def group_width_caps(groups: Sequence[tuple[int, int]]) -> dict[int, int]:
     """Widest declared group width per extent -- what a group is chunked down to."""
     caps: dict[int, int] = {}
-    for width, extent in encoder_shape_tables(vllm_config).groups:
+    for width, extent in groups:
         caps[extent] = max(caps.get(extent, 1), width)
     return caps
 
@@ -445,8 +542,8 @@ class SpyreShapeBucketer:
     def for_config(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
         """The runner's bucketer for 1D body token sizes, or None when it needs none.
 
-        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
-        the token budget.
+        Decoder and pooling share 1D ``compile_sizes``. Pooling has one entry per
+        body, and a step pads to the smallest that holds its token count.
 
         Pooling keeps a bucketer in eager *and* compile so *runtime* always
         1D-pads the body. Warmup still differs: compile dummies each 1D size
@@ -469,9 +566,11 @@ class SpyreShapeBucketer:
 
     @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
-        """Pooling bucketer: the single body shape, ``R`` rows.
+        """Pooling bucketer: one bucket per body, from ``compile_sizes``.
 
-        Encoder attention shapes live on the tables above, not here.
+        A step pads to the smallest bucket that holds its token count. Encoder
+        attention shapes live on the tables above, not here. A user-set
+        ``compile_sizes`` is the list of bodies serving will pad to.
         """
         model_config = vllm_config.model_config
         if getattr(model_config, "runner_type", None) != "pooling":

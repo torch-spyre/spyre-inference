@@ -167,10 +167,22 @@ def test_bundle_without_build_hashes_fails():
 def test_devel_must_be_a_listed_package(tmp_path):
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
+        '[tool.uv.extra-build-variables.torch-spyre]\nSPYRE_RPM_BUNDLE = "b"\n'
         '[tool.spyre-rpms]\nbundle = "b"\npackages = ["ibm-flex"]\n'
         '[tool.spyre-rpms.devel]\nibm-flex-devel = "ibm-flex"\n'
     )
     with pytest.raises(lock.LockError, match="ibm-flex-devel"):
+        lock.load_config(pyproject)
+
+
+@pytest.mark.parametrize("stamp", ["", 'SPYRE_RPM_BUNDLE = "older"\n'])
+def test_torch_spyre_build_stamp_must_match_bundle(tmp_path, stamp):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        f"[tool.uv.extra-build-variables.torch-spyre]\n{stamp}"
+        '[tool.spyre-rpms]\nbundle = "b"\npackages = ["ibm-flex"]\n'
+    )
+    with pytest.raises(lock.LockError, match="SPYRE_RPM_BUNDLE"):
         lock.load_config(pyproject)
 
 

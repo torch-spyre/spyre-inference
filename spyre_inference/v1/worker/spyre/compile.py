@@ -16,7 +16,8 @@
 
 STOCK_TORCH_COMPILE on MRV2 doesn't exist before vLLM 0.32 (vllm#59079);
 compiles one block at a time instead, through the same shared helpers V1
-uses (_repeated_block_lists, _compile_granularity, spyre_model_runner.py).
+uses (repeated_block_lists, compile_granularity, compile_blocks in
+v1/worker/compile_granularity.py).
 """
 
 from typing import TYPE_CHECKING

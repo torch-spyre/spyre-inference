@@ -265,6 +265,19 @@ def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     assert vllm_config.compilation_config.compile_sizes == [512]
 
 
+def test_apply_config_keeps_a_fast_body_when_the_model_is_longer_than_2k():
+    """bge-reranker-v2-m3 at 8K. The scheduler can still accept one 8K sequence,
+    but compile sizes include the 2K and 4K bodies so shorter steps do not pad to 8K."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.compilation_config.compile_sizes == [2048, 4096, 8192]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 8192
+
+
 def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
     from spyre_inference.platform import TorchSpyrePlatform
 
@@ -752,6 +765,69 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
 
     assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+@pytest.mark.parametrize(
+    ("budget", "user_budget", "sizes"),
+    [
+        pytest.param(2048, None, [1, 2, 4, 512], id="unset_default_is_capped"),
+        pytest.param(1024, 1024, [1, 2, 4, 512, 1024], id="user_budget_keeps_512"),
+        pytest.param(2048, 1024, [1, 2, 4, 512], id="budget_not_from_user_is_capped"),
+        pytest.param(256, 256, [1, 2, 4, 256], id="user_budget_below_default"),
+    ],
+)
+def test_compile_sizes_default_honors_a_user_budget(monkeypatch, budget, user_budget, sizes):
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", user_budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == sizes
+    assert vllm_config.scheduler_config.max_num_batched_tokens == sizes[-1]
+
+
+@pytest.mark.parametrize(("budget", "expect_warn"), [(1024, False), (2048, True)])
+def test_compile_sizes_warns_above_twice_the_default(monkeypatch, caplog, budget, expect_warn):
+    import logging
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", budget)
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = None
+    vllm_config.scheduler_config.max_num_seqs = 4
+    vllm_config.scheduler_config.max_num_batched_tokens = budget
+
+    with caplog.at_level(logging.WARNING, logger="spyre_inference.platform"):
+        caplog.clear()
+        TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 512, budget]
+    warned = any("torch-spyre#5250" in r.message for r in caplog.records)
+    assert warned == expect_warn
+
+
+@pytest.mark.parametrize(
+    ("flag", "budget", "sizes"), [(None, 512, [512]), (1024, 1024, [512, 1024])]
+)
+def test_engine_args_budget_reaches_the_scheduler(monkeypatch, flag, budget, sizes):
+    """Through EngineArgs: an omitted flag keeps the default, a passed one is honored."""
+    from vllm.engine.arg_utils import EngineArgs
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    monkeypatch.setattr(TorchSpyrePlatform, "_user_max_num_batched_tokens", None)
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", max_model_len=4096, max_num_batched_tokens=flag
+    ).create_engine_config()
+
+    assert vllm_config.scheduler_config.max_num_batched_tokens == budget
+    assert vllm_config.compilation_config.compile_sizes[-len(sizes) :] == sizes
 
 
 def test_compile_sizes_empty_list_opts_out():

@@ -36,6 +36,7 @@ from spyre_inference import envs, keep_sigterm_handler
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
+from spyre_inference.threading_config import apply_in_process_threading
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre import device_shims, kernels
 from spyre_inference.v1.worker.spyre.model_runner import SpyreModelRunnerV2
@@ -50,6 +51,8 @@ class SpyreWorkerV2(TorchSpyreWorker):
     """MRV2: vllm/v1/worker/gpu_worker.py:Worker, via TorchSpyreWorker."""
 
     def init_device(self) -> None:
+        apply_in_process_threading(self.parallel_config)
+
         # The env vars spyreccl reads. `setdefault` leaves torchrun-supplied
         # values intact.
         # DP>1 is rejected in TorchSpyrePlatform.check_and_update_config,

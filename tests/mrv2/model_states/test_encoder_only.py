@@ -325,6 +325,51 @@ def test_eager_groups_ragged_requests_one_by_one():
     assert [g.group for g in eager_groups] == [1, 1, 1]
 
 
+class TestLongContextBodyTiers:
+    """An 8K model has bodies 2048, 4096 and 8192. A step uses the rectangle of
+    the body it was padded to, the same rule as the V1 runner."""
+
+    def _state(self):
+        return _state(max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=8192)
+
+    def test_a_short_step_uses_the_2048_rectangle(self):
+        state = self._state()
+        _step(state, make_input_batch([100], num_tokens_after_padding=2048))
+        assert state.encoder_plan.grid == (128, 16, [100])
+
+    def test_one_document_past_2k_uses_the_4k_rectangle(self):
+        state = self._state()
+        _step(state, make_input_batch([3000], num_tokens_after_padding=4096))
+        assert state.encoder_plan.grid == (4096, 1, [3000])
+
+    def test_one_document_past_4k_uses_the_8k_rectangle(self):
+        state = self._state()
+        _step(state, make_input_batch([5000], num_tokens_after_padding=8192))
+        assert state.encoder_plan.grid == (8192, 1, [5000])
+
+    def test_three_long_documents_stay_ragged(self):
+        """Three sequences of extent 4096 do not fit that rectangle (width 2).
+
+        2500 each is 7500 tokens, so the batch fits in the 8192 body. Three sequences
+        of 3000 would be 9000 tokens and cannot be padded down to 8192.
+        """
+        state = self._state()
+        _step(state, make_input_batch([2500, 2500, 2500], num_tokens_after_padding=8192))
+        assert not state.encoder_plan.is_rectangular
+
+    def test_a_forced_smaller_tier_fills_that_body(self):
+        state = self._state()
+        dummy = make_input_batch([128] * 16, num_tokens_after_padding=2048)
+        with state.forced_plan(rect=(128, 16)):
+            _step(state, dummy)
+        assert state.encoder_plan.grid == (128, 16, [128] * 16)
+
+    def test_a_forced_smaller_tier_rejects_another_body(self):
+        state = self._state()
+        with state.forced_plan(rect=(128, 16)), pytest.raises(RuntimeError, match="2048 rows"):
+            _step(state, make_input_batch([8192], num_tokens_after_padding=8192))
+
+
 def test_dispatch_stats_count_each_path():
     state = _state()
     _step(state, make_input_batch([3, 2], num_tokens_after_padding=_BUDGET))

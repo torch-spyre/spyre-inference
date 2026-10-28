@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre adaptations for vLLM's Gemma-4 model."""
+"""Gemma 4's text decoder (``SpyreGemma4ForCausalLM``, MoE layers) and its startup hooks.
+
+The hooks (``force_text_backbone``, ``repair_head_dim_access``) run for every model, so this
+module must not import the vision model; that lives in ``gemma4_mm.py``.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import torch
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.logger import init_logger
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 
@@ -96,6 +101,24 @@ def is_multimodal_gemma4(hf_config: Any) -> bool:
     return getattr(hf_config, "vision_config", None) is not None
 
 
+def _disable_unsupported_modalities(engine_args: EngineArgs, has_audio: bool) -> None:
+    # A limit of 0 makes the frontend refuse the input per request; past it, the worker
+    # raises mid-step and takes the engine down with every in-flight request.
+    limits = dict(engine_args.limit_mm_per_prompt or {})
+    for modality in ("video", "audio") if has_audio else ("video",):
+        value = limits.get(modality)
+        # A dict without "count" takes vLLM's default, which enables the modality.
+        if isinstance(value, dict):
+            value = value.get("count", BaseDummyOptions().count)
+        if value:
+            raise NotImplementedError(
+                f"gemma-4 {modality} input is not supported on Spyre; remove it from "
+                "limit_mm_per_prompt."
+            )
+        limits[modality] = 0
+    engine_args.limit_mm_per_prompt = limits
+
+
 def force_text_backbone(engine_args: EngineArgs) -> None:
     """Default a gemma-4 checkpoint with no vision tower to its text-only backbone.
 
@@ -103,7 +126,8 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     documents, so a user override of any shape replaces it wholesale (the head-dim repair
     they also need runs from the platform hook, not from here). A vision checkpoint keeps
     its real ``architectures`` -- forcing ``Gemma4ForCausalLM`` there would strip the tower
-    -- while an audio-only one is rejected rather than silently reduced to text.
+    -- with video and audio capped at 0 per prompt, while an audio-only one is rejected
+    rather than silently reduced to text.
     """
     if engine_args.hf_overrides:
         return
@@ -128,11 +152,7 @@ def force_text_backbone(engine_args: EngineArgs) -> None:
     has_audio = getattr(hf_config, "audio_config", None) is not None
     # A multimodal Gemma4Config reports the same model_type as a text checkpoint.
     if is_multimodal_gemma4(hf_config):
-        if has_audio:
-            logger.warning(
-                "gemma-4: this checkpoint has an audio tower, which is not supported on "
-                "Spyre; image and text inputs work, audio input will fail."
-            )
+        _disable_unsupported_modalities(engine_args, has_audio)
         return
     if has_audio:
         # Falling through would force the text-only backbone and silently drop the

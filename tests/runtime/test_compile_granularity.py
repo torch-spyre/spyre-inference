@@ -32,11 +32,11 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference.multimodal.utils import mark_blocks_compilable
 from spyre_inference.v1.worker import compile_guard
-from spyre_inference.v1.worker.spyre_model_runner import (
-    TorchSpyreModelRunner,
+from spyre_inference.v1.worker.compile_granularity import (
     _is_decoder_attention_like,
-    _repeated_block_lists,
+    repeated_block_lists,
 )
+from spyre_inference.v1.worker.spyre_model_runner import TorchSpyreModelRunner
 
 
 @pytest.fixture
@@ -187,7 +187,7 @@ def _runner(model: nn.Module, enforce_eager: bool = False) -> TorchSpyreModelRun
 
 def test_finds_the_transformer_block_list() -> None:
     model = _Model(num_layers=4)
-    found = _repeated_block_lists(model)
+    found = repeated_block_lists(model)
     assert found == [(model.model.layers, False)]
 
 
@@ -197,12 +197,12 @@ def test_ignores_module_lists_without_attention() -> None:
             super().__init__()
             self.layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
 
-    assert _repeated_block_lists(NoAttention()) == []
+    assert repeated_block_lists(NoAttention()) == []
 
 
 def test_pp_missing_layers_do_not_break_discovery() -> None:
     model = _Model(num_layers=2, num_missing=2)
-    assert _repeated_block_lists(model) == [(model.model.layers, False)]
+    assert repeated_block_lists(model) == [(model.model.layers, False)]
 
 
 def test_ignores_a_module_list_of_bare_attention_layers() -> None:
@@ -213,14 +213,14 @@ def test_ignores_a_module_list_of_bare_attention_layers() -> None:
             super().__init__()
             self.dpa_list = nn.ModuleList([_fake_attention() for _ in range(2)])
 
-    assert _repeated_block_lists(SharedAttention()) == []
+    assert repeated_block_lists(SharedAttention()) == []
 
 
 def test_finds_heterogeneous_hybrid_stacks() -> None:
     """Hybrid Mamba+attention stacks (Granite 4.0, Jamba, Nemotron-H) mix classes."""
     model = _Model(num_layers=4, hybrid=True)
     assert len({type(b) for b in model.model.layers}) == 2
-    assert _repeated_block_lists(model) == [(model.model.layers, False)]
+    assert repeated_block_lists(model) == [(model.model.layers, False)]
 
 
 def test_decoder_attention_like_uses_kv_cache_dispatch_not_class_name() -> None:
@@ -252,7 +252,7 @@ def test_finds_blocks_with_hf_decoder_kv_cache_attention(implementation: str) ->
     """
     model = _hf_decoder_stack(implementation)
     assert not isinstance(model.layers[0].self_attn, Attention)
-    assert _repeated_block_lists(model) == [(model.layers, False)]
+    assert repeated_block_lists(model) == [(model.layers, False)]
 
 
 def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
@@ -273,9 +273,9 @@ def test_ignores_hf_attention_without_vllm_kv_cache_dispatch() -> None:
             super().__init__()
             self.layers = nn.ModuleList([GraniteDecoderLayer() for _ in range(3)])
 
-    assert _repeated_block_lists(GraniteModel()) == []
+    assert repeated_block_lists(GraniteModel()) == []
     sdpa = _hf_decoder_stack("sdpa")
-    assert _repeated_block_lists(sdpa) == []
+    assert repeated_block_lists(sdpa) == []
 
 
 def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
@@ -330,8 +330,8 @@ def test_does_not_treat_pixtral_vision_attention_as_decoder_blocks() -> None:
             # No vision_* path segment: decoder-attention dispatch must be enough.
             self.layers = nn.ModuleList([PixtralHFBlock() for _ in range(2)])
 
-    assert _repeated_block_lists(Pixtral()) == []
-    assert _repeated_block_lists(PixtralHF()) == []
+    assert repeated_block_lists(Pixtral()) == []
+    assert repeated_block_lists(PixtralHF()) == []
 
 
 def _marked_tower(marked: bool = True) -> nn.Module:
@@ -362,13 +362,11 @@ class _VLM(nn.Module):
 def test_a_marked_vision_tower_opts_into_block_compile() -> None:
     """The mark sits on the blocks, so it is independent of where discovery starts and
     of whether the tower sits under a recognised ``vision_*`` path."""
-    assert _repeated_block_lists(_VLM(marked=False)) == []
+    assert repeated_block_lists(_VLM(marked=False)) == []
 
     marked = _VLM()
-    assert _repeated_block_lists(marked) == [(marked.vision_tower.encoder.layers, True)]
-    assert _repeated_block_lists(marked.vision_tower) == [
-        (marked.vision_tower.encoder.layers, True)
-    ]
+    assert repeated_block_lists(marked) == [(marked.vision_tower.encoder.layers, True)]
+    assert repeated_block_lists(marked.vision_tower) == [(marked.vision_tower.encoder.layers, True)]
 
 
 def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
@@ -376,7 +374,7 @@ def test_marking_one_tower_does_not_compile_the_list_that_nests_it() -> None:
     ``ModuleList`` that merely holds a marked tower is not itself a compile unit."""
     model = nn.Module()
     model.towers = nn.ModuleList([_marked_tower().encoder for _ in range(2)])
-    assert _repeated_block_lists(model) == [(t.layers, True) for t in model.towers]
+    assert repeated_block_lists(model) == [(t.layers, True) for t in model.towers]
 
 
 def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
@@ -417,7 +415,7 @@ def test_vlm_discovers_decoder_blocks_not_vision_blocks() -> None:
     model = VLM()
     vision_layers = model.vision_encoder.transformer.layers
     decoder_layers = model.language_model.layers
-    assert _repeated_block_lists(model) == [(decoder_layers, False)]
+    assert repeated_block_lists(model) == [(decoder_layers, False)]
 
     originals = list(vision_layers)
     assert _runner(model)._compile_blocks() == 3
@@ -469,7 +467,7 @@ def test_compile_blocks_counts_a_block_shared_by_two_lists_once() -> None:
     model.model.self_decoder.decoder_layers = model.model.layers[:2]
     model.model.cross_decoder = nn.Module()
     model.model.cross_decoder.decoder_layers = model.model.layers[2:]
-    assert len(_repeated_block_lists(model)) == 3
+    assert len(repeated_block_lists(model)) == 3
 
     assert _runner(model)._compile_blocks() == 4
     assert all(block._compiled_call_impl is not None for block in model.model.layers)

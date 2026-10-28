@@ -44,6 +44,7 @@ def _engine_args(**overrides):
         code_revision=None,
         config_format="auto",
         hf_token=None,
+        limit_mm_per_prompt={},
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -100,8 +101,7 @@ def test_audio_only_checkpoint_is_rejected(monkeypatch):
 
 
 def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch):
-    """Both towers present: the vision path still works, so this warns rather than
-    refusing to load."""
+    """Both towers present: the vision path still works, so it loads, with audio refused."""
     hf_config = SimpleNamespace(
         model_type="gemma4",
         vision_config=SimpleNamespace(model_type="gemma4_vision"),
@@ -109,10 +109,53 @@ def test_vision_plus_audio_checkpoint_is_allowed_for_its_vision_path(monkeypatch
     )
     _patch_get_config(monkeypatch, hf_config)
 
-    engine_args = _engine_args()
+    engine_args = _engine_args(limit_mm_per_prompt={"image": 2})
     force_text_backbone(engine_args)
 
     assert engine_args.hf_overrides is None
+    assert engine_args.limit_mm_per_prompt == {"image": 2, "video": 0, "audio": 0}
+
+
+# A dict without "count" takes vLLM's default of 999, so it enables the modality too.
+@pytest.mark.parametrize("limit", [1, {"count": 2}, {}])
+def test_an_explicit_audio_limit_fails_at_startup(monkeypatch, limit):
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=SimpleNamespace(model_type="gemma4_audio"),
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    with pytest.raises(NotImplementedError, match="audio input is not supported"):
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"audio": limit}))
+
+
+def test_vision_checkpoint_refuses_video_per_request(monkeypatch):
+    """Capped at 0, so the frontend rejects a video request instead of the worker crashing."""
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=None,
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    engine_args = _engine_args()
+    force_text_backbone(engine_args)
+
+    assert engine_args.limit_mm_per_prompt == {"video": 0}
+
+
+@pytest.mark.parametrize("limit", [1, {"count": 2}, {"num_frames": 32, "width": 512}])
+def test_an_explicit_video_limit_fails_at_startup(monkeypatch, limit):
+    hf_config = SimpleNamespace(
+        model_type="gemma4",
+        vision_config=SimpleNamespace(model_type="gemma4_vision"),
+        audio_config=None,
+    )
+    _patch_get_config(monkeypatch, hf_config)
+
+    with pytest.raises(NotImplementedError, match="video input is not supported"):
+        force_text_backbone(_engine_args(limit_mm_per_prompt={"video": limit}))
 
 
 def test_repair_head_dim_access_reaches_the_nested_text_config():
@@ -170,7 +213,7 @@ def test_is_multimodal_gemma4_requires_a_vision_tower(hf_config, expected):
 
 
 def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
-    """Why ``Gemma4ForConditionalGeneration`` needs no ``_ADAPTED_ARCHS`` entry: it
+    """Why ``SpyreGemma4ForConditionalGeneration`` adapts only the vision tower: upstream
     resolves its text half through ``ModelRegistry``, so it already lands on
     ``SpyreGemma4ForCausalLM``. If upstream ever built that model directly, the PLE and
     MoE adaptations would vanish silently -- hence a tripwire rather than a comment.
@@ -183,7 +226,7 @@ def test_multimodal_gemma4_delegates_its_text_half_through_the_model_registry():
     assert "init_vllm_registered_model" in source, (
         "Gemma4ForConditionalGeneration no longer resolves its text model through "
         "the vLLM registry; SpyreGemma4ForCausalLM's MoE/PLE adaptations are being "
-        "bypassed. Register a Spyre subclass of it in models/_ADAPTED_ARCHS."
+        "bypassed. SpyreGemma4ForConditionalGeneration has to build it itself."
     )
     assert '"Gemma4ForCausalLM"' in source, (
         "Gemma4ForConditionalGeneration no longer names Gemma4ForCausalLM as its "

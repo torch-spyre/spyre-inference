@@ -235,6 +235,22 @@ def test_save_idempotent_when_key_present(tmp_path, lockfiles):
     assert tar.stat().st_mtime_ns == first
 
 
+def test_save_uses_restore_key_after_lockfile_rewrite(tmp_path, lockfiles):
+    nfs = tmp_path / "nfs"
+    local = tmp_path / "uvcache"
+    state = tmp_path / "state"
+    assert (
+        nuc.main(_args("restore", nfs, local, lockfiles, github_state=state, **_push_main())) == 0
+    )
+    key = nuc.compute_key(lockfiles)
+    assert state.read_text() == f"key={key}\n"
+
+    _write(pathlib.Path(lockfiles[0]), "rewritten by uv add\n")
+    _populate(local)
+    assert nuc.main(_args("save", nfs, local, lockfiles, key=key, **_push_main())) == 0
+    assert [p.name for p in (nfs / "main" / "x86_64").iterdir()] == [f"{key}.tar"]
+
+
 def test_corrupt_tar_restores_cold(tmp_path, lockfiles):
     nfs = tmp_path / "nfs"
     local = tmp_path / "uvcache"

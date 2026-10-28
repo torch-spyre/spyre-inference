@@ -70,7 +70,7 @@ SERVED_TOKEN_COUNTS = [1, 3, 4, 5, 8]
 class _Block(torch.nn.Module):
     """One transformer block's stand-in: compiled once, guarded on its row count.
 
-    Carries a real ``Attention`` so ``_repeated_block_lists`` recognises the list as a
+    Carries a real ``Attention`` so ``repeated_block_lists`` recognises the list as a
     decoder stack, which is what makes ``_compile_blocks`` compile and register it.
     """
 
@@ -86,7 +86,7 @@ class _Block(torch.nn.Module):
 
 
 class _Decoder(torch.nn.Module):
-    """A model shaped the way ``_repeated_block_lists`` expects: one ModuleList.
+    """A model shaped the way ``repeated_block_lists`` expects: one ModuleList.
 
     ``embed_input_ids`` mirrors a multimodal model's text-only early return.
     """
@@ -186,6 +186,7 @@ def build_runner(default_vllm_config, tp_group, monkeypatch):
         runner._spyre_kv_caches = {}
         runner._encoder_budget = max(bucket_sizes, default=64)
         runner._encoder_rectangles = []
+        runner._encoder_groups_by_rows = {}
         runner._pooling_on_spyre = False
 
         attn = Attention(

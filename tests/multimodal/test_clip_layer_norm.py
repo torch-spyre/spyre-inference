@@ -153,6 +153,33 @@ def test_apply_multimodal_patches_skips_a_non_clip_model_with_the_same_shape():
     assert not isinstance(model.text_model.final_layer_norm, SpyreLayerNorm)
 
 
+def test_apply_multimodal_patches_skips_a_stage_missing_tower(monkeypatch):
+    """With every modality limited to 0, vLLM builds the tower on the meta device behind
+    a `StageMissingLayer` that forwards attribute reads but must never run: there are no
+    weights to patch, and a text-only run must not hit the Gemma 4 tower rejection."""
+    from vllm.model_executor.models.utils import StageMissingLayer
+
+    import spyre_inference.multimodal.clip as clip_module
+
+    called: list[bool] = []
+    monkeypatch.setattr(clip_module, "apply", lambda *a: called.append(True))
+
+    model = torch.nn.Module()
+    model.config = types.SimpleNamespace(model_type="clip")
+    model.vision_model = StageMissingLayer("vision_tower", torch.nn.Module())
+    apply_multimodal_patches(model, torch.device("cpu"))
+
+    assert called == [], "a stage-skipped tower must get no vision patches"
+
+    # Named as the dispatch key: EmbeddingGemma2 / DiffusionGemma with image and video at 0.
+    class Gemma4VisionModel(torch.nn.Module):
+        pass
+
+    gemma_model = torch.nn.Module()
+    gemma_model.vision_tower = StageMissingLayer("vision_tower", Gemma4VisionModel())
+    apply_multimodal_patches(gemma_model, torch.device("cpu"))
+
+
 def _encoder_layers(attn_cls: type[torch.nn.Module], num_layers: int = 2):
     """`CLIPEncoderLayer`-shaped stand-ins: only `self_attn.attn` is read."""
 

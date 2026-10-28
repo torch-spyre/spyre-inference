@@ -145,6 +145,26 @@ llm = LLM(
 `1` and `8` cover decode steps (one token per running sequence, up to 8); `512` is the
 prefill bucket.
 
+The default prefill bucket is 512 tokens, but larger ones compile. For prompts of many
+thousands of tokens, a 1024-token prefill chunk shortens time to first token, on dense
+models such as granite-3.3-8b as well as on MoE models such as gemma-4, where each
+prefill step reads every expert's weights however many tokens it carries. Pass a larger
+`--max-num-batched-tokens` to get one; the default buckets then keep `512` too, so short
+prefills don't pad up to the larger one:
+
+```bash
+vllm serve google/gemma-4-26B-A4B -tp 4 --max-model-len 32768 \
+    --max-num-batched-tokens 1024 \
+    --limit-mm-per-prompt '{"image": 0, "video": 0, "audio": 0}'
+```
+
+Warmup takes longer, and for prompts under a few thousand tokens it gains little; decode
+can get slightly slower. The example serves text only: a larger token budget also raises
+the number of image-batch widths the vision tower is warmed at, which can run out of
+device memory (#1302). At a long `--max-model-len`, a 2048-token bucket can push the
+largest attention variants past torch-spyre's 60 s backend compile limit at warmup, so
+they are left to compile on first use (torch-spyre#5250 makes that limit configurable).
+
 **Attention (KV length × query length).** Set the buckets directly as comma-separated
 lists. Each is clamped to its limit: entries above `--max-model-len` (KV) or
 `--max-num-batched-tokens` (query) are dropped, and the limit is appended if missing, so
@@ -164,6 +184,42 @@ default tiled walk it is reached on the head-major layout only, and a token-majo
 the per-sequence loop), warmup records eligible KV-length × num-sequences combinations.
 `SPYRE_ATTN_NUM_SEQS_BUCKETS` (default: powers of two from 1 to `--max-num-seqs`) is the
 extra lever there, and the same keep-it-short advice applies.
+
+## FP8 KV cache
+
+Pass `--kv-cache-dtype fp8` to store the KV cache in float8 (e4m3), halving the bytes
+each cached token takes:
+
+```bash
+vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
+```
+
+It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
+that is a multiple of 128. It does not raise capacity: the platform pins the block count
+to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
+same number of tokens in half the device memory. Attention still computes in the model
+dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
+when it has none. The speedup grows with the number of cached tokens each decode step
+reads, so it is small at short contexts; check accuracy against an fp16 cache before
+relying on it.
+
+The scales are compiled into the graphs as constants. A checkpoint whose layers carry
+different KV scales therefore compiles the transformer block and each recorded attention
+kernel once per distinct pair of scales, which lengthens warmup; one without scales
+compiles them once, as an fp16 cache does.
+
+## Offline engine in the calling process
+
+At `tensor_parallel_size=1`, set `VLLM_ENABLE_V1_MULTIPROCESSING=0` to run the offline
+`LLM` engine in the calling process instead of a spawned EngineCore, which skips the
+spawn and the second round of imports at startup. `vllm serve` always spawns EngineCore.
+
+The engine then changes the calling process: vLLM freezes the garbage collector's heap,
+caches its environment variables, seeds the global RNGs and leaves `RANK`/`WORLD_SIZE`
+set, the worker sets torch's thread count, and the card stays open until the process
+exits. Build an engine with `tensor_parallel_size > 1` in a new process. Set
+`OMP_WAIT_POLICY=PASSIVE` before Python starts: OpenMP reads it when it loads, so the
+default the plugin sets only reaches spawned processes.
 
 ## pyproject.toml Reference
 

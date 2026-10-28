@@ -28,8 +28,8 @@ import pytest
 from spyre_testing_plugin.pytest_plugin import spyre_device_count
 from spyre_testing_plugin.vfio_reaper import wait_until_card_free
 
-# Each run is a fresh Python process: torch-spyre reads SPYRE_KERNEL_CACHE and
-# spyre-inference reads SPYRE_ATTN_FOR_EACH_TILE once, at import time.
+# Each run is a fresh Python process: torch-spyre reads SPYRE_KERNEL_CACHE once,
+# at import time.
 pytestmark = pytest.mark.uses_subprocess
 
 _MODEL = "ibm-ai-platform/micro-g3.3-8b-instruct-1b"
@@ -89,7 +89,6 @@ def _run(
     tmp_path: Path,
     name: str,
     tp: int,
-    for_each_tile: bool,
     fresh_lowering: bool,
     kernel_cache: bool,
 ) -> tuple[dict, str]:
@@ -102,11 +101,11 @@ def _run(
         "TORCHINDUCTOR_AUTOGRAD_CACHE",
         "VLLM_DISABLE_COMPILE_CACHE",
         "TORCH_SPYRE_CACHE_SCAN",
+        "SPYRE_ATTN_FOR_EACH_TILE",
     ):
         env.pop(var, None)
     env.update(
         SPYRE_KERNEL_CACHE="1" if kernel_cache else "0",
-        SPYRE_ATTN_FOR_EACH_TILE="1" if for_each_tile else "0",
         TORCHINDUCTOR_CACHE_DIR=str(tmp_path / "inductor"),
         VLLM_CACHE_ROOT=str(tmp_path / "vllm"),
         VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="36000",
@@ -167,41 +166,41 @@ _TP2 = [
 ]
 
 
-# The xfail case runs at TP=1 only: TP=2 would hit the same cache-key bug. With
-# SPYRE_ATTN_FOR_EACH_TILE=1 only "shared" runs, since "fresh" would also hit the
-# fresh-lowering bug.
+# The xfail case runs at TP=1 only: TP=2 would hit the same cache-key bug. It
+# skips the uncached run, already checked against the cold run by tp1-shared.
 @pytest.mark.timeout(3 * (_RUN_TIMEOUT_S + 60) + 120)
 @pytest.mark.parametrize(
-    ("tp", "for_each_tile", "fresh_lowering"),
+    ("tp", "fresh_lowering"),
     [
-        pytest.param(1, False, False, id="tp1-for_each_tile_off-shared"),
-        pytest.param(2, False, False, id="tp2-for_each_tile_off-shared", marks=_TP2),
-        pytest.param(1, False, True, id="tp1-for_each_tile_off-fresh", marks=_XFAIL_FRESH_LOWERING),
-        pytest.param(1, True, False, id="tp1-for_each_tile_on-shared"),
+        pytest.param(1, False, id="tp1-shared"),
+        pytest.param(2, False, id="tp2-shared", marks=_TP2),
+        pytest.param(1, True, id="tp1-fresh", marks=_XFAIL_FRESH_LOWERING),
     ],
 )
-def test_kernel_cache(tmp_path: Path, tp: int, for_each_tile: bool, fresh_lowering: bool) -> None:
+def test_kernel_cache(tmp_path: Path, tp: int, fresh_lowering: bool) -> None:
     """Cache off, cold cache, warm cache: same output, and the warm run adds no entries.
 
     ``shared`` keeps the vLLM and Inductor graph caches across runs, so the warm run
     reuses the cold run's lowered graph; ``fresh`` lowers the model again in every run.
     """
     cache_root = tmp_path / "inductor" / "inductor-spyre-cache"
-    args = (tp, for_each_tile, fresh_lowering)
+    args = (tp, fresh_lowering)
 
-    disabled, _ = _run(tmp_path, "disabled", *args, kernel_cache=False)
-    assert not _cache_entries(cache_root), "cache populated with SPYRE_KERNEL_CACHE=0"
+    if not fresh_lowering:
+        disabled, _ = _run(tmp_path, "disabled", *args, kernel_cache=False)
+        assert not _cache_entries(cache_root), "cache populated with SPYRE_KERNEL_CACHE=0"
 
     cold, _ = _run(tmp_path, "cold", *args, kernel_cache=True)
     cold_entries = _cache_entries(cache_root)
     assert cold_entries, "cold run did not populate the kernel cache"
     assert not (cache_root / "failed").exists(), "cold run left failed compiles"
-    assert cold == disabled, "cold-cache output differs from the uncached output"
+    if not fresh_lowering:
+        assert cold == disabled, "cold-cache output differs from the uncached output"
 
     warm, warm_log = _run(tmp_path, "warm", *args, kernel_cache=True)
     # A run that bypasses the cache also adds no entries, so check it was consulted.
     assert _CACHE_DISABLED_MSG not in warm_log, "warm run did not use the kernel cache"
-    assert warm == disabled, "warm-cache output differs from the uncached output"
+    assert warm == cold, "warm-cache output differs from the cold-cache output"
 
     new_entries = _cache_entries(cache_root) - cold_entries
     if new_entries:

@@ -320,7 +320,7 @@ class TestForcedWarmupPlan:
     @pytest.mark.parametrize(("extent", "width"), encoder_rectangles(_config(512, 32, 2048)))
     def test_fills_the_body_exactly(self, extent, width):
         """``sum(query_lens) == width * extent`` keeps ``_preprocess``'s expansion an
-        identity and lets ``_unpad_encoder_hidden`` short-circuit, so the dummy's buffers
+        identity and lets ``unpad_encoder_grid`` short-circuit, so the dummy's buffers
         stay self-consistent."""
         plan = self._plan((extent, width))
         assert isinstance(plan, EncoderRectPlan)
@@ -437,7 +437,7 @@ class TestBuildAttentionMetadata:
         runner.model_config = SimpleNamespace(runner_type="pooling", dtype=torch.float16)
         runner.compilation_config = SimpleNamespace(mode=CompilationMode.STOCK_TORCH_COMPILE)
         runner._encoder_rectangles = encoder_rectangles(config)
-        runner._encoder_width_caps = {}
+        runner._encoder_width_caps_by_rows = {}
         runner._encoder_budget = encoder_shape_tables(config).budget
         runner._encoder_buffer_rows = 0
         runner._encoder_grid = None

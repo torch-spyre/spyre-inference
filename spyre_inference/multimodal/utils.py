@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from functools import cache
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -36,6 +37,16 @@ _BLOCK_COMPILABLE_ATTR = "_spyre_block_compilable"
 
 def align_up(n: int, align: int = STICK) -> int:
     return (n + align - 1) // align * align
+
+
+def linear_weight(layer: nn.Module) -> torch.Tensor:
+    """``[out, in]``, undoing the Spyre linear's post-load transpose and row padding."""
+    weight = cast(torch.Tensor, layer.weight).detach()
+    padding = getattr(layer, "spyre_row_padding", None)
+    if padding is None:
+        return weight
+    weight = weight.t()
+    return weight[: weight.shape[0] - padding]
 
 
 @cache

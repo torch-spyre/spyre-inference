@@ -90,9 +90,10 @@ bucket lattice is not a second knob: `derive_lattice` builds it from the shape l
 so that every declared length is its own bucket and the real
 `SpyreAttentionMetadataBuilder`'s round-up is the identity. `max_model_len` and
 `max_num_seqs` are the tops of those ladders, so they are derived too.
-`max_num_batched_tokens` is pinned to the platform's 512 cap instead: `staging_rows`
-is it plus one, and those buffers are the kernel's query and output arguments, so
-deriving it from a decode-only shape list would narrow the gather the kernel runs.
+`max_num_batched_tokens` comes from `--max-num-batched-tokens` instead (default 512,
+the platform's default prefill bucket): `staging_rows` is it plus one, and those
+buffers are the kernel's query and output arguments, so deriving it from a
+decode-only shape list would narrow the gather the kernel runs.
 A config that sets any of the three, or the old `attn_*_buckets` keys, is rejected.
 
 Padding has not gone away — it is now something you ask for. The kernel specialises
@@ -114,12 +115,13 @@ which it has to be, since `spyre_inference.envs` caches on first read.
 
 ### Prefill is always chunked
 
-`apply_config_platform_defaults` caps `max_num_batched_tokens` at
-`min(max_num_batched_tokens, 512)` for compiled decoder models (the largest default
-`compile_sizes` bucket), so a query longer than
-that is unschedulable at **any** `max_model_len`: production chunks its prefills.
-A prefill capture is therefore `query_len <= 512` against a growing `seq_len`, not
-`query_len == seq_len`. The cap is checked against the declared batch, since the
+Unless the user passes `--max-num-batched-tokens`, `apply_config_platform_defaults`
+caps it at 512 for compiled decoder models (the largest default `compile_sizes`
+bucket), so a longer query is unschedulable at **any** `max_model_len`: production
+chunks its prefills. A prefill capture is therefore `query_len <= 512` against a
+growing `seq_len`, not `query_len == seq_len`; to measure a deployment that passes a
+larger budget, give the microbench the same `--max-num-batched-tokens`. The budget is
+checked against the declared batch, since the
 derived limits come from the shapes and so can never rule one out; a batch over it
 is reported as a row with `error` set rather than an assertion mid-sweep.
 

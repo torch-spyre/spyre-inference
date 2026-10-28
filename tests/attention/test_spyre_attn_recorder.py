@@ -216,6 +216,30 @@ class TestRecordGraphs:
         assert _record(impl, kv_cache, builder) == first
         assert compiles() == snapshot
 
+    def test_layer_with_equal_graph_key_shares_the_recorded_graphs(self, impl, kv_cache, builder):
+        """Another layer's impl and pages, with an equal key, compile nothing new."""
+        bucketer = builder._attn_bucketer = make_bucketer()
+        _record(impl, kv_cache, builder)
+        other = SpyreAttentionImpl(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=impl.scale,
+            num_kv_heads=NUM_KV_HEADS,
+        )
+        other_cache = SpyrePagedKVCache(*(torch.zeros_like(t) for t in kv_cache))
+        assert other.graph_key() == impl.graph_key()
+
+        snapshot = compiles()
+        for bucket in _recordable(bucketer):
+            _dispatch(other, builder, other_cache, bucket.num_blocks, bucket.padded_query_len)
+        assert compiles() == snapshot
+
+    @pytest.mark.parametrize("attr", ["num_heads", "scale"])
+    def test_graph_key_tells_apart_per_layer_kernel_scalars(self, impl, attr):
+        base = impl.graph_key()
+        setattr(impl, attr, getattr(impl, attr) * 2)
+        assert impl.graph_key() != base
+
     def test_buckets_collapsing_onto_one_kernel_record_once(
         self, impl, kv_cache, sliding_window_builder
     ):

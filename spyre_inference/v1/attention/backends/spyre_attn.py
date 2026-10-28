@@ -186,6 +186,9 @@ compile_guard.watch(page_attn_kernel, "page attention kernel")
 compile_guard.watch(batched_decode_kernel, "batched decode kernel")
 compile_guard.watch(reshape_and_cache_kernel, "reshape_and_cache kernel")
 
+# Stored as float8_e4m3fn with one per-tensor (k_scale, v_scale) pair per layer.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
 
 @dataclass
 class SpyreAttentionMetadata(AttentionMetadata):
@@ -1135,6 +1138,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     compiles its attention kernels, including under --enforce-eager.
     """
 
+    supports_fp8_kv_cache: ClassVar[bool] = False
+    # False for layers that keep no KV cache (encoder self-attention).
+    keeps_kv_cache: ClassVar[bool] = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1173,13 +1180,33 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        fp8_requested = kv_cache_dtype in FP8_KV_CACHE_DTYPES
+        self.kv_cache_fp8 = fp8_requested and self.keeps_kv_cache
+        if self.kv_cache_fp8:
+            if not self.supports_fp8_kv_cache:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} is not supported by "
+                    f"{type(self).__name__}; it needs the head-major KV layout "
+                    "(unset SPYRE_ATTN_KV_LAYOUT)."
+                )
+            # A float8 stick holds 128 elements.
+            if head_size % 128:
+                raise ValueError(
+                    f"kv_cache_dtype={kv_cache_dtype} needs head_size % 128 == 0, got {head_size}."
+                )
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
-        # the two 2-byte dtypes are not interchangeable per-cache.
-        if kv_cache_dtype not in ("auto", str(self.model_dtype).removeprefix("torch.")):
+        # the two 2-byte dtypes are not interchangeable per-cache. A layer without a cache
+        # has nothing to apply an fp8 dtype to; upstream passes the engine-wide one.
+        elif not fp8_requested and kv_cache_dtype not in (
+            "auto",
+            str(self.model_dtype).removeprefix("torch."),
+        ):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."
             )
+        # Per-layer (k_scale, v_scale); see `prepare_kv_scales`.
+        self._kv_scales: tuple[float, float] | None = None
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -1352,6 +1379,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         return output
+
+    def graph_key(self) -> tuple:
+        """The kernel arguments that may differ between layers of one attention group."""
+        alibi = None if self.alibi_slopes is None else tuple(self.alibi_slopes.flatten().tolist())
+        return (self.num_heads, self.scale, self.logits_soft_cap, alibi, self._kv_scales)
 
     def record_graphs(
         self,
@@ -1589,15 +1621,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         cls, num_blocks: int, spec: AttentionSpec, device: torch.device
     ) -> SpyrePagedKVCache:
         """Allocate the paged K/V tensors in the layout this impl's kernels read."""
-        # Host-allocated then transferred: only .to() takes a device_layout.
         dtype = spec.dtype
         layout = slot_major_kv_layout(
             num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, dtype
         )
         shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
         return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
-            v_pages=torch.zeros(shape, dtype=dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            k_pages=torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_(),  # ty: ignore[no-matching-overload]
+            v_pages=torch.empty(shape, dtype=dtype, device=device, device_layout=layout).zero_(),  # ty: ignore[no-matching-overload]
         )
 
     def kv_write_index(self, slot_mapping: torch.Tensor, device: torch.device):
@@ -1618,6 +1649,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
+
+    def prepare_kv_scales(self, layer: AttentionLayer | None) -> None:
+        """Read the layer's float8 KV scales as floats (a [1] tensor fails torch-spyre's
+        pointwise layout pass). The runner calls it at load and after a reload."""
+        if not self.kv_cache_fp8:
+            return
+        # Set by upstream after weight loading.
+        self._kv_scales = (
+            float(getattr(layer, "_k_scale_float", 1.0)),
+            float(getattr(layer, "_v_scale_float", 1.0)),
+        )
 
     def do_kv_cache_update(
         self,
@@ -1835,7 +1877,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_query_lens = attn_metadata.aligned_query_lens
-        index_tables = self.index_tables(attn_metadata, _target_device)
         # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
 
@@ -1846,6 +1887,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if num_decode_seqs == num_seqs:
                 return output
             batched_done = True
+
+        # Past the early return: only the per-sequence loop reads these tables.
+        index_tables = self.index_tables(attn_metadata, _target_device)
 
         # Past the early return, so a step the batched kernel fully served pays nothing.
         # Entries are filled at their read site below: in a mixed batch, the decode

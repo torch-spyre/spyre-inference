@@ -151,3 +151,26 @@ def configure_threading(worker_count: int) -> None:
             cpus_per_worker,
             worker_count,
         )
+
+
+def apply_in_process_threading(parallel_config) -> None:
+    """Give an engine that runs in this process the thread settings a spawned EngineCore
+    reads at its torch import. VLLM_ENABLE_V1_MULTIPROCESSING=0 with the uni executor
+    runs the offline engine here, where torch was imported before they were set."""
+    import torch
+    import torch._inductor.config as inductor_config
+    import vllm.envs as vllm_envs
+
+    if (
+        vllm_envs.VLLM_ENABLE_V1_MULTIPROCESSING
+        or parallel_config.distributed_executor_backend != "uni"
+    ):
+        return
+    # Part of the FX graph cache key, so it has to match the engine that wrote the cache.
+    if os.environ.get("TORCHINDUCTOR_CPP_DYNAMIC_THREADS") == "1":
+        inductor_config.cpp.dynamic_threads = True
+    # Sets the OpenMP and MKL thread counts. OMP_WAIT_POLICY and the pools of libraries
+    # already loaded keep their values from process start.
+    num_threads = os.environ.get("OMP_NUM_THREADS", "")
+    if num_threads.isdigit() and int(num_threads) > 0:
+        torch.set_num_threads(int(num_threads))

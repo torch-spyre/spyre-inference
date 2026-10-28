@@ -80,9 +80,16 @@ class Artifactory:
 
 def load_config(pyproject):
     with open(pyproject, "rb") as f:
-        cfg = tomllib.load(f).get("tool", {}).get("spyre-rpms")
+        tool = tomllib.load(f).get("tool", {})
+    cfg = tool.get("spyre-rpms")
     if not cfg or "bundle" not in cfg or "packages" not in cfg:
         raise LockError(f"{pyproject} needs [tool.spyre-rpms] with `bundle` and `packages`")
+    stamp = tool.get("uv", {}).get("extra-build-variables", {}).get("torch-spyre", {})
+    if stamp.get("SPYRE_RPM_BUNDLE") != cfg["bundle"]:
+        raise LockError(
+            f"set [tool.uv.extra-build-variables.torch-spyre] SPYRE_RPM_BUNDLE "
+            f"(now {stamp.get('SPYRE_RPM_BUNDLE')!r}) to the bundle {cfg['bundle']!r}"
+        )
     unknown = set(cfg.get("devel", {})) - set(cfg["packages"])
     if unknown:
         raise LockError(

@@ -149,6 +149,8 @@ PYTORCH_VERSION = "2.13.0"
 # Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
 [tool.uv.extra-build-variables.torch-spyre]
 USE_SPYRE_PROFILER = "0"
+# Must equal [tool.spyre-rpms] bundle: a change makes uv rebuild a cached torch-spyre wheel against the new RPMs.
+SPYRE_RPM_BUNDLE = "main_nightly_2026_10_27"
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
@@ -157,7 +159,7 @@ vllm = [
   # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
   { git = "https://github.com/vllm-project/vllm", rev = "v0.32.0" },
 ]
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "10b02864e197f174d3edbc98ba97579661eda9ed" }
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "64870622fc39cda7e344a271decb901e7088c6c6" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.
@@ -226,9 +228,9 @@ requires-dist = [
 provides-extras = ["gdown", "scipy"]
 
 # spyre-rpms.lock is generated from this; after editing, re-run
-# `python3 scripts/lock_spyre_rpms.py`.
+# `python3 scripts/lock_spyre_rpms.py`. Bump SPYRE_RPM_BUNDLE above with `bundle`.
 [tool.spyre-rpms]
-bundle = "main_nightly_2026_10_15"
+bundle = "main_nightly_2026_10_27"
 packages = [
   "ibm-aiu-toolbox-e2e",
   "ibm-deeptools",
@@ -348,7 +350,8 @@ filterwarnings = [
 
 # --8<-- [start:test-markers-definition]
 markers = [
-    "distributed: Tests requiring multiple spyre cards",
+    "distributed: Tests requiring multiple spyre cards (TP=2, runs on spyre_pf_x2)",
+    "distributed_tp4: Tests requiring 4 Spyre cards (TP=4, runs on spyre_pf_x4)",
     "upstream: Tests coming from upstream vLLM",
     "attention: SpyreAttentionImpl tests (tests/attention/test_spyre_attn.py, tests/attention/test_spyre_encoder_attn.py); slow, runs in its own CI job",
     "encoder_attention: encoder-attention subset (tests/attention/test_spyre_encoder_attn.py); also marked attention, split into its own CI job",
@@ -367,12 +370,12 @@ markers = [
     "siluandmul: SiluAndMul custom-op tests (tests/custom_ops/test_silu_and_mul.py)",
     "vocab_parallel_embedding: SpyreVocabParallelEmbedding custom-op tests (tests/custom_ops/test_vocab_parallel_embedding.py)",
     "pixtral: Pixtral vision-tower patch tests (tests/multimodal/test_pixtral.py)",
-    "gemma4_vision: Gemma-4 vision-tower tests (tests/multimodal/test_gemma4_vision.py, plus the on-card row in tests/e2e/test_multimodal.py)",
+    "gemma4_vision: Gemma-4 vision-tower tests (tests/models/test_gemma4_mm.py, plus the on-card row in tests/e2e/test_multimodal.py)",
     "siglip: SigLIP vision-encoder patch tests (tests/multimodal/test_siglip.py)",
     "blip2: BLIP-2 Q-Former patch tests (tests/multimodal/test_blip2.py)",
     "granite4_vision: Granite Vision 4 patch tests (tests/multimodal/test_granite4_vision.py)",
     "multimodal: VLM tests. Local (tests/e2e/test_multimodal.py) is slow and needs a card; the upstream ones are host-side processor tests and need neither",
-    "rmsnorm: GemmaRMSNorm custom-op tests (tests/custom_ops/test_gemma_rms_norm.py)",
+    "rmsnorm: RMSNorm and GemmaRMSNorm custom-op tests (tests/custom_ops/test_rms_norm.py)",
     "granite_vision_e2e: End-to-end Granite Vision 4.1 tests (tests/e2e/test_granite_vision.py); slow, needs a card",
     "runtime: encoder inline-dispatch tests (tests/runtime/test_encoder_inline_dispatch.py); CPU-only",
 ]

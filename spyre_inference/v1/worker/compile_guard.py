@@ -478,12 +478,12 @@ def level() -> CompileGuardLevel:
 def allow_compile(reason: str) -> Any:
     """Suspend the guard on this thread, for a phase that compiles on purpose.
 
-    Reserved escape hatch: nothing in ``spyre_inference`` calls this today, because the
-    guard is armed only once warmup has finished, so every deliberate compile phase
-    (whole-model or per-block compile, attention recording) has already run by then,
-    and a layer that recompiles per input shape by contract opts out through
-    ``CompileOutermost.allow_inference_recompiles`` instead. Kept for a future phase
-    that has to compile after arming.
+    The guard is armed only once warmup has finished, so the startup compile phases
+    (whole-model or per-block compile, attention recording) never need this, and a
+    layer that recompiles per input shape by contract opts out through
+    ``CompileOutermost.allow_inference_recompiles`` instead. Its one caller is the
+    runner's ``reload_weights``, which re-warms after a reload changes the KV cache
+    scales the graphs were compiled with.
 
     Suppression is per-thread, but that cannot be a guarantee on its own: torch runs
     start callbacks only when its *process-wide* pending-compile counter goes 0 -> 1,

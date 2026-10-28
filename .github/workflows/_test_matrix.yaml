@@ -753,6 +753,17 @@ jobs:
               - linux
             image_label: image_torch_spyre
             test_target: test-distributed-shard-2
+          # TP=4 distributed suite. Runs on the 4-card runner (spyre_pf_x4).
+          # A distinct marker (distributed_tp4) keeps these out of the 2-card
+          # distributed job, which would silently skip them.
+          - cfg: Distributed TP4 spyre tests
+            test_types: unit regression trunk
+            runs_on:
+              - x86_64
+              - spyre_pf_x4
+              - linux
+            image_label: image_torch_spyre
+            test_target: test-distributed-tp4
           # torch-spyre backend probes (strict-xfail signals for backend readiness),
           # sharded across parallel 2-card jobs. Deliberately NOT in `integration`: a
           # strict-xfail flipping to xpass means the backend team shipped support and must
@@ -921,6 +932,10 @@ jobs:
       # Runs the actual build+test for this leg via the shared composite action, so test_retry below can reuse the exact same steps for a fresh-pod retry instead of duplicating them.
       - name: Run matrix config
         if: ${{ steps.gate.outputs.run == 'true' }}
+        # Bounds the whole composite. Observed legs run 27-38min, so 90 is ~2.4x headroom.
+        # NOTE: the runner's Linux kill is single-process, so this ends the job but does not
+        # reap a double-forked leftover; the pod is torn down by ARC, which releases the card.
+        timeout-minutes: 90
         uses: ./.github/actions/run-matrix-config
         with:
           cfg: ${{ matrix.cfg }}
@@ -937,6 +952,7 @@ jobs:
           job_slot: ${{ strategy.job-index }}
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}
@@ -1011,6 +1027,7 @@ jobs:
 
       # Same composite action the `test` job uses -- a pod-level retry runs the exact same steps, just on a fresh pod, so there is no separate copy to keep in sync here.
       - name: Run matrix config (pod-level retry)
+        timeout-minutes: 90
         uses: ./.github/actions/run-matrix-config
         with:
           cfg: ${{ matrix.cfg }}
@@ -1026,6 +1043,7 @@ jobs:
           retry: 'true'
           use_prebaked_image: ${{ inputs.use_prebaked_image }}
           storage_root: ${{ env.STORAGE_1_DIR }}/.cache/uv
+          compile_cache_root: ${{ env.STORAGE_1_DIR }}/.cache/compile
           torch_spyre_ref: ${{ inputs.torch_spyre_ref }}
           rpm_names: ${{ inputs.rpm_names }}
           rpm_location: ${{ inputs.rpm_location }}

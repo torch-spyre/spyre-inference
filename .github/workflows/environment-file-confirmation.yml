@@ -157,7 +157,9 @@ jobs:
                     repo,
                     username: commenter,
                   });
-                  authorized = ['admin', 'maintain'].includes(data.permission);
+                  // data.permission is the coarse classic bucket (admin/write/read/none);
+                  // a custom role like "maintain" only shows up in role_name.
+                  authorized = ['admin', 'maintain'].includes(data.role_name);
                 } catch (error) {
                   if (error.status !== 404) throw error;
                 }

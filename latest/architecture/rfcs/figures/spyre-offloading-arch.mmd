@@ -1,0 +1,39 @@
+flowchart TB
+    subgraph upstream["vLLM 0.32 — reused contracts"]
+        factories["KVConnectorFactory / OffloadingSpecFactory<br/>Public module-path configuration"]
+        scheduler["OffloadingConnectorScheduler"]
+    end
+    subgraph plugin["spyre-inference — connector integration"]
+        connector["SpyreOffloadingConnector<br/>Explicitly installs Spyre connector worker"]
+        runner["Model runner<br/>Register dense K/V; transfer hooks and output"]
+        adapter["Dense-cache adapter<br/>Typed K/V refs; original allocations retained"]
+        worker["Spyre transfer worker<br/>Store / load / completion / shutdown"]
+        runner -->|register caches| adapter
+        connector -->|worker-side ingestion| adapter
+        adapter -->|spec.get_worker| worker
+    end
+    subgraph policy["Scheduler-side policy"]
+        local["M1: CPUOffloadingManager<br/>Instance-local ownership"]
+        shared["M2/M3 target: shared manager<br/>Shared claims; complete pinned lookup"]
+    end
+    subgraph runtime["torch-spyre + device runtime"]
+        copy["Validated raw page copy<br/>Fence producers → copy pages → wait"]
+        pools["Slot-addressed data pool<br/>Host memory OR secondary memory"]
+        copy -->|byte-exact; no format conversion| pools
+    end
+    factories -->|connector selection| connector
+    scheduler -->|local spec| local
+    scheduler -->|shared spec| shared
+    worker -->|tensor + page identity + pool/slot| copy
+    shared -.->|shared-directory locations| pools
+
+    classDef base fill:#37474f,stroke:#263238,color:#ffffff
+    classDef spyre fill:#2e7d32,stroke:#1b5e20,color:#ffffff
+    classDef device fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    class factories,scheduler,local base
+    class connector,runner,adapter,worker,shared spyre
+    class copy,pools device
+    style upstream fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style plugin fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style policy fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style runtime fill:#e0e0e0,stroke:#9e9e9e,color:#212121

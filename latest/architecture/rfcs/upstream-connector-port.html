@@ -1,0 +1,2954 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+      
+      
+        <link rel="canonical" href="https://torch-spyre.github.io/spyre-inference/latest/architecture/rfcs/upstream-connector-port.html">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.8.0">
+    
+    
+      
+        <title>RFC: Port the upstream KV Connector experience to spyre-inference - Spyre Inference</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.57a0d79d.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.fb2fffe2.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#rfc-port-the-upstream-kv-connector-experience-to-spyre-inference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+        <aside class="md-banner">
+          <div class="md-banner__inner md-grid md-typeset">
+            
+            
+  <p id="dev-banner" style="display:none">
+    You are viewing development docs. <a href="https://torch-spyre.github.io/spyre-inference/lateststable/">Click here</a> to view docs for the latest stable release.
+  </p>
+  <script>
+    if (globalThis.location.pathname.includes('/latest/')) {
+      document.getElementById('dev-banner').style.display = '';
+    }
+  </script>
+
+          </div>
+          
+        </aside>
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Spyre Inference" class="md-header__button md-logo" aria-label="Spyre Inference" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Spyre Inference
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              RFC: Port the upstream KV Connector experience to spyre-inference
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="white" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="black" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 2c-1.82 0-3.53.5-5 1.35C8 5.08 10 8.3 10 12s-2 6.92-5 8.65C6.47 21.5 8.18 22 10 22a10 10 0 0 0 10-10A10 10 0 0 0 10 2"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/torch-spyre/spyre-inference" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../index.html" class="md-tabs__link">
+          
+  
+  
+  Home
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../getting_started/installation.html" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../index.html" class="md-tabs__link">
+          
+  
+  
+  Architecture
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../.." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Examples
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../user_guide/configuration.html" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../contributing/index.html" class="md-tabs__link">
+          
+  
+  
+  Developer Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Spyre Inference" class="md-nav__button md-logo" aria-label="Spyre Inference" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Spyre Inference
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/torch-spyre/spyre-inference" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_1" id="__nav_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Home
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_2" id="__nav_1_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting_started/installation.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_3" id="__nav_1_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4" id="__nav_1_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Examples
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_4_1" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_4_1" id="__nav_1_4_1_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Offline Inference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="3" aria-labelledby="__nav_1_4_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_4_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Offline Inference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/offline_inference/profile_spyre_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Profile Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/offline_inference/setup_profile_env.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Setup Profile Env
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/offline_inference/torch_spyre_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Torch Spyre Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/offline_inference/torch_spyre_multimodal_inference.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Torch Spyre Multimodal Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_5" id="__nav_1_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/configuration.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/env_vars.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Environment Variables
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/kineto_profiling.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Kineto Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_1_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_1_6" id="__nav_1_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_1_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/vllm-upgrade-procedure.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    vLLM Upgrade Procedure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting_started/installation.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Plugin Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/configuration.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/env_vars.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Environment Variables
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../user_guide/kineto_profiling.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Kineto Profiling
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Developer Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Developer Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/index.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../contributing/vllm-upgrade-procedure.html" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    vLLM Upgrade Procedure
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-motivation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Motivation
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-goals-and-non-goals" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Goals and non-goals
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Goals and non-goals">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#m1-instance-local-host-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M1 — instance-local host memory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#m2-shared-host-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M2 — shared host memory
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#m3-secondary-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M3 — secondary memory
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-background-the-pinned-upstream-contracts" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Background: the pinned upstream contracts
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Background: the pinned upstream contracts">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-dense-kv-caches-and-the-ingestion-point" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 Dense KV caches and the ingestion point
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-offloadingspec-offloadingworker-and-canonical-caches" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 OffloadingSpec, OffloadingWorker and canonical caches
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-cpu-reference-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 CPU reference implementation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-public-configuration-seams" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 Public configuration seams
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-filesystemobject-tiering-is-background-not-a-free-integration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 Filesystem/object tiering is background, not a free integration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#36-what-changed-since-the-earlier-version-basis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.6 What changed since the earlier version basis
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-device-copy-contract-and-current-torch-spyre" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Device-copy contract and current torch-spyre
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Device-copy contract and current torch-spyre">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-runtimebinding-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 Runtime/binding boundary
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-proposed-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Proposed architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Proposed architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-worker-factoring" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 Worker factoring
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-manager-factoring" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 Manager factoring
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-component-design" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Component design
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="6. Component design">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#61-spyrekvdmacopier-layout-and-physical-capacity" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.1 SpyreKvDmaCopier: layout and physical capacity
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#62-transfer-ordering-and-worker-completion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.2 Transfer ordering and worker completion
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#63-spyreoffloadingspec" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.3 SpyreOffloadingSpec
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#64-secondary-memory-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.4 Secondary-memory backend
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#65-registration-and-serving-configuration" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.5 Registration and serving configuration
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#66-spyreoffloadingconnector-dense-cache-ingestion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.6 SpyreOffloadingConnector: dense-cache ingestion
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#67-shared-pool-lifecycle-control-plane-versus-data-plane" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.7 Shared-pool lifecycle: control plane versus data plane
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#68-shared-manager-identity-and-concurrency" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6.8 Shared manager, identity and concurrency
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#7-implementation-plan" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        7. Implementation plan
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#8-compatibility-with-other-connectors" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        8. Compatibility with other connectors
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#9-alignment-with-the-working-prototypes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        9. Alignment with the working prototypes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#10-open-questions-and-resolved-review-points" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        10. Open questions and resolved review points
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#11-out-of-scope-and-follow-ups" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        11. Out of scope and follow-ups
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#12-acceptance-criteria" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        12. Acceptance criteria
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="12. Acceptance criteria">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#m1-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M1 acceptance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#m2-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M2 acceptance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#m3-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        M3 acceptance
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fp8-acceptance-for-each-enabled-offload-backend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FP8 acceptance, for each enabled offload backend
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#persistent-lifecycle-acceptance-for-both-shared-memory-kinds" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistent lifecycle acceptance, for both shared memory kinds
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#13-references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        13. References
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="rfc-port-the-upstream-kv-connector-experience-to-spyre-inference">RFC: Port the upstream KV Connector experience to spyre-inference<a class="headerlink" href="#rfc-port-the-upstream-kv-connector-experience-to-spyre-inference" title="Permanent link">&para;</a></h1>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Status</td>
+<td>Draft</td>
+</tr>
+<tr>
+<td>Authors</td>
+<td>Chen Wang (<a href="https://github.com/wangchen615">@wangchen615</a>), Yue Zhu (<a href="https://github.com/yuezhu1">@yuezhu1</a>), Pravein Govindan Kannan (<a href="https://github.com/praveingk">@praveingk</a>), Hubertus Franke (<a href="https://github.com/frankeh">@frankeh</a>)</td>
+</tr>
+<tr>
+<td>Created</td>
+<td>2026-06-05</td>
+</tr>
+<tr>
+<td>Updated</td>
+<td>2026-10-28</td>
+</tr>
+<tr>
+<td>Tracking</td>
+<td>First design doc for <a href="https://github.com/torch-spyre/spyre-inference/issues/76">#76 — [Epic] Develop KVCacheConnector for Spyre</a></td>
+</tr>
+<tr>
+<td>Related</td>
+<td>vLLM <code>OffloadingConnector</code>; device-runtime shared-pool and persistent-lifecycle designs; M1/M2/M3 offload prototypes</td>
+</tr>
+</tbody>
+</table>
+<h2 id="1-motivation">1. Motivation<a class="headerlink" href="#1-motivation" title="Permanent link">&para;</a></h2>
+<p>vLLM's <code>OffloadingConnector</code> separates scheduler-side cache policy from worker-side transfers.
+Spyre can reuse this framework without upstream patches, but needs its own dense-cache ingestion
+and byte-exact transfer path. The stock CPU-offload worker is implemented for CUDA-alike/XPU devices.</p>
+<p>This RFC describes three incremental capabilities:</p>
+<ol>
+<li><strong>M1 — instance-local host-memory offload:</strong> reuse an offloaded prefix across requests in one engine.</li>
+<li><strong>M2 — shared host-memory offload:</strong> another compatible instance on the same node can find and load
+   that prefix through a shared allocator and directory.</li>
+<li><strong>M3 — secondary-memory offload:</strong> use a secondary-memory data pool behind the same shared-pool
+   contract, retaining CPU-resident metadata.</li>
+</ol>
+<p>Working development branches exist for these three stages (§9). They establish the implementation
+path, not availability in the main-branch dependency pins or completion of the persistent-lifecycle
+contract. This remains an agreed starting design, with implementation and production hardening in
+follow-up PRs.</p>
+<p>Host DRAM and secondary memory are <strong>alternative, co-equal pool backends</strong>. This RFC does not define
+an automatic hierarchy, spill to DRAM, promotion/demotion, or lookup across unrelated pools. It makes
+no relative performance claim about the memory kinds.</p>
+<h2 id="2-goals-and-non-goals">2. Goals and non-goals<a class="headerlink" href="#2-goals-and-non-goals" title="Permanent link">&para;</a></h2>
+<h3 id="m1-instance-local-host-memory">M1 — instance-local host memory<a class="headerlink" href="#m1-instance-local-host-memory" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Select <code>SpyreOffloadingConnector</code> and <code>SpyreOffloadingSpec</code> through existing vLLM configuration.</li>
+<li>Reuse upstream <code>CPUOffloadingManager</code> for local admission, eviction and block bookkeeping.</li>
+<li>Offload and restore the device representation byte-for-byte, without converting through host floats.</li>
+<li>Support dense head-major and token-major model-dtype caches; validate each layout's physical page
+  mapping separately. FP8 acceptance is a separate gate (§6.1, §12), not implied by FP16 success.</li>
+<li>Preserve the no-connector serving path and avoid an upstream vLLM patch.</li>
+</ul>
+<h3 id="m2-shared-host-memory">M2 — shared host memory<a class="headerlink" href="#m2-shared-host-memory" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Let compatible instances attach the same named data/metadata pair and discover published prefixes.</li>
+<li>Use a shared allocator and generation-checked directory, not independent local allocators pointing
+  at the same backing.</li>
+<li>Never consume a reserved, stale, incompatible or partially written entry as a cache hit.</li>
+<li>Separate pool administration from serving: a node-local control-plane service (the <strong>delegator</strong>)
+  manages pool creation/discovery/destruction; serving processes attach/detach only.</li>
+<li>Keep the pool and published entries across a zero-attachment interval, normal shutdown or a serving
+  process restart. Host shared memory is not durable across node reboot.</li>
+</ul>
+<h3 id="m3-secondary-memory">M3 — secondary memory<a class="headerlink" href="#m3-secondary-memory" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Replace the data-pool backend without replacing vLLM's scheduling contract or the shared directory.</li>
+<li>Keep transport, backing acquisition and device-visible addresses below the Python boundary.</li>
+<li>Apply the same compatibility, completion, publication and persistent-lifecycle rules as M2.</li>
+</ul>
+<p>Cross-host PD disaggregation, filesystem/object-store integration, cross-topology raw-page reuse,
+and automatic multi-tier placement are separate work (§11).</p>
+<h2 id="3-background-the-pinned-upstream-contracts">3. Background: the pinned upstream contracts<a class="headerlink" href="#3-background-the-pinned-upstream-contracts" title="Permanent link">&para;</a></h2>
+<p><strong>Version basis.</strong> Source references below were checked against spyre-inference main
+<code>94f4f6950f7e979a7cac5808bf85f283f09ea530</code>. Its <code>pyproject.toml</code> specifies
+<code>vllm[grpc]&gt;=0.32.0,&lt;0.33</code>; <code>uv.lock</code> resolves tag <code>v0.32.0</code> to
+<code>5df63a7203cdb9328d824a27b682e77c7b9928be</code>. The torch-spyre pin is
+<code>64870622fc39cda7e344a271decb901e7088c6c6</code>. These are source checks, not hardware qualification
+of that dependency combination.</p>
+<h3 id="31-dense-kv-caches-and-the-ingestion-point">3.1 Dense KV caches and the ingestion point<a class="headerlink" href="#31-dense-kv-caches-and-the-ingestion-point" title="Permanent link">&para;</a></h3>
+<p><code>SpyrePagedKVCache</code> is a named tuple with <strong>two dense tensors</strong>, <code>key</code> and <code>value</code>, per layer.
+It is not two Python lists of separately allocated pages. Each tensor's leading dimension is
+<code>num_blocks</code>, and its remaining dimensions come from the selected attention backend:</p>
+<table>
+<thead>
+<tr>
+<th>Backend</th>
+<th>Shape of each K or V tensor</th>
+<th>Selection</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SpyreHeadMajorAttentionBackend</code></td>
+<td><code>[num_blocks, num_kv_heads, block_size, head_size]</code></td>
+<td>Default</td>
+</tr>
+<tr>
+<td><code>SpyreAttentionBackend</code></td>
+<td><code>[num_blocks, block_size, num_kv_heads, head_size]</code></td>
+<td><code>SPYRE_ATTN_KV_LAYOUT=token_major</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>allocate_spyre_kv_caches</code> in <code>spyre_inference/v1/worker/kv_cache_setup.py</code> delegates to each
+attention implementation's <code>allocate_pages</code>. It uses <code>kv_cache_config.num_blocks</code> directly and
+preserves aliases for shared layers. There is <strong>no rounding of the block count to a multiple of 64</strong>
+in this allocator. Physical tensor padding and head-dimension constraints are separate issues.</p>
+<p>At vLLM 0.32, <code>OffloadingConnector</code> delegates worker calls to <code>OffloadingConnectorWorker</code> in
+<code>vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py</code>. Its <code>register_kv_caches</code>:</p>
+<ol>
+<li>Selects offloaded groups and derives canonical mappings.</li>
+<li>Calls <code>group_kernel_blocks</code> for each layer's tensor.</li>
+<li>Builds an <code>int8</code> storage view using <code>set_(ref.untyped_storage(), byte_offset, size, stride)</code>.</li>
+<li>Deduplicates aliased regions and calls <code>_init_worker(canonical_kv_caches)</code>.</li>
+</ol>
+<p>The former <code>isinstance(layer_kv_cache, torch.Tensor)</code> assertion is <strong>not</strong> the current failure
+premise. The dense K and V fields are tensors; the outer pair still needs adapting to upstream's
+single-tensor-per-layer contract. More importantly, a logical byte-strided storage view is not a
+validated description of a padded/tiled device page. Canonicalization precedes <code>spec.get_worker</code>,
+so changing the spec alone cannot fix ingestion. §6.6 retains a small dense-cache adapter for this
+reason, not a paged-list adapter.</p>
+<h3 id="32-offloadingspec-offloadingworker-and-canonical-caches">3.2 <code>OffloadingSpec</code>, <code>OffloadingWorker</code> and canonical caches<a class="headerlink" href="#32-offloadingspec-offloadingworker-and-canonical-caches" title="Permanent link">&para;</a></h3>
+<p><code>vllm/v1/kv_offload/base.py</code> defines:</p>
+<ul>
+<li><code>OffloadingSpec(config: OffloadingConfig)</code>, with <code>get_manager()</code> and <code>get_worker(kv_caches)</code>.</li>
+<li><code>OffloadingWorker</code>, with <code>submit_store</code>, <code>submit_load</code>, <code>get_finished</code>, <code>wait</code>, and optional
+  <code>shutdown</code>. <code>TransferResult</code> records job completion and success.</li>
+<li><code>GPULoadStoreSpec</code>, containing device block IDs, group sizes and logical block indices. Its name
+  does not require CUDA. Group/chunk mapping must be respected; blindly zipping host and device
+  block-ID lists is insufficient when <code>blocks_per_chunk &gt; 1</code>.</li>
+<li><code>CanonicalKVCacheTensor(tensor, page_size_bytes)</code> and per-group <code>CanonicalKVCacheRef</code> entries,
+  including optional <code>mapping: CanonicalPageMapping | None</code>.</li>
+</ul>
+<p>The tensor contract permits a leading block dimension <code>(num_blocks, ...)</code>; the stock worker turns
+it into a byte view. Our worker consumes the original typed dense tensors instead. Reusing these
+containers does not certify that raw pages are portable across TP layouts: leave <code>mapping=None</code>
+unless that mapping has actually been established, and reject unsupported canonical/replicated
+layout modes.</p>
+<p><code>OffloadKey</code> includes the KV-cache group index as well as the block hash. Shared lookup must retain
+that group identity and the request context required by the current manager API.</p>
+<h3 id="33-cpu-reference-implementation">3.3 CPU reference implementation<a class="headerlink" href="#33-cpu-reference-implementation" title="Permanent link">&para;</a></h3>
+<p><code>CPUOffloadingSpec.get_worker</code> in <code>vllm/v1/kv_offload/cpu/spec.py</code> rejects platforms other than
+CUDA-alike/XPU before calling <code>create_worker</code>. <code>CPUOffloadingWorker</code> in <code>cpu/gpu_worker.py</code> uses
+byte views and accelerator streams/events. Neither is a ready-made Spyre transfer implementation.</p>
+<p>We subclass <code>OffloadingSpec</code> directly rather than inheriting and replacing CPU-specific behavior.
+This is a factoring choice, not a claim that Python subclasses cannot override <code>get_worker</code>.
+<code>CPUOffloadingManager</code> itself is platform-independent and reusable for <strong>M1</strong>. It takes
+<code>num_chunks</code>, cache-policy options, event settings and admission thresholds. The Spyre spec must
+also declare the metric definitions its manager emits through <code>build_metric_definitions</code>.</p>
+<p>M2 cannot inherit that manager unchanged: a per-instance dictionary/allocator neither discovers
+peer entries nor reserves shared slots safely (§6.8).</p>
+<h3 id="34-public-configuration-seams">3.4 Public configuration seams<a class="headerlink" href="#34-public-configuration-seams" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>kv_connector_module_path</code> lets <code>KVConnectorFactory</code> load the Spyre connector.</li>
+<li><code>spec_name</code> and <code>spec_module_path</code> in <code>kv_connector_extra_config</code> let <code>OffloadingSpecFactory</code>
+  load the Spyre spec. Registry calls are optional conveniences, not prerequisites.</li>
+<li>A secondary tier's <code>module_path</code> is a different setting; it does not select an offloading spec.</li>
+</ul>
+<p>No upstream patch is required for these seams. They do not eliminate the plugin's responsibility
+to wire cache registration, transfer hooks, worker output and shutdown into its model runner.</p>
+<h3 id="35-filesystemobject-tiering-is-background-not-a-free-integration">3.5 Filesystem/object tiering is background, not a free integration<a class="headerlink" href="#35-filesystemobject-tiering-is-background-not-a-free-integration" title="Permanent link">&para;</a></h3>
+<p>Upstream <code>TieringOffloadingSpec</code> subclasses <code>CPUOffloadingSpec</code>. Its primary tier exposes a host
+<code>memoryview</code> to filesystem/object secondary tiers. Selecting it does not compose our Spyre spec
+underneath it, and a pool addressed only by slots is not that host-memory interface.</p>
+<p>Consequently, adding <code>tiering/fs</code> or <code>tiering/obj</code> is <strong>not a config-only extension of M1</strong>. It needs
+separate primary-tier/worker integration. Likewise, an unrelated LMCache or NIXL connector does not
+automatically gain Spyre support merely because this connector exists.</p>
+<h3 id="36-what-changed-since-the-earlier-version-basis">3.6 What changed since the earlier version basis<a class="headerlink" href="#36-what-changed-since-the-earlier-version-basis" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Earlier assumption</th>
+<th>Verified v0.32 contract / design consequence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Connector worker will move into <code>offloading_connector.py</code></td>
+<td>At this exact tag it is imported from <code>offloading/worker.py</code>; use the pinned source, not a predicted move.</td>
+</tr>
+<tr>
+<td>Constructor shape is uncertain</td>
+<td><code>OffloadingConnectorWorker(spec, vllm_config, kv_cache_config)</code>; test this integration on each bump.</td>
+</tr>
+<tr>
+<td>A connector <code>_worker_cls</code> attribute selects the subclass</td>
+<td>Upstream directly constructs <code>OffloadingConnectorWorker</code>; no such factory hook exists at this pin.</td>
+</tr>
+<tr>
+<td>Canonical caches require a paged-list bridge</td>
+<td>Dense K/V tensors need a small typed adapter and physical page-copy contract.</td>
+</tr>
+<tr>
+<td>Storage reinterpretation is wholly unsupported</td>
+<td>The pin registers <code>set_.source_Storage_storage_offset</code>; that is not proof of valid raw device-page addressing (§4).</td>
+</tr>
+<tr>
+<td>Shared CPU backing and mappings are future drift</td>
+<td><code>_uses_shared_region()</code>, <code>CanonicalPageMapping</code>, and <code>OffloadingConfig</code> already exist; do not advertise unimplemented Spyre replicated/canonical layouts.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4-device-copy-contract-and-current-torch-spyre">4. Device-copy contract and current torch-spyre<a class="headerlink" href="#4-device-copy-contract-and-current-torch-spyre" title="Permanent link">&para;</a></h2>
+<p>The pinned torch-spyre exposes converting <code>copy_tensor</code>. A converting device→host→device transfer
+is not a contract for preserving the device representation, even if ordinary floating-point tests
+pass. KV offload must snapshot and restore <strong>raw bytes</strong>, with no quantization, dequantization or
+layout conversion in the transport.</p>
+<p>A source check of the pin found no <code>copy_tensor_raw</code> or shared-pool bindings. The working prototypes
+use local dependency builds with additional APIs (§9). They must not be described as available
+merely by installing the main-branch lockfile.</p>
+<p><strong>Storage recheck.</strong> <code>torch_spyre/csrc/spyre_mem.cpp</code> registers
+<code>set_.source_Storage_storage_offset</code>; <code>spyre_set_storage</code> delegates to <code>at::cpu::set_</code>.
+Spyre-aware view implementations in <code>spyre_views.cpp</code> explicitly carry tensor layout and DMA
+size/stride metadata. The old blanket statement that <code>.set_()</code> is unsupported is therefore removed.
+However, a generic <code>int8</code> storage reinterpretation does not establish the correct physical page
+layout or preserve all that tensor metadata. No device round-trip through upstream canonicalization
+was run for this docs-only revision; the adapter remains until that complete path is qualified.</p>
+<h3 id="41-runtimebinding-boundary">4.1 Runtime/binding boundary<a class="headerlink" href="#41-runtimebinding-boundary" title="Permanent link">&para;</a></h3>
+<p>The proposed shared-pool interface is:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="n">copy_tensor_raw</span><span class="p">(</span><span class="n">dev_tensor</span><span class="p">,</span> <span class="n">pool</span><span class="p">,</span> <span class="n">slot_id</span><span class="p">,</span> <span class="n">to_device</span><span class="p">,</span> <span class="n">non_blocking</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+</span></code></pre></div>
+<p><code>to_device=False</code> stores into a slot; <code>True</code> restores from it. The tensor and pool/slot are the Python
+boundary. The device runtime owns address resolution support, physical byte movement, bounds checks
+and backing retention; torch-spyre provides the tensor-aware bindings. Python receives no raw host
+pointer, device address or host-buffer-registration API.</p>
+<p><code>SharedPool</code> provides immutable slot geometry and checked copy dispatch. Concrete host-memory and
+secondary-memory pools own their local mappings or provider resources. The host backend manages
+shared-memory mapping and pinning per device function; the secondary-memory backend retains its
+provider range. Backing must stay valid until DMA completes, regardless of Python handle lifetime.</p>
+<p><strong>Dense-page prerequisite.</strong> The baseline pooled call copies a complete allocation. A slice such as
+<code>cache.key[block_id]</code> is a view into a larger allocation, not necessarily an independently transferable
+page. The production binding must support a validated page/range transfer, or another explicitly
+byte-exact page operation, before it can offload dense caches. It must not silently snapshot the
+whole layer into a page-sized slot. The prototypes' page-copy implementation is evidence for this
+extension, not evidence that the baseline whole-allocation signature already handles views.</p>
+<p>Single-chunk raw transfers are the baseline. Multi-chunk packing/restoration is a runtime extension,
+with ordered chunk sizes/domain identities and no persisted process-local addresses. Unsupported
+chunking or layouts must fail explicitly; same logical shape/dtype alone does not prove compatibility.</p>
+<h2 id="5-proposed-architecture">5. Proposed architecture<a class="headerlink" href="#5-proposed-architecture" title="Permanent link">&para;</a></h2>
+<p><img alt="Spyre KV offloading architecture" src="figures/spyre-offloading-arch.svg" /></p>
+<p>Diagram sources: <a href="figures/spyre-offloading-arch.d2">D2</a>,
+<a href="figures/spyre-offloading-arch.mmd">Mermaid</a>.</p>
+<p>The plugin owns vLLM integration, selection/admission policy, compatible cache identity and transfer
+sequencing. torch-spyre and the device runtime own byte-copy and shared-memory mechanisms. The
+control plane owns persistent pool lifecycle, not the serving worker.</p>
+<h3 id="51-worker-factoring">5.1 Worker factoring<a class="headerlink" href="#51-worker-factoring" title="Permanent link">&para;</a></h3>
+<p><code>SpyreOffloadingWorker</code> implements the current upstream worker ABC. A copier isolates device-specific
+operations from scheduler bookkeeping and enables mock tests. Per-direction helper objects are
+optional implementation details, not upstream extension points or a requirement to duplicate state.</p>
+<p>The initial correctness path waits for copies before exposing completion. Batching submissions and
+waiting once per job is compatible with this contract. Neither a <code>non_blocking</code> flag nor queue
+submission alone means that bytes are safe to consume or publish.</p>
+<h3 id="52-manager-factoring">5.2 Manager factoring<a class="headerlink" href="#52-manager-factoring" title="Permanent link">&para;</a></h3>
+<p>M1 reuses <code>CPUOffloadingManager</code>. M2/M3 provide a shared manager implementing <code>OffloadingManager</code>
+over the runtime directory/allocator. They can reuse admission/eviction policy choices, but <strong>not</strong>
+an independent instance-local ownership map as the authority for shared slots.</p>
+<p>The shared manager handles lookup, reservation, load protection, publication, completion and local
+request cleanup. Changing only pool construction in the M1 spec is not enough to implement sharing.</p>
+<h2 id="6-component-design">6. Component design<a class="headerlink" href="#6-component-design" title="Permanent link">&para;</a></h2>
+<h3 id="61-spyrekvdmacopier-layout-and-physical-capacity">6.1 <code>SpyreKvDmaCopier</code>: layout and physical capacity<a class="headerlink" href="#61-spyrekvdmacopier-layout-and-physical-capacity" title="Permanent link">&para;</a></h3>
+<p>The copier takes dense K/V tensors plus page identities and validated pool destinations. It must
+preserve the selected backend layout; head-major and token-major pages are not interchangeable even
+when their logical byte counts match. No per-transfer host transpose or float conversion is allowed.</p>
+<p>Capacity is based on <strong>physical transfer extents</strong>, not blindly on
+<code>numel() * element_size()</code>, and not on the size of the entire dense layer divided by block count
+without a validated layout mapping. Use the runtime's size/alignment information for the actual
+page/range operation. The aligned slot stride must accommodate every physical fragment assigned to
+it; all range/stride/slot arithmetic is bounds- and overflow-checked.</p>
+<p>A vLLM offloaded chunk may cover multiple device blocks and all K/V tensors in a cache group. In
+the M2 prototype, <strong>each component page has its own directory entry and slot</strong>, keyed by the full
+<code>OffloadKey</code> plus component identity. A stable manifest fixes layer order, K/V order, page order and
+rank-local ownership. Slots need not be adjacent. Publication is per page, not an atomic transaction
+over the whole chunk: a logical hit requires every component to be valid and successfully pinned.
+Capacity negotiation between scheduler and workers must agree on complete chunks, not confuse a
+K-only page slot with one vLLM chunk. Heterogeneous layers need validated per-tensor extents, not one
+guessed page size. The initial PoCs require <code>blocks_per_chunk == 1</code> and one KV group; supporting
+larger chunks or multiple groups is an explicit extension, not demonstrated behavior.</p>
+<p><strong>Layout/dtype coverage:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Cache layout and encoding</th>
+<th>Current attention support</th>
+<th>Offload requirement</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Head-major, model dtype</td>
+<td>Default; normally FP16</td>
+<td>Qualify dense page addressing, padding and raw round-trip.</td>
+</tr>
+<tr>
+<td>Token-major, model dtype</td>
+<td>Explicit opt-in</td>
+<td>Qualify its distinct page mapping; do not use head-major offsets.</td>
+</tr>
+<tr>
+<td>Head-major, <code>fp8</code> / <code>fp8_e4m3</code></td>
+<td>Allocated as <code>torch.float8_e4m3fn</code>; requires <code>head_size % 128 == 0</code></td>
+<td>Separate raw-copy/slot-sizing and end-to-end acceptance gate.</td>
+</tr>
+<tr>
+<td>Token-major, FP8</td>
+<td>Rejected by current attention implementation</td>
+<td>Reject during configuration; do not imply M1 enables it.</td>
+</tr>
+</tbody>
+</table>
+<p>For FP8, the vLLM cache spec can report <code>uint8</code> while actual device pages hold E4M3 values. Store the
+existing encoded bytes, not an FP16 expansion or a new quantization. Physical padding/alignment
+still applies: a logical one-byte dtype does not guarantee a pool slot is exactly half its FP16
+size. Compatibility includes the encoding, layout, quantization scheme and resolved per-layer K/V
+scales. Current attention uses per-layer scales rather than putting scales into each cache page;
+shared reuse must establish identical scales or explicitly carry/restore them as part of a future
+format. Raw bytes copied under different scales are not reusable KV.</p>
+<p>Until the production page-copy API supports and passes a layout/dtype combination, reject that
+combination explicitly. Attention support by itself is not offload qualification.</p>
+<h3 id="62-transfer-ordering-and-worker-completion">6.2 Transfer ordering and worker completion<a class="headerlink" href="#62-transfer-ordering-and-worker-completion" title="Permanent link">&para;</a></h3>
+<p>For each store job:</p>
+<ol>
+<li>Retain the source pages and destination reservation.</li>
+<li>Fence all relevant pending compute/KV writes before raw DMA reads the pages. Synchronizing only
+   after copying cannot repair a snapshot taken before the producer finished.</li>
+<li>Transfer all K/V pages for the selected groups/chunks and wait for completion.</li>
+<li>Publish each newly stored shared page only after its DMA completes. Report job success after its
+   required transfers finish; complete pinned lookup across components/ranks establishes logical
+   availability. The runtime does not supply an atomic multi-worker publication barrier.</li>
+</ol>
+<p>For a load, retain the source slot protection through the final DMA completion and make restored
+pages visible before attention runs. Block reuse, preemption, cancellation, <code>wait</code> and <code>shutdown</code>
+must respect in-flight transfers. Failed stores must not publish; failed loads must not be consumed
+as restored KV. After a scheduled hit fails, return the upstream failure/recompute path rather than
+silently treating partially loaded device pages as usable.</p>
+<h3 id="63-spyreoffloadingspec">6.3 <code>SpyreOffloadingSpec</code><a class="headerlink" href="#63-spyreoffloadingspec" title="Permanent link">&para;</a></h3>
+<p>Subclass <code>OffloadingSpec</code> directly. <code>get_manager</code> creates the M1 <code>CPUOffloadingManager</code> with validated
+chunk capacity and the current cache-policy/event options. <code>get_worker</code> builds the Spyre transfer
+worker from canonical dense tensors. Declare matching metric definitions instead of inheriting the
+base class's empty definition set while emitting CPU-manager statistics.</p>
+<p>Pool/DMA construction belongs on the worker side after cache geometry is known; constructing a spec
+in the scheduler must not initialize an accelerator stream. Keep imports lazy so installations
+without the optional lower-layer APIs can still use spyre-inference with no offload connector.</p>
+<p>The shared spec replaces both the local manager and pool-resolution behavior. Reuse the byte mover
+and validated page mapping where possible, not a promise of identical worker/spec source in every
+milestone.</p>
+<h3 id="64-secondary-memory-backend">6.4 Secondary-memory backend<a class="headerlink" href="#64-secondary-memory-backend" title="Permanent link">&para;</a></h3>
+<p>M3 uses the same slot-copy and directory contracts with a secondary-memory data pool. Metadata
+remains host-resident and CPU-accessible. The runtime owns acquisition, attachment and retention of
+the provider backing; the plugin does not construct provider handles or device-visible addresses.</p>
+<p>A pool is a DMA endpoint, not necessarily a host-mappable byte array. Multiple named pools can
+coexist; a cache group attaches its selected pair at startup. This does not imply one global pool,
+a host-wide directory spanning all pools, per-hit pool resolution, or fallback into another backend.
+Unsupported backends fail clearly instead of silently switching to host memory.</p>
+<h3 id="65-registration-and-serving-configuration">6.5 Registration and serving configuration<a class="headerlink" href="#65-registration-and-serving-configuration" title="Permanent link">&para;</a></h3>
+<p>M1 uses the existing configuration seams:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>vllm<span class="w"> </span>serve<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL</span><span class="s2">"</span><span class="w"> </span>--kv-transfer-config<span class="w"> </span><span class="s1">'{</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="s1">  "kv_connector": "SpyreOffloadingConnector",</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="s1">  "kv_connector_module_path": "spyre_inference.v1.kv_offload.connector",</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="s1">  "kv_role": "kv_both",</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="s1">  "kv_connector_extra_config": {</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="s1">    "spec_name": "SpyreOffloadingSpec",</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="s1">    "spec_module_path": "spyre_inference.v1.kv_offload.spec",</span>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="s1">    "cpu_bytes_to_use": 8000000000</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="s1">  }</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="s1">}'</span>
+</span></code></pre></div>
+<p>This is an implementation target; the main-branch dependency pin does not supply the raw-pool APIs.
+A PoC build must use its matching dependencies and configuration, not the lockfile alone.</p>
+<p>For persistent shared pools, the <strong>proposed</strong> public selection is
+<code>kv_connector_extra_config.pool_name</code>, with <code>SPYRE_KV_POOL_NAME</code> as fallback. Resolve it once before
+worker processes start:</p>
+<ol>
+<li>An explicitly present <code>pool_name</code> wins. Empty/invalid values are errors, not a fallback request.</li>
+<li>Otherwise use the environment value, if present and valid.</li>
+<li>Otherwise generate an instance-specific name to prevent accidental sharing.</li>
+</ol>
+<p>Use logical names matching <code>[A-Za-z0-9][A-Za-z0-9._-]*</code>; validate length including derived suffixes
+and never truncate. Log the effective name and source, then propagate the resolved configuration.
+Workers and bindings must not independently reread the environment.</p>
+<p>Derive deterministic rank/shard/cache-group suffixes, for example <code>_r0_c0</code>, from agreed topology.
+Explicit shared names must not acquire a process-local engine ID; generated defaults must retain
+instance identity. Derive matching data, metadata and lifecycle names from the same scope. Naming
+alone does not implement sharing: the shared allocator and compatibility checks remain mandatory.</p>
+<p>The delegator resolves the name to a descriptor whose backend, slot geometry, compatibility and
+pool generation were fixed at creation. Neither <code>cpu_bytes_to_use</code> nor worker-local defaults may
+resize an existing shared pool. Exact Python lifecycle binding/config field names remain subject to
+the lower-layer implementation; do not document prototype-only backend selectors as a stable API.</p>
+<h3 id="66-spyreoffloadingconnector-dense-cache-ingestion">6.6 <code>SpyreOffloadingConnector</code>: dense-cache ingestion<a class="headerlink" href="#66-spyreoffloadingconnector-dense-cache-ingestion" title="Permanent link">&para;</a></h3>
+<p>The adapter should retain each original typed dense K and V tensor, create one
+<code>CanonicalKVCacheTensor</code> per unique field, and build ordered per-group references. Preserve known
+shared-layer aliases without manufacturing a device byte view. Validate the selected groups,
+per-layer specs, block counts, layout and supported dtype before initializing the transfer worker.
+Physical transfer sizes come from the page-copy contract (§6.1), not storage reinterpretation.</p>
+<p>This is a <strong>dense adapter</strong>, conventionally <code>spyre_dense_to_canonical</code>, replacing the earlier
+<code>spyre_paged_to_canonical</code> sketch. There is no concatenation of per-block Python lists and no reason
+to allocate a second canonical device cache.</p>
+<p>At the pin, upstream's connector constructor directly instantiates its worker; assigning a
+<code>_worker_cls</code> attribute has no effect. The plugin connector must explicitly install its
+<code>SpyreOffloadingConnectorWorker</code> on the worker role, preserving the upstream scheduler role and
+configuration. Its registration override then calls inherited <code>_init_worker</code> with our canonical
+containers. Test that the intended worker is actually constructed, not merely that the subclass
+exists.</p>
+<p>The model runner also needs connector lifecycle integration: register caches after
+<code>allocate_spyre_kv_caches</code>, run load/save and preemption hooks around execution, propagate connector
+output, and drain/shut down transfers. The PoC includes this wiring. The old acceptance criterion
+that <strong>no worker/model-runner file may change</strong> is withdrawn. The allocator's backend-owned layout
+need not change, but connector wiring cannot be omitted.</p>
+<h3 id="67-shared-pool-lifecycle-control-plane-versus-data-plane">6.7 Shared-pool lifecycle: control plane versus data plane<a class="headerlink" href="#67-shared-pool-lifecycle-control-plane-versus-data-plane" title="Permanent link">&para;</a></h3>
+<p>The persistent-lifecycle contract supersedes prototype <code>create_or_attach</code> and last-detacher-unlink
+behavior for named shared pools.</p>
+<table>
+<thead>
+<tr>
+<th>Owner</th>
+<th>Responsibilities</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Node-local delegator</td>
+<td><code>CreatePool</code>, <code>OpenPool</code>, <code>DestroyPool</code>; provisioning, discovery, recovery and explicit retirement policy. Not in the KV-copy path.</td>
+</tr>
+<tr>
+<td>Serving processes</td>
+<td>Resolve through the delegator; <code>AttachPool</code> / <code>DetachPool</code>; perform ordinary cache lookup, reservation, copy and eviction. Never create or destroy a persistent pool.</td>
+</tr>
+<tr>
+<td>torch-spyre</td>
+<td>Thin tensor-aware bindings and local handle lifetime; no separate pool policy.</td>
+</tr>
+<tr>
+<td>Device runtime</td>
+<td>Geometry validation, backing attachment, DMA retention, metadata synchronization and generation-checked lifecycle mechanism.</td>
+</tr>
+</tbody>
+</table>
+<p><code>PoolConfig</code> identifies logical name, memory backend, immutable slot geometry and versioned KV
+compatibility. A descriptor includes the opaque <strong>pool generation</strong>, state and effective config.
+Attach requires <code>READY</code>, matching generation/config and the original data/metadata backing. Missing,
+replaced or incompatible backing is unavailable; do not create a replacement during lookup/attach.</p>
+<p>Attachments hold a shared lifecycle <code>flock</code> until dependent metadata/data mappings and DMA resources
+are released. Destruction requires exclusive access and the expected pool generation; busy pools
+return <code>PoolBusy</code> without leaving <code>READY</code>. There is no force-destroy by a serving worker and no
+authoritative process-count field whose decrement destroys the pool.</p>
+<p>The runtime serializes management with a persistent per-name guard, publishes a fully initialized
+root atomically, and can recover interrupted <code>INITIALIZING</code>/<code>DESTROYING</code> transitions. Recovery must
+not remove a <code>READY</code> pool. Same-name recreation gets a new generation, invalidating old descriptors.</p>
+<p>Last detach, <code>shutdown</code> and <code>reset_cache()</code> release local work/pins/bookkeeping, <strong>not published
+shared entries</strong>. Normal cache eviction remains permitted under the slot protocol. Existing
+attachments can keep serving if the delegator is unavailable; new resolution retries or fails,
+never silently creates a local replacement. Persistence across zero attached processes is not
+persistence across host reboot.</p>
+<h3 id="68-shared-manager-identity-and-concurrency">6.8 Shared manager, identity and concurrency<a class="headerlink" href="#68-shared-manager-identity-and-concurrency" title="Permanent link">&para;</a></h3>
+<p><img alt="Shared pools and persistent lifecycle" src="figures/spyre-shared-pool-m2.svg" /></p>
+<p>Diagram sources: <a href="figures/spyre-shared-pool-m2.d2">D2</a>,
+<a href="figures/spyre-shared-pool-m2.mmd">Mermaid</a>.</p>
+<p>Each selected cache group has a matching named data-pool/metadata pair, retained for the session.
+The metadata is pageable host shared memory for either backend. Its directory maps each compatible
+component-page key to a slot and <strong>slot generation</strong>; the serving-side manager composes and validates
+the complete chunk manifest. Pool generation protects backing incarnation; slot generation protects
+reuse within a live pool. Neither replaces the other.</p>
+<p><strong>Compatibility.</strong> A shared prefix requires matching model/revision and relevant adapters, hash
+algorithm/seed and request identity inputs, cache-group/layer order, block/chunk geometry, attention
+layout, dtype/encoding and scales, TP rank/shard topology, and versioned physical format. Equal
+names, hashes or byte counts alone are insufficient. Reject incompatible attachments before DMA;
+do not claim cross-TP raw-page portability.</p>
+<p><strong>Store.</strong> Claim missing component pages under the shared allocator/directory lock, with duplicate
+recheck and first-writer-wins semantics; already valid pages can be reused. Entries transition
+<code>EMPTY → RESERVED → VALID</code>; a reservation is neither readable nor evictable. Release the directory
+lock before DMA. Complete all new page copies before publishing them individually. Logical readiness
+comes from complete pinned lookup, not an assumed multi-entry atomic publish. After failure, quiesce
+DMA before aborting reservations or removing only attempt-owned publications, rechecking tenancy.
+A future multi-worker extension must not report a logical hit while any required rank is missing.</p>
+<p><strong>Load.</strong> Obtain a safe lookup snapshot, acquire the process-shared per-slot read protection, and
+recheck generation plus <code>VALID</code> <strong>before</strong> copying. A stale snapshot is a miss with no DMA. Hold
+protection through completion. For a chunk spanning slots, protect the entire required manifest
+before consuming it; an incomplete manifest is not a partial hit.</p>
+<p><strong>Eviction.</strong> Obtain exclusive slot protection, then the directory lock; recheck tenancy, remove the
+mapping and advance the slot generation before reuse. Never wait for a slot lock or DMA while
+holding the directory lock. Refuse generation exhaustion rather than wrap.</p>
+<p>The baseline slot protocol uses process-shared pthread read/write locks. Unlock on the same OS
+thread that acquired the lock; do not rely on arbitrary Python finalization or a completion callback
+on another thread. Bindings release the GIL during blocking attachment/locking/copy/wait operations.
+The GIL is not cross-process synchronization, and no directory lock spans the whole
+claim→copy→publish sequence.</p>
+<p><strong>Crash boundary.</strong> Lifecycle <code>flock</code> cleanup on process exit does not make pthread slot locks robust
+or prove device DMA has stopped. A timeout, dead PID or recovered directory mutex alone does not
+justify resetting locks or recycling active storage. If quiescence cannot be established, mark the
+affected pool unavailable pending coordinated recovery. The design must not promise that every
+mid-copy failure can be downgraded to an ordinary miss after bytes were already consumed.</p>
+<h2 id="7-implementation-plan">7. Implementation plan<a class="headerlink" href="#7-implementation-plan" title="Permanent link">&para;</a></h2>
+<p>Keep the plugin-specific code in <code>spyre_inference/v1/kv_offload/</code>; the prototype may factor modules
+differently as the interfaces settle. Avoid estimated line counts as an architectural constraint.</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Plugin work</th>
+<th>Lower-layer prerequisites</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>M1</td>
+<td>Dense canonicalization, connector/runner lifecycle, local spec/manager, byte copier, transfer completion and metrics</td>
+<td>Raw dense-page/range copy, physical extent validation, compute-to-DMA ordering, host pool</td>
+</tr>
+<tr>
+<td>M2</td>
+<td>Shared manager and transfer specs, compatible keys, reservations/publication/pins, shared configuration</td>
+<td>Matching named host data/metadata pair, shared allocator and concurrency mechanism</td>
+</tr>
+<tr>
+<td>M3</td>
+<td>Backend selection using the same shared contracts; secondary-memory integration tests</td>
+<td>Secondary-memory pool implementation, provider attachment and validated page transport</td>
+</tr>
+<tr>
+<td>Persistent shared-pool hardening</td>
+<td>Delegator resolution, attach/detach-only serving, local reset semantics, restart/recovery tests</td>
+<td>Generation-checked lifecycle, whole-pool attachment protection, recoverable creation/destruction</td>
+</tr>
+</tbody>
+</table>
+<p>Persistent lifecycle applies to <strong>both</strong> M2 and M3; it is not an optional implementation detail of
+one memory backend. Existing instance-local M1 scratch pools may remain ephemeral, provided they
+cannot accidentally attach or destroy a persistent shared pool.</p>
+<p>Change the dependency pin only in implementation PRs that have matching runtime builds and hardware
+qualification. This RFC adds no runtime code or dependency override.</p>
+<h2 id="8-compatibility-with-other-connectors">8. Compatibility with other connectors<a class="headerlink" href="#8-compatibility-with-other-connectors" title="Permanent link">&para;</a></h2>
+<p>M1 supplies a device↔host offload path through <strong>our</strong> connector. M2/M3 add on-node shared reuse.
+Neither registration makes stock <code>OffloadingConnector</code> understand a Spyre K/V pair, nor does it add
+our raw-copy path to all other connectors.</p>
+<p>Filesystem/object tiers need explicit integration with a suitable primary tier (§3.5). LMCache and
+NIXL integrations require their own storage/transfer/lifecycle checks. PD disaggregation additionally
+requires transport, routing, request handoff and failure semantics. These are follow-ups, not
+features automatically unlocked by a config change.</p>
+<h2 id="9-alignment-with-the-working-prototypes">9. Alignment with the working prototypes<a class="headerlink" href="#9-alignment-with-the-working-prototypes" title="Permanent link">&para;</a></h2>
+<p>The fork's three branches demonstrate separate capabilities; they are <strong>not a cumulatively integrated
+M1→M2→M3 product</strong>. In particular, M3 selects a secondary-memory backend for the M1-style worker and
+does not contain M2's shared manager/spec/worker. Combining sharing with secondary memory remains
+integration work.</p>
+<table>
+<thead>
+<tr>
+<th>Branch / inspected tip</th>
+<th>Implemented shape</th>
+<th>Boundary still to close</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kvc-offload-m1</code> / <code>582390cc1472328b41330d6c21f01b66c08a1a08</code></td>
+<td>Dense host-page offload, upstream local manager, connector/runner wiring; per-cache pools with K slot <code>2*h</code> and V slot <code>2*h+1</code></td>
+<td>Physical capacity negotiation; full failure-path quiescence; production dependency/API integration</td>
+</tr>
+<tr>
+<td><code>kvc-offload-m2</code> / <code>28bf1a2768e9758071ebfa1c06a11041551a4042</code></td>
+<td>One shared host data pool across components, directory, shared manager/worker, fragmented page slots and complete pinned lookup</td>
+<td>TP1, one group, one block per chunk, FP16, single-chunk allocations and <code>uni</code> executor only; persistent lifecycle remains separate</td>
+</tr>
+<tr>
+<td><code>kvc-offload-m3</code> / <code>7921f92110133631c37e022a40719e6e6b908f89</code></td>
+<td>Selectable host or secondary-memory transport behind the M1-style page offloader; disjoint per-rank/per-cache backing windows</td>
+<td>No M2 directory integration or global backing allocator; independent engines still need non-overlapping assigned regions</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Concrete transfer seam.</strong> <code>SpyreKvPageOffloader</code> in
+<code>spyre_inference/v1/worker/spyre_kv_offload.py</code> calls
+<code>copy_kv_page_raw(tensor, block_id, pool, slot_id, to_device, non_blocking)</code>. It passes the original
+rank-four allocation plus the block ID, letting the native binding identify the physical page range;
+it does not copy the whole layer just because the argument is the full tensor. The page starts at
+byte zero of its destination slot. Its size helper divides physical allocation size by block count
+with a divisibility check; production support must validate that mapping for every admitted layout.</p>
+<p>The PoC helper is still named <code>spyre_paged_to_canonical</code> in <code>kv_offload/connector.py</code>, but it handles
+dense tensors: flattened K/V views serve bookkeeping, while <code>SpyrePhysicalCaches</code> retains the
+original allocations for DMA. §6.6's dense name describes the intended factoring, not a claim that
+the branch already renamed it. There is no dtype-changing canonical copy.</p>
+<p><strong>Shared mechanism.</strong> M2's <code>shared_spec.py</code>, <code>shared_manager.py</code>, <code>shared_worker.py</code> and
+<code>shared_types.py</code> implement the shared spec, manager, worker and component manifest. Slot stride is
+the aligned largest component-page size; logical capacity is
+<code>floor(budget / (component_count * slot_stride))</code>. All components must be found and pinned for a hit;
+partial publication alone cannot create one. Local upstream admission policy is reused, while shared
+claims/pins determine actual slot ownership. Peer-owned pages are readable, but this is not a global
+victim policy or orphan-page scavenger.</p>
+<p>M2 currently registers one data pool with its directory and carries versioned pool/slot references.
+The target runtime design instead attaches a matching named pair at startup (§6.4, §6.8); a global
+registry or per-hit pool resolution is not a requirement carried forward from that prototype.
+Its configured model/revision digest also must not be mistaken for verification of actual weights or
+all semantic settings. The full compatibility contract in §6.8 remains the requirement.</p>
+<p><strong>Ordering.</strong> All three inspected tips fence the device on job entry, enqueue page copies with
+<code>non_blocking=True</code>, then synchronize once before reporting success. Job submission remains
+synchronous; this is not serving/transfer overlap or a native batched-descriptor API. M2 additionally
+quiesces and rolls back attempt-owned pages on failure; the other branches do not establish the same
+transactional failure recovery.</p>
+<p><strong>Evidence and remaining gates.</strong> <code>tests/kv_offload/</code> contains both-layout FP16 page/worker tests,
+M2 shared-manager and shared-worker tests, and an opt-in two-server cross-instance test. M3's secondary
+backend tests require explicit hardware setup and otherwise skip. The M2 branch's recorded manual
+run in <code>docs/superpowers/results/2026-09-30-spyre-shared-kv-manual-demo.md</code> reports a compiled one-pool
+A→A→B reuse demonstration; it is evidence from an earlier development state, not a rerun of these tips.
+No hardware tests were rerun for this RFC revision, and the offload suites do not establish FP8 reuse.</p>
+<p>Prototype creation/last-handle cleanup and operator demo cleanup are <strong>not</strong> persistent control-plane
+management. Their local dependency pins and backend-specific selectors are not a stable public API.
+Persistent attach/detach-only serving, zero-attachment reuse, crash recovery and M2+M3 integration
+require the newer lifecycle and shared-backend work. §12 keeps those gates separate.</p>
+<h2 id="10-open-questions-and-resolved-review-points">10. Open questions and resolved review points<a class="headerlink" href="#10-open-questions-and-resolved-review-points" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Dense page-copy API and physical accounting.</strong> Settle the production tensor/page or range
+   interface, supported layouts, authoritative byte extents and scheduler/worker capacity agreement.
+   The whole-allocation pool call cannot simply be applied to a dense-page view.</li>
+<li><strong>Canonicalization — corrected premise.</strong> Dense K/V fields replace the old paged-list assumption.
+   Retain the small adapter until upstream ingestion and its storage view are fully qualified on
+   Spyre. The exact pin implements a storage-offset <code>set_</code> overload; do not describe all <code>set_</code> as
+   unsupported.</li>
+<li><strong>Parallelism.</strong> Current Spyre supports TP beyond the old TP=2-only statement; DP&gt;1 and PP&gt;1 are
+   rejected. Offload still needs per-rank slice, identity, capacity and all-worker publication tests.
+   Do not infer those guarantees from ordinary model TP support.</li>
+<li><strong>Block-count alignment — resolved/removed.</strong> <code>allocate_spyre_kv_caches</code> uses the configured block
+   count unchanged. There is no hidden multiple-of-64 block-count slack to expose on the host tier.
+   Physical padding and offload chunk factors still need validation.</li>
+<li><strong>FP8.</strong> Qualify raw E4M3 page copies, physical slot geometry and scale compatibility. Reject
+   unsupported combinations rather than assuming success from model-dtype tests.</li>
+<li><strong>Persistent lifecycle and crash recovery.</strong> Finalize delegator/binding integration and safe recovery
+   from abandoned reservations or non-robust slot locks without recycling live DMA storage.</li>
+<li><strong>Upstream maintenance.</strong> Keep constructor/registration/metrics tests at the pinned vLLM tag. An
+   eventual upstream canonicalization hook could reduce the connector subclass, but it is not needed
+   to begin implementation.</li>
+</ol>
+<h2 id="11-out-of-scope-and-follow-ups">11. Out of scope and follow-ups<a class="headerlink" href="#11-out-of-scope-and-follow-ups" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Upstream a general cache-ingestion hook once the dense adapter has a tested consumer.</li>
+<li>Stabilize a public copier API for third-party connectors after the raw-page contract is qualified.</li>
+<li>Integrate filesystem/object tiers with a suitable primary-memory interface.</li>
+<li>Design cross-host PD disaggregation and any direct device-to-storage path separately.</li>
+<li>Qualify compute/copy overlap and batched/asynchronous execution without weakening completion,
+  page lifetime or slot-lock ownership.</li>
+<li>Add multi-chunk raw-page support and cross-topology canonical formats only with explicit layout
+  descriptors and validation; never persist process-local device addresses.</li>
+<li>Define multi-pool placement or migration policy separately. Selecting secondary memory does not
+  imply automatic tiering.</li>
+</ul>
+<h2 id="12-acceptance-criteria">12. Acceptance criteria<a class="headerlink" href="#12-acceptance-criteria" title="Permanent link">&para;</a></h2>
+<p>These are implementation gates, <strong>not test results for this docs-only PR</strong>. Hardware tests must run
+sequentially on a contested accelerator; independent serving processes can be exercised in sequence
+for restart/reuse tests. Concurrent device tests require separately assigned hardware.</p>
+<h3 id="m1-acceptance">M1 acceptance<a class="headerlink" href="#m1-acceptance" title="Permanent link">&para;</a></h3>
+<ul>
+<li>[ ] The §6.5 serve configuration boots with matching dependency builds. The Spyre connector worker
+  is actually selected, caches are registered, and transfer hooks/output/shutdown are reached.</li>
+<li>[ ] Mock-safe tests cover spec loading, constructor/API drift, manager metrics, dense K/V identity,
+  shared-layer aliases, selected groups, per-layer geometry and chunk-factor dispatch. The adapter
+  does not call <code>untyped_storage().set_()</code> or copy the device cache to a new buffer.</li>
+<li>[ ] A known-pattern raw page is stored and restored into another page byte-for-byte. Cover both
+  head-major and token-major model-dtype layouts, first/middle/last pages, nonzero view offsets,
+  padding, multiple K/V heads and adjacent-page canaries. Unsupported extents fail before DMA.</li>
+<li>[ ] Store ordering is tested with pending KV writes; load ordering is tested before attention reads.
+  Failure/cancellation, preemption, waits and shutdown do not publish or reuse unfinished transfers.</li>
+<li>[ ] Force device-cache eviction or otherwise rule out a device-only prefix hit. A subsequent request
+  records completed offload/load jobs with nonzero blocks and reuses the host prefix. Do not rely on
+  a guessed log string or an obsolete metric name as evidence.</li>
+<li>[ ] With the same model, precision, topology, execution mode and deterministic settings, greedy
+  tokens match a no-offload baseline. Raw-byte tests remain the transport correctness test; greedy
+  equality alone is not enough.</li>
+<li>[ ] No-connector serving remains unchanged; no upstream vLLM source patch is needed. Runner wiring
+  changes are allowed and tested. Stock-connector behavior is a diagnostic, not a mandated failure
+  if future upstream support improves.</li>
+</ul>
+<h3 id="m2-acceptance">M2 acceptance<a class="headerlink" href="#m2-acceptance" title="Permanent link">&para;</a></h3>
+<ul>
+<li>[ ] Two compatible instances resolve the same named pair, use a shared allocator, and validate the
+  full compatibility descriptor. A peer's first request finds a previously published chunk; no
+  peer-side prefix recomputation, file/object-store hop or private-cache warmup is mistaken for reuse.</li>
+<li>[ ] Each page becomes valid only after its copy completes; logical hits require the complete pinned
+  component set, including every required rank. Duplicate writers, capacity exhaustion, eviction and
+  stale generations cannot turn a partially published set into a logical hit.</li>
+<li>[ ] A reader holds generation-checked protection through DMA; an evictor cannot recycle its slot.
+  Stale/reserved entries are rejected before DMA. Incompatible layout/dtype/scale/rank attachments
+  fail instead of reusing equal-sized bytes.</li>
+<li>[ ] Bindings release the GIL when blocking; slot-lock release occurs on the acquiring thread;
+  backing survives dropped Python references while a copy is pending.</li>
+<li>[ ] M1 still works, and importing the plugin without selecting offload does not require optional
+  shared-pool APIs.</li>
+</ul>
+<h3 id="m3-acceptance">M3 acceptance<a class="headerlink" href="#m3-acceptance" title="Permanent link">&para;</a></h3>
+<ul>
+<li>[ ] Repeat raw round-trip and end-to-end offload/reload tests using a secondary-memory data pool and
+  the same host-resident metadata protocol. Verify the selected backend was actually used; no silent
+  host-memory fallback.</li>
+<li>[ ] Invalid provider/backing identity, insufficient slot capacity and unsupported physical ranges
+  fail safely. Backing ownership lasts through DMA completion.</li>
+<li>[ ] M1 and M2 remain functional; adding the backend does not introduce automatic spill or migration.</li>
+</ul>
+<h3 id="fp8-acceptance-for-each-enabled-offload-backend">FP8 acceptance, for each enabled offload backend<a class="headerlink" href="#fp8-acceptance-for-each-enabled-offload-backend" title="Permanent link">&para;</a></h3>
+<ul>
+<li>[ ] Head-major E4M3 pages round-trip byte-exactly with physical extent/alignment-derived slot sizes,
+  adjacent-slot canaries, nonzero page offsets and representative head/block geometries.</li>
+<li>[ ] FP8-aware offload tokens match an <strong>FP8 no-offload baseline</strong>, not an FP16 model baseline.
+  Shared instances establish identical resolved K/V scales and encoding.</li>
+<li>[ ] Token-major FP8 and any unqualified copy/backend combination are rejected explicitly.</li>
+</ul>
+<h3 id="persistent-lifecycle-acceptance-for-both-shared-memory-kinds">Persistent lifecycle acceptance, for both shared memory kinds<a class="headerlink" href="#persistent-lifecycle-acceptance-for-both-shared-memory-kinds" title="Permanent link">&para;</a></h3>
+<ul>
+<li>[ ] Provision through the delegator; serving processes only attach/detach. Configuration/env/default
+  naming precedence is resolved once and propagated, with invalid/empty names rejected.</li>
+<li>[ ] A publishes a prefix, all serving attachments exit, then B attaches and reuses it. <code>reset_cache</code>,
+  normal shutdown and rolling restart do not delete published shared entries.</li>
+<li>[ ] Old descriptors fail after explicit destroy/recreate. A destroy while attached or while dependent
+  DMA is retained returns busy without destroying the live pool.</li>
+<li>[ ] Delegator restart and interrupted create/destroy recover correctly. Existing attachments survive
+  delegator unavailability; a new client cannot create a replacement on its own.</li>
+<li>[ ] Crash recovery does not reset non-robust slot locks or reuse storage based only on a timeout/PID
+  check. Unprovable quiescence fails unavailable pending coordinated recovery.</li>
+</ul>
+<h2 id="13-references">13. References<a class="headerlink" href="#13-references" title="Permanent link">&para;</a></h2>
+<p><strong>Main-branch source at the version basis in §3:</strong></p>
+<ul>
+<li><code>spyre_inference/v1/attention/backends/spyre_attn.py</code>: <code>SpyrePagedKVCache</code>, model-dtype allocation,
+  FP8 eligibility checks.</li>
+<li><code>spyre_inference/v1/attention/backends/spyre_head_major_attn.py</code>: default cache shape, E4M3 allocation
+  and per-layer scale usage.</li>
+<li><code>spyre_inference/v1/worker/kv_cache_setup.py</code>: <code>allocate_spyre_kv_caches</code>.</li>
+<li><code>spyre_inference/envs.py</code>: head-major default and token-major override.</li>
+</ul>
+<p><strong>vLLM <a href="https://github.com/vllm-project/vllm/tree/5df63a7203cdb9328d824a27b682e77c7b9928be">v0.32.0</a>:</strong></p>
+<ul>
+<li><code>vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py</code>: connector construction.</li>
+<li><code>vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py</code>: registration/canonicalization.</li>
+<li><code>vllm/distributed/kv_transfer/kv_connector/v1/offloading/config.py</code>: offloading configuration.</li>
+<li><code>vllm/v1/kv_offload/{base,config,factory}.py</code>: worker/spec/manager and dynamic-loading contracts.</li>
+<li><code>vllm/v1/kv_offload/cpu/{spec,manager,gpu_worker,shared_offload_region}.py</code>: CPU reference path.</li>
+<li><code>vllm/v1/kv_offload/tiering/spec.py</code>: CPU-primary-tier dependency.</li>
+</ul>
+<p><strong>torch-spyre <a href="https://github.com/torch-spyre/torch-spyre/tree/64870622fc39cda7e344a271decb901e7088c6c6">pinned source</a>:</strong></p>
+<ul>
+<li><code>torch_spyre/csrc/spyre_mem.cpp</code>: <code>spyre_set_storage</code>, converting copies and allocation metadata.</li>
+<li><code>torch_spyre/csrc/spyre_views.cpp</code>: Spyre-aware view metadata propagation.</li>
+<li><code>torch_spyre/csrc/module.cpp</code>: exported Python bindings.</li>
+</ul>
+<p><strong>Development evidence and design dependencies:</strong></p>
+<ul>
+<li>Fork branches <code>kvc-offload-m1</code>, <code>kvc-offload-m2</code>, <code>kvc-offload-m3</code>: instance-local host offload,
+  cross-instance host sharing, and the secondary-memory end-to-end prototype, respectively.</li>
+<li>Device-runtime shared-pool and raw-copy contracts: slot-addressed host/secondary-memory pools,
+  matching per-pool metadata, physical copy geometry and slot concurrency.</li>
+<li>Persistent shared-pool lifecycle contract: delegator-managed provisioning/destruction and
+  attach/detach-only serving. This supersedes creator/last-detacher destruction in earlier sketches.</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.copy", "content.tabs.link", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.top", "search.highlight", "search.share", "toc.follow"], "search": "../../assets/javascripts/workers/search.a7633da7.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.c21346df.min.js"></script>
+      
+    
+  </body>
+</html>

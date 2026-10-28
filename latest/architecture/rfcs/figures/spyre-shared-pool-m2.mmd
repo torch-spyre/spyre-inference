@@ -1,0 +1,35 @@
+flowchart TB
+    subgraph control["Control plane — target persistent lifecycle"]
+        delegator["Node-local delegator<br/>CreatePool / OpenPool / DestroyPool"]
+    end
+    subgraph clients["Data plane — compatible serving instances"]
+        a["Instance A<br/>Shared manager + page worker"]
+        b["Instance B<br/>Shared manager + page worker"]
+    end
+    subgraph pair["Named pair per selected cache group — retained at startup"]
+        lifecycle["Generation-checked attachment<br/>AttachPool / DetachPool only for serving<br/>Published entries survive last detach"]
+        directory["Host-resident shared metadata<br/>Component key → slot + generation<br/>Claim / publish / pin / evict"]
+        data[("SharedPool data slots<br/>Host memory OR secondary memory<br/>No automatic tiering")]
+        lifecycle -->|protect pair identity| directory
+        directory -->|all components valid + pinned before a hit| data
+    end
+    delegator -->|provision / resolve / explicit destroy| lifecycle
+    a -->|attach / detach| lifecycle
+    b -->|attach / detach| lifecycle
+    a -.->|claim → copy → publish pages| directory
+    b -.->|lookup → pin → recheck → copy| directory
+    a <-->|byte-exact page DMA| data
+    b <-->|byte-exact page DMA| data
+    scope["Target architecture: M2 demonstrates host sharing; M3 separately demonstrates<br/>secondary-memory transport. Combining them and persistent lifecycle remain work."]
+    pair -.->|implementation status| scope
+
+    classDef base fill:#37474f,stroke:#263238,color:#ffffff
+    classDef spyre fill:#2e7d32,stroke:#1b5e20,color:#ffffff
+    classDef device fill:#1565c0,stroke:#0d47a1,color:#ffffff
+    class delegator,lifecycle,directory base
+    class a,b spyre
+    class data device
+    style control fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style clients fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style pair fill:#e0e0e0,stroke:#9e9e9e,color:#212121
+    style scope fill:#e0e0e0,stroke:#9e9e9e,color:#212121

@@ -203,6 +203,43 @@ def test_embed_input_ids_hands_each_level_to_the_decoder_buffers():
     assert model._ds_num_tokens == tokens
 
 
+@pytest.mark.parametrize(
+    "positions",
+    [[0, 3, 7], [1, 2, 5, 6], [0, 1, 2, 3], [4, 5, 6, 7]],
+    ids=["scattered", "two_pairs", "contiguous_prefix", "contiguous_suffix"],
+)
+def test_embed_input_ids_narrow_staging_matches_full_buffer_staging(positions):
+    """Staging ``[tokens, H]`` and copying into ``[:tokens]`` fills the same live rows as
+    staging the whole buffer, and leaves the rows past ``tokens`` alone."""
+    from spyre_inference.models.granite4_vision import (
+        SpyreGranite4VisionForConditionalGeneration as Spyre,
+    )
+
+    levels, tokens, capacity = 2, 8, 16
+    inner = SimpleNamespace(
+        embed_input_ids=lambda ids: ids.float()[:, None].expand(-1, LM_HIDDEN).contiguous(),
+        config=SimpleNamespace(embedding_multiplier=1.0),
+    )
+    model = nn.Module()
+    model.language_model = SimpleNamespace(model=inner)
+    stale = 7.0
+    model._ds_buffers = [torch.full((capacity, LM_HIDDEN), stale) for _ in range(levels)]
+    model._ds_num_tokens = 0
+    model.vision_merge = lambda text, mask: torch.where(mask, torch.zeros_like(text), text)
+
+    is_multimodal = torch.zeros(tokens, dtype=torch.bool)
+    is_multimodal[positions] = True
+    rows = torch.randn(len(positions), levels * LM_HIDDEN)
+
+    Spyre.embed_input_ids(model, torch.arange(tokens), [rows], is_multimodal=is_multimodal)
+
+    for level, buf in enumerate(model._ds_buffers):
+        full = torch.zeros(capacity, LM_HIDDEN)
+        full[:tokens][is_multimodal] = rows[:, level * LM_HIDDEN : (level + 1) * LM_HIDDEN]
+        torch.testing.assert_close(buf[:tokens], full[:tokens], atol=0, rtol=0)
+        assert torch.all(buf[tokens:] == stale)
+
+
 def test_embed_input_ids_count_mismatch_fails_like_upstream():
     from spyre_inference.models.granite4_vision import (
         SpyreGranite4VisionForConditionalGeneration as Spyre,

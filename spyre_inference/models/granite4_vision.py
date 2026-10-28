@@ -342,11 +342,11 @@ class SpyreGranite4VisionForConditionalGeneration(
         """Upstream's text embedding (times ``embedding_multiplier``), the image rows zeroed
         through ``vision_merge``, and each deepstack level handed to the decoder's buffers.
 
-        The rows are ``[tokens, levels * H]``. Each level is placed on the host and copied
-        card-to-card over its whole persistent buffer: the buffers outlive the step, and a copy
-        into a ``[:tokens]`` slice fails on Spyre ("Invalid dma sizes") because the DMA checks
-        the physical allocation. Rows past ``tokens`` stay zero, and ``forward`` reads only
-        ``[:tokens]``.
+        The rows are ``[tokens, levels * H]``. Each level is placed on the host in a
+        ``[tokens, H]`` staging tensor and copied into the ``[:tokens]`` prefix of its
+        persistent buffer. Rows past ``tokens`` are stale by design: ``forward`` reads only
+        ``[:tokens]`` (``_ds_num_tokens``), as upstream's own write does, so the per-call copy
+        scales with the prompt rather than the buffer capacity.
         """
         text = _Upstream.embed_input_ids(self, input_ids, (), is_multimodal=is_multimodal)
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
@@ -361,11 +361,10 @@ class SpyreGranite4VisionForConditionalGeneration(
                 f"{int(mask.sum())} placeholders"
             )
         tokens, hidden = text.shape
-        capacity = self._ds_buffers[0].shape[0]
         for level, feats in enumerate(rows.to(text.dtype).split(hidden, dim=-1)):
-            staged = torch.zeros((capacity, hidden), dtype=text.dtype)
-            staged[:tokens][mask] = feats
-            self._ds_buffers[level].copy_(convert(staged, device=text.device))
+            staged = torch.zeros((tokens, hidden), dtype=text.dtype)
+            staged[mask] = feats
+            self._ds_buffers[level][:tokens].copy_(convert(staged, device=text.device))
         self._ds_num_tokens = tokens
         merge = getattr(self, "_spyre_vision_merge", self.vision_merge)
         return merge(text, convert(mask[:, None], device=text.device))
